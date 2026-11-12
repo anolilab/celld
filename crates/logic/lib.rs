@@ -1742,6 +1742,36 @@ impl State {
         Some(id)
     }
 
+    /// False for an ingress-only node, which routes cells but never holds
+    /// one. Fullness is `has_capacity`; this is whether room can ever exist.
+    fn hosts_cells(&self) -> bool {
+        self.config.max_resident > 0
+    }
+
+    /// Take over a dead owner's cell. A node that can never host it would
+    /// queue the claim until the deadline and strand the cell, though a peer
+    /// with room can take it over itself; a node that is only full sheds a
+    /// resident cell to admit it.
+    fn admit_takeover(
+        &mut self,
+        id: &str,
+        cell: &mut Cell,
+        claim: Claim,
+        effects: &mut Vec<Effect>,
+    ) {
+        if self.hosts_cells() {
+            self.activate_or_wait(
+                id,
+                cell,
+                Activation::Claim(claim),
+                WhenFull::ShedToAdmit,
+                effects,
+            );
+        } else {
+            self.place_on_peer(id, cell, claim, effects);
+        }
+    }
+
     fn has_capacity(&self) -> bool {
         // Residency is a hard cap, known exactly and counted -- never sampled.
         // A node at its cell cap is at capacity, not overloaded: it refuses
@@ -4574,12 +4604,9 @@ impl State {
                         None | Some(crate::log_tier::LogState::Sealed)
                     )
                 });
-                // A node that can never host a cell would queue the takeover
-                // until the deadline and strand the cell, though a peer with
-                // room can take it over itself. It forwards the claim and
-                // leaves the dead owner's log to the peer that takes it.
-                let never_hosts = self.config.max_resident == 0;
-                if unrecovered && !never_hosts {
+                // An ingress-only node leaves the dead owner's log to the
+                // peer that takes the cell.
+                if unrecovered && self.hosts_cells() {
                     let owner = record.node.clone().unwrap_or_default();
                     let next = self.cell_op(id);
                     set_phase(
@@ -4607,17 +4634,7 @@ impl State {
                     prior: record.node.clone(),
                     reconciles: 0,
                 };
-                if never_hosts {
-                    self.place_on_peer(id, cell, claim, effects);
-                } else {
-                    self.activate_or_wait(
-                        id,
-                        cell,
-                        Activation::Claim(claim),
-                        WhenFull::ShedToAdmit,
-                        effects,
-                    );
-                }
+                self.admit_takeover(id, cell, claim, effects);
             }
             Err(_) => {
                 set_phase(&mut self.occupied, cell, Phase::Inactive);
