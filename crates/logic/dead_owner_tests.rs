@@ -107,16 +107,6 @@ fn work(effects: &[Effect]) -> Vec<&Effect> {
         .collect()
 }
 
-fn read_owner_op(effects: &[Effect], cell: &str) -> OpId {
-    effects
-        .iter()
-        .find_map(|effect| match effect {
-            Effect::ReadOwner { op, cell: c } if c == cell => Some(*op),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("expected ReadOwner for {cell}, got {effects:?}"))
-}
-
 fn request(state: &mut State, request: RequestId, cell: &str) -> OpId {
     let effects = on_event(
         state,
@@ -126,7 +116,13 @@ fn request(state: &mut State, request: RequestId, cell: &str) -> OpId {
             now_mono_ms: 0,
         },
     );
-    read_owner_op(&effects, cell)
+    effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::ReadOwner { op, cell: c } if c == cell => Some(*op),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected ReadOwner for {cell}, got {effects:?}"))
 }
 
 fn owner_read(state: &mut State, op: OpId, node: Option<&str>) -> Vec<Effect> {
