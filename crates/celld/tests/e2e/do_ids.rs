@@ -56,7 +56,7 @@ async fn malformed_id_string_throws() {
     let out: Value = server.get_json("/malformed").await;
     assert_eq!(
         out,
-        json!({"notHex": true, "tooShort": true, "empty": true}),
+        json!({"forged": true, "notHex": true, "tooShort": true, "empty": true}),
         "{out}"
     );
 }

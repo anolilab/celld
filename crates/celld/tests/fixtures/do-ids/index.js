@@ -57,7 +57,13 @@ export default {
       });
     }
     if (url.pathname === "/malformed") {
+      // A well-formed id with one hex digit of its signature changed: it has
+      // the right shape but this namespace did not mint it.
+      const valid = ns.newUniqueId().toString();
+      const last = valid.at(-1);
+      const forged = valid.slice(0, -1) + (last === "0" ? "1" : "0");
       return Response.json({
+        forged: throws(() => ns.idFromString(forged)),
         notHex: throws(() => ns.idFromString("not-a-durable-object-id")),
         tooShort: throws(() => ns.idFromString("abcd")),
         empty: throws(() => ns.idFromString("")),
