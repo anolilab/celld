@@ -47,7 +47,7 @@ pub enum FacetReq {
         root: String,
         epoch: u64,
         names: Vec<String>,
-        reply: tokio::sync::oneshot::Sender<Result<(std::path::PathBuf, bool)>>,
+        reply: tokio::sync::oneshot::Sender<Result<std::path::PathBuf>>,
     },
     /// Delete the facet's stream and every stream below it.
     Delete {

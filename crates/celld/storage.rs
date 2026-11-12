@@ -96,8 +96,6 @@ enum StorageBacking {
         path: String,
         root_scope: String,
         facet_path: Vec<String>,
-        /// The activation's paged VFS, when its restore paged.
-        root_vfs: Option<String>,
     },
     /// A facet: a database and a replication stream of its own
     /// (`crate::facet_streams`), opened inside its root's activation.
@@ -106,7 +104,6 @@ enum StorageBacking {
         root_path: String,
         root_scope: String,
         facet_path: Vec<String>,
-        root_vfs: Option<String>,
         /// Unique to this opening of the facet within the process. A facet
         /// that its root reopens, even at the same scope and epoch after a
         /// generation swap, is a new actor and takes a new value.
@@ -122,9 +119,6 @@ pub(crate) struct StorageIdentity {
     pub root_path: String,
     pub root_scope: String,
     pub facet_path: Vec<String>,
-    /// The root activation's paged VFS. A paged root is sparse until it has
-    /// hydrated, so a facet that reads the root's file must go through it.
-    pub root_vfs: Option<String>,
     pub epoch: u64,
     /// A committed-write position of `root_scope`, sampled in the isolate that
     /// holds the root database.
@@ -426,12 +420,6 @@ pub fn schema(c: &Connection) -> anyhow::Result<()> {
     c.execute(
         "CREATE TABLE IF NOT EXISTS _cf_METADATA \
          (scope TEXT PRIMARY KEY, actor_name TEXT)",
-        [],
-    )?;
-    c.execute(
-        "CREATE TABLE IF NOT EXISTS _cf_FACETS \
-         (scope TEXT NOT NULL, path TEXT NOT NULL, image BLOB NOT NULL, \
-          PRIMARY KEY(scope,path)) WITHOUT ROWID",
         [],
     )?;
     let alarm_columns = {
@@ -772,7 +760,12 @@ pub(crate) fn open_at_epoch(
     sqlite_vec: bool,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(epoch > 0, "a cell activation epoch must be positive");
-    let connection = open_with_vfs(path, vfs)?;
+    let connection = match vfs {
+        Some(vfs) => {
+            Connection::open_with_flags_and_vfs(path, rusqlite::OpenFlags::default(), vfs)?
+        }
+        None => Connection::open(path)?,
+    };
     finish_open(
         scope,
         connection,
@@ -783,7 +776,6 @@ pub(crate) fn open_at_epoch(
             path: path.to_string(),
             root_scope: scope.to_string(),
             facet_path: Vec::new(),
-            root_vfs: vfs.map(str::to_string),
         },
     )
 }
@@ -800,7 +792,6 @@ pub fn open_with_fault_vfs_for_test(scope: &str, path: &str) -> anyhow::Result<(
             path: path.to_string(),
             root_scope: scope.to_string(),
             facet_path: Vec::new(),
-            root_vfs: None,
         },
     )
 }
@@ -947,18 +938,16 @@ pub(crate) fn storage_identity(scope: &str) -> anyhow::Result<Option<StorageIden
     let observed = observed_position(scope, sample);
     Ok(dbs(|databases| {
         databases.borrow().get(scope).map(|cell| {
-            let (root_path, root_scope, facet_path, root_vfs, root_position, root_observed) =
+            let (root_path, root_scope, facet_path, root_position, root_observed) =
                 match &cell.backing {
                     StorageBacking::File {
                         path,
                         root_scope,
                         facet_path,
-                        root_vfs,
                     } => (
                         path.clone(),
                         root_scope.clone(),
                         facet_path.clone(),
-                        root_vfs.clone(),
                         sample.unwrap_or(0),
                         observed,
                     ),
@@ -966,7 +955,6 @@ pub(crate) fn storage_identity(scope: &str) -> anyhow::Result<Option<StorageIden
                         root_path,
                         root_scope,
                         facet_path,
-                        root_vfs,
                         root_position,
                         root_observed,
                         ..
@@ -974,7 +962,6 @@ pub(crate) fn storage_identity(scope: &str) -> anyhow::Result<Option<StorageIden
                         root_path.clone(),
                         root_scope.clone(),
                         facet_path.clone(),
-                        root_vfs.clone(),
                         *root_position,
                         *root_observed,
                     ),
@@ -983,7 +970,6 @@ pub(crate) fn storage_identity(scope: &str) -> anyhow::Result<Option<StorageIden
                 root_path,
                 root_scope,
                 facet_path,
-                root_vfs,
                 epoch: cell.epoch,
                 root_position,
                 root_observed,
@@ -1079,44 +1065,20 @@ pub(crate) fn refresh_embedded_root(scope: &str, parent: &StorageIdentity) {
     });
 }
 
-fn owned_sqlite_data(bytes: &[u8]) -> anyhow::Result<rusqlite::serialize::OwnedData> {
-    let pointer = unsafe { rusqlite::ffi::sqlite3_malloc64(bytes.len() as u64) }.cast::<u8>();
-    let pointer = std::ptr::NonNull::new(pointer)
-        .ok_or_else(|| anyhow::anyhow!("allocate an embedded facet database"))?;
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.as_ptr(), bytes.len());
-        Ok(rusqlite::serialize::OwnedData::from_raw_nonnull(
-            pointer,
-            bytes.len(),
-        ))
-    }
-}
-
 /// Open a facet's own database file, which `crate::facet_streams`
-/// activated at `path`. A facet from before facets had streams of their own
-/// kept its database as an image in a row of its root's `_cf_FACETS`; a
-/// stream replication did not restore takes that image as its first content.
+/// activated at `path`.
 pub(crate) fn open_embedded(
     scope: &str,
     parent: &StorageIdentity,
     name: &str,
     path: &std::path::Path,
-    restored: bool,
     sqlite_vec: bool,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(parent.facet_path.len() < 3, "Facet nesting depth limit exceeded. The maximum depth including the root Durable Object is 4.");
     let mut facet_path = parent.facet_path.clone();
     facet_path.push(name.to_string());
     let stream = crate::engine_api::facet_cell(&parent.root_scope, &facet_path);
-    let mut connection = Connection::open(path)?;
-    if !restored && holds_only_control_tables(&connection)? {
-        import_legacy_facet(
-            &mut connection,
-            &open_with_vfs(&parent.root_path, parent.root_vfs.as_deref())?,
-            &parent.root_scope,
-            &facet_path,
-        )?;
-    }
+    let connection = Connection::open(path)?;
     schema(&connection)?;
     // Each run of a facet has its own scope, so a continuation from an
     // aborted instance cannot enter its replacement. The database is one
@@ -1138,96 +1100,11 @@ pub(crate) fn open_embedded(
             opening: NEXT_FACET_OPENING.fetch_add(1, Ordering::Relaxed),
             root_path: parent.root_path.clone(),
             root_scope: parent.root_scope.clone(),
-            root_vfs: parent.root_vfs.clone(),
             facet_path,
             root_position: parent.root_position,
             root_observed: parent.root_observed,
         },
     )
-}
-
-/// True when a facet database has never held application or celld tables.
-/// Replication opens the file before `open_embedded` and creates its own
-/// control tables, so a page count of zero never identifies a new facet.
-fn holds_only_control_tables(connection: &Connection) -> anyhow::Result<bool> {
-    Ok(table_names(connection)?
-        .iter()
-        .all(|name| celld_ltx::db::is_control_table(name)))
-}
-
-/// Every table in the database other than SQLite's own.
-fn table_names(connection: &Connection) -> anyhow::Result<Vec<String>> {
-    let mut statement = connection.prepare(
-        "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-    )?;
-    let names = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(names)
-}
-
-/// Open a cell database, through its activation's paged VFS when it has one.
-fn open_with_vfs(path: &str, vfs: Option<&str>) -> rusqlite::Result<Connection> {
-    match vfs {
-        Some(vfs) => Connection::open_with_flags_and_vfs(path, rusqlite::OpenFlags::default(), vfs),
-        None => Connection::open(path),
-    }
-}
-
-/// Copy a facet's legacy image from its root's `_cf_FACETS` row into the
-/// facet's own database.
-fn import_legacy_facet(
-    connection: &mut Connection,
-    root: &Connection,
-    root_scope: &str,
-    facet_path: &[String],
-) -> anyhow::Result<()> {
-    let legacy = serde_json::to_string(facet_path)?;
-    let image = root
-        .query_row(
-            "SELECT image FROM _cf_FACETS WHERE scope=?1 AND path=?2",
-            rusqlite::params![root_scope, legacy],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .optional()?;
-    let Some(image) = image else {
-        return Ok(());
-    };
-    let mut source = Connection::open_in_memory()?;
-    source.deserialize(
-        rusqlite::DatabaseName::Main,
-        owned_sqlite_data(&image)?,
-        true,
-    )?;
-    rusqlite::backup::Backup::new(&source, connection)?
-        .run_to_completion(i32::MAX, std::time::Duration::ZERO, None)
-        .context("import the facet's legacy image")?;
-    Ok(())
-}
-
-/// Delete the legacy `_cf_FACETS` images of a facet and every facet below it,
-/// so a deleted facet cannot import its old image when it is recreated.
-pub(crate) fn delete_legacy_facet(parent: &StorageIdentity, name: &str) -> anyhow::Result<()> {
-    let mut facet_path = parent.facet_path.clone();
-    facet_path.push(name.to_string());
-    let mut root = open_with_vfs(&parent.root_path, parent.root_vfs.as_deref())?;
-    let paths = {
-        let mut statement = root.prepare("SELECT path FROM _cf_FACETS WHERE scope=?1")?;
-        let rows = statement.query_map([&parent.root_scope], |row| row.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    let transaction = root.transaction()?;
-    for path in paths {
-        let candidate: Vec<String> = serde_json::from_str(&path)?;
-        if candidate.starts_with(&facet_path) {
-            transaction.execute(
-                "DELETE FROM _cf_FACETS WHERE scope=?1 AND path=?2",
-                rusqlite::params![parent.root_scope, path],
-            )?;
-        }
-    }
-    transaction.commit()?;
-    Ok(())
 }
 
 static NEXT_BATCH_SAVEPOINT: AtomicU64 = AtomicU64::new(1);
@@ -1336,8 +1213,8 @@ fn schema_version(connection: &Connection) -> u64 {
 /// The cell's committed-write position: SQLite's total completed row changes,
 /// data version, and schema cookie, monotonic for the life of the activation.
 /// The output gate samples it around a handler to tell a write from a read.
-/// The data version detects a legacy facet image deleted through a second
-/// connection, and the cookie makes DDL-only mutations count as writes.
+/// The data version detects a commit through a second connection, and the
+/// cookie makes DDL-only mutations count as writes.
 /// Widened only after the gated-frame flush learned to outlive its dispatch —
 /// before that, counting DDL turned every lazily-CREATE-ing connect handler
 /// into a "writer" whose held frames were silently lost. `None` when the scope
@@ -4202,7 +4079,13 @@ pub fn get_actor_name(scope: &str) -> anyhow::Result<Option<String>> {
 /// which form the public JS deleteAll() operation selects.
 pub fn delete_all_with_alarm(scope: &str, delete_alarm: bool) -> anyhow::Result<()> {
     let result = with_application_storage_write(scope, |c| -> anyhow::Result<()> {
-        let tables = table_names(c)?;
+        let mut statement = c.prepare(
+            "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        )?;
+        let tables = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
         without_sql_authorizer(c, || {
             c.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
             let result = (|| -> anyhow::Result<()> {
@@ -4515,6 +4398,3 @@ pub fn bump_alarm_with_policy(scope: &str, now_ms: i64, counts_against_limit: bo
 
 #[cfg(celld_internal_tests)]
 include!(env!("CELLD_INTERNAL_STORAGE_OBSERVERS"));
-
-#[cfg(test)]
-mod legacy_facet_tests;
