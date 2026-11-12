@@ -155,10 +155,7 @@ impl Server {
         }
         // Kills a straggler too, such as a node that outlived its supervisor;
         // an empty group fails the signal harmlessly.
-        signal_group(child.id(), "KILL");
-        for node in nodes {
-            signal_group(node, "KILL");
-        }
+        kill_groups(child.id(), &nodes);
         let _ = child.wait();
     }
 }
@@ -192,11 +189,7 @@ pub fn run_expecting_exit(fixture: &str, env: &[(&str, &str)]) -> Exited {
             break status;
         }
         if Instant::now() >= deadline {
-            let nodes = child_pids(child.id());
-            signal_group(child.id(), "KILL");
-            for node in nodes {
-                signal_group(node, "KILL");
-            }
+            kill_groups(child.id(), &child_pids(child.id()));
             let _ = child.wait();
             print_log(&log_path);
             panic!("celld kept running although it should have exited");
@@ -229,6 +222,14 @@ where
         }
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Kills the supervisor's process group and each node's own group.
+fn kill_groups(supervisor: u32, nodes: &[u32]) {
+    signal_group(supervisor, "KILL");
+    for &node in nodes {
+        signal_group(node, "KILL");
     }
 }
 
