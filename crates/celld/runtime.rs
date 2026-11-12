@@ -453,7 +453,7 @@ impl Drop for AlarmRequestGuard {
 pub fn pool_limits() -> celld_logic::isolate::PoolLimits {
     const GROW_AT: usize = 2;
     const SHRINK_UNDER: usize = 1;
-    const MAX_CELLS_PER_ISOLATE: usize = 32;
+    const DEFAULT_MAX_CELLS_PER_ISOLATE: usize = 32;
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -464,9 +464,10 @@ pub fn pool_limits() -> celld_logic::isolate::PoolLimits {
         shrink_under: SHRINK_UNDER,
         max_stateless: env_usize("CELLD_MAX_STATELESS_ISOLATES").unwrap_or(cores),
         max_requests: env_usize("CELLD_MAX_REQUESTS"),
-        // This is an engine blast-radius policy. The resident-cell and RSS
-        // limits are the operator controls for node memory.
-        max_cells: MAX_CELLS_PER_ISOLATE,
+        // This is an engine blast-radius policy: one isolate's heap and event
+        // loop are shared by every cell it hosts. Heavy objects can lower it.
+        max_cells: env_usize("CELLD_MAX_CELLS_PER_ISOLATE")
+            .unwrap_or(DEFAULT_MAX_CELLS_PER_ISOLATE),
     }
 }
 
