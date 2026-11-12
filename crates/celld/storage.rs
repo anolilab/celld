@@ -96,6 +96,8 @@ enum StorageBacking {
         path: String,
         root_scope: String,
         facet_path: Vec<String>,
+        /// The activation's paged VFS, when its restore paged.
+        vfs: Option<String>,
     },
     /// A facet: a database and a replication stream of its own
     /// (`crate::facet_streams`), opened inside its root's activation.
@@ -104,6 +106,7 @@ enum StorageBacking {
         root_path: String,
         root_scope: String,
         facet_path: Vec<String>,
+        root_vfs: Option<String>,
         /// Unique to this opening of the facet within the process. A facet
         /// that its root reopens, even at the same scope and epoch after a
         /// generation swap, is a new actor and takes a new value.
@@ -119,6 +122,9 @@ pub(crate) struct StorageIdentity {
     pub root_path: String,
     pub root_scope: String,
     pub facet_path: Vec<String>,
+    /// The root activation's paged VFS. A paged root is sparse until it has
+    /// hydrated, so a facet that reads the root's file must go through it.
+    pub root_vfs: Option<String>,
     pub epoch: u64,
     /// A committed-write position of `root_scope`, sampled in the isolate that
     /// holds the root database.
@@ -782,6 +788,7 @@ pub(crate) fn open_at_epoch(
             path: path.to_string(),
             root_scope: scope.to_string(),
             facet_path: Vec::new(),
+            vfs: vfs.map(str::to_string),
         },
     )
 }
@@ -798,6 +805,7 @@ pub fn open_with_fault_vfs_for_test(scope: &str, path: &str) -> anyhow::Result<(
             path: path.to_string(),
             root_scope: scope.to_string(),
             facet_path: Vec::new(),
+            vfs: None,
         },
     )
 }
@@ -944,16 +952,18 @@ pub(crate) fn storage_identity(scope: &str) -> anyhow::Result<Option<StorageIden
     let observed = observed_position(scope, sample);
     Ok(dbs(|databases| {
         databases.borrow().get(scope).map(|cell| {
-            let (root_path, root_scope, facet_path, root_position, root_observed) =
+            let (root_path, root_scope, facet_path, root_vfs, root_position, root_observed) =
                 match &cell.backing {
                     StorageBacking::File {
                         path,
                         root_scope,
                         facet_path,
+                        vfs,
                     } => (
                         path.clone(),
                         root_scope.clone(),
                         facet_path.clone(),
+                        vfs.clone(),
                         sample.unwrap_or(0),
                         observed,
                     ),
@@ -961,6 +971,7 @@ pub(crate) fn storage_identity(scope: &str) -> anyhow::Result<Option<StorageIden
                         root_path,
                         root_scope,
                         facet_path,
+                        root_vfs,
                         root_position,
                         root_observed,
                         ..
@@ -968,6 +979,7 @@ pub(crate) fn storage_identity(scope: &str) -> anyhow::Result<Option<StorageIden
                         root_path.clone(),
                         root_scope.clone(),
                         facet_path.clone(),
+                        root_vfs.clone(),
                         *root_position,
                         *root_observed,
                     ),
@@ -976,6 +988,7 @@ pub(crate) fn storage_identity(scope: &str) -> anyhow::Result<Option<StorageIden
                 root_path,
                 root_scope,
                 facet_path,
+                root_vfs,
                 epoch: cell.epoch,
                 root_position,
                 root_observed,
@@ -1102,7 +1115,12 @@ pub(crate) fn open_embedded(
     let stream = crate::engine_api::facet_cell(&parent.root_scope, &facet_path);
     let mut connection = Connection::open(path)?;
     if !restored && holds_only_control_tables(&connection)? {
-        import_legacy_facet(&mut connection, &parent.root_path, &parent.root_scope, &facet_path)?;
+        import_legacy_facet(
+            &mut connection,
+            &open_root(parent)?,
+            &parent.root_scope,
+            &facet_path,
+        )?;
     }
     schema(&connection)?;
     // Each run of a facet has its own scope, so a continuation from an
@@ -1125,6 +1143,7 @@ pub(crate) fn open_embedded(
             opening: NEXT_FACET_OPENING.fetch_add(1, Ordering::Relaxed),
             root_path: parent.root_path.clone(),
             root_scope: parent.root_scope.clone(),
+            root_vfs: parent.root_vfs.clone(),
             facet_path,
             root_position: parent.root_position,
             root_observed: parent.root_observed,
@@ -1145,16 +1164,28 @@ fn holds_only_control_tables(connection: &Connection) -> anyhow::Result<bool> {
     })
 }
 
+/// A connection to a facet's root database, through the root activation's
+/// paged VFS when it has one.
+fn open_root(parent: &StorageIdentity) -> anyhow::Result<Connection> {
+    Ok(match parent.root_vfs.as_deref() {
+        Some(vfs) => Connection::open_with_flags_and_vfs(
+            &parent.root_path,
+            rusqlite::OpenFlags::default(),
+            vfs,
+        )?,
+        None => Connection::open(&parent.root_path)?,
+    })
+}
+
 /// Copy a facet's legacy image from its root's `_cf_FACETS` row into the
-/// facet's own database. Returns whether an image existed.
+/// facet's own database.
 fn import_legacy_facet(
     connection: &mut Connection,
-    root_path: impl AsRef<std::path::Path>,
+    root: &Connection,
     root_scope: &str,
     facet_path: &[String],
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<()> {
     let legacy = serde_json::to_string(facet_path)?;
-    let root = Connection::open(root_path.as_ref())?;
     let image = root
         .query_row(
             "SELECT image FROM _cf_FACETS WHERE scope=?1 AND path=?2",
@@ -1163,14 +1194,18 @@ fn import_legacy_facet(
         )
         .optional()?;
     let Some(image) = image else {
-        return Ok(false);
+        return Ok(());
     };
     let mut source = Connection::open_in_memory()?;
-    source.deserialize(rusqlite::DatabaseName::Main, owned_sqlite_data(&image)?, true)?;
+    source.deserialize(
+        rusqlite::DatabaseName::Main,
+        owned_sqlite_data(&image)?,
+        true,
+    )?;
     rusqlite::backup::Backup::new(&source, connection)?
         .run_to_completion(i32::MAX, std::time::Duration::ZERO, None)
         .context("import the facet's legacy image")?;
-    Ok(true)
+    Ok(())
 }
 
 /// Delete the legacy `_cf_FACETS` images of a facet and every facet below it,
@@ -1178,7 +1213,7 @@ fn import_legacy_facet(
 pub(crate) fn delete_legacy_facet(parent: &StorageIdentity, name: &str) -> anyhow::Result<()> {
     let mut facet_path = parent.facet_path.clone();
     facet_path.push(name.to_string());
-    let mut root = Connection::open(&parent.root_path)?;
+    let mut root = open_root(parent)?;
     let paths = {
         let mut statement = root.prepare("SELECT path FROM _cf_FACETS WHERE scope=?1")?;
         let rows = statement.query_map([&parent.root_scope], |row| row.get::<_, String>(0))?;
@@ -4502,7 +4537,10 @@ mod legacy_facet_tests {
         facet
             .execute_batch("CREATE TABLE notes (body TEXT); INSERT INTO notes VALUES ('kept');")
             .unwrap();
-        facet.serialize(rusqlite::DatabaseName::Main).unwrap().to_vec()
+        facet
+            .serialize(rusqlite::DatabaseName::Main)
+            .unwrap()
+            .to_vec()
     }
 
     #[test]
@@ -4516,7 +4554,11 @@ mod legacy_facet_tests {
         schema(&root).unwrap();
         root.execute(
             "INSERT INTO _cf_FACETS (scope, path, image) VALUES (?1, ?2, ?3)",
-            rusqlite::params!["root", serde_json::to_string(&facet_path).unwrap(), legacy_image()],
+            rusqlite::params![
+                "root",
+                serde_json::to_string(&facet_path).unwrap(),
+                legacy_image()
+            ],
         )
         .unwrap();
 
@@ -4528,9 +4570,12 @@ mod legacy_facet_tests {
         let pages: u64 = connection
             .query_row("PRAGMA page_count", [], |row| row.get(0))
             .unwrap();
-        assert!(pages > 0, "the file is not empty once replication opened it");
+        assert!(
+            pages > 0,
+            "the file is not empty once replication opened it"
+        );
         assert!(holds_only_control_tables(&connection).unwrap());
-        assert!(import_legacy_facet(&mut connection, &root_path, "root", &facet_path).unwrap());
+        import_legacy_facet(&mut connection, &root, "root", &facet_path).unwrap();
         schema(&connection).unwrap();
 
         let body: String = connection
