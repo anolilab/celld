@@ -520,14 +520,19 @@ enum AlarmState {
         /// The newest runtime observation that arrived before the firing's
         /// durability result. It cannot settle the alarm by itself.
         observed: Option<(wake::AlarmSnapshot, bool)>,
-        /// When the alarm's deadline passes, on the monotonic clock. A begin
-        /// moves it later, so a deadline timer armed earlier finds it unmet.
-        deadline_mono_ms: u64,
-        /// The deadline passed and the handler was told to stop. The alarm
-        /// stays `Firing` until that handler reports back: re-arming while it
-        /// may still be running starts a second copy beside it.
-        aborting: bool,
+        deadline: AlarmDeadline,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlarmDeadline {
+    /// The handler may run until then, on the monotonic clock. A begin moves
+    /// it later, so a deadline timer armed earlier finds it unmet.
+    Running { until_mono_ms: u64 },
+    /// The deadline passed and the handler was told to stop. The alarm stays
+    /// `Firing` until that handler reports back: re-arming while it may still
+    /// be running starts a second copy beside it.
+    Aborting,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1746,30 +1751,6 @@ impl State {
     /// one. Fullness is `has_capacity`; this is whether room can ever exist.
     fn hosts_cells(&self) -> bool {
         self.config.max_resident > 0
-    }
-
-    /// Take over a dead owner's cell. A node that can never host it would
-    /// queue the claim until the deadline and strand the cell, though a peer
-    /// with room can take it over itself; a node that is only full sheds a
-    /// resident cell to admit it.
-    fn admit_takeover(
-        &mut self,
-        id: &str,
-        cell: &mut Cell,
-        claim: Claim,
-        effects: &mut Vec<Effect>,
-    ) {
-        if self.hosts_cells() {
-            self.activate_or_wait(
-                id,
-                cell,
-                Activation::Claim(claim),
-                WhenFull::ShedToAdmit,
-                effects,
-            );
-        } else {
-            self.place_on_peer(id, cell, claim, effects);
-        }
     }
 
     fn has_capacity(&self) -> bool {
@@ -3412,8 +3393,9 @@ impl State {
             generation,
             covered,
             observed: None,
-            deadline_mono_ms: self.now_mono_ms.saturating_add(self.alarm_deadline_ms()),
-            aborting: false,
+            deadline: AlarmDeadline::Running {
+                until_mono_ms: self.now_mono_ms.saturating_add(self.alarm_deadline_ms()),
+            },
         });
         cell.alarm_wake = false;
         self.cells.insert(id.to_string(), cell);
@@ -3425,22 +3407,6 @@ impl State {
         });
     }
 
-    /// Settle a firing alarm, once the commit that consumed it is durable.
-    ///
-    /// The consuming commit is a write like any other, so it takes the same
-    /// output gate a request's write takes. Holding the alarm behind that gate
-    /// is what lets the core order the wake-entry delete safely: the delete
-    /// leaves only from the far side of a proven `DurableReached`, and every
-    /// response that can reveal the same commit trails the same gate through
-    /// `read_output`. The gate is keyed by the cell and epoch the firing was
-    /// dispatched against, because an activity fold can supersede the firing
-    /// state while the write is still unproven.
-    ///
-    /// The gate calls back here with `position: None` once it settles, so the
-    /// second pass runs the ordinary settlement below and cannot re-gate.
-    ///
-    /// `(fired, epoch)` is where the firing was dispatched, carried as a pair
-    /// because neither half means anything without the other.
     /// A firing alarm's deadline: the handler budget, plus one operation for
     /// its report to arrive.
     fn alarm_deadline_ms(&self) -> u64 {
@@ -3457,17 +3423,15 @@ impl State {
     /// handler that never reports could hold the alarm forever.
     fn alarm_begun(&mut self, op: OpId, id: CellId) {
         let deadline = self.now_mono_ms.saturating_add(self.alarm_deadline_ms());
-        let Some(AlarmState::Firing {
+        if let Some(AlarmState::Firing {
             op: current,
-            deadline_mono_ms,
-            aborting: false,
+            deadline: AlarmDeadline::Running { until_mono_ms },
             ..
         }) = self.cells.get_mut(&id).and_then(|cell| cell.alarm.as_mut())
-        else {
-            return;
-        };
-        if *current == op {
-            *deadline_mono_ms = deadline;
+        {
+            if *current == op {
+                *until_mono_ms = deadline;
+            }
         }
     }
 
@@ -3503,26 +3467,24 @@ impl State {
             Phase::Resident { epoch } => epoch,
             _ => 0,
         };
-        let Some(AlarmState::Firing {
-            deadline_mono_ms,
-            aborting,
-            ..
-        }) = cell.alarm.as_mut()
-        else {
+        let Some(AlarmState::Firing { deadline, .. }) = cell.alarm.as_mut() else {
             return;
         };
-        if !*aborting {
+        match *deadline {
             // The timer armed at dispatch, and the handler began since.
-            if now_mono_ms < *deadline_mono_ms {
+            AlarmDeadline::Running { until_mono_ms } if now_mono_ms < until_mono_ms => {
                 effects.push(Effect::ScheduleTimer {
                     timer: Timer::OperationDeadline { op },
-                    at_mono_ms: *deadline_mono_ms,
+                    at_mono_ms: until_mono_ms,
                 });
                 return;
             }
-            *aborting = true;
-            effects.push(Effect::AbortAlarm { op, cell: id });
-            return;
+            AlarmDeadline::Running { .. } => {
+                *deadline = AlarmDeadline::Aborting;
+                effects.push(Effect::AbortAlarm { op, cell: id });
+                return;
+            }
+            AlarmDeadline::Aborting => {}
         }
         self.alarm_finished(
             op,
@@ -3534,6 +3496,22 @@ impl State {
         );
     }
 
+    /// Settle a firing alarm, once the commit that consumed it is durable.
+    ///
+    /// The consuming commit is a write like any other, so it takes the same
+    /// output gate a request's write takes. Holding the alarm behind that gate
+    /// is what lets the core order the wake-entry delete safely: the delete
+    /// leaves only from the far side of a proven `DurableReached`, and every
+    /// response that can reveal the same commit trails the same gate through
+    /// `read_output`. The gate is keyed by the cell and epoch the firing was
+    /// dispatched against, because an activity fold can supersede the firing
+    /// state while the write is still unproven.
+    ///
+    /// The gate calls back here with `position: None` once it settles, so the
+    /// second pass runs the ordinary settlement below and cannot re-gate.
+    ///
+    /// `(fired, epoch)` is where the firing was dispatched, carried as a pair
+    /// because neither half means anything without the other.
     fn alarm_finished(
         &mut self,
         op: OpId,
@@ -4631,7 +4609,21 @@ impl State {
                     prior: record.node.clone(),
                     reconciles: 0,
                 };
-                self.admit_takeover(id, cell, claim, effects);
+                // A node that can never host the cell would queue the claim
+                // until the deadline and strand it, though a peer with room
+                // can take it over itself; a node that is only full sheds a
+                // resident cell to admit it.
+                if self.hosts_cells() {
+                    self.activate_or_wait(
+                        id,
+                        cell,
+                        Activation::Claim(claim),
+                        WhenFull::ShedToAdmit,
+                        effects,
+                    );
+                } else {
+                    self.place_on_peer(id, cell, claim, effects);
+                }
             }
             Err(_) => {
                 set_phase(&mut self.occupied, cell, Phase::Inactive);
