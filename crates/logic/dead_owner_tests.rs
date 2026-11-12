@@ -226,6 +226,17 @@ fn full_node_still_takes_a_dead_owners_cell_over_locally() {
     ));
 }
 
+/// `request` was refused at once, not queued.
+fn assert_refused(effects: &[Effect], request: RequestId) {
+    assert!(
+        effects.contains(&Effect::Complete {
+            request,
+            result: Err(RequestError::CapacityExhausted),
+        }),
+        "expected an immediate refusal, got {effects:?}"
+    );
+}
+
 /// The cell is back to `Inactive` with nothing queued for it.
 fn assert_unqueued(state: &State, cell: &str) {
     let cell = &state.cells[cell];
@@ -258,16 +269,7 @@ fn ingress_only_node_with_leases_off_fails_a_takeover_it_can_never_admit() {
         },
     );
 
-    assert!(
-        effects.iter().any(|effect| matches!(
-            effect,
-            Effect::Complete {
-                request: 1,
-                result: Err(RequestError::CapacityExhausted),
-            }
-        )),
-        "expected an immediate refusal, got {effects:?}"
-    );
+    assert_refused(&effects, 1);
     assert_unqueued(&state, "cell");
 }
 
@@ -287,16 +289,7 @@ fn ingress_only_node_fails_a_claim_when_the_capacity_lookup_errors() {
             result: Err(Failure::Ambiguous),
         },
     );
-    assert!(
-        effects.iter().any(|effect| matches!(
-            effect,
-            Effect::Complete {
-                request: 1,
-                result: Err(RequestError::CapacityExhausted),
-            }
-        )),
-        "expected an immediate refusal, got {effects:?}"
-    );
+    assert_refused(&effects, 1);
     assert_unqueued(&state, "cell");
 }
 
@@ -316,13 +309,7 @@ fn ingress_only_node_fails_a_claim_when_no_peer_is_eligible() {
             result: Ok(vec![peer("dead", NOW_MS - 1)]),
         },
     );
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::Complete {
-            request: 1,
-            result: Err(RequestError::CapacityExhausted),
-        }
-    )));
+    assert_refused(&effects, 1);
     assert_unqueued(&state, "cell");
 }
 
