@@ -2640,7 +2640,7 @@ unsafe fn d1_run_statements(
             &mut budget,
         );
         rusqlite::ffi::sqlite3_finalize(statement);
-        let stepped = stepped.map_err(&failure)?;
+        let stepped = stepped.map_err(failure)?;
         if let Some(over) = stepped.over {
             return Err(failure(over));
         }

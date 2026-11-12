@@ -34,7 +34,7 @@ jobs:
         with:
           shared-key: nightly-${{ matrix.toolchain }}
       - run: cargo +${{ matrix.toolchain }} test --workspace --locked
-      - run: cargo +${{ matrix.toolchain }} clippy --workspace --all-targets --locked
+      - run: cargo +${{ matrix.toolchain }} clippy --workspace --all-targets --locked -- -D warnings
 
   audit:
     name: Dependency advisories

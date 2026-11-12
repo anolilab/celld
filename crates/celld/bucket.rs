@@ -354,8 +354,8 @@ impl BlobConditions {
                 .split(',')
                 .any(|candidate| etag_eq(candidate, etag.unwrap_or_default())),
         };
-        self.if_match.as_deref().is_none_or(&matches)
-            && !self.if_none_match.as_deref().is_some_and(&matches)
+        self.if_match.as_deref().is_none_or(matches)
+            && !self.if_none_match.as_deref().is_some_and(matches)
     }
 
     /// Whether an upload time satisfies the halves this module checks.

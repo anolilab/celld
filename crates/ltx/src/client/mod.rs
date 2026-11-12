@@ -39,6 +39,8 @@ pub(crate) async fn read_upload_chunk(
 ///
 /// Ported from the `ReplicaClient` interface (replica_client.go:19-51). Methods
 /// take a compaction `level` (0 = L0, the only level in the one-shot scope).
+// `async_trait` marks the boxed futures `#[must_use]`, which they already are.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ReplicaClient: Send + Sync {
     /// Returns all LTX files for `level`, sorted ascending by `min_txid`, that
