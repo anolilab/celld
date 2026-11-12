@@ -1,0 +1,7 @@
+# The toolchain CI and the release build use. Newer compilers add lints, so
+# a local build on another version can warn where CI does not. Raise this
+# together with RUST_VERSION in .github/workflows/release.yml.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
