@@ -1228,6 +1228,12 @@ pub enum Effect {
         epoch: Epoch,
         scheduled_ms: i64,
     },
+    /// Stop a firing alarm whose deadline passed. The handler's completion
+    /// still arrives as `AlarmFinished` for the same `op`.
+    AbortAlarm {
+        op: OpId,
+        cell: CellId,
+    },
     Complete {
         request: RequestId,
         result: Result<Route, RequestError>,

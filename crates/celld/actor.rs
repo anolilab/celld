@@ -4097,6 +4097,13 @@ impl Actor {
                     );
                 }
             }
+            Effect::AbortAlarm { op, cell } => {
+                // The aborted handler still returns through `fire_alarm`, so
+                // its `AlarmFinished` is what settles the alarm.
+                if let Some(runtime) = &self.host {
+                    runtime.abort_alarm(&cell, op);
+                }
+            }
             Effect::FireAlarm {
                 op,
                 cell,

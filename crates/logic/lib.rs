@@ -38,6 +38,9 @@ pub mod wake;
 mod types;
 pub use types::*;
 
+#[cfg(test)]
+mod tests_alarm;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Activation {
     Claim(Claim),
@@ -520,6 +523,10 @@ enum AlarmState {
         /// The newest runtime observation that arrived before the firing's
         /// durability result. It cannot settle the alarm by itself.
         observed: Option<(wake::AlarmSnapshot, bool)>,
+        /// The deadline passed and the handler was told to stop. The alarm
+        /// stays `Firing` until that handler reports back: re-arming while it
+        /// may still be running starts a second copy beside it.
+        aborting: bool,
     },
 }
 
@@ -2899,9 +2906,39 @@ impl State {
             return;
         }
         // A firing alarm is tracked on the cell rather than in its phase, so
-        // it is looked for first. Expiry re-arms it exactly as a failed
-        // handler would, which keeps alarms at-least-once instead of turning
-        // a stuck handler into a lost one.
+        // it is looked for first. The handler is still running when the
+        // deadline passes, and re-arming then starts a second copy beside it.
+        // The first expiry therefore aborts it and keeps waiting for its own
+        // completion, which carries the retry record the final turn wrote.
+        //
+        // That completion can be swallowed like any other, so the abort gets
+        // one more deadline. A stuck alarm holds the cell for at most twice
+        // the operation deadline; the second expiry re-arms it exactly as a
+        // failed handler would, which keeps alarms at-least-once instead of
+        // turning a stuck handler into a lost one.
+        if let Some(AlarmState::Firing {
+            op: current,
+            aborting: false,
+            ..
+        }) = cell.alarm
+        {
+            if current == op {
+                let id = id.clone();
+                if let Some(AlarmState::Firing { aborting, .. }) =
+                    self.cells.get_mut(&id).and_then(|cell| cell.alarm.as_mut())
+                {
+                    *aborting = true;
+                }
+                effects.push(Effect::AbortAlarm { op, cell: id });
+                effects.push(Effect::ScheduleTimer {
+                    timer: Timer::OperationDeadline { op },
+                    at_mono_ms: self
+                        .now_mono_ms
+                        .saturating_add(self.config.operation_deadline_ms.unwrap_or(0)),
+                });
+                return;
+            }
+        }
         if matches!(cell.alarm, Some(AlarmState::Firing { op: current, .. }) if current == op) {
             // The cell comes from the index here, unlike the event, which
             // carries its own: an expiry that cannot find the op has nothing
@@ -3391,6 +3428,7 @@ impl State {
             generation,
             covered,
             observed: None,
+            aborting: false,
         });
         cell.alarm_wake = false;
         self.cells.insert(id.to_string(), cell);
