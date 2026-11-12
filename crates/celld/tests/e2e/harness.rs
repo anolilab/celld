@@ -1,0 +1,281 @@
+//! Shared helpers for the end-to-end tests.
+//!
+//! Every test copies its fixture into a private temp directory, because
+//! `celld dev` writes `.celld/` into the project it serves, and runs the real
+//! binary on a port of its own, so tests can run in parallel.
+
+// The harness drives a child process from the outside, so it is not part of the
+// execution boundary that the disallowed-methods policy protects.
+#![allow(clippy::disallowed_methods)]
+
+use std::fs;
+use std::future::Future;
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use tempfile::TempDir;
+
+const CELLD: &str = env!("CARGO_BIN_EXE_celld");
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const START_ATTEMPTS: usize = 3;
+/// Path the fixtures answer without touching any state, so the readiness probe
+/// cannot change what a test counts.
+const READY_PATH: &str = "/__ready";
+
+/// A running `celld dev` process and the project directory it serves.
+pub struct Server {
+    // Kept in this order: the process must be gone before its directory is.
+    child: Option<Child>,
+    port: u16,
+    env: Vec<(String, String)>,
+    log: PathBuf,
+    project: PathBuf,
+    client: reqwest::Client,
+    _dir: TempDir,
+}
+
+impl Server {
+    /// Copies `fixture` to a fresh directory and waits until the server answers.
+    pub async fn start(fixture: &str, env: &[(&str, &str)]) -> Server {
+        let dir = TempDir::new().expect("create temp dir");
+        let project = dir.path().join("project");
+        copy_dir(&fixture_dir(fixture), &project);
+        let mut server = Server {
+            child: None,
+            port: 0,
+            env: owned_env(env),
+            log: dir.path().join("celld.log"),
+            project,
+            client: client(),
+            _dir: dir,
+        };
+        server.launch().await;
+        server
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    pub async fn get_text(&self, path: &str) -> String {
+        let response = self
+            .client
+            .get(self.url(path))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("GET {path}: {error}"));
+        response.text().await.expect("read response body")
+    }
+
+    pub async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> T {
+        let response = self
+            .client
+            .get(self.url(path))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("GET {path}: {error}"));
+        response
+            .json()
+            .await
+            .unwrap_or_else(|error| panic!("GET {path}: body is not JSON: {error}"))
+    }
+
+    /// Stops the server and starts it again on the same project directory, so
+    /// the state under `.celld/` carries over.
+    pub async fn restart(&mut self) {
+        self.stop();
+        self.launch().await;
+    }
+
+    /// Picks a free port and starts the process, retrying when the port was
+    /// taken between the reservation and the bind.
+    async fn launch(&mut self) {
+        let mut last = String::new();
+        for attempt in 1..=START_ATTEMPTS {
+            self.port = free_port();
+            let log = fs::File::create(&self.log).expect("create log file");
+            let child = Command::new(CELLD)
+                .arg("dev")
+                .arg(&self.project)
+                .args(["--no-watch", "--logs", "--port"])
+                .arg(self.port.to_string())
+                .envs(self.env.iter().map(|(k, v)| (k, v)))
+                .stdin(Stdio::null())
+                .stdout(log.try_clone().expect("clone log handle"))
+                .stderr(log)
+                .spawn()
+                .expect("spawn celld");
+            self.child = Some(child);
+            match self.wait_ready().await {
+                Ok(()) => return,
+                Err(reason) => {
+                    last = format!("attempt {attempt}: {reason}");
+                    self.stop();
+                }
+            }
+        }
+        panic!("celld did not start after {START_ATTEMPTS} attempts ({last})");
+    }
+
+    async fn wait_ready(&mut self) -> Result<(), String> {
+        let deadline = Instant::now() + READY_TIMEOUT;
+        let url = self.url(READY_PATH);
+        loop {
+            let child = self.child.as_mut().expect("child is running");
+            if let Some(status) = child.try_wait().expect("poll celld") {
+                return Err(format!("celld exited early: {status}"));
+            }
+            if self.client.get(&url).send().await.is_ok() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("timed out waiting for the first response".into());
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Asks the process to stop gracefully, so it can hand its state to disk,
+    /// and kills it when it does not exit in time.
+    fn stop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop();
+        if std::thread::panicking() {
+            print_log(&self.log);
+        }
+    }
+}
+
+/// Result of a `celld dev` run that was expected to end by itself.
+pub struct Exited {
+    pub success: bool,
+    pub output: String,
+}
+
+/// Runs `celld dev` on a copy of `fixture` and returns when the process exits.
+/// For configurations that must be refused at start-up.
+pub fn run_expecting_exit(fixture: &str, env: &[(&str, &str)]) -> Exited {
+    let dir = TempDir::new().expect("create temp dir");
+    let project = dir.path().join("project");
+    copy_dir(&fixture_dir(fixture), &project);
+    let log_path = dir.path().join("celld.log");
+    let log = fs::File::create(&log_path).expect("create log file");
+    let mut child = Command::new(CELLD)
+        .arg("dev")
+        .arg(&project)
+        .args(["--no-watch", "--logs", "--port"])
+        .arg(free_port().to_string())
+        .envs(owned_env(env))
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().expect("clone log handle"))
+        .stderr(log)
+        .spawn()
+        .expect("spawn celld");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll celld") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            print_log(&log_path);
+            panic!("celld kept running although it should have exited");
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    };
+    Exited {
+        success: status.success(),
+        output: fs::read_to_string(&log_path).unwrap_or_default(),
+    }
+}
+
+/// Polls `probe` until it returns `Some`, and panics after `timeout`. For
+/// outcomes that happen on their own time; never assert after a fixed sleep.
+pub async fn wait_until<T, F, Fut>(what: &str, timeout: Duration, mut probe: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<T>>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(value) = probe().await {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+fn client() -> reqwest::Client {
+    // A request to a cell behind `blockConcurrencyWhile` waits for the hold,
+    // so the timeout only bounds a hung server.
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .expect("build http client")
+}
+
+fn owned_env(env: &[(&str, &str)]) -> Vec<(String, String)> {
+    env.iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect()
+}
+
+/// `celld dev --port 0` is refused, so the port is reserved here and handed
+/// over after the listener is dropped.
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind an ephemeral port")
+        .local_addr()
+        .expect("read local address")
+        .port()
+}
+
+fn fixture_dir(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).expect("create project dir");
+    for entry in fs::read_dir(from).expect("read fixture dir") {
+        let entry = entry.expect("read fixture entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("fixture entry type").is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).expect("copy fixture file");
+        }
+    }
+}
+
+fn print_log(path: &Path) {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    eprintln!(
+        "---- celld log ({}) ----\n{text}\n---- end of celld log ----",
+        path.display()
+    );
+}
