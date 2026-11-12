@@ -11,6 +11,7 @@
 use std::fs;
 use std::future::Future;
 use std::net::TcpListener;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -24,6 +25,11 @@ const START_ATTEMPTS: usize = 3;
 /// Path the fixtures answer without touching any state, so the readiness probe
 /// cannot change what a test counts.
 const READY_PATH: &str = "/__ready";
+/// Body every fixture answers on `READY_PATH`.
+const READY_BODY: &str = "ready";
+/// How long a stopping server may take. `celld dev` gives its node process 35 s
+/// to shut down gracefully, so the wait must exceed that before it escalates.
+const STOP_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// A running `celld dev` process and the project directory it serves.
 pub struct Server {
@@ -115,8 +121,12 @@ impl Server {
             if let Some(status) = child.try_wait().expect("poll celld") {
                 return Err(format!("celld exited early: {status}"));
             }
-            if self.client.get(&url).send().await.is_ok() {
-                return Ok(());
+            if let Ok(response) = self.client.get(&url).send().await {
+                if response.status().is_success()
+                    && response.text().await.is_ok_and(|body| body == READY_BODY)
+                {
+                    return Ok(());
+                }
             }
             if Instant::now() >= deadline {
                 return Err("timed out waiting for the first response".into());
@@ -125,22 +135,23 @@ impl Server {
         }
     }
 
-    /// Asks the process to stop gracefully, so it can hand its state to disk,
-    /// and kills it when it does not exit in time.
+    /// Asks the whole process group to stop gracefully, so it can hand its
+    /// state to disk, and kills the group when it does not exit in time.
+    /// Returns only after the supervisor has exited.
     fn stop(&mut self) {
         let Some(mut child) = self.child.take() else {
             return;
         };
         if matches!(child.try_wait(), Ok(None)) {
-            let _ = Command::new("kill")
-                .args(["-TERM", &child.id().to_string()])
-                .status();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            signal_group(child.id(), "TERM");
+            let deadline = Instant::now() + STOP_TIMEOUT;
             while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
                 std::thread::sleep(POLL_INTERVAL);
             }
         }
-        let _ = child.kill();
+        // Kills a straggler of the group too, such as a node that outlived its
+        // supervisor; the group is empty and the signal fails harmlessly otherwise.
+        signal_group(child.id(), "KILL");
         let _ = child.wait();
     }
 }
@@ -174,7 +185,7 @@ pub fn run_expecting_exit(fixture: &str, env: &[(&str, &str)]) -> Exited {
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            signal_group(child.id(), "KILL");
             let _ = child.wait();
             print_log(&log_path);
             panic!("celld kept running although it should have exited");
@@ -185,6 +196,12 @@ pub fn run_expecting_exit(fixture: &str, env: &[(&str, &str)]) -> Exited {
         success: status.success(),
         output: fs::read_to_string(&log_path).unwrap_or_default(),
     }
+}
+
+/// Waits a fixed `window`. Only for proving that something does not happen,
+/// where there is no event to poll for.
+pub async fn observe_for(window: Duration) {
+    tokio::time::sleep(window).await;
 }
 
 /// Polls `probe` until it returns `Some`, and panics after `timeout`. For
@@ -204,7 +221,16 @@ where
     }
 }
 
-/// Starts `celld dev` on `project`, with its output going to `log`.
+/// Sends `signal` to the process group that `spawn` made for `pgid`.
+fn signal_group(pgid: u32, signal: &str) {
+    let _ = Command::new("kill")
+        .args([&format!("-{signal}"), "--", &format!("-{pgid}")])
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Starts `celld dev` on `project`, with its output going to `log`. The child
+/// leads a process group of its own, so the whole tree can be signalled.
 fn spawn(project: &Path, port: u16, env: &[(String, String)], log: &Path) -> Child {
     let log = fs::File::create(log).expect("create log file");
     Command::new(CELLD)
@@ -216,6 +242,7 @@ fn spawn(project: &Path, port: u16, env: &[(String, String)], log: &Path) -> Chi
         .stdin(Stdio::null())
         .stdout(log.try_clone().expect("clone log handle"))
         .stderr(log)
+        .process_group(0)
         .spawn()
         .expect("spawn celld")
 }

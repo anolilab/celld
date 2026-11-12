@@ -12,7 +12,10 @@ export class Cell extends DurableObject {
   async fetch(request) {
     if (new URL(request.url).pathname === "/hold") {
       await this.ctx.storage.setAlarm(Date.now() + 100);
-      this.ctx.blockConcurrencyWhile(() => sleep(2000));
+      this.ctx.blockConcurrencyWhile(async () => {
+        await sleep(2000);
+        log.push({ event: "released", at: Date.now() });
+      });
       log.push({ event: "hold", at: Date.now() });
       return new Response("holding\n");
     }

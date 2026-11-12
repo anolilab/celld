@@ -24,6 +24,9 @@ export class Cell extends DurableObject {
       await this.ctx.storage.setAlarm(Date.now() + 10);
       return new Response("armed\n");
     }
+    if (url.pathname === "/alarm") {
+      return Response.json(await this.ctx.storage.getAlarm());
+    }
     return Response.json(log);
   }
 }
