@@ -656,6 +656,7 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_DEPLOY_POLL_S` | The deployment pointer poll interval in seconds (default: 30) |
 | `CELLD_DEPLOY_MAX_AGE_S` | Seconds before celld forces a resident Durable Object onto a new deployment (default: 60; 0 forces at once) |
 | `CELLD_OPERATION_DEADLINE_MS` | The deadline for a non-restore operation (default: 15000) |
+| `CELLD_HANDLER_BUDGET_S` | How long one JavaScript handler may run (default: 300). A Durable Object alarm may run this long, and is aborted only when it has not reported back `CELLD_OPERATION_DEADLINE_MS` after that |
 | `CELLD_MAX_CELL_REQUESTS` | Concurrent fetch events for one Durable Object (default: 64) |
 | `CELLD_MAX_CELLS_PER_ISOLATE` | Cells that one V8 isolate may host before celld starts another isolate (default: 32). Lower it for heavy objects that share a heap badly |
 | `CELLD_MAX_REQUEST_BODY_BYTES` | The body limit for a public Worker request or a direct Durable Object request (default: 1 GiB) |
