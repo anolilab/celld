@@ -2556,10 +2556,8 @@ impl Actor {
                     require_node_lease: true,
                     peer_protocol: crate::peer_auth::PROTOCOL_VERSION,
                     operation_deadline_ms: Some(operation_deadline_ms),
-                    alarm_deadline_ms: Some(
-                        (crate::js::handler_budget().as_millis() as u64)
-                            .saturating_add(operation_deadline_ms),
-                    ),
+                    alarm_handler_budget_ms: u64::try_from(crate::js::handler_budget().as_millis())
+                        .unwrap_or(u64::MAX),
                     owner_log_recovery_backoff_ms: crate::env_vars::positive_or(
                         "CELLD_RECOVERY_RETRY_MS",
                         DEFAULT_OWNER_LOG_RECOVERY_BACKOFF_MS,
@@ -4115,6 +4113,19 @@ impl Actor {
                 scheduled_ms,
             } => {
                 if let Some(runtime) = self.host.clone() {
+                    // Resolves when the handler begins, or when its job ends
+                    // without beginning; the core ignores a begin that no
+                    // longer matches the firing.
+                    let (started, begun) = tokio::sync::oneshot::channel();
+                    let begun_cell = cell.clone();
+                    out.spawn_scoped(async move {
+                        let _ = begun.await;
+                        CompletedEffect::plain(Event::AlarmBegun {
+                            op,
+                            cell: begun_cell,
+                            now_mono_ms: crate::asyncrt::mono_ms(),
+                        })
+                    });
                     out.spawn_scoped(async move {
                         // The shell reports the firing raw: the deadline that
                         // stands after the handler, whether a wake entry
@@ -4128,7 +4139,7 @@ impl Actor {
                         // re-arms or resets; either way the entry stays
                         // discoverable and at-least-once holds.
                         let result = runtime
-                            .fire_alarm(op, cell.clone(), scheduled_ms)
+                            .fire_alarm(op, cell.clone(), scheduled_ms, started)
                             .await
                             .map_err(|error| {
                                 eprintln!("celld alarm dispatch failed: {error:#}");

@@ -1686,6 +1686,7 @@ impl RuntimeManager {
         op: celld_logic::OpId,
         cell: String,
         scheduled_ms: i64,
+        started: tokio::sync::oneshot::Sender<()>,
     ) -> anyhow::Result<(celld_logic::wake::AlarmSnapshot, bool, Option<u64>)> {
         let request_id = js::next_request_id();
         let cancel = self
@@ -1700,6 +1701,7 @@ impl RuntimeManager {
             scheduled_ms,
             claim: js::AlarmDispatch::Due,
             reply,
+            started: Some(started),
         };
         let guard = AlarmRequestGuard {
             registry: self.alarm_requests.clone(),
@@ -3382,7 +3384,7 @@ async fn drive_cell_inner(
     // waiting happens out here, because a turn may not await.
     let mut pending = Some(job);
     let started_event = match pending.as_mut() {
-        Some(CellJob::WsMessage { started, .. }) => started.take(),
+        Some(CellJob::WsMessage { started, .. } | CellJob::Alarm { started, .. }) => started.take(),
         _ => None,
     };
     let (begun, started, moves) = loop {
@@ -3426,6 +3428,8 @@ async fn drive_cell_inner(
     // A socket waits for this turn, including the input gate, rather than
     // handler completion. Acknowledging a queued task instead can reorder
     // messages; awaiting completion prevents a later message cancelling it.
+    // An alarm's deadline starts here for the same reason: the gate wait is
+    // another event's time, not its handler's.
     if let Some(started) = started_event {
         let _ = started.send(());
     }

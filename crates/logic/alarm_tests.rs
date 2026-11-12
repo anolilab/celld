@@ -5,7 +5,8 @@
 use crate::*;
 
 const DEADLINE_MS: u64 = 15_000;
-const ALARM_DEADLINE_MS: u64 = 315_000;
+const BUDGET_MS: u64 = 300_000;
+const ALARM_DEADLINE_MS: u64 = BUDGET_MS + DEADLINE_MS;
 const CELL: &str = "cell";
 const START_MS: u64 = 1_000_000;
 const FIRE_MS: u64 = START_MS + 5_000;
@@ -21,7 +22,7 @@ impl Sim {
             ownership_on_evict: OwnershipOnEvict::Sticky,
             require_node_lease: false,
             operation_deadline_ms: Some(DEADLINE_MS),
-            alarm_deadline_ms: Some(ALARM_DEADLINE_MS),
+            alarm_handler_budget_ms: BUDGET_MS,
             alarm_resident_ms: 60_000,
             ..crate::test_support::config()
         };
@@ -120,6 +121,14 @@ impl Sim {
             .find(|(timer, _)| matches!(timer, Timer::CellAlarm { .. }))
             .cloned()
             .expect("an alarm timer was scheduled")
+    }
+
+    fn begin(&mut self, op: OpId, at_ms: u64) -> Vec<Effect> {
+        self.feed(Event::AlarmBegun {
+            op,
+            cell: CELL.into(),
+            now_mono_ms: at_ms,
+        })
     }
 
     fn finish(&mut self, op: OpId, epoch: Epoch, at_ms: u64, next: Option<i64>) -> Vec<Effect> {
@@ -239,4 +248,56 @@ fn alarm_that_never_reports_back_re_arms_after_the_second_deadline() {
         panic!("expected a retry after the second deadline, got {retried:?}");
     };
     assert_ne!(second, op);
+}
+
+#[test]
+fn a_queued_alarm_counts_its_deadline_from_when_its_handler_began() {
+    let mut sim = Sim::resident_with_alarm();
+
+    let first = fire_due_alarm(&mut sim, FIRE_MS);
+    let [(op, _)] = fires(&first)[..] else {
+        panic!("expected exactly one firing, got {first:?}");
+    };
+
+    // Held behind another event's critical section for most of a budget.
+    let began = FIRE_MS + 290_000;
+    sim.begin(op, began);
+    assert_eq!(sim.deadline(op), began + ALARM_DEADLINE_MS);
+
+    let early = sim.fire(Timer::OperationDeadline { op }, FIRE_MS + ALARM_DEADLINE_MS);
+    assert!(
+        !early
+            .iter()
+            .any(|effect| matches!(effect, Effect::AbortAlarm { .. })),
+        "aborted a handler inside its own budget: {early:?}"
+    );
+
+    let due = sim.fire(Timer::OperationDeadline { op }, began + ALARM_DEADLINE_MS);
+    assert!(due.contains(&Effect::AbortAlarm {
+        op,
+        cell: CELL.into()
+    }));
+}
+
+#[test]
+fn a_begin_after_the_abort_does_not_extend_it() {
+    let mut sim = Sim::resident_with_alarm();
+
+    let first = fire_due_alarm(&mut sim, FIRE_MS);
+    let [(op, _)] = fires(&first)[..] else {
+        panic!("expected exactly one firing, got {first:?}");
+    };
+    let expiry = FIRE_MS + ALARM_DEADLINE_MS;
+    sim.fire(Timer::OperationDeadline { op }, expiry);
+    assert_eq!(sim.deadline(op), expiry + DEADLINE_MS);
+
+    sim.begin(op, expiry + 1);
+    assert_eq!(sim.deadline(op), expiry + DEADLINE_MS);
+
+    let second_expiry = expiry + DEADLINE_MS;
+    sim.fire(Timer::OperationDeadline { op }, second_expiry);
+    let (timer, due) = sim.alarm_timer();
+    assert_eq!(due, second_expiry + 500);
+    let retried = sim.fire(timer, due);
+    assert_eq!(fires(&retried).len(), 1, "expected a retry: {retried:?}");
 }

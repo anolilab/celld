@@ -648,6 +648,10 @@ pub enum CellJob {
         /// same way now, in `InFlight::answer_settled`.
         reply:
             tokio::sync::oneshot::Sender<Result<(celld_logic::wake::AlarmSnapshot, Option<u64>)>>,
+        /// Signalled when the handler begins, past the cell's input gate. The
+        /// core counts the alarm's deadline from here, because a wait behind
+        /// another event's critical section is not handler time.
+        started: Option<tokio::sync::oneshot::Sender<()>>,
     },
     #[cfg(celld_internal_tests)]
     SyncErrorForTest {
@@ -5424,6 +5428,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
             scheduled_ms,
             claim,
             reply,
+            started: _,
         } => begin_alarm(
             tc,
             &scope,

@@ -520,6 +520,9 @@ enum AlarmState {
         /// The newest runtime observation that arrived before the firing's
         /// durability result. It cannot settle the alarm by itself.
         observed: Option<(wake::AlarmSnapshot, bool)>,
+        /// When the alarm's deadline passes, on the monotonic clock. A begin
+        /// moves it later, so a deadline timer armed earlier finds it unmet.
+        deadline_mono_ms: u64,
         /// The deadline passed and the handler was told to stop. The alarm
         /// stays `Firing` until that handler reports back: re-arming while it
         /// may still be running starts a second copy beside it.
@@ -2807,7 +2810,7 @@ impl State {
         let Some(deadline_ms) = self.config.operation_deadline_ms else {
             return;
         };
-        let alarm_deadline_ms = self.config.alarm_deadline_ms.unwrap_or(deadline_ms);
+        let alarm_deadline_ms = self.alarm_deadline_ms();
         let watched: Vec<(OpId, u64)> = effects
             .iter()
             .filter_map(|effect| match effect {
@@ -2908,55 +2911,10 @@ impl State {
             return;
         }
         // A firing alarm is tracked on the cell rather than in its phase, so
-        // it is looked for first. Its deadline already covers the handler
-        // budget, so by now the report was lost or the handler is wedged past
-        // the runtime's reach. Re-arming could still start a second copy
-        // beside one that runs, so the first expiry aborts it and waits for
-        // its own completion, which carries the retry record the final turn
-        // wrote.
-        //
-        // That completion can be swallowed like any other, so the abort gets
-        // one operation deadline more; the second expiry re-arms the alarm
-        // exactly as a failed handler would, which keeps alarms at-least-once
-        // instead of turning a stuck handler into a lost one.
-        if let Some(AlarmState::Firing {
-            op: current,
-            aborting: false,
-            ..
-        }) = cell.alarm
-        {
-            if current == op {
-                let id = id.clone();
-                if let Some(AlarmState::Firing { aborting, .. }) =
-                    self.cells.get_mut(&id).and_then(|cell| cell.alarm.as_mut())
-                {
-                    *aborting = true;
-                }
-                effects.push(Effect::AbortAlarm { op, cell: id });
-                return;
-            }
-        }
+        // it is looked for first.
         if matches!(cell.alarm, Some(AlarmState::Firing { op: current, .. }) if current == op) {
-            // The cell comes from the index here, unlike the event, which
-            // carries its own: an expiry that cannot find the op has nothing
-            // to time out, so depending on the index is safe, while the event
-            // cannot depend on it because a fold may retire the firing state
-            // while the write it reports is still unproven. The epoch is read
-            // for completeness and never used — a failure opens no gate, and
-            // the gate is the only thing `alarm_finished` reads it for.
-            let epoch = match cell.phase {
-                Phase::Resident { epoch } => epoch,
-                _ => 0,
-            };
-            let (id, now_mono_ms) = (id.clone(), self.now_mono_ms);
-            self.alarm_finished(
-                op,
-                (id, epoch),
-                now_ms,
-                now_mono_ms,
-                Err(Failure::Ambiguous),
-                effects,
-            );
+            let id = id.clone();
+            self.alarm_deadline_passed(op, id, now_ms, effects);
             return;
         }
         if phase_op(&cell.phase) != Some(op) {
@@ -3425,6 +3383,7 @@ impl State {
             generation,
             covered,
             observed: None,
+            deadline_mono_ms: self.now_mono_ms.saturating_add(self.alarm_deadline_ms()),
             aborting: false,
         });
         cell.alarm_wake = false;
@@ -3453,6 +3412,101 @@ impl State {
     ///
     /// `(fired, epoch)` is where the firing was dispatched, carried as a pair
     /// because neither half means anything without the other.
+    /// A firing alarm's deadline: the handler budget, plus one operation for
+    /// its report to arrive.
+    fn alarm_deadline_ms(&self) -> u64 {
+        self.config
+            .operation_deadline_ms
+            .unwrap_or(0)
+            .saturating_add(self.config.alarm_handler_budget_ms)
+    }
+
+    /// The handler of a firing alarm began, so its deadline counts from now.
+    /// A begin that arrives after the abort leaves the abort's own deadline
+    /// alone, or a handler that never reports could hold the alarm forever.
+    fn alarm_begun(&mut self, op: OpId, id: CellId, effects: &mut Vec<Effect>) {
+        if self.config.operation_deadline_ms.is_none() {
+            return;
+        }
+        let at_mono_ms = self.now_mono_ms.saturating_add(self.alarm_deadline_ms());
+        let Some(AlarmState::Firing {
+            op: current,
+            deadline_mono_ms,
+            aborting: false,
+            ..
+        }) = self.cells.get_mut(&id).and_then(|cell| cell.alarm.as_mut())
+        else {
+            return;
+        };
+        if *current != op {
+            return;
+        }
+        *deadline_mono_ms = at_mono_ms;
+        effects.push(Effect::ScheduleTimer {
+            timer: Timer::OperationDeadline { op },
+            at_mono_ms,
+        });
+    }
+
+    /// The deadline of the firing alarm `op` passed. The deadline covers the
+    /// handler budget, so by now the report was lost or the handler is wedged
+    /// past the runtime's reach. Re-arming could still start a second copy
+    /// beside one that runs, so the first expiry aborts it and waits for its
+    /// own completion, which carries the retry record the final turn wrote.
+    ///
+    /// That completion can be swallowed like any other, so the abort gets one
+    /// operation deadline more; the second expiry re-arms the alarm exactly as
+    /// a failed handler would, which keeps alarms at-least-once instead of
+    /// turning a stuck handler into a lost one.
+    fn alarm_deadline_passed(
+        &mut self,
+        op: OpId,
+        id: CellId,
+        now_ms: u64,
+        effects: &mut Vec<Effect>,
+    ) {
+        let now_mono_ms = self.now_mono_ms;
+        let Some(cell) = self.cells.get_mut(&id) else {
+            return;
+        };
+        // The cell comes from the index here, unlike the event, which
+        // carries its own: an expiry that cannot find the op has nothing to
+        // time out, so depending on the index is safe, while the event cannot
+        // depend on it because a fold may retire the firing state while the
+        // write it reports is still unproven. The epoch is read for
+        // completeness and never used — a failure opens no gate, and the gate
+        // is the only thing `alarm_finished` reads it for.
+        let epoch = match cell.phase {
+            Phase::Resident { epoch } => epoch,
+            _ => 0,
+        };
+        let Some(AlarmState::Firing {
+            deadline_mono_ms,
+            aborting,
+            ..
+        }) = cell.alarm.as_mut()
+        else {
+            return;
+        };
+        if !*aborting {
+            // A timer armed before the handler began; a later one is pending.
+            if now_mono_ms < *deadline_mono_ms {
+                return;
+            }
+            *aborting = true;
+            effects.push(Effect::AbortAlarm { op, cell: id });
+            return;
+        }
+        self.alarm_finished(
+            op,
+            (id, epoch),
+            now_ms,
+            now_mono_ms,
+            Err(Failure::Ambiguous),
+            effects,
+        );
+    }
+
     fn alarm_finished(
         &mut self,
         op: OpId,
@@ -6775,6 +6829,7 @@ fn event_mono_ms(event: &Event) -> Option<u64> {
         | Event::WakeHintAt { now_mono_ms, .. }
         | Event::TimerFired { now_mono_ms, .. }
         | Event::AlarmObserved { now_mono_ms, .. }
+        | Event::AlarmBegun { now_mono_ms, .. }
         | Event::AlarmFinished { now_mono_ms, .. }
         | Event::LoadSampled { now_mono_ms, .. }
         | Event::GenerationChanged { now_mono_ms, .. } => Some(*now_mono_ms),
@@ -6909,6 +6964,7 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
             now_mono_ms,
             &mut effects,
         ),
+        Event::AlarmBegun { op, cell, .. } => state.alarm_begun(op, cell, &mut effects),
         Event::AlarmFinished {
             op,
             cell,
