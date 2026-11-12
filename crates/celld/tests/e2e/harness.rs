@@ -27,7 +27,6 @@ const READY_PATH: &str = "/__ready";
 
 /// A running `celld dev` process and the project directory it serves.
 pub struct Server {
-    // Kept in this order: the process must be gone before its directory is.
     child: Option<Child>,
     port: u16,
     env: Vec<(String, String)>,
@@ -96,19 +95,7 @@ impl Server {
         let mut last = String::new();
         for attempt in 1..=START_ATTEMPTS {
             self.port = free_port();
-            let log = fs::File::create(&self.log).expect("create log file");
-            let child = Command::new(CELLD)
-                .arg("dev")
-                .arg(&self.project)
-                .args(["--no-watch", "--logs", "--port"])
-                .arg(self.port.to_string())
-                .envs(self.env.iter().map(|(k, v)| (k, v)))
-                .stdin(Stdio::null())
-                .stdout(log.try_clone().expect("clone log handle"))
-                .stderr(log)
-                .spawn()
-                .expect("spawn celld");
-            self.child = Some(child);
+            self.child = Some(spawn(&self.project, self.port, &self.env, &self.log));
             match self.wait_ready().await {
                 Ok(()) => return,
                 Err(reason) => {
@@ -180,18 +167,7 @@ pub fn run_expecting_exit(fixture: &str, env: &[(&str, &str)]) -> Exited {
     let project = dir.path().join("project");
     copy_dir(&fixture_dir(fixture), &project);
     let log_path = dir.path().join("celld.log");
-    let log = fs::File::create(&log_path).expect("create log file");
-    let mut child = Command::new(CELLD)
-        .arg("dev")
-        .arg(&project)
-        .args(["--no-watch", "--logs", "--port"])
-        .arg(free_port().to_string())
-        .envs(owned_env(env))
-        .stdin(Stdio::null())
-        .stdout(log.try_clone().expect("clone log handle"))
-        .stderr(log)
-        .spawn()
-        .expect("spawn celld");
+    let mut child = spawn(&project, free_port(), &owned_env(env), &log_path);
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll celld") {
@@ -226,6 +202,22 @@ where
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// Starts `celld dev` on `project`, with its output going to `log`.
+fn spawn(project: &Path, port: u16, env: &[(String, String)], log: &Path) -> Child {
+    let log = fs::File::create(log).expect("create log file");
+    Command::new(CELLD)
+        .arg("dev")
+        .arg(project)
+        .args(["--no-watch", "--logs", "--port"])
+        .arg(port.to_string())
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().expect("clone log handle"))
+        .stderr(log)
+        .spawn()
+        .expect("spawn celld")
 }
 
 fn client() -> reqwest::Client {
