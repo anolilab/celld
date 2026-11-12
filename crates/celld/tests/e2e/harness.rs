@@ -142,6 +142,10 @@ impl Server {
         let Some(mut child) = self.child.take() else {
             return;
         };
+        // `celld dev` starts its node in a process group of its own, and only
+        // Linux kills that node when the supervisor dies. Note the node now,
+        // while the supervisor is alive to name it.
+        let nodes = child_pids(child.id());
         if matches!(child.try_wait(), Ok(None)) {
             signal_group(child.id(), "TERM");
             let deadline = Instant::now() + STOP_TIMEOUT;
@@ -149,9 +153,12 @@ impl Server {
                 std::thread::sleep(POLL_INTERVAL);
             }
         }
-        // Kills a straggler of the group too, such as a node that outlived its
-        // supervisor; the group is empty and the signal fails harmlessly otherwise.
+        // Kills a straggler too, such as a node that outlived its supervisor;
+        // an empty group fails the signal harmlessly.
         signal_group(child.id(), "KILL");
+        for node in nodes {
+            signal_group(node, "KILL");
+        }
         let _ = child.wait();
     }
 }
@@ -185,7 +192,11 @@ pub fn run_expecting_exit(fixture: &str, env: &[(&str, &str)]) -> Exited {
             break status;
         }
         if Instant::now() >= deadline {
+            let nodes = child_pids(child.id());
             signal_group(child.id(), "KILL");
+            for node in nodes {
+                signal_group(node, "KILL");
+            }
             let _ = child.wait();
             print_log(&log_path);
             panic!("celld kept running although it should have exited");
@@ -219,6 +230,20 @@ where
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// The direct children of `pid`.
+fn child_pids(pid: u32) -> Vec<u32> {
+    Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Sends `signal` to the process group that `spawn` made for `pgid`.
