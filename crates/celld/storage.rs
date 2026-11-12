@@ -1155,13 +1155,20 @@ pub(crate) fn open_embedded(
 /// Replication opens the file before `open_embedded` and creates its own
 /// control tables, so a page count of zero never identifies a new facet.
 fn holds_only_control_tables(connection: &Connection) -> anyhow::Result<bool> {
+    Ok(table_names(connection)?
+        .iter()
+        .all(|name| celld_ltx::db::is_control_table(name)))
+}
+
+/// Every table in the database other than SQLite's own.
+fn table_names(connection: &Connection) -> anyhow::Result<Vec<String>> {
     let mut statement = connection.prepare(
         "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'",
     )?;
-    let mut names = statement.query_map([], |row| row.get::<_, String>(0))?;
-    names.try_fold(true, |only_control, name| {
-        Ok(only_control && celld_ltx::db::is_control_table(&name?))
-    })
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names)
 }
 
 /// A connection to a facet's root database, through the root activation's
@@ -4205,13 +4212,7 @@ pub fn get_actor_name(scope: &str) -> anyhow::Result<Option<String>> {
 /// which form the public JS deleteAll() operation selects.
 pub fn delete_all_with_alarm(scope: &str, delete_alarm: bool) -> anyhow::Result<()> {
     let result = with_application_storage_write(scope, |c| -> anyhow::Result<()> {
-        let mut statement = c.prepare(
-            "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-        )?;
-        let tables = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
+        let tables = table_names(c)?;
         without_sql_authorizer(c, || {
             c.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
             let result = (|| -> anyhow::Result<()> {
