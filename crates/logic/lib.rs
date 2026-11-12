@@ -38,9 +38,6 @@ pub mod wake;
 mod types;
 pub use types::*;
 
-#[cfg(test)]
-mod tests_alarm;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Activation {
     Claim(Claim),
@@ -2844,7 +2841,10 @@ impl State {
                 // A held write response: a swallowed durability proof must not
                 // hang a client forever.
                 | Effect::AwaitDurable { op, .. }
-                | Effect::FireAlarm { op, .. } => Some(*op),
+                | Effect::FireAlarm { op, .. }
+                // An aborted alarm stays firing until it reports; its second
+                // deadline is what re-arms it if the report never comes.
+                | Effect::AbortAlarm { op, .. } => Some(*op),
                 _ => None,
             })
             .collect();
@@ -2930,12 +2930,6 @@ impl State {
                     *aborting = true;
                 }
                 effects.push(Effect::AbortAlarm { op, cell: id });
-                effects.push(Effect::ScheduleTimer {
-                    timer: Timer::OperationDeadline { op },
-                    at_mono_ms: self
-                        .now_mono_ms
-                        .saturating_add(self.config.operation_deadline_ms.unwrap_or(0)),
-                });
                 return;
             }
         }
@@ -4510,30 +4504,6 @@ impl State {
                 {
                     return;
                 }
-                // A node that can never host a cell would queue the takeover
-                // until the deadline and strand the cell, though a peer with
-                // room can take it over itself. Decided before the interlock
-                // so no log is recovered for a cell this node forwards.
-                if self.config.max_resident == 0 {
-                    let Some(epoch) = self.next_writer_epoch(id, cell, record.epoch, effects)
-                    else {
-                        return;
-                    };
-                    let prior = record.node.clone();
-                    self.place_on_peer(
-                        id,
-                        cell,
-                        Claim {
-                            guard: CasGuard::Match(record.etag),
-                            epoch,
-                            takeover: true,
-                            prior,
-                            reconciles: 0,
-                        },
-                        effects,
-                    );
-                    return;
-                }
                 // The takeover interlock, decided HERE on the lease the
                 // core just read (lease-fold): a dead owner whose folded
                 // log state is not sealed may hold acked writes only on
@@ -4547,7 +4517,12 @@ impl State {
                         None | Some(crate::log_tier::LogState::Sealed)
                     )
                 });
-                if unrecovered {
+                // A node that can never host a cell would queue the takeover
+                // until the deadline and strand the cell, though a peer with
+                // room can take it over itself. It forwards the claim and
+                // leaves the dead owner's log to the peer that takes it.
+                let never_hosts = self.config.max_resident == 0;
+                if unrecovered && !never_hosts {
                     let owner = record.node.clone().unwrap_or_default();
                     let next = self.cell_op(id);
                     set_phase(
@@ -4568,20 +4543,24 @@ impl State {
                 let Some(epoch) = self.next_writer_epoch(id, cell, record.epoch, effects) else {
                     return;
                 };
-                let prior = record.node.clone();
-                self.activate_or_wait(
-                    id,
-                    cell,
-                    Activation::Claim(Claim {
-                        guard: CasGuard::Match(record.etag),
-                        epoch,
-                        takeover: true,
-                        prior,
-                        reconciles: 0,
-                    }),
-                    WhenFull::ShedToAdmit,
-                    effects,
-                );
+                let claim = Claim {
+                    guard: CasGuard::Match(record.etag),
+                    epoch,
+                    takeover: true,
+                    prior: record.node.clone(),
+                    reconciles: 0,
+                };
+                if never_hosts {
+                    self.place_on_peer(id, cell, claim, effects);
+                } else {
+                    self.activate_or_wait(
+                        id,
+                        cell,
+                        Activation::Claim(claim),
+                        WhenFull::ShedToAdmit,
+                        effects,
+                    );
+                }
             }
             Err(_) => {
                 set_phase(&mut self.occupied, cell, Phase::Inactive);
@@ -7181,4 +7160,8 @@ fn runtime_epoch(phase: &Phase) -> Option<Epoch> {
 }
 
 #[cfg(test)]
+mod alarm_tests;
+#[cfg(test)]
 mod dead_owner_tests;
+#[cfg(test)]
+mod test_support;

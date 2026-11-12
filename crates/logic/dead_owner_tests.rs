@@ -10,18 +10,8 @@ fn config(max_resident: usize) -> Config {
     Config {
         max_resident,
         max_activations: 4,
-        max_evictions: 1,
-        max_releases: 1,
-        max_outbound_websockets: 1,
-        ownership_on_evict: OwnershipOnEvict::Release,
-        require_node_lease: true,
         peer_protocol: PEER_PROTOCOL,
-        operation_deadline_ms: Some(15_000),
-        owner_log_recovery_backoff_ms: 1_000,
-        owner_log_recovery_attempts: 3,
-        alarm_resident_ms: 0,
-        idle_evict_ms: None,
-        pressure: pressure::PressureConfig::default(),
+        ..crate::test_support::config()
     }
 }
 

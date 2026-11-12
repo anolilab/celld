@@ -1,7 +1,7 @@
 //! An alarm that outlives its operation deadline must not be started again
 //! while the first run may still be executing (#42).
 
-use super::*;
+use crate::*;
 
 const DEADLINE_MS: u64 = 15_000;
 const CELL: &str = "cell";
@@ -16,20 +16,11 @@ struct Sim {
 impl Sim {
     fn resident_with_alarm() -> Self {
         let config = Config {
-            max_resident: 8,
-            max_activations: 8,
-            max_evictions: 1,
-            max_releases: 1,
-            max_outbound_websockets: 8,
             ownership_on_evict: OwnershipOnEvict::Sticky,
             require_node_lease: false,
-            peer_protocol: 1,
             operation_deadline_ms: Some(DEADLINE_MS),
-            owner_log_recovery_backoff_ms: 1_000,
-            owner_log_recovery_attempts: 3,
             alarm_resident_ms: 60_000,
-            idle_evict_ms: None,
-            pressure: Default::default(),
+            ..crate::test_support::config()
         };
         let mut sim = Self {
             state: State::new("node", config),
