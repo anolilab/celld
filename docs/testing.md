@@ -134,6 +134,10 @@ faults, zero status faults, and zero lost messages.
   two of the ten nodes stopped, every cell was available again on another node
   in ~11 s at the tail (with reserve headroom).
 
+The nightly workflow also measures throughput and latency of the real binary
+over HTTP. It reports the numbers and never gates on them; see
+[Benchmarks](benchmarks.md).
+
 ## Known failure edges
 
 A fleet at its resident limit has no space for a lost node's cells, so losing

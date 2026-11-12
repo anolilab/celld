@@ -39,6 +39,7 @@ pub struct Server {
     log: PathBuf,
     project: PathBuf,
     client: reqwest::Client,
+    boot: Duration,
     _dir: TempDir,
 }
 
@@ -55,10 +56,18 @@ impl Server {
             log: dir.path().join("celld.log"),
             project,
             client: client(),
+            boot: Duration::ZERO,
             _dir: dir,
         };
         server.launch().await;
         server
+    }
+
+    /// Time from spawning the process to its first successful response, on the
+    /// attempt that came up. Benchmarks read it as the cold-start time.
+    #[allow(dead_code)]
+    pub fn boot_time(&self) -> Duration {
+        self.boot
     }
 
     pub fn url(&self, path: &str) -> String {
@@ -111,9 +120,13 @@ impl Server {
         let mut last = String::new();
         for attempt in 1..=START_ATTEMPTS {
             self.port = free_port();
+            let spawned = Instant::now();
             self.child = Some(spawn(&self.project, self.port, &self.env, &self.log));
             match self.wait_ready().await {
-                Ok(()) => return,
+                Ok(()) => {
+                    self.boot = spawned.elapsed();
+                    return;
+                }
                 Err(reason) => {
                     last = format!("attempt {attempt}: {reason}");
                     self.stop();
