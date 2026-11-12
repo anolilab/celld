@@ -54,8 +54,6 @@ async fn alarm_runs_once_while_the_handler_outlives_the_deadline() {
         alarm.is_null(),
         "an alarm is still armed after the run: {alarm}"
     );
-    // Proving that something does not happen needs a bounded wait: this is the
-    // one place a fixed sleep is right, since there is no event to poll for.
     observe_for(Duration::from_millis(2 * DEADLINE_MS)).await;
     let log: Value = server.get_json("/log").await;
     assert_eq!(
