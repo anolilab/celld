@@ -2943,8 +2943,7 @@ impl State {
         // A firing alarm is tracked on the cell rather than in its phase, so
         // it is looked for first.
         if matches!(cell.alarm, Some(AlarmState::Firing { op: current, .. }) if current == op) {
-            let id = id.clone();
-            self.alarm_deadline_passed(op, id, now_ms, effects);
+            self.alarm_deadline_passed(op, id.clone(), now_ms, effects);
             return;
         }
         if phase_op(&cell.phase) != Some(op) {
@@ -3452,13 +3451,12 @@ impl State {
     }
 
     /// The handler of a firing alarm began, so its deadline counts from now.
-    /// A begin that arrives after the abort leaves the abort's own deadline
-    /// alone, or a handler that never reports could hold the alarm forever.
-    fn alarm_begun(&mut self, op: OpId, id: CellId, effects: &mut Vec<Effect>) {
-        if self.config.operation_deadline_ms.is_none() {
-            return;
-        }
-        let at_mono_ms = self.now_mono_ms.saturating_add(self.alarm_deadline_ms());
+    /// Only the deadline moves: the timer armed at dispatch still holds the
+    /// op's one deadline slot, and its expiry arms the later one. A begin that
+    /// arrives after the abort leaves the abort's own deadline alone, or a
+    /// handler that never reports could hold the alarm forever.
+    fn alarm_begun(&mut self, op: OpId, id: CellId) {
+        let deadline = self.now_mono_ms.saturating_add(self.alarm_deadline_ms());
         let Some(AlarmState::Firing {
             op: current,
             deadline_mono_ms,
@@ -3468,14 +3466,9 @@ impl State {
         else {
             return;
         };
-        if *current != op {
-            return;
+        if *current == op {
+            *deadline_mono_ms = deadline;
         }
-        *deadline_mono_ms = at_mono_ms;
-        effects.push(Effect::ScheduleTimer {
-            timer: Timer::OperationDeadline { op },
-            at_mono_ms,
-        });
     }
 
     /// The deadline of the firing alarm `op` passed. The deadline covers the
@@ -3519,8 +3512,12 @@ impl State {
             return;
         };
         if !*aborting {
-            // A timer armed before the handler began; a later one is pending.
+            // The timer armed at dispatch, and the handler began since.
             if now_mono_ms < *deadline_mono_ms {
+                effects.push(Effect::ScheduleTimer {
+                    timer: Timer::OperationDeadline { op },
+                    at_mono_ms: *deadline_mono_ms,
+                });
                 return;
             }
             *aborting = true;
@@ -6981,7 +6978,7 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
             now_mono_ms,
             &mut effects,
         ),
-        Event::AlarmBegun { op, cell, .. } => state.alarm_begun(op, cell, &mut effects),
+        Event::AlarmBegun { op, cell, .. } => state.alarm_begun(op, cell),
         Event::AlarmFinished {
             op,
             cell,

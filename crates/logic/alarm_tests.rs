@@ -14,6 +14,9 @@ const FIRE_MS: u64 = START_MS + 5_000;
 struct Sim {
     state: State,
     timers: Vec<(Timer, u64)>,
+    /// Deadline slots armed and not yet fired. The actor holds one slot per
+    /// op and asserts that no deadline displaces another.
+    armed_deadlines: Vec<OpId>,
 }
 
 impl Sim {
@@ -29,6 +32,7 @@ impl Sim {
         let mut sim = Self {
             state: State::new("node", config),
             timers: Vec::new(),
+            armed_deadlines: Vec::new(),
         };
         sim.feed(Event::RequestAt {
             request: 1,
@@ -83,6 +87,13 @@ impl Sim {
                     _ => None,
                 };
                 if let Effect::ScheduleTimer { timer, at_mono_ms } = &effect {
+                    if let Timer::OperationDeadline { op } = timer {
+                        assert!(
+                            !self.armed_deadlines.contains(op),
+                            "a deadline for op {op} displaced an armed one"
+                        );
+                        self.armed_deadlines.push(*op);
+                    }
                     self.timers.push((timer.clone(), *at_mono_ms));
                 }
                 match reply {
@@ -96,6 +107,9 @@ impl Sim {
     }
 
     fn fire(&mut self, timer: Timer, at_ms: u64) -> Vec<Effect> {
+        if let Timer::OperationDeadline { op } = &timer {
+            self.armed_deadlines.retain(|armed| armed != op);
+        }
         self.feed(Event::TimerFired {
             timer,
             now_ms: at_ms,
@@ -262,7 +276,6 @@ fn a_queued_alarm_counts_its_deadline_from_when_its_handler_began() {
     // Held behind another event's critical section for most of a budget.
     let began = FIRE_MS + 290_000;
     sim.begin(op, began);
-    assert_eq!(sim.deadline(op), began + ALARM_DEADLINE_MS);
 
     let early = sim.fire(Timer::OperationDeadline { op }, FIRE_MS + ALARM_DEADLINE_MS);
     assert!(
@@ -271,6 +284,7 @@ fn a_queued_alarm_counts_its_deadline_from_when_its_handler_began() {
             .any(|effect| matches!(effect, Effect::AbortAlarm { .. })),
         "aborted a handler inside its own budget: {early:?}"
     );
+    assert_eq!(sim.deadline(op), began + ALARM_DEADLINE_MS);
 
     let due = sim.fire(Timer::OperationDeadline { op }, began + ALARM_DEADLINE_MS);
     assert!(due.contains(&Effect::AbortAlarm {

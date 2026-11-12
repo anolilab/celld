@@ -43,6 +43,8 @@ const DEFAULT_OPERATION_DEADLINE_MS: u64 = 15_000;
 /// entry before it gives up and lets the drain deadline decide.
 const HANDOFF_ALARM_COVERAGE_MS: u64 = 5_000;
 
+const MAX_ALARM_HANDLER_BUDGET_MS: u64 = 365 * 24 * 60 * 60 * 1000;
+
 /// The shell's deadline for one actor operation. Queue leases include this
 /// exact budget for their settlement call, so the actor and broker must read
 /// one accessor rather than duplicate the environment default.
@@ -2556,8 +2558,11 @@ impl Actor {
                     require_node_lease: true,
                     peer_protocol: crate::peer_auth::PROTOCOL_VERSION,
                     operation_deadline_ms: Some(operation_deadline_ms),
+                    // The core arms a timer this far out, and the timer wheel
+                    // refuses a delay past about two years.
                     alarm_handler_budget_ms: u64::try_from(crate::js::handler_budget().as_millis())
-                        .unwrap_or(u64::MAX),
+                        .unwrap_or(u64::MAX)
+                        .min(MAX_ALARM_HANDLER_BUDGET_MS),
                     owner_log_recovery_backoff_ms: crate::env_vars::positive_or(
                         "CELLD_RECOVERY_RETRY_MS",
                         DEFAULT_OWNER_LOG_RECOVERY_BACKOFF_MS,
