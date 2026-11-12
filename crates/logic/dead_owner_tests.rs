@@ -225,3 +225,120 @@ fn full_node_still_takes_a_dead_owners_cell_over_locally() {
         Some(Activation::Claim(Claim { takeover: true, .. }))
     ));
 }
+
+/// The cell is back to `Inactive` with nothing queued for it.
+fn assert_unqueued(state: &State, cell: &str) {
+    let cell = &state.cells[cell];
+    assert_eq!(cell.phase, Phase::Inactive);
+    assert!(cell.waiting_for.is_none() && cell.waiting_activation.is_none());
+    assert!(cell.requests.is_empty() && !cell.alarm_wake && !cell.resume_demand);
+    assert!(state.capacity_waiters.is_empty());
+}
+
+#[test]
+fn ingress_only_node_with_leases_off_fails_a_takeover_it_can_never_admit() {
+    let mut state = State::new(
+        "ingress",
+        Config {
+            require_node_lease: false,
+            ..config(0)
+        },
+    );
+    let op = request(&mut state, 1, "cell");
+    let effects = owner_read(&mut state, op, Some("dead"));
+    let [Effect::ReadNodeLease { op, .. }] = work(&effects)[..] else {
+        panic!("expected a node lease read, got {effects:?}");
+    };
+    let effects = on_event(
+        &mut state,
+        Event::NodeLeaseRead {
+            op: *op,
+            now_ms: NOW_MS,
+            result: Ok(Some(lease_record("dead", NOW_MS - 1, None))),
+        },
+    );
+
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Complete {
+                request: 1,
+                result: Err(RequestError::CapacityExhausted),
+            }
+        )),
+        "expected an immediate refusal, got {effects:?}"
+    );
+    assert_unqueued(&state, "cell");
+}
+
+#[test]
+fn ingress_only_node_fails_a_claim_when_the_capacity_lookup_errors() {
+    let mut state = started(0);
+    let effects = dead_owner_resolved(&mut state, 1, "cell");
+    let [Effect::ReadCapacityPeers { op, .. }] = work(&effects)[..] else {
+        panic!("expected peer placement, got {effects:?}");
+    };
+
+    let effects = on_event(
+        &mut state,
+        Event::CapacityPeersRead {
+            op: *op,
+            now_ms: NOW_MS,
+            result: Err(Failure::Ambiguous),
+        },
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Complete {
+                request: 1,
+                result: Err(RequestError::CapacityExhausted),
+            }
+        )),
+        "expected an immediate refusal, got {effects:?}"
+    );
+    assert_unqueued(&state, "cell");
+}
+
+#[test]
+fn ingress_only_node_fails_a_claim_when_no_peer_is_eligible() {
+    let mut state = started(0);
+    let effects = dead_owner_resolved(&mut state, 1, "cell");
+    let [Effect::ReadCapacityPeers { op, .. }] = work(&effects)[..] else {
+        panic!("expected peer placement, got {effects:?}");
+    };
+
+    let effects = on_event(
+        &mut state,
+        Event::CapacityPeersRead {
+            op: *op,
+            now_ms: NOW_MS,
+            result: Ok(vec![peer("dead", NOW_MS - 1)]),
+        },
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Complete {
+            request: 1,
+            result: Err(RequestError::CapacityExhausted),
+        }
+    )));
+    assert_unqueued(&state, "cell");
+}
+
+#[test]
+fn ingress_only_node_drops_a_wake_hint_without_reading_the_owner() {
+    let mut state = started(0);
+    let effects = on_event(
+        &mut state,
+        Event::WakeHintAt {
+            cell: "cell".into(),
+            entry_ms: 0,
+            scope: WakeHintScope::Fleet,
+            now_mono_ms: 0,
+        },
+    );
+    assert!(effects.is_empty(), "got {effects:?}");
+    assert!(state.capacity_waiters.is_empty());
+    assert!(state.cells.get("cell").is_none_or(|cell| !cell.alarm_wake));
+}

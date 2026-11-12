@@ -2289,6 +2289,20 @@ impl State {
             if self.refuse_new_ownership_during_drain(id, cell, claim.prior.as_deref(), effects) {
                 return;
             }
+            // A node that can never hold a cell has no room to wait for, so
+            // a queued claim would strand its callers until the deadline.
+            // The refusal carries the stale-route header, so callers
+            // re-resolve. An alarm wake is dropped with it: the alarm stays
+            // in shared storage, and this node arms no alarm timer that
+            // could re-fire it.
+            if !self.hosts_cells() {
+                set_phase(&mut self.occupied, cell, Phase::Inactive);
+                cell.waiting_for = None;
+                cell.waiting_activation = None;
+                cell.alarm_wake = false;
+                self.finish_requests(id, cell, Err(RequestError::CapacityExhausted), effects);
+                return;
+            }
         }
         if cell.requests.is_empty() && !cell.alarm_wake && !cell.resume_demand && !cell.confirming {
             set_phase(
@@ -3862,6 +3876,12 @@ impl State {
         effects: &mut Vec<Effect>,
     ) {
         if self.draining {
+            return;
+        }
+        // A node that can never hold the cell has nothing to wake: a hint
+        // leads to a claim it could only queue. The entry stays in shared
+        // storage.
+        if !self.hosts_cells() {
             return;
         }
         // An `Owned` hint is decided before the map is touched.
