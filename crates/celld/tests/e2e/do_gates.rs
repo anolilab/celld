@@ -39,6 +39,21 @@ async fn concurrent_first_requests_all_wait_for_the_hold() {
 async fn read_await_write_does_not_lose_updates() {
     let server = Server::start("do-gates", &[]).await;
     let out: Value = server.get_json("/race?o=race&count=20").await;
-    // Input gates keep other requests out while a storage operation runs.
+    // Concurrent read-then-write requests on one object must not lose an
+    // update. Local storage completes within the turn, so this checks request
+    // ordering; the hold test below covers a gate across a real suspension.
     assert_eq!(out["n"], 20, "{out}");
+}
+
+#[tokio::test]
+async fn hold_during_the_objects_life_keeps_requests_out() {
+    let server = Server::start("do-gates", &[]).await;
+    let out: Value = server.get_json("/midhold?o=midhold").await;
+    // Requests that arrive while `blockConcurrencyWhile` waits on a timer run
+    // only after it, so none sees the state half written.
+    assert_eq!(
+        out,
+        json!([{"phase": "whole"}, {"phase": "whole"}, {"phase": "whole"}]),
+        "{out}"
+    );
 }

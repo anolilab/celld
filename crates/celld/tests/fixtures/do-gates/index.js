@@ -15,6 +15,19 @@ export class Cell extends DurableObject {
   async fetch(request) {
     const url = new URL(request.url);
     const storage = this.ctx.storage;
+    if (url.pathname === "/hold") {
+      // A hold during the object's life, across a real timer: requests that
+      // arrive meanwhile must not see the half-written state.
+      this.ctx.blockConcurrencyWhile(async () => {
+        this.phase = "half";
+        await sleep(600);
+        this.phase = "whole";
+      });
+      return Response.json({ held: true });
+    }
+    if (url.pathname === "/phase") {
+      return Response.json({ phase: this.phase ?? "none" });
+    }
     if (url.pathname === "/init") {
       return Response.json({ init: this.init });
     }
@@ -40,6 +53,11 @@ export default {
       const count = Number(url.searchParams.get("count") ?? 20);
       await Promise.all(Array.from({ length: count }, () => call("/incr")));
       return Response.json(await call("/get"));
+    }
+    if (url.pathname === "/midhold") {
+      await call("/init");
+      await call("/hold");
+      return Response.json(await Promise.all([call("/phase"), call("/phase"), call("/phase")]));
     }
     if (url.pathname === "/inits") {
       return Response.json(await Promise.all([call("/init"), call("/init"), call("/init")]));
