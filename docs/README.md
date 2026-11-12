@@ -533,8 +533,7 @@ release, so keep operator tooling and celld releases together.
   that: it cannot restore a paged cell.
 - **v0.5.1 to v0.6.0: stop all with `fleet` durability.** A v0.6.0 node
   refuses to start against a v0.5.1 follower. A `bucket` durability fleet
-  can roll. Facet storage written by v0.5.1 or earlier is not carried
-  over: each facet starts with an empty database.
+  can roll.
 - **v0.6.0 to v0.6.1: rolling.** Until every node runs v0.6.1, do not set
   `CELLD_LTX_RETENTION_SECS`, do not deploy a Python Worker, and do not
   raise `CELLD_MAX_ASSET_FILE_BYTES` above 25 MiB. A rollback to v0.6.0
@@ -549,6 +548,11 @@ release, so keep operator tooling and celld releases together.
   promptly. Until every node runs v0.6.3, a v0.6.2 node can still acquire a
   cell whose ownership record was lost and start the cell with an empty
   database. A rollback to v0.6.2 can also roll.
+- **v0.6.3 to v0.7.0: rolling.** A v0.7.0 node no longer imports facet
+  storage that v0.5.1 or earlier wrote. Up to v0.6.3, that import ran the
+  first time a facet opened, so a facet that no v0.6 node has opened since
+  starts with an empty database on v0.7.0. Before the upgrade, open each
+  such facet once on v0.6.3.
 
 ## Diagnose a fleet
 
