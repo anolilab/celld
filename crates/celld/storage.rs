@@ -97,7 +97,7 @@ enum StorageBacking {
         root_scope: String,
         facet_path: Vec<String>,
         /// The activation's paged VFS, when its restore paged.
-        vfs: Option<String>,
+        root_vfs: Option<String>,
     },
     /// A facet: a database and a replication stream of its own
     /// (`crate::facet_streams`), opened inside its root's activation.
@@ -772,12 +772,7 @@ pub(crate) fn open_at_epoch(
     sqlite_vec: bool,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(epoch > 0, "a cell activation epoch must be positive");
-    let connection = match vfs {
-        Some(vfs) => {
-            Connection::open_with_flags_and_vfs(path, rusqlite::OpenFlags::default(), vfs)?
-        }
-        None => Connection::open(path)?,
-    };
+    let connection = open_with_vfs(path, vfs)?;
     finish_open(
         scope,
         connection,
@@ -788,7 +783,7 @@ pub(crate) fn open_at_epoch(
             path: path.to_string(),
             root_scope: scope.to_string(),
             facet_path: Vec::new(),
-            vfs: vfs.map(str::to_string),
+            root_vfs: vfs.map(str::to_string),
         },
     )
 }
@@ -805,7 +800,7 @@ pub fn open_with_fault_vfs_for_test(scope: &str, path: &str) -> anyhow::Result<(
             path: path.to_string(),
             root_scope: scope.to_string(),
             facet_path: Vec::new(),
-            vfs: None,
+            root_vfs: None,
         },
     )
 }
@@ -958,12 +953,12 @@ pub(crate) fn storage_identity(scope: &str) -> anyhow::Result<Option<StorageIden
                         path,
                         root_scope,
                         facet_path,
-                        vfs,
+                        root_vfs,
                     } => (
                         path.clone(),
                         root_scope.clone(),
                         facet_path.clone(),
-                        vfs.clone(),
+                        root_vfs.clone(),
                         sample.unwrap_or(0),
                         observed,
                     ),
@@ -1117,7 +1112,7 @@ pub(crate) fn open_embedded(
     if !restored && holds_only_control_tables(&connection)? {
         import_legacy_facet(
             &mut connection,
-            &open_root(parent)?,
+            &open_with_vfs(&parent.root_path, parent.root_vfs.as_deref())?,
             &parent.root_scope,
             &facet_path,
         )?;
@@ -1171,17 +1166,12 @@ fn table_names(connection: &Connection) -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
-/// A connection to a facet's root database, through the root activation's
-/// paged VFS when it has one.
-fn open_root(parent: &StorageIdentity) -> anyhow::Result<Connection> {
-    Ok(match parent.root_vfs.as_deref() {
-        Some(vfs) => Connection::open_with_flags_and_vfs(
-            &parent.root_path,
-            rusqlite::OpenFlags::default(),
-            vfs,
-        )?,
-        None => Connection::open(&parent.root_path)?,
-    })
+/// Open a cell database, through its activation's paged VFS when it has one.
+fn open_with_vfs(path: &str, vfs: Option<&str>) -> rusqlite::Result<Connection> {
+    match vfs {
+        Some(vfs) => Connection::open_with_flags_and_vfs(path, rusqlite::OpenFlags::default(), vfs),
+        None => Connection::open(path),
+    }
 }
 
 /// Copy a facet's legacy image from its root's `_cf_FACETS` row into the
@@ -1220,7 +1210,7 @@ fn import_legacy_facet(
 pub(crate) fn delete_legacy_facet(parent: &StorageIdentity, name: &str) -> anyhow::Result<()> {
     let mut facet_path = parent.facet_path.clone();
     facet_path.push(name.to_string());
-    let mut root = open_root(parent)?;
+    let mut root = open_with_vfs(&parent.root_path, parent.root_vfs.as_deref())?;
     let paths = {
         let mut statement = root.prepare("SELECT path FROM _cf_FACETS WHERE scope=?1")?;
         let rows = statement.query_map([&parent.root_scope], |row| row.get::<_, String>(0))?;
@@ -4527,77 +4517,4 @@ pub fn bump_alarm_with_policy(scope: &str, now_ms: i64, counts_against_limit: bo
 include!(env!("CELLD_INTERNAL_STORAGE_OBSERVERS"));
 
 #[cfg(test)]
-mod legacy_facet_tests {
-    use super::*;
-
-    /// A facet image as an older release stored it: a whole database,
-    /// serialized into its root's `_cf_FACETS` row.
-    fn legacy_image() -> Vec<u8> {
-        let facet = Connection::open_in_memory().unwrap();
-        schema(&facet).unwrap();
-        facet
-            .execute_batch("CREATE TABLE notes (body TEXT); INSERT INTO notes VALUES ('kept');")
-            .unwrap();
-        facet
-            .serialize(rusqlite::DatabaseName::Main)
-            .unwrap()
-            .to_vec()
-    }
-
-    #[test]
-    fn imports_legacy_image_after_replication_opened_the_facet() {
-        let dir = tempfile::tempdir().unwrap();
-        let root_path = dir.path().join("root.sqlite");
-        let facet_file = dir.path().join("facet.sqlite");
-        let facet_path = vec!["child".to_string()];
-
-        let root = Connection::open(&root_path).unwrap();
-        schema(&root).unwrap();
-        root.execute(
-            "INSERT INTO _cf_FACETS (scope, path, image) VALUES (?1, ?2, ?3)",
-            rusqlite::params![
-                "root",
-                serde_json::to_string(&facet_path).unwrap(),
-                legacy_image()
-            ],
-        )
-        .unwrap();
-
-        // Replication opens the facet first, as `open_embedded`'s callers do:
-        // it creates its control tables and keeps a read transaction open.
-        let _capture = celld_ltx::db::Db::open(&facet_file).unwrap();
-
-        let mut connection = Connection::open(&facet_file).unwrap();
-        let pages: u64 = connection
-            .query_row("PRAGMA page_count", [], |row| row.get(0))
-            .unwrap();
-        assert!(
-            pages > 0,
-            "the file is not empty once replication opened it"
-        );
-        assert!(holds_only_control_tables(&connection).unwrap());
-        import_legacy_facet(&mut connection, &root, "root", &facet_path).unwrap();
-        schema(&connection).unwrap();
-
-        let body: String = connection
-            .query_row("SELECT body FROM notes", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(body, "kept");
-        assert!(!holds_only_control_tables(&connection).unwrap());
-    }
-
-    #[test]
-    fn a_cleared_facet_does_not_look_new() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE _litestream_seq (id INTEGER PRIMARY KEY, seq INTEGER);\
-                 CREATE TABLE _litestream_lock (id INTEGER);",
-            )
-            .unwrap();
-        assert!(holds_only_control_tables(&connection).unwrap());
-        // deleteAll keeps these celld tables and reruns `schema`.
-        schema(&connection).unwrap();
-        assert!(!holds_only_control_tables(&connection).unwrap());
-    }
-}
+mod legacy_facet_tests;
