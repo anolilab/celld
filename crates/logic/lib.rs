@@ -2807,7 +2807,8 @@ impl State {
         let Some(deadline_ms) = self.config.operation_deadline_ms else {
             return;
         };
-        let watched: Vec<OpId> = effects
+        let alarm_deadline_ms = self.config.alarm_deadline_ms.unwrap_or(deadline_ms);
+        let watched: Vec<(OpId, u64)> = effects
             .iter()
             .filter_map(|effect| match effect {
                 // Every operation that holds something back. The activation
@@ -2841,18 +2842,19 @@ impl State {
                 // A held write response: a swallowed durability proof must not
                 // hang a client forever.
                 | Effect::AwaitDurable { op, .. }
-                | Effect::FireAlarm { op, .. }
                 // An aborted alarm stays firing until it reports; its second
                 // deadline is what re-arms it if the report never comes.
-                | Effect::AbortAlarm { op, .. } => Some(*op),
+                | Effect::AbortAlarm { op, .. } => Some((*op, deadline_ms)),
+                // A running handler is not a lost report: the runtime ends
+                // one that overruns its budget and reports then.
+                Effect::FireAlarm { op, .. } => Some((*op, alarm_deadline_ms)),
                 _ => None,
             })
             .collect();
-        let at_mono_ms = self.now_mono_ms.saturating_add(deadline_ms);
-        for op in watched {
+        for (op, after_ms) in watched {
             effects.push(Effect::ScheduleTimer {
                 timer: Timer::OperationDeadline { op },
-                at_mono_ms,
+                at_mono_ms: self.now_mono_ms.saturating_add(after_ms),
             });
         }
     }
@@ -2906,16 +2908,17 @@ impl State {
             return;
         }
         // A firing alarm is tracked on the cell rather than in its phase, so
-        // it is looked for first. The handler is still running when the
-        // deadline passes, and re-arming then starts a second copy beside it.
-        // The first expiry therefore aborts it and keeps waiting for its own
-        // completion, which carries the retry record the final turn wrote.
+        // it is looked for first. Its deadline already covers the handler
+        // budget, so by now the report was lost or the handler is wedged past
+        // the runtime's reach. Re-arming could still start a second copy
+        // beside one that runs, so the first expiry aborts it and waits for
+        // its own completion, which carries the retry record the final turn
+        // wrote.
         //
         // That completion can be swallowed like any other, so the abort gets
-        // one more deadline. A stuck alarm holds the cell for at most twice
-        // the operation deadline; the second expiry re-arms it exactly as a
-        // failed handler would, which keeps alarms at-least-once instead of
-        // turning a stuck handler into a lost one.
+        // one operation deadline more; the second expiry re-arms the alarm
+        // exactly as a failed handler would, which keeps alarms at-least-once
+        // instead of turning a stuck handler into a lost one.
         if let Some(AlarmState::Firing {
             op: current,
             aborting: false,

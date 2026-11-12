@@ -2556,6 +2556,10 @@ impl Actor {
                     require_node_lease: true,
                     peer_protocol: crate::peer_auth::PROTOCOL_VERSION,
                     operation_deadline_ms: Some(operation_deadline_ms),
+                    alarm_deadline_ms: Some(
+                        (crate::js::handler_budget().as_millis() as u64)
+                            .saturating_add(operation_deadline_ms),
+                    ),
                     owner_log_recovery_backoff_ms: crate::env_vars::positive_or(
                         "CELLD_RECOVERY_RETRY_MS",
                         DEFAULT_OWNER_LOG_RECOVERY_BACKOFF_MS,

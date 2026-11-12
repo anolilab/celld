@@ -1,9 +1,11 @@
-//! An alarm that outlives its operation deadline must not be started again
-//! while the first run may still be executing (#42).
+//! An alarm handler may run longer than one operation, and a firing alarm
+//! must never be started again while its first run may still be executing
+//! (#42).
 
 use crate::*;
 
 const DEADLINE_MS: u64 = 15_000;
+const ALARM_DEADLINE_MS: u64 = 315_000;
 const CELL: &str = "cell";
 const START_MS: u64 = 1_000_000;
 const FIRE_MS: u64 = START_MS + 5_000;
@@ -19,6 +21,7 @@ impl Sim {
             ownership_on_evict: OwnershipOnEvict::Sticky,
             require_node_lease: false,
             operation_deadline_ms: Some(DEADLINE_MS),
+            alarm_deadline_ms: Some(ALARM_DEADLINE_MS),
             alarm_resident_ms: 60_000,
             ..crate::test_support::config()
         };
@@ -99,6 +102,16 @@ impl Sim {
         })
     }
 
+    /// When the core asked for `op`'s newest deadline to fire.
+    fn deadline(&self, op: OpId) -> u64 {
+        self.timers
+            .iter()
+            .rev()
+            .find(|(timer, _)| *timer == Timer::OperationDeadline { op })
+            .map(|(_, at)| *at)
+            .expect("a deadline was scheduled")
+    }
+
     /// The newest alarm timer the core has asked for.
     fn alarm_timer(&self) -> (Timer, u64) {
         self.timers
@@ -139,6 +152,22 @@ fn fire_due_alarm(sim: &mut Sim, at_ms: u64) -> Vec<Effect> {
 }
 
 #[test]
+fn a_running_alarm_outlives_the_operation_deadline() {
+    let mut sim = Sim::resident_with_alarm();
+
+    let first = fire_due_alarm(&mut sim, FIRE_MS);
+    let [(op, _)] = fires(&first)[..] else {
+        panic!("expected exactly one firing, got {first:?}");
+    };
+    assert_eq!(sim.deadline(op), FIRE_MS + ALARM_DEADLINE_MS);
+
+    // Its abort, when it comes, is a lost-report backstop of one operation.
+    let expiry = FIRE_MS + ALARM_DEADLINE_MS;
+    sim.fire(Timer::OperationDeadline { op }, expiry);
+    assert_eq!(sim.deadline(op), expiry + DEADLINE_MS);
+}
+
+#[test]
 fn expired_alarm_is_not_started_again_until_it_finishes() {
     let mut sim = Sim::resident_with_alarm();
 
@@ -147,7 +176,7 @@ fn expired_alarm_is_not_started_again_until_it_finishes() {
         panic!("expected exactly one firing, got {first:?}");
     };
 
-    let expiry = FIRE_MS + DEADLINE_MS;
+    let expiry = FIRE_MS + ALARM_DEADLINE_MS;
     let expired = sim.fire(Timer::OperationDeadline { op }, expiry);
     assert!(fires(&expired).is_empty(), "expiry restarted: {expired:?}");
     assert!(
@@ -187,7 +216,7 @@ fn alarm_that_never_reports_back_re_arms_after_the_second_deadline() {
         panic!("expected exactly one firing, got {first:?}");
     };
 
-    let first_expiry = FIRE_MS + DEADLINE_MS;
+    let first_expiry = FIRE_MS + ALARM_DEADLINE_MS;
     sim.fire(Timer::OperationDeadline { op }, first_expiry);
     let (timer, _) = sim.alarm_timer();
     let early = sim.fire(timer, first_expiry + 600);

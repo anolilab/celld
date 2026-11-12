@@ -127,6 +127,12 @@ pub struct Config {
     /// requests past ninety seconds. `None` restores the old behaviour, which
     /// callers use only when they need to observe an indefinite wait.
     pub operation_deadline_ms: Option<u64>,
+    /// How long a firing alarm may go without reporting before the core
+    /// aborts it. An `alarm()` handler may legitimately run far longer than
+    /// one operation, so this is the runtime's own handler budget plus the
+    /// operation deadline: past it the runtime has already ended the handler
+    /// and its report was lost. `None` uses `operation_deadline_ms`.
+    pub alarm_deadline_ms: Option<u64>,
     /// How long a cell waits after a failed dead-owner log recovery
     /// before it re-enters ownership resolution.
     ///

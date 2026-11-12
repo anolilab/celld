@@ -15,6 +15,7 @@ pub(crate) fn config() -> Config {
         require_node_lease: true,
         peer_protocol: 1,
         operation_deadline_ms: Some(15_000),
+        alarm_deadline_ms: None,
         owner_log_recovery_backoff_ms: 1_000,
         owner_log_recovery_attempts: 3,
         alarm_resident_ms: 0,
