@@ -453,7 +453,7 @@ impl Drop for AlarmRequestGuard {
 pub fn pool_limits() -> celld_logic::isolate::PoolLimits {
     const GROW_AT: usize = 2;
     const SHRINK_UNDER: usize = 1;
-    const MAX_CELLS_PER_ISOLATE: usize = 32;
+    const DEFAULT_MAX_CELLS_PER_ISOLATE: usize = 32;
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -464,9 +464,10 @@ pub fn pool_limits() -> celld_logic::isolate::PoolLimits {
         shrink_under: SHRINK_UNDER,
         max_stateless: env_usize("CELLD_MAX_STATELESS_ISOLATES").unwrap_or(cores),
         max_requests: env_usize("CELLD_MAX_REQUESTS"),
-        // This is an engine blast-radius policy. The resident-cell and RSS
-        // limits are the operator controls for node memory.
-        max_cells: MAX_CELLS_PER_ISOLATE,
+        // This is an engine blast-radius policy: one isolate's heap and event
+        // loop are shared by every cell it hosts. Heavy objects can lower it.
+        max_cells: env_usize("CELLD_MAX_CELLS_PER_ISOLATE")
+            .unwrap_or(DEFAULT_MAX_CELLS_PER_ISOLATE),
     }
 }
 
@@ -1685,6 +1686,7 @@ impl RuntimeManager {
         op: celld_logic::OpId,
         cell: String,
         scheduled_ms: i64,
+        started: tokio::sync::oneshot::Sender<()>,
     ) -> anyhow::Result<(celld_logic::wake::AlarmSnapshot, bool, Option<u64>)> {
         let request_id = js::next_request_id();
         let cancel = self
@@ -1699,6 +1701,7 @@ impl RuntimeManager {
             scheduled_ms,
             claim: js::AlarmDispatch::Due,
             reply,
+            started: Some(started),
         };
         let guard = AlarmRequestGuard {
             registry: self.alarm_requests.clone(),
@@ -3381,7 +3384,7 @@ async fn drive_cell_inner(
     // waiting happens out here, because a turn may not await.
     let mut pending = Some(job);
     let started_event = match pending.as_mut() {
-        Some(CellJob::WsMessage { started, .. }) => started.take(),
+        Some(CellJob::WsMessage { started, .. } | CellJob::Alarm { started, .. }) => started.take(),
         _ => None,
     };
     let (begun, started, moves) = loop {
@@ -3425,6 +3428,8 @@ async fn drive_cell_inner(
     // A socket waits for this turn, including the input gate, rather than
     // handler completion. Acknowledging a queued task instead can reorder
     // messages; awaiting completion prevents a later message cancelling it.
+    // An alarm's deadline starts here for the same reason: the gate wait is
+    // another event's time, not its handler's.
     if let Some(started) = started_event {
         let _ = started.send(());
     }

@@ -217,7 +217,7 @@ impl CellRuntime {
         root: &str,
         epoch: u64,
         names: &[String],
-    ) -> anyhow::Result<(PathBuf, bool)> {
+    ) -> anyhow::Result<PathBuf> {
         self.facets
             .open(
                 self.replication.as_ref(),

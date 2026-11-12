@@ -648,6 +648,10 @@ pub enum CellJob {
         /// same way now, in `InFlight::answer_settled`.
         reply:
             tokio::sync::oneshot::Sender<Result<(celld_logic::wake::AlarmSnapshot, Option<u64>)>>,
+        /// Signalled when the handler begins, past the cell's input gate. The
+        /// core counts the alarm's deadline from here, because a wait behind
+        /// another event's critical section is not handler time.
+        started: Option<tokio::sync::oneshot::Sender<()>>,
     },
     #[cfg(celld_internal_tests)]
     SyncErrorForTest {
@@ -5424,6 +5428,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
             scheduled_ms,
             claim,
             reply,
+            started: _,
         } => begin_alarm(
             tc,
             &scope,
@@ -6163,7 +6168,7 @@ impl Worker {
         name: &str,
         id_sc: Vec<u8>,
         props_sc: Vec<u8>,
-        file: (std::path::PathBuf, bool),
+        path: std::path::PathBuf,
     ) -> Result<u64> {
         let compat = self.inner.as_ref().expect("live worker isolate").compat;
         let (mut locker, _cells) = self.lock();
@@ -6180,7 +6185,6 @@ impl Worker {
         let cs = &mut v8::ContextScope::new(hs, context);
         let tc = std::pin::pin!(v8::TryCatch::new(cs));
         let tc = &mut tc.init();
-        let (path, restored) = file;
         adopt_embedded_cell(
             tc,
             cell,
@@ -6190,7 +6194,6 @@ impl Worker {
                 id_sc,
                 props_sc,
                 path,
-                restored,
             },
             compat,
         )?;
@@ -7944,11 +7947,11 @@ fn facet_scope(class_name: &str, parent_scope: &str, owner: &str, name: &str) ->
 }
 
 /// Activate a facet's stream through the host loop, which owns the
-/// replicator, and answer its database file and whether it was restored.
+/// replicator, and answer its database file.
 async fn open_facet_file(
     parent: &storage::StorageIdentity,
     name: &str,
-) -> Result<(std::path::PathBuf, bool), String> {
+) -> Result<std::path::PathBuf, String> {
     let mut names = parent.facet_path.clone();
     names.push(name.to_string());
     let Some(sender) = FACET_TX.get() else {
@@ -7961,7 +7964,7 @@ async fn open_facet_file(
             .replace('/', "-");
         let root = std::path::Path::new(&parent.root_path);
         let file = root.file_name().unwrap().to_string_lossy();
-        return Ok((root.with_file_name(format!("{file}.{facet}.sqlite")), false));
+        return Ok(root.with_file_name(format!("{file}.{facet}.sqlite")));
     };
     let (reply, receive) = tokio::sync::oneshot::channel();
     let request = FacetReq::Open {
@@ -8320,7 +8323,7 @@ async fn prepare_facet(host: FacetHost, start: FacetStart) -> Result<LoadedFacet
         None
     };
     let slot = host.slot().await?;
-    let file = open_facet_file(&start.parent, &start.name).await?;
+    let path = open_facet_file(&start.parent, &start.name).await?;
     let mut names = start.parent.facet_path.clone();
     names.push(start.name.clone());
     let stream = crate::engine_api::facet_cell(&start.parent.root_scope, &names);
@@ -8343,7 +8346,7 @@ async fn prepare_facet(host: FacetHost, start: FacetStart) -> Result<LoadedFacet
                     &start.name,
                     start.id_sc,
                     start.props_sc,
-                    file,
+                    path,
                 )
                 .map_err(|error| format!("{error}"))
         })
@@ -8634,14 +8637,11 @@ fn op_facet_delete(
         }
         Err(error) => return loader_throw(scope, &error.to_string()),
     };
-    if let Err(error) = storage::delete_legacy_facet(&parent, &name) {
-        return loader_throw(scope, &format!("delete facet storage: {error}"));
-    }
     let mut names = parent.facet_path.clone();
     names.push(name);
     let async_id = asyncrt::enqueue(async move {
         let Some(sender) = FACET_TX.get() else {
-            let (path, _) = open_facet_file(&parent, names.last().unwrap()).await?;
+            let path = open_facet_file(&parent, names.last().unwrap()).await?;
             for suffix in ["", "-wal", "-shm"] {
                 let mut file = path.clone().into_os_string();
                 file.push(suffix);

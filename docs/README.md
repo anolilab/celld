@@ -548,6 +548,11 @@ release, so keep operator tooling and celld releases together.
   promptly. Until every node runs v0.6.3, a v0.6.2 node can still acquire a
   cell whose ownership record was lost and start the cell with an empty
   database. A rollback to v0.6.2 can also roll.
+- **v0.6.3 to v0.7.0: rolling.** A v0.7.0 node no longer imports facet
+  storage that v0.5.1 or earlier wrote. Up to v0.6.3, that import ran the
+  first time a facet opened, so a facet that no v0.6 node has opened since
+  starts with an empty database on v0.7.0. Before the upgrade, open each
+  such facet once on v0.6.3.
 
 ## Diagnose a fleet
 
@@ -656,7 +661,9 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_DEPLOY_POLL_S` | The deployment pointer poll interval in seconds (default: 30) |
 | `CELLD_DEPLOY_MAX_AGE_S` | Seconds before celld forces a resident Durable Object onto a new deployment (default: 60; 0 forces at once) |
 | `CELLD_OPERATION_DEADLINE_MS` | The deadline for a non-restore operation (default: 15000) |
+| `CELLD_HANDLER_BUDGET_S` | How long one JavaScript handler may run (default: 300). A Durable Object alarm may run this long, and is aborted only when it has not reported back `CELLD_OPERATION_DEADLINE_MS` after that |
 | `CELLD_MAX_CELL_REQUESTS` | Concurrent fetch events for one Durable Object (default: 64) |
+| `CELLD_MAX_CELLS_PER_ISOLATE` | Cells that one V8 isolate may host before celld starts another isolate (default: 32). Lower it for heavy objects that share a heap badly |
 | `CELLD_MAX_REQUEST_BODY_BYTES` | The body limit for a public Worker request or a direct Durable Object request (default: 1 GiB) |
 | `CELLD_MAX_RESIDENT_CELLS` | The hard limit for resident cells, enforced at admission |
 | `CELLD_IDLE_EVICT_S` | Seconds after which an idle cell leaves memory and hibernates (unset: only pressure or the residency cap removes an idle cell) |

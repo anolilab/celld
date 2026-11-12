@@ -208,9 +208,10 @@ impl CellHost {
         op: celld_logic::OpId,
         cell: String,
         scheduled_ms: i64,
+        started: tokio::sync::oneshot::Sender<()>,
     ) -> anyhow::Result<(celld_logic::wake::AlarmSnapshot, bool, Option<u64>)> {
         match self {
-            Self::Engine(runtime) => runtime.fire_alarm(op, cell, scheduled_ms).await,
+            Self::Engine(runtime) => runtime.fire_alarm(op, cell, scheduled_ms, started).await,
             #[cfg(all(test, celld_internal_tests))]
             Self::Scripted(runtime) => runtime.fire_alarm(op, cell, scheduled_ms).await,
         }

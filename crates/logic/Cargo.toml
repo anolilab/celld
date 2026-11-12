@@ -8,7 +8,6 @@ license = "Apache-2.0"
 # Pure decision core: no async, I/O, clocks, randomness, locks, or dependencies.
 [lib]
 path = "lib.rs"
-test = false
 
 [lints.rust.unexpected_cfgs]
 level = "warn"

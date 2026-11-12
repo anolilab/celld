@@ -127,6 +127,15 @@ pub struct Config {
     /// requests past ninety seconds. `None` restores the old behaviour, which
     /// callers use only when they need to observe an indefinite wait.
     pub operation_deadline_ms: Option<u64>,
+    /// The runtime's JavaScript handler budget. An `alarm()` handler may
+    /// legitimately run far longer than one operation, so a firing alarm's
+    /// deadline is this budget plus `operation_deadline_ms`, counted from when
+    /// its handler begins: past it the runtime has already ended the handler
+    /// and its report was lost. Until the handler begins the same deadline
+    /// runs from dispatch, so an alarm held behind the input gate is still
+    /// bounded: at most two such deadlines and one operation deadline pass
+    /// before a lost alarm re-arms.
+    pub alarm_handler_budget_ms: u64,
     /// How long a cell waits after a failed dead-owner log recovery
     /// before it re-enters ownership resolution.
     ///
@@ -720,6 +729,14 @@ pub enum Event {
         now_ms: u64,
         now_mono_ms: u64,
     },
+    /// The handler of a firing alarm began, past the cell's input gate. Also
+    /// sent when its job ended without beginning, which the completion that
+    /// follows settles either way.
+    AlarmBegun {
+        op: OpId,
+        cell: CellId,
+        now_mono_ms: u64,
+    },
     AlarmFinished {
         op: OpId,
         /// The cell and epoch the firing was dispatched against. The gate the
@@ -1227,6 +1244,12 @@ pub enum Effect {
         cell: CellId,
         epoch: Epoch,
         scheduled_ms: i64,
+    },
+    /// Stop a firing alarm whose deadline passed. The handler's completion
+    /// still arrives as `AlarmFinished` for the same `op`.
+    AbortAlarm {
+        op: OpId,
+        cell: CellId,
     },
     Complete {
         request: RequestId,

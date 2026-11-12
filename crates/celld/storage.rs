@@ -422,12 +422,6 @@ pub fn schema(c: &Connection) -> anyhow::Result<()> {
          (scope TEXT PRIMARY KEY, actor_name TEXT)",
         [],
     )?;
-    c.execute(
-        "CREATE TABLE IF NOT EXISTS _cf_FACETS \
-         (scope TEXT NOT NULL, path TEXT NOT NULL, image BLOB NOT NULL, \
-          PRIMARY KEY(scope,path)) WITHOUT ROWID",
-        [],
-    )?;
     let alarm_columns = {
         let mut statement = c.prepare("PRAGMA table_info(_cf_ALARM)")?;
         let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -1071,59 +1065,20 @@ pub(crate) fn refresh_embedded_root(scope: &str, parent: &StorageIdentity) {
     });
 }
 
-fn owned_sqlite_data(bytes: &[u8]) -> anyhow::Result<rusqlite::serialize::OwnedData> {
-    let pointer = unsafe { rusqlite::ffi::sqlite3_malloc64(bytes.len() as u64) }.cast::<u8>();
-    let pointer = std::ptr::NonNull::new(pointer)
-        .ok_or_else(|| anyhow::anyhow!("allocate an embedded facet database"))?;
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.as_ptr(), bytes.len());
-        Ok(rusqlite::serialize::OwnedData::from_raw_nonnull(
-            pointer,
-            bytes.len(),
-        ))
-    }
-}
-
 /// Open a facet's own database file, which `crate::facet_streams`
-/// activated at `path`. A facet from before facets had streams of their own
-/// kept its database as an image in a row of its root's `_cf_FACETS`; a
-/// stream replication did not restore takes that image as its first content.
+/// activated at `path`.
 pub(crate) fn open_embedded(
     scope: &str,
     parent: &StorageIdentity,
     name: &str,
     path: &std::path::Path,
-    restored: bool,
     sqlite_vec: bool,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(parent.facet_path.len() < 3, "Facet nesting depth limit exceeded. The maximum depth including the root Durable Object is 4.");
     let mut facet_path = parent.facet_path.clone();
     facet_path.push(name.to_string());
     let stream = crate::engine_api::facet_cell(&parent.root_scope, &facet_path);
-    let mut connection = Connection::open(path)?;
-    let empty = connection.query_row("PRAGMA page_count", [], |row| row.get::<_, u64>(0))? == 0;
-    if !restored && empty {
-        let legacy = serde_json::to_string(&facet_path)?;
-        let root = Connection::open(&parent.root_path)?;
-        let image = root
-            .query_row(
-                "SELECT image FROM _cf_FACETS WHERE scope=?1 AND path=?2",
-                rusqlite::params![parent.root_scope, legacy],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?;
-        if let Some(image) = image {
-            let mut source = Connection::open_in_memory()?;
-            source.deserialize(
-                rusqlite::DatabaseName::Main,
-                owned_sqlite_data(&image)?,
-                true,
-            )?;
-            rusqlite::backup::Backup::new(&source, &mut connection)?
-                .run_to_completion(i32::MAX, std::time::Duration::ZERO, None)
-                .context("import the facet's legacy image")?;
-        }
-    }
+    let connection = Connection::open(path)?;
     schema(&connection)?;
     // Each run of a facet has its own scope, so a continuation from an
     // aborted instance cannot enter its replacement. The database is one
@@ -1150,31 +1105,6 @@ pub(crate) fn open_embedded(
             root_observed: parent.root_observed,
         },
     )
-}
-
-/// Delete the legacy `_cf_FACETS` images of a facet and every facet below it,
-/// so a deleted facet cannot import its old image when it is recreated.
-pub(crate) fn delete_legacy_facet(parent: &StorageIdentity, name: &str) -> anyhow::Result<()> {
-    let mut facet_path = parent.facet_path.clone();
-    facet_path.push(name.to_string());
-    let mut root = Connection::open(&parent.root_path)?;
-    let paths = {
-        let mut statement = root.prepare("SELECT path FROM _cf_FACETS WHERE scope=?1")?;
-        let rows = statement.query_map([&parent.root_scope], |row| row.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    let transaction = root.transaction()?;
-    for path in paths {
-        let candidate: Vec<String> = serde_json::from_str(&path)?;
-        if candidate.starts_with(&facet_path) {
-            transaction.execute(
-                "DELETE FROM _cf_FACETS WHERE scope=?1 AND path=?2",
-                rusqlite::params![parent.root_scope, path],
-            )?;
-        }
-    }
-    transaction.commit()?;
-    Ok(())
 }
 
 static NEXT_BATCH_SAVEPOINT: AtomicU64 = AtomicU64::new(1);
@@ -1283,8 +1213,8 @@ fn schema_version(connection: &Connection) -> u64 {
 /// The cell's committed-write position: SQLite's total completed row changes,
 /// data version, and schema cookie, monotonic for the life of the activation.
 /// The output gate samples it around a handler to tell a write from a read.
-/// The data version detects a legacy facet image deleted through a second
-/// connection, and the cookie makes DDL-only mutations count as writes.
+/// The data version detects a commit through a second connection, and the
+/// cookie makes DDL-only mutations count as writes.
 /// Widened only after the gated-frame flush learned to outlive its dispatch —
 /// before that, counting DDL turned every lazily-CREATE-ing connect handler
 /// into a "writer" whose held frames were silently lost. `None` when the scope
