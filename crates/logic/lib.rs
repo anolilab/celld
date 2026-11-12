@@ -4026,6 +4026,18 @@ impl State {
             return;
         }
 
+        self.place_on_peer(id, cell, claim, effects);
+    }
+
+    /// Look for fleet capacity for a cell this node cannot admit, refusing
+    /// first any capacity handoff aimed at it so its sender traverses on.
+    fn place_on_peer(
+        &mut self,
+        id: &str,
+        cell: &mut Cell,
+        claim: Claim,
+        effects: &mut Vec<Effect>,
+    ) {
         let handoffs: Vec<RequestId> = cell
             .requests
             .iter()
@@ -4496,6 +4508,30 @@ impl State {
             Ok(lease) => {
                 if self.refuse_new_ownership_during_drain(id, cell, record.node.as_deref(), effects)
                 {
+                    return;
+                }
+                // A node that can never host a cell would queue the takeover
+                // until the deadline and strand the cell, though a peer with
+                // room can take it over itself. Decided before the interlock
+                // so no log is recovered for a cell this node forwards.
+                if self.config.max_resident == 0 {
+                    let Some(epoch) = self.next_writer_epoch(id, cell, record.epoch, effects)
+                    else {
+                        return;
+                    };
+                    let prior = record.node.clone();
+                    self.place_on_peer(
+                        id,
+                        cell,
+                        Claim {
+                            guard: CasGuard::Match(record.etag),
+                            epoch,
+                            takeover: true,
+                            prior,
+                            reconciles: 0,
+                        },
+                        effects,
+                    );
                     return;
                 }
                 // The takeover interlock, decided HERE on the lease the
@@ -7143,3 +7179,6 @@ fn runtime_epoch(phase: &Phase) -> Option<Epoch> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod dead_owner_tests;
