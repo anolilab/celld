@@ -42,7 +42,7 @@ pub(crate) static GATE_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<GateReq>>
 /// prove.
 pub enum FacetReq {
     /// Activate the stream of the facet at `names` below `root`, and answer
-    /// its database file and whether replication restored it.
+    /// its database file.
     Open {
         root: String,
         epoch: u64,
