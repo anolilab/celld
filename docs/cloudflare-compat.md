@@ -150,6 +150,13 @@ execution.
 - `node:diagnostics_channel` does not export messages to a tail Worker.
 - `node:crypto` does not implement Diffie-Hellman, streaming signatures,
   ciphers, RSA-PSS, or DSA signatures and key generation.
+- `scrypt()` and `scryptSync()` take Node.js's parameters (`N`, `r`, `p`,
+  `maxmem`, and the `cost`, `blockSize` and `parallelization` aliases), its
+  defaults, and its errors. Both throw for rejected parameters; `scrypt()`
+  does not pass them to its callback. celld derives the key before it returns,
+  so a large `N` blocks the isolate. It also refuses a derivation that needs
+  more than 1 GiB, or a key longer than 1 GiB, whatever `maxmem` allows, with
+  the memory-limit error.
 - `generateKeyPairSync("ec")` generates keys on P-256, P-384 and P-521, under
   their NIST and OpenSSL names. SEC1 import and export work on all three, and
   an exported SEC1 key names its curve, as OpenSSL writes it.

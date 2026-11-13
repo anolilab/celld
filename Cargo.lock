@@ -369,6 +369,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "rustls-webpki",
+ "scrypt",
  "sec1",
  "serde",
  "serde_json",

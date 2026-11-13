@@ -1738,6 +1738,98 @@ pub(super) fn op_node_hkdf(
     }
 }
 
+/// Why scrypt refused its parameters. The two cases carry the wording Node
+/// gives each, so `$$scrypt` reports which one and the JS layer builds the
+/// error.
+#[derive(Debug, PartialEq, Eq)]
+enum ScryptRefusal {
+    /// `N` is below 2 or not a power of two, which OpenSSL rejects without
+    /// naming a reason.
+    Params,
+    /// The parameters need more memory than `maxmem` allows, or break a bound
+    /// RFC 7914 puts on `N`, `r` and `p`. OpenSSL reports all of them as
+    /// "memory limit exceeded".
+    MemoryLimit,
+}
+
+/// Memory scrypt may use however large a `maxmem` the caller asks for, and
+/// the longest key it derives. Node has no such bound and lets a caller
+/// allocate until the machine gives out; here the allocation happens inside
+/// the host process, so a request past the cap is refused with the
+/// memory-limit error instead.
+const SCRYPT_HOST_MEMORY_CAP: u128 = 1 << 30;
+
+/// scrypt (RFC 7914) for node:crypto, over the `scrypt` crate, with the
+/// parameter rules OpenSSL enforces and Node surfaces: `N` a power of two of
+/// at least 2, `p * r` below 2^30, `N` below 2^(16 * r), `128 * p * r` within
+/// `i32`, and `128 * r * p + 128 * r * (N + 2)` bytes within `maxmem`. The
+/// checks run in that order, which fixes which error a request that breaks
+/// several gets.
+fn scrypt_kdf(
+    password: &[u8],
+    salt: &[u8],
+    n: u32,
+    r: u32,
+    p: u32,
+    maxmem: u64,
+    keylen: usize,
+) -> Result<Vec<u8>, ScryptRefusal> {
+    const PR_MAX: u32 = (1 << 30) - 1;
+    if r == 0 || p == 0 || n < 2 || !n.is_power_of_two() {
+        return Err(ScryptRefusal::Params);
+    }
+    if p > PR_MAX / r {
+        return Err(ScryptRefusal::MemoryLimit);
+    }
+    let log_n = n.trailing_zeros();
+    if u64::from(log_n) >= 16 * u64::from(r) {
+        return Err(ScryptRefusal::MemoryLimit);
+    }
+    let block = 128 * u128::from(r);
+    let blen = block * u128::from(p);
+    if blen > i32::MAX as u128 {
+        return Err(ScryptRefusal::MemoryLimit);
+    }
+    let needed = blen + block * (u128::from(n) + 2);
+    if needed > u128::from(maxmem).min(SCRYPT_HOST_MEMORY_CAP) {
+        return Err(ScryptRefusal::MemoryLimit);
+    }
+    // The derived key is memory too, but Node does not count it against
+    // `maxmem`, so only the host cap bounds it.
+    if keylen as u128 > SCRYPT_HOST_MEMORY_CAP {
+        return Err(ScryptRefusal::MemoryLimit);
+    }
+    let mut out = vec![0u8; keylen];
+    if keylen == 0 {
+        return Ok(out);
+    }
+    let params = scrypt::Params::new(log_n as u8, r, p).map_err(|_| ScryptRefusal::Params)?;
+    scrypt::scrypt(password, salt, &params, &mut out).map_err(|_| ScryptRefusal::Params)?;
+    Ok(out)
+}
+
+/// `$$scrypt(password, salt, N, r, p, maxmem, keylen)` -> Uint8Array, or `1`
+/// for a bad `N` or `2` for the memory limit.
+pub(super) fn op_node_scrypt(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let (Some(password), Some(salt)) = (view_bytes(args.get(0)), view_bytes(args.get(1))) else {
+        return;
+    };
+    let n = args.get(2).uint32_value(scope).unwrap_or(0);
+    let r = args.get(3).uint32_value(scope).unwrap_or(0);
+    let p = args.get(4).uint32_value(scope).unwrap_or(0);
+    let maxmem = args.get(5).number_value(scope).unwrap_or(0.0).max(0.0) as u64;
+    let keylen = args.get(6).uint32_value(scope).unwrap_or(0) as usize;
+    match scrypt_kdf(&password, &salt, n, r, p, maxmem, keylen) {
+        Ok(out) => webcrypto_return_bytes(scope, rv, &out),
+        Err(ScryptRefusal::Params) => rv.set(v8::Integer::new(scope, 1).into()),
+        Err(ScryptRefusal::MemoryLimit) => rv.set(v8::Integer::new(scope, 2).into()),
+    }
+}
+
 /// Constant-time equality for equal-length byte views. The JS surfaces own
 /// their distinct argument and length errors; one native primitive owns the
 /// security property both APIs promise.
@@ -2009,4 +2101,93 @@ pub(super) fn op_webcrypto_aes_decrypt(
     rv: v8::ReturnValue<v8::Value>,
 ) {
     op_webcrypto_aes(scope, args, rv, false);
+}
+
+#[cfg(test)]
+mod scrypt_tests {
+    use super::{scrypt_kdf, ScryptRefusal};
+
+    const DEFAULT_MAXMEM: u64 = 32 * 1024 * 1024;
+
+    #[test]
+    fn matches_the_rfc_7914_vector() {
+        let key = scrypt_kdf(b"", b"", 16, 1, 1, DEFAULT_MAXMEM, 16).unwrap();
+        assert_eq!(
+            key,
+            [
+                0x77, 0xd6, 0x57, 0x62, 0x38, 0x65, 0x7b, 0x20, 0x3b, 0x19, 0xca, 0x42, 0xc1, 0x8a,
+                0x04, 0x97
+            ]
+        );
+    }
+
+    #[test]
+    fn a_zero_length_key_is_empty() {
+        assert_eq!(
+            scrypt_kdf(b"a", b"b", 16, 1, 1, DEFAULT_MAXMEM, 0),
+            Ok(vec![])
+        );
+    }
+
+    #[test]
+    fn refuses_a_bad_n_before_it_counts_memory() {
+        for n in [0, 1, 3, 15, u32::MAX] {
+            assert_eq!(
+                scrypt_kdf(b"", b"", n, 8, 1, 1, 16),
+                Err(ScryptRefusal::Params),
+                "N={n}"
+            );
+        }
+    }
+
+    #[test]
+    fn counts_memory_as_openssl_does() {
+        // 128 * r * p + 128 * r * (N + 2) for N=16, r=1, p=1.
+        assert!(scrypt_kdf(b"", b"", 16, 1, 1, 2432, 16).is_ok());
+        assert_eq!(
+            scrypt_kdf(b"", b"", 16, 1, 1, 2431, 16),
+            Err(ScryptRefusal::MemoryLimit)
+        );
+    }
+
+    #[test]
+    fn enforces_the_rfc_bounds_on_n_r_and_p() {
+        let huge = u64::MAX;
+        // N must stay below 2^(16 * r).
+        assert_eq!(
+            scrypt_kdf(b"", b"", 65536, 1, 1, huge, 16),
+            Err(ScryptRefusal::MemoryLimit)
+        );
+        // p * r must stay below 2^30.
+        assert_eq!(
+            scrypt_kdf(b"", b"", 2, 1 << 15, 1 << 15, huge, 16),
+            Err(ScryptRefusal::MemoryLimit)
+        );
+        assert_eq!(
+            scrypt_kdf(b"", b"", 2, u32::MAX, 1, huge, 16),
+            Err(ScryptRefusal::MemoryLimit)
+        );
+    }
+
+    #[test]
+    fn the_derived_key_counts_against_the_host_cap_only() {
+        assert_eq!(
+            scrypt_kdf(b"", b"", 2, 1, 1, DEFAULT_MAXMEM, (1 << 30) + 1),
+            Err(ScryptRefusal::MemoryLimit)
+        );
+        // A key longer than maxmem is fine: Node does not count it there.
+        assert_eq!(
+            scrypt_kdf(b"", b"", 2, 1, 1, 640, 4096).map(|key| key.len()),
+            Ok(4096)
+        );
+    }
+
+    #[test]
+    fn a_huge_maxmem_does_not_lift_the_host_cap() {
+        // 128 * 8 * (2^20 + 2) is just over the 1 GiB the host allows.
+        assert_eq!(
+            scrypt_kdf(b"", b"", 1 << 20, 8, 1, u64::MAX, 16),
+            Err(ScryptRefusal::MemoryLimit)
+        );
+    }
 }
