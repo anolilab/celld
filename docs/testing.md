@@ -205,11 +205,14 @@ skipped. Each test writes under its own prefix and deletes what it wrote.
 | Store | Version | Result | Where |
 | --- | --- | --- | --- |
 | RustFS | `1.0.5` | pass | every pull request and nightly |
-| SeaweedFS | `3.97` | **fail**: racing creates and racing updates each let several writers apply (4 to 16 of 16 in repeated runs) | nightly, expected to fail |
+| SeaweedFS | `3.97` | **fail**: racing creates and racing updates each let several writers apply (4 to 16 of 16 in repeated runs); everything else passes | nightly |
+| MinIO | | not tested: no pullable image | |
 
 SeaweedFS does not serialize conditional writes, so celld must not run its
-ownership records on it. MinIO is not in the table because it no longer
-publishes container images. Start a store locally with
+ownership records on it. The startup probe in `Bucket::validate` writes one
+request at a time, so it does not catch this. MinIO could not be tested
+because neither Docker Hub nor quay.io served a MinIO tag on 2026-11-13.
+Start a store locally with
 `crates/celld/tests/stores/run.sh rustfs|seaweedfs`, which brings the store up
 with Docker Compose, creates the bucket and runs the suite. The nightly job
 runs the same script and writes each store's line to its job summary, from

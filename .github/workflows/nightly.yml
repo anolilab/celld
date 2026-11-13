@@ -65,9 +65,11 @@ jobs:
 
   # Runs the object-store contract suite against each store in
   # crates/celld/tests/stores/compose.yml and writes one line per store to the
-  # job summary, which is what the table in docs/testing.md is refreshed from.
-  # SeaweedFS is expected to fail: it does not serialize racing conditional
-  # writes. Its entry stays so that a release that fixes it shows up here.
+  # job summary, which is what the table in docs/testing.md is updated from.
+  # SeaweedFS does not serialize racing conditional writes, so its racing
+  # tests are known to fail. They run last and do not fail the job, while
+  # everything else for that store must pass. The image tag is pinned, so
+  # retesting a newer release means bumping it in compose.yml.
   stores:
     name: Store contract (${{ matrix.provider }})
     strategy:
@@ -76,7 +78,6 @@ jobs:
         provider: [rustfs, seaweedfs]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    continue-on-error: ${{ matrix.provider == 'seaweedfs' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -87,7 +88,15 @@ jobs:
       - name: Run the contract suite
         run: |
           set -o pipefail
-          crates/celld/tests/stores/run.sh ${{ matrix.provider }} | tee "$RUNNER_TEMP/stores.log"
+          args=()
+          if [ "${{ matrix.provider }}" = seaweedfs ]; then args=(-- --skip racing_); fi
+          crates/celld/tests/stores/run.sh ${{ matrix.provider }} "${args[@]}" | tee "$RUNNER_TEMP/stores.log"
+      - name: Run the racing tests
+        if: ${{ matrix.provider == 'seaweedfs' }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          crates/celld/tests/stores/run.sh seaweedfs -- racing_ | tee "$RUNNER_TEMP/racing.log"
       - name: Record the result
         if: ${{ !cancelled() }}
         run: |
@@ -95,6 +104,7 @@ jobs:
             echo "### Store contract"
             echo
             tail -n 1 "$RUNNER_TEMP/stores.log" || true
+            tail -n 1 "$RUNNER_TEMP/racing.log" 2>/dev/null | sed 's/$/ (racing tests)/' || true
           } >> "$GITHUB_STEP_SUMMARY"
 
   audit:
