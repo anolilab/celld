@@ -455,15 +455,21 @@ fn normalize_key(der: &[u8], structure: &str) -> Result<(Vec<u8>, bool)> {
             Ok((key.to_pkcs8_der()?.as_bytes().to_vec(), true))
         }
         "sec1" => {
-            // SEC1 names no algorithm, so P-256 is the only reading celld has.
-            let key = p256::SecretKey::from_sec1_der(der)
-                .map_err(|_| anyhow!("invalid SEC1 EC private key (celld implements P-256)"))?;
-            Ok((
-                p256::pkcs8::EncodePrivateKey::to_pkcs8_der(&key)?
-                    .as_bytes()
-                    .to_vec(),
-                true,
-            ))
+            // SEC1 names no algorithm. Each curve checks the key's curve
+            // parameter and length, so the first one that parses it is the
+            // key's own.
+            macro_rules! pkcs8 {
+                ($c:ident) => {
+                    $c::SecretKey::from_sec1_der(der)
+                        .ok()
+                        .map(|key| $c::pkcs8::EncodePrivateKey::to_pkcs8_der(&key))
+                };
+            }
+            let document = pkcs8!(p256)
+                .or_else(|| pkcs8!(p384))
+                .or_else(|| pkcs8!(p521))
+                .ok_or_else(|| anyhow!("invalid SEC1 EC private key"))??;
+            Ok((document.as_bytes().to_vec(), true))
         }
         other => Err(anyhow!("unsupported key structure \"{other}\"")),
     }
@@ -1265,12 +1271,32 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                     let key = rsa::RsaPublicKey::from_public_key_der(&der)?;
                     ("RSA PUBLIC KEY", key.to_pkcs1_der()?.as_bytes().to_vec())
                 }
+                // With the curve named in `parameters`, as OpenSSL writes it:
+                // a SEC1 key does not otherwise say which curve it is on.
                 ("sec1", "ec") if private => {
-                    use p256::elliptic_curve::sec1::ToEncodedPoint;
-                    use p256::pkcs8::DecodePrivateKey;
-                    let key = p256::SecretKey::from_pkcs8_der(&der)?;
-                    let _ = key.public_key().to_encoded_point(false);
-                    ("EC PRIVATE KEY", key.to_sec1_der()?.to_vec())
+                    use sec1::der::Encode as _;
+                    let crv = ec_jwk_crv(&described)?;
+                    let oid = EC_CURVES
+                        .iter()
+                        .find(|(.., name)| *name == crv)
+                        .map(|(oid, ..)| *oid)
+                        .ok_or_else(|| anyhow!("unsupported EC curve {crv}"))?;
+                    macro_rules! sec1 {
+                        ($c:ident) => {{
+                            use $c::elliptic_curve::sec1::ToEncodedPoint;
+                            use $c::pkcs8::DecodePrivateKey;
+                            let key = $c::SecretKey::from_pkcs8_der(&der)?;
+                            let private = key.to_bytes();
+                            let public = key.public_key().to_encoded_point(false);
+                            sec1::EcPrivateKey {
+                                private_key: &private,
+                                parameters: Some(sec1::EcParameters::NamedCurve(oid)),
+                                public_key: Some(public.as_bytes()),
+                            }
+                            .to_der()?
+                        }};
+                    }
+                    ("EC PRIVATE KEY", ec_curve!(crv, sec1))
                 }
                 (structure, kind) => {
                     return Err(anyhow!("cannot export a {kind} key as {structure}"))

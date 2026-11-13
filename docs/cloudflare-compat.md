@@ -151,7 +151,8 @@ execution.
 - `node:crypto` does not implement Diffie-Hellman, streaming signatures,
   ciphers, RSA-PSS, or DSA signatures and key generation.
 - `generateKeyPairSync("ec")` generates keys on P-256, P-384 and P-521, under
-  their NIST and OpenSSL names.
+  their NIST and OpenSSL names. SEC1 import and export work on all three, and
+  an exported SEC1 key names its curve, as OpenSSL writes it.
 - `createPublicKey()` accepts a private key in PEM or JWK form and returns its
   public half, as in Node.js.
 - `KeyObject.toCryptoKey()` applies the requested algorithm, extractability,
