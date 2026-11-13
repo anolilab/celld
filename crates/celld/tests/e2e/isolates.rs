@@ -52,6 +52,9 @@ struct Released {
 /// Cell `a` waits on a promise that cell `b` settles, so `a` continues while
 /// `b`'s request is the one running. What `a` writes to its request's `/tmp`
 /// must stay with `a`.
+// Drives a server from the outside, like the harness; the boundary policy on
+// `tokio::spawn` and `tokio::time::timeout` is for code inside celld.
+#[allow(clippy::disallowed_methods)]
 #[tokio::test]
 async fn a_cell_that_resumes_during_another_keeps_its_own_tmp() {
     let server = std::sync::Arc::new(Server::start("isolate-sharing", &[]).await);
