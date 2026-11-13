@@ -3613,10 +3613,15 @@ impl State {
         websocket: WebSocketId,
         effects: &mut Vec<Effect>,
     ) {
+        // A quiescing cell is leaving this runtime. Only a socket that pins it
+        // finishes here; a hibernatable socket's event waits for the runtime
+        // that replaces it, or the swap would wait on work it keeps admitting.
         let held_resident = self.node_authoritative()
             && self.cells.get(&id).is_some_and(|cell| {
                 matches!(cell.phase, Phase::Resident { .. })
-                    && cell.websockets.contains_key(&websocket)
+                    && cell.websockets.get(&websocket).is_some_and(|kind| {
+                        !cell.quiescing || !matches!(kind, WebSocketKind::Hibernatable)
+                    })
             });
         if held_resident {
             self.complete_request(&id, request, Ok(Route::Local), effects);
@@ -6552,6 +6557,10 @@ impl State {
             // its reservation with residency, or the stale index consumes
             // a drain handoff slot even after the runtime is gone.
             self.quiescing_cells.remove(id);
+            // Sockets live and die with the runtime that holds them. Leaving
+            // them on a cell that is no longer resident claims a transport
+            // nothing serves; the stop would clear them a moment later.
+            cell.websockets.clear();
             set_phase(
                 &mut self.occupied,
                 cell,
