@@ -67,8 +67,8 @@ jobs:
   # crates/celld/tests/stores/compose.yml and writes one line per store to the
   # job summary, which is what the table in docs/testing.md is updated from.
   # SeaweedFS does not serialize racing conditional writes, so its racing
-  # tests are known to fail. They run last and do not fail the job, while
-  # everything else for that store must pass. The image tag is pinned, so
+  # tests are known to fail. They run last and their failure does not fail
+  # the job, while everything else for that store must pass. The image tag is pinned, so
   # retesting a newer release means bumping it in compose.yml.
   stores:
     name: Store contract (${{ matrix.provider }})
@@ -91,12 +91,13 @@ jobs:
           args=()
           if [ "${{ matrix.provider }}" = seaweedfs ]; then args=(-- --skip racing_); fi
           crates/celld/tests/stores/run.sh ${{ matrix.provider }} "${args[@]}" | tee "$RUNNER_TEMP/stores.log"
+      # A failing racing test is tolerated, but the run must reach its
+      # result line: a store or bucket that never came up fails the job.
       - name: Run the racing tests
         if: ${{ matrix.provider == 'seaweedfs' }}
-        continue-on-error: true
         run: |
-          set -o pipefail
-          crates/celld/tests/stores/run.sh seaweedfs -- racing_ | tee "$RUNNER_TEMP/racing.log"
+          crates/celld/tests/stores/run.sh seaweedfs -- racing_ | tee "$RUNNER_TEMP/racing.log" || true
+          grep -qE '^seaweedfs [^ ]+ (pass|fail)$' "$RUNNER_TEMP/racing.log"
       - name: Record the result
         if: ${{ !cancelled() }}
         run: |
