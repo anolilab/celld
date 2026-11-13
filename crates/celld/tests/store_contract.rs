@@ -13,6 +13,9 @@
 //! whether it passes or fails.
 //!
 //! Conditional deletes are not covered: celld never issues one.
+//!
+//! `faults` runs the client against the same bucket through a proxy that
+//! injects store failures.
 
 // The tests measure nothing and run outside the execution boundary that the
 // disallowed-methods policy protects.
@@ -25,6 +28,11 @@ use std::sync::Arc;
 
 use celld::bucket::Bucket;
 use futures_util::FutureExt;
+
+mod store_contract {
+    pub mod faults;
+    pub mod proxy;
+}
 
 const BUCKET_VAR: &str = "CELLD_STORE_CONTRACT_BUCKET";
 const RACERS: usize = 16;

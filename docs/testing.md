@@ -206,7 +206,30 @@ skipped. Each test writes under its own prefix and deletes what it wrote.
 | --- | --- | --- | --- |
 | RustFS | `1.0.5` | pass | every pull request |
 
-Other providers, a fault proxy and the outage scenarios are tracked in
+### Store faults
+
+The same test binary also runs the bucket client through a proxy that injects
+store failures into its requests, and checks the result with a direct client.
+It needs a plain-HTTP endpoint in `AWS_ENDPOINT_URL`, so CI runs it against
+RustFS. It pins these outcomes:
+
+| Fault on the request | Conditional write | Plain write |
+| --- | --- | --- |
+| 503 once | error, not retried, reported as possibly committed | retried, applies |
+| connection reset before the store | error, not retried, reported as possibly committed | |
+| store applies, response lost | error reported as possibly committed; the object is there | |
+| 429 | error, never a clean rejection | |
+| 429 on every request | | error after one attempt and two retries |
+| 403 | error reported as not committed | |
+| no answer | error within the 15 s request bound | |
+| 409 on an update | clean rejection, the same as a lost race | |
+
+A 409 on an update means other conditional writes were in flight, not that
+another writer won. A rejected node-lease renewal is read back before the node
+decides anything, but other callers of conditional writes take a rejection as
+final. That is tracked in [#36](https://github.com/anolilab/celld/issues/36).
+
+Other providers and the fleet-level outage scenarios are tracked in
 [#7](https://github.com/anolilab/celld/issues/7).
 
 ## Known failure edges
