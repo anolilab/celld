@@ -66,26 +66,36 @@ impl Server {
     }
 
     pub async fn get_text(&self, path: &str) -> String {
-        let response = self
-            .client
-            .get(self.url(path))
-            .send()
+        self.get(path)
             .await
-            .unwrap_or_else(|error| panic!("GET {path}: {error}"));
-        response.text().await.expect("read response body")
+            .text()
+            .await
+            .expect("read response body")
     }
 
     pub async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> T {
+        self.get(path)
+            .await
+            .json()
+            .await
+            .unwrap_or_else(|error| panic!("GET {path}: body is not JSON: {error}"))
+    }
+
+    /// A GET that must succeed: an error page would otherwise reach the
+    /// assertions as if it were the fixture's answer.
+    async fn get(&self, path: &str) -> reqwest::Response {
         let response = self
             .client
             .get(self.url(path))
             .send()
             .await
             .unwrap_or_else(|error| panic!("GET {path}: {error}"));
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            panic!("GET {path}: {status}: {body}");
+        }
         response
-            .json()
-            .await
-            .unwrap_or_else(|error| panic!("GET {path}: body is not JSON: {error}"))
     }
 
     /// Stops the server and starts it again on the same project directory, so
