@@ -3,8 +3,8 @@
 //! outcome with a direct client, so the faults reach only the call under
 //! test.
 //!
-//! These need a plain-HTTP S3-compatible endpoint in `AWS_ENDPOINT_URL`
-//! besides the contract bucket, and skip without one.
+//! These need an `s3://` contract bucket and a plain-HTTP endpoint in
+//! `AWS_ENDPOINT_URL`, and skip without them.
 
 use std::future::Future;
 use std::io::Write;
@@ -30,14 +30,24 @@ where
     F: FnOnce(Faulted) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let upstream = std::env::var("AWS_ENDPOINT_URL").ok().and_then(|url| {
+    if std::env::var(crate::BUCKET_VAR).is_ok_and(|spec| !spec.starts_with("s3://")) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "{test}: skipped, the proxy speaks S3 only"
+        );
+        return;
+    }
+    // The proxy relays to the endpoint's host and port, and the proxied
+    // client keeps its path, so requests reach the same route either way.
+    let endpoint = std::env::var("AWS_ENDPOINT_URL").ok().and_then(|url| {
         let url: hyper::Uri = url.parse().ok()?;
         if url.scheme_str() != Some("http") {
             return None;
         }
-        Some(format!("{}:{}", url.host()?, url.port_u16().unwrap_or(80)))
+        let upstream = format!("{}:{}", url.host()?, url.port_u16().unwrap_or(80));
+        Some((upstream, url.path().trim_end_matches('/').to_string()))
     });
-    let Some(upstream) = upstream else {
+    let Some((upstream, path)) = endpoint else {
         let _ = writeln!(
             std::io::stderr(),
             "{test}: skipped, AWS_ENDPOINT_URL is not a plain-HTTP endpoint"
@@ -48,14 +58,9 @@ where
         let proxy = Proxy::start(upstream).await;
         let spec = std::env::var(crate::BUCKET_VAR).expect("bucket spec");
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into());
-        let proxied = Bucket::open(
-            &spec,
-            Some(proxy.url()),
-            &region,
-            None,
-            Some("store-faults"),
-        )
-        .unwrap_or_else(|error| panic!("open {spec} through the proxy: {error:#}"));
+        let endpoint = format!("{}{path}", proxy.url());
+        let proxied = Bucket::open(&spec, Some(&endpoint), &region, None, Some("store-faults"))
+            .unwrap_or_else(|error| panic!("open {spec} through the proxy: {error:#}"));
         let key = format!("{prefix}/record");
         body(Faulted {
             direct,
