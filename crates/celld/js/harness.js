@@ -2359,14 +2359,77 @@ const __ptyOption = (pty) => {
   throw new TypeError(
     "pty must be true or an object with integer cols and rows from 1 to 65535.");
 };
-const __execStream = (id, which) => new ReadableStream({
-  type: "bytes",
-  async pull(controller) {
-    const chunk = await __container_exec_read(id, which);
-    if (chunk.byteLength === 0) controller.close();
-    else controller.enqueue(new Uint8Array(chunk));
-  },
-});
+// The promise of something a host op settles. The op is dropped when the
+// event that issued it ends, so a consumer that attaches from another event
+// must start an op of its own: `then`, which `await` calls, does that. The
+// host answers the new op with what the old one would have.
+class __ReissuingPromise extends Promise {
+  static get [Symbol.species]() { return Promise; }
+  then(onFulfilled, onRejected) {
+    if (this._arm) this._arm();
+    return super.then(onFulfilled, onRejected);
+  }
+}
+// A read is an op of the event that issued it, so a `pull()` that waited on
+// one would never finish, and a reader the object keeps for a later event would
+// hang. `pull()` therefore starts a read and returns: each demand, from any
+// event, starts its own read. Reads ask for chunks by number and the host
+// answers one number with one chunk, so two reads in flight for one demand
+// deliver it once. A `read()` promise of `getReader()` that is awaited from
+// another event while it is pending starts a read there too.
+const __reissuingReader = (stream, arm) => {
+  const getReader = stream.getReader.bind(stream);
+  stream.getReader = (options) => {
+    const reader = getReader(options);
+    const read = reader.read.bind(reader);
+    reader.read = (...args) => {
+      const inner = read(...args);
+      let settled = false;
+      const done = () => { settled = true; };
+      inner.then(done, done);
+      const promise = new __ReissuingPromise((resolve, reject) => inner.then(resolve, reject));
+      promise._arm = () => { if (!settled) arm(); };
+      return promise;
+    };
+    return reader;
+  };
+};
+const __execStream = (id, which) => {
+  let next = 0;
+  let ended = false;
+  let readingIn;
+  let controller;
+  const startRead = () => {
+    readingIn = __io_context_id();
+    const seq = next;
+    __container_exec_read(id, which, seq).then(
+      (chunk) => {
+        if (ended || seq !== next) return;
+        next++;
+        if (chunk.byteLength === 0) {
+          ended = true;
+          controller.close();
+        } else {
+          controller.enqueue(new Uint8Array(chunk));
+        }
+      },
+      (error) => {
+        if (ended) return;
+        ended = true;
+        controller.error(error);
+      },
+    );
+  };
+  const stream = new ReadableStream({
+    type: "bytes",
+    start(c) { controller = c; },
+    pull: startRead,
+  });
+  __reissuingReader(stream, () => {
+    if (!ended && readingIn !== __io_context_id()) startRead();
+  });
+  return stream;
+};
 class ContainerExecOutput {
   constructor(stdout, stderr, exitCode) {
     this.stdout = stdout;
@@ -2394,7 +2457,31 @@ class ContainerExecProcess {
   }
   get exitCode() {
     if (this._exitCode === null) {
-      this._exitCode = __container_exec_wait(this._id).then(Number);
+      let settle;
+      let fail;
+      const promise = new __ReissuingPromise((resolve, reject) => {
+        settle = resolve;
+        fail = reject;
+      });
+      let settled = false;
+      let waitingIn;
+      promise._arm = () => {
+        const event = __io_context_id();
+        if (settled || waitingIn === event) return;
+        waitingIn = event;
+        __container_exec_wait(this._id).then(
+          (code) => {
+            settled = true;
+            settle(Number(code));
+          },
+          (error) => {
+            settled = true;
+            fail(error);
+          },
+        );
+      };
+      this._exitCode = promise;
+      promise._arm();
     }
     return this._exitCode;
   }

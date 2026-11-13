@@ -248,7 +248,8 @@ fn process_arg(
     container::process(id).ok_or_else(|| "the process is closed".to_string())
 }
 
-/// One chunk of stdout (1) or stderr (2); an empty chunk is the end.
+/// Chunk `seq` of stdout (1) or stderr (2); an empty chunk is the end. See
+/// `container::Output` for why a chunk is asked for by number.
 pub(super) fn op_container_exec_read(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -256,9 +257,10 @@ pub(super) fn op_container_exec_read(
 ) {
     let process = process_arg(scope, &args);
     let which = number_arg(scope, &args, 1) as u8;
+    let seq = number_arg(scope, &args, 2);
     let async_id = asyncrt::enqueue_unrefed(async move {
         let process = process?;
-        Ok::<Vec<u8>, String>(process.read(which).await.to_vec())
+        Ok::<Vec<u8>, String>(process.read(which, seq).await.to_vec())
     });
     rv.set(promise_for(scope, async_id));
 }

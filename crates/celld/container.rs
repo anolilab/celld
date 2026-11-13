@@ -1524,8 +1524,8 @@ impl ContainerEngine {
             pid,
             docker: self.docker.clone(),
             stdin: tokio::sync::Mutex::new(Some(write)),
-            stdout: tokio::sync::Mutex::new(stdout_rx),
-            stderr: tokio::sync::Mutex::new(stderr_rx),
+            stdout: tokio::sync::Mutex::new(Output::new(stdout_rx)),
+            stderr: tokio::sync::Mutex::new(Output::new(stderr_rx)),
             ended,
             exit_code: tokio::sync::Mutex::new(None),
         });
@@ -1573,8 +1573,8 @@ pub struct ExecProcess {
     pub pid: i64,
     docker: Docker,
     stdin: tokio::sync::Mutex<Option<WriteHalf>>,
-    stdout: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
-    stderr: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
+    stdout: tokio::sync::Mutex<Output>,
+    stderr: tokio::sync::Mutex<Output>,
     /// True once the hijacked stream reached EOF, which the daemon sends
     /// when the process exits.
     ended: watch::Sender<bool>,
@@ -1604,14 +1604,55 @@ pub fn process_ended(id: u64) -> bool {
     process(id).is_none_or(|process| *process.ended.borrow())
 }
 
+/// One output stream of a process: the chunks the daemon sent that the
+/// object has not taken, and the chunk it was last given.
+///
+/// A read is asked for by sequence number, and the chunk stays here until
+/// the next number is asked for. The op that carries a read belongs to the
+/// event that issued it, and is dropped when that event ends, possibly after
+/// the chunk was taken from the channel and before it reached JavaScript. A
+/// read that is asked for again, by the same number, from another event gets
+/// the same chunk, so none is lost or delivered twice.
+struct Output {
+    chunks: mpsc::Receiver<Bytes>,
+    last: Option<(u64, Bytes)>,
+}
+
+impl Output {
+    fn new(chunks: mpsc::Receiver<Bytes>) -> Self {
+        Self { chunks, last: None }
+    }
+
+    /// Chunk number `seq`, taking it from the channel only when it is new.
+    async fn chunk(&mut self, seq: u64) -> Bytes {
+        if let Some((last, chunk)) = &self.last {
+            if *last == seq {
+                return chunk.clone();
+            }
+            // A number below the last answered is a read that another event
+            // had pending and whose reader has moved on. Nothing waits for
+            // its answer, so it takes nothing: a chunk taken for it would be
+            // dropped by the reader and lost.
+            if seq < *last {
+                return Bytes::new();
+            }
+        }
+        let chunk = self.chunks.recv().await.unwrap_or_default();
+        self.last = Some((seq, chunk.clone()));
+        chunk
+    }
+}
+
 impl ExecProcess {
-    /// One chunk of stdout (`1`) or stderr (`2`); empty at end of stream.
-    pub async fn read(&self, which: u8) -> Bytes {
-        let mut receiver = match which {
+    /// Chunk number `seq` of stdout (`1`) or stderr (`2`); empty at end of
+    /// stream. The numbers start at 0 and a caller asks for the next only
+    /// after it has the one before.
+    pub async fn read(&self, which: u8, seq: u64) -> Bytes {
+        let mut output = match which {
             1 => self.stdout.lock().await,
             _ => self.stderr.lock().await,
         };
-        receiver.recv().await.unwrap_or_default()
+        output.chunk(seq).await
     }
 
     pub async fn write(&self, bytes: &[u8]) -> Result<(), String> {
@@ -1898,5 +1939,42 @@ mod image_tests {
             spec.all_images().collect::<Vec<_>>(),
             ["celld-image:base", "celld-image:worker"]
         );
+    }
+}
+
+// The test drives a channel on a runtime of its own, outside the node.
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod output_tests {
+    use super::*;
+
+    fn run<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    #[test]
+    fn a_chunk_is_given_again_for_its_number_and_never_taken_for_an_old_one() {
+        run(async {
+            let (tx, rx) = mpsc::channel(8);
+            for chunk in ["a", "b", "c"] {
+                tx.send(Bytes::from(chunk)).await.unwrap();
+            }
+            drop(tx);
+            let mut output = Output::new(rx);
+            assert_eq!(output.chunk(0).await, "a");
+            // The same number again, as a read whose result was lost asks.
+            assert_eq!(output.chunk(0).await, "a");
+            assert_eq!(output.chunk(1).await, "b");
+            // A number the reader has moved past takes nothing from the
+            // channel, so "c" is still there for the next one.
+            assert_eq!(output.chunk(0).await, "");
+            assert_eq!(output.chunk(2).await, "c");
+            // The end of the stream is an empty chunk, and stays one.
+            assert_eq!(output.chunk(3).await, "");
+            assert_eq!(output.chunk(3).await, "");
+        });
     }
 }

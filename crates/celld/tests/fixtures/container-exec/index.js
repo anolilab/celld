@@ -171,6 +171,48 @@ export class Runner extends DurableObject {
           await process.output();
           return { before, after };
         });
+      // An exec kept across events: this event starts it, others consume it.
+      case "/spawn-late":
+        return run(async () => {
+          container.start();
+          this.process = await container.exec(["late"]);
+          // The promise is taken here, in this event, and awaited in another.
+          this.exit = this.process.exitCode;
+          return "spawned";
+        });
+      case "/exit-stored":
+        return run(() => this.exit);
+      case "/exit-getter":
+        return run(() => this.process.exitCode);
+      // A read issued here and left pending when this event ends.
+      case "/read-start":
+        return run(async () => {
+          container.start();
+          this.process = await container.exec(["late"]);
+          this.reader = this.process.stdout.getReader();
+          this.pending = this.reader.read();
+          return "reading";
+        });
+      case "/read-rest":
+        return run(async () => {
+          const decode = (result) =>
+            result.done ? null : new TextDecoder().decode(result.value);
+          const first = decode(await this.pending);
+          const second = decode(await this.reader.read());
+          const third = decode(await this.reader.read());
+          return { first, second, third };
+        });
+      // The reader's next read comes first; the read this object left pending
+      // in the other event is consumed after it.
+      case "/read-fresh":
+        return run(async () => {
+          const decode = (result) =>
+            result.done ? null : new TextDecoder().decode(result.value);
+          const fresh = this.reader.read();
+          const first = decode(await this.pending);
+          const second = decode(await fresh);
+          return { first, second };
+        });
       default:
         return new Response("not found", { status: 404 });
     }

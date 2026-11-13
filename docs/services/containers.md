@@ -117,6 +117,16 @@ the event that started it is still running. Otherwise it goes at the next
 `exec()` with the same signal, so a long-lived signal holds the listeners of its
 running processes and of those started since its last `exec()`.
 
+An object can keep a process, a reader, or the `exitCode` promise of a process
+across events. A read or a wait that one event left pending is dropped when that
+event ends, and the next event that reads the stream, or awaits the pending
+`read()` or `exitCode`, starts its own. Each chunk of output arrives once, in
+order, and every wait gets the same exit code. Only `getReader().read()` and
+`exitCode` re-arm on an `await` from another event; a consumer that wraps the
+stream first, such as `pipeTo()` or `tee()`, keeps the limit that a pending read
+needs the event that started it, and a new read in the later event starts the
+stream again.
+
 ## The image and the node
 
 `celld deploy` builds a Dockerfile in the project, or pulls an image reference,
@@ -218,6 +228,10 @@ count against `max_instances`. A start over the cap fails, and the node logs
   after the handler answers.
 - An `exec()` with `pty` has one output stream. `stdout` carries what `stderr`
   would, `stderr` is `null`, and `output().stderr` is empty.
+- A read that one event left pending continues in a later event when that event
+  awaits the `read()` of `getReader()` or `exitCode`, or reads the stream
+  again. A consumer that read through `pipeTo()`, `tee()`, or `Response` keeps
+  the limit that its pending read needs the event that started it.
 - On macOS, the node reaches a container through a published port, so the image
   must declare the port with `EXPOSE`. `enableInternet: false` has no effect on
   macOS.
