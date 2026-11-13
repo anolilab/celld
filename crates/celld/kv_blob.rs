@@ -137,10 +137,9 @@ pub(crate) async fn run(
 ///   CELLD_TEST_KV=no-sweep,fail-after-blob,min-ttl-ms=1000
 ///
 /// These are test-only and read the production environment rather than
-/// sitting behind `cfg(celld_internal_tests)`, because the code they steer
-/// is JavaScript and a cfg cannot reach it. `min-ttl-ms` shortens the
-/// sixty-second expiry floor; `no-sweep` stops reclamation so a test can pin
-/// the read filter; `fail-after-blob` fails a put between the blob write and
+/// sitting behind a cfg, because the code they steer is JavaScript and a cfg
+/// cannot reach it. `min-ttl-ms` shortens the sixty-second expiry floor;
+/// `no-sweep` stops reclamation so a test can pin the read filter; `fail-after-blob` fails a put between the blob write and
 /// the row commit; `race-sweep-put` holds a sweep after its mark snapshot
 /// until a new large put starts; `blob-sweep-ms` shortens the collector
 /// delay; `legacy-schema` creates the first release's inline-only table.

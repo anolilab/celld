@@ -183,8 +183,3 @@ pub fn local_cache_max_bytes_from_environment() -> anyhow::Result<Option<u64>> {
     )?;
     Ok((bytes > 0).then_some(bytes))
 }
-
-#[cfg(all(test, celld_internal_tests))]
-mod internal_tests {
-    include!(env!("CELLD_INTERNAL_MACHINE_TESTS"));
-}

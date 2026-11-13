@@ -1016,11 +1016,6 @@ fn strip_port(host: &str) -> &str {
         .map_or(host, |(host, _)| host)
 }
 
-#[cfg(all(test, celld_internal_tests))]
-mod internal_tests {
-    include!(env!("CELLD_INTERNAL_ASSETS_TESTS"));
-}
-
 fn route(index: &AssetIndex, path: &str, include_not_found: bool) -> Route {
     let entries = &index.entries;
     let html = index

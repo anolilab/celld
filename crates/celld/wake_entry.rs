@@ -4,13 +4,7 @@
 //! the service that holds it. Engine-neutral; `crate::js` re-exports every
 //! item at its old path.
 use crate::asyncrt;
-#[cfg(celld_internal_tests)]
-use std::collections::HashMap;
-#[cfg(celld_internal_tests)]
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-#[cfg(celld_internal_tests)]
-use std::sync::Mutex;
 use std::sync::OnceLock;
 
 /// The arm-time wake-entry gate, output-gate style (matching Durable
@@ -30,16 +24,6 @@ pub(crate) type ArmGateRx = tokio::sync::oneshot::Receiver<Result<(), String>>;
 #[derive(Default)]
 pub(crate) struct WakeEntryService {
     pub(crate) gate: OnceLock<ArmGate>,
-    #[cfg(celld_internal_tests)]
-    pub(crate) test_pending: Mutex<HashMap<String, Vec<ArmGateRx>>>,
-    #[cfg(celld_internal_tests)]
-    pub(crate) scripted: Mutex<std::collections::VecDeque<ArmGateRx>>,
-    #[cfg(celld_internal_tests)]
-    pub(crate) scripted_by_cell: Mutex<HashMap<String, std::collections::VecDeque<ArmGateRx>>>,
-    #[cfg(celld_internal_tests)]
-    pub(crate) drop_next_gated_reply_task: AtomicBool,
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) egress_gate_samples: Mutex<HashMap<(String, celld_logic::Channel), u64>>,
 }
 
 pub fn set_arm_gate(gate: ArmGate) {
@@ -91,21 +75,6 @@ pub(crate) fn launch_arm_gate(
     alarm: celld_logic::wake::AlarmSnapshot,
 ) -> Option<ArmGateRx> {
     let services = asyncrt::services();
-    #[cfg(celld_internal_tests)]
-    if let Some(rx) = services
-        .wake_entry()
-        .scripted_by_cell
-        .lock()
-        .unwrap()
-        .get_mut(cell)
-        .and_then(std::collections::VecDeque::pop_front)
-    {
-        return Some(rx);
-    }
-    #[cfg(celld_internal_tests)]
-    if let Some(rx) = services.wake_entry().scripted.lock().unwrap().pop_front() {
-        return Some(rx);
-    }
     services.wake_entry().gate.get()?;
     alarm.at_ms()?;
     let cell = cell.to_string();

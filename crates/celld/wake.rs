@@ -337,8 +337,6 @@ pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i6
 pub struct WakeFlusher {
     pub core: Mutex<WakeCore>,
     settled: Mutex<BTreeMap<String, PublicationId>>,
-    #[cfg(all(test, celld_internal_tests))]
-    reuse_identity: std::sync::atomic::AtomicBool,
 }
 
 /// The alarm source and its replication proof belong to the same host.
@@ -394,25 +392,6 @@ impl WakeFlusher {
         let publication = self.core.lock().unwrap().publication(cell, alarm);
         let Some(publication) = publication else {
             return Ok(());
-        };
-        #[cfg(all(test, celld_internal_tests))]
-        let publication = if self
-            .reuse_identity
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            celld_logic::wake::Publication {
-                key: celld_logic::wake::entry_key(
-                    alarm.at_ms().unwrap(),
-                    cell,
-                    PublicationId {
-                        epoch: alarm.source().unwrap().id.epoch,
-                        sequence: 1,
-                    },
-                ),
-                alarm,
-            }
-        } else {
-            publication
         };
         let body = serde_json::to_vec(&serde_json::json!({
             "format": 2, "cell": cell, "due_ms": alarm.at_ms(),
@@ -508,11 +487,6 @@ impl WakeFlusher {
 
     // Reuse a retired name at the actual PUT boundary, so the independent
     // store observer must catch a later DELETE destroying acknowledged work.
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn reuse_publication_identity_for_tooth(&self) {
-        self.reuse_identity
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
 }
 
 // Only `maintain` constructs this after all three remote proofs. A bare

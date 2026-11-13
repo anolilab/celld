@@ -1278,16 +1278,6 @@ fn follower_batch_range(name: &str, suffix: &str) -> Option<(u64, u64)> {
     Some((first.parse().ok()?, last.parse().ok()?))
 }
 
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn sync_directory(path: &Path) -> std::io::Result<()> {
-    let filesystem = celld_ltx::DirectFileSystem;
-    celld_ltx::FileSystem::sync_all(&filesystem, path)
-}
-
-#[cfg(celld_internal_tests)]
-type DirectorySyncForTest = dyn Fn(&Path) -> std::io::Result<()> + Send + Sync;
-
 #[derive(Default)]
 struct FollowerPersistTiming {
     write_us: u64,
@@ -1323,15 +1313,11 @@ pub struct FollowerStore {
     /// floor the 2026-08-25 gate decomposition landed on. A restart
     /// starts empty and conservatively re-syncs each chain once.
     synced_namespaces: Mutex<std::collections::BTreeSet<String>>,
-    #[cfg(celld_internal_tests)]
-    directory_sync_for_test: Arc<DirectorySyncForTest>,
 }
 
 impl FollowerStore {
     pub fn new(root: &Path, bucket: Option<Arc<Bucket>>, node: &str) -> Self {
         let filesystem = crate::asyncrt::fs();
-        #[cfg(celld_internal_tests)]
-        let directory_filesystem = filesystem.clone();
         Self {
             root: root.join("peerlog"),
             filesystem,
@@ -1340,48 +1326,9 @@ impl FollowerStore {
             logs: Mutex::new(HashMap::new()),
             guards: Mutex::new(HashMap::new()),
             synced_namespaces: Mutex::new(std::collections::BTreeSet::new()),
-            #[cfg(celld_internal_tests)]
-            directory_sync_for_test: Arc::new(move |path| directory_filesystem.sync_all(path)),
         }
     }
 
-    #[cfg(celld_internal_tests)]
-    #[doc(hidden)]
-    pub fn new_with_directory_sync_for_test(
-        root: &Path,
-        bucket: Option<Arc<Bucket>>,
-        node: &str,
-        directory_sync: impl Fn(&Path) -> std::io::Result<()> + Send + Sync + 'static,
-    ) -> Self {
-        let mut store = Self::new(root, bucket, node);
-        store.directory_sync_for_test = Arc::new(directory_sync);
-        store
-    }
-
-    /// A store over an injected filesystem, so a test can count every
-    /// fsync the serve path issues — the directory sync included, which is
-    /// why the directory seam is wired to the same filesystem here.
-    #[cfg(celld_internal_tests)]
-    #[doc(hidden)]
-    pub fn new_with_filesystem_for_test(
-        root: &Path,
-        bucket: Option<Arc<Bucket>>,
-        node: &str,
-        filesystem: Arc<dyn celld_ltx::FileSystem>,
-    ) -> Self {
-        let mut store = Self::new(root, bucket, node);
-        let directory_filesystem = filesystem.clone();
-        store.filesystem = filesystem;
-        store.directory_sync_for_test = Arc::new(move |path| directory_filesystem.sync_all(path));
-        store
-    }
-
-    #[cfg(celld_internal_tests)]
-    fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
-        (self.directory_sync_for_test)(path)
-    }
-
-    #[cfg(not(celld_internal_tests))]
     fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
         self.filesystem.sync_all(path)
     }
@@ -2692,12 +2639,6 @@ impl StreamWindow {
         let prior = self.watermark.fetch_max(minimum, Ordering::SeqCst);
         (minimum > prior).then_some(minimum)
     }
-
-    #[cfg(celld_internal_tests)]
-    #[doc(hidden)]
-    pub fn watermark(&self) -> u64 {
-        self.watermark.load(Ordering::SeqCst)
-    }
 }
 
 /// The fleet shipper for ONE ensemble at one epoch: assigns sequence
@@ -3985,22 +3926,6 @@ pub struct NodeLogManager {
     /// A bundle flush between its PUT and its credit; the graceful seal
     /// waits this out after latching `closing`.
     flush_in_flight: std::sync::atomic::AtomicBool,
-    #[cfg(all(test, celld_internal_tests))]
-    close_transition_pause: Mutex<Option<Arc<NodeLogTransitionPause>>>,
-    #[cfg(all(test, celld_internal_tests))]
-    maintenance_install_pause: Mutex<Option<Arc<NodeLogTransitionPause>>>,
-    #[cfg(all(test, celld_internal_tests))]
-    maintenance_publish_pause: Mutex<Option<Arc<NodeLogTransitionPause>>>,
-    #[cfg(all(test, celld_internal_tests))]
-    shipper_injection_calls: std::sync::atomic::AtomicU64,
-    /// The gather window budget. A test override lowers it to fold a
-    /// small session in several windows.
-    #[cfg(all(test, celld_internal_tests))]
-    recovery_gather_window_bytes: std::sync::atomic::AtomicU64,
-    /// The most row bytes one gather window held at once, the measure of
-    /// the memory a recovery costs.
-    #[cfg(all(test, celld_internal_tests))]
-    recovery_gather_peak_bytes: std::sync::atomic::AtomicU64,
     /// Every predecessor session's log is proven recovered; see
     /// `ensure_predecessors_recovered` for why this can latch.
     predecessors_clean: std::sync::atomic::AtomicBool,
@@ -4066,27 +3991,6 @@ impl DurabilityOwner {
         let ltx_tasks = ltx.take_task_owner();
         let registration = fleet.then(|| {
             ltx.register_durability(manager.clone())
-                .expect("a new durability owner cannot install on a stopped LTX service")
-        });
-        Self::from_claimed_registration(manager, fleet, ltx, ltx_tasks, registration)
-    }
-
-    /// Installs a gated shipper decorator at the shipping registration seam.
-    /// The lifecycle owner still retains the real manager, so the decorator
-    /// cannot replace its maintenance, shutdown, or bundle ownership.
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn new_with_shipper_for_world(
-        manager: Arc<NodeLogManager>,
-        fleet: bool,
-        shipper: Arc<dyn crate::ltx_repl::Shipper>,
-    ) -> Self {
-        manager
-            .shipper_injection_calls
-            .fetch_add(1, Ordering::SeqCst);
-        let ltx = manager.ltx.clone();
-        let ltx_tasks = ltx.take_task_owner();
-        let registration = fleet.then(|| {
-            ltx.register_durability_for_world(manager.clone(), shipper)
                 .expect("a new durability owner cannot install on a stopped LTX service")
         });
         Self::from_claimed_registration(manager, fleet, ltx, ltx_tasks, registration)
@@ -4394,16 +4298,6 @@ impl crate::ltx_repl::Shipper for NodeLogManager {
 }
 
 impl NodeLogManager {
-    #[cfg(all(test, celld_internal_tests))]
-    pub fn reset_shipper_injection_calls_for_world(&self) {
-        self.shipper_injection_calls.store(0, Ordering::SeqCst);
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub fn shipper_injection_calls_for_world(&self) -> u64 {
-        self.shipper_injection_calls.load(Ordering::SeqCst)
-    }
-
     /// `session` is the process's full log identity, `<node>/<generation>`,
     /// with the generation taken from the node lease record.
     pub fn new(
@@ -4422,18 +4316,6 @@ impl NodeLogManager {
             Arc::new(SignedPeerTransport::new(auth)),
             policy,
         )
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn new_with_transport(
-        session: &str,
-        bucket: Arc<Bucket>,
-        own_log: Arc<OwnLog>,
-        ltx: Arc<crate::ltx_repl::LtxRepl>,
-        transport: Arc<dyn LogTransport>,
-        policy: celld_logic::log_evict::EvictionPolicy,
-    ) -> Self {
-        Self::new_with_log_transport(session, bucket, own_log, ltx, transport, policy)
     }
 
     fn new_with_log_transport(
@@ -4467,20 +4349,6 @@ impl NodeLogManager {
             shortfall_logged_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             closing: std::sync::atomic::AtomicBool::new(false),
             flush_in_flight: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(all(test, celld_internal_tests))]
-            close_transition_pause: Mutex::new(None),
-            #[cfg(all(test, celld_internal_tests))]
-            maintenance_install_pause: Mutex::new(None),
-            #[cfg(all(test, celld_internal_tests))]
-            maintenance_publish_pause: Mutex::new(None),
-            #[cfg(all(test, celld_internal_tests))]
-            shipper_injection_calls: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(all(test, celld_internal_tests))]
-            recovery_gather_window_bytes: std::sync::atomic::AtomicU64::new(
-                RECOVERY_GATHER_WINDOW_BYTES,
-            ),
-            #[cfg(all(test, celld_internal_tests))]
-            recovery_gather_peak_bytes: std::sync::atomic::AtomicU64::new(0),
             predecessors_clean: std::sync::atomic::AtomicBool::new(false),
             recovery_locks: Mutex::new(BTreeMap::new()),
             gc_confirmed_empty: Mutex::new(std::collections::HashSet::new()),
@@ -5304,9 +5172,6 @@ impl NodeLogManager {
                 .await
                 .with_context(|| format!("list retained recovery bundles for {dead}"))?;
             let bundles_read = bundle_metas.len();
-            #[cfg(all(test, celld_internal_tests))]
-            let window_bytes = self.recovery_gather_window_bytes.load(Ordering::SeqCst);
-            #[cfg(not(all(test, celld_internal_tests)))]
             let window_bytes = RECOVERY_GATHER_WINDOW_BYTES;
             let windows = gather_windows(
                 bundle_metas
@@ -5364,9 +5229,6 @@ impl NodeLogManager {
                 }
                 bundles_ms += mono_ms().saturating_sub(fetch_started);
                 let held: u64 = gathered.values().map(|bytes| bytes.len() as u64).sum();
-                #[cfg(all(test, celld_internal_tests))]
-                self.recovery_gather_peak_bytes
-                    .fetch_max(held, Ordering::SeqCst);
                 gathered_bytes += held;
                 // Skip rows the drain points already folded into the
                 // per-cell prefix: one listing per cell bounds uploads to
@@ -5524,15 +5386,6 @@ impl NodeLogManager {
                 break;
             }
             crate::asyncrt::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        #[cfg(all(test, celld_internal_tests))]
-        {
-            // Capture the real folded record before the test pause. The
-            // final transition deliberately re-reads it under a fresh guard.
-            let transition = self.live_log.lock().await;
-            let _captured = transition.current();
-            drop(transition);
-            self.pause_close_transition_for_world().await;
         }
         let transition = self.live_log.lock().await;
         debug_assert!(!transition.is_running());
@@ -5807,8 +5660,6 @@ impl NodeLogManager {
         // flips through the lease chain before its first fleet credit. The
         // open itself rides an immediate renewal; a failure means our lease
         // is not applying and the posture stays bucket.
-        #[cfg(all(test, celld_internal_tests))]
-        self.pause_maintenance_publish_for_world().await;
         // Keep this check under the transition guard and immediately before
         // the remote write. A pass stopped before this point cannot publish.
         // A write admitted here can finish after fallback, so dead-session
@@ -5817,8 +5668,6 @@ impl NodeLogManager {
             return Ok(());
         }
         transition.write(Some(log_to_wire(&record, false))).await?;
-        #[cfg(all(test, celld_internal_tests))]
-        self.pause_maintenance_install_for_world().await;
         info!(
             epoch = record.epoch,
             members = ?record.ensemble,
@@ -6992,6 +6841,3 @@ impl NodeLogManager {
         Ok(())
     }
 }
-
-#[cfg(all(test, celld_internal_tests))]
-include!(env!("CELLD_INTERNAL_NODE_LOG_OBSERVERS"));

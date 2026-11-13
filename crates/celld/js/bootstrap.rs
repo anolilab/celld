@@ -116,7 +116,6 @@ static POST_HARNESS: &[BootstrapSource] = &[
 // one external buffer in the binary and checks the ASCII requirement at
 // compile time. Compiled code and the objects created by the script remain
 // isolate-local; this shares only the original source buffer.
-#[cfg(any(not(celld_internal_tests), all(test, celld_internal_tests)))]
 static HARNESS_SOURCE: v8::OneByteConst =
     v8::String::create_external_onebyte_const(HARNESS.as_bytes());
 
@@ -128,18 +127,6 @@ fn bootstrap_code_cache() -> &'static std::sync::Mutex<BootstrapCache> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<BootstrapCache>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(Default::default)
-}
-
-#[cfg(celld_internal_tests)]
-fn run_bootstrap_script<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    name: &'static str,
-    src: &str,
-    arguments: &InternalArguments<'s>,
-) -> Result<()> {
-    let code = v8::String::new(scope, src).unwrap();
-    run_internal_script(scope, Some(name), code, arguments)?;
-    Ok(())
 }
 
 fn run_bootstrap_static_script<'s>(
@@ -224,25 +211,6 @@ pub(super) fn run_internal_script<'s>(
         .ok_or_else(|| anyhow!("bootstrap run {name}"))
 }
 
-#[cfg(all(test, celld_internal_tests))]
-pub(super) fn harness_source_for_test<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-) -> v8::Local<'s, v8::String> {
-    shipping_harness_source(scope)
-}
-
-#[cfg(all(test, celld_internal_tests))]
-pub(super) fn bootstrap_sources_for_test<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-) -> Vec<(&'static str, v8::Local<'s, v8::String>)> {
-    PRELUDE
-        .iter()
-        .chain(POST_HARNESS)
-        .map(|source| (source.name, v8_strings::source(scope, source.source)))
-        .collect()
-}
-
-#[cfg(any(not(celld_internal_tests), all(test, celld_internal_tests)))]
 fn shipping_harness_source<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::String> {
     v8::String::new_from_onebyte_const(scope, &HARNESS_SOURCE).expect("static harness source")
 }
@@ -263,39 +231,6 @@ pub(super) fn install_harness<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     arguments: &InternalArguments<'s>,
 ) -> Result<()> {
-    #[cfg(celld_internal_tests)]
-    let harness = HARNESS
-        .replace(
-            "/*__CELLD_TEST_WORKFLOW_EVENT_CONSUMED__*/",
-            "__test_workflow_event_consumed();",
-        )
-        .replace(
-            "/*__CELLD_TEST_WORKFLOW_META_CREATED__*/",
-            "__test_workflow_meta_created();",
-        )
-        .replace(
-            "/*__CELLD_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/",
-            "__test_workflow_terminal_alarm_set();",
-        )
-        .replace(
-            "/*__CELLD_TEST_WORKFLOW_BEFORE_PAUSE_SETTLE__*/",
-            concat!(
-                "if (globalThis.__test_workflow_pause_settle_race === true) { ",
-                "await this.__wfResume(); ",
-                "globalThis.__test_workflow_pause_settle_race = false; }"
-            ),
-        )
-        .replace(
-            "/*__CELLD_TEST_WORKFLOW_AFTER_RUN_STARTED__*/",
-            concat!(
-                "if (globalThis.__test_workflow_pause_settle_race === true) { ",
-                "await globalThis.__test_workflow_callback_started(); ",
-                "await this.__wfPause(); globalThis.__test_workflow_release(); }"
-            ),
-        );
-    #[cfg(celld_internal_tests)]
-    run_bootstrap_script(scope, "harness.js", harness.as_str(), arguments)?;
-    #[cfg(not(celld_internal_tests))]
     {
         let harness = shipping_harness_source(scope);
         run_internal_script(scope, Some("harness.js"), harness, arguments)?;

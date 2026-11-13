@@ -425,48 +425,10 @@ impl PreservedCache {
 pub(crate) fn sqlite_snapshot(
     source: &std::path::Path,
     destination: &std::path::Path,
-    vfs: Option<&str>,
 ) -> anyhow::Result<()> {
-    {
-        let open = |path: &std::path::Path, flags, role| {
-            #[cfg(celld_internal_tests)]
-            {
-                match vfs {
-                    Some(vfs) => crate::fault::with_connection_role(role, || {
-                        Connection::open_with_flags_and_vfs(path, flags, vfs)
-                    }),
-                    None => Connection::open_with_flags(path, flags),
-                }
-            }
-            #[cfg(not(celld_internal_tests))]
-            {
-                let _ = role;
-                debug_assert!(vfs.is_none());
-                Connection::open_with_flags(path, flags)
-            }
-        };
-        let source = open(
-            source,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            "sqlite_snapshot_source",
-        )?;
-        let mut destination = open(
-            destination,
-            rusqlite::OpenFlags::default(),
-            "sqlite_snapshot_destination",
-        )?;
-        let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
-        backup.run_to_completion(64, Duration::from_millis(5), None)?;
-    }
+    let source = Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut destination = Connection::open_with_flags(destination, rusqlite::OpenFlags::default())?;
+    let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
+    backup.run_to_completion(64, Duration::from_millis(5), None)?;
     Ok(())
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn sqlite_snapshot_on_vfs_for_test(
-    source: &std::path::Path,
-    destination: &std::path::Path,
-    vfs: &str,
-) -> anyhow::Result<()> {
-    sqlite_snapshot(source, destination, Some(vfs))
 }

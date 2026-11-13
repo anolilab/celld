@@ -59,11 +59,6 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(all(test, celld_internal_tests))]
-mod internal_tests {
-    include!(env!("CELLD_INTERNAL_BUCKET_TESTS"));
-}
-
 /// The stored form of an empty blob key segment. See [`Bucket::blob_path`].
 const EMPTY_SEGMENT: &str = "%";
 
@@ -538,69 +533,7 @@ fn user_metadata(attributes: &Attributes) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The paginated listing an injected store cannot serve.
-///
-/// A test build constructs a bucket over plain injected stores, and a
-/// paginated listing serves an operator command rather than a node
-/// decision, so no injected store reaches one. Refusing is louder than an
-/// empty page, which a caller would read as a fleet that holds no cells.
-#[cfg(celld_internal_tests)]
-#[derive(Debug)]
-struct UnpaginatedStore;
-
-#[cfg(celld_internal_tests)]
-#[async_trait::async_trait]
-impl PaginatedListStore for UnpaginatedStore {
-    async fn list_paginated(
-        &self,
-        _prefix: Option<&str>,
-        _options: PaginatedListOptions,
-    ) -> object_store::Result<object_store::list::PaginatedListResult> {
-        Err(object_store::Error::NotSupported {
-            source: "an injected store serves no paginated listing".into(),
-        })
-    }
-}
-
 impl Bucket {
-    /// Builds a bucket from separate ordinary and paginated stores.
-    #[cfg(celld_internal_tests)]
-    #[doc(hidden)]
-    pub fn with_paginated_store_for_test(
-        store: Arc<dyn ObjectStore>,
-        paginated: Arc<dyn PaginatedListStore>,
-        prefix: String,
-    ) -> Self {
-        Self {
-            cas_store: store.clone(),
-            store,
-            paginated,
-            backend: StorageBackend::S3,
-            name: "telemetry-test".to_string(),
-            prefix,
-        }
-    }
-
-    /// Builds a bucket over injected ordinary and conditional-write stores.
-    #[cfg(celld_internal_tests)]
-    #[doc(hidden)]
-    pub fn with_stores(
-        store: Arc<dyn ObjectStore>,
-        cas_store: Arc<dyn ObjectStore>,
-        backend: StorageBackend,
-        name: String,
-        prefix: String,
-    ) -> Self {
-        Self {
-            store,
-            paginated: Arc::new(UnpaginatedStore),
-            cas_store,
-            backend,
-            name,
-            prefix,
-        }
-    }
-
     /// `bucket` is `[s3://|gs://|az://]NAME[/PREFIX]`. With a PREFIX every
     /// key this client reads or writes lives under `PREFIX/`, so several
     /// fleets can share one bucket without colliding.

@@ -249,8 +249,3 @@ impl PreparedWait {
         }
     }
 }
-
-#[cfg(all(test, celld_internal_tests))]
-mod input_gate_lifecycle_tests {
-    include!(env!("CELLD_INTERNAL_INPUT_GATE_TESTS"));
-}

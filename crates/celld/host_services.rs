@@ -23,8 +23,6 @@ pub struct HostMetricsSample {
 
 enum MetricsBackend {
     Production(Mutex<ProcessLoadSampler>),
-    #[cfg(celld_internal_tests)]
-    Scripted(Mutex<HostMetricsSample>),
 }
 
 /// All process-like services owned by one execution domain.
@@ -35,8 +33,6 @@ pub struct HostServices {
     websockets: crate::js::WebSocketService,
     http_streams: Arc<crate::js::HttpStreamService>,
     metrics: MetricsBackend,
-    #[cfg(all(test, celld_internal_tests))]
-    handoff_transport: Mutex<Option<Arc<dyn crate::actor::HandoffTransportForTest>>>,
 }
 
 impl HostServices {
@@ -48,44 +44,11 @@ impl HostServices {
             websockets: crate::js::WebSocketService::default(),
             http_streams: Arc::new(crate::js::HttpStreamService::default()),
             metrics: MetricsBackend::Production(Mutex::new(ProcessLoadSampler::default())),
-            #[cfg(all(test, celld_internal_tests))]
-            handoff_transport: Mutex::new(None),
-        }
-    }
-
-    #[cfg(celld_internal_tests)]
-    pub fn scripted() -> Self {
-        Self {
-            domain: OnceLock::new(),
-            node_load: OnceLock::new(),
-            wake_entry: crate::js::WakeEntryService::default(),
-            websockets: crate::js::WebSocketService::default(),
-            http_streams: Arc::new(crate::js::HttpStreamService::default()),
-            metrics: MetricsBackend::Scripted(Mutex::new(HostMetricsSample::default())),
-            #[cfg(all(test, celld_internal_tests))]
-            handoff_transport: Mutex::new(None),
         }
     }
 
     pub fn set_node_load(&self, load: Arc<LiveLoad>) {
         let _ = self.node_load.set(load);
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn set_handoff_transport_for_test(
-        &self,
-        transport: Arc<dyn crate::actor::HandoffTransportForTest>,
-    ) {
-        let mut slot = self.handoff_transport.lock().unwrap();
-        assert!(slot.is_none(), "the handoff transport is already installed");
-        *slot = Some(transport);
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn handoff_transport_for_test(
-        &self,
-    ) -> Option<Arc<dyn crate::actor::HandoffTransportForTest>> {
-        self.handoff_transport.lock().unwrap().clone()
     }
 
     pub(crate) fn bind_domain(&self, domain: crate::asyncrt::DomainToken) {
@@ -128,16 +91,6 @@ impl HostServices {
         self.http_streams.clone()
     }
 
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn quarantine_http_streams(&self) {
-        self.http_streams.quarantine();
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn close_http_streams(&self) {
-        self.http_streams.close();
-    }
-
     /// Collect off the core so filesystem reads cannot delay a lease.
     #[allow(clippy::disallowed_methods)] // `/proc` is host telemetry, not node storage.
     pub fn sample_metrics(&self) -> HostMetricsSample {
@@ -177,17 +130,7 @@ impl HostServices {
                     fd_limit,
                 }
             }
-            #[cfg(celld_internal_tests)]
-            MetricsBackend::Scripted(sample) => *sample.lock().unwrap(),
         }
-    }
-
-    #[cfg(celld_internal_tests)]
-    pub fn set_scripted_metrics(&self, sample: HostMetricsSample) {
-        let MetricsBackend::Scripted(current) = &self.metrics else {
-            panic!("scripted metrics require a simulation HostServices instance");
-        };
-        *current.lock().unwrap() = sample;
     }
 }
 

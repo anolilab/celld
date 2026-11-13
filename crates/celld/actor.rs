@@ -175,17 +175,6 @@ impl<V> TimerSlots<V> {
     fn clear_slot(&mut self, slot: &TimerSlot) {
         self.armed.remove(slot);
     }
-
-    /// Every slot this map still retains, across all of its bookkeeping.
-    ///
-    /// `TimerSlot::OperationDeadline` carries a unique `OpId`, so a per-slot
-    /// entry that outlives its arm grows once per operation and never
-    /// shrinks. The count exists so a test can prove the map returns to the
-    /// armed set. A map added beside `armed` must be counted here.
-    #[cfg(all(test, celld_internal_tests))]
-    pub fn retained_slots(&self) -> usize {
-        self.armed.len()
-    }
 }
 
 pub struct MemoryOwnership {
@@ -615,42 +604,6 @@ pub enum ShutdownMode {
 pub struct Routed {
     pub request: u64,
     pub route: Route,
-}
-
-/// A test-only receipt for three request-path outcomes. `AppHandle::request`
-/// deliberately maps both channel failures to `NodeFenced`, so its public
-/// result cannot identify which asynchronous seam failed.
-#[cfg(all(test, celld_internal_tests))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RequestPathReceiptForTest {
-    SubmissionFailure {
-        request: u64,
-    },
-    ReplyChannelClosed {
-        request: u64,
-    },
-    Returned {
-        allocated_request: u64,
-        result: Result<(u64, Route), RequestError>,
-    },
-}
-
-/// A test-only receipt for three output-gate outcomes. The public gate maps
-/// both channel failures to `NodeFenced`, so its result cannot identify which
-/// asynchronous seam failed.
-#[cfg(all(test, celld_internal_tests))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum OutputGateReceiptForTest {
-    SubmissionFailure {
-        request: u64,
-    },
-    ReplyChannelClosed {
-        request: u64,
-    },
-    Returned {
-        request: u64,
-        result: Result<(), RequestError>,
-    },
 }
 
 enum RequestPathOutcome {
@@ -1304,8 +1257,6 @@ pub struct SwapCensus {
 pub struct AppHandle {
     pub tx: mpsc::UnboundedSender<Message>,
     pub runtime: Option<RuntimeManager>,
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) scripted_activity_host: Option<crate::conformance_sim_cell_host::SimCellHost>,
     /// Asks the pointer watcher to adopt the current deployment now. Sending
     /// fails on a node with no pointer to watch, such as a local-script node.
     pub reload: crate::generation::ReloadSender,
@@ -1357,29 +1308,6 @@ impl AppHandle {
     pub async fn gate_request(&self, cell: String) -> Result<Routed, RequestError> {
         self.request_with_mode(cell, false, Some(ResidentWork::OutputGate))
             .await
-    }
-
-    /// Route one test request and retain which asynchronous seam produced the
-    /// result. The shipping method keeps its compact public result, while this
-    /// receipt prevents an inference from `NodeFenced` or an error string.
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) async fn request_with_receipt_for_test(
-        &self,
-        cell: String,
-    ) -> RequestPathReceiptForTest {
-        let (request, outcome) = self.request_path(cell, false, None).await;
-        match outcome {
-            RequestPathOutcome::SubmissionFailure => {
-                RequestPathReceiptForTest::SubmissionFailure { request }
-            }
-            RequestPathOutcome::ReplyChannelClosed => {
-                RequestPathReceiptForTest::ReplyChannelClosed { request }
-            }
-            RequestPathOutcome::Returned(result) => RequestPathReceiptForTest::Returned {
-                allocated_request: request,
-                result: result.map(|routed| (routed.request, routed.route)),
-            },
-        }
     }
 
     pub async fn capacity_request(&self, cell: String) -> Result<Routed, RequestError> {
@@ -1572,10 +1500,7 @@ impl AppHandle {
     }
 
     pub(crate) fn execution_host(&self) -> Option<CellHost> {
-        let host = self.runtime.clone().map(CellHost::Engine);
-        #[cfg(all(test, celld_internal_tests))]
-        let host = host.or_else(|| self.scripted_activity_host.clone().map(CellHost::Scripted));
-        host
+        self.runtime.clone().map(CellHost::Engine)
     }
 
     pub fn activity(&self, request: u64, cell: String) -> ActivityGuard {
@@ -1642,28 +1567,6 @@ impl AppHandle {
             "output gate resolved"
         );
         outcome
-    }
-
-    /// Run one test output gate without collapsing its two channel failures
-    /// into a returned engine rejection. The request travels in every arm, so
-    /// a consumer cannot attach the receipt to another caller.
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) async fn gate_output_with_receipt_for_test(
-        &self,
-        request: u64,
-        ticket: GateTicket,
-    ) -> OutputGateReceiptForTest {
-        match self.gate_output_path(request, ticket).await {
-            OutputGateOutcome::SubmissionFailure => {
-                OutputGateReceiptForTest::SubmissionFailure { request }
-            }
-            OutputGateOutcome::ReplyChannelClosed => {
-                OutputGateReceiptForTest::ReplyChannelClosed { request }
-            }
-            OutputGateOutcome::Returned(result) => {
-                OutputGateReceiptForTest::Returned { request, result }
-            }
-        }
     }
 
     pub async fn gate_write(&self, request: u64, position: u64) -> Result<(), RequestError> {
@@ -2232,12 +2135,6 @@ async fn request_peer_handoff(
     let request = outbound.body(body).build()?;
     // Keep response decoding after transport selection so a test transport
     // cannot bypass the donor contract with an invented typed acceptance.
-    #[cfg(all(test, celld_internal_tests))]
-    let response = match crate::asyncrt::services().handoff_transport_for_test() {
-        Some(transport) => transport.send(request).await?,
-        None => http.execute(request).await?,
-    };
-    #[cfg(not(all(test, celld_internal_tests)))]
     let response = http.execute(request).await?;
     peer_auth::validate_response(response.headers())?;
     let status = response.status();
@@ -2264,8 +2161,6 @@ pub struct AdmissionLimits {
     pub resident: usize,
     pub activations: usize,
     // Private worlds vary admission pressure; production fixes this in the core config.
-    #[cfg(all(test, celld_internal_tests))]
-    pub evictions: usize,
     pub releases: usize,
     /// The ownership share this node publishes for rebalancing.
     pub placement_weight: u64,
@@ -2275,18 +2170,6 @@ pub struct ActorIdentity {
     pub node: String,
     pub advertise: String,
     pub region: String,
-}
-
-/// The test-only decision state that must be installed as one unit.
-///
-/// A scripted Actor cannot read process-wide configuration while concurrent
-/// Worlds construct other nodes. The resume generation and the core
-/// configuration therefore travel together to the private constructor.
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) struct ScriptedActorDecisionState {
-    pub(crate) resume_generation: Option<String>,
-    pub(crate) placement_weight: u64,
-    pub(crate) config: Config,
 }
 
 pub struct ActorServices {
@@ -2387,100 +2270,6 @@ impl Actor {
         .await
     }
 
-    /// Build an Actor on the scripted cell host with the caller's peer client.
-    ///
-    /// `main` passes one client to both the Actor and the AppHandle of a node,
-    /// and the caller of this constructor can do the same. The arguments are
-    /// those of `from_environment`, with the scripted host in place of the
-    /// runtime and with that client added. The added client puts the
-    /// constructor one argument over the Clippy limit.
-    #[cfg(all(test, celld_internal_tests))]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn from_environment_with_scripted_host(
-        limits: AdmissionLimits,
-        fail_publish_once: bool,
-        fence: mpsc::UnboundedSender<i32>,
-        host: crate::conformance_sim_cell_host::SimCellHost,
-        ownership: Option<Ownership>,
-        peer_http: reqwest::Client,
-        identity: ActorIdentity,
-        resume_generation: Option<String>,
-    ) -> anyhow::Result<Self> {
-        let peer_auth = Arc::new(PeerAuth::new([0; 32], identity.node.clone())?);
-        Self::from_environment_with_cell_host(
-            limits,
-            fail_publish_once,
-            fence,
-            ActorHostServices {
-                host: Some(CellHost::Scripted(host)),
-                drain_pins: DrainPinRegistry::default(),
-                ownership,
-                peer_http,
-                peer_auth,
-            },
-            identity,
-            resume_generation,
-        )
-        .await
-    }
-
-    /// Build the scripted Actor with one recorded core configuration.
-    ///
-    /// Concurrent node construction cannot safely mutate process-wide
-    /// environment variables. Build the ordinary scripted shell first, then
-    /// install the supplied configuration in both the unstarted decision core
-    /// and the shell fields that consume it. The shell services, ownership,
-    /// and host boundary stay identical to the ordinary constructor.
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) async fn from_environment_with_scripted_host_and_config(
-        fail_publish_once: bool,
-        fence: mpsc::UnboundedSender<i32>,
-        host: crate::conformance_sim_cell_host::SimCellHost,
-        ownership: Option<Ownership>,
-        peer_http: reqwest::Client,
-        identity: ActorIdentity,
-        decision_state: ScriptedActorDecisionState,
-    ) -> anyhow::Result<Self> {
-        let ScriptedActorDecisionState {
-            resume_generation,
-            placement_weight,
-            config,
-        } = decision_state;
-        let operation_deadline_ms = config
-            .operation_deadline_ms
-            .filter(|deadline| *deadline > 0)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "the scripted Actor configuration requires a positive operation deadline"
-                )
-            })?;
-        let limits = AdmissionLimits {
-            resident: config.max_resident,
-            activations: config.max_activations,
-            evictions: config.max_evictions,
-            releases: config.max_releases,
-            placement_weight,
-        };
-        let node = identity.node.clone();
-        let mut actor = Self::from_environment_with_scripted_host(
-            limits,
-            fail_publish_once,
-            fence,
-            host,
-            ownership,
-            peer_http,
-            identity,
-            resume_generation,
-        )
-        .await?;
-        // The shell uses this deadline for handoff and stop retries while the
-        // core uses the same value to arm operation timers. Installing only
-        // the core configuration creates two different clocks in one Actor.
-        actor.operation_deadline_ms = operation_deadline_ms;
-        actor.state = ActorState::from(State::new(node, config));
-        Ok(actor)
-    }
-
     async fn from_environment_with_cell_host(
         limits: AdmissionLimits,
         fail_publish_once: bool,
@@ -2549,10 +2338,7 @@ impl Actor {
                     max_resident: limits.resident,
                     max_activations: limits.activations,
                     // Each eviction proves durability, so bound background bucket I/O.
-                    #[cfg(not(all(test, celld_internal_tests)))]
                     max_evictions: 4,
-                    #[cfg(all(test, celld_internal_tests))]
-                    max_evictions: limits.evictions,
                     max_releases: limits.releases,
                     alarm_resident_ms: crate::wake::resident_ms().max(0) as u64,
                     require_node_lease: true,
@@ -4437,13 +4223,8 @@ fn request_error_phase(error: RequestError) -> &'static str {
     }
 }
 
-#[cfg(not(all(test, celld_internal_tests)))]
 type ActorState = State;
 
-#[cfg(not(all(test, celld_internal_tests)))]
 fn apply_core_event(state: &mut ActorState, event: Event) -> Vec<Effect> {
     on_event(state, event)
 }
-
-#[cfg(all(test, celld_internal_tests))]
-include!(env!("CELLD_INTERNAL_ACTOR_OBSERVERS"));

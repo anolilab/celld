@@ -61,17 +61,6 @@ use celld_logic::durability::{proof_deadline, ProofProgress, ProofWait};
 /// and in-flight object-store requests under high write fan-out.
 const SYNC_CONCURRENCY: usize = 64;
 
-/// The upload slots this node starts with. The simulation narrows them to
-/// put a second cell's upload in the queue on purpose, which is the state
-/// the durability wait's queued regime exists for.
-fn sync_concurrency() -> usize {
-    #[cfg(celld_internal_tests)]
-    if let Some(slots) = sync_concurrency_for_world() {
-        return slots;
-    }
-    SYNC_CONCURRENCY
-}
-
 /// Max LTX object downloads across every restore on this node. A hot cell can
 /// contain thousands of L0 files, so serial reads turn a takeover into minutes
 /// of terminal failures. This shared ceiling hides round-trip latency without
@@ -435,10 +424,6 @@ struct OwnedTask {
 struct TaskGroupInner {
     next_id: AtomicU64,
     tasks: Mutex<Vec<OwnedTask>>,
-    #[cfg(celld_internal_tests)]
-    started_roles: Mutex<std::collections::BTreeSet<&'static str>>,
-    #[cfg(celld_internal_tests)]
-    joined_failures: AtomicU64,
 }
 
 struct TaskCompletion {
@@ -491,10 +476,6 @@ impl TaskGroup {
             inner: Arc::new(TaskGroupInner {
                 next_id: AtomicU64::new(0),
                 tasks: Mutex::new(Vec::new()),
-                #[cfg(celld_internal_tests)]
-                started_roles: Mutex::new(std::collections::BTreeSet::new()),
-                #[cfg(celld_internal_tests)]
-                joined_failures: AtomicU64::new(0),
             }),
         }
     }
@@ -512,8 +493,6 @@ impl TaskGroup {
             return false;
         }
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
-        #[cfg(celld_internal_tests)]
-        self.inner.started_roles.lock().unwrap().insert(role);
         let completion = TaskCompletion {
             group: Arc::downgrade(&self.inner),
             id,
@@ -553,33 +532,9 @@ impl TaskGroup {
             let result = (&mut joining.task.as_mut().unwrap().handle).await;
             let _completed = joining.task.take().unwrap();
             if let Err(error) = result {
-                #[cfg(celld_internal_tests)]
-                self.inner.joined_failures.fetch_add(1, Ordering::SeqCst);
                 warn!(role, %error, "durability task stopped with an error");
             }
         }
-    }
-
-    #[cfg(celld_internal_tests)]
-    pub(crate) fn roles_for_world(&self) -> Vec<&'static str> {
-        self.inner
-            .started_roles
-            .lock()
-            .unwrap()
-            .iter()
-            .copied()
-            .collect()
-    }
-
-    #[cfg(celld_internal_tests)]
-    pub(crate) fn live_roles_for_world(&self) -> Vec<&'static str> {
-        self.inner
-            .tasks
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|task| task.role)
-            .collect()
     }
 }
 
@@ -736,8 +691,6 @@ struct CellCompaction {
     /// that handoff attempt ends. See `HandoffCompactionPause`.
     handoff_paused: AtomicBool,
     cancel: Notify,
-    #[cfg(all(test, celld_internal_tests))]
-    finish_pause: Mutex<Option<Arc<CompactionFinishPauseForWorld>>>,
     /// Serializes threshold compaction with the final handoff snapshot. The
     /// handoff path pauses background work, then waits here before it reads
     /// the quiesced database image.
@@ -935,20 +888,6 @@ struct Cell {
     /// Notified when `synced_seq` advances (or a sync fails), waking waiters.
     ready: Notify,
     compaction: Option<CellCompaction>,
-    #[cfg(all(test, celld_internal_tests))]
-    sync_credit_pause: Mutex<Option<Arc<SyncCreditPauseForWorld>>>,
-    #[cfg(all(test, celld_internal_tests))]
-    observer_cell: String,
-    #[cfg(all(test, celld_internal_tests))]
-    observer_epoch: u64,
-    #[cfg(all(test, celld_internal_tests))]
-    durability_ticket_receipts: Mutex<Vec<LtxDurabilityTicketReceiptForWorldV1>>,
-    #[cfg(all(test, celld_internal_tests))]
-    upload_round_receipts: Mutex<Vec<LtxUploadRoundReceiptForWorldV1>>,
-    #[cfg(all(test, celld_internal_tests))]
-    fleet_credit_receipts: Mutex<Vec<LtxFleetCreditReceiptForWorldV1>>,
-    #[cfg(all(test, celld_internal_tests))]
-    fleet_capture_receipts: Mutex<Vec<LtxFleetCaptureReceiptForWorld>>,
 }
 type CellHandle = Arc<Cell>;
 
@@ -1241,9 +1180,6 @@ pub struct LtxRepl {
     /// One connection pool for the whole node, shared by every cell client.
     store: Arc<dyn ObjectStore>,
     ltx_host: LtxHost,
-    /// An explicit SQLite VFS for both managed connections. Production keeps
-    /// this unset.
-    vfs_name: Option<String>,
     cells: Arc<Mutex<BTreeMap<(String, u64), CellHandle>>>,
     stopped_cells: Arc<Mutex<BTreeMap<(String, u64), CellHandle>>>,
     /// Serializes a release admission with the final shutdown snapshot. A
@@ -1305,12 +1241,6 @@ pub struct LtxRepl {
     registration: Arc<Mutex<RegistrationState>>,
     stop: StopToken,
     task_owner: Mutex<Option<LtxTaskOwner>>,
-    #[cfg(celld_internal_tests)]
-    activation_install_pause: Mutex<Option<Arc<LtxActivationInstallPause>>>,
-    #[cfg(celld_internal_tests)]
-    close_local_replicas_pause: Mutex<Option<Arc<LtxReplicaClosePause>>>,
-    #[cfg(celld_internal_tests)]
-    panic_next_release_close: AtomicBool,
     /// The budget for one durability proof, in milliseconds. Fixed at
     /// construction, so the hot write path pays no environment lookup.
     durability_timeout_ms: u64,
@@ -1355,109 +1285,6 @@ pub struct LtxRepl {
 }
 
 impl LtxRepl {
-    /// Cfg-gated constructor over an injected store.
-    #[cfg(celld_internal_tests)]
-    pub fn start_with_store_for_test(watch: &Path, store: Arc<dyn ObjectStore>) -> Self {
-        Self::start_with_store(watch, store, None, 0)
-    }
-
-    /// Build the production loop topology over an injected object store,
-    /// with the settings that production reads from the environment.
-    #[cfg(celld_internal_tests)]
-    pub fn start_with_store(
-        watch: &Path,
-        store: Arc<dyn ObjectStore>,
-        compaction: Option<CompactionConfig>,
-        flush_ms: u64,
-    ) -> Self {
-        Self::start_with_store_and_optional_vfs(
-            watch,
-            store,
-            compaction,
-            flush_ms,
-            None,
-            LtxConfig::from_env(),
-        )
-    }
-
-    /// Build the same loop topology with `config`, and route managed SQLite
-    /// through `vfs`. A simulated fleet passes each node its own config.
-    #[cfg(celld_internal_tests)]
-    pub(crate) fn start_with_store_on_vfs(
-        watch: &Path,
-        store: Arc<dyn ObjectStore>,
-        compaction: Option<CompactionConfig>,
-        flush_ms: u64,
-        vfs: &str,
-        config: LtxConfig,
-    ) -> Self {
-        Self::start_with_store_and_optional_vfs(
-            watch,
-            store,
-            compaction,
-            flush_ms,
-            Some(vfs.to_string()),
-            config,
-        )
-    }
-
-    #[cfg(celld_internal_tests)]
-    fn start_with_store_and_optional_vfs(
-        watch: &Path,
-        store: Arc<dyn ObjectStore>,
-        compaction: Option<CompactionConfig>,
-        flush_ms: u64,
-        vfs_name: Option<String>,
-        config: LtxConfig,
-    ) -> Self {
-        Self::assemble(
-            watch,
-            store,
-            TimestampMetadataKey::default(),
-            "test".into(),
-            String::new(),
-            None,
-            "auto".into(),
-            None,
-            compaction,
-            flush_ms,
-            deterministic_ltx_host(),
-            vfs_name,
-            DEFAULT_DURABILITY_TIMEOUT_SECS * 1_000,
-            config,
-        )
-    }
-
-    /// Cfg-gated constructor with additive L1 compaction enabled.
-    #[cfg(celld_internal_tests)]
-    pub fn start_with_compaction_for_test(
-        watch: &Path,
-        store: Arc<dyn ObjectStore>,
-        min_txids: u64,
-        concurrency: usize,
-    ) -> Self {
-        Self::assemble(
-            watch,
-            store,
-            TimestampMetadataKey::default(),
-            "test".into(),
-            String::new(),
-            None,
-            "auto".into(),
-            None,
-            Some(CompactionConfig {
-                min_txids,
-                min_bytes: COMPACTION_MAX_INPUT_BYTES / 2,
-                concurrency,
-            }),
-            0,
-            deterministic_ltx_host(),
-            None,
-            DEFAULT_DURABILITY_TIMEOUT_SECS * 1_000,
-            LtxConfig::from_env(),
-        )
-    }
-
     pub(crate) fn start(
         watch: &Path,
         backend: crate::bucket::StorageBackend,
@@ -1516,7 +1343,6 @@ impl LtxRepl {
             compaction,
             flush_ms,
             production_ltx_host(),
-            None,
             durability_timeout_ms,
             LtxConfig::from_env(),
         ))
@@ -1536,7 +1362,6 @@ impl LtxRepl {
         compaction: Option<CompactionConfig>,
         flush_ms: u64,
         ltx_host: LtxHost,
-        vfs_name: Option<String>,
         durability_timeout_ms: u64,
         config: LtxConfig,
     ) -> Self {
@@ -1559,7 +1384,7 @@ impl LtxRepl {
             sync_loop(
                 cells.clone(),
                 dirty.clone(),
-                Arc::new(Semaphore::new(sync_concurrency())),
+                Arc::new(Semaphore::new(SYNC_CONCURRENCY)),
                 registration.clone(),
                 stop.clone(),
                 tasks.clone(),
@@ -1592,7 +1417,6 @@ impl LtxRepl {
             credentials,
             store,
             ltx_host,
-            vfs_name,
             cells,
             stopped_cells: Arc::new(Mutex::new(BTreeMap::new())),
             replica_close_gate: Mutex::new(()),
@@ -1619,12 +1443,6 @@ impl LtxRepl {
                 tasks,
                 replica_close_tasks,
             })),
-            #[cfg(celld_internal_tests)]
-            activation_install_pause: Mutex::new(None),
-            #[cfg(celld_internal_tests)]
-            close_local_replicas_pause: Mutex::new(None),
-            #[cfg(celld_internal_tests)]
-            panic_next_release_close: AtomicBool::new(false),
             durability_timeout_ms,
             node_proof_ms: Arc::new(AtomicU64::new(0)),
             snapshot_budget_bytes: AtomicU64::new(
@@ -1671,11 +1489,7 @@ impl LtxRepl {
         if cells.is_empty() {
             return None;
         }
-        #[cfg(celld_internal_tests)]
-        let pause = self.take_replica_close_pause_for_world();
         Some(asyncrt::blocking(move || {
-            #[cfg(celld_internal_tests)]
-            pause_replica_close_for_world(pause);
             for ((cell, epoch), handle) in cells {
                 close_replica_or_warn(&handle, &cell, epoch);
             }
@@ -1695,15 +1509,6 @@ impl LtxRepl {
             shipper: manager.clone(),
             manager,
         })
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn register_durability_for_world(
-        &self,
-        manager: Arc<crate::node_log::NodeLogManager>,
-        shipper: Arc<dyn Shipper>,
-    ) -> Option<DurabilityRegistration> {
-        self.register_targets(RegisteredTargets { shipper, manager })
     }
 
     fn register_targets(&self, targets: RegisteredTargets) -> Option<DurabilityRegistration> {
@@ -2498,7 +2303,7 @@ impl LtxRepl {
                     let name = celld_ltx::paged_vfs::next_registration_name();
                     celld_ltx::paged_vfs::register_paged_vfs(
                         &name,
-                        self.vfs_name.as_deref(),
+                        None,
                         &dst,
                         std::sync::Arc::new(source),
                     )
@@ -2583,8 +2388,7 @@ impl LtxRepl {
         let db_open_started_mono_ms = asyncrt::mono_ms();
         let dst_ = dst.clone();
         let ltx_host = self.ltx_host.clone();
-        // The paged VFS (this activation) takes precedence over the fault VFS.
-        let vfs_name = paged_vfs_name.clone().or_else(|| self.vfs_name.clone());
+        let vfs_name = paged_vfs_name.clone();
         let truncate_pages = self.truncate_pages_for_cell(cell);
         // Capture must finish opening before the application's SQLite connection
         // or schema setup runs. An earlier write can hide a torn WAL header and
@@ -2594,9 +2398,6 @@ impl LtxRepl {
                 Some(vfs_name) => Db::open_with_host_and_vfs(&dst_, ltx_host, vfs_name),
                 None => Db::open_with_host(&dst_, ltx_host),
             };
-            #[cfg(celld_internal_tests)]
-            let mut db = crate::fault::with_connection_role("celld_ltx_db", || open_db(ltx_host))?;
-            #[cfg(not(celld_internal_tests))]
             let mut db = open_db(ltx_host)?;
             if let Some(pages) = truncate_pages {
                 db.truncate_page_n = pages;
@@ -2688,20 +2489,6 @@ impl LtxRepl {
             percell_txid: AtomicU64::new(seed.map_or(0, |pos| pos.txid.0)),
             syncing: AtomicBool::new(false),
             ready: Notify::new(),
-            #[cfg(all(test, celld_internal_tests))]
-            sync_credit_pause: Mutex::new(None),
-            #[cfg(all(test, celld_internal_tests))]
-            observer_cell: cell.to_string(),
-            #[cfg(all(test, celld_internal_tests))]
-            observer_epoch: epoch,
-            #[cfg(all(test, celld_internal_tests))]
-            durability_ticket_receipts: Mutex::new(Vec::new()),
-            #[cfg(all(test, celld_internal_tests))]
-            upload_round_receipts: Mutex::new(Vec::new()),
-            #[cfg(all(test, celld_internal_tests))]
-            fleet_credit_receipts: Mutex::new(Vec::new()),
-            #[cfg(all(test, celld_internal_tests))]
-            fleet_capture_receipts: Mutex::new(Vec::new()),
             compaction: self.compaction_queue.as_ref().map(|queue| {
                 let fetcher = Arc::new(SinkFetcher {
                     registration: self.registration.clone(),
@@ -2734,14 +2521,10 @@ impl LtxRepl {
                     cancelled: AtomicBool::new(false),
                     handoff_paused: AtomicBool::new(false),
                     cancel: Notify::new(),
-                    #[cfg(all(test, celld_internal_tests))]
-                    finish_pause: Mutex::new(None),
                     run: tokio::sync::Mutex::new(()),
                 }
             }),
         });
-        #[cfg(celld_internal_tests)]
-        self.pause_activation_install_for_world().await;
         // Shutdown publishes stop before it takes the close gate and this map.
         // An activation that linearizes first is in shutdown's snapshot; one
         // that linearizes later closes its just-opened database and cannot
@@ -2868,34 +2651,6 @@ impl LtxRepl {
         });
     }
 
-    /// How much of the cut a paged activation's file holds, for a world
-    /// that waits on the background fill.
-    #[cfg(all(test, celld_internal_tests))]
-    pub fn hydration_for_test(
-        &self,
-        cell: &str,
-        epoch: u64,
-    ) -> Option<celld_ltx::paged_vfs::Hydration> {
-        celld_ltx::paged_vfs::hydration(&self.paged_vfs_name(cell, epoch)?)
-    }
-
-    /// The test chain-size threshold for paging, so a world can
-    /// page a small cut or clone one.
-    #[cfg(all(test, celld_internal_tests))]
-    pub fn set_paged_min_bytes_for_test(&self, bytes: u64) {
-        self.paged_min_bytes.store(bytes, Ordering::Relaxed);
-    }
-
-    /// The test switch for paged restore, so a world runs its
-    /// schedules over the fault path without the process environment. It
-    /// pages every cut; `set_paged_min_bytes_for_test` restores a threshold.
-    #[cfg(all(test, celld_internal_tests))]
-    pub fn set_paged_restore_for_test(&self, on: bool) {
-        self.paged_restore.store(on, Ordering::Relaxed);
-        self.paged_fleet.store(on, Ordering::Relaxed);
-        self.paged_min_bytes.store(0, Ordering::Relaxed);
-    }
-
     /// The fleet's answer to "can every live node read a paged epoch". The
     /// fleet sampler sets it from the leases; returns the prior value so the
     /// caller logs a transition once.
@@ -2929,49 +2684,8 @@ impl LtxRepl {
             .and_then(|handle| handle.paged_vfs.clone())
     }
 
-    /// Run the managed database's real checkpoint at a controlled test cut.
-    /// A second SQLite connection keeps the managed reader's lock held and
-    /// cannot exercise its truncate path. The test driver selects timing;
-    /// the shipping Db still owns capture, lock release, and checkpoint order.
-    /// Observe the result on the native lane before waking its async caller.
-    /// A later writer can repair a failed WAL header before that caller runs,
-    /// so delayed classification against the current image loses the cause.
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) async fn checkpoint_for_world<T, F>(
-        &self,
-        cell: &str,
-        epoch: u64,
-        mode: celld_ltx::CheckpointMode,
-        observe: F,
-    ) -> anyhow::Result<T>
-    where
-        T: Send + 'static,
-        F: FnOnce(anyhow::Result<()>) -> anyhow::Result<T> + Send + 'static,
-    {
-        let handle = self
-            .cells
-            .lock()
-            .unwrap()
-            .get(&(cell.to_owned(), epoch))
-            .cloned()
-            .ok_or_else(|| anyhow!("checkpoint requires a resident {cell} epoch {epoch}"))?;
-        asyncrt::blocking(move || {
-            let mut replica = handle.replica.lock().unwrap();
-            let result = managed_db_mut(&mut replica)
-                .ok_or_else(|| anyhow!("checkpoint lost its managed database"))
-                .and_then(|db| db.checkpoint(mode).map_err(anyhow::Error::new));
-            observe(result)
-        })
-        .await
-        .map_err(|error| anyhow!("checkpoint task failed: {error}"))?
-    }
-
     // Reopening a frozen image must use the same execution-domain host as
     // activation. A direct test host would bypass clock and filesystem adapters.
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn host_for_world(&self) -> LtxHost {
-        self.ltx_host.clone()
-    }
 
     /// The output gate's primitive: take a durability ticket and return once a
     /// background sync that captured this write has completed, coalescing
@@ -2997,8 +2711,6 @@ impl LtxRepl {
             anyhow::bail!("ltx cell not resident: {cell} epoch {epoch}");
         };
         let ticket = handle.req_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        #[cfg(all(test, celld_internal_tests))]
-        handle.record_durability_ticket_for_world(position, ticket);
         self.dirty.notify_one();
         self.dirty_ship.notify_one();
         let source = self
@@ -3170,20 +2882,6 @@ impl LtxRepl {
         }
     }
 
-    /// Return the configured durability deadline to a deterministic
-    /// world, so a bounded-liveness assertion uses the production value.
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn durability_timeout_ms_for_world(&self) -> u64 {
-        self.durability_timeout_ms
-    }
-
-    /// Lower the handoff snapshot budget, so a test world can hand off a
-    /// small database the way production hands off a whale.
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn set_handoff_snapshot_budget_for_world(&self, bytes: u64) {
-        self.snapshot_budget_bytes.store(bytes, Ordering::Relaxed);
-    }
-
     /// Close this cell after a final durability pass and install its database
     /// as the previous-epoch cache entry which the next activation consumes.
     ///
@@ -3254,10 +2952,6 @@ impl LtxRepl {
                     "managed replica close was deferred to local shutdown for {cell} epoch {epoch}"
                 ));
             }
-            #[cfg(celld_internal_tests)]
-            let pause = self.take_replica_close_pause_for_world();
-            #[cfg(celld_internal_tests)]
-            let panic_close = self.take_release_close_panic_for_world();
             let stopped_cells = self.stopped_cells.clone();
             let failed_release_closes = self.failed_release_closes.clone();
             let close_key = key.clone();
@@ -3269,10 +2963,6 @@ impl LtxRepl {
                 async move {
                     let task_handle = close_handle.clone();
                     let close_result = asyncrt::blocking(move || {
-                        #[cfg(celld_internal_tests)]
-                        assert!(!panic_close, "injected managed release-close panic");
-                        #[cfg(celld_internal_tests)]
-                        pause_replica_close_for_world(pause);
                         close_replica(&task_handle)
                     })
                     .await;
@@ -3880,7 +3570,7 @@ impl LtxRepl {
             self.paged_vfs_name(cell, epoch).is_none(),
             "{cell} epoch {epoch} is paged in; inspect it from the bucket"
         );
-        sqlite_snapshot(&source, &path, self.vfs_name.as_deref())?;
+        sqlite_snapshot(&source, &path)?;
         Ok(Some(RestoredSnapshot::new(
             epoch,
             path,
@@ -4165,18 +3855,11 @@ async fn sync_cell(handle: CellHandle) -> Option<bool> {
                 .pending_bytes
                 .fetch_add(bytes.len() as u64, Ordering::SeqCst);
         }
-        #[cfg(all(test, celld_internal_tests))]
-        let round_ordinal = handle.begin_upload_round_for_world(captured, *min_txid, *max_txid);
         if let Err(error) = handle
             .client
             .write_ltx_file(0, TXID(*min_txid), TXID(*max_txid), bytes)
             .await
         {
-            #[cfg(all(test, celld_internal_tests))]
-            handle.finish_upload_round_for_world(
-                round_ordinal,
-                LtxUploadRoundStatusForWorldV1::Failed,
-            );
             warn!(%error, min_txid, max_txid, "ltx upload failed");
             handle
                 .last_sync_ms
@@ -4184,11 +3867,6 @@ async fn sync_cell(handle: CellHandle) -> Option<bool> {
             handle.ready.notify_waiters();
             return Some(false);
         }
-        #[cfg(all(test, celld_internal_tests))]
-        handle.finish_upload_round_for_world(
-            round_ordinal,
-            LtxUploadRoundStatusForWorldV1::Completed,
-        );
     }
     if let Some(last) = last {
         // Advance the replica's uploaded watermark; `syncing` serializes
@@ -4199,8 +3877,6 @@ async fn sync_cell(handle: CellHandle) -> Option<bool> {
             replica.seed_pos(Pos::new(TXID(last), 0));
         }
         credit_percell_upload(&handle, last);
-        #[cfg(all(test, celld_internal_tests))]
-        handle.pause_after_sync_credit_for_world().await;
     }
     handle.synced_seq.fetch_max(captured, Ordering::SeqCst);
     maybe_queue_compaction(&handle, handle.durable_txid.load(Ordering::SeqCst));
@@ -4369,14 +4045,6 @@ async fn compact_cell(
     };
 
     *compaction.fetcher.rows.lock().await = None;
-    #[cfg(all(test, celld_internal_tests))]
-    {
-        let pause = compaction.finish_pause.lock().unwrap().take();
-        if let Some(pause) = pause {
-            pause.reached.store(true, Ordering::SeqCst);
-            pause.release.notified().await;
-        }
-    }
     let outcome = match result {
         Some(Ok(CompactionResult {
             output: Some(output),
@@ -5208,19 +4876,6 @@ async fn ship_loop(
         // frame, not only that the bucket already covers them. Queue the
         // empty credit through the same ordered pipeline, so an earlier
         // failure discards it instead of releasing an unproved fleet ticket.
-        #[cfg(all(test, celld_internal_tests))]
-        let observer_rounds = credits
-            .iter()
-            .map(|(handle, tickets, position)| {
-                let count = entries
-                    .iter()
-                    .filter(|entry| {
-                        entry.cell == handle.observer_cell && entry.epoch == handle.observer_epoch
-                    })
-                    .count();
-                handle.begin_fleet_capture_for_world(*tickets, *position, count, capture_epoch)
-            })
-            .collect::<Vec<_>>();
         let append = if entries.is_empty() {
             None
         } else {
@@ -5237,8 +4892,6 @@ async fn ship_loop(
         let submitted = asyncrt::mono_ms();
         inflight.push_back(Box::pin(async move {
             ShipRound {
-                #[cfg(all(test, celld_internal_tests))]
-                observer_rounds,
                 completion: match append {
                     Some(append) => ShipRoundCompletion::Append(append.await),
                     None => ShipRoundCompletion::OrderedEmpty,
@@ -5276,8 +4929,6 @@ enum ShipRoundCompletion {
 
 /// One pipelined round's completion, applied strictly in submission order.
 struct ShipRound {
-    #[cfg(all(test, celld_internal_tests))]
-    observer_rounds: Vec<LtxFleetCaptureForWorld>,
     completion: ShipRoundCompletion,
     credits: Vec<(CellHandle, u64, u64)>,
     covered_seq: u64,
@@ -5315,10 +4966,6 @@ fn apply_round(
     let proof_last_seq = match &round.completion {
         ShipRoundCompletion::Append(completion) => {
             let Some(last_seq) = completion.last_seq() else {
-                #[cfg(all(test, celld_internal_tests))]
-                for observer in &round.observer_rounds {
-                    observer.finish(LtxFleetCaptureStatusForWorld::Failed);
-                }
                 return false;
             };
             if last_seq > round.covered_seq {
@@ -5386,13 +5033,7 @@ fn apply_round(
         proof_last_seq = ?proof_last_seq,
         "shipped a log batch"
     );
-    #[cfg(all(test, celld_internal_tests))]
-    for observer in &round.observer_rounds {
-        observer.finish(LtxFleetCaptureStatusForWorld::Applied);
-    }
     for (handle, tickets, position) in round.credits {
-        #[cfg(all(test, celld_internal_tests))]
-        handle.record_fleet_credit_for_world(tickets, position, proof_last_seq);
         handle.shipped_txid.fetch_max(position, Ordering::SeqCst);
         handle.shipped_seq.fetch_max(tickets, Ordering::SeqCst);
         note_proof(&handle);
@@ -5468,11 +5109,6 @@ fn node_config(
 }
 
 fn production_ltx_host() -> LtxHost {
-    execution_domain_ltx_host()
-}
-
-#[cfg(celld_internal_tests)]
-fn deterministic_ltx_host() -> LtxHost {
     execution_domain_ltx_host()
 }
 
@@ -5552,6 +5188,3 @@ impl Drop for LtxRepl {
         self.shutdown_local_fallback();
     }
 }
-
-#[cfg(celld_internal_tests)]
-include!(env!("CELLD_INTERNAL_LTX_REPL_OBSERVERS"));

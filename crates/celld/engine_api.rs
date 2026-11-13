@@ -584,20 +584,6 @@ pub fn queue_cell_scope(queue: &str) -> String {
     )
 }
 
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn workflow_cell_scope_for_test(
-    script_name: &str,
-    workflow_name: &str,
-    instance_id: &str,
-) -> String {
-    let class = crate::deploy::workflow_class(script_name);
-    let namespace = namespace_key(script_name, &class);
-    let name = format!("{workflow_name}/{instance_id}");
-    let id = durable_object_id_for_name(&namespace, &name);
-    format!("{class}:{}", durable_object_id_hex(&id))
-}
-
 pub(crate) fn durable_object_id_hex(bytes: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(64);
@@ -811,8 +797,8 @@ pub fn answer_ticket<T: GatedAnswer>(result: &Result<T>) -> Option<crate::actor:
 /// A count rather than a latch, so a test can prove the retry reaches
 /// success instead of only proving that it never proceeds. `debug_assertions`
 /// is the gate `CELLD_TEST_CELL_STARTUP_FAILURE` beside it already uses: the
-/// runtime matrix drives the debug binary, which no internal test cfg
-/// reaches, and a release build compiles neither.
+/// runtime matrix drives the debug binary, and a release build compiles
+/// neither.
 #[cfg(debug_assertions)]
 pub(crate) fn injected_swap_release_failure() -> Option<anyhow::Error> {
     use std::sync::atomic::AtomicI64;

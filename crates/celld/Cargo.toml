@@ -20,10 +20,6 @@ name = "e2e"
 path = "benches/e2e.rs"
 harness = false
 
-[lints.rust.unexpected_cfgs]
-level = "warn"
-check-cfg = ["cfg(celld_internal_tests)", "cfg(celld_proxy_internals)"]
-
 [lints.clippy]
 disallowed_macros = "forbid"
 

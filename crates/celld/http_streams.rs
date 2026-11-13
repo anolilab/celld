@@ -12,8 +12,6 @@ use anyhow::Result;
 use futures_util::StreamExt as _;
 use std::collections::HashMap;
 use std::pin::Pin;
-#[cfg(all(test, celld_internal_tests))]
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
@@ -192,82 +190,12 @@ pub(crate) struct HttpStreamState {
     sweeper_running: bool,
     pub(crate) sources: HashMap<u64, HttpStreamEntry>,
     pub(crate) response_writers: HashMap<u64, ResponseStreamWriter>,
-    #[cfg(all(test, celld_internal_tests))]
-    sweeper_starts: u64,
-    #[cfg(all(test, celld_internal_tests))]
-    sweeper_active: usize,
-    #[cfg(all(test, celld_internal_tests))]
-    sweeper_exit_gate: Option<Arc<HttpSweeperExitGate>>,
-    #[cfg(all(test, celld_internal_tests))]
-    pull_completion_gate: Option<HttpPullCompletionGate>,
 }
 
 pub(crate) struct HttpStreamService {
     pub(crate) state: std::sync::Mutex<HttpStreamState>,
     sweeper_notify: Arc<tokio::sync::Notify>,
     owner: OnceLock<asyncrt::DomainToken>,
-    #[cfg(all(test, celld_internal_tests))]
-    registration_clock_reads: AtomicU64,
-}
-
-#[cfg(all(test, celld_internal_tests))]
-struct HttpPullCompletionGate {
-    stream_id: u64,
-    reached: std::sync::mpsc::SyncSender<()>,
-    release: std::sync::mpsc::Receiver<()>,
-}
-
-#[cfg(all(test, celld_internal_tests))]
-impl HttpPullCompletionGate {
-    fn pause(self) {
-        if self.reached.send(()).is_ok() {
-            let _ = self.release.recv();
-        }
-    }
-}
-
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) struct HttpSweeperExitGate {
-    pub(crate) reached: AtomicBool,
-    released: AtomicBool,
-    waiter: futures_util::task::AtomicWaker,
-}
-
-#[cfg(all(test, celld_internal_tests))]
-impl HttpSweeperExitGate {
-    fn new() -> Self {
-        Self {
-            reached: AtomicBool::new(false),
-            released: AtomicBool::new(false),
-            waiter: futures_util::task::AtomicWaker::new(),
-        }
-    }
-
-    async fn wait(self: Arc<Self>) {
-        self.reached.store(true, Ordering::Release);
-        futures_util::future::poll_fn(|context| {
-            if self.released.load(Ordering::Acquire) {
-                return std::task::Poll::Ready(());
-            }
-            self.waiter.register(context.waker());
-            if self.released.load(Ordering::Acquire) {
-                std::task::Poll::Ready(())
-            } else {
-                std::task::Poll::Pending
-            }
-        })
-        .await;
-    }
-
-    pub(crate) fn release(&self) {
-        self.released.store(true, Ordering::Release);
-        self.waiter.wake();
-    }
-}
-
-#[cfg(all(test, celld_internal_tests))]
-struct HttpSweeperRunGuard {
-    service: Weak<HttpStreamService>,
 }
 
 struct HttpSweeperOwnerGuard {
@@ -287,16 +215,6 @@ impl Drop for HttpSweeperOwnerGuard {
             if let Some(service) = self.service.upgrade() {
                 service.owner_lost();
             }
-        }
-    }
-}
-
-#[cfg(all(test, celld_internal_tests))]
-impl Drop for HttpSweeperRunGuard {
-    fn drop(&mut self) {
-        if let Some(service) = self.service.upgrade() {
-            let mut state = service.state.lock().unwrap();
-            state.sweeper_active = state.sweeper_active.saturating_sub(1);
         }
     }
 }
@@ -425,14 +343,6 @@ impl Default for HttpStreamState {
             sweeper_running: false,
             sources: HashMap::new(),
             response_writers: HashMap::new(),
-            #[cfg(all(test, celld_internal_tests))]
-            sweeper_starts: 0,
-            #[cfg(all(test, celld_internal_tests))]
-            sweeper_active: 0,
-            #[cfg(all(test, celld_internal_tests))]
-            sweeper_exit_gate: None,
-            #[cfg(all(test, celld_internal_tests))]
-            pull_completion_gate: None,
         }
     }
 }
@@ -443,8 +353,6 @@ impl Default for HttpStreamService {
             state: std::sync::Mutex::new(HttpStreamState::default()),
             sweeper_notify: Arc::new(tokio::sync::Notify::new()),
             owner: OnceLock::new(),
-            #[cfg(all(test, celld_internal_tests))]
-            registration_clock_reads: AtomicU64::new(0),
         }
     }
 }
@@ -530,8 +438,6 @@ impl HttpStreamService {
         state: &mut HttpStreamState,
         drain: &mut HttpStreamDrain,
     ) -> Option<(asyncrt::DomainToken, u64)> {
-        #[cfg(all(test, celld_internal_tests))]
-        self.registration_clock_reads.fetch_add(1, Ordering::SeqCst);
         let owner = self.owner.get()?.clone();
         match owner.mono_ms() {
             Ok(now_ms) => Some((owner, now_ms)),
@@ -544,15 +450,6 @@ impl HttpStreamService {
 
     fn spawn_sweeper(self: &Arc<Self>, owner: &asyncrt::DomainToken) -> bool {
         let service = Arc::downgrade(self);
-        #[cfg(all(test, celld_internal_tests))]
-        let run_guard = {
-            let mut state = self.state.lock().unwrap();
-            state.sweeper_starts = state.sweeper_starts.saturating_add(1);
-            state.sweeper_active = state.sweeper_active.saturating_add(1);
-            HttpSweeperRunGuard {
-                service: service.clone(),
-            }
-        };
         let owner_guard = HttpSweeperOwnerGuard {
             service: service.clone(),
             armed: true,
@@ -561,8 +458,6 @@ impl HttpStreamService {
         let sweeper_owner = owner.clone();
         owner
             .spawn_detached("http-stream-idle-sweeper", async move {
-                #[cfg(all(test, celld_internal_tests))]
-                let _run_guard = run_guard;
                 let mut owner_guard = owner_guard;
                 http_stream_sweeper(service, notify, sweeper_owner, &mut owner_guard).await;
             })
@@ -865,8 +760,6 @@ impl HttpStreamService {
     ) -> Result<Option<Vec<u8>>, String> {
         let mut source = Some(source);
         let mut drain = HttpStreamDrain::default();
-        #[cfg(all(test, celld_internal_tests))]
-        let mut completion_gate = None;
         let (answer, waiter) = {
             let mut state = self.state.lock().unwrap();
             let reason = lease.termination.reason();
@@ -920,20 +813,8 @@ impl HttpStreamService {
             // as soon as this lock opens. Take only this lease's waiter while
             // the registry still prevents that successor checkout.
             let waiter = lease.termination.take_waiter();
-            #[cfg(all(test, celld_internal_tests))]
-            if state
-                .pull_completion_gate
-                .as_ref()
-                .is_some_and(|candidate| candidate.stream_id == lease.stream_id)
-            {
-                completion_gate = state.pull_completion_gate.take();
-            }
             (answer, waiter)
         };
-        #[cfg(all(test, celld_internal_tests))]
-        if let Some(gate) = completion_gate {
-            gate.pause();
-        }
         if let Some(source) = source {
             drain.detached_sources.push((lease.stream_id, source));
         }
@@ -1266,119 +1147,6 @@ impl HttpStreamService {
         };
         (wait, drain)
     }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn source_exists_for_test(&self, stream_id: u64) -> bool {
-        self.state.lock().unwrap().sources.contains_key(&stream_id)
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn writer_exists_for_test(&self, stream_id: u64) -> bool {
-        self.state
-            .lock()
-            .unwrap()
-            .response_writers
-            .contains_key(&stream_id)
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn termination_for_test(
-        &self,
-        stream_id: u64,
-    ) -> Option<Arc<HttpStreamTermination>> {
-        self.state
-            .lock()
-            .unwrap()
-            .sources
-            .get(&stream_id)
-            .map(|entry| entry.termination.clone())
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn lock_is_available_for_test(&self) -> bool {
-        self.state.try_lock().is_ok()
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn arm_sweeper_exit_for_test(&self) -> Arc<HttpSweeperExitGate> {
-        let gate = Arc::new(HttpSweeperExitGate::new());
-        let mut state = self.state.lock().unwrap();
-        assert!(state.sweeper_exit_gate.replace(gate.clone()).is_none());
-        gate
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    fn take_sweeper_exit_gate_for_test(&self) -> Option<Arc<HttpSweeperExitGate>> {
-        self.state.lock().unwrap().sweeper_exit_gate.take()
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn sweeper_state_for_test(&self) -> (u64, usize, bool) {
-        let state = self.state.lock().unwrap();
-        (
-            state.sweeper_starts,
-            state.sweeper_active,
-            state.sweeper_running,
-        )
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn registration_clock_reads_for_test(&self) -> u64 {
-        self.registration_clock_reads.load(Ordering::SeqCst)
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn arm_pull_completion_after_unlock_for_test(
-        &self,
-        stream_id: u64,
-    ) -> (
-        std::sync::mpsc::Receiver<()>,
-        std::sync::mpsc::SyncSender<()>,
-    ) {
-        let (reached_sender, reached_receiver) = std::sync::mpsc::sync_channel(1);
-        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
-        let gate = HttpPullCompletionGate {
-            stream_id,
-            reached: reached_sender,
-            release: release_receiver,
-        };
-        assert!(self
-            .state
-            .lock()
-            .unwrap()
-            .pull_completion_gate
-            .replace(gate)
-            .is_none());
-        (reached_receiver, release_sender)
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn closing_for_test(&self, stream_id: u64) -> bool {
-        self.state
-            .lock()
-            .unwrap()
-            .sources
-            .get(&stream_id)
-            .is_some_and(|entry| entry.closing)
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn quarantine(&self) {
-        self.state.lock().unwrap().closed = true;
-        self.sweeper_notify.notify_one();
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn close(&self) {
-        let drain = {
-            let mut state = self.state.lock().unwrap();
-            let mut drain = HttpStreamDrain::default();
-            Self::close_locked(&mut state, &mut drain);
-            drain
-        };
-        self.sweeper_notify.notify_one();
-        drain.dispose_propagating();
-    }
 }
 
 impl Drop for HttpStreamService {
@@ -1411,20 +1179,12 @@ async fn http_stream_sweeper(
             return;
         };
         let (wait, drain) = service.sweep_step(&owner);
-        #[cfg(all(test, celld_internal_tests))]
-        let exit_gate = matches!(wait, HttpSweepWait::Exit)
-            .then(|| service.take_sweeper_exit_gate_for_test())
-            .flatten();
         drop(service);
         // An abandoned source can own a panicking destructor. The leak
         // backstop must still service later entries after that failure.
         drain.dispose_suppressing();
         match wait {
             HttpSweepWait::Exit => {
-                #[cfg(all(test, celld_internal_tests))]
-                if let Some(gate) = exit_gate {
-                    gate.wait().await;
-                }
                 owner_guard.disarm();
                 return;
             }
@@ -1863,8 +1623,7 @@ pub(crate) fn settle_http_stream_read(
 /// Build the future used by the JavaScript read op.
 ///
 /// Checkout stays synchronous because the op reserves the source before it
-/// enqueues asynchronous work. Internal tests call this constructor so they
-/// exercise the same checkout and completion transitions as the op.
+/// enqueues asynchronous work.
 pub(crate) fn http_stream_read(
     service: Arc<HttpStreamService>,
     stream_id: u64,
@@ -1875,26 +1634,6 @@ pub(crate) fn http_stream_read(
         let mut pull = HttpPull { lease, source };
         let termination = pull.lease.termination.clone();
         let next = crate::asyncrt::select! {
-            result = next_http_stream_chunk(&mut pull.source) => Some(result),
-            _ = futures_util::future::poll_fn(|context| termination.poll_reason(context)) => None,
-        };
-        let HttpPull { lease, source } = pull;
-        settle_http_stream_read(lease, source, next)
-    }
-}
-
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) fn http_stream_read_source_first_for_test(
-    service: Arc<HttpStreamService>,
-    stream_id: u64,
-) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'static {
-    let checkout = service.checkout_source(stream_id);
-    async move {
-        let (lease, source) = checkout?;
-        let mut pull = HttpPull { lease, source };
-        let termination = pull.lease.termination.clone();
-        let next = crate::asyncrt::select_biased! {
-            "the source-first test probe makes a ready source win a termination tie";
             result = next_http_stream_chunk(&mut pull.source) => Some(result),
             _ = futures_util::future::poll_fn(|context| termination.poll_reason(context)) => None,
         };

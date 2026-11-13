@@ -39,44 +39,6 @@ static_source!(BYTE_STREAMS_SOURCE, "byte_streams.js");
 static_source!(SET_IMMEDIATE_SOURCE, "set_immediate.js");
 static_source!(URL_PATTERN_SOURCE, "url_pattern.js");
 
-#[cfg(all(test, celld_internal_tests))]
-static INTERNAL_MODULE_SOURCES: &[(&str, &v8::OneByteConst)] = &[
-    ("node_assert.js", &NODE_ASSERT_SOURCE),
-    ("node_timers.js", &NODE_TIMERS_SOURCE),
-    ("node_test.js", &NODE_TEST_SOURCE),
-    ("node_util.js", &NODE_UTIL_SOURCE),
-    ("node_events.js", &NODE_EVENTS_SOURCE),
-    ("node_os.js", &NODE_OS_SOURCE),
-    ("node_path.js", &NODE_PATH_SOURCE),
-    ("node_buffer.js", &NODE_BUFFER_SOURCE),
-    ("node_crypto.js", &NODE_CRYPTO_SOURCE),
-    ("node_async_hooks.js", &NODE_ASYNC_HOOKS_SOURCE),
-    (
-        "node_diagnostics_channel.js",
-        &NODE_DIAGNOSTICS_CHANNEL_SOURCE,
-    ),
-    ("node_stream.js", &NODE_STREAM_SOURCE),
-    (
-        "identity_transform_stream.js",
-        &IDENTITY_TRANSFORM_STREAM_SOURCE,
-    ),
-    ("compression_streams.js", &COMPRESSION_STREAMS_SOURCE),
-    ("byte_streams.js", &BYTE_STREAMS_SOURCE),
-    ("set_immediate.js", &SET_IMMEDIATE_SOURCE),
-    ("url_pattern.js", &URL_PATTERN_SOURCE),
-];
-
-#[cfg(all(test, celld_internal_tests))]
-pub(super) fn internal_sources_for_test<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-) -> Vec<(&'static str, v8::Local<'s, v8::String>)> {
-    let mut sources = Vec::with_capacity(INTERNAL_MODULE_SOURCES.len());
-    for &(name, source) in INTERNAL_MODULE_SOURCES {
-        sources.push((name, v8_strings::source(scope, source)));
-    }
-    sources
-}
-
 pub(super) fn compile_module<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
@@ -263,24 +225,6 @@ static IMPORT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|
 static IMPORT_BRACES_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"\{([^}]*)\}").unwrap());
 
-/// Counts scans of a source carrying [`SCAN_PROBE_MARKER`].
-///
-/// The counter is filtered by the marker rather than counting every scan, so a
-/// bare global counter cannot move under an unrelated worker build.
-#[cfg(celld_internal_tests)]
-static IMPORT_SCANS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// A source puts this in a comment to have its scans counted.
-#[cfg(celld_internal_tests)]
-pub(super) const SCAN_PROBE_MARKER: &str = "celld-import-scan-probe";
-
-/// How many times a source carrying [`SCAN_PROBE_MARKER`] has been scanned.
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn import_scans() -> usize {
-    IMPORT_SCANS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// External specifier -> the bindings a bundle pulls from it.
 pub(super) type ExternalImports =
     std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
@@ -289,10 +233,6 @@ pub(super) type ExternalImports =
 /// named/default bindings pulled from each. V8 static-links these, so a stub
 /// must provide exactly these names; namespace imports (`* as x`) need none.
 pub(super) fn scan_external_imports(src: &str) -> ExternalImports {
-    #[cfg(celld_internal_tests)]
-    if src.contains(SCAN_PROBE_MARKER) {
-        IMPORT_SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
     let mut map = ExternalImports::default();
     for cap in IMPORT_RE.captures_iter(src) {
         if !is_external(&cap[2]) {

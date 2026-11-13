@@ -312,17 +312,6 @@ pub struct NodeLoadWire {
     pub container_instances: std::collections::BTreeMap<String, u64>,
 }
 
-#[cfg(all(test, celld_internal_tests))]
-#[derive(Clone)]
-pub(crate) struct AmbientLoadSample {
-    pub rss_bytes: u64,
-    pub in_use_bytes: u64,
-    pub cgroup_working_set_bytes: Option<u64>,
-    pub cgroup_current_bytes: Option<u64>,
-    pub open_fds: u64,
-    pub fd_limit: u64,
-}
-
 /// A node record older than this is not worth reading. Three lease
 /// lifetimes, floored, so a fleet with a short TTL does not discard records
 /// a slow renewal would have refreshed.
@@ -407,11 +396,6 @@ pub struct BucketOwnership {
     /// interval in production. Placement and recruitment read the sample
     /// through it so a burst of either costs one GET each, not a fleet scan.
     fleet_sample_ms: u64,
-    /// A deterministic execution must not publish ambient process telemetry into
-    /// its authoritative store. The override leaves the simulated clock and
-    /// the live Actor counters load-bearing.
-    #[cfg(all(test, celld_internal_tests))]
-    ambient_load_override: Option<AmbientLoadSample>,
     /// The full folded log object this node's OWN lease record carries,
     /// tagged with a publish sequence.
     /// Renewals snapshot (seq, object) ONCE when they serialize the wire
@@ -521,8 +505,6 @@ impl BucketOwnership {
             live: Arc::new(LiveLoad::default()),
             lease_ttl_ms: 0,
             fleet_sample_ms: 5_000,
-            #[cfg(all(test, celld_internal_tests))]
-            ambient_load_override: None,
             own_log: std::sync::Mutex::new((0, None)),
             applied: tokio::sync::watch::channel((String::new(), 0)).0,
             lost_records: std::sync::Mutex::default(),
@@ -539,17 +521,6 @@ impl BucketOwnership {
     pub fn with_lease_ttl_ms(mut self, ttl_ms: u64) -> Self {
         self.lease_ttl_ms = ttl_ms;
         self
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn with_ambient_load_for_test(mut self, load: AmbientLoadSample) -> Self {
-        self.ambient_load_override = Some(load);
-        self
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn load_sample_for_test(&self) -> NodeLoadWire {
-        self.process_load()
     }
 
     pub fn lease_ttl_ms(&self) -> u64 {
@@ -1045,39 +1016,8 @@ impl BucketOwnership {
     }
 
     fn process_load(&self) -> NodeLoadWire {
-        #[cfg(all(test, celld_internal_tests))]
-        if let Some(ambient) = &self.ambient_load_override {
-            let rss_bytes = ambient.rss_bytes.max(1);
-            return NodeLoadWire {
-                sampled_ms: now_ms(),
-                owned_cells: owned_cells(&self.live),
-                placement_weight: placement_weight(&self.live),
-                bucket_format: Some(celld_logic::format::BUCKET_FORMAT),
-                resident_cells: self.live.resident_cells.load(Ordering::Relaxed),
-                host_websockets: self.live.host_websockets.load(Ordering::Relaxed),
-                rss_bytes,
-                in_use_bytes: Some(ambient.in_use_bytes.max(1).min(rss_bytes)),
-                cgroup_working_set_bytes: ambient.cgroup_working_set_bytes,
-                cgroup_current_bytes: ambient.cgroup_current_bytes,
-                cpu_percent_x100: self.live.sample().cpu_percent_x100,
-                open_fds: ambient.open_fds,
-                fd_limit: ambient.fd_limit,
-                pressured: self.live.pressured.load(Ordering::Relaxed),
-                memory_headroom: Some(self.live.memory_headroom.load(Ordering::Relaxed)),
-                shed_cells: self.live.shed_cells.load(Ordering::Relaxed),
-                restoring: self.live.restoring.load(Ordering::Relaxed),
-                rebalance_paused: Some(self.live.rebalance_paused.load(Ordering::Relaxed)),
-                draining: Some(self.live.draining.load(Ordering::Relaxed)),
-                container_instances: Default::default(),
-            };
-        }
         process_load(&self.live)
     }
-}
-
-#[cfg(all(test, celld_internal_tests))]
-mod internal_tests {
-    include!(env!("CELLD_INTERNAL_OWNERSHIP_STORE_TESTS"));
 }
 
 impl BucketOwnership {

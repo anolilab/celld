@@ -91,10 +91,6 @@ impl RequestCancellationLifetime {
     /// Publish an abort from an embedder that owns this lifetime.
     #[doc(hidden)]
     pub fn publish_abort(&self) {
-        #[cfg(all(test, celld_internal_tests))]
-        // Pause before taking `finished`: the test must let retirement win
-        // this ordering without deadlocking on the very lock under test.
-        js::pause_abort_request_if_armed_for_test(self.request_id);
         let finished = self
             .finished
             .lock()
@@ -700,63 +696,6 @@ pub(crate) async fn receive_service_fetch_response(
         },
         None => response.await,
     }
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub async fn receive_cell_fetch_reply_for_test(
-    receive: tokio::sync::oneshot::Receiver<anyhow::Result<HttpResponse>>,
-    request_id: Option<js::RequestId>,
-    cancel: Option<tokio::sync::oneshot::Receiver<()>>,
-) -> anyhow::Result<HttpResponse> {
-    let cancellation = request_id.map(RequestCancellationLifetime::from_request_id);
-    receive_cell_fetch_reply(receive, cancellation, cancel).await
-}
-
-#[cfg(celld_internal_tests)]
-#[derive(Clone)]
-#[doc(hidden)]
-pub struct RequestCancellationLifetimeForTest(Arc<RequestCancellationLifetime>);
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn request_cancellation_lifetime_for_test(
-    request_id: js::RequestId,
-) -> RequestCancellationLifetimeForTest {
-    RequestCancellationLifetimeForTest(RequestCancellationLifetime::from_request_id(request_id))
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn finish_request_cancellation_for_test(lifetime: &RequestCancellationLifetimeForTest) {
-    lifetime.0.finish();
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn finish_active_request_cancellation_for_test(lifetime: &Arc<RequestCancellationLifetime>) {
-    lifetime.finish();
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub async fn receive_cell_fetch_reply_with_lifetime_for_test(
-    receive: tokio::sync::oneshot::Receiver<anyhow::Result<HttpResponse>>,
-    lifetime: RequestCancellationLifetimeForTest,
-    cancel: tokio::sync::oneshot::Receiver<()>,
-    entered: tokio::sync::oneshot::Sender<()>,
-) -> anyhow::Result<HttpResponse> {
-    let _ = entered.send(());
-    receive_cell_fetch_reply(receive, Some(lifetime.0), Some(cancel)).await
-}
-
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) async fn receive_service_fetch_response_for_test(
-    response: impl std::future::Future<Output = anyhow::Result<HttpResponse>>,
-    lifetime: Arc<RequestCancellationLifetime>,
-    cancel: tokio::sync::oneshot::Receiver<()>,
-) -> anyhow::Result<HttpResponse> {
-    receive_service_fetch_response(response, lifetime, Some(cancel)).await
 }
 
 impl RuntimeManager {
@@ -2103,16 +2042,6 @@ fn restored_alarm_from_persisted(
     })
 }
 
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) fn restored_alarm_for_test(
-    cell: &str,
-    path: &std::path::Path,
-    covered: bool,
-) -> Option<celld_logic::RestoredAlarm> {
-    let persisted = crate::storage::persisted_alarm(&path.to_string_lossy(), cell, None);
-    restored_alarm_from_persisted(cell, persisted, |_| covered)
-}
-
 /// The caller's trace context, when the ingress request carried one.
 /// Malformed headers are ignored; nothing here is trusted for anything
 /// but correlation and (under parentbased samplers, deliberately) the
@@ -2192,22 +2121,6 @@ fn drive_affiliated_with_budget(
     let StatelessWorkerJob { job, cancellation } = job;
     let driving = drive_affiliated_inner(affiliation, job, telemetry, budget);
     drive_with_request_cancellation(driving, cancellation)
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn drive_affiliated_with_budget_for_test(
-    affiliation: crate::pool::Affiliation,
-    job: crate::WorkerJob,
-    telemetry: Option<(Arc<str>, Arc<str>)>,
-    budget: Duration,
-) -> impl std::future::Future<Output = ()> + Send + 'static {
-    drive_affiliated_with_budget(
-        affiliation,
-        StatelessWorkerJob::driver_owned(job),
-        telemetry,
-        budget,
-    )
 }
 
 async fn drive_affiliated_inner(
@@ -3068,18 +2981,6 @@ pub async fn drive_cell(
     let cancellation = job
         .request_id()
         .map(RequestCancellationLifetime::from_request_id);
-    #[cfg(celld_internal_tests)]
-    let _ = drive_cell_inner(
-        affiliation,
-        job,
-        report,
-        parent,
-        js::handler_budget(),
-        cancellation,
-        DriveCellTestObservers::default(),
-    )
-    .await;
-    #[cfg(not(celld_internal_tests))]
     let _ = drive_cell_inner(
         affiliation,
         job,
@@ -3143,34 +3044,8 @@ pub(crate) async fn drive_alarm(
         None,
         js::handler_budget(),
         cancellation,
-        #[cfg(celld_internal_tests)]
-        DriveCellTestObservers::default(),
     )
     .await
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub async fn drive_cell_with_budget_for_test(
-    affiliation: crate::pool::Affiliation,
-    job: CellJob,
-    report: Option<AlarmReporter>,
-    parent: Option<crate::telemetry::TraceContext>,
-    budget: Duration,
-) {
-    let cancellation = job
-        .request_id()
-        .map(RequestCancellationLifetime::from_request_id);
-    let _ = drive_cell_inner(
-        affiliation,
-        job,
-        report,
-        parent,
-        budget,
-        cancellation,
-        DriveCellTestObservers::default(),
-    )
-    .await;
 }
 
 async fn drive_cell_with_request_cancellation(
@@ -3185,18 +3060,6 @@ async fn drive_cell_with_request_cancellation(
         cancellation.as_ref().map(|lifetime| lifetime.request_id),
         "a cell fetch and its cancellation lifetime must have the same request id"
     );
-    #[cfg(celld_internal_tests)]
-    let _ = drive_cell_inner(
-        affiliation,
-        job,
-        report,
-        parent,
-        js::handler_budget(),
-        cancellation,
-        DriveCellTestObservers::default(),
-    )
-    .await;
-    #[cfg(not(celld_internal_tests))]
     let _ = drive_cell_inner(
         affiliation,
         job,
@@ -3206,104 +3069,6 @@ async fn drive_cell_with_request_cancellation(
         cancellation,
     )
     .await;
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub async fn drive_cell_observing_gated_failure_for_test(
-    affiliation: crate::pool::Affiliation,
-    job: CellJob,
-    gated_failure: tokio::sync::oneshot::Sender<bool>,
-) {
-    let cancellation = job
-        .request_id()
-        .map(RequestCancellationLifetime::from_request_id);
-    let _ = drive_cell_inner(
-        affiliation,
-        job,
-        None,
-        None,
-        js::handler_budget(),
-        cancellation,
-        DriveCellTestObservers {
-            gated_failure: Some(gated_failure),
-            ..DriveCellTestObservers::default()
-        },
-    )
-    .await;
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub async fn drive_cell_observing_gated_op_drop_for_test(
-    affiliation: crate::pool::Affiliation,
-    job: CellJob,
-    gated_failure: tokio::sync::oneshot::Sender<bool>,
-    native_op_dropped: tokio::sync::oneshot::Sender<()>,
-) {
-    let cancellation = job
-        .request_id()
-        .map(RequestCancellationLifetime::from_request_id);
-    let _ = drive_cell_inner(
-        affiliation,
-        job,
-        None,
-        None,
-        js::handler_budget(),
-        cancellation,
-        DriveCellTestObservers {
-            gated_failure: Some(gated_failure),
-            native_op_dropped: Some(native_op_dropped),
-        },
-    )
-    .await;
-}
-
-#[cfg(celld_internal_tests)]
-#[derive(Default)]
-struct DriveCellTestObservers {
-    gated_failure: Option<tokio::sync::oneshot::Sender<bool>>,
-    native_op_dropped: Option<tokio::sync::oneshot::Sender<()>>,
-}
-
-#[cfg(celld_internal_tests)]
-struct NativeOpDropProbe(Option<tokio::sync::oneshot::Sender<()>>);
-
-#[cfg(celld_internal_tests)]
-impl Drop for NativeOpDropProbe {
-    fn drop(&mut self) {
-        if let Some(dropped) = self.0.take() {
-            let _ = dropped.send(());
-        }
-    }
-}
-
-#[cfg(celld_internal_tests)]
-fn adopt_cell_ops_for_test(
-    ops: &mut Ops,
-    started: Vec<js::Op>,
-    observer: &mut Option<tokio::sync::oneshot::Sender<()>>,
-) {
-    for (id, future) in started {
-        let probe = observer
-            .take()
-            .map(|observer| NativeOpDropProbe(Some(observer)));
-        ops.push(Box::pin(async move {
-            let _probe = probe;
-            (id, future.await)
-        }));
-    }
-}
-
-#[cfg(celld_internal_tests)]
-fn notify_gated_failure_for_test(
-    entry: &mut js::InFlight,
-    observer: &mut Option<tokio::sync::oneshot::Sender<bool>>,
-) {
-    let gated = entry.gated_reply_and_io_context().0.is_some();
-    if let Some(observer) = observer.take() {
-        let _ = observer.send(gated);
-    }
 }
 
 async fn drive_cell_inner(
@@ -3313,7 +3078,6 @@ async fn drive_cell_inner(
     parent: Option<crate::telemetry::TraceContext>,
     budget: Duration,
     request_cancellation: Option<Arc<RequestCancellationLifetime>>,
-    #[cfg(celld_internal_tests)] mut test_observers: DriveCellTestObservers,
 ) -> anyhow::Result<Option<u64>> {
     let _request_cancellation = request_cancellation.map(RequestCancellationGuard::shared);
     // Held to the end of this function: the event's claim on the isolate
@@ -3359,8 +3123,6 @@ async fn drive_cell_inner(
             CellJob::WsOpen { .. } => "celld.ws_open",
             CellJob::WsMessage { .. } => "celld.ws_message",
             CellJob::WsClosed { .. } => "celld.ws_close",
-            #[cfg(celld_internal_tests)]
-            CellJob::SyncErrorForTest { .. } => "celld.sync_error_test",
         };
         (
             name,
@@ -3446,20 +3208,10 @@ async fn drive_cell_inner(
         return Ok(None);
     };
     if entry.keeps_native_ops() {
-        #[cfg(celld_internal_tests)]
-        adopt_cell_ops_for_test(&mut ops, started, &mut test_observers.native_op_dropped);
-        #[cfg(not(celld_internal_tests))]
         adopt(&mut ops, started);
     } else {
-        #[cfg(celld_internal_tests)]
-        adopt_cell_ops_for_test(&mut ops, started, &mut test_observers.native_op_dropped);
-        #[cfg(not(celld_internal_tests))]
         drop(started);
         abort_ops(&mut ops, &mut entry);
-    }
-    #[cfg(celld_internal_tests)]
-    if entry.gated_reply_and_io_context().0.is_some() {
-        notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
     }
 
     while !entry.finished() {
@@ -3496,24 +3248,18 @@ async fn drive_cell_inner(
                     })
                     .await;
                 entry.cancel_gated_reply();
-                #[cfg(celld_internal_tests)]
-                notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
                 cancelled
             }
             Wake::Expired => {
                 entry.time_out(budget);
                 slot.turn(|worker| worker.turn_retire_input_gates(&entry))
                     .await;
-                #[cfg(celld_internal_tests)]
-                notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
                 (Vec::new(), Vec::new())
             }
             Wake::Idle => {
                 entry.stuck();
                 slot.turn(|worker| worker.turn_retire_input_gates(&entry))
                     .await;
-                #[cfg(celld_internal_tests)]
-                notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
                 (Vec::new(), Vec::new())
             }
             Wake::PendingEventIdle => {
@@ -3531,14 +3277,7 @@ async fn drive_cell_inner(
                 .await
             }
         };
-        #[cfg(celld_internal_tests)]
-        if entry.gated_reply_and_io_context().0.is_some() {
-            notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
-        }
         if entry.keeps_native_ops() {
-            #[cfg(celld_internal_tests)]
-            adopt_cell_ops_for_test(&mut ops, started, &mut test_observers.native_op_dropped);
-            #[cfg(not(celld_internal_tests))]
             adopt(&mut ops, started);
         } else {
             drop(started);

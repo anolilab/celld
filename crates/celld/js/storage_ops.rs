@@ -649,61 +649,6 @@ pub(super) fn op_d1_run(
     let out = storage::d1_run_json(&cell, &request);
     rv.set(v8::String::new(scope, &out).unwrap().into());
 }
-#[cfg(celld_internal_tests)]
-pub(super) fn op_sql_set_max_page_count_for_test(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let pages = args.get(1).uint32_value(scope).unwrap_or(0);
-    if let Err(error) = storage::set_max_page_count_for_test(&cell, pages) {
-        throw_storage_error(scope, "sql.setMaxPageCountForTest", error);
-    }
-}
-#[cfg(celld_internal_tests)]
-pub(super) fn op_sql_set_write_fault_for_test(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    storage::set_write_fault_for_test(args.get(0).boolean_value(scope));
-}
-#[cfg(celld_internal_tests)]
-pub(super) fn op_sql_set_cache_size_for_test(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let pages = args.get(1).int32_value(scope).unwrap_or(0);
-    if let Err(error) = storage::set_cache_size_for_test(&cell, pages) {
-        throw_storage_error(scope, "sql.setCacheSizeForTest", error);
-    }
-}
-#[cfg(celld_internal_tests)]
-pub(super) fn op_sql_set_interrupt_fault_for_test(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let enabled = args.get(1).boolean_value(scope);
-    if let Err(error) = storage::set_interrupt_fault_for_test(&cell, enabled) {
-        throw_storage_error(scope, "sql.setInterruptFaultForTest", error);
-    }
-}
-#[cfg(celld_internal_tests)]
-pub(super) fn op_sql_register_nomem_function_for_test(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    if let Err(error) = storage::register_nomem_function_for_test(&cell) {
-        throw_storage_error(scope, "sql.registerNomemFunctionForTest", error);
-    }
-}
 pub(super) fn op_storage_transaction_control(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,

@@ -18,10 +18,6 @@ publish = false
 [lib]
 test = false
 
-[lints.rust.unexpected_cfgs]
-level = "warn"
-check-cfg = ["cfg(celld_internal_tests)"]
-
 [lints.clippy]
 disallowed_macros = "forbid"
 

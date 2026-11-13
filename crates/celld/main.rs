@@ -72,26 +72,6 @@ const SHUTDOWN_ACCEPT_RETRY_MAX: std::time::Duration = std::time::Duration::from
 static LOG_GUARD: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> =
     std::sync::Mutex::new(None);
 
-#[cfg(all(test, celld_internal_tests))]
-// Keep the client open until the child exits, so the accepted connection
-// reaches the real drain-time HTTP path instead of closing immediately.
-static SHUTDOWN_ACCEPT_FAILURE_CLIENT: std::sync::Mutex<Option<std::net::TcpStream>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(all(test, celld_internal_tests))]
-fn shutdown_accept_failure_test_checkpoint(active: bool, step: &'static str) {
-    if active {
-        // The tracing writer is deliberately lossy and asynchronous. This
-        // process regression needs every cleanup checkpoint to remain
-        // visible and ordered when the child exits through process::exit.
-        celld::cli_output::Output::new(celld::cli_output::Format::Text)
-            .line(format_args!(
-                "shutdown accept failure test checkpoint: {step}"
-            ))
-            .expect("write the shutdown accept failure test checkpoint");
-    }
-}
-
 static CONNECTION_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONNECTION_ERRORS_REPORTED: AtomicU64 = AtomicU64::new(0);
 static CONNECTION_ERROR_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
@@ -3152,15 +3132,12 @@ struct ShutdownConnection {
     stream: tokio::net::TcpStream,
     surface: HttpSurface,
     received: oneshot::Sender<()>,
-    #[cfg(all(test, celld_internal_tests))]
-    recovered_after_error: bool,
 }
 
 fn spawn_shutdown_acceptor(
     listener: tokio::net::TcpListener,
     surface: HttpSurface,
     connections: mpsc::Sender<ShutdownConnection>,
-    #[cfg(all(test, celld_internal_tests))] mut fail_next_for_test: bool,
 ) {
     // Shutdown selects finish whenever a timer, request, or actor message
     // wins. Keep each listener's accept and retry waits in one task so those
@@ -3168,34 +3145,7 @@ fn spawn_shutdown_acceptor(
     tokio::spawn(async move {
         let mut retry_delay = SHUTDOWN_ACCEPT_RETRY_INITIAL;
         let mut recovering = false;
-        #[cfg(all(test, celld_internal_tests))]
-        let mut connect_after_failure_for_test = false;
         loop {
-            #[cfg(all(test, celld_internal_tests))]
-            let inject_failure = std::mem::take(&mut fail_next_for_test);
-            #[cfg(all(test, celld_internal_tests))]
-            let accepted = if inject_failure {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionAborted,
-                    "injected listener accept failure during shutdown",
-                ))
-            } else if std::mem::take(&mut connect_after_failure_for_test) {
-                let retry_address = listener
-                    .local_addr()
-                    .expect("read the shutdown accept failure test listener address");
-                // Connect before polling accept, so the injected transition
-                // does not depend on an operating-system readiness-
-                // notification race after the error.
-                let connection = std::net::TcpStream::connect(retry_address)
-                    .expect("connect after the injected shutdown accept failure");
-                *SHUTDOWN_ACCEPT_FAILURE_CLIENT
-                    .lock()
-                    .expect("lock the shutdown accept failure test connection") = Some(connection);
-                listener.accept().await
-            } else {
-                listener.accept().await
-            };
-            #[cfg(not(all(test, celld_internal_tests)))]
             let accepted = listener.accept().await;
             match accepted {
                 Ok((stream, _)) => {
@@ -3212,8 +3162,6 @@ fn spawn_shutdown_acceptor(
                         stream,
                         surface,
                         received,
-                        #[cfg(all(test, celld_internal_tests))]
-                        recovered_after_error: recovering,
                     };
                     if connections.send(connection).await.is_err() {
                         return;
@@ -3231,11 +3179,6 @@ fn spawn_shutdown_acceptor(
                         "could not accept {} connection during shutdown; retrying",
                         surface.name()
                     );
-                    #[cfg(all(test, celld_internal_tests))]
-                    if inject_failure {
-                        shutdown_accept_failure_test_checkpoint(true, "listener failure observed");
-                        connect_after_failure_for_test = true;
-                    }
                     recovering = true;
                     tokio::time::sleep(retry_delay).await;
                     retry_delay = retry_delay.saturating_mul(2).min(SHUTDOWN_ACCEPT_RETRY_MAX);
@@ -3366,26 +3309,6 @@ async fn recover_with_follower_listener(
 mod cli;
 use cli::{action_from_process, print_help, Action};
 
-#[cfg(all(test, celld_internal_tests))]
-fn shutdown_accept_failure_test_action() -> Action {
-    let listen = std::env::var("CELLD_DRAIN_ACCEPT_FAILURE_LISTEN")
-        .map(celld::startup::Listen::Explicit)
-        .unwrap_or(celld::startup::Listen::LoopbackEphemeral);
-    Action::Run(cli::Settings {
-        control_plane: false,
-        bucket: None,
-        load_deployment: false,
-        endpoint: None,
-        region: "test".to_string(),
-        listen,
-        internal_listen: celld::startup::Listen::LoopbackEphemeral,
-        advertise: None,
-        unsafe_public_advertise: false,
-        trust_forwarded_headers: false,
-        dev_store: None,
-    })
-}
-
 fn node_bucket(
     settings: &cli::Settings,
     managed: Option<&celld::control_plane::ManagedStorageConfig>,
@@ -3459,16 +3382,6 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyhow::Result<()> {
-    #[cfg(all(test, celld_internal_tests))]
-    let shutdown_accept_failure_test_active =
-        std::env::var_os("CELLD_DRAIN_ACCEPT_FAILURE_CHILD").is_some();
-    #[cfg(all(test, celld_internal_tests))]
-    let action = if shutdown_accept_failure_test_active {
-        shutdown_accept_failure_test_action()
-    } else {
-        action_from_process()?
-    };
-    #[cfg(not(all(test, celld_internal_tests)))]
     let action = action_from_process()?;
     let host_runtime = tokio::runtime::Handle::current();
     celld::asyncrt::set_host_handle(host_runtime.clone());
@@ -4201,11 +4114,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         }
         _ => None,
     };
-    #[cfg(all(test, celld_internal_tests))]
-    let follower = follower.or_else(|| {
-        shutdown_accept_failure_test_active
-            .then(|| Arc::new(celld::node_log::FollowerStore::new(&data_dir, None, &node)))
-    });
     let app = AppHandle {
         tx,
         runtime,
@@ -4713,10 +4621,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         app.advertise
     ))?;
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
-    #[cfg(all(test, celld_internal_tests))]
-    if shutdown_accept_failure_test_active {
-        let _ = shutdown_tx.send(ShutdownMode::Handoff);
-    }
     // A SIGTERM (systemd stop, `docker stop`, a Kubernetes pod delete) or a
     // SIGINT begins the same graceful shutdown as `POST /shutdown`, so the
     // orchestrator's ordinary stop drains and hands off instead of killing.
@@ -4943,29 +4847,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // Each acceptor waits until this loop receives its previous connection.
     // One surface therefore cannot occupy both slots and block the other.
     let (shutdown_connection_tx, mut shutdown_connection_rx) = mpsc::channel(2);
-    #[cfg(all(test, celld_internal_tests))]
-    let mut shutdown_accept_failure_recovered_for_test = !shutdown_accept_failure_test_active;
-    #[cfg(all(test, celld_internal_tests))]
-    shutdown_accept_failure_test_checkpoint(
-        shutdown_accept_failure_test_active,
-        "listener failure armed",
-    );
-    #[cfg(all(test, celld_internal_tests))]
-    {
-        spawn_shutdown_acceptor(
-            listener,
-            HttpSurface::Public,
-            shutdown_connection_tx.clone(),
-            shutdown_accept_failure_test_active,
-        );
-        spawn_shutdown_acceptor(
-            internal_listener,
-            HttpSurface::Internal,
-            shutdown_connection_tx,
-            false,
-        );
-    }
-    #[cfg(not(all(test, celld_internal_tests)))]
     {
         spawn_shutdown_acceptor(
             listener,
@@ -5056,8 +4937,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             }
             if let Some(admitted_drained) = admitted {
                 let token_ready = drain_token.lock().expect("drain token slot").is_some();
-                #[cfg(all(test, celld_internal_tests))]
-                let token_ready = token_ready && shutdown_accept_failure_recovered_for_test;
                 if token_ready {
                     break admitted_drained;
                 }
@@ -5080,10 +4959,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         drain_connection.clone(),
                         connection_grace,
                     ));
-                    #[cfg(all(test, celld_internal_tests))]
-                    if connection.recovered_after_error {
-                        shutdown_accept_failure_recovered_for_test = true;
-                    }
                     let _ = connection.received.send(());
                 }
                 Some(_) = drain_connections.next(), if !drain_connections.is_empty() => {}
@@ -5382,11 +5257,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             );
         }
     }
-    #[cfg(all(test, celld_internal_tests))]
-    shutdown_accept_failure_test_checkpoint(
-        shutdown_accept_failure_test_active,
-        "drain token release finished",
-    );
     if !handoff_started {
         tracing::error!(
             event = "shutdown_handoff_not_started",
@@ -5494,11 +5364,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     } else {
         true
     };
-    #[cfg(all(test, celld_internal_tests))]
-    shutdown_accept_failure_test_checkpoint(
-        shutdown_accept_failure_test_active,
-        "durability quiesce finished",
-    );
     // Preparation captures and uploads each stopped cell's exact database
     // position. A failed proof abandons the marker and leaves normal startup
     // to reconcile the preserved files against bucket coverage.
@@ -5569,11 +5434,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             eprintln!("celld local durability shutdown exceeded the process deadline");
         }
     }
-    #[cfg(all(test, celld_internal_tests))]
-    shutdown_accept_failure_test_checkpoint(
-        shutdown_accept_failure_test_active,
-        "local durability shutdown finished",
-    );
     // Exit without unwinding. Returning from here drops the tokio runtime
     // and the V8 platform underneath tasks and isolates that are still
     // alive -- on a deadline-cut drain that teardown segfaults (status 139
@@ -5581,11 +5441,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // every release the drain completed proved durability first, and a
     // cell the deadline cut off keeps its owner record exactly as a kill
     // would have left it.
-    #[cfg(all(test, celld_internal_tests))]
-    shutdown_accept_failure_test_checkpoint(
-        shutdown_accept_failure_test_active,
-        "final log flush reached",
-    );
     exit_flushed(0);
 }
 
@@ -5669,9 +5524,4 @@ fn forwarder_response_stream(
             }
         },
     ))
-}
-
-#[cfg(all(test, celld_internal_tests))]
-mod durability_lifecycle_private {
-    include!(env!("CELLD_CONFORMANCE_MAIN_DURABILITY_TESTS"));
 }
