@@ -646,13 +646,11 @@ fn authorize_sql(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::
     }
 }
 
-fn without_sql_authorizer<T>(connection: &Connection, callback: impl FnOnce() -> T) -> T {
-    use rusqlite::hooks::{AuthContext, Authorization};
-
-    connection.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
-    let result = callback();
-    connection.authorizer(Some(authorize_sql));
-    result
+fn without_sql_authorizer<T>(
+    connection: &mut Connection,
+    callback: impl FnOnce(&Connection) -> T,
+) -> T {
+    without_sql_authorizer_mut(connection, |connection| callback(connection))
 }
 
 fn without_sql_authorizer_mut<T>(
@@ -661,9 +659,16 @@ fn without_sql_authorizer_mut<T>(
 ) -> T {
     use rusqlite::hooks::{AuthContext, Authorization};
 
-    connection.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    connection
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .expect("remove the SQL authorizer");
     let result = callback(connection);
-    connection.authorizer(Some(authorize_sql));
+    // SQLite only fails this on allocation failure; continuing would run user
+    // SQL without the authorizer.
+    if let Err(error) = connection.authorizer(Some(authorize_sql)) {
+        eprintln!("celld: could not reinstall the SQL authorizer: {error}");
+        std::process::abort();
+    }
     result
 }
 
@@ -755,7 +760,7 @@ pub(crate) fn open_at_epoch(
 
 fn finish_open(
     scope: &str,
-    c: Connection,
+    mut c: Connection,
     epoch: u64,
     replicated_wake: bool,
     sqlite_vec: bool,
@@ -812,7 +817,7 @@ fn finish_open(
             rusqlite::ffi::sqlite3_limit(database, category, limit);
         }
     }
-    c.authorizer(Some(authorize_sql));
+    c.authorizer(Some(authorize_sql))?;
     // rusqlite's default holds 16 statements; the KV texts plus a cell's
     // few hot user statements fit in 64 without evicting each other.
     c.set_prepared_statement_cache_capacity(64);
@@ -1070,10 +1075,10 @@ static NEXT_SYNC_LIST_CURSOR: AtomicU64 = AtomicU64::new(1);
 static NEXT_SQL_CURSOR: AtomicU64 = AtomicU64::new(1);
 
 fn with_batch_savepoint<T>(
-    connection: &Connection,
+    connection: &mut Connection,
     callback: impl FnOnce(&Connection) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    without_sql_authorizer(connection, || {
+    without_sql_authorizer(connection, |connection| {
         let sequence = NEXT_BATCH_SAVEPOINT.fetch_add(1, Ordering::Relaxed);
         let name = format!("cells_batch_{sequence}");
         connection.execute_batch(&format!("SAVEPOINT {name};"))?;
@@ -1354,7 +1359,7 @@ pub fn sql_exec(scope: &str, query: &str, binds: &[serde_json::Value]) -> Result
                 ));
             }
             let mut stmt = c.prepare(query).map_err(|e| e.to_string())?;
-            let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+            let cols: Vec<String> = stmt.column_names().map(|s| s.to_string()).collect();
             let n = cols.len();
             let params = rusqlite::params_from_iter(binds.iter().map(json_to_sql));
             let mut rows = stmt.query(params).map_err(|e| e.to_string())?;
@@ -2058,8 +2063,8 @@ pub fn sql_write_meta(scope: &str) -> Result<(i64, u64), String> {
 
 pub fn sql_database_size(scope: &str) -> Result<u64, String> {
     require_sql_healthy(scope)?;
-    with(scope, |connection| {
-        without_sql_authorizer(connection, || {
+    with_mut(scope, |connection| {
+        without_sql_authorizer(connection, |connection| {
             connection
                 .query_row(
                     "SELECT (page_count - freelist_count) * page_size \
@@ -2478,8 +2483,8 @@ unsafe fn d1_rows_read(statement: *mut rusqlite::ffi::sqlite3_stmt, emitted: u64
 /// compares this across the statement instead of trusting
 /// `sqlite3_stmt_readonly` alone, which reported `changed_db: true` for
 /// `UPDATE ... WHERE 0` where upstream reports the false its name promises.
-fn d1_schema_version(connection: &Connection) -> i64 {
-    without_sql_authorizer(connection, || {
+fn d1_schema_version(connection: &mut Connection) -> i64 {
+    without_sql_authorizer(connection, |connection| {
         connection
             .query_row("PRAGMA schema_version", [], |row| row.get(0))
             .unwrap_or(0)
@@ -2533,7 +2538,7 @@ unsafe fn d1_tail_has_statement(
 /// whole source ran; the caller owns any surrounding transaction.
 unsafe fn d1_run_statements(
     scope: &str,
-    connection: &Connection,
+    connection: &mut Connection,
     source: &CString,
     input: &str,
     keep_rows: bool,
@@ -2614,7 +2619,7 @@ unsafe fn d1_run_statements(
 
 unsafe fn d1_run_prepared(
     scope: &str,
-    connection: &Connection,
+    connection: &mut Connection,
     sql: &str,
     params: &[serde_json::Value],
     keep: usize,
@@ -2740,8 +2745,14 @@ fn d1_poison_transaction(scope: &str, error: String) {
     });
 }
 
-fn d1_rollback_after_commit_failure(scope: &str, connection: &Connection) -> Result<(), String> {
-    without_sql_authorizer(connection, || connection.execute_batch("ROLLBACK")).map_err(|error| {
+fn d1_rollback_after_commit_failure(
+    scope: &str,
+    connection: &mut Connection,
+) -> Result<(), String> {
+    without_sql_authorizer(connection, |connection| {
+        connection.execute_batch("ROLLBACK")
+    })
+    .map_err(|error| {
         if let rusqlite::Error::SqliteFailure(sqlite, _) = &error {
             // SAFETY: the handle belongs to this live connection.
             let database = unsafe { connection.handle() };
@@ -2754,7 +2765,7 @@ fn d1_rollback_after_commit_failure(scope: &str, connection: &Connection) -> Res
 
 fn d1_transaction_control(
     scope: &str,
-    connection: &Connection,
+    connection: &mut Connection,
     operation: D1TransactionOperation,
     failure: fn(String) -> D1Failure,
 ) -> Result<(), D1Failure> {
@@ -2763,15 +2774,16 @@ fn d1_transaction_control(
     let result = if let Some(result_code) = injected {
         Err((result_code, None))
     } else {
-        without_sql_authorizer(connection, || connection.execute_batch(operation.sql())).map_err(
-            |error| {
-                let code = match &error {
-                    rusqlite::Error::SqliteFailure(sqlite, _) => Some(sqlite.extended_code),
-                    _ => None,
-                };
-                (code.unwrap_or(rusqlite::ffi::SQLITE_ERROR), Some(error))
-            },
-        )
+        without_sql_authorizer(connection, |connection| {
+            connection.execute_batch(operation.sql())
+        })
+        .map_err(|error| {
+            let code = match &error {
+                rusqlite::Error::SqliteFailure(sqlite, _) => Some(sqlite.extended_code),
+                _ => None,
+            };
+            (code.unwrap_or(rusqlite::ffi::SQLITE_ERROR), Some(error))
+        })
     };
 
     result.map_err(|(result_code, error)| {
@@ -2839,7 +2851,7 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
     match request {
         D1Request::Prepared { sql, params, first } => {
             let keep = if *first { 1 } else { D1_MAX_ROWS };
-            with(scope, |connection| {
+            with_mut(scope, |connection| {
                 as_user_sql(|| {
                     let mut budget = D1_MAX_RESULT_BYTES;
                     // SAFETY: the connection lives in DBS until close(), and
@@ -2852,7 +2864,7 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
             })
             .unwrap_or_else(|| Err(d1_error(format!("no db for {scope}"))))
         }
-        D1Request::Batch { statements } => with(scope, |connection| {
+        D1Request::Batch { statements } => with_mut(scope, |connection| {
             if !connection.is_autocommit() {
                 return Err(d1_error("batch cannot start inside an open transaction"));
             }
@@ -2905,7 +2917,7 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
         D1Request::Exec { sql, rows } => {
             let source = CString::new(sql.as_str())
                 .map_err(|error| d1_exec_error(format!("invalid SQL text: {error}")))?;
-            with(scope, |connection| {
+            with_mut(scope, |connection| {
                 // One transaction per exec, as upstream D1 runs it (verified
                 // against workerd's D1 under miniflare: a failing line rolls
                 // the whole call back). Without the bracket the statements
@@ -2967,7 +2979,7 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
             }
             let source = CString::new(sql.as_str())
                 .map_err(|error| d1_error(format!("invalid SQL text: {error}")))?;
-            with(scope, |connection| {
+            with_mut(scope, |connection| {
                 // The transaction is what makes the durability claim true:
                 // a migration that fails part-way rolls back whole, and the
                 // operator fixes the file and re-runs. Without it the
@@ -3053,8 +3065,8 @@ fn d1_plain_identifier(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn d1_database_size(connection: &Connection) -> u64 {
-    without_sql_authorizer(connection, || {
+fn d1_database_size(connection: &mut Connection) -> u64 {
+    without_sql_authorizer(connection, |connection| {
         connection
             .query_row(
                 "SELECT (page_count - freelist_count) * page_size \
@@ -3113,8 +3125,8 @@ pub fn transaction_control(
     {
         return Err("invalid storage transaction savepoint".to_string());
     }
-    let result = with(scope, |connection| {
-        without_sql_authorizer(connection, || {
+    let result = with_mut(scope, |connection| {
+        without_sql_authorizer(connection, |connection| {
             let query = match (action, nested) {
                 ("start", false) => "BEGIN IMMEDIATE".to_string(),
                 ("start", true) => format!("SAVEPOINT {savepoint}"),
@@ -3650,7 +3662,7 @@ pub fn delete_all_with_alarm(scope: &str, delete_alarm: bool) -> anyhow::Result<
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
-        without_sql_authorizer(c, || {
+        without_sql_authorizer(c, |c| {
             c.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
             let result = (|| -> anyhow::Result<()> {
                 for table in tables {
