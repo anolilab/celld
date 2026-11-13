@@ -190,9 +190,13 @@ async function generatedAgreement(algorithm) {
   const ab = await subtle.deriveBits({ ...algorithm, public: b.publicKey }, a.privateKey, length);
   const ba = await subtle.deriveBits({ ...algorithm, public: a.publicKey }, b.privateKey, length);
   equal(hex(ab), hex(ba), "the two sides agree");
-  const jwk = await subtle.exportKey("jwk", a.privateKey);
-  const again = await subtle.importKey("jwk", jwk, algorithm, true, usages);
-  equal(hex(await subtle.deriveBits({ ...algorithm, public: b.publicKey }, again, length)), hex(ab), "after a JWK round trip");
+  // Each half survives export and import in each format, and the imported
+  // keys still agree with the original secret.
+  for (const [privFormat, pubFormat] of [["jwk", "jwk"], ["pkcs8", "spki"]]) {
+    const priv = await subtle.importKey(privFormat, await subtle.exportKey(privFormat, a.privateKey), algorithm, true, usages);
+    const pub = await subtle.importKey(pubFormat, await subtle.exportKey(pubFormat, b.publicKey), algorithm, true, []);
+    equal(hex(await subtle.deriveBits({ ...algorithm, public: pub }, priv, length)), hex(ab), `after a ${privFormat} round trip`);
+  }
 }
 
 const checks = {
