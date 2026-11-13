@@ -1,0 +1,19 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  # The WebAssembly example is its own Cargo workspace.
+  - package-ecosystem: cargo
+    directory: /examples/wasm
+    schedule:
+      interval: weekly

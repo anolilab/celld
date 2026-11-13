@@ -47,6 +47,8 @@ pub use crate::engine_api::PoolCensus;
 /// value as opaque, so its allocation order is not a deterministic decision.
 static NEXT_HEAP_ID: AtomicU64 = AtomicU64::new(1);
 
+// `fetch_update` is `try_update` from Rust 1.99; the pinned toolchain is older.
+#[allow(deprecated)]
 fn next_heap_id() -> HeapId {
     let value = NEXT_HEAP_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {

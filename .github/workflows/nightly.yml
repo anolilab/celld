@@ -1,0 +1,48 @@
+name: Nightly
+
+# Catches what a pull request cannot: a newer compiler that breaks the build
+# or adds lints, and advisories published against locked dependencies. The
+# long suites from the test-infrastructure tickets join this workflow as they
+# land.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  toolchains:
+    name: Test (${{ matrix.toolchain }})
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, beta]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal -c clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: nightly-${{ matrix.toolchain }}
+      - run: cargo +${{ matrix.toolchain }} test --workspace --locked
+      - run: cargo +${{ matrix.toolchain }} clippy --workspace --all-targets --locked -- -D warnings
+
+  audit:
+    name: Dependency advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
