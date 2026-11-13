@@ -5178,6 +5178,13 @@ impl State {
                 // node that has already decided it has no room. Publishing it
                 // as unowned is what turns an eviction into shed load.
                 if rebalance {
+                    // The cell can have been wanted again while an earlier
+                    // release was still in flight. That release is
+                    // superseded: its answer finds no owner, and its index
+                    // entry must not outlive the slot it named.
+                    if let Some(superseded) = cell.releasing.take() {
+                        self.cell_ops.remove(&superseded);
+                    }
                     let op = self.cell_op(&id);
                     cell.releasing = Some(op);
                     self.releasing_cells.insert(id.clone());
@@ -7158,5 +7165,9 @@ fn runtime_epoch(phase: &Phase) -> Option<Epoch> {
 mod alarm_tests;
 #[cfg(test)]
 mod dead_owner_tests;
+#[cfg(test)]
+mod scripted;
+#[cfg(test)]
+mod second_release_tests;
 #[cfg(test)]
 mod test_support;
