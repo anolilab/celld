@@ -50,11 +50,10 @@ jobs:
     name: Test (linux x86_64)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    # MinIO's root account and the client's credentials, for the store
-    # contract suite.
+    # RustFS's default account, for the store contract suite.
     env:
-      AWS_ACCESS_KEY_ID: contract
-      AWS_SECRET_ACCESS_KEY: contract-secret
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
       AWS_ENDPOINT_URL: http://127.0.0.1:9000
       AWS_REGION: us-east-1
     steps:
@@ -67,15 +66,12 @@ jobs:
           shared-key: linux-x86_64
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # The object-store contract suite (tests/store_contract.rs) runs against
-      # a local MinIO, an S3-compatible store with conditional writes.
-      - name: Start MinIO
+      # a local RustFS, an S3-compatible store with conditional writes.
+      - name: Start RustFS
         run: |
           set -euo pipefail
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" \
-            -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
-            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
-          timeout 60 sh -c 'until curl -sf "$AWS_ENDPOINT_URL/minio/health/live"; do sleep 1; done'
+          docker run -d --name rustfs -p 9000:9000 rustfs/rustfs:1.0.5
+          timeout 60 sh -c 'until aws s3 ls >/dev/null 2>&1; do sleep 1; done'
           aws s3 mb s3://contract
       - run: cargo test --workspace --locked
         env:

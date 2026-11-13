@@ -22,7 +22,7 @@ every pull request:
 - **Unit tests** in the crates, such as the input gate's admission decisions in
   `celld-logic`.
 - **The object-store contract** (`crates/celld/tests/store_contract.rs`)
-  against a local MinIO; see [below](#object-store-contract).
+  against a local RustFS; see [below](#object-store-contract).
 - **Format, clippy and multi-platform builds.**
 
 The nightly workflow adds end-to-end [benchmarks](benchmarks.md).
@@ -204,7 +204,7 @@ skipped. Each test writes under its own prefix and deletes what it wrote.
 
 | Store | Version | Result | Where |
 | --- | --- | --- | --- |
-| MinIO | `RELEASE.2025-04-22T22-12-26Z` | pass | every pull request |
+| RustFS | `1.0.5` | pass | every pull request |
 
 Other providers, a fault proxy and the outage scenarios are tracked in
 [#7](https://github.com/anolilab/celld/issues/7).
