@@ -50,7 +50,10 @@ async fn hold_during_the_objects_life_keeps_requests_out() {
     let server = Server::start("do-gates", &[]).await;
     let out: Value = server.get_json("/midhold?o=midhold").await;
     // Requests that arrive while `blockConcurrencyWhile` waits on a timer run
-    // only after it, so none sees the state half written.
+    // only after it, so none sees the state half written. This checks what a
+    // caller observes: the host gate and the instance's readiness promise both
+    // hold these requests, and the gate's own decisions are unit-tested in
+    // `celld_logic::gate`.
     assert_eq!(
         out,
         json!([{"phase": "whole"}, {"phase": "whole"}, {"phase": "whole"}]),
