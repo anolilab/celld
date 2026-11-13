@@ -25,7 +25,8 @@ most one container.
 celld implements this part of `ctx.container`:
 
 - `start()` starts the container. It accepts `entrypoint`, `env`,
-  `enableInternet`, and `labels`.
+  `enableInternet`, `labels`, and `image`, which picks one of the
+  [images of the class](#more-than-one-image-per-class).
 - `running` reports the state of the engine, so an object that lost its
   `monitor()` sees the exit at its next event.
 - `monitor()` returns a promise that settles when the container exits.
@@ -47,6 +48,43 @@ transports. Its preview URLs need a wildcard hostname at the load balancer,
 tunnels run cloudflared inside the container, and bucket mounts use the
 credentials that the application passes. See the
 [sandbox example](../../examples/sandbox).
+
+## More than one image per class
+
+A `containers` entry names the image that its objects start. An entry can also
+name other images, and an object picks one when it starts:
+
+```jsonc
+"containers": [
+  {
+    "class_name": "Runner",
+    "image": "./Dockerfile",
+    "images": { "gpu": "./Dockerfile.gpu", "tools": "alpine:3.20" }
+  }
+]
+```
+
+Each image under `images` is a Dockerfile path or an image reference, as for
+`image`. `ctx.container.images` lists the names of the class, and `default` is
+always among them: it names `image`. `ctx.container.images.gpu` is the string
+`"gpu"`, so a name can be passed back to `start()`:
+
+```js
+this.ctx.container.start({ image: this.ctx.container.images.gpu });
+```
+
+`start()` with no `image`, or with `default`, starts the image of the entry.
+A name that the entry does not declare makes `start()` throw before anything
+reaches the engine. The value is a name and never an image reference, so an
+object cannot start an image that the deployment did not build. A name is 1 to
+64 letters, digits, dots, dashes, or underscores, and `default` is reserved.
+
+`celld deploy` builds, tags, and uploads every image of the class like the
+default one, and each node loads them all at startup. A deployment that names
+more than one image requires every node to run a celld that supports it, and a
+node that predates it refuses the deployment. The container that is running
+keeps the image it started with, and an object that starts again can pick
+another one. Cloudflare has no `images` key, so `celld` adds it, like `runtime`.
 
 ## The image and the node
 
@@ -129,9 +167,10 @@ count against `max_instances`. A start over the cap fails, and the node logs
 
 ## Differences from Cloudflare
 
-- A `containers` entry accepts `class_name`, `image`, `name`, `instance_type`,
-  `max_instances`, and `runtime`. Each other key stops the deployment. celld
-  adds `runtime`, and it accepts `name` without using it.
+- A `containers` entry accepts `class_name`, `image`, `images`, `name`,
+  `instance_type`, `max_instances`, and `runtime`. Each other key stops the
+  deployment. celld adds `images` and `runtime`, and it accepts `name` without
+  using it.
 - celld places a container on the node that owns the cell. Cloudflare can place
   a container away from its object.
 - A node that serves a container class needs a Docker daemon or a Podman daemon.

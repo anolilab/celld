@@ -1,0 +1,15 @@
+{
+  "name": "container-images",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "containers": [
+    {
+      "class_name": "Box",
+      "image": "./Dockerfile",
+      "images": { "alt": "./Dockerfile.alt" }
+    }
+  ],
+  "durable_objects": { "bindings": [{ "name": "BOX", "class_name": "Box" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Box"] }]
+}
