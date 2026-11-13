@@ -1,0 +1,9 @@
+{
+  "name": "container-exec",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "containers": [{ "class_name": "Runner", "image": "./Dockerfile" }],
+  "durable_objects": { "bindings": [{ "name": "RUNNER", "class_name": "Runner" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Runner"] }]
+}
