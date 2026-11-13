@@ -1,12 +1,11 @@
 //! Ownership records: a cell whose `own.json` is gone while its LTX remains
 //! must not be claimed as a new cell, which would serve an empty database.
 
-// The test edits a stopped server's state and waits from the outside, so it is
-// not part of the execution boundary that the disallowed-methods policy protects.
+// The test edits a stopped server's state from the outside, so it is not part
+// of the execution boundary that the disallowed-methods policy protects.
 #![allow(clippy::disallowed_methods)]
 
 use std::path::Path;
-use std::time::Duration;
 
 use super::harness::Server;
 
@@ -54,7 +53,6 @@ async fn lost_record_beside_ltx_is_refused_not_reclaimed() {
     );
     // The refusal is held, so a retry inside the hold is refused without
     // another read of the bucket.
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!server.get_status("/agent/kept").await.is_success());
     assert_eq!(
         server
