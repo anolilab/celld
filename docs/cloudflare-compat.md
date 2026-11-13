@@ -62,6 +62,10 @@ An unsupported feature that does not cause an error is a defect.
 ### [Fetch, Request, Response, and Headers](https://developers.cloudflare.com/workers/runtime-apis/fetch/)
 
 - The `cache` request option is unavailable.
+- `clone()` on a `Request` or `Response` with a streaming body tees the body,
+  and the original keeps one branch. Both refuse a body that has been read or
+  is held by a reader, and `bodyUsed` is `true` once a reader has read from the
+  body.
 - An inbound `Request` has a `cf` object without Cloudflare edge fields. celld
   cannot prove the geolocation, colo, or TLS metadata.
 - celld removes `Content-Length` from a Worker response, except for a `HEAD`

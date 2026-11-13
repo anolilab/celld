@@ -246,6 +246,29 @@ for (const bodyStream of [CelldBodyStream, CelldHttpBodyStream]) {
     value: ReadableStream, writable: true, configurable: true,
   });
 }
+// Whether a Body has been read, partly or whole, by text() and its kin or
+// through a reader: the standard `bodyUsed`.
+function __bodyIsUsed(owner) {
+  return owner._bodyUsed || (owner.body !== null && owner.body._disturbed === true);
+}
+// What clone() hands the copy. A buffered body is shared; a streaming body is
+// teed, the original keeping one branch. Refuses a body that was read or is
+// held by a reader, as the standard does.
+function __cloneBody(owner) {
+  if (__bodyIsUsed(owner) || (owner.body !== null && owner.body.locked))
+    throw new TypeError("Body has already been consumed");
+  if (owner.body === null) return null;
+  if (owner._bodyBytes !== null) return owner._bodyBytes;
+  const [kept, copy] = owner.body.tee();
+  owner.body = kept;
+  return copy;
+}
+const __bodyUsedAccessor = {
+  get() { return __bodyIsUsed(this); },
+  set(value) { this._bodyUsed = Boolean(value); },
+  configurable: true,
+  enumerable: true,
+};
 globalThis.Response = class Response {
   constructor(body, init = {}) {
     // Streaming/iterable detection runs only for object bodies, so
@@ -293,7 +316,7 @@ globalThis.Response = class Response {
     this.redirected = false;
     this.type = "default";
     this.url = "";
-    this.bodyUsed = false;
+    this._bodyUsed = false;
     if (init.cf !== undefined) this.cf = init.cf;
   }
   static json(data, init = {}) {
@@ -359,11 +382,9 @@ globalThis.Response = class Response {
       { type: this.headers.get("content-type") || "" });
   }
   clone() {
-    if (this.bodyUsed) throw new TypeError("Body has already been consumed");
-    if (this._bodyBytes === null)
-      throw new TypeError("Cannot clone a streaming response before consumption");
+    const body = __cloneBody(this);
     const response = new Response(
-      this.body === null ? null : this._bodyBytes,
+      body,
       {
         status: this.status, statusText: this.statusText, headers: this.headers,
         webSocket: this.webSocket, __wsTarget: this._wsTarget, cf: this.cf,
@@ -373,6 +394,7 @@ globalThis.Response = class Response {
     return response;
   }
 };
+Object.defineProperty(Response.prototype, "bodyUsed", __bodyUsedAccessor);
 // Hoisted: this would otherwise allocate an array and scan it on
 // every Request construction, which is the HTTP hot path.
 const __HTTP_METHODS = new Set(
@@ -453,7 +475,7 @@ globalThis.Request = class Request {
     if (typed && typed.type && !this.headers.has("content-type")) {
       this.headers.set("content-type", typed.type);
     }
-    this.bodyUsed = false;
+    this._bodyUsed = false;
     // The body stream and the signal stay eager, own properties: the RPC and
     // storage serializers fall back to the lift-into-marker path only when a
     // value is not directly structured-cloneable, and a Request's un-cloneable
@@ -525,16 +547,11 @@ globalThis.Request = class Request {
       { type: this.headers.get("content-type") || "" });
   }
   clone() {
-    if (this.bodyUsed) throw new TypeError("Body has already been consumed");
-    if (this._bodyBytes === null) {
-      // Streaming body: tee, keep one branch, clone the other.
-      const [left, right] = this.body.tee();
-      this.body = left;
-      return new Request(this, { body: right });
-    }
-    return new Request(this);
+    const body = __cloneBody(this);
+    return body === this._bodyBytes ? new Request(this) : new Request(this, { body });
   }
 };
+Object.defineProperty(Request.prototype, "bodyUsed", __bodyUsedAccessor);
 const __makeRequest = __celld.__makeRequest = (
   url, method, body, headersJson = "[]", signal = undefined,
   incomingSignal = false,
