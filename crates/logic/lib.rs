@@ -411,6 +411,11 @@ struct Cell {
     waiting_activation: Option<ColdStart>,
     /// The in-flight release of this cell's ownership record, if any.
     releasing: Option<OpId>,
+    /// The last restore of this cell failed. Its local state may hold
+    /// acknowledged writes the bucket does not, so the record stays with this
+    /// node: a peer given the cell would restore from the bucket alone and
+    /// lose that tail. Cleared by the next restore that succeeds.
+    restore_failed: bool,
     /// Whether the eviction now under way hands this cell to the fleet.
     evict_rebalance: bool,
     /// The epoch this node holds the record at, kept across the transient
@@ -594,6 +599,7 @@ impl Default for Cell {
             waiting_for: None,
             waiting_activation: None,
             releasing: None,
+            restore_failed: false,
             evict_rebalance: false,
             held_epoch: None,
             handoff: false,
@@ -4849,6 +4855,7 @@ impl State {
         let mut resume_failed = false;
         match result {
             Ok(outcome) => {
+                cell.restore_failed = false;
                 if outcome.restored {
                     self.activity.restored = self.activity.restored.saturating_add(1);
                 }
@@ -4889,6 +4896,7 @@ impl State {
                 });
             }
             Err(_) => {
+                cell.restore_failed = true;
                 set_phase(&mut self.occupied, &mut cell, Phase::Dormant { epoch });
                 self.finish_requests(&id, &mut cell, Err(RequestError::RestoreFailed), effects);
                 resume_failed = cell.resume_demand;
@@ -5739,7 +5747,9 @@ impl State {
             .cells
             .iter()
             .filter_map(|(id, cell)| match cell.phase {
-                Phase::Dormant { epoch } if cell.releasing.is_none() && is_queue_broker(id) => {
+                Phase::Dormant { epoch }
+                    if cell.releasing.is_none() && !cell.restore_failed && is_queue_broker(id) =>
+                {
                     Some((id.clone(), epoch))
                 }
                 _ => None,
@@ -5835,7 +5845,9 @@ impl State {
             .cells
             .iter()
             .filter_map(|(id, cell)| match cell.phase {
-                Phase::Dormant { epoch } if cell.releasing.is_none() => Some((id.clone(), epoch)),
+                Phase::Dormant { epoch } if cell.releasing.is_none() && !cell.restore_failed => {
+                    Some((id.clone(), epoch))
+                }
                 _ => None,
             })
             .collect();
@@ -5906,6 +5918,7 @@ impl State {
             .filter_map(|(id, cell)| match cell.phase {
                 Phase::Dormant { epoch }
                     if cell.releasing.is_none()
+                        && !cell.restore_failed
                         && cell.requests.is_empty()
                         && !self.alarm_is_imminent(cell) =>
                 {
@@ -7250,6 +7263,8 @@ mod alarm_tests;
 mod dead_owner_tests;
 #[cfg(test)]
 mod drain_tests;
+#[cfg(test)]
+mod failed_restore_tests;
 #[cfg(test)]
 mod fence_confirming_tests;
 #[cfg(test)]

@@ -14,6 +14,8 @@ pub(crate) struct Shell {
     /// Effects the shell has not answered.
     pub inbox: Vec<Effect>,
     owners: BTreeMap<CellId, Epoch>,
+    /// Restores of these cells fail, as when the replica cannot be read.
+    pub failing_restores: BTreeSet<CellId>,
     next_request: RequestId,
     /// The monotonic and wall clock, in milliseconds, advanced per event.
     pub now: u64,
@@ -31,6 +33,7 @@ impl Shell {
             state: State::new("node", config),
             inbox: Vec::new(),
             owners: BTreeMap::new(),
+            failing_restores: BTreeSet::new(),
             next_request: 1,
             now: 1_000_000,
         }
@@ -43,6 +46,7 @@ impl Shell {
             state: State::new("node", config),
             inbox: Vec::new(),
             owners: BTreeMap::new(),
+            failing_restores: BTreeSet::new(),
             next_request: 1,
             now: 1_000_000,
         };
@@ -165,12 +169,16 @@ impl Shell {
                         result: Ok(CasOutcome::Applied),
                     }
                 }
-                Effect::Restore { op, .. } => Event::RestoreCompleted {
+                Effect::Restore { op, cell, .. } => Event::RestoreCompleted {
                     op,
-                    result: Ok(RestoreOutcome {
-                        restored: false,
-                        alarm: None,
-                    }),
+                    result: if self.failing_restores.contains(&cell) {
+                        Err(Failure::Definite)
+                    } else {
+                        Ok(RestoreOutcome {
+                            restored: false,
+                            alarm: None,
+                        })
+                    },
                 },
                 Effect::StartRuntime { op, .. } => Event::RuntimeStarted {
                     op,
