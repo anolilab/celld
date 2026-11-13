@@ -63,6 +63,40 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  # Runs the object-store contract suite against each store in
+  # crates/celld/tests/stores/compose.yml and writes one line per store to the
+  # job summary, which is what the table in docs/testing.md is refreshed from.
+  # SeaweedFS is expected to fail: it does not serialize racing conditional
+  # writes. Its entry stays so that a release that fixes it shows up here.
+  stores:
+    name: Store contract (${{ matrix.provider }})
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [rustfs, seaweedfs]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.provider == 'seaweedfs' }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: nightly-stores
+      - name: Run the contract suite
+        run: |
+          set -o pipefail
+          crates/celld/tests/stores/run.sh ${{ matrix.provider }} | tee "$RUNNER_TEMP/stores.log"
+      - name: Record the result
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "### Store contract"
+            echo
+            tail -n 1 "$RUNNER_TEMP/stores.log" || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
   audit:
     name: Dependency advisories
     runs-on: ubuntu-24.04

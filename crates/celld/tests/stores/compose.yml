@@ -1,0 +1,16 @@
+# S3-compatible stores for the object-store contract suite. Start one with
+# `run.sh <provider>`; the suite's results per store are in docs/testing.md.
+services:
+  rustfs:
+    image: rustfs/rustfs:1.0.5
+    ports:
+      - "9000:9000"
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:3.97
+    command: server -s3 -dir=/data
+    environment:
+      AWS_ACCESS_KEY_ID: seaweedadmin
+      AWS_SECRET_ACCESS_KEY: seaweedadmin
+    ports:
+      - "8333:8333"
