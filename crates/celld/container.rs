@@ -1426,13 +1426,21 @@ impl ContainerEngine {
         if !cell.running() {
             return Err(anyhow!("exec() requires a running container."));
         }
+        let tty = params.pty.is_some();
         let mut body = json!({
             "AttachStdin": true,
             "AttachStdout": true,
             "AttachStderr": true,
-            "Tty": false,
+            "Tty": tty,
             "Cmd": params.cmd,
         });
+        // The terminal is born with its size, so a process that ends before
+        // it can be resized has still run at the right one. The daemon takes
+        // rows first. One older than API 1.42 ignores the field, and the
+        // resize below sizes the terminal there.
+        if let Some((cols, rows)) = params.pty {
+            body["ConsoleSize"] = json!([rows, cols]);
+        }
         if !params.env.is_empty() {
             body["Env"] = json!(params
                 .env
@@ -1465,7 +1473,7 @@ impl ContainerEngine {
             .docker
             .hijack(
                 &format!("/exec/{exec_id}/start"),
-                json!({ "Detach": false, "Tty": false }),
+                json!({ "Detach": false, "Tty": tty }),
             )
             .await?;
         // Docker reports `Running: false` with no pid before it has spawned
@@ -1498,7 +1506,14 @@ impl ContainerEngine {
         let ended = watch::channel(false).0;
         let ended_ = ended.clone();
         asyncrt::spawn(async move {
-            demux(read, stdout_tx, stderr_tx, combined).await;
+            if tty {
+                // A terminal has one stream: the daemon sends its bytes
+                // unframed, and stderr has nothing to carry.
+                drop(stderr_tx);
+                pump(read, stdout_tx).await;
+            } else {
+                demux(read, stdout_tx, stderr_tx, combined).await;
+            }
             ended_.send_replace(true);
         })
         .detach();
@@ -1519,6 +1534,20 @@ impl ContainerEngine {
             .unwrap()
             .insert(process.id, process.clone());
         cell.processes.lock().unwrap().push(process.id);
+        // A process that cannot be sized is not the one the object asked
+        // for, so it does not outlive the failure. One that has already
+        // exited cannot be resized either, because the daemon answers 404 for
+        // it, and a command that ends at once is not an error: it ran at the
+        // size the exec was created with.
+        if let Some((cols, rows)) = params.pty {
+            if let Err(error) = process.resize(cols, rows).await {
+                if process.running().await.unwrap_or(true) {
+                    let _ = process.kill(9).await;
+                    drop_process(process.id);
+                    return Err(error.context("size the terminal of the exec"));
+                }
+            }
+        }
         Ok(process)
     }
 }
@@ -1530,6 +1559,9 @@ pub struct ExecParams {
     pub user: Option<String>,
     /// stderr folded into stdout.
     pub combined: bool,
+    /// Run on a pseudo-terminal of this size, `(cols, rows)`. The terminal
+    /// has one stream, so stdout carries what stderr would.
+    pub pty: Option<(u16, u16)>,
 }
 
 type WriteHalf = tokio::io::WriteHalf<Box<dyn Stream>>;
@@ -1638,6 +1670,37 @@ impl ExecProcess {
         Ok(code)
     }
 
+    /// Whether the process is still running.
+    async fn running(&self) -> anyhow::Result<bool> {
+        let info = self
+            .docker
+            .expect(
+                "GET",
+                &format!("/exec/{}/json", self.exec_id),
+                None,
+                "inspect exec",
+            )
+            .await?
+            .json()?;
+        Ok(info
+            .get("Running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+    }
+
+    /// Set the size of the terminal of a pty exec.
+    pub async fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        self.docker
+            .expect(
+                "POST",
+                &format!("/exec/{}/resize?h={rows}&w={cols}", self.exec_id),
+                None,
+                "resize exec",
+            )
+            .await?;
+        Ok(())
+    }
+
     /// The Engine API has no exec kill, so the signal is delivered by a
     /// second exec of `kill`, as workerd does.
     pub async fn kill(&self, signal: u32) -> anyhow::Result<()> {
@@ -1668,6 +1731,21 @@ impl ExecProcess {
             )
             .await?;
         Ok(())
+    }
+}
+
+/// Copy a terminal's unframed output to `stdout` until the daemon closes it.
+async fn pump(mut read: tokio::io::ReadHalf<Box<dyn Stream>>, stdout: mpsc::Sender<Bytes>) {
+    let mut buffer = vec![0u8; 16 * 1024];
+    loop {
+        match read.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            // The reader going away still drains the terminal, as `demux`
+            // does, so the process is not blocked on a full pipe.
+            Ok(n) => {
+                let _ = stdout.send(Bytes::copy_from_slice(&buffer[..n])).await;
+            }
+        }
     }
 }
 

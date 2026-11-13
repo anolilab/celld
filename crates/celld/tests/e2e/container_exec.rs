@@ -64,3 +64,94 @@ async fn a_container_created_after_destroy_ended_its_start_is_removed() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn pty_defaults_to_80_by_24() {
+    let engine = FakeEngine::start(Kill::Realistic).await;
+    let server = server(&engine).await;
+    let out: Value = server.get_json("/pty?pty=true").await;
+    assert_eq!(
+        out,
+        json!({ "ok": { "isPty": true, "out": "80x24\n", "exitCode": 0 } }),
+        "{out}"
+    );
+    // A pty exec is a tty stream, not the multiplexed one.
+    assert_eq!(engine.exec_creates()[0]["Tty"], true);
+}
+
+#[tokio::test]
+async fn pty_takes_the_size_it_is_given() {
+    let engine = FakeEngine::start(Kill::Realistic).await;
+    let server = server(&engine).await;
+    let out: Value = server
+        .get_json("/pty?pty=%7B%22cols%22%3A100%2C%22rows%22%3A30%7D")
+        .await;
+    assert_eq!(out["ok"]["out"], "100x30\n", "{out}");
+}
+
+#[tokio::test]
+async fn resize_changes_the_terminal() {
+    let engine = FakeEngine::start(Kill::Realistic).await;
+    let server = server(&engine).await;
+    let out: Value = server.get_json("/pty?pty=true&resize=120x40").await;
+    assert_eq!(out["ok"]["out"], "120x40\n", "{out}");
+}
+
+#[tokio::test]
+async fn is_pty_and_resize_are_checked() {
+    let engine = FakeEngine::start(Kill::Realistic).await;
+    let server = server(&engine).await;
+    let out: Value = server.get_json("/pty-state").await;
+    let state = &out["ok"];
+    assert_eq!(state["plain"], false, "{out}");
+    assert_eq!(state["piped"], true, "{out}");
+    assert!(
+        state["resizeError"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pty"),
+        "{out}"
+    );
+    assert_eq!(state["rangeError"], "RangeError", "{out}");
+    for bad in state["bad"].as_array().unwrap() {
+        assert!(bad["error"].is_string(), "{out}");
+    }
+}
+
+#[tokio::test]
+async fn a_failed_first_resize_kills_the_exec() {
+    // An image with `kill` and a pid that names the process, so a kill by
+    // the old means is observable here; the realistic case is covered with
+    // the kill delivery.
+    let engine = FakeEngine::start(Kill::Binary).await;
+    engine.fail_resize("cannot resize");
+    let server = server(&engine).await;
+    let out: Value = server.get_json("/pty-hold").await;
+    assert!(
+        out["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cannot resize"),
+        "{out}"
+    );
+    wait_until("the exec to be killed", Duration::from_secs(10), || async {
+        (!engine.exec_running(0)).then_some(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_pty_command_that_ends_at_once_is_not_an_error() {
+    // The daemon answers a resize of a process that has exited with a 404,
+    // so a short command must not fail the exec for it.
+    let engine = FakeEngine::start(Kill::Realistic).await;
+    let server = server(&engine).await;
+    let out: Value = server.get_json("/pty-short").await;
+    assert_eq!(
+        out,
+        json!({ "ok": { "out": "hello\n", "exitCode": 0 } }),
+        "{out}"
+    );
+    // The size went with the exec's creation, not only in a later call.
+    assert_eq!(engine.exec_creates()[0]["ConsoleSize"], json!([30, 100]));
+}

@@ -248,6 +248,7 @@ const NOT_CELL_SCOPED: &[&str] = &[
     "__container_exec_wait",
     "__container_exec_kill",
     "__container_exec_drop",
+    "__container_exec_resize",
     "__sql_cursor_next",
     "__sql_cursor_close",
     "__log",

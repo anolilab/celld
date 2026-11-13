@@ -2344,6 +2344,21 @@ const __execOutputMode = (mode, kind) => {
   throw new TypeError(`Invalid ${kind} option: ${value}`);
 };
 const __validSignal = (signo) => Number.isInteger(signo) && signo > 0 && signo <= 64;
+const __validTerminalSize = (cols, rows) =>
+  Number.isInteger(cols) && cols > 0 && cols <= 65535 &&
+  Number.isInteger(rows) && rows > 0 && rows <= 65535;
+// `pty: true` is an 80 by 24 terminal; an object names either side.
+const __ptyOption = (pty) => {
+  if (pty === undefined || pty === false) return null;
+  if (pty === true) return { cols: 80, rows: 24 };
+  if (pty !== null && typeof pty === "object") {
+    const cols = pty.cols === undefined ? 80 : pty.cols;
+    const rows = pty.rows === undefined ? 24 : pty.rows;
+    if (__validTerminalSize(cols, rows)) return { cols, rows };
+  }
+  throw new TypeError(
+    "pty must be true or an object with integer cols and rows from 1 to 65535.");
+};
 const __execStream = (id, which) => new ReadableStream({
   type: "bytes",
   async pull(controller) {
@@ -2360,13 +2375,15 @@ class ContainerExecOutput {
   }
 }
 class ContainerExecProcess {
-  constructor(id, pid, stdinMode, stdoutMode, stderrMode) {
+  constructor(id, pid, stdinMode, stdoutMode, stderrMode, pty) {
     this._id = id;
     this.pid = pid;
+    this.isPty = pty !== null;
     this._outputCalled = false;
     this._exitCode = null;
     this.stdout = stdoutMode === "pipe" ? __execStream(id, 1) : null;
-    this.stderr = stderrMode === "pipe" ? __execStream(id, 2) : null;
+    // A terminal has one stream, so stderr has nothing of its own.
+    this.stderr = stderrMode === "pipe" && pty === null ? __execStream(id, 2) : null;
     this.stdin = stdinMode === "pipe"
       ? new WritableStream({
         write: (chunk) => __container_exec_write(id, __bytesOf(chunk)),
@@ -2400,6 +2417,13 @@ class ContainerExecProcess {
   kill(signal = 15) {
     if (!__validSignal(signal)) throw new RangeError("Invalid signal number.");
     __container_exec_kill(this._id, signal).catch(() => {});
+  }
+  async resize(cols, rows) {
+    if (!this.isPty)
+      throw new Error("resize() requires an exec started with the pty option.");
+    if (!__validTerminalSize(cols, rows))
+      throw new RangeError("resize() needs integer cols and rows from 1 to 65535.");
+    await __container_exec_resize(this._id, cols, rows);
   }
 }
 const __bytesOf = (chunk) => {
@@ -2551,7 +2575,8 @@ class Container {
     const o = options ?? {};
     const stdoutMode = __execOutputMode(o.stdout, "stdout");
     const stderrMode = __execOutputMode(o.stderr, "stderr");
-    const combined = stderrMode === "combined";
+    const pty = __ptyOption(o.pty);
+    const combined = stderrMode === "combined" && pty === null;
     if (combined && stdoutMode !== "pipe")
       throw new TypeError('stderr: "combined" requires stdout to be "pipe".');
     if (o.cwd !== undefined && String(o.cwd).includes("\0"))
@@ -2569,6 +2594,7 @@ class Container {
       env: __containerEnvList(o.env),
       combined,
     };
+    if (pty !== null) params.pty = pty;
     if (o.cwd !== undefined) params.cwd = String(o.cwd);
     if (o.user !== undefined) params.user = String(o.user);
     const { id, pid } = JSON.parse(
@@ -2592,7 +2618,7 @@ class Container {
     } else if (stdinMode === "none") {
       __container_exec_close(id).catch(() => {});
     }
-    return new ContainerExecProcess(id, pid, stdinMode, stdoutMode, stderrMode);
+    return new ContainerExecProcess(id, pid, stdinMode, stdoutMode, stderrMode, pty);
   }
   inspect() {
     return Promise.reject(new Error("inspect() is not implemented in celld"));
