@@ -225,9 +225,9 @@ RustFS. It pins these outcomes:
 | 409 on an update | clean rejection, the same as a lost race | |
 
 A 409 on an update means other conditional writes were in flight, not that
-another writer won, so reading it as a lost race can fence a node that still
-holds the record. That is tracked in
-[#36](https://github.com/anolilab/celld/issues/36).
+another writer won. A rejected node-lease renewal is read back before the node
+decides anything, but other callers of conditional writes take a rejection as
+final. That is tracked in [#36](https://github.com/anolilab/celld/issues/36).
 
 Other providers and the fleet-level outage scenarios are tracked in
 [#7](https://github.com/anolilab/celld/issues/7).

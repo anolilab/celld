@@ -192,8 +192,8 @@ async fn cas_stalled_store_times_out() {
 /// A store can answer 409 to an If-Match write while other conditional
 /// writes on the key are in flight. The client reports that as a clean
 /// rejection, the same answer as a lost race, even though no other writer
-/// changed the object. This pins the current behaviour; a renewal that
-/// reads it as lost ownership is tracked in #36.
+/// changed the object. This pins the current behaviour; callers that take
+/// a rejection as final are tracked in #36.
 #[tokio::test]
 async fn cas_update_conflict_reads_as_a_rejection() {
     faulted("cas-409", |t| async move {
