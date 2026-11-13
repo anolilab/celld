@@ -18,9 +18,9 @@ use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, ComponentPointer,
     DeployPointer, Manifest, ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig,
     QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1,
-    FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1,
-    FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
-    QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+    FEATURE_CONTAINER_IMAGES_V1, FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_KV_V1,
+    FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1,
+    FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1, QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -408,6 +408,10 @@ struct ContainerDecl {
     class_name: String,
     /// A Dockerfile path relative to the project, or an image reference.
     image: String,
+    /// The named images `start({ image })` can pick, each a Dockerfile path
+    /// or an image reference like `image`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    images: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -440,7 +444,8 @@ pub struct Built {
     pub modules: Vec<(String, Vec<u8>)>,
     pub assets: Option<BuiltAssets>,
     pub bundled_in: Duration,
-    /// The resolved image ids of `containers[]`, in config order.
+    /// The resolved image ids of `containers[]`, in config order, each
+    /// class's default image before its named ones.
     pub images: Vec<String>,
     /// Save each image to the bucket. `celld dev` leaves them in the local
     /// engine, which is where the node loads them from.
@@ -607,23 +612,31 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     let platform = (!options.local_images).then(|| {
         std::env::var("CELLD_CONTAINER_PLATFORM").unwrap_or_else(|_| "linux/amd64".to_string())
     });
-    let images = project
-        .containers
-        .iter()
-        .map(|decl| resolve_image(&root, &decl.image, platform.as_deref()))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let container_specs: Vec<ContainerSpec> = project
-        .containers
-        .iter()
-        .zip(&images)
-        .map(|(decl, image)| ContainerSpec {
+    let mut container_specs: Vec<ContainerSpec> = Vec::new();
+    let mut images: Vec<String> = Vec::new();
+    for decl in &project.containers {
+        let image = resolve_image(&root, &decl.image, platform.as_deref())?;
+        let named = decl
+            .images
+            .iter()
+            .map(|(name, source)| {
+                Ok((
+                    name.clone(),
+                    resolve_image(&root, source, platform.as_deref())?,
+                ))
+            })
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        images.push(image.clone());
+        images.extend(named.values().cloned());
+        container_specs.push(ContainerSpec {
             class_name: decl.class_name.clone(),
-            image: image.clone(),
+            image,
+            images: named,
             instance_type: decl.instance_type.clone(),
             max_instances: decl.max_instances,
             runtime: decl.runtime.clone(),
-        })
-        .collect();
+        });
+    }
     if !container_specs.is_empty() {
         project.metadata["containers"] = json!(container_specs);
     }
@@ -756,6 +769,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if !container_specs.is_empty() {
                 features.push(FEATURE_CONTAINERS_V1.to_string());
+            }
+            if container_specs.iter().any(|spec| !spec.images.is_empty()) {
+                features.push(FEATURE_CONTAINER_IMAGES_V1.to_string());
             }
             if uses_d1 {
                 features.push(FEATURE_D1_V1.to_string());
@@ -2334,7 +2350,13 @@ fn read_containers(
         if let Some(key) = entry.keys().find(|key| {
             !matches!(
                 key.as_str(),
-                "class_name" | "image" | "name" | "instance_type" | "max_instances" | "runtime"
+                "class_name"
+                    | "image"
+                    | "images"
+                    | "name"
+                    | "instance_type"
+                    | "max_instances"
+                    | "runtime"
             )
         }) {
             bail!("config `containers[{index}]` declares `{key}`, which celld does not model");
@@ -2364,6 +2386,7 @@ fn read_containers(
             .and_then(Value::as_str)
             .filter(|image| !image.is_empty())
             .ok_or_else(|| anyhow!("config `containers[{index}].image` must be a string"))?;
+        let images = read_container_images(entry.get("images"), index)?;
         let name = entry
             .get("name")
             .map(|value| {
@@ -2415,6 +2438,7 @@ fn read_containers(
         declared.push(ContainerDecl {
             class_name: class_name.to_string(),
             image: image.to_string(),
+            images,
             name,
             instance_type,
             max_instances,
@@ -2422,6 +2446,49 @@ fn read_containers(
         });
     }
     Ok(declared)
+}
+
+/// `containers[].images`: the images beside `image` that `start({ image })`
+/// can name. A name is what a Worker passes, so it is a short token and not
+/// `default`, which already names `image`.
+fn read_container_images(
+    value: Option<&Value>,
+    index: usize,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let map = value.as_object().ok_or_else(|| {
+        anyhow!("config `containers[{index}].images` must be an object of image names to images")
+    })?;
+    let mut images = BTreeMap::new();
+    for (name, image) in map {
+        let valid = !name.is_empty()
+            && name.len() <= 64
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        if !valid {
+            bail!(
+                "config `containers[{index}].images` name {name:?} must be 1 to 64 letters, \
+                 digits, dots, dashes, or underscores"
+            );
+        }
+        if name == crate::container::DEFAULT_IMAGE_NAME {
+            bail!(
+                "config `containers[{index}].images` cannot name an image `default`; \
+                 `default` is the class's `image`"
+            );
+        }
+        let image = image
+            .as_str()
+            .filter(|image| !image.is_empty())
+            .ok_or_else(|| {
+                anyhow!("config `containers[{index}].images.{name}` must be a non-empty string")
+            })?;
+        images.insert(name.clone(), image.to_string());
+    }
+    Ok(images)
 }
 
 fn reject_queue_keys(value: &Value, accepted: &[&str], kind: &str) -> anyhow::Result<()> {
@@ -3332,5 +3399,37 @@ mod image_tag_tests {
             &calls,
         );
         tag_image(&run, "id", "ref", "content").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod container_image_tests {
+    use super::*;
+
+    fn read(value: Value) -> anyhow::Result<BTreeMap<String, String>> {
+        read_container_images(Some(&value), 0)
+    }
+
+    #[test]
+    fn named_images_are_read_by_name() {
+        let images = read(json!({ "worker": "./Dockerfile.worker", "db": "postgres:16" })).unwrap();
+        assert_eq!(images["worker"], "./Dockerfile.worker");
+        assert_eq!(images["db"], "postgres:16");
+        assert!(read_container_images(None, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_bad_name_or_image_is_refused() {
+        for value in [
+            json!([]),
+            json!({ "default": "./Dockerfile" }),
+            json!({ "": "./Dockerfile" }),
+            json!({ "has space": "./Dockerfile" }),
+            json!({ "a".repeat(65): "./Dockerfile" }),
+            json!({ "worker": "" }),
+            json!({ "worker": 1 }),
+        ] {
+            assert!(read(value.clone()).is_err(), "{value}");
+        }
     }
 }

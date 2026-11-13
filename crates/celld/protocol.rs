@@ -65,6 +65,7 @@ fn legacy_manifest_schema_version() -> u32 {
 pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_ASSETS_V1,
     FEATURE_CONTAINERS_V1,
+    FEATURE_CONTAINER_IMAGES_V1,
     FEATURE_CRON_V1,
     FEATURE_D1_V1,
     FEATURE_KV_V1,
@@ -81,6 +82,10 @@ pub const FEATURE_ASSETS_V1: &str = "assets-v1";
 /// container engine would load the manifest, build a `ctx` with no
 /// `container`, and fail only when the object first touches it.
 pub const FEATURE_CONTAINERS_V1: &str = "containers-v1";
+/// A deployment whose container class names more than one image. Required
+/// because a node without per-start image selection would ignore the name and
+/// start the class's default image, which is the wrong program.
+pub const FEATURE_CONTAINER_IMAGES_V1: &str = "container-images-v1";
 /// A deployment with D1 databases. Required because a build without the
 /// reserved `__D1Database` class would load the manifest and then fail every
 /// `env.DB` call at request time, on a node the developer is not watching —

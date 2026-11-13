@@ -420,7 +420,21 @@ pub(super) fn inject_containers(
     for spec in containers {
         let key =
             v8::String::new(scope, &spec.class_name).ok_or_else(|| anyhow!("container class"))?;
-        let value = v8::Boolean::new(scope, true);
+        // The class's entry names its images, `default` first, for
+        // `ctx.container.images`. It is an object, so it is truthy as the
+        // `@cloudflare/containers` constructor needs.
+        let names = v8::Array::new(scope, 0);
+        let default = v8::String::new(scope, crate::container::DEFAULT_IMAGE_NAME)
+            .ok_or_else(|| anyhow!("container image name"))?;
+        names.set_index(scope, 0, default.into());
+        for (index, name) in spec.images.keys().enumerate() {
+            let name =
+                v8::String::new(scope, name).ok_or_else(|| anyhow!("container image name"))?;
+            names.set_index(scope, index as u32 + 1, name.into());
+        }
+        let value = v8::Object::new(scope);
+        let images_key = v8::String::new(scope, "images").unwrap();
+        value.set(scope, images_key.into(), names.into());
         map.set(scope, key.into(), value.into());
     }
     let key = v8::String::new(scope, "containers").unwrap();

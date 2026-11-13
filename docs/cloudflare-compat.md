@@ -235,6 +235,11 @@ The accepted top-level keys:
 
 Any other top-level key, including `routes`, stops the deployment.
 
+A `containers` entry accepts `class_name`, `image`, `images`, `name`,
+`instance_type`, `max_instances`, and `runtime`. `images` and `runtime` are
+celld additions, and Cloudflare has neither. The [Containers](services/containers.md)
+page lists the `ctx.container` surface and how it differs.
+
 `define` and `rules` go to the esbuild run. Each `define` value is a
 JavaScript expression, as in Wrangler. A rule `type` must be `Text`, `Data`,
 or `CompiledWasm`, and each glob must have the form `**/*.ext` or `*.ext`,
