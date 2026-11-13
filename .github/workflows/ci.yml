@@ -59,7 +59,29 @@ jobs:
         with:
           shared-key: linux-x86_64
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The object-store contract suite (tests/store_contract.rs) runs against
+      # a local MinIO, an S3-compatible store with conditional writes.
+      - name: Start MinIO
+        run: |
+          set -euo pipefail
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" \
+            -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+          timeout 60 sh -c 'until curl -sf "$AWS_ENDPOINT_URL/minio/health/live"; do sleep 1; done'
+          aws s3 mb s3://contract
+        env:
+          AWS_ACCESS_KEY_ID: contract
+          AWS_SECRET_ACCESS_KEY: contract-secret
+          AWS_ENDPOINT_URL: http://127.0.0.1:9000
+          AWS_REGION: us-east-1
       - run: cargo test --workspace --locked
+        env:
+          CELLD_STORE_CONTRACT_BUCKET: s3://contract
+          AWS_ACCESS_KEY_ID: contract
+          AWS_SECRET_ACCESS_KEY: contract-secret
+          AWS_ENDPOINT_URL: http://127.0.0.1:9000
+          AWS_REGION: us-east-1
 
   build:
     name: Build (${{ matrix.target }})

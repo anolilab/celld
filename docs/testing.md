@@ -21,6 +21,8 @@ every pull request:
   input gates and ids, plus regressions for alarms, isolate sharing and facets.
 - **Unit tests** in the crates, such as the input gate's admission decisions in
   `celld-logic`.
+- **The object-store contract** (`crates/celld/tests/store_contract.rs`)
+  against a local MinIO; see [below](#object-store-contract).
 - **Format, clippy and multi-platform builds.**
 
 The nightly workflow adds end-to-end [benchmarks](benchmarks.md).
@@ -173,6 +175,39 @@ data is tracked in [#10](https://github.com/anolilab/celld/issues/10).*
 The nightly workflow also measures throughput and latency of the real binary
 over HTTP. It reports the numbers and never gates on them; see
 [Benchmarks](benchmarks.md).
+
+## Object-store contract
+
+celld fences cell ownership with conditional writes, so it is only safe on a
+store whose conditional writes behave as compare-and-swap. The contract suite
+checks that against a real bucket:
+
+- a create-only put applies once, and a second one is a clean rejection;
+- an update applies only with the current token, and a stale token is a clean
+  rejection that leaves the object unchanged;
+- of 16 writers racing one create, or one update on the same token, exactly
+  one applies and the rest are clean rejections, never errors;
+- a listing shows every completed put and drops a completed delete.
+
+Conditional deletes are not checked, because celld does not issue them.
+
+Run it against any bucket celld can open:
+
+```sh
+CELLD_STORE_CONTRACT_BUCKET=s3://my-bucket/some-prefix \
+AWS_ENDPOINT_URL=https://… AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… \
+cargo test -p celld --test store_contract
+```
+
+Without `CELLD_STORE_CONTRACT_BUCKET` the tests pass after saying they were
+skipped. Each test writes under its own prefix and deletes what it wrote.
+
+| Store | Version | Result | Where |
+| --- | --- | --- | --- |
+| MinIO | `RELEASE.2025-04-22T22-12-26Z` | pass | every pull request |
+
+Other providers, a fault proxy and the outage scenarios are tracked in
+[#7](https://github.com/anolilab/celld/issues/7).
 
 ## Known failure edges
 
