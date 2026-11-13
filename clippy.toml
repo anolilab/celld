@@ -86,5 +86,5 @@ disallowed-macros = [
 ]
 
 disallowed-types = [
-  { path = "rand::rngs::OsRng", reason = "use a labeled execution-domain RNG inside the execution boundary" },
+  { path = "rand_core::os::OsRng", reason = "use a labeled execution-domain RNG inside the execution boundary" },
 ]

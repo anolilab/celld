@@ -385,3 +385,148 @@ fn hex_nibble(value: u8) -> anyhow::Result<u8> {
         _ => Err(anyhow!("hexadecimal must be lowercase ASCII")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue, Method};
+
+    const KEY: [u8; 32] = [7; 32];
+    const PATH: &str = "/peer/cell?x=1";
+
+    fn signed(auth: &PeerAuth, body: &[u8]) -> HeaderMap {
+        auth.signed_headers("POST", PATH, body, "node-b")
+            .expect("sign")
+    }
+
+    fn node_a() -> PeerAuth {
+        PeerAuth::new(KEY, "node-a").expect("valid source")
+    }
+
+    fn verify(auth: &PeerAuth, headers: &HeaderMap, body: &[u8]) -> Result<(), VerifyError> {
+        auth.verify(&Method::POST, PATH, headers, body, "node-b")
+    }
+
+    /// The signature over a fixed request, computed independently with
+    /// Python's `hmac`, so a change to the canonical form or to the MAC
+    /// breaks the wire between nodes of different builds and fails here.
+    #[test]
+    fn signature_matches_the_reference() {
+        let body_hash = sha256_hex(b"body");
+        let auth = PeerAuth::new(std::array::from_fn(|i| i as u8), "node-a").unwrap();
+        let canonical = CanonicalRequest {
+            method: "POST",
+            path_and_query: "/peer/x?y=1",
+            body_hash: &body_hash,
+            source: "node-a",
+            target: "node-b",
+            timestamp: 1_700_000_000_000,
+            nonce: &"00".repeat(16),
+        };
+        assert_eq!(
+            auth.signature(&canonical),
+            "5e72e53c4da4f1ddd987e413a196784353fcd9880654eb7dec0ffb56c9738b58"
+        );
+    }
+
+    #[test]
+    fn a_signed_request_verifies_once() {
+        let auth = node_a();
+        let headers = signed(&auth, b"payload");
+        verify(&auth, &headers, b"payload").expect("first delivery verifies");
+        assert!(matches!(
+            verify(&auth, &headers, b"payload"),
+            Err(VerifyError::Replay)
+        ));
+    }
+
+    #[test]
+    fn any_change_to_the_request_is_rejected() {
+        let auth = node_a();
+        let headers = signed(&auth, b"payload");
+        let unauthorized = |result: Result<(), VerifyError>| {
+            assert!(
+                matches!(result, Err(VerifyError::Unauthorized)),
+                "{result:?}"
+            );
+        };
+        unauthorized(verify(&auth, &headers, b"payloaD"));
+        unauthorized(auth.verify(&Method::PUT, PATH, &headers, b"payload", "node-b"));
+        unauthorized(auth.verify(
+            &Method::POST,
+            "/peer/cell?x=2",
+            &headers,
+            b"payload",
+            "node-b",
+        ));
+        let other_key = PeerAuth::new([8; 32], "node-a").unwrap();
+        unauthorized(verify(&other_key, &headers, b"payload"));
+        for name in [
+            HEADER_SOURCE,
+            HEADER_TIMESTAMP,
+            HEADER_NONCE,
+            HEADER_SIGNATURE,
+        ] {
+            let mut changed = headers.clone();
+            changed.remove(name);
+            unauthorized(verify(&auth, &changed, b"payload"));
+        }
+        let mut forged = headers.clone();
+        forged.insert(HEADER_SOURCE, HeaderValue::from_static("node-c"));
+        unauthorized(verify(&auth, &forged, b"payload"));
+    }
+
+    #[test]
+    fn a_request_for_another_node_is_refused() {
+        let auth = node_a();
+        let headers = signed(&auth, b"payload");
+        assert!(matches!(
+            auth.verify(&Method::POST, PATH, &headers, b"payload", "node-c"),
+            Err(VerifyError::WrongTarget)
+        ));
+    }
+
+    #[test]
+    fn another_protocol_version_is_incompatible() {
+        let auth = node_a();
+        let mut headers = signed(&auth, b"payload");
+        headers.insert(RESPONSE_VERSION_HEADER, HeaderValue::from_static("4"));
+        assert!(matches!(
+            verify(&auth, &headers, b"payload"),
+            Err(VerifyError::IncompatibleVersion)
+        ));
+    }
+
+    /// The stale request is signed correctly, so only the clock window can
+    /// reject it.
+    #[test]
+    fn a_stale_timestamp_is_rejected() {
+        let auth = node_a();
+        let mut headers = signed(&auth, b"payload");
+        let body_hash = sha256_hex(b"payload");
+        let nonce = header(&headers, HEADER_NONCE).unwrap().to_string();
+        let mut resign = |timestamp: u64| {
+            let signature = auth.signature(&CanonicalRequest {
+                method: "POST",
+                path_and_query: PATH,
+                body_hash: &body_hash,
+                source: "node-a",
+                target: "node-b",
+                timestamp,
+                nonce: &nonce,
+            });
+            headers.insert(HEADER_TIMESTAMP, HeaderValue::from(timestamp));
+            headers.insert(HEADER_SIGNATURE, HeaderValue::from_str(&signature).unwrap());
+            headers.clone()
+        };
+        let stale = resign(now_ms().unwrap() - 2 * CLOCK_WINDOW_MS);
+        assert!(matches!(
+            verify(&auth, &stale, b"payload"),
+            Err(VerifyError::Unauthorized)
+        ));
+        // The same request inside the window verifies, so the rejection
+        // above came from the clock check.
+        let fresh = resign(now_ms().unwrap());
+        verify(&auth, &fresh, b"payload").expect("a fresh timestamp verifies");
+    }
+}

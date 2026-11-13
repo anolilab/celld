@@ -210,3 +210,17 @@ pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
 
 trait Stream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<S: AsyncRead + AsyncWrite + Send + Unpin> Stream for S {}
+
+#[cfg(test)]
+mod tests {
+    use super::accept_key;
+
+    /// The handshake example in RFC 6455, section 1.3.
+    #[test]
+    fn accept_key_matches_the_rfc_example() {
+        assert_eq!(
+            accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+}
