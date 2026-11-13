@@ -236,3 +236,93 @@ fn hex_nibble(value: u8) -> anyhow::Result<u8> {
         _ => Err(anyhow!("hexadecimal must be lowercase ASCII")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHALLENGE: &str = "abababababababababababababababababababababababababababababababab";
+    const ADVERTISE: &str = "127.0.0.1:9000";
+    /// The Ed25519 key of the seed 0, 1, ..., 31, and its signature over the
+    /// probe payload of node-a, `ADVERTISE` and `CHALLENGE`, both made with
+    /// Node's `crypto` (OpenSSL). Ed25519 signatures are deterministic, so a
+    /// change to the payload or to the signing code shows here.
+    const PUBLIC_KEY: &str = "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8";
+    const SIGNATURE: &str = "9f376c0eb297e1aa2f0b8f4c6c86a9a8c0bab02d4626f7adaa789cd97941a86c\
+                             43e5d117ca272a68b805179f838d018611511a29854b710f51a20d4cb17f5301";
+
+    fn signer() -> PeerProbeSigner {
+        PeerProbeSigner::from_secret(std::array::from_fn(|i| i as u8))
+    }
+
+    fn lease(public_key: &str) -> crate::ownership_store::NodeLeaseWire {
+        serde_json::from_value(serde_json::json!({
+            "node": "node-a",
+            "expires_ms": 0,
+            "addr": ADVERTISE,
+            "probe_public_key": public_key,
+        }))
+        .expect("a lease needs only a node and an expiry")
+    }
+
+    fn response() -> PeerProbeResponse {
+        signer()
+            .respond("node-a", ADVERTISE, CHALLENGE)
+            .expect("respond")
+    }
+
+    #[test]
+    fn signer_matches_the_reference() {
+        let signer = signer();
+        assert_eq!(signer.public_key_hex(), PUBLIC_KEY);
+        assert_eq!(response().signature, SIGNATURE);
+    }
+
+    #[test]
+    fn a_response_from_the_leased_key_verifies() {
+        verify(&lease(PUBLIC_KEY), CHALLENGE, &response()).expect("verifies");
+    }
+
+    #[test]
+    fn a_response_that_differs_in_any_way_is_rejected() {
+        let leased = lease(PUBLIC_KEY);
+
+        let mut other = response();
+        other.signature = SIGNATURE.replacen("9f37", "9f38", 1);
+        assert!(
+            verify(&leased, CHALLENGE, &other).is_err(),
+            "altered signature"
+        );
+
+        let other_challenge = "cd".repeat(32);
+        assert!(
+            verify(&leased, &other_challenge, &response()).is_err(),
+            "a signature for another challenge"
+        );
+
+        let mut other = response();
+        other.node = "node-b".into();
+        assert!(verify(&leased, CHALLENGE, &other).is_err(), "another node");
+
+        let mut other = response();
+        other.advertise = "127.0.0.1:9001".into();
+        assert!(
+            verify(&leased, CHALLENGE, &other).is_err(),
+            "another address"
+        );
+
+        let wrong_key = PeerProbeSigner::from_secret([9; 32]).public_key_hex();
+        assert!(
+            verify(&lease(&wrong_key), CHALLENGE, &response()).is_err(),
+            "a key the lease does not name"
+        );
+    }
+
+    #[test]
+    fn a_malformed_challenge_is_not_signed() {
+        assert!(signer().respond("node-a", ADVERTISE, "not-hex").is_err());
+        assert!(signer()
+            .respond("node-a", ADVERTISE, &"AB".repeat(32))
+            .is_err());
+    }
+}
