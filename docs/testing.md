@@ -11,7 +11,30 @@ We test the API contract by differential execution against workerd, the
 coordination protocol by model checking and deterministic simulation, and the
 full system by fault injection on live fleets.
 
+## What runs today
+
+Not every method below has its assets in this repository yet. These run on
+every pull request:
+
+- **End-to-end tests** (`crates/celld/tests/e2e/`): fixture Workers served by
+  the real `celld dev` binary. They cover Durable Object storage, SQL, alarms,
+  input gates and ids, plus regressions for alarms, isolate sharing and facets.
+- **Unit tests** in the crates, such as the input gate's admission decisions in
+  `celld-logic`.
+- **Format, clippy and multi-platform builds.**
+
+The nightly workflow adds end-to-end [benchmarks](benchmarks.md).
+
+The sections below describe the full method. Each one says whether its assets
+are present. The [test baseline](test-baseline.md) lists the internal test
+hooks that were removed because the files they included are missing, and the
+ticket that owns each one.
+
 ## Conformance: two runtimes, one output
+
+*Status: the differential harness against workerd is tracked in [#5](https://github.com/anolilab/celld/issues/5), and the
+Web Platform Tests and workerd API tests in [#6](https://github.com/anolilab/celld/issues/6). The end-to-end contract tests
+check documented behavior, not workerd's output.*
 
 We run the same Workers and Durable Objects programs on workerd, Cloudflare's
 production runtime, and on celld, and the outputs must match. workerd supplies
@@ -24,6 +47,9 @@ WebSocket, and lifecycle scenarios through the full `celld` binary in each
 deployment mode.
 
 ## Specification: exhaustive at small size
+
+*Status: no TLA+ specification is in this repository. A clean-room
+specification is tracked in [#4](https://github.com/anolilab/celld/issues/4).*
 
 The coordination protocol is specified in TLA+. Heyang Zhou wrote the
 specifications against celld v0.1.0. His model checking found four bugs and a
@@ -57,6 +83,9 @@ describe, including guarantees weaker than the code's.
 
 ## Simulation: the protocol under adversarial schedules
 
+*Status: the simulator is not in this repository. `celld-logic` is still a
+pure decision core; the simulation harness is tracked in [#3](https://github.com/anolilab/celld/issues/3).*
+
 The dangerous bugs are in coordination: a crash during an ownership handoff, a
 lease renewal that races a takeover, an alarm against a partially restored
 cell. These windows are too narrow and too rare to wait for.
@@ -78,6 +107,9 @@ the core protocols have run through millions of schedules. Deliberately broken
 protocol variants verify that the checkers detect the faults.
 
 ## Live fleets: what simulation cannot see
+
+*Status: the fleet lab and its archived runs are not in this repository. A
+fleet chaos lab is tracked in [#9](https://github.com/anolilab/celld/issues/9), and object-store fault injection in [#7](https://github.com/anolilab/celld/issues/7).*
 
 Simulation cannot see real S3 tail latency, real kernel and filesystem
 behavior, or V8 under memory pressure. A permanent fleet lab runs standard VMs
@@ -111,6 +143,10 @@ Across every run of every scenario, the verification sweeps show zero body
 faults, zero status faults, and zero lost messages.
 
 ## A few numbers we trust
+
+*Status: these figures come from fleet runs whose data is not in this
+repository. The benchmark harness with a workerd baseline and published raw
+data is tracked in [#10](https://github.com/anolilab/celld/issues/10).*
 
 - **The epoch fence holds under contention.** Five hundred concurrent
   claimants made 5,500 attempts on the same cells: one writer for each epoch,
