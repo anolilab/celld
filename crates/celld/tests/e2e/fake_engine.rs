@@ -12,6 +12,8 @@
 //! - `echo` copies its stdin to its stdout and exits 0 at the end of stdin.
 //! - `eof` prints nothing and exits 0 at the end of stdin.
 //! - `hold` runs until it is signalled, then exits 137.
+//! - `late` prints `late\n` after 500 ms and `later\n` 500 ms after that, then
+//!   exits 0.
 //! - `lines` prints `one\n`, `two\n` and `three\n` 300 ms apart, then exits 0.
 //! - `exit N` exits with N.
 //! - `size` reads one line of stdin, prints `<cols>x<rows>\n`, and exits 0.
@@ -662,6 +664,13 @@ async fn drive(
                 }
             }
             137
+        }
+        "late" => {
+            for line in ["late\n", "later\n"] {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let _ = write.write_all(&out(line.as_bytes())).await;
+            }
+            0
         }
         "lines" => {
             for line in ["one\n", "two\n", "three\n"] {
