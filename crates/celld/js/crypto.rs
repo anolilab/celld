@@ -66,6 +66,17 @@ fn digest_bytes(hash: &str, data: &[u8]) -> Result<Vec<u8>> {
     })
 }
 
+/// `digest` as the prehash for an ECDSA key whose field is `field` bytes.
+/// A digest shorter than half the field (SHA-256 on P-521) is left-padded
+/// with zeroes, which is the same integer FIPS 186 takes from it; the
+/// signer would otherwise refuse it.
+fn ecdsa_prehash(mut digest: Vec<u8>, field: usize) -> Vec<u8> {
+    if digest.len() < field {
+        digest.splice(0..0, std::iter::repeat_n(0, field - digest.len()));
+    }
+    digest
+}
+
 /// Algorithm OIDs, so a parsed key can say what it is. Same constants as
 /// Node's, via deno's `ext/node_crypto/keys.rs`.
 const RSA_ENCRYPTION_OID: rsa::pkcs8::ObjectIdentifier =
@@ -700,16 +711,6 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 .map_err(|_| anyhow!("invalid Ed25519 PKCS#8 key"))?;
             Ok(serde_json::json!({ "bytes": key.sign(&data).to_bytes().to_vec() }))
         }
-        "p256-sign" => {
-            use p256::ecdsa::signature::Signer;
-            use p256::pkcs8::DecodePrivateKey;
-            let key = crypto_bytes(args, "key")?;
-            let data = crypto_bytes(args, "data")?;
-            let key = p256::ecdsa::SigningKey::from_pkcs8_der(&key)
-                .map_err(|_| anyhow!("invalid P-256 PKCS#8 key"))?;
-            let signature: p256::ecdsa::Signature = key.sign(&data);
-            Ok(serde_json::json!({ "bytes": signature.to_bytes().to_vec() }))
-        }
         // JWT verification is the reason these exist: RS256 and ES256 are what
         // token issuers sign with (denoland/celld#124). Both take an SPKI
         // public key, matching `importKey("spki", ...)`.
@@ -759,9 +760,10 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             };
             Ok(serde_json::json!({ "bytes": bytes }))
         }
-        // Node's ECDSA signatures are DER by default (`dsaEncoding`), where
-        // Web Crypto's are raw r||s.
-        "ec-sign-der" => {
+        // ECDSA on any NIST curve with the call's hash. Web Crypto's
+        // signatures are raw r||s at the curve's field size; Node's are DER
+        // by default (`dsaEncoding`).
+        "ecdsa-sign" | "ec-sign-der" => {
             let key = crypto_bytes(args, "key")?;
             let data = crypto_bytes(args, "data")?;
             let hash = args
@@ -779,15 +781,20 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                         .map_err(|_| anyhow!("invalid {crv} PKCS#8 key"))?;
                     let key = $c::ecdsa::SigningKey::from_slice(secret.to_bytes().as_slice())
                         .map_err(|_| anyhow!("invalid {crv} signing key"))?;
+                    let digest = ecdsa_prehash(digest, $c::FieldBytes::default().len());
                     let signature: $c::ecdsa::Signature = key
                         .sign_prehash(&digest)
                         .map_err(|_| anyhow!("could not sign with {crv}"))?;
-                    signature.to_der().as_bytes().to_vec()
+                    if operation == "ecdsa-sign" {
+                        signature.to_bytes().to_vec()
+                    } else {
+                        signature.to_der().as_bytes().to_vec()
+                    }
                 }};
             }
             Ok(serde_json::json!({ "bytes": ec_curve!(crv, sign) }))
         }
-        "ec-verify-der" => {
+        "ecdsa-verify" | "ec-verify-der" => {
             let key = crypto_bytes(args, "key")?;
             let data = crypto_bytes(args, "data")?;
             let signature = crypto_bytes(args, "signature")?;
@@ -808,28 +815,22 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                     let point = public.to_encoded_point(false);
                     let key = $c::ecdsa::VerifyingKey::from_sec1_bytes(point.as_bytes())
                         .map_err(|_| anyhow!("invalid {crv} verifying key"))?;
-                    $c::ecdsa::DerSignature::try_from(signature.as_slice())
-                        .ok()
-                        .and_then(|signature| $c::ecdsa::Signature::try_from(signature).ok())
+                    let digest = ecdsa_prehash(digest, $c::FieldBytes::default().len());
+                    // A malformed signature is a failed verification, not an
+                    // error.
+                    let signature = if operation == "ecdsa-verify" {
+                        $c::ecdsa::Signature::from_slice(&signature).ok()
+                    } else {
+                        $c::ecdsa::DerSignature::try_from(signature.as_slice())
+                            .ok()
+                            .and_then(|signature| $c::ecdsa::Signature::try_from(signature).ok())
+                    };
+                    signature
                         .map(|signature| key.verify_prehash(&digest, &signature).is_ok())
                         .unwrap_or(false)
                 }};
             }
             let ok = ec_curve!(crv, verify);
-            Ok(serde_json::json!({ "ok": ok }))
-        }
-        "p256-verify" => {
-            use p256::ecdsa::signature::Verifier;
-            use p256::pkcs8::DecodePublicKey;
-            let key = crypto_bytes(args, "key")?;
-            let data = crypto_bytes(args, "data")?;
-            let signature = crypto_bytes(args, "signature")?;
-            let key = p256::ecdsa::VerifyingKey::from_public_key_der(&key)
-                .map_err(|_| anyhow!("invalid P-256 SPKI key"))?;
-            // WebCrypto passes ECDSA signatures as raw r||s, not DER.
-            let ok = p256::ecdsa::Signature::from_slice(&signature)
-                .map(|signature| key.verify(&data, &signature).is_ok())
-                .unwrap_or(false);
             Ok(serde_json::json!({ "ok": ok }))
         }
         "rsa-pkcs1-verify" => {
