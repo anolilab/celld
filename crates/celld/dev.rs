@@ -583,6 +583,7 @@ async fn deploy_project(config: &Path, store: &Store, logs: bool) -> anyhow::Res
         endpoint: None,
         region: None,
         dry_run: false,
+        no_activate: false,
         json: false,
         vars: read_dev_vars(config)?,
         local_images: true,
@@ -591,7 +592,7 @@ async fn deploy_project(config: &Path, store: &Store, logs: bool) -> anyhow::Res
         built.report();
     }
     crate::wake_format::ensure_ready(&bucket).await?;
-    deploy::write(&bucket, &built).await
+    deploy::write(&bucket, &built, true).await
 }
 
 async fn run_stack(
