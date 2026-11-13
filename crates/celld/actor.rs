@@ -2203,13 +2203,18 @@ impl Actor {
             )
             .await
             {
-                // The flusher holds the installation now. Say so: a restored
-                // alarm starts uncovered in this process, and until the core
-                // hears otherwise it keeps the cell resident for it.
-                Ok(Ok(())) => host.report_alarm_coverage(&cell),
+                Ok(Ok(())) => {}
                 Ok(Err(error)) => tracing::warn!(%cell, %error, "wake maintenance deferred"),
                 Err(_) => tracing::warn!(%cell, "wake maintenance timed out; a later scan retries"),
             }
+            // The flusher confirms the installation when it publishes, before
+            // the proof, ownership and retirement steps that can still fail
+            // or time out. Report whatever it holds either way: a restored
+            // alarm starts uncovered in this process, and until the core
+            // hears otherwise it keeps the cell resident for it. The report
+            // itself checks the current installation, so a failed publish or
+            // a concurrent re-arm is never reported as covered.
+            host.report_alarm_coverage(&cell);
         })
         .detach();
     }
