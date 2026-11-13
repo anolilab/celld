@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
-// The object keeps no state, so the workload measures activation and
-// placement of a name, not storage.
+// The object keeps no state, so the workload measures routing across many
+// objects, not storage.
 export class Cell extends DurableObject {
   fetch() {
     return new Response("ok");

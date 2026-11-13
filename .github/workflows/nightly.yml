@@ -36,8 +36,8 @@ jobs:
       - run: cargo +${{ matrix.toolchain }} test --workspace --locked
       - run: cargo +${{ matrix.toolchain }} clippy --workspace --all-targets --locked -- -D warnings
 
-  # Reports numbers and never fails on them: a shared runner is too noisy for a
-  # threshold. The profile is `lab` because `bench` inherits `release`, whose
+  # Never fails on the numbers, which a shared runner is too noisy to gate on,
+  # only on a workload with failed requests. The profile is `lab` because `bench` inherits `release`, whose
   # fat LTO takes far longer to build for the same optimization level.
   bench:
     name: End-to-end benchmarks
@@ -56,6 +56,7 @@ jobs:
         env:
           CELLD_BENCH_OUT: ${{ runner.temp }}/e2e-bench/results.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
         with:
           name: e2e-bench-${{ github.sha }}
           path: ${{ runner.temp }}/e2e-bench/results.json

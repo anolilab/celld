@@ -37,7 +37,8 @@ use harness::Server;
 
 const DEFAULT_SECONDS: u64 = 10;
 const DEFAULT_CONCURRENCY: usize = 32;
-/// Long enough for the JIT, connection pools and first activations to settle.
+/// Long enough for the JIT, connection pools and every fan-out object's first
+/// activation to settle.
 const WARMUP: Duration = Duration::from_secs(2);
 const COLD_START_RUNS: usize = 5;
 const FANOUT_NAMES: u64 = 1000;
@@ -53,9 +54,6 @@ struct Workload {
     name: &'static str,
     fixture: &'static str,
     path: fn(u64) -> String,
-    /// Fan-out measures first contact with each object name, so a warm-up
-    /// would spend the activations before the window opens.
-    warmup: bool,
 }
 
 const WORKLOADS: [Workload; 4] = [
@@ -63,25 +61,21 @@ const WORKLOADS: [Workload; 4] = [
         name: "hello",
         fixture: "bench-hello",
         path: |_| "/".into(),
-        warmup: true,
     },
     Workload {
         name: "do_counter",
         fixture: "bench-do-counter",
         path: |_| "/".into(),
-        warmup: true,
     },
     Workload {
         name: "do_sql_insert",
         fixture: "bench-do-sql-insert",
         path: |_| "/".into(),
-        warmup: true,
     },
     Workload {
         name: "do_fanout",
         fixture: "bench-do-fanout",
         path: |i| format!("/?name=object-{}", i % FANOUT_NAMES),
-        warmup: false,
     },
 ];
 
@@ -128,8 +122,8 @@ impl LoadResult {
 
 fn main() {
     let settings = Settings {
-        seconds: env_number("CELLD_BENCH_SECONDS", DEFAULT_SECONDS),
-        concurrency: env_number("CELLD_BENCH_CONCURRENCY", DEFAULT_CONCURRENCY),
+        seconds: positive("CELLD_BENCH_SECONDS", DEFAULT_SECONDS),
+        concurrency: positive("CELLD_BENCH_CONCURRENCY", DEFAULT_CONCURRENCY),
         filter: std::env::var("CELLD_BENCH_FILTER")
             .ok()
             .filter(|f| !f.is_empty()),
@@ -156,6 +150,18 @@ fn main() {
     }
     out(&table(&results, cold.as_deref()));
     write_json(&settings, &results, cold.as_deref());
+
+    // The numbers never fail the run, but a workload that could not be served
+    // has no numbers worth keeping.
+    let failed: Vec<_> = results
+        .iter()
+        .filter(|r| r.errors > 0 || r.requests == 0)
+        .map(|r| r.name)
+        .collect();
+    if !failed.is_empty() {
+        out(&format!("failed requests in: {}\n", failed.join(", ")));
+        std::process::exit(1);
+    }
 }
 
 /// Starts a fresh server for `workload`, then offers load for the warm-up and
@@ -168,13 +174,7 @@ async fn run_load(workload: &Workload, settings: &Settings) -> LoadResult {
         .build()
         .expect("build http client");
 
-    let warmup = if workload.warmup {
-        WARMUP
-    } else {
-        Duration::ZERO
-    };
-    let started = Instant::now();
-    let measure_from = started + warmup;
+    let measure_from = Instant::now() + WARMUP;
     let end = measure_from + Duration::from_secs(settings.seconds);
     let next = Arc::new(AtomicU64::new(0));
     let errors = Arc::new(AtomicU64::new(0));
@@ -377,11 +377,15 @@ fn percentile_us(sorted: &[u64], p: f64) -> u64 {
     sorted[rank.clamp(1, sorted.len()) - 1]
 }
 
-fn env_number<T: std::str::FromStr>(name: &str, default: T) -> T {
+/// A setting that must be a whole number above zero: zero seconds or zero
+/// connections measure nothing.
+fn positive<T: std::str::FromStr + Default + PartialOrd>(name: &str, default: T) -> T {
     match std::env::var(name) {
         Ok(value) => value
             .parse()
-            .unwrap_or_else(|_| panic!("{name}={value:?} is not a valid number")),
+            .ok()
+            .filter(|n| *n > T::default())
+            .unwrap_or_else(|| panic!("{name}={value:?} must be a number above zero")),
         Err(_) => default,
     }
 }
