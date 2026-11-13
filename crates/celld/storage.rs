@@ -648,13 +648,6 @@ fn authorize_sql(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::
 
 fn without_sql_authorizer<T>(
     connection: &mut Connection,
-    callback: impl FnOnce(&Connection) -> T,
-) -> T {
-    without_sql_authorizer_mut(connection, |connection| callback(connection))
-}
-
-fn without_sql_authorizer_mut<T>(
-    connection: &mut Connection,
     callback: impl FnOnce(&mut Connection) -> T,
 ) -> T {
     use rusqlite::hooks::{AuthContext, Authorization};
@@ -3258,7 +3251,7 @@ pub fn put_many_serialized(scope: &str, entries: &[(String, Vec<u8>)]) -> anyhow
         return with(scope, |_| ()).ok_or_else(|| anyhow::anyhow!("no db for {scope}"));
     }
     with_application_storage_write(scope, |c| {
-        without_sql_authorizer_mut(c, |c| {
+        without_sql_authorizer(c, |c| {
             let write = |c: &Connection| -> anyhow::Result<()> {
                 let mut statement = c.prepare_cached(KV_PUT_SQL)?;
                 for (key, value) in entries {
@@ -3293,7 +3286,7 @@ pub fn delete_many(scope: &str, keys: &[String]) -> anyhow::Result<usize> {
         return with(scope, |_| 0).ok_or_else(|| anyhow::anyhow!("no db for {scope}"));
     }
     with_application_storage_write(scope, |c| {
-        without_sql_authorizer_mut(c, |c| {
+        without_sql_authorizer(c, |c| {
             if !c.is_autocommit() {
                 return with_batch_savepoint(c, |c| {
                     let mut statement = c.prepare_cached(KV_DELETE_SQL)?;
