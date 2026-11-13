@@ -203,8 +203,6 @@ pub struct Slot {
     // toward the collection boundary. Residency drop retires both counts.
     adopted_cells: AtomicUsize,
     retiring: AtomicBool,
-    #[cfg(celld_internal_tests)]
-    turn_observations: Mutex<Vec<String>>,
 }
 
 thread_local! {
@@ -259,11 +257,6 @@ impl Slot {
             Some(worker) => worker,
             None => panic!("entered isolate {} after it was freed", self.id),
         };
-        #[cfg(celld_internal_tests)]
-        self.turn_observations.lock().unwrap().push(match lane {
-            TurnLane::Stateless => "stateless".to_string(),
-            TurnLane::Cell(scope) => scope,
-        });
         let previous = CURRENT_SLOT.replace(Some(self.me.clone()));
         let result = f(worker);
         CURRENT_SLOT.set(previous);
@@ -336,64 +329,12 @@ impl Slot {
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
-            #[cfg(celld_internal_tests)]
-            turn_observations: Mutex::new(Vec::new()),
         })
     }
 
     /// Whether this slot holds a Worker Loader's Worker.
     pub(crate) fn is_loaded_worker(&self) -> bool {
         self.loaded_worker
-    }
-
-    #[cfg(celld_internal_tests)]
-    pub fn for_test(worker: js::Worker) -> Arc<Self> {
-        Self::outside_pool(worker, false)
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn vacant_for_request_cancellation_test() -> Arc<Self> {
-        Arc::new_cyclic(|me| Slot {
-            me: me.clone(),
-            id: 0,
-            heap_id: HeapId::new(0),
-            worker: tokio::sync::Mutex::new(None),
-            turn_scheduler: TurnScheduler::default(),
-            queue_producers: Mutex::new(std::collections::HashMap::new()),
-            turns: AtomicUsize::new(0),
-            requests: AtomicUsize::new(0),
-            freed: Arc::new(tokio::sync::Notify::new()),
-            reclaim: None,
-            loaded_worker: false,
-            cells: AtomicUsize::new(0),
-            adopted_cells: AtomicUsize::new(0),
-            retiring: AtomicBool::new(false),
-            turn_observations: Mutex::new(Vec::new()),
-        })
-    }
-
-    #[cfg(celld_internal_tests)]
-    #[doc(hidden)]
-    pub async fn hold_turn_for_test(&self) -> impl Drop + '_ {
-        self.worker.lock().await
-    }
-
-    #[cfg(celld_internal_tests)]
-    #[doc(hidden)]
-    pub fn queued_turns_for_test(&self) -> usize {
-        self.turns.load(Ordering::Relaxed)
-    }
-
-    #[cfg(celld_internal_tests)]
-    #[doc(hidden)]
-    pub fn reset_turn_observations_for_test(&self) {
-        self.turn_observations.lock().unwrap().clear();
-    }
-
-    #[cfg(celld_internal_tests)]
-    #[doc(hidden)]
-    pub fn turn_observations_for_test(&self) -> Vec<String> {
-        self.turn_observations.lock().unwrap().clone()
     }
 
     /// Give this isolate a cell's realm. Held for as long as the cell lives
@@ -638,8 +579,6 @@ impl Pool {
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(self.retired.load(Ordering::Relaxed)),
-            #[cfg(celld_internal_tests)]
-            turn_observations: Mutex::new(Vec::new()),
         });
         if let Some(id) = reusable {
             slots[id] = slot.clone();

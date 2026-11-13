@@ -11,8 +11,6 @@ use crate::engine_api::RpcData;
 use crate::http_streams::RequestBodyGuard;
 use crate::ws_registry::OutboundWsReq;
 use anyhow::Result;
-#[cfg(celld_internal_tests)]
-use std::cell::RefCell;
 use std::sync::OnceLock;
 
 /// A ticket asking the actor whether an outbound effect may leave the process.
@@ -202,74 +200,8 @@ pub fn set_outbound_ws_tx(tx: tokio::sync::mpsc::UnboundedSender<OutboundWsReq>)
     let _ = OUTBOUND_WS_TX.set(tx);
 }
 
-#[cfg(celld_internal_tests)]
-/// An outbound connector scoped to the current internal-test JS thread.
-///
-/// The production connector is process-wide. Installing a test sender there
-/// captures requests from unrelated suites, and those suites have no receiver
-/// that can answer them. The thread-local sender follows the current-thread V8
-/// harnesses, while this handle owns its receiver and removes the sender when
-/// the case ends.
-#[doc(hidden)]
-pub struct TestOutboundWsConnector {
-    requests: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<OutboundWsReq>>,
-    /// A scoped connector must drop on the thread where it installed its sender.
-    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-
-#[cfg(celld_internal_tests)]
-impl TestOutboundWsConnector {
-    #[doc(hidden)]
-    pub fn requests(
-        &self,
-    ) -> &tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<OutboundWsReq>> {
-        &self.requests
-    }
-}
-
-#[cfg(celld_internal_tests)]
-thread_local! {
-    static TEST_OUTBOUND_WS_TX: RefCell<Option<tokio::sync::mpsc::UnboundedSender<OutboundWsReq>>> =
-        const { RefCell::new(None) };
-}
-
-#[cfg(celld_internal_tests)]
-impl Drop for TestOutboundWsConnector {
-    fn drop(&mut self) {
-        TEST_OUTBOUND_WS_TX.with(|slot| {
-            assert!(
-                slot.borrow_mut().take().is_some(),
-                "test outbound WebSocket connector was not installed",
-            );
-        });
-    }
-}
-
-#[cfg(celld_internal_tests)]
-/// Install the internal-test connector for the current JS thread.
-#[doc(hidden)]
-pub fn install_outbound_ws_connector_for_test() -> TestOutboundWsConnector {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    TEST_OUTBOUND_WS_TX.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        assert!(
-            slot.is_none(),
-            "test outbound WebSocket connector is already installed"
-        );
-        *slot = Some(tx);
-    });
-    TestOutboundWsConnector {
-        requests: tokio::sync::Mutex::new(rx),
-        _not_send: std::marker::PhantomData,
-    }
-}
-
 /// Select the scoped internal-test connector before the production connector.
 pub(crate) fn outbound_ws_tx() -> Option<tokio::sync::mpsc::UnboundedSender<OutboundWsReq>> {
-    #[cfg(celld_internal_tests)]
-    if let Some(tx) = TEST_OUTBOUND_WS_TX.with(|slot| slot.borrow().clone()) {
-        return Some(tx);
-    }
     OUTBOUND_WS_TX.get().cloned()
 }
 /// The fleet bucket, once a node has opened one. Installed beside the

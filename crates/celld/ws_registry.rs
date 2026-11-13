@@ -234,19 +234,7 @@ impl WsPull {
 }
 
 struct WsPullCharge {
-    #[cfg(all(test, celld_internal_tests))]
-    bytes: usize,
-    #[cfg(all(test, celld_internal_tests))]
-    queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
-}
-
-#[cfg(all(test, celld_internal_tests))]
-impl Drop for WsPullCharge {
-    fn drop(&mut self) {
-        self.queued_bytes
-            .fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
-    }
 }
 
 struct QueuedWsPull {
@@ -266,21 +254,15 @@ struct WsPullSendState {
 #[derive(Clone)]
 pub struct WsPullSender {
     state: Arc<std::sync::Mutex<WsPullSendState>>,
-    #[cfg(all(test, celld_internal_tests))]
-    queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
     capacity: Arc<tokio::sync::Semaphore>,
 }
 
 pub struct WsPullReceiver {
     rx: tokio::sync::mpsc::UnboundedReceiver<QueuedWsPull>,
-    #[cfg(all(test, celld_internal_tests))]
-    queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub fn ws_pull_channel() -> (WsPullSender, WsPullReceiver) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    #[cfg(all(test, celld_internal_tests))]
-    let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let capacity = Arc::new(tokio::sync::Semaphore::new(WS_PULL_QUEUE_MAX_BYTES));
     (
         WsPullSender {
@@ -288,15 +270,9 @@ pub fn ws_pull_channel() -> (WsPullSender, WsPullReceiver) {
                 tx,
                 terminal_sent: false,
             })),
-            #[cfg(all(test, celld_internal_tests))]
-            queued_bytes: queued_bytes.clone(),
             capacity,
         },
-        WsPullReceiver {
-            rx,
-            #[cfg(all(test, celld_internal_tests))]
-            queued_bytes,
-        },
+        WsPullReceiver { rx },
     )
 }
 
@@ -343,18 +319,11 @@ impl WsPullSender {
         if state.terminal_sent {
             return Err(frame);
         }
-        #[cfg(all(test, celld_internal_tests))]
-        self.queued_bytes
-            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         state
             .tx
             .send(QueuedWsPull {
                 frame,
                 _charge: WsPullCharge {
-                    #[cfg(all(test, celld_internal_tests))]
-                    bytes,
-                    #[cfg(all(test, celld_internal_tests))]
-                    queued_bytes: self.queued_bytes.clone(),
                     _permit: Some(permit),
                 },
             })
@@ -368,28 +337,17 @@ impl WsPullSender {
     /// for capacity, so a stopped isolate cannot keep a host socket task alive.
     pub fn send_close(&self, code: u16, reason: String, was_clean: bool) -> Result<(), WsPull> {
         let frame = WsPull::Close(code, reason, was_clean);
-        #[cfg(all(test, celld_internal_tests))]
-        let bytes = frame.queue_bytes();
         let mut state = self.state.lock().unwrap();
         if state.terminal_sent {
             return Err(frame);
         }
         state.terminal_sent = true;
         self.capacity.close();
-        #[cfg(all(test, celld_internal_tests))]
-        self.queued_bytes
-            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         state
             .tx
             .send(QueuedWsPull {
                 frame,
-                _charge: WsPullCharge {
-                    #[cfg(all(test, celld_internal_tests))]
-                    bytes,
-                    #[cfg(all(test, celld_internal_tests))]
-                    queued_bytes: self.queued_bytes.clone(),
-                    _permit: None,
-                },
+                _charge: WsPullCharge { _permit: None },
             })
             .map_err(|error| error.0.frame)
     }
@@ -408,16 +366,6 @@ impl WsPullReceiver {
         drop(_charge);
         Some(frame)
     }
-
-    #[cfg(all(test, celld_internal_tests))]
-    fn queued_bytes(&self) -> usize {
-        self.queued_bytes.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
-
-#[cfg(all(test, celld_internal_tests))]
-mod input_queue_private {
-    include!(env!("CELLD_INTERNAL_WEBSOCKET_TESTS"));
 }
 
 /// One socket's inbound queue. Shared so an op can await it without holding
@@ -466,18 +414,6 @@ impl Drop for WorkerWebSocket {
         ws_pull_unregister(self.id);
         ws_unregister(self.id);
     }
-}
-
-/// Whether the host still holds an inbound queue for `id`.
-///
-/// A leak here is invisible from outside the process: the queue holds the
-/// receiver whose survival keeps a connector task — and its TCP connection —
-/// alive, and a request that dies before its socket is ever registered for
-/// output leaves nothing else to observe.
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn ws_pull_registered(id: u64) -> bool {
-    ws_pull().lock().unwrap().contains_key(&id)
 }
 
 pub enum WsIn {
@@ -728,20 +664,6 @@ pub(crate) fn ws_release_unanswered(id: u64, scope: &str) {
     }
 }
 
-/// Register a socket that a facet accepted, through a cfg-gated execution
-/// backend that has no facet call to record it.
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn ws_register_facet_for_test(
-    id: u64,
-    scope: &str,
-    facet: FacetSocket,
-    tx: tokio::sync::mpsc::UnboundedSender<WsOut>,
-) {
-    ws_register_hibernatable_for_test(id, scope, tx);
-    ws_attach_facet(id, scope, facet);
-}
-
 pub fn ws_next_id() -> u64 {
     asyncrt::services()
         .websockets()
@@ -752,29 +674,6 @@ pub fn ws_register(id: u64, tx: tokio::sync::mpsc::UnboundedSender<WsOut>) {
     ws_registry().lock().unwrap().register(id, tx);
 }
 
-/// Install one hibernatable socket through a cfg-gated execution backend.
-#[cfg(celld_internal_tests)]
-pub(crate) fn ws_register_hibernatable_for_test(
-    id: u64,
-    scope: &str,
-    tx: tokio::sync::mpsc::UnboundedSender<WsOut>,
-) {
-    let registry = ws_registry();
-    let mut registry = registry.lock().unwrap();
-    registry.register(id, tx);
-    registry.metadata.insert(
-        id,
-        WsMeta {
-            scope: scope.to_string(),
-            hibernatable: true,
-            tags: Vec::new(),
-            attachment: None,
-            pending: Vec::new(),
-            auto_response_at: None,
-            facet: None,
-        },
-    );
-}
 /// Register an outbound socket of `scope`. A socket that a facet opened
 /// takes its facet record in the same insertion, so no event, close, or
 /// `ws_close_facet` can find the entry without it.
@@ -1052,59 +951,6 @@ impl WsFlushState {
 /// process-wide sharing this state exists to end.
 pub(crate) fn ws_flush_state() -> Arc<WsFlushState> {
     asyncrt::services().websockets().flush.clone()
-}
-
-/// One held segment and the flush that owns it, for a test that stands in for
-/// the durability ticket. Holding the guard is what keeps the socket's
-/// teardown wait honest while the queue exists.
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub struct WsHeldFlush(WsFlushGuard);
-
-/// Hold `out` behind `id`'s gate exactly as a gated frame does, and return
-/// the flush that holds it.
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn ws_defer_frame(id: u64, out: WsOut) -> WsHeldFlush {
-    let flush = ws_flush_state();
-    let registry = ws_registry();
-    WsHeldFlush(
-        flush
-            .emit_or_defer(&registry, std::iter::once((id, out)), true)
-            .expect("a gated frame always opens a segment of its own"),
-    )
-}
-
-/// How many frames this instance holds for `id`.
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn ws_deferred_count(id: u64) -> usize {
-    ws_flush_state()
-        .deferred
-        .lock()
-        .unwrap()
-        .get(&id)
-        .map_or(0, |queue| {
-            queue.iter().map(|segment| segment.frames.len()).sum()
-        })
-}
-
-/// Release a held flush as a settled durability ticket does, then count it
-/// out. Consuming the guard is what makes the two happen together.
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn ws_release_flush(held: WsHeldFlush) {
-    let registry = ws_registry();
-    held.0.release(&registry, Ok(()));
-}
-
-/// Answer a held flush as a refused durability ticket does.
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn ws_refuse_flush(held: WsHeldFlush) {
-    let registry = ws_registry();
-    held.0
-        .release(&registry, Err("refused for a test".to_string()));
 }
 
 /// The segments one flush holds, and the counts that name it to a teardown.

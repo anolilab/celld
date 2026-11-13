@@ -15,15 +15,6 @@ enum EffectJob {
     Lease(EffectFuture),
 }
 
-#[cfg(celld_internal_tests)]
-impl EffectJob {
-    fn into_future(self) -> EffectFuture {
-        match self {
-            Self::Spawn(future) | Self::Lease(future) => future,
-        }
-    }
-}
-
 pub(crate) enum LeaseRequest {
     ReadSelf {
         op: OpId,
@@ -200,29 +191,6 @@ impl StepOutput {
             }),
         };
         self.effects.push(EffectJob::Lease(future));
-    }
-
-    // Binary test harnesses compile the library without cfg(test).
-    // celld_internal_tests is never set in a shipped build.
-    #[cfg(celld_internal_tests)]
-    pub fn take_effects(&mut self) -> Vec<EffectFuture> {
-        self.effects.drain(..).map(EffectJob::into_future).collect()
-    }
-
-    #[cfg(celld_internal_tests)]
-    pub fn effects_is_empty(&self) -> bool {
-        self.effects.is_empty()
-    }
-
-    // A driver that runs only the newest effect must retain every older job.
-    #[cfg(celld_internal_tests)]
-    pub fn pop_effect(&mut self) -> Option<EffectFuture> {
-        self.effects.pop().map(EffectJob::into_future)
-    }
-
-    #[cfg(celld_internal_tests)]
-    pub fn effects_len(&self) -> usize {
-        self.effects.len()
     }
 }
 

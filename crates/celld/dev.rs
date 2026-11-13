@@ -288,11 +288,6 @@ fn ignored_project_path(project: &Path, path: &Path, ignored: &[Pattern]) -> boo
         })
 }
 
-#[cfg(all(test, celld_internal_tests))]
-mod dev_contract {
-    include!(env!("CELLD_INTERNAL_DEV_TESTS"));
-}
-
 struct ShutdownSignals {
     #[cfg(unix)]
     interrupt: tokio::signal::unix::Signal,

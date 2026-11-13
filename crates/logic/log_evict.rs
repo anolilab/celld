@@ -170,15 +170,6 @@ impl FollowerHealth {
         self.members.clear();
     }
 
-    /// Return the completion time and latency for each recorded append.
-    #[cfg(celld_internal_tests)]
-    pub fn append_samples_for_test(&self, member: &str) -> Vec<(u64, u64)> {
-        self.members
-            .get(member)
-            .map(|health| health.samples.iter().copied().collect())
-            .unwrap_or_default()
-    }
-
     /// An append POST went out to `member`.
     pub fn append_started(&mut self, member: &str, now_ms: u64) {
         let health = self.members.entry(member.to_string()).or_default();

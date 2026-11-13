@@ -44,8 +44,6 @@ pub use crate::engine_api::next_request_id;
 pub use crate::engine_api::parse_request_id;
 pub use crate::engine_api::queue_cell_scope;
 pub use crate::engine_api::request_id_string;
-#[cfg(celld_internal_tests)]
-pub use crate::engine_api::workflow_cell_scope_for_test;
 pub use crate::engine_api::CellOverloaded;
 pub use crate::engine_api::Compat;
 pub use crate::engine_api::FailedInTurn;
@@ -72,8 +70,6 @@ pub use crate::engine_api::WorkflowBinding;
 pub use crate::engine_api::WsTarget;
 pub(crate) use crate::engine_api::BARE_NODE_BUILTINS;
 pub use crate::engine_api::CELL_OVERLOAD_ERROR_MARKER;
-#[cfg(celld_internal_tests)]
-pub use crate::host_channels::install_outbound_ws_connector_for_test;
 pub(crate) use crate::host_channels::outbound_ws_tx;
 pub use crate::host_channels::set_asset_call_tx;
 pub use crate::host_channels::set_facet_tx;
@@ -92,8 +88,6 @@ pub use crate::host_channels::QueueLeaseRef;
 pub use crate::host_channels::RpcCallReq;
 pub use crate::host_channels::SvcCallReq;
 pub use crate::host_channels::SvcRpcReq;
-#[cfg(celld_internal_tests)]
-pub use crate::host_channels::TestOutboundWsConnector;
 pub(crate) use crate::host_channels::ASSET_CALL_TX;
 pub(crate) use crate::host_channels::FACET_TX;
 pub(crate) use crate::host_channels::GATE_TX;
@@ -104,47 +98,21 @@ pub(crate) use crate::host_channels::SVC_RPC_TX;
 pub(crate) use crate::http_streams::claim_http_stream;
 pub(crate) use crate::http_streams::encode_http_response;
 pub(crate) use crate::http_streams::http_stream_read;
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) use crate::http_streams::http_stream_read_source_first_for_test;
 pub(crate) use crate::http_streams::http_stream_service;
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) use crate::http_streams::next_http_stream_chunk;
 pub(crate) use crate::http_streams::prepare_http_stream_tee;
 pub use crate::http_streams::register_body_stream;
 pub(crate) use crate::http_streams::response_stream_close;
 pub(crate) use crate::http_streams::response_stream_write;
 pub(crate) use crate::http_streams::retain_first_http_cleanup_panic;
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) use crate::http_streams::settle_http_stream_read;
 pub use crate::http_streams::take_body_stream;
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) use crate::http_streams::HttpStreamActivityError;
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) use crate::http_streams::HttpStreamActivityKind;
 pub(crate) use crate::http_streams::HttpStreamClaim;
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) use crate::http_streams::HttpStreamEntry;
 pub(crate) use crate::http_streams::HttpStreamService;
 pub(crate) use crate::http_streams::HttpStreamSource;
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) use crate::http_streams::HttpStreamTermination;
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) use crate::http_streams::HttpStreamTerminationReason;
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) use crate::http_streams::HttpSweeperExitGate;
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) use crate::http_streams::HttpTeePump;
 pub(crate) use crate::http_streams::HttpTransferredStream;
 pub use crate::http_streams::RequestBodyGuard;
 pub(crate) use crate::http_streams::ResponseStreamWriter;
 pub(crate) use crate::http_streams::HTTP_STREAM_DONE;
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) use crate::http_streams::HTTP_STREAM_IDLE_TIMEOUT_MS;
 pub(crate) use crate::http_streams::HTTP_STREAM_REGISTRATION_CLOSED;
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) use crate::http_streams::HTTP_TEE_BRANCH_CAPACITY;
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) use crate::http_streams::NEXT_HTTP_STREAM_ID;
 pub use crate::wake_entry::forget_wake_entry;
 pub(crate) use crate::wake_entry::launch_arm_gate;
 pub(crate) use crate::wake_entry::maintain_wake_entry;
@@ -153,11 +121,6 @@ pub use crate::wake_entry::set_arm_gate;
 pub use crate::wake_entry::ArmGate;
 pub(crate) use crate::wake_entry::ArmGateRx;
 pub(crate) use crate::wake_entry::WakeEntryService;
-
-#[cfg(all(test, celld_internal_tests))]
-fn test_host_services() -> Arc<crate::host_services::HostServices> {
-    asyncrt::services()
-}
 
 /// The pending exception text from a TryCatch scope (a macro so it needs no
 /// bound on the crate-private scope traits).
@@ -368,104 +331,6 @@ fn register_arm_gate_with_current_event(gate: ArmGateRx, context: Option<Arc<IoC
     }
 }
 
-#[cfg(celld_internal_tests)]
-fn register_test_pending_arm_gate(cell: &str, gate: ArmGateRx) {
-    let services = asyncrt::services();
-    let mut pending = services.wake_entry().test_pending.lock().unwrap();
-    let gates = pending.entry(cell.to_string()).or_default();
-    gates.retain_mut(|gate| {
-        matches!(
-            gate.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        )
-    });
-    gates.push(gate);
-}
-
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) fn spawn_observed_arm_gate_for_test(
-    cell: &str,
-    alarm: celld_logic::wake::AlarmSnapshot,
-) {
-    let Some(gate) = launch_arm_gate(cell, alarm) else {
-        return;
-    };
-    match installed_context() {
-        Some(context) => register_arm_gate_with_current_event(gate, Some(context)),
-        None => register_test_pending_arm_gate(cell, gate),
-    }
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn pause_next_arm_gate_for_test() -> tokio::sync::oneshot::Sender<Result<(), String>> {
-    let (resume, paused) = tokio::sync::oneshot::channel();
-    asyncrt::services()
-        .wake_entry()
-        .scripted
-        .lock()
-        .unwrap()
-        .push_back(paused);
-    resume
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn pause_next_arm_gate_for_cell_for_test(
-    cell: &str,
-) -> tokio::sync::oneshot::Sender<Result<(), String>> {
-    let (resume, paused) = tokio::sync::oneshot::channel();
-    asyncrt::services()
-        .wake_entry()
-        .scripted_by_cell
-        .lock()
-        .unwrap()
-        .entry(cell.to_string())
-        .or_default()
-        .push_back(paused);
-    resume
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn next_arm_gate_is_paused_for_test() -> bool {
-    !asyncrt::services()
-        .wake_entry()
-        .scripted
-        .lock()
-        .unwrap()
-        .is_empty()
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn next_arm_gate_for_cell_is_paused_for_test(cell: &str) -> bool {
-    asyncrt::services()
-        .wake_entry()
-        .scripted_by_cell
-        .lock()
-        .unwrap()
-        .get(cell)
-        .is_some_and(|gates| !gates.is_empty())
-}
-
-/// Drain the compatibility wake-entry PUT gates for a simulated S1 cell.
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub async fn drain_arm_gates(cell: &str) -> Result<(), String> {
-    let services = asyncrt::services();
-    let gates = services
-        .wake_entry()
-        .test_pending
-        .lock()
-        .unwrap()
-        .remove(cell);
-    let Some(gates) = gates else {
-        return Ok(());
-    };
-    await_arm_gates(gates).await
-}
-
 #[derive(Clone, Copy)]
 pub struct FetchRequest<'a> {
     pub url: &'a str,
@@ -569,10 +434,6 @@ fn timer_cancels() -> &'static std::sync::Mutex<HashMap<u64, tokio::sync::onesho
 pub enum AlarmDispatch {
     /// Claim whatever is due now, and record the outcome.
     Due,
-    #[cfg(celld_internal_tests)]
-    Armed,
-    #[cfg(celld_internal_tests)]
-    Claimed(i64),
 }
 
 /// One event a cell receives.
@@ -653,14 +514,6 @@ pub enum CellJob {
         /// another event's critical section is not handler time.
         started: Option<tokio::sync::oneshot::Sender<()>>,
     },
-    #[cfg(celld_internal_tests)]
-    SyncErrorForTest {
-        scope: String,
-        gate: ArmGateRx,
-        socket_id: Option<u64>,
-        terminate: bool,
-        reply: tokio::sync::oneshot::Sender<Result<Option<u64>>>,
-    },
 }
 
 impl CellJob {
@@ -673,8 +526,6 @@ impl CellJob {
             | CellJob::WsMessage { scope, .. }
             | CellJob::WsClosed { scope, .. }
             | CellJob::Alarm { scope, .. } => scope,
-            #[cfg(celld_internal_tests)]
-            CellJob::SyncErrorForTest { scope, .. } => scope,
         }
     }
 
@@ -713,8 +564,6 @@ impl CellJob {
             CellJob::WsMessage { reply, .. } => drop(reply.send(Err(error))),
             CellJob::WsClosed { reply, .. } => drop(reply.send(Err(error))),
             CellJob::Alarm { reply, .. } => drop(reply.send(Err(error))),
-            #[cfg(celld_internal_tests)]
-            CellJob::SyncErrorForTest { reply, .. } => drop(reply.send(Err(error))),
         }
     }
 }
@@ -851,18 +700,6 @@ fn current_cell_event(context: &IoContext) -> Option<EgressFrame> {
     context.egress.lock().unwrap().last().cloned()
 }
 
-/// Return and clear the number of output-gate samples for one test cell.
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) fn take_egress_gate_samples_for_test(scope: &str, channel: celld_logic::Channel) -> u64 {
-    test_host_services()
-        .wake_entry()
-        .egress_gate_samples
-        .lock()
-        .unwrap()
-        .remove(&(scope.to_string(), channel))
-        .unwrap_or(0)
-}
-
 /// Sample what the running handler's outbound effects must trail. Answers for
 /// every active cell event, including a read whose core lookup can settle
 /// immediately. Every sample here happens in the calling turn; the ticket
@@ -871,21 +708,6 @@ fn egress_gate_request(context: &IoContext, channel: celld_logic::Channel) -> Eg
     let Some(frame) = current_cell_event(context) else {
         return EgressGate::NoCell;
     };
-    #[cfg(all(test, celld_internal_tests))]
-    {
-        let cell = frame
-            .root
-            .as_ref()
-            .map(|root| root.cell.clone())
-            .unwrap_or_else(|| frame.storage.clone());
-        *test_host_services()
-            .wake_entry()
-            .egress_gate_samples
-            .lock()
-            .unwrap()
-            .entry((cell, channel))
-            .or_default() += 1;
-    }
     let (cell, before) = (frame.storage, frame.before);
     let sample = match storage::write_position(&cell) {
         Ok(sample) => sample,
@@ -1427,50 +1249,10 @@ fn resolve_res(tc: &mut v8::PinScope, id: u64, res: Result<asyncrt::OpOut, Strin
 
 /// Move `bytes` into a `Uint8Array` without copying.
 fn bytes_value<'s>(scope: &mut v8::PinScope<'s, '_>, bytes: Vec<u8>) -> v8::Local<'s, v8::Value> {
-    #[cfg(celld_internal_tests)]
-    let input = bytes.as_ptr() as usize;
     let len = bytes.len();
     let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
     let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
-    #[cfg(celld_internal_tests)]
-    record_bytes_value_allocation_for_test(
-        input,
-        buffer
-            .get_backing_store()
-            .data()
-            .map(|data| data.as_ptr() as usize),
-    );
     v8::Uint8Array::new(scope, buffer, 0, len).unwrap().into()
-}
-
-#[cfg(celld_internal_tests)]
-static BYTES_VALUE_ALLOCATION_PROBE: Mutex<Option<(usize, Option<usize>)>> = Mutex::new(None);
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn capture_bytes_value_allocation_for_test(expected: *const u8) {
-    *BYTES_VALUE_ALLOCATION_PROBE.lock().unwrap() = Some((expected as usize, None));
-}
-
-#[cfg(celld_internal_tests)]
-fn record_bytes_value_allocation_for_test(input: usize, output: Option<usize>) {
-    let mut probe = BYTES_VALUE_ALLOCATION_PROBE.lock().unwrap();
-    if probe
-        .as_ref()
-        .is_some_and(|(expected, _)| *expected == input)
-    {
-        *probe = Some((input, output));
-    }
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn take_bytes_value_allocation_for_test() -> Option<usize> {
-    BYTES_VALUE_ALLOCATION_PROBE
-        .lock()
-        .unwrap()
-        .take()
-        .and_then(|(_, output)| output)
 }
 
 #[cfg(unix)]
@@ -1499,12 +1281,6 @@ fn platform_thread_cpu_nanos() -> Option<u64> {
 }
 
 fn thread_cpu_nanos() -> Option<u64> {
-    #[cfg(all(test, celld_internal_tests))]
-    if let Some(sample) =
-        THREAD_CPU_NANOS_SAMPLES_FOR_TEST.with(|samples| samples.borrow_mut().pop_front())
-    {
-        return sample;
-    }
     platform_thread_cpu_nanos()
 }
 
@@ -1616,94 +1392,8 @@ fn shutdown_aborts() -> &'static std::sync::Mutex<std::collections::HashSet<Requ
     SHUTDOWN_ABORTS.get_or_init(Default::default)
 }
 
-#[cfg(all(test, celld_internal_tests))]
-type AbortRequestPauseForTest = (
-    RequestId,
-    std::sync::mpsc::Sender<()>,
-    std::sync::mpsc::Receiver<()>,
-);
-
-#[cfg(all(test, celld_internal_tests))]
-static ABORT_REQUEST_PAUSE_FOR_TEST: Mutex<Option<AbortRequestPauseForTest>> = Mutex::new(None);
-
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) struct AbortRequestPauseHandleForTest {
-    entered: std::sync::mpsc::Receiver<()>,
-    release: Option<std::sync::mpsc::Sender<()>>,
-}
-
-#[cfg(all(test, celld_internal_tests))]
-impl AbortRequestPauseHandleForTest {
-    pub(crate) fn wait_until_entered(&self) {
-        self.entered
-            .recv()
-            .expect("the abort publisher dropped before its publication seam");
-    }
-
-    pub(crate) fn release(mut self) {
-        self.release
-            .take()
-            .expect("the abort publication pause was released twice")
-            .send(())
-            .expect("the abort publisher dropped while paused");
-    }
-}
-
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) fn pause_abort_request_for_test(
-    request_id: RequestId,
-) -> AbortRequestPauseHandleForTest {
-    let (entered_tx, entered) = std::sync::mpsc::channel();
-    let (release, release_rx) = std::sync::mpsc::channel();
-    let previous = ABORT_REQUEST_PAUSE_FOR_TEST
-        .lock()
-        .unwrap()
-        .replace((request_id, entered_tx, release_rx));
-    assert!(
-        previous.is_none(),
-        "an abort publication pause is already armed"
-    );
-    AbortRequestPauseHandleForTest {
-        entered,
-        release: Some(release),
-    }
-}
-
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) fn pause_abort_request_if_armed_for_test(request_id: RequestId) {
-    let pause = {
-        let mut pause = ABORT_REQUEST_PAUSE_FOR_TEST.lock().unwrap();
-        if pause
-            .as_ref()
-            .is_some_and(|(expected, _, _)| *expected == request_id)
-        {
-            pause.take()
-        } else {
-            None
-        }
-    };
-    if let Some((_, entered, release)) = pause {
-        entered
-            .send(())
-            .expect("the abort publication test dropped its observer");
-        release
-            .recv()
-            .expect("the abort publication test dropped its release");
-    }
-}
-
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) fn request_cancellation_state_for_test(request_id: RequestId) -> (bool, bool) {
-    (
-        pending_aborts().lock().unwrap().contains(&request_id),
-        cancelled_requests().lock().unwrap().contains(&request_id),
-    )
-}
-
 /// Mark an in-flight request cancelled from any thread.
 pub fn abort_request(request_id: RequestId) {
-    #[cfg(all(test, celld_internal_tests))]
-    pause_abort_request_if_armed_for_test(request_id);
     if pending_aborts().lock().unwrap().insert(request_id) {
         PENDING_ABORT_COUNT.fetch_add(1, Ordering::Relaxed);
     }
@@ -1725,12 +1415,6 @@ pub(crate) fn clear_request_cancellation(request_id: RequestId) {
 
 pub fn take_shutdown_cancellation(request_id: Option<RequestId>) -> bool {
     request_id.is_some_and(|request_id| shutdown_aborts().lock().unwrap().remove(&request_id))
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn clear_request_cancellation_for_test(request_id: RequestId) {
-    clear_request_cancellation(request_id);
 }
 
 fn take_pending_abort(request_id: RequestId) -> bool {
@@ -1804,8 +1488,6 @@ impl Engine {
         // which poisoned the global state when both ran.
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
-            #[cfg(celld_internal_tests)]
-            v8::V8::set_flags_from_string("--expose-gc");
             // No `v8::icu::set_common_data_78` call: the rusty_v8 152 prebuilt
             // statically links the complete ICU data (full locale tables and
             // regex property-of-strings, e.g. /\p{RGI_Emoji}/v — verified
@@ -2012,11 +1694,6 @@ fn serialized_json_bytes(value: &impl serde::Serialize) -> usize {
     let mut counter = JsonByteCounter::default();
     serde_json::to_writer(&mut counter, value).expect("TailLog serialization is infallible");
     counter.0
-}
-
-#[cfg(all(test, celld_internal_tests))]
-fn tail_log_limit_bytes_for_test() -> usize {
-    TAIL_LOG_LIMIT_BYTES
 }
 
 impl WorkerConfig {
@@ -2382,10 +2059,6 @@ struct HeapLimitState {
     /// the current one.
     limit: usize,
     last_gc_nudge: Mutex<Option<Instant>>,
-    /// An explicit admission refusal cannot use the condemnation flag because
-    /// recovery clears that flag at the next turn.
-    #[cfg(celld_internal_tests)]
-    forced_admission_refusal: AtomicBool,
 }
 
 impl HeapLimitState {
@@ -2407,12 +2080,6 @@ impl HeapLimitState {
     }
 }
 
-#[cfg(celld_internal_tests)]
-fn admission_refusal_forced(state: &HeapLimitState) -> bool {
-    state.forced_admission_refusal.load(Ordering::Relaxed)
-}
-
-#[cfg(not(celld_internal_tests))]
 fn admission_refusal_forced(_state: &HeapLimitState) -> bool {
     false
 }
@@ -2457,15 +2124,6 @@ struct ActorRuntimeState {
     event_hooks: OnceLock<EventHooks>,
     /// See [`internals`].
     internals: OnceLock<v8::Global<v8::Object>>,
-    /// Set once a patch is installed, so an unpatched isolate pays one
-    /// relaxed load per op and not a lock: the patch check runs on every op
-    /// call of every test, and the lock cost 18% on an op-bound loop.
-    #[cfg(celld_internal_tests)]
-    op_patched: AtomicBool,
-    #[cfg(celld_internal_tests)]
-    op_patches: Mutex<HashMap<&'static str, v8::Global<v8::Function>>>,
-    #[cfg(celld_internal_tests)]
-    op_patches_active: Mutex<HashSet<&'static str>>,
 }
 
 /// The harness functions the host calls on the boundary of every cell event.
@@ -2542,55 +2200,7 @@ struct ExecutionTermination {
     context_id: Option<u64>,
 }
 
-#[cfg(all(test, celld_internal_tests))]
-static CPU_FINISH_TERMINATION_FOR_TEST: Mutex<Option<(usize, usize)>> = Mutex::new(None);
-
-#[cfg(all(test, celld_internal_tests))]
-fn terminate_on_cpu_finish_for_test(runtime_state: &Arc<ActorRuntimeState>, finish: usize) {
-    let previous = CPU_FINISH_TERMINATION_FOR_TEST
-        .lock()
-        .unwrap()
-        .replace((Arc::as_ptr(runtime_state) as usize, finish));
-    assert!(
-        previous.is_none(),
-        "a CPU finish termination is already armed"
-    );
-}
-
-#[cfg(all(test, celld_internal_tests))]
-fn inject_cpu_finish_termination_for_test(
-    tc: &mut v8::PinScope,
-    entry: &InFlight,
-) -> Option<String> {
-    let mut armed = CPU_FINISH_TERMINATION_FOR_TEST.lock().unwrap();
-    let (runtime_state, remaining) = armed.as_mut()?;
-    if *runtime_state != Arc::as_ptr(&entry.runtime_state) as usize {
-        return None;
-    }
-    *remaining = remaining.saturating_sub(1);
-    if *remaining != 0 {
-        return None;
-    }
-    armed.take();
-    let error = "Worker exceeded CPU limit of 10 ms".to_string();
-    *entry
-        .runtime_state
-        .termination
-        .lock()
-        .expect("termination lock poisoned") = Some(ExecutionTermination {
-        error: error.clone(),
-        actor_scope: None,
-        context_id: None,
-    });
-    tc.terminate_execution();
-    Some(error)
-}
-
 fn finish_cpu_turn(_tc: &mut v8::PinScope, entry: &InFlight) -> Result<(), String> {
-    #[cfg(all(test, celld_internal_tests))]
-    if let Some(error) = inject_cpu_finish_termination_for_test(_tc, entry) {
-        return Err(error);
-    }
     entry.context.finish_cpu_turn()
 }
 
@@ -2666,17 +2276,6 @@ impl CpuWatchdog {
         drop(state);
         wake.notify_one();
         Some(Self { id })
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    fn is_registered_for_test(&self) -> bool {
-        cpu_watchdog_service()
-            .shared
-            .0
-            .lock()
-            .unwrap()
-            .watches
-            .contains_key(&self.id)
     }
 }
 
@@ -3083,16 +2682,7 @@ fn send_answer_after_arm_gates<T: Send + 'static>(
     }
     let (completed, completion) = tokio::sync::oneshot::channel();
     let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
-    #[cfg(celld_internal_tests)]
-    let drop_task = asyncrt::services()
-        .wake_entry()
-        .drop_next_gated_reply_task
-        .swap(false, Ordering::AcqRel);
     asyncrt::spawn(async move {
-        #[cfg(celld_internal_tests)]
-        if drop_task {
-            return;
-        }
         enum GateWait {
             Completed(Result<(), String>),
             CallerClosed,
@@ -3210,65 +2800,6 @@ impl std::future::Future for GatedReplyRx {
     ) -> std::task::Poll<Self::Output> {
         Pin::new(&mut self.get_mut().completion).poll(context)
     }
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub async fn await_arm_gates_for_test(
-    gates: Vec<tokio::sync::oneshot::Receiver<Result<(), String>>>,
-) -> Result<(), String> {
-    await_arm_gates(gates).await
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub enum GatedReplyCompletionForTest {
-    Sent { failure: Option<String> },
-    CallerClosed { failure: Option<String> },
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub struct GatedReplyForTest(GatedReplyRx);
-
-#[cfg(celld_internal_tests)]
-impl std::future::Future for GatedReplyForTest {
-    type Output = Result<GatedReplyCompletionForTest, tokio::sync::oneshot::error::RecvError>;
-
-    fn poll(
-        self: Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        Pin::new(&mut self.get_mut().0).poll(context).map(|result| {
-            result.map(|completion| match completion {
-                GatedReplyCompletion::Sent { failure } => {
-                    GatedReplyCompletionForTest::Sent { failure }
-                }
-                GatedReplyCompletion::CallerClosed { failure } => {
-                    GatedReplyCompletionForTest::CallerClosed { failure }
-                }
-            })
-        })
-    }
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn send_answer_after_arm_gates_for_test<T: Send + 'static>(
-    reply: tokio::sync::oneshot::Sender<Result<T>>,
-    value: Result<T>,
-    gates: Vec<tokio::sync::oneshot::Receiver<Result<(), String>>>,
-) -> Option<GatedReplyForTest> {
-    send_answer_after_arm_gates(reply, value, gates).map(GatedReplyForTest)
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn drop_next_gated_reply_task_for_test() {
-    asyncrt::services()
-        .wake_entry()
-        .drop_next_gated_reply_task
-        .store(true, Ordering::Release);
 }
 
 pub struct InFlight {
@@ -3403,21 +2934,10 @@ impl InFlight {
             Answer::CellRpc(reply) => {
                 let outcome = self
                     .gate_positions()
-                    .map(|(write_position, observed_position)| {
-                        #[cfg(celld_internal_tests)]
-                        if self.scope.as_deref().is_some_and(|scope| {
-                            scope
-                                .split_once(':')
-                                .is_some_and(|(class, _)| class == crate::deploy::QUEUE_CLASS)
-                        }) {
-                            QUEUE_PRODUCER_WRITE_POSITIONS
-                                .with(|positions| positions.borrow_mut().push(write_position));
-                        }
-                        RpcOutcome {
-                            data: rpc_data_ret(tc, value),
-                            write_position,
-                            observed_position,
-                        }
+                    .map(|(write_position, observed_position)| RpcOutcome {
+                        data: rpc_data_ret(tc, value),
+                        write_position,
+                        observed_position,
                     });
                 send_and_end(tc, &self.context, reply, outcome)
             }
@@ -3599,23 +3119,6 @@ impl InFlight {
         &mut self,
     ) -> (Option<&mut GatedReplyRx>, &Arc<IoContext>) {
         (self.gated_reply.as_mut(), &self.context)
-    }
-
-    #[cfg(celld_internal_tests)]
-    #[doc(hidden)]
-    pub fn has_gated_reply_for_test(&self) -> bool {
-        self.gated_reply.is_some()
-    }
-
-    #[cfg(celld_internal_tests)]
-    #[doc(hidden)]
-    pub async fn finish_gated_reply_for_test(&mut self) -> bool {
-        let Some(gated_reply) = self.gated_reply.as_mut() else {
-            return false;
-        };
-        let completion = gated_reply.await;
-        self.finish_gated_reply(completion);
-        true
     }
 
     /// Ask the detached gate owner to release every event gate and finish the
@@ -5002,10 +4505,6 @@ fn rpc_data_ret(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> RpcData 
 }
 
 fn unix_now_ms() -> i64 {
-    #[cfg(all(test, celld_internal_tests))]
-    if let Some(timestamp_ms) = unix_now_ms_for_test() {
-        return timestamp_ms;
-    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -5440,32 +4939,6 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
             reply,
             event_time,
         ),
-        #[cfg(celld_internal_tests)]
-        CellJob::SyncErrorForTest {
-            scope,
-            gate,
-            socket_id,
-            terminate,
-            reply,
-        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
-            register_arm_gate_with_current_event(gate, installed_context());
-            if let Some(socket_id) = socket_id {
-                current_context().sockets.lock().unwrap().push(socket_id);
-            }
-            if terminate {
-                let state = actor_runtime_state(tc);
-                *state.termination.lock().expect("termination lock poisoned") =
-                    Some(ExecutionTermination {
-                        error: "synchronous V8 termination sentinel".to_string(),
-                        actor_scope: None,
-                        context_id: None,
-                    });
-                tc.terminate_execution();
-                Err(anyhow!("generic synchronous dispatch failure"))
-            } else {
-                Err(anyhow!("synchronous cell dispatch sentinel"))
-            }
-        }),
     }
 }
 
@@ -5487,20 +4960,8 @@ fn begin_alarm(
         let _ = reply.send(Err(anyhow!("alarm dispatched before its deadline")));
         return Begun::Nothing;
     }
-    #[cfg(celld_internal_tests)]
-    if let AlarmDispatch::Claimed(retry) = claim {
-        let Some(scheduled_at) = storage::active_alarm_scheduled_time(scope) else {
-            let _ = reply.send(Err(anyhow!("alarm dispatched without a claim")));
-            return Begun::Nothing;
-        };
-        return fire_alarm_handler(tc, scope, scheduled_at, retry, None, request_id, reply);
-    }
     let due_by = match claim {
-        #[cfg(celld_internal_tests)]
-        AlarmDispatch::Armed => i64::MAX,
         AlarmDispatch::Due => event_time,
-        #[cfg(celld_internal_tests)]
-        AlarmDispatch::Claimed(_) => unreachable!("claimed alarms return above"),
     };
     let Some((scheduled_at, retry)) = storage::due_alarm_entry(scope, due_by) else {
         // Nothing is due: another dispatch already ran it, or the handler
@@ -5794,23 +5255,10 @@ enum Started<'s> {
 }
 
 fn settle_isolate_heap(isolate: &mut v8::Isolate) {
-    #[cfg(all(test, celld_internal_tests))]
-    let _observation = HeapSettlementObservationForTest::begin();
     isolate.low_memory_notification();
 }
 
 impl Worker {
-    /// Compile the worker module, wire the DO harness, and extract the entry
-    /// `fetch`. `do_classes` come from the manifest; `bindings` maps a binding
-    /// name to a DO class name (from wrangler metadata).
-    ///
-    /// The runtime builds a `WorkerConfig` directly. This cfg-gated helper
-    /// constructs the same value from individual options.
-    #[cfg(celld_internal_tests)]
-    pub fn load(options: WorkerConfigOptions) -> Result<Worker> {
-        Self::load_config(Arc::new(WorkerConfig::new(options)))
-    }
-
     pub fn load_config(config: Arc<WorkerConfig>) -> Result<Worker> {
         let src = config.src.as_str();
         let script_name = config.script_name.as_str();
@@ -5826,8 +5274,6 @@ impl Worker {
             excessively_exceeded: AtomicBool::new(false),
             limit: original_heap_limit,
             last_gc_nudge: Mutex::new(None),
-            #[cfg(celld_internal_tests)]
-            forced_admission_refusal: AtomicBool::new(false),
         });
         let runtime_state = Arc::new(ActorRuntimeState {
             promises: std::sync::Mutex::new(PromiseMap::new()),
@@ -6085,8 +5531,6 @@ impl Worker {
         // new cell isolate can otherwise retain their pages indefinitely.
         // Observe only post-setup collection, so bootstrap GC cannot make
         // a missing settlement notification pass the regression.
-        #[cfg(all(test, celld_internal_tests))]
-        install_heap_collection_observer_for_test(&mut isolate);
         settle_isolate_heap(&mut isolate);
         Ok(Worker {
             inner: Some(WorkerIsolate {
@@ -6200,14 +5644,6 @@ impl Worker {
             compat,
         )?;
         storage::facet_opening(cell).context("the facet opened without an embedded backing")
-    }
-
-    /// The opening of the facet `scope` in this isolate, for a test that
-    /// addresses a facet's socket event to it.
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn facet_opening_for_test(&mut self, scope: &str) -> Option<u64> {
-        let (_locker, _cells) = self.lock();
-        storage::facet_opening(scope)
     }
 
     /// Close the facet `cell` at `facet_path` of `root`, and every facet
@@ -6453,12 +5889,6 @@ macro_rules! ops {
                     args: v8::FunctionCallbackArguments<'s>,
                     rv: v8::ReturnValue<'s, v8::Value>,
                 ) {
-                    #[cfg(celld_internal_tests)]
-                    let mut rv = rv;
-                    #[cfg(celld_internal_tests)]
-                    if call_op_patch(scope, $name, &args, &mut rv) {
-                        return;
-                    }
                     let before = asyncrt::spawn_count();
                     $op(scope, args, rv);
                     if asyncrt::spawn_count() != before {
@@ -6494,9 +5924,6 @@ pub(super) struct InternalArguments<'s> {
 }
 
 fn op_names() -> impl Iterator<Item = &'static str> {
-    #[cfg(celld_internal_tests)]
-    let test = TEST_OP_NAMES.iter().copied();
-    #[cfg(not(celld_internal_tests))]
     let test = std::iter::empty();
     OP_NAMES.iter().copied().chain(test)
 }
@@ -6529,8 +5956,6 @@ fn install_ops<'s>(scope: &mut v8::PinScope<'s, '_>) -> InternalArguments<'s> {
     let internals = v8::Object::new(scope);
     let mut functions = Vec::new();
     install_op_functions(scope, &mut functions);
-    #[cfg(celld_internal_tests)]
-    install_test_op_functions(scope, &mut functions);
     let mut functions = functions.into_iter();
     // Read-only: a test that assigns `__celld.__op = fn`, the idiom that
     // patching a global once allowed, throws instead of binding a script that
@@ -6552,17 +5977,6 @@ fn install_ops<'s>(scope: &mut v8::PinScope<'s, '_>) -> InternalArguments<'s> {
     // A test build exposes the internals object, so an engine test can reach
     // ops and harness state by name and patch an op through
     // `__test_patch_op`. A shipping isolate has no `__`-prefixed global.
-    #[cfg(celld_internal_tests)]
-    {
-        let global = scope.get_current_context().global(scope);
-        let key = v8_strings::key(scope, &v8_strings::INTERNALS);
-        global.define_own_property(
-            scope,
-            key.into(),
-            internals.into(),
-            v8::PropertyAttribute::DONT_ENUM,
-        );
-    }
     arguments
 }
 
@@ -6641,77 +6055,6 @@ pub(super) fn run_internal_snippet<'s>(
         values: vec![internals(scope).into()],
     };
     bootstrap::run_internal_script(scope, None, code, &arguments).ok()
-}
-
-/// `__test_patch_op(name, fn | null)`: route the named op through `fn` for
-/// the rest of the isolate's life, or restore it. The patch receives the op's
-/// arguments and `this`; an op it calls itself runs the real op, so a patch
-/// can observe or clamp arguments and then forward them.
-///
-/// The forward must happen before the patch returns. The re-entrancy guard
-/// is held for that synchronous extent only, so a forward after an `await`
-/// meets the patch again and recurses.
-#[cfg(celld_internal_tests)]
-fn op_test_patch_op(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let requested = args.get(0).to_rust_string_lossy(scope);
-    let Some(name) = op_names()
-        .filter(|name| *name != "__test_patch_op")
-        .find(|name| *name == requested)
-    else {
-        return loader_throw(
-            scope,
-            &format!("__test_patch_op: {requested} is not a patchable op"),
-        );
-    };
-    let state = actor_runtime_state(scope);
-    let mut patches = state.op_patches.lock().unwrap();
-    match v8::Local::<v8::Function>::try_from(args.get(1)) {
-        Ok(patch) => {
-            state.op_patched.store(true, Ordering::Relaxed);
-            patches.insert(name, v8::Global::new(scope, patch));
-        }
-        Err(_) => {
-            patches.remove(name);
-        }
-    }
-}
-
-#[cfg(celld_internal_tests)]
-fn call_op_patch(
-    scope: &mut v8::PinScope,
-    name: &'static str,
-    args: &v8::FunctionCallbackArguments,
-    rv: &mut v8::ReturnValue<v8::Value>,
-) -> bool {
-    let state = actor_runtime_state(scope);
-    if !state.op_patched.load(Ordering::Relaxed) {
-        return false;
-    }
-    let patch = state
-        .op_patches
-        .lock()
-        .unwrap()
-        .get(name)
-        .map(|patch| v8::Local::new(scope, patch));
-    let Some(patch) = patch else {
-        return false;
-    };
-    // Re-entered from inside the patch: this call is the forward to the real
-    // op.
-    if !state.op_patches_active.lock().unwrap().insert(name) {
-        return false;
-    }
-    let values: Vec<v8::Local<v8::Value>> = (0..args.length()).map(|i| args.get(i)).collect();
-    let result = patch.call(scope, args.this().into(), &values);
-    state.op_patches_active.lock().unwrap().remove(name);
-    if let Some(result) = result {
-        rv.set(result);
-    }
-    true
 }
 
 ops! { OP_NAMES, install_op_functions,
@@ -6897,36 +6240,6 @@ ops! { OP_NAMES, install_op_functions,
         "__zlib_stream_drop" => zlib::op_zlib_stream_drop,
 }
 
-#[cfg(celld_internal_tests)]
-ops! { TEST_OP_NAMES, install_test_op_functions,
-    "__test_patch_op" => op_test_patch_op,
-    "__test_gc" => op_test_gc,
-        "__loader_count" => op_loader_count,
-        "__test_set_heap_limit_excessively_exceeded" =>
-            op_test_set_heap_limit_excessively_exceeded,
-        "__test_force_heap_admission_refusal" =>
-            op_test_force_heap_admission_refusal,
-        "__test_heap_share" => op_test_heap_share,
-        "__test_external_memory" => op_test_external_memory,
-        "__test_workflow_event_consumed" => op_test_workflow_event_consumed,
-        "__test_workflow_meta_created" => op_test_workflow_meta_created,
-        "__test_workflow_terminal_alarm_set" => op_test_workflow_terminal_alarm_set,
-        "__test_queue_dlq_accepted" => op_test_queue_dlq_accepted,
-        "__test_queue_metrics_materialized" => op_test_queue_metrics_materialized,
-        "__test_queue_producer_group" => op_test_queue_producer_group,
-        "__test_queue_rearm_bounded" => op_test_queue_rearm_bounded,
-        "__test_queue_lease_lookup_plan" => op_test_queue_lease_lookup_plan,
-        "__test_kv_list_plan" => op_test_kv_list_plan,
-        "__sql_set_max_page_count_for_test" =>
-            storage_ops::op_sql_set_max_page_count_for_test,
-        "__sql_set_write_fault_for_test" => storage_ops::op_sql_set_write_fault_for_test,
-        "__sql_set_cache_size_for_test" => storage_ops::op_sql_set_cache_size_for_test,
-        "__sql_set_interrupt_fault_for_test" =>
-            storage_ops::op_sql_set_interrupt_fault_for_test,
-    "__sql_register_nomem_function_for_test" =>
-        storage_ops::op_sql_register_nomem_function_for_test,
-}
-
 /// `__kv_blob(requestJson, bytes?)` -> Promise<string | Uint8Array>.
 ///
 /// One op for the whole large-value path, following `__d1_run` rather than
@@ -7036,10 +6349,6 @@ fn op_queue_policy(
                 return loader_throw(scope, &format!("invalid Queue policy input: {error}"))
             }
         };
-    #[cfg(celld_internal_tests)]
-    if request.get("op").and_then(serde_json::Value::as_str) == Some("settlement") {
-        QUEUE_SETTLEMENT_POLICY_OBSERVED.with(|observed| observed.set(true));
-    }
     match crate::queue_policy::run(&request) {
         Ok(value) => {
             let value = v8::String::new(scope, &value.to_string()).unwrap();
@@ -9959,8 +9268,6 @@ mod container;
 mod crypto;
 mod html_rewriter;
 mod tcp;
-#[cfg(celld_internal_tests)]
-pub use tcp::test_extra_tls_root;
 mod zlib;
 
 fn op_actor_abort(
@@ -10124,310 +9431,7 @@ fn op_heap_over_admission_share(
     };
     rv.set(v8::Boolean::new(scope, over).into());
 }
-#[cfg(celld_internal_tests)]
-fn op_test_set_heap_limit_excessively_exceeded(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    if let Some(state) = scope.get_slot::<Arc<HeapLimitState>>() {
-        state
-            .excessively_exceeded
-            .store(args.get(0).boolean_value(scope), Ordering::Relaxed);
-    }
-}
-#[cfg(celld_internal_tests)]
-fn op_test_force_heap_admission_refusal(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    if let Some(state) = scope.get_slot::<Arc<HeapLimitState>>() {
-        state
-            .forced_admission_refusal
-            .store(args.get(0).boolean_value(scope), Ordering::Relaxed);
-    }
-}
-#[cfg(celld_internal_tests)]
-fn op_test_gc(
-    scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    scope.request_garbage_collection_for_testing(v8::GarbageCollectionType::Full);
-}
 
-#[cfg(celld_internal_tests)]
-thread_local! {
-    static FAIL_NEXT_WORKFLOW_EVENT_CONSUMPTION: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
-    };
-    static FAIL_NEXT_WORKFLOW_META_CREATION: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
-    };
-    static FAIL_NEXT_WORKFLOW_TERMINAL_ALARM_SET: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
-    };
-    static FAIL_NEXT_QUEUE_DLQ_ACCEPT: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
-    };
-    static QUEUE_DLQ_ACCEPT_CALLS: std::cell::Cell<usize> = const {
-        std::cell::Cell::new(0)
-    };
-    static QUEUE_METRICS_MATERIALIZED: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
-    };
-    static QUEUE_PRODUCER_GROUPS: std::cell::RefCell<Vec<(usize, usize)>> = const {
-        std::cell::RefCell::new(Vec::new())
-    };
-    static QUEUE_PRODUCER_WRITE_POSITIONS: std::cell::RefCell<Vec<Option<u64>>> = const {
-        std::cell::RefCell::new(Vec::new())
-    };
-    static QUEUE_REARM_OBSERVED: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
-    };
-    static QUEUE_REARM_POSITIVE: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
-    };
-    static QUEUE_REARM_BOUND_VIOLATED: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
-    };
-    static QUEUE_SETTLEMENT_POLICY_OBSERVED: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
-    };
-    static QUEUE_LEASE_LOOKUP_PLANS: std::cell::RefCell<Vec<String>> = const {
-        std::cell::RefCell::new(Vec::new())
-    };
-    static KV_LIST_PLANS: std::cell::RefCell<Vec<String>> = const {
-        std::cell::RefCell::new(Vec::new())
-    };
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn fail_next_workflow_event_consumption_for_test() {
-    FAIL_NEXT_WORKFLOW_EVENT_CONSUMPTION.with(|fail| fail.set(true));
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn fail_next_workflow_meta_creation_for_test() {
-    FAIL_NEXT_WORKFLOW_META_CREATION.with(|fail| fail.set(true));
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn fail_next_workflow_terminal_alarm_set_for_test() {
-    FAIL_NEXT_WORKFLOW_TERMINAL_ALARM_SET.with(|fail| fail.set(true));
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn fail_next_queue_dlq_accept_for_test() {
-    FAIL_NEXT_QUEUE_DLQ_ACCEPT.with(|fail| fail.set(true));
-}
-
-#[cfg(celld_internal_tests)]
-pub fn reset_queue_dlq_accept_calls_for_test() {
-    QUEUE_DLQ_ACCEPT_CALLS.with(|calls| calls.set(0));
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn queue_dlq_accept_calls_for_test() -> usize {
-    QUEUE_DLQ_ACCEPT_CALLS.with(std::cell::Cell::get)
-}
-
-#[cfg(celld_internal_tests)]
-pub fn reset_queue_hot_path_observations_for_test() {
-    QUEUE_METRICS_MATERIALIZED.with(|observed| observed.set(false));
-    QUEUE_REARM_OBSERVED.with(|observed| observed.set(false));
-    QUEUE_REARM_POSITIVE.with(|observed| observed.set(false));
-    QUEUE_REARM_BOUND_VIOLATED.with(|violated| violated.set(false));
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn queue_hot_path_observations_for_test() -> (bool, bool, bool) {
-    let materialized = QUEUE_METRICS_MATERIALIZED.with(std::cell::Cell::get);
-    let bounded = QUEUE_REARM_OBSERVED.with(std::cell::Cell::get)
-        && QUEUE_REARM_POSITIVE.with(std::cell::Cell::get)
-        && !QUEUE_REARM_BOUND_VIOLATED.with(std::cell::Cell::get);
-    let violated = QUEUE_REARM_BOUND_VIOLATED.with(std::cell::Cell::get);
-    (materialized, bounded, violated)
-}
-
-#[cfg(celld_internal_tests)]
-pub fn reset_queue_producer_groups_for_test() {
-    QUEUE_PRODUCER_GROUPS.with(|groups| groups.borrow_mut().clear());
-    QUEUE_PRODUCER_WRITE_POSITIONS.with(|positions| positions.borrow_mut().clear());
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn queue_producer_groups_for_test() -> Vec<(usize, usize)> {
-    QUEUE_PRODUCER_GROUPS.with(|groups| groups.borrow().clone())
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn queue_producer_write_positions_for_test() -> Vec<Option<u64>> {
-    QUEUE_PRODUCER_WRITE_POSITIONS.with(|positions| positions.borrow().clone())
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn reset_queue_lease_lookup_plans_for_test() {
-    QUEUE_LEASE_LOOKUP_PLANS.with(|plans| plans.borrow_mut().clear());
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn queue_lease_lookup_plans_for_test() -> Vec<String> {
-    QUEUE_LEASE_LOOKUP_PLANS.with(|plans| plans.borrow().clone())
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn reset_kv_list_plans_for_test() {
-    KV_LIST_PLANS.with(|plans| plans.borrow_mut().clear());
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn kv_list_plans_for_test() -> Vec<String> {
-    KV_LIST_PLANS.with(|plans| plans.borrow().clone())
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn reset_queue_settlement_policy_observation_for_test() {
-    QUEUE_SETTLEMENT_POLICY_OBSERVED.with(|observed| observed.set(false));
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn queue_settlement_policy_observed_for_test() -> bool {
-    QUEUE_SETTLEMENT_POLICY_OBSERVED.with(std::cell::Cell::get)
-}
-
-#[cfg(celld_internal_tests)]
-fn op_test_workflow_event_consumed(
-    scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let fail = FAIL_NEXT_WORKFLOW_EVENT_CONSUMPTION.with(|fail| fail.replace(false));
-    if fail {
-        throw_storage_error(
-            scope,
-            "workflow event consumption",
-            "injected failure after workflow event delete",
-        );
-    }
-}
-
-#[cfg(celld_internal_tests)]
-fn op_test_workflow_meta_created(
-    scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let fail = FAIL_NEXT_WORKFLOW_META_CREATION.with(|fail| fail.replace(false));
-    if fail {
-        throw_storage_error(
-            scope,
-            "workflow creation",
-            "injected failure after workflow metadata write",
-        );
-    }
-}
-
-#[cfg(celld_internal_tests)]
-fn op_test_workflow_terminal_alarm_set(
-    scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let fail = FAIL_NEXT_WORKFLOW_TERMINAL_ALARM_SET.with(|fail| fail.replace(false));
-    if fail {
-        throw_storage_error(
-            scope,
-            "workflow terminal alarm installation",
-            "injected failure after workflow terminal alarm installation",
-        );
-    }
-}
-
-#[cfg(celld_internal_tests)]
-fn op_test_queue_dlq_accepted(
-    scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    QUEUE_DLQ_ACCEPT_CALLS.with(|calls| calls.set(calls.get() + 1));
-    let fail = FAIL_NEXT_QUEUE_DLQ_ACCEPT.with(|fail| fail.replace(false));
-    if fail {
-        throw_storage_error(
-            scope,
-            "Queue DLQ transfer",
-            "injected failure after the target accepted the message",
-        );
-    }
-}
-
-#[cfg(celld_internal_tests)]
-fn op_test_queue_metrics_materialized(
-    _scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    QUEUE_METRICS_MATERIALIZED.with(|observed| observed.set(true));
-}
-
-#[cfg(celld_internal_tests)]
-fn op_test_queue_producer_group(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let calls = args.get(0).integer_value(scope).unwrap_or(0).max(0) as usize;
-    let messages = args.get(1).integer_value(scope).unwrap_or(0).max(0) as usize;
-    QUEUE_PRODUCER_GROUPS.with(|groups| groups.borrow_mut().push((calls, messages)));
-}
-
-#[cfg(celld_internal_tests)]
-fn op_test_queue_lease_lookup_plan(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let plan = args.get(0).to_rust_string_lossy(scope);
-    QUEUE_LEASE_LOOKUP_PLANS.with(|plans| plans.borrow_mut().push(plan));
-}
-
-#[cfg(celld_internal_tests)]
-fn op_test_kv_list_plan(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    let plan = args.get(0).to_rust_string_lossy(scope);
-    KV_LIST_PLANS.with(|plans| plans.borrow_mut().push(plan));
-}
-
-#[cfg(celld_internal_tests)]
-fn op_test_queue_rearm_bounded(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
-    QUEUE_REARM_OBSERVED.with(|observed| observed.set(true));
-    QUEUE_REARM_POSITIVE.with(|observed| observed.set(observed.get() || args.get(1).is_true()));
-    if !args.get(0).boolean_value(scope) {
-        QUEUE_REARM_BOUND_VIOLATED.with(|violated| violated.set(true));
-    }
-}
 // `celld r2` writes an object a binding then reads, so the operator command
 // calls the very functions the ops call rather than a second implementation
 // of the object record.
@@ -11174,11 +10178,6 @@ impl IoContext {
         Self::with_options(limits, false)
     }
 
-    #[cfg(all(test, celld_internal_tests))]
-    fn with_tail_reporting(tail_reporting: bool) -> Arc<Self> {
-        Self::with_options(None, tail_reporting)
-    }
-
     fn with_options(limits: Option<ResourceLimits>, tail_reporting: bool) -> Arc<Self> {
         Arc::new(Self {
             continuation: None,
@@ -11533,106 +10532,6 @@ impl IoContext {
         drop(original);
         drop(replaced);
     }
-
-    #[cfg(celld_internal_tests)]
-    #[doc(hidden)]
-    pub fn begin_event_for_test(&self) {
-        self.begin_event();
-    }
-
-    #[cfg(celld_internal_tests)]
-    #[doc(hidden)]
-    pub fn end_event_for_test(&self) -> Option<()> {
-        self.end_event().map(drop)
-    }
-
-    #[cfg(celld_internal_tests)]
-    #[doc(hidden)]
-    pub fn register_arm_gate_for_test(
-        &self,
-        gate: tokio::sync::oneshot::Receiver<Result<(), String>>,
-    ) -> Result<(), tokio::sync::oneshot::Receiver<Result<(), String>>> {
-        self.register_arm_gate(gate)
-    }
-
-    #[cfg(celld_internal_tests)]
-    #[doc(hidden)]
-    pub fn take_arm_gates_for_test(
-        &self,
-    ) -> Vec<tokio::sync::oneshot::Receiver<Result<(), String>>> {
-        self.take_arm_gates()
-    }
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-#[derive(Default)]
-pub struct IoContextRegistryForTest(Arc<ActorRuntimeState>);
-
-#[cfg(celld_internal_tests)]
-impl IoContextRegistryForTest {
-    #[doc(hidden)]
-    pub fn track(&self) -> (u64, Arc<IoContext>) {
-        let context = IoContext::tracked(&self.0);
-        let id = context
-            .continuation
-            .as_ref()
-            .map(|(id, _)| *id)
-            .expect("a tracked IoContext has a continuation id");
-        (id, context)
-    }
-
-    #[doc(hidden)]
-    pub fn resolves_to(&self, id: u64, expected: &Arc<IoContext>) -> bool {
-        self.0
-            .io_context(id)
-            .is_some_and(|context| Arc::ptr_eq(&context, expected))
-    }
-
-    #[doc(hidden)]
-    pub fn contains(&self, id: u64) -> bool {
-        self.0.io_contexts.lock().unwrap().contains_key(&id)
-    }
-
-    #[doc(hidden)]
-    pub fn is_empty(&self) -> bool {
-        self.0.io_contexts.lock().unwrap().is_empty()
-    }
-
-    /// Hand `context` an op that never completes, and report whether its
-    /// mailbox accepted it. The future stands in for real work: the mailbox
-    /// only stores it, so nothing here polls it.
-    #[doc(hidden)]
-    pub fn hand_pending_op(&self, context: &Arc<IoContext>, id: u64) -> bool {
-        context.hand_op(
-            id,
-            Box::pin(std::future::pending()),
-            asyncrt::OpLifetime::Handler,
-        )
-    }
-
-    /// The op ids `context` still holds for a driver that has not taken them.
-    #[doc(hidden)]
-    pub fn handed_op_ids(&self, context: &Arc<IoContext>) -> Vec<u64> {
-        context
-            .handed
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|queue| queue.iter().map(|(id, _, _)| *id).collect())
-            .unwrap_or_default()
-    }
-
-    /// Run the mailbox half of an event's retirement: close it, and report
-    /// the ops whose resolvers `InFlight::abandon` must then drop.
-    #[doc(hidden)]
-    pub fn close_handed_ops(&self, context: &Arc<IoContext>) -> Vec<u64> {
-        context
-            .close_handed_ops()
-            .into_iter()
-            .map(|(id, _, _)| id)
-            .collect()
-    }
 }
 
 /// A Worker socket lives and dies with its request, exactly as it does on
@@ -11740,11 +10639,6 @@ fn current_context() -> Arc<IoContext> {
         let mut current = current.borrow_mut();
         current.get_or_insert_with(IoContext::new).clone()
     })
-}
-
-#[cfg(celld_internal_tests)]
-fn installed_context() -> Option<Arc<IoContext>> {
-    CURRENT.with(|current| current.borrow().clone())
 }
 
 fn op_event_begin(
@@ -12673,12 +11567,3 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
         observed_position: None,
     })
 }
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn init_engine_for_tests() {
-    Engine::init();
-}
-
-#[cfg(celld_internal_tests)]
-include!(env!("CELLD_INTERNAL_JS_OBSERVERS"));

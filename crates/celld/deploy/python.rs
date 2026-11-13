@@ -670,8 +670,3 @@ fn run_esbuild(directory: &Path) -> anyhow::Result<()> {
     }
     Ok(())
 }
-
-#[cfg(all(test, celld_internal_tests))]
-mod internal_tests {
-    include!(env!("CELLD_INTERNAL_PYTHON_DEPLOY_TESTS"));
-}

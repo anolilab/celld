@@ -3036,8 +3036,3 @@ fn strip_jsonc(source: &str) -> String {
     }
     out
 }
-
-#[cfg(all(test, celld_internal_tests))]
-mod deploy_contract {
-    include!(env!("CELLD_INTERNAL_DEPLOY_TESTS"));
-}

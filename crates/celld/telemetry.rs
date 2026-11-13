@@ -536,24 +536,6 @@ fn decide_with_sampler(
     (trace_id, sampled)
 }
 
-/// The sampler is private, so tests reach the decision
-/// through the ratio the configuration carries.
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn decide(
-    parent_based: bool,
-    sample_ratio: f64,
-    parent: Option<&ParentContext>,
-    fresh: [u8; 16],
-) -> ([u8; 16], bool) {
-    decide_with_sampler(
-        parent_based,
-        Sampler::from_ratio(sample_ratio),
-        parent,
-        fresh,
-    )
-}
-
 /// Join an in-process parent: same trace and decision, with a fresh span id.
 pub fn child_of(parent: &TraceContext) -> Option<TraceContext> {
     TELEMETRY.get()?;
@@ -883,13 +865,6 @@ fn otlp_backoff(attempt: u32) -> Duration {
         .min(OTLP_BACKOFF_MAX);
     let ceiling_ms = ceiling.as_millis() as u64;
     Duration::from_millis(rand::random::<u64>() % (ceiling_ms + 1))
-}
-
-#[cfg(all(test, celld_internal_tests))]
-mod telemetry_contract {
-    use super::*;
-
-    include!(env!("CELLD_INTERNAL_TELEMETRY_TESTS"));
 }
 
 /// A `spawn_blocking` result unwrapped honestly: the panic and the

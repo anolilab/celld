@@ -68,7 +68,7 @@ fn cgroup_memory() -> Option<CgroupMemory> {
     None
 }
 
-#[cfg(any(target_os = "linux", all(test, celld_internal_tests)))]
+#[cfg(target_os = "linux")]
 fn memory_stat_value(stat: &str, key: &str) -> Option<u64> {
     stat.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
@@ -78,7 +78,7 @@ fn memory_stat_value(stat: &str, key: &str) -> Option<u64> {
     })
 }
 
-#[cfg(any(target_os = "linux", all(test, celld_internal_tests)))]
+#[cfg(target_os = "linux")]
 fn cgroup_memory_from_stat(current_bytes: u64, stat: &str, inactive_key: &str) -> CgroupMemory {
     let inactive_file_bytes = memory_stat_value(stat, inactive_key)
         .or_else(|| {
@@ -333,9 +333,4 @@ pub fn tune_allocator() {
              return only when a thread allocates again"
         );
     }
-}
-
-#[cfg(all(test, celld_internal_tests))]
-mod internal_tests {
-    include!(env!("CELLD_INTERNAL_MEMORY_TESTS"));
 }

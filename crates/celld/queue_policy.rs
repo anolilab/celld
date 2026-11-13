@@ -327,89 +327,18 @@ pub(crate) fn run(request: &serde_json::Value) -> Result<serde_json::Value> {
     }
 }
 
-#[cfg(celld_internal_tests)]
-thread_local! {
-    static QUEUE_LEASE_DURATION_FOR_TEST: std::cell::Cell<Option<i64>> = const {
-        std::cell::Cell::new(None)
-    };
-    static QUEUE_BATCH_TIMEOUT_FOR_TEST: std::cell::Cell<Option<i64>> = const {
-        std::cell::Cell::new(None)
-    };
-    static QUEUE_RETENTION_FOR_TEST: std::cell::Cell<Option<i64>> = const {
-        std::cell::Cell::new(None)
-    };
-    static QUEUE_SWEEP_BATCH_FOR_TEST: std::cell::Cell<Option<usize>> = const {
-        std::cell::Cell::new(None)
-    };
-}
-
-/// Measure lease expiry without waiting through the production handler budget.
-/// The override is thread-local because runtime tests build
-/// unrelated Workers in parallel, and a process environment variable would
-/// silently shorten their leases too.
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn set_queue_lease_duration_for_test(duration: Option<i64>) {
-    QUEUE_LEASE_DURATION_FOR_TEST.set(duration);
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn set_queue_batch_timeout_for_test(duration: Option<i64>) {
-    QUEUE_BATCH_TIMEOUT_FOR_TEST.set(duration);
-}
-
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn set_queue_retention_for_test(duration: Option<i64>) {
-    QUEUE_RETENTION_FOR_TEST.set(duration);
-}
-
-#[cfg(celld_internal_tests)]
-pub fn set_queue_sweep_batch_for_test(rows: Option<usize>) {
-    QUEUE_SWEEP_BATCH_FOR_TEST.set(rows);
-}
-
-#[cfg(celld_internal_tests)]
-fn effective_queue_lease_duration(duration: i64) -> i64 {
-    QUEUE_LEASE_DURATION_FOR_TEST.get().unwrap_or(duration)
-}
-
-#[cfg(not(celld_internal_tests))]
 fn effective_queue_lease_duration(duration: i64) -> i64 {
     duration
 }
 
-#[cfg(celld_internal_tests)]
-fn effective_queue_batch_timeout(duration: i64) -> i64 {
-    if duration == 0 {
-        0
-    } else {
-        QUEUE_BATCH_TIMEOUT_FOR_TEST.get().unwrap_or(duration)
-    }
-}
-
-#[cfg(celld_internal_tests)]
-fn effective_queue_retention(duration: i64) -> i64 {
-    QUEUE_RETENTION_FOR_TEST.get().unwrap_or(duration)
-}
-
-#[cfg(not(celld_internal_tests))]
 fn effective_queue_retention(duration: i64) -> i64 {
     duration
 }
 
-#[cfg(celld_internal_tests)]
-fn effective_queue_sweep_batch(rows: usize) -> usize {
-    QUEUE_SWEEP_BATCH_FOR_TEST.get().unwrap_or(rows)
-}
-
-#[cfg(not(celld_internal_tests))]
 fn effective_queue_sweep_batch(rows: usize) -> usize {
     rows
 }
 
-#[cfg(not(celld_internal_tests))]
 fn effective_queue_batch_timeout(duration: i64) -> i64 {
     duration
 }

@@ -13,31 +13,8 @@ mod tokio_select;
 pub use tokio_select::__asyncrt_select_support;
 
 pub mod actor;
-#[cfg(all(test, celld_internal_tests))]
-mod conformance_core_loop_tests {
-    include!(env!("CELLD_CONFORMANCE_CORE_LOOP_TESTS"));
-}
-#[cfg(all(test, celld_internal_tests))]
-mod conformance_facet_failure_tests {
-    include!(env!("CELLD_CONFORMANCE_FACET_FAILURE_TESTS"));
-}
 pub mod assets;
-#[cfg(not(celld_internal_tests))]
 pub mod asyncrt;
-// The internal test flag alone selects the simulated asyncrt, so an external
-// test harness built with the flag sees the same simulated world the
-// in-crate suites see. `test` must not be part of the gate:
-// a dependency never has it, and the harness binary builds unflagged,
-// so the shipped and harness builds keep the real asyncrt.
-#[cfg(celld_internal_tests)]
-#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
-pub mod asyncrt {
-    include!(env!("CELLD_INTERNAL_ASYNCRT"));
-}
-#[cfg(all(test, celld_internal_tests))]
-mod asyncrt_contract_tests {
-    include!(env!("CELLD_INTERNAL_ASYNCRT_TESTS"));
-}
 pub mod bucket;
 pub mod cell_cli;
 pub mod cell_dispatch;
@@ -56,12 +33,6 @@ pub mod docker;
 pub mod drain_token;
 pub mod engine_api;
 pub mod env_vars;
-#[cfg(celld_internal_tests)]
-#[allow(clippy::disallowed_methods)]
-#[doc(hidden)]
-pub mod fault {
-    include!(env!("CELLD_INTERNAL_SQLITE_FAULT"));
-}
 pub(crate) mod facet_streams;
 pub mod fleet;
 pub mod generation;
@@ -100,88 +71,6 @@ pub mod wake_entry;
 pub mod wake_format;
 pub mod ws_client;
 pub mod ws_registry;
-
-#[cfg(all(test, celld_internal_tests))]
-mod composed_simulation {
-    include!(env!("CELLD_INTERNAL_COMPOSED_SIMULATION"));
-}
-
-#[cfg(all(test, celld_internal_tests))]
-mod simulation_reproduction {
-    include!(env!("CELLD_INTERNAL_SIMULATION_REPRODUCTION"));
-}
-
-#[cfg(all(test, celld_internal_tests))]
-mod token_lifecycle_tests {
-    include!(env!("CELLD_INTERNAL_TOKEN_PROBE"));
-}
-
-#[cfg(all(test, celld_internal_tests))]
-mod conformance_world_tests {
-    include!(env!("CELLD_CONFORMANCE_WORLD_TESTS"));
-}
-
-#[cfg(all(test, celld_internal_tests))]
-#[allow(clippy::disallowed_methods)]
-mod conformance_world_s2_tests {
-    include!(env!("CELLD_CONFORMANCE_WORLD_S2_TESTS"));
-}
-
-#[cfg(all(test, celld_internal_tests))]
-#[allow(clippy::disallowed_methods)]
-mod conformance_o3_oracle {
-    include!(env!("CELLD_CONFORMANCE_O3_ORACLE_TESTS"));
-}
-
-#[cfg(all(test, celld_internal_tests))]
-#[allow(clippy::disallowed_methods)]
-mod conformance_world_s5a_tests {
-    include!(env!("CELLD_CONFORMANCE_WORLD_S5A_TESTS"));
-}
-
-#[cfg(all(test, celld_internal_tests))]
-#[allow(clippy::disallowed_methods)]
-mod conformance_world_s5c_tests {
-    include!(env!("CELLD_CONFORMANCE_WORLD_S5C_TESTS"));
-}
-
-#[cfg(celld_internal_tests)]
-#[allow(clippy::disallowed_methods)]
-#[doc(hidden)]
-pub mod conformance_sim_store {
-    include!(env!("CELLD_CONFORMANCE_SIM_STORE_TESTS"));
-}
-
-#[cfg(celld_internal_tests)]
-#[allow(clippy::disallowed_methods)]
-#[doc(hidden)]
-pub mod conformance_sim_cell_host {
-    include!(env!("CELLD_CONFORMANCE_SIM_CELL_HOST_TESTS"));
-}
-
-#[cfg(all(test, celld_internal_tests))]
-#[allow(clippy::disallowed_methods)]
-pub(crate) mod conformance_world_s1_tests {
-    include!(env!("CELLD_CONFORMANCE_WORLD_S1_TESTS"));
-}
-
-#[cfg(all(test, celld_internal_tests))]
-#[allow(clippy::disallowed_methods)]
-pub(crate) mod conformance_world_coverage {
-    include!(env!("CELLD_CONFORMANCE_WORLD_COVERAGE_TESTS"));
-}
-
-#[cfg(all(test, celld_internal_tests))]
-#[allow(clippy::disallowed_methods)]
-mod conformance_world_s3_tests {
-    include!(env!("CELLD_CONFORMANCE_WORLD_S3_TESTS"));
-}
-
-#[cfg(all(test, celld_internal_tests))]
-#[allow(clippy::disallowed_methods)]
-mod conformance_world_s5b_tests {
-    include!(env!("CELLD_CONFORMANCE_WORLD_S5B_TESTS"));
-}
 
 /// Completion token for a resident-isolate reservation made by the decision
 /// core. Dropping the queued/running job reports that the cell is idle again;

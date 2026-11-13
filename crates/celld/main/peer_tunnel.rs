@@ -773,8 +773,3 @@ pub(crate) fn response_stream(body: PooledResponseBody) -> HttpChunkStream {
             .map_err(|error| error.to_string()),
     )
 }
-
-#[cfg(all(test, celld_internal_tests))]
-mod private_tests {
-    include!(env!("CELLD_CONFORMANCE_PEER_TUNNEL_TESTS"));
-}

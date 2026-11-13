@@ -562,11 +562,6 @@ pub(crate) fn resolve_storage_location(
         .unwrap_or_else(|| "us-east-1".to_string())
 }
 
-#[cfg(all(test, celld_internal_tests))]
-mod internal_tests {
-    include!(env!("CELLD_INTERNAL_FLEET_TESTS"));
-}
-
 pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     let Some(mut options) = deploy::options_from_arguments(arguments)? else {
         deploy::print_help();

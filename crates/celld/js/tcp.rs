@@ -65,32 +65,9 @@ fn insert(id: u64, stream: Duplex) {
     );
 }
 
-/// Mozilla's roots, the same choice `ws_client` makes and for the same
-/// reason: a downloaded celld must reach TLS hosts on a machine with no
-/// `/etc/ssl/certs`. Test TLS servers use a root injected through the
-/// gated seam below.
-#[cfg(celld_internal_tests)]
-fn test_root() -> &'static Mutex<Option<Vec<u8>>> {
-    static ROOT: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
-    ROOT.get_or_init(Default::default)
-}
-
-/// Trust one extra DER root for outbound TLS, so test servers with
-/// self-signed certificates verify. No compatibility guarantee.
-#[cfg(celld_internal_tests)]
-#[doc(hidden)]
-pub fn test_extra_tls_root(der: Vec<u8>) {
-    *test_root().lock().unwrap() = Some(der);
-}
-
 // Rebuilt per handshake only under the internal-tests cfg, where the
 // injected root must be visible; production caches the connector.
-#[cfg(celld_internal_tests)]
-fn tls_connector() -> tokio_rustls::TlsConnector {
-    build_tls_connector(test_root().lock().unwrap().clone())
-}
 
-#[cfg(not(celld_internal_tests))]
 fn tls_connector() -> tokio_rustls::TlsConnector {
     static CONNECTOR: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
     CONNECTOR.get_or_init(|| build_tls_connector(None)).clone()

@@ -571,11 +571,6 @@ impl Action {
     }
 }
 
-#[cfg(all(test, celld_internal_tests))]
-mod kv_cli_contract {
-    include!(env!("CELLD_INTERNAL_KV_CLI_TESTS"));
-}
-
 enum Action {
     Get {
         key: String,

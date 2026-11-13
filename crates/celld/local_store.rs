@@ -516,11 +516,6 @@ fn decode_attributes(encoded: &str) -> object_store::Result<Attributes> {
     Ok(attributes)
 }
 
-#[cfg(all(test, celld_internal_tests))]
-mod internal_tests {
-    include!(env!("CELLD_INTERNAL_LOCAL_STORE_TESTS"));
-}
-
 /// The [`Path`] a stored key came from. Every key is stored as
 /// `location.to_string()`, which is already percent-encoded, so this parses
 /// that form back. `Path::from` would encode it a second time, and a listed

@@ -190,13 +190,6 @@ const KV_PUT_SQL: &str = "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
      ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v";
 const KV_DELETE_SQL: &str = "DELETE FROM _cf_KV WHERE scope=?1 AND k=?2";
 
-/// The number of SQL compilations so far, for a test assertion: a
-/// warm cell's gets and puts must not move it.
-#[cfg(celld_internal_tests)]
-pub fn sql_prepares_for_test() -> u64 {
-    SQL_PREPARES.load(Ordering::Relaxed)
-}
-
 /// SAFETY: the cursors and statement caches hold raw SQLite handles, so this
 /// is not `Send` by inference. It is `Send` in fact: the handles move
 /// between threads only with the isolate that owns them, and a thread
@@ -211,8 +204,6 @@ thread_local! {
     /// for one turn, so the pointer is live exactly when a turn is running.
     static CURRENT_CELLS: std::cell::Cell<*const Cells> =
         const { std::cell::Cell::new(std::ptr::null()) };
-    #[cfg(celld_internal_tests)]
-    static THREAD_OWNS_CELLS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl Cells {
@@ -222,10 +213,6 @@ impl Cells {
     /// blocking cell run loop still does — leaves the outer turn's cells in
     /// place on the way out.
     pub fn install(&self) -> Installed {
-        #[cfg(celld_internal_tests)]
-        if THREAD_OWNS_CELLS.get() {
-            return Installed(CURRENT_CELLS.get());
-        }
         Installed(CURRENT_CELLS.replace(self))
     }
 }
@@ -236,15 +223,6 @@ impl Drop for Installed {
     fn drop(&mut self) {
         CURRENT_CELLS.set(self.0);
     }
-}
-
-#[cfg(celld_internal_tests)]
-pub fn install_for_test() {
-    thread_local! {
-        static OWN: Cells = Cells::default();
-    }
-    OWN.with(|cells| CURRENT_CELLS.set(cells));
-    THREAD_OWNS_CELLS.set(true);
 }
 
 /// Reach the current isolate's cells.
@@ -494,11 +472,6 @@ fn valid_sql_boolean(value: &str) -> bool {
         value.to_ascii_lowercase().as_str(),
         "true" | "false" | "yes" | "no" | "on" | "off" | "1" | "0"
     )
-}
-
-#[cfg(all(test, celld_internal_tests))]
-mod internal_tests {
-    include!(env!("CELLD_INTERNAL_STORAGE_TESTS"));
 }
 
 fn valid_sql_i32(value: &str) -> bool {
@@ -772,22 +745,6 @@ pub(crate) fn open_at_epoch(
         epoch,
         replicated_wake,
         sqlite_vec,
-        StorageBacking::File {
-            path: path.to_string(),
-            root_scope: scope.to_string(),
-            facet_path: Vec::new(),
-        },
-    )
-}
-
-#[cfg(celld_internal_tests)]
-pub fn open_with_fault_vfs_for_test(scope: &str, path: &str) -> anyhow::Result<()> {
-    finish_open(
-        scope,
-        crate::fault::open_database(path)?,
-        1,
-        true,
-        false,
         StorageBacking::File {
             path: path.to_string(),
             root_scope: scope.to_string(),
@@ -2784,16 +2741,6 @@ fn d1_poison_transaction(scope: &str, error: String) {
 }
 
 fn d1_rollback_after_commit_failure(scope: &str, connection: &Connection) -> Result<(), String> {
-    #[cfg(celld_internal_tests)]
-    if let Some(result_code) = D1_ROLLBACK_FAULT.with(std::cell::Cell::take) {
-        // SAFETY: the handle belongs to this live connection.
-        let database = unsafe { connection.handle() };
-        return Err(d1_critical_transaction_failure(
-            scope,
-            database,
-            result_code,
-        ));
-    }
     without_sql_authorizer(connection, || connection.execute_batch("ROLLBACK")).map_err(|error| {
         if let rusqlite::Error::SqliteFailure(sqlite, _) = &error {
             // SAFETY: the handle belongs to this live connection.
@@ -2811,13 +2758,6 @@ fn d1_transaction_control(
     operation: D1TransactionOperation,
     failure: fn(String) -> D1Failure,
 ) -> Result<(), D1Failure> {
-    #[cfg(celld_internal_tests)]
-    let injected = if operation == D1TransactionOperation::Commit {
-        D1_COMMIT_FAULT.with(std::cell::Cell::take)
-    } else {
-        None
-    };
-    #[cfg(not(celld_internal_tests))]
     let injected: Option<i32> = None;
 
     let result = if let Some(result_code) = injected {
@@ -2888,22 +2828,6 @@ fn d1_critical_transaction_failure(
         });
     }
     error
-}
-
-#[cfg(celld_internal_tests)]
-thread_local! {
-    static D1_COMMIT_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
-    static D1_ROLLBACK_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(celld_internal_tests)]
-pub fn set_d1_commit_fault_for_test(result_code: i32) {
-    D1_COMMIT_FAULT.with(|fault| fault.set(Some(result_code)));
-}
-
-#[cfg(celld_internal_tests)]
-pub fn set_d1_rollback_fault_for_test(result_code: i32) {
-    D1_ROLLBACK_FAULT.with(|fault| fault.set(Some(result_code)));
 }
 
 /// Run one D1 request against a cell's SQLite: the binding's single seam
@@ -3239,121 +3163,6 @@ pub fn transaction_control(
     result
 }
 
-#[cfg(celld_internal_tests)]
-pub fn set_query_only_for_test(scope: &str, enabled: bool) -> anyhow::Result<()> {
-    with(scope, |connection| {
-        without_sql_authorizer(connection, || {
-            connection
-                .pragma_update(None, "query_only", enabled)
-                .map_err(Into::into)
-        })
-    })
-    .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
-}
-
-#[cfg(celld_internal_tests)]
-pub fn set_max_page_count_for_test(scope: &str, pages: u32) -> anyhow::Result<()> {
-    with(scope, |connection| {
-        without_sql_authorizer(connection, || {
-            connection
-                .pragma_update(None, "max_page_count", pages)
-                .map_err(Into::into)
-        })
-    })
-    .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
-}
-
-#[cfg(celld_internal_tests)]
-pub fn set_write_fault_for_test(enabled: bool) {
-    crate::fault::set_write_fault(enabled);
-}
-
-/// Shrink the page cache so a large write spills to disk mid-statement.
-#[cfg(celld_internal_tests)]
-pub fn set_cache_size_for_test(scope: &str, pages: i32) -> anyhow::Result<()> {
-    with(scope, |connection| {
-        without_sql_authorizer(connection, || {
-            connection
-                .pragma_update(None, "cache_size", pages)
-                .map_err(Into::into)
-        })
-    })
-    .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
-}
-
-/// Interrupt the next statement on `scope` through SQLite's real interrupt
-/// machinery: a progress handler that aborts on its first callback.
-#[cfg(celld_internal_tests)]
-pub fn set_interrupt_fault_for_test(scope: &str, enabled: bool) -> anyhow::Result<()> {
-    unsafe extern "C" fn interrupt(_: *mut std::ffi::c_void) -> std::ffi::c_int {
-        1
-    }
-    with(scope, |connection| {
-        // SAFETY: the handle belongs to this live connection.
-        unsafe {
-            let database = connection.handle();
-            if enabled {
-                rusqlite::ffi::sqlite3_progress_handler(
-                    database,
-                    1,
-                    Some(interrupt),
-                    std::ptr::null_mut(),
-                );
-            } else {
-                rusqlite::ffi::sqlite3_progress_handler(database, 0, None, std::ptr::null_mut());
-            }
-        }
-        Ok(())
-    })
-    .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
-}
-
-/// Register `cells_nomem_for_test()`, a scalar that reports allocation failure
-/// through SQLite's own OOM path (`sqlite3_result_error_nomem`).
-#[cfg(celld_internal_tests)]
-pub fn register_nomem_function_for_test(scope: &str) -> anyhow::Result<()> {
-    unsafe extern "C" fn nomem(
-        context: *mut rusqlite::ffi::sqlite3_context,
-        _argc: std::ffi::c_int,
-        _argv: *mut *mut rusqlite::ffi::sqlite3_value,
-    ) {
-        rusqlite::ffi::sqlite3_result_error_nomem(context);
-    }
-    with(scope, |connection| {
-        // SAFETY: the handle belongs to this live connection; the function is
-        // stateless.
-        let rc = unsafe {
-            rusqlite::ffi::sqlite3_create_function_v2(
-                connection.handle(),
-                c"cells_nomem_for_test".as_ptr(),
-                0,
-                rusqlite::ffi::SQLITE_UTF8,
-                std::ptr::null_mut(),
-                Some(nomem),
-                None,
-                None,
-                None,
-            )
-        };
-        anyhow::ensure!(
-            rc == rusqlite::ffi::SQLITE_OK,
-            "create nomem function: {rc}",
-        );
-        Ok(())
-    })
-    .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
-}
-
-#[cfg(celld_internal_tests)]
-pub fn get(scope: &str, key: &str) -> Option<String> {
-    with(scope, |c| {
-        c.prepare_cached(KV_GET_SQL)
-            .ok()?
-            .query_row([scope, key], |r| r.get::<_, String>(0))
-            .ok()
-    })?
-}
-
 pub fn get_stored(scope: &str, key: &str) -> anyhow::Result<Option<StoredValue>> {
     with(scope, |c| {
         c.prepare_cached(KV_GET_SQL)?
@@ -3362,32 +3171,6 @@ pub fn get_stored(scope: &str, key: &str) -> anyhow::Result<Option<StoredValue>>
             .map_err(Into::into)
     })
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
-}
-
-#[cfg(celld_internal_tests)]
-pub fn key_names_for_test(scope: &str) -> anyhow::Result<Vec<String>> {
-    with(scope, |connection| {
-        let mut statement = connection.prepare("SELECT k FROM _cf_KV WHERE scope=?1 ORDER BY k")?;
-        let rows = statement.query_map([scope], |row| row.get(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    })
-    .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
-}
-
-/// Fetch multiple keys in storage order, omitting absent keys. Duplicate input
-/// keys are coalesced, matching Durable Object storage's map-like result.
-#[cfg(celld_internal_tests)]
-pub fn get_many(scope: &str, keys: &[String]) -> anyhow::Result<Vec<(String, String)>> {
-    get_many_stored(scope, keys)?
-        .into_iter()
-        .map(|(key, value)| match value {
-            StoredValue::LegacyJson(value) => Ok((key, value)),
-            StoredValue::V8(_) => Err(anyhow::anyhow!(
-                "structured-clone value cannot be read as legacy JSON",
-            )),
-        })
-        .collect()
 }
 
 pub fn get_many_stored(scope: &str, keys: &[String]) -> anyhow::Result<Vec<(String, StoredValue)>> {
@@ -3410,14 +3193,6 @@ pub fn get_many_stored(scope: &str, keys: &[String]) -> anyhow::Result<Vec<(Stri
         Ok(values)
     })
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
-}
-
-#[cfg(celld_internal_tests)]
-pub fn put(scope: &str, key: &str, val: &str) {
-    with(scope, |c| {
-        c.prepare_cached(KV_PUT_SQL)
-            .and_then(|mut statement| statement.execute([scope, key, val]))
-    });
 }
 
 /// Run an application-visible storage write and preserve a critical SQLite
@@ -3464,38 +3239,6 @@ pub fn put_serialized(scope: &str, key: &str, value: &[u8]) -> anyhow::Result<()
             .map(|_| ())
             .map_err(Into::into)
     })
-}
-
-/// Atomically apply a multi-key put.
-#[cfg(celld_internal_tests)]
-pub fn put_many(scope: &str, entries: &[(String, String)]) -> anyhow::Result<()> {
-    if entries.is_empty() {
-        return with(scope, |_| ()).ok_or_else(|| anyhow::anyhow!("no db for {scope}"));
-    }
-    with_mut(scope, |c| {
-        without_sql_authorizer_mut(c, |c| {
-            if !c.is_autocommit() {
-                return with_batch_savepoint(c, |c| {
-                    let mut statement = c.prepare_cached(KV_PUT_SQL)?;
-                    for (key, value) in entries {
-                        statement.execute(rusqlite::params![scope, key, value])?;
-                    }
-                    Ok(())
-                });
-            }
-            let transaction =
-                c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            {
-                let mut statement = transaction.prepare_cached(KV_PUT_SQL)?;
-                for (key, value) in entries {
-                    statement.execute(rusqlite::params![scope, key, value])?;
-                }
-            }
-            transaction.commit()?;
-            Ok(())
-        })
-    })
-    .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
 }
 
 pub fn put_many_serialized(scope: &str, entries: &[(String, Vec<u8>)]) -> anyhow::Result<()> {
@@ -3562,41 +3305,6 @@ pub fn delete_many(scope: &str, keys: &[String]) -> anyhow::Result<usize> {
             Ok(deleted)
         })
     })
-}
-
-/// List a half-open key range in bytewise SQLite text order.
-#[cfg(celld_internal_tests)]
-pub fn list(
-    scope: &str,
-    begin: Option<&str>,
-    end: Option<&str>,
-    limit: Option<usize>,
-    reverse: bool,
-) -> anyhow::Result<Vec<(String, String)>> {
-    list_with_options(scope, begin, end, None, None, limit, reverse)
-}
-
-/// List storage using the full Durable Object key-filter surface. Predicates
-/// stay in SQLite so large objects are not materialized and filtered in V8.
-#[cfg(celld_internal_tests)]
-pub fn list_with_options(
-    scope: &str,
-    begin: Option<&str>,
-    end: Option<&str>,
-    start_after: Option<&str>,
-    prefix: Option<&str>,
-    limit: Option<usize>,
-    reverse: bool,
-) -> anyhow::Result<Vec<(String, String)>> {
-    list_stored_with_options(scope, begin, end, start_after, prefix, limit, reverse)?
-        .into_iter()
-        .map(|(key, value)| match value {
-            StoredValue::LegacyJson(value) => Ok((key, value)),
-            StoredValue::V8(_) => Err(anyhow::anyhow!(
-                "structured-clone value cannot be read as legacy JSON",
-            )),
-        })
-        .collect()
 }
 
 pub fn list_stored_with_options(
@@ -3889,150 +3597,6 @@ fn prefix_upper_bound(prefix: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// A local SQLite transaction implementing the portable portion of Workerd's
-/// ActorCache transaction contract.
-#[cfg(celld_internal_tests)]
-pub struct KvTransaction<'connection> {
-    scope: String,
-    transaction: rusqlite::Transaction<'connection>,
-}
-
-#[cfg(celld_internal_tests)]
-impl KvTransaction<'_> {
-    pub fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
-        match self
-            .transaction
-            .prepare_cached(KV_GET_SQL)?
-            .query_row(rusqlite::params![self.scope, key], |row| row.get(0))
-        {
-            Ok(value) => Ok(Some(value)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    pub fn get_many(&self, keys: &[String]) -> anyhow::Result<Vec<(String, String)>> {
-        let mut keys = keys.to_vec();
-        keys.sort();
-        keys.dedup();
-        let mut statement = self.transaction.prepare_cached(KV_GET_SQL)?;
-        let mut values = Vec::new();
-        for key in keys {
-            if let Some(value) = statement
-                .query_row(rusqlite::params![self.scope, key], |row| {
-                    row.get::<_, String>(0)
-                })
-                .optional()?
-            {
-                values.push((key, value));
-            }
-        }
-        Ok(values)
-    }
-
-    pub fn put(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        self.transaction
-            .prepare_cached(KV_PUT_SQL)?
-            .execute(rusqlite::params![self.scope, key, value])?;
-        Ok(())
-    }
-
-    pub fn put_many(&self, entries: &[(String, String)]) -> anyhow::Result<()> {
-        let mut statement = self.transaction.prepare_cached(KV_PUT_SQL)?;
-        for (key, value) in entries {
-            statement.execute(rusqlite::params![self.scope, key, value])?;
-        }
-        Ok(())
-    }
-
-    pub fn delete_many(&self, keys: &[String]) -> anyhow::Result<usize> {
-        let mut statement = self.transaction.prepare_cached(KV_DELETE_SQL)?;
-        let mut deleted = 0;
-        for key in keys {
-            deleted += statement.execute(rusqlite::params![self.scope, key])?;
-        }
-        Ok(deleted)
-    }
-
-    pub fn get_alarm(&self) -> anyhow::Result<Option<i64>> {
-        Ok(self
-            .transaction
-            .query_row(
-                "SELECT at_ms FROM _cf_ALARM WHERE scope=?1",
-                [self.scope.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?)
-    }
-
-    pub fn set_alarm(&self, at_ms: i64) -> anyhow::Result<()> {
-        self.transaction.execute(
-            "INSERT INTO _cf_ALARM(scope,at_ms,retry,counted_retry,generation) \
-             VALUES(?1,?2,0,0,random()) \
-             ON CONFLICT(scope) DO UPDATE SET \
-               at_ms=excluded.at_ms, retry=0, counted_retry=0, generation=random()",
-            rusqlite::params![self.scope, at_ms],
-        )?;
-        Ok(())
-    }
-
-    pub fn delete_alarm(&self) -> anyhow::Result<()> {
-        self.transaction.execute(
-            "DELETE FROM _cf_ALARM WHERE scope=?1",
-            [self.scope.as_str()],
-        )?;
-        Ok(())
-    }
-
-    pub fn list(
-        &self,
-        begin: Option<&str>,
-        end: Option<&str>,
-        limit: Option<usize>,
-        reverse: bool,
-    ) -> anyhow::Result<Vec<(String, String)>> {
-        let order = if reverse { "DESC" } else { "ASC" };
-        let query = format!(
-            "SELECT k,v FROM _cf_KV \
-             WHERE scope=?1 AND (?2 IS NULL OR k>=?2) AND (?3 IS NULL OR k<?3) \
-             ORDER BY k {order} LIMIT ?4",
-        );
-        let mut statement = self.transaction.prepare(&query)?;
-        let rows = statement.query_map(
-            rusqlite::params![
-                self.scope,
-                begin,
-                end,
-                limit.unwrap_or(usize::MAX).min(i64::MAX as usize) as i64,
-            ],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-}
-
-/// Run a KV transaction and commit only if the callback succeeds.
-#[cfg(celld_internal_tests)]
-pub fn transaction<T>(
-    scope: &str,
-    callback: impl FnOnce(&KvTransaction<'_>) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    with_mut(scope, |connection| {
-        without_sql_authorizer_mut(connection, |connection| {
-            let transaction =
-                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let transaction = KvTransaction {
-                scope: scope.to_string(),
-                transaction,
-            };
-            let value = callback(&transaction)?;
-            transaction.transaction.commit()?;
-            Ok(value)
-        })
-    })
-    .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
 }
 
 /// Persist the optional human-readable name associated with an idFromName()
@@ -4357,18 +3921,6 @@ pub fn finish_alarm_handler_with_retry_policy(
     }
 }
 
-/// Delete the fired alarm unless the handler re-armed it to the future.
-#[cfg(celld_internal_tests)]
-pub fn clear_alarm_if_due(scope: &str, fired_at_ms: i64) {
-    with(scope, |c| {
-        c.execute(
-            "DELETE FROM _cf_ALARM WHERE scope=?1 AND at_ms<=?2",
-            rusqlite::params![scope, fired_at_ms],
-        )
-    });
-    publish_alarm(scope);
-}
-
 pub fn bump_alarm_with_policy(scope: &str, now_ms: i64, counts_against_limit: bool) {
     with(scope, |c| {
         let (retry, counted_retry): (i64, i64) = c
@@ -4395,6 +3947,3 @@ pub fn bump_alarm_with_policy(scope: &str, now_ms: i64, counts_against_limit: bo
     });
     publish_alarm(scope);
 }
-
-#[cfg(celld_internal_tests)]
-include!(env!("CELLD_INTERNAL_STORAGE_OBSERVERS"));

@@ -1260,16 +1260,6 @@ async fn run_websocket_upgrade(
     }
 }
 
-#[cfg(all(test, celld_internal_tests))]
-pub(super) async fn run_websocket_upgrade_for_test(
-    task_app: AppHandle,
-    upgrade: fastwebsockets::upgrade::UpgradeFut,
-    websocket: HttpResponseWebSocket,
-) {
-    let websocket = PendingWebSocket::new(websocket).unwrap();
-    run_websocket_upgrade(task_app, upgrade, websocket).await;
-}
-
 struct WebSocketConnectionOutcome<'a> {
     outcome: &'a str,
     route: &'a str,
@@ -1313,7 +1303,3 @@ fn emit_websocket_connection_timing(
 // in the same select! as the cell's outbound queue, so an outbound frame that
 // won the race dropped a read in progress. A lost frame keeps the workload
 // ledger exact while delivery is not, so frame-level observation is required.
-#[cfg(all(test, celld_internal_tests))]
-mod socket_cancel_private {
-    include!(env!("CELLD_CONFORMANCE_SOCKET_CANCEL_TESTS"));
-}
