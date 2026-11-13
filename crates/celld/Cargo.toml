@@ -67,7 +67,7 @@ x25519-dalek.workspace = true
 rand.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, features = ["rustls-tls", "stream", "json"] }
-rusqlite = { workspace = true, features = ["backup", "bundled", "hooks", "serialize"] }
+rusqlite = { workspace = true, features = ["backup", "bundled", "fallible_uint", "hooks", "serialize"] }
 sqlite-vec.workspace = true
 rustls.workspace = true
 rustls-webpki.workspace = true

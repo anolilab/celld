@@ -1392,7 +1392,6 @@ fn preview_table(connection: &Connection, table: &str) -> anyhow::Result<serde_j
     ))?;
     let columns = statement
         .column_names()
-        .iter()
         .take(MAX_EXPLORER_COLUMNS)
         .map(|name| truncate_utf8(name, 200).0)
         .collect::<Vec<_>>();
