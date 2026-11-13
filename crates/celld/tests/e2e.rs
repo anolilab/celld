@@ -2,6 +2,11 @@
 
 mod e2e {
     pub mod alarms;
+    pub mod do_alarms;
+    pub mod do_gates;
+    pub mod do_ids;
+    pub mod do_sql;
+    pub mod do_storage;
     pub mod facets;
     pub mod harness;
     pub mod isolates;

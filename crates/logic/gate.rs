@@ -143,3 +143,54 @@ impl InputGate {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::InputGate;
+
+    #[test]
+    fn a_hold_refuses_every_other_event_until_released() {
+        let mut gate = InputGate::new();
+        assert!(gate.is_open());
+        assert!(gate.acquire(1));
+        assert!(!gate.is_open());
+        assert!(!gate.acquire(2));
+        assert!(gate.release(1));
+        assert!(gate.is_open());
+        assert!(gate.acquire(2));
+    }
+
+    #[test]
+    fn nested_holds_open_the_gate_only_when_the_outermost_ends() {
+        let mut gate = InputGate::new();
+        assert!(gate.acquire(1));
+        assert!(gate.acquire(1));
+        assert!(!gate.release(1));
+        assert!(!gate.is_open());
+        assert!(!gate.acquire(2));
+        assert!(gate.release(1));
+        assert!(gate.is_open());
+    }
+
+    #[test]
+    fn a_stale_release_leaves_the_new_holder_in_place() {
+        let mut gate = InputGate::new();
+        assert!(gate.acquire(1));
+        assert!(gate.abandon(1));
+        assert!(gate.acquire(2));
+        assert!(!gate.release(1));
+        assert!(!gate.is_open());
+        assert!(gate.release(2));
+    }
+
+    #[test]
+    fn abandoning_another_event_does_not_open_the_gate() {
+        let mut gate = InputGate::new();
+        assert!(gate.acquire(1));
+        assert!(gate.acquire(1));
+        assert!(!gate.abandon(2));
+        assert!(!gate.is_open());
+        assert!(gate.abandon(1));
+        assert!(gate.is_open());
+    }
+}
