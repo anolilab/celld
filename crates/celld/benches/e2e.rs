@@ -262,7 +262,15 @@ fn table(results: &[LoadResult], cold: Option<&[f64]>) -> String {
         let s = cold_summary(runs);
         text += &format!(
             "\n{:<16}{:>11}{:>10}{:>10}\n{:<16}{:>11.0}{:>10.0}{:>10.0}   ({} runs)\n",
-            "cold_start", "min ms", "median ms", "max ms", "", s.0, s.1, s.2, runs.len()
+            "cold_start",
+            "min ms",
+            "median ms",
+            "max ms",
+            "",
+            s.0,
+            s.1,
+            s.2,
+            runs.len()
         );
     }
     text.push('\n');
