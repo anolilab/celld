@@ -2203,7 +2203,10 @@ impl Actor {
             )
             .await
             {
-                Ok(Ok(())) => {}
+                // The flusher holds the installation now. Say so: a restored
+                // alarm starts uncovered in this process, and until the core
+                // hears otherwise it keeps the cell resident for it.
+                Ok(Ok(())) => host.report_alarm_coverage(&cell),
                 Ok(Err(error)) => tracing::warn!(%cell, %error, "wake maintenance deferred"),
                 Err(_) => tracing::warn!(%cell, "wake maintenance timed out; a later scan retries"),
             }

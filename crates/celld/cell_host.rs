@@ -128,6 +128,14 @@ impl CellHost {
         }
     }
 
+    /// Report the cell's alarm to the core as covered, if the flusher says the
+    /// current installation is. See `RuntimeManager::report_alarm_coverage`.
+    pub(crate) fn report_alarm_coverage(&self, cell: &str) {
+        match self {
+            Self::Engine(runtime) => runtime.report_alarm_coverage(cell),
+        }
+    }
+
     /// The armed alarm and whether the runtime covers it, as the wake path
     /// observes them.
     pub(crate) fn alarm_observation(

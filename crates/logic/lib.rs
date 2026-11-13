@@ -3119,7 +3119,20 @@ impl State {
             // alarm) is therefore confirmation, not new demand. Cancelling
             // here re-emits EnsureDurable forever while the cell has no pin.
             let safe_drain_refresh = self.draining && (at_ms.is_none() || covered);
-            if !safe_drain_refresh {
+            // The same holds off the drain for a report that only confirms
+            // coverage of the installation the cell already holds: the wake
+            // flusher sends one after every maintenance pass, and treating
+            // each as new demand would cancel every eviction it overlaps.
+            // The installation is compared, not the whole snapshot, whose
+            // position moves with every unrelated write.
+            let confirms_coverage = covered
+                && at_ms.is_some()
+                && matches!(
+                    cell.alarm,
+                    Some(AlarmState::Armed { at_ms: armed, .. }) if Some(armed) == at_ms
+                )
+                && source == cell.alarm_source;
+            if !safe_drain_refresh && !confirms_coverage {
                 self.cancel_eviction(id, &mut cell, epoch, EvictCancellation::Alarm, effects);
             }
         }
@@ -7277,3 +7290,5 @@ mod scripted;
 mod second_release_tests;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod wake_coverage_tests;

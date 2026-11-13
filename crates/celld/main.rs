@@ -3718,11 +3718,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let (tx, rx) = mpsc::unbounded_channel();
     let sample_tx = tx.clone();
     let alarm_tx = tx.clone();
-    let alarm_observer: celld::runtime::AlarmObserver = Arc::new(move |cell, alarm| {
+    let alarm_observer: celld::runtime::AlarmObserver = Arc::new(move |cell, alarm, covered| {
         let _ = alarm_tx.send(Message::AlarmObserved {
             cell,
             alarm,
-            covered: false,
+            covered,
         });
     });
     let (fence_tx, mut fence_rx) = mpsc::unbounded_channel();
