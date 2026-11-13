@@ -1402,7 +1402,6 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                     let key = ed25519_dalek::VerifyingKey::from_public_key_der(&der)
                         .map_err(|_| anyhow!("invalid Ed25519 public key"))?;
                     serde_json::json!({
-                        "alg": "EdDSA",
                         "kty": "OKP",
                         "crv": "Ed25519",
                         "x": base64url(key.as_bytes()),
@@ -1413,7 +1412,6 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                     let key = ed25519_dalek::SigningKey::from_pkcs8_der(&der)
                         .map_err(|_| anyhow!("invalid Ed25519 private key"))?;
                     serde_json::json!({
-                        "alg": "EdDSA",
                         "kty": "OKP",
                         "crv": "Ed25519",
                         "x": base64url(key.verifying_key().as_bytes()),

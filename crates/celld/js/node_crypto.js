@@ -629,11 +629,12 @@
     }
   };
   const asymmetricMaterial = (key) => key.__celldMaterial ?? {};
-  // The generation op does not carry a curve yet, so it always generates
-  // P-256. Keep that limitation separate from imported-key conversion, which
-  // accepts every curve that the shared Web Crypto implementation parses.
-  const GENERATED_EC_CURVES = new Set([
-    "prime256v1", "secp256r1", "P-256",
+  // Node's names for the curves celld generates keys on, mapped to the JOSE
+  // name the host op takes. Imported keys are not limited to these.
+  const GENERATED_EC_CURVES = new Map([
+    ["prime256v1", "P-256"], ["secp256r1", "P-256"], ["P-256", "P-256"],
+    ["secp384r1", "P-384"], ["P-384", "P-384"],
+    ["secp521r1", "P-521"], ["P-521", "P-521"],
   ]);
   const WEB_CRYPTO_ALGORITHM = {
     rsa: "RSASSA-PKCS1-v1_5",
@@ -864,8 +865,14 @@
         "public",
       );
     }
-    return importAsymmetric(
-      prepareAsymmetricKey(key, KeyContext.kCreatePublic), "public");
+    // A private key in PEM or JWK form yields its public half as well.
+    const prepared = prepareAsymmetricKey(key, KeyContext.kCreatePublic);
+    const holdsPrivate = prepared.format === "jwk"
+      ? prepared.key.d !== undefined
+      : prepared.format === "pem" &&
+        new TextDecoder().decode(asU8(prepared.key)).includes("PRIVATE KEY");
+    if (holdsPrivate) return createPublicKey(createPrivateKey(key));
+    return importAsymmetric(prepared, "public");
   }
 
   function generateKey(type, options, callback) {
@@ -983,7 +990,11 @@
       throw ERR_METHOD_NOT_IMPLEMENTED(
         `generateKeyPairSync ec ${namedCurve}`);
     }
-    const pair = keyOp("asym-key-generate", { type, modulusLength });
+    const pair = keyOp("asym-key-generate", {
+      type,
+      modulusLength,
+      namedCurve: GENERATED_EC_CURVES.get(namedCurve),
+    });
     const half = (der, visibility, encoding) => {
       if (encoding === undefined) {
         return asymmetricKeyObject(

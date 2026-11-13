@@ -150,6 +150,10 @@ execution.
 - `node:diagnostics_channel` does not export messages to a tail Worker.
 - `node:crypto` does not implement Diffie-Hellman, streaming signatures,
   ciphers, RSA-PSS, or DSA signatures and key generation.
+- `generateKeyPairSync("ec")` generates keys on P-256, P-384 and P-521, under
+  their NIST and OpenSSL names.
+- `createPublicKey()` accepts a private key in PEM or JWK form and returns its
+  public half, as in Node.js.
 - `KeyObject.toCryptoKey()` applies the requested algorithm, extractability,
   and usages to an asymmetric key.
 - `node:zlib` implements only the synchronous gzip and deflate functions.
