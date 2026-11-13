@@ -171,6 +171,66 @@ export class Runner extends DurableObject {
           await process.output();
           return { before, after };
         });
+      // An exec kept across events: this event starts it, others consume it.
+      case "/spawn-late":
+        return run(async () => {
+          container.start();
+          this.process = await container.exec(["late"]);
+          // The promise is taken here, in this event, and awaited in another.
+          this.exit = this.process.exitCode;
+          return "spawned";
+        });
+      case "/exit-stored":
+        return run(() => this.exit);
+      case "/exit-getter":
+        return run(() => this.process.exitCode);
+      // A read issued here and left pending when this event ends.
+      case "/read-start":
+        return run(async () => {
+          container.start();
+          this.process = await container.exec(["late"]);
+          this.reader = this.process.stdout.getReader();
+          this.pending = this.reader.read();
+          return "reading";
+        });
+      case "/read-rest":
+        return run(async () => {
+          const decode = (result) =>
+            result.done ? null : new TextDecoder().decode(result.value);
+          const first = decode(await this.pending);
+          const second = decode(await this.reader.read());
+          const third = decode(await this.reader.read());
+          return { first, second, third };
+        });
+      // The reader's next read comes first; the read this object left pending
+      // in the other event is consumed after it.
+      case "/read-fresh":
+        return run(async () => {
+          const decode = (result) =>
+            result.done ? null : new TextDecoder().decode(result.value);
+          const fresh = this.reader.read();
+          const first = decode(await this.pending);
+          const second = decode(await fresh);
+          return { first, second };
+        });
+      // Many reads queued on a process that is silent: each gets its chunk,
+      // in order, and the host is not asked once per read.
+      case "/quiet-reads":
+        return run(async () => {
+          container.start();
+          const process = await container.exec(["late"]);
+          const reader = process.stdout.getReader();
+          // A poller that races each read against a timer leaves one more
+          // read pending per round, each from its own turn.
+          const reads = [];
+          for (let round = 0; round < 30; round++) {
+            reads.push(reader.read());
+            await new Promise((resolve) => setTimeout(resolve, 5));
+          }
+          const results = await Promise.all(reads);
+          return results.map((result) =>
+            result.done ? null : new TextDecoder().decode(result.value));
+        });
       default:
         return new Response("not found", { status: 404 });
     }

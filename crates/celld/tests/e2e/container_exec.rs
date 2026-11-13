@@ -212,3 +212,56 @@ async fn the_abort_listener_goes_when_the_event_that_spawned_the_process_ended_f
         "{out}"
     );
 }
+
+#[tokio::test]
+async fn an_exit_code_taken_in_one_event_settles_in_another() {
+    let engine = FakeEngine::start(Kill::Realistic).await;
+    let server = server(&engine).await;
+    let out: Value = server.get_json("/spawn-late").await;
+    assert_eq!(out, json!({ "ok": "spawned" }), "{out}");
+    let out: Value = server.get_json("/exit-stored").await;
+    assert_eq!(out, json!({ "ok": 0 }), "{out}");
+    let out: Value = server.get_json("/exit-getter").await;
+    assert_eq!(out, json!({ "ok": 0 }), "{out}");
+}
+
+#[tokio::test]
+async fn a_read_left_pending_by_one_event_continues_in_another() {
+    let engine = FakeEngine::start(Kill::Realistic).await;
+    let server = server(&engine).await;
+    let out: Value = server.get_json("/read-start").await;
+    assert_eq!(out, json!({ "ok": "reading" }), "{out}");
+    // Every byte arrives once, in order, and the stream then ends.
+    let out: Value = server.get_json("/read-rest").await;
+    assert_eq!(
+        out,
+        json!({ "ok": { "first": "late\n", "second": "later\n", "third": null } }),
+        "{out}"
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_read_in_another_event_gets_the_next_chunk() {
+    let engine = FakeEngine::start(Kill::Realistic).await;
+    let server = server(&engine).await;
+    let out: Value = server.get_json("/read-start").await;
+    assert_eq!(out, json!({ "ok": "reading" }), "{out}");
+    // The read of the first event gets the first chunk and the read of this
+    // one the second, so no chunk goes to both and none is skipped.
+    let out: Value = server.get_json("/read-fresh").await;
+    assert_eq!(
+        out,
+        json!({ "ok": { "first": "late\n", "second": "later\n" } }),
+        "{out}"
+    );
+}
+
+#[tokio::test]
+async fn reads_queued_on_a_quiet_process_each_get_their_chunk() {
+    let engine = FakeEngine::start(Kill::Realistic).await;
+    let server = server(&engine).await;
+    let out: Value = server.get_json("/quiet-reads").await;
+    let mut expected = vec![json!("late\n"), json!("later\n")];
+    expected.resize(30, Value::Null);
+    assert_eq!(out["ok"], Value::Array(expected), "{out}");
+}
