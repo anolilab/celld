@@ -94,7 +94,8 @@ another one. Cloudflare has no `images` key, so `celld` adds it, like `runtime`.
 
 `exec(cmd, options)` runs a command in the running container and returns a
 process with `stdin`, `stdout`, `stderr`, `exitCode`, `output()`, `kill()`, and
-`pid`. It accepts `env`, `cwd`, `user`, `stdin`, `stdout`, and `stderr`. The
+`pid`. It accepts `env`, `cwd`, `user`, `stdin`, `stdout`, `stderr`, `pty`, and
+`signal`. The
 `pid` is the one the container engine reports, which the engine takes from the
 host, so it does not name the process inside the container.
 
@@ -108,6 +109,13 @@ the process has no terminal. The terminal has its size from the exec's creation,
 and a process whose terminal cannot be sized at the start is killed, and
 `exec()` rejects with the engine's error. A command that has already exited when
 the node sizes it is not an error.
+
+`signal` takes an `AbortSignal`. A signal that is already aborted makes
+`exec()` reject with its reason before the process spawns. An abort after the
+spawn sends the process SIGKILL. The listener goes when the process exits, if
+the event that started it is still running. Otherwise it goes at the next
+`exec()` with the same signal, so a long-lived signal holds the listeners of its
+running processes and of those started since its last `exec()`.
 
 ## The image and the node
 

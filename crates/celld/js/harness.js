@@ -2478,6 +2478,23 @@ class ContainerPort {
       __container_address(this._scope, this._port), options);
   }
 }
+// The abort listeners of the processes that were started with a signal, by
+// signal. The wait for an exit belongs to the event that started the process
+// and is dropped when that event ends, so a process that exits after that
+// leaves its listener behind. The host can say whether a process has ended,
+// and every exec() on the signal takes off the listeners of those that have,
+// so a signal kept for many execs holds the listeners of the running ones and
+// of the ones since its last exec, not of every process it ever saw.
+const __abortWatches = new WeakMap();
+const __sweepAbortWatches = (signal) => {
+  const watches = __abortWatches.get(signal);
+  if (watches === undefined) return;
+  for (const watch of watches) {
+    if (!__container_exec_ended(watch.id)) continue;
+    signal.removeEventListener("abort", watch.onAbort);
+    watches.delete(watch);
+  }
+};
 class Container {
   constructor(scope, config) {
     this._scope = scope;
@@ -2575,6 +2592,14 @@ class Container {
     const o = options ?? {};
     const stdoutMode = __execOutputMode(o.stdout, "stdout");
     const stderrMode = __execOutputMode(o.stderr, "stderr");
+    const signal = o.signal;
+    if (signal !== undefined) {
+      if (!(signal instanceof AbortSignal))
+        throw new TypeError("exec() signal must be an AbortSignal.");
+      // Refused with the signal's own reason, before anything spawns.
+      signal.throwIfAborted();
+      __sweepAbortWatches(signal);
+    }
     const pty = __ptyOption(o.pty);
     const combined = stderrMode === "combined" && pty === null;
     if (combined && stdoutMode !== "pipe")
@@ -2618,7 +2643,29 @@ class Container {
     } else if (stdinMode === "none") {
       __container_exec_close(id).catch(() => {});
     }
-    return new ContainerExecProcess(id, pid, stdinMode, stdoutMode, stderrMode, pty);
+    const process = new ContainerExecProcess(
+      id, pid, stdinMode, stdoutMode, stderrMode, pty);
+    if (signal !== undefined) {
+      // An abort is SIGKILL. One that came in while the process was
+      // spawning is delivered now. Otherwise the listener goes when the
+      // process exits, if this event is still there to see it, and else the
+      // next exec() on the signal removes it; see `__sweepAbortWatches`.
+      if (signal.aborted) {
+        process.kill(9);
+      } else {
+        const watch = { id, onAbort: () => __container_exec_kill(id, 9).catch(() => {}) };
+        signal.addEventListener("abort", watch.onAbort, { once: true });
+        let watches = __abortWatches.get(signal);
+        if (watches === undefined) __abortWatches.set(signal, watches = new Set());
+        watches.add(watch);
+        const done = () => {
+          signal.removeEventListener("abort", watch.onAbort);
+          watches.delete(watch);
+        };
+        process.exitCode.then(done, done);
+      }
+    }
+    return process;
   }
   inspect() {
     return Promise.reject(new Error("inspect() is not implemented in celld"));

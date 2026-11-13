@@ -1,4 +1,5 @@
 //! `ctx.container.exec()` against a fake container engine.
+#![allow(clippy::disallowed_methods)]
 
 use std::time::Duration;
 
@@ -154,4 +155,60 @@ async fn a_pty_command_that_ends_at_once_is_not_an_error() {
     );
     // The size went with the exec's creation, not only in a later call.
     assert_eq!(engine.exec_creates()[0]["ConsoleSize"], json!([30, 100]));
+}
+
+#[tokio::test]
+async fn an_aborted_signal_refuses_before_spawning() {
+    let engine = FakeEngine::start(Kill::Binary).await;
+    let server = server(&engine).await;
+    let out: Value = server.get_json("/abort-before").await;
+    assert_eq!(out, json!({ "error": "stop now" }), "{out}");
+    assert!(
+        engine.exec_creates().is_empty(),
+        "{:?}",
+        engine.exec_creates()
+    );
+}
+
+#[tokio::test]
+async fn aborting_later_kills_the_process() {
+    let engine = FakeEngine::start(Kill::Binary).await;
+    let server = server(&engine).await;
+    let out: Value = server.get_json("/abort-after").await;
+    assert_eq!(out, json!({ "ok": { "exitCode": 137 } }), "{out}");
+}
+
+#[tokio::test]
+async fn the_abort_listener_goes_with_the_process() {
+    let engine = FakeEngine::start(Kill::Binary).await;
+    let server = server(&engine).await;
+    let out: Value = server.get_json("/abort-listener").await;
+    assert_eq!(
+        out,
+        json!({ "ok": { "exitCode": 0, "added": 1, "removed": 1 } }),
+        "{out}"
+    );
+}
+
+#[tokio::test]
+async fn the_abort_listener_goes_when_the_event_that_spawned_the_process_ended_first() {
+    let engine = FakeEngine::start(Kill::Binary).await;
+    let server = server(&engine).await;
+    let out: Value = server.get_json("/abort-leak-spawn").await;
+    assert_eq!(out, json!({ "ok": "spawned" }), "{out}");
+    wait_until("the process to exit", Duration::from_secs(10), || async {
+        (!engine.exec_running(0)).then_some(())
+    })
+    .await;
+    // The daemon closes the stream a moment before the node notes the end.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let out: Value = server.get_json("/abort-leak-sweep").await;
+    assert_eq!(
+        out,
+        json!({ "ok": {
+            "before": { "added": 1, "removed": 0 },
+            "after": { "added": 2, "removed": 1 },
+        } }),
+        "{out}"
+    );
 }
