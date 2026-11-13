@@ -225,14 +225,19 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Option<T>>,
 {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(value) = probe().await {
-            return value;
+    // The timeout covers each probe too: one stuck on a slow request would
+    // otherwise outlast the deadline.
+    let poll = async {
+        loop {
+            if let Some(value) = probe().await {
+                return value;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
+    };
+    tokio::time::timeout(timeout, poll)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
 }
 
 /// Kills the supervisor's process group and each node's own group.
