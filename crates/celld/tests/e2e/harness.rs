@@ -90,6 +90,48 @@ impl Server {
             .unwrap_or_else(|error| panic!("GET {path}: body is not JSON: {error}"))
     }
 
+    /// POSTs `body` to the operator route of a reserved cell, signed as
+    /// `celld d1` signs it, and returns the status and the decoded reply.
+    ///
+    /// The CLIs cannot reach `celld dev`: its object store is a local file that
+    /// no operator subcommand opens. So this reads that file the way the node
+    /// does, finds the node's lease for its internal address and the fleet
+    /// secret for the signature, and sends the same request the CLI would.
+    pub async fn operator_call(
+        &self,
+        scope: &str,
+        body: &serde_json::Value,
+    ) -> (u16, serde_json::Value) {
+        let database = fs::canonicalize(self.project.join(".celld/dev"))
+            .expect("resolve the dev state directory")
+            .join("objects.sqlite3");
+        let (key, node, addr) = host_runtime()
+            .spawn(read_operator_identity(database))
+            .await
+            .expect("read the operator identity");
+        let auth = celld::peer_auth::PeerAuth::new(key, "d1").expect("build peer auth");
+        let path = format!("/runtime/{scope}");
+        let payload = serde_json::to_vec(body).expect("encode the request");
+        let request = auth
+            .sign(
+                self.client
+                    .post(format!("http://{addr}{path}"))
+                    .body(payload.clone()),
+                "POST",
+                &path,
+                &payload,
+                &node,
+            )
+            .expect("sign the request");
+        let response = request.send().await.expect("send the operator request");
+        let status = response.status().as_u16();
+        let text = response.text().await.expect("read the operator reply");
+        let value = serde_json::from_str(&text).unwrap_or_else(|error| {
+            panic!("operator reply is not JSON ({status}): {text}: {error}")
+        });
+        (status, value)
+    }
+
     /// A GET that must succeed: an error page would otherwise reach the
     /// assertions as if it were the fixture's answer.
     async fn get(&self, path: &str) -> reqwest::Response {
@@ -223,6 +265,43 @@ impl Drop for Server {
 pub struct Exited {
     pub success: bool,
     pub output: String,
+}
+
+/// The library's storage code spawns onto one process-wide runtime that it is
+/// handed exactly once, and a `#[tokio::test]` runtime ends with its test. So
+/// the reads that open the dev store run on a runtime of their own that lives
+/// for the whole test binary.
+fn host_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        let runtime = tokio::runtime::Runtime::new().expect("build the host runtime");
+        celld::asyncrt::set_host_handle(runtime.handle().clone());
+        runtime
+    })
+}
+
+/// The fleet secret, and the node name and internal address from the node's
+/// lease, read from the dev store at `database`.
+async fn read_operator_identity(database: PathBuf) -> ([u8; 32], String, String) {
+    let bucket = celld::dev::open_local_bucket(&database).expect("open the dev store");
+    let key = celld::peer_auth::load_existing(&bucket)
+        .await
+        .expect("read the fleet secret");
+    let mut lease = None;
+    for object in bucket.list("nodes/").await.expect("list node leases") {
+        let (bytes, _) = bucket
+            .get(object.location.as_ref())
+            .await
+            .expect("read a node lease")
+            .expect("the lease exists");
+        lease = Some(serde_json::from_slice::<serde_json::Value>(&bytes).expect("decode a lease"));
+    }
+    let lease = lease.expect("the node has written its lease");
+    (
+        key,
+        lease["node"].as_str().expect("lease node").to_owned(),
+        lease["addr"].as_str().expect("lease addr").to_owned(),
+    )
 }
 
 /// Runs `celld dev` on a copy of `fixture` and returns when the process exits.

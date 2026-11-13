@@ -7669,6 +7669,24 @@ class __D1DatabaseCell {
           String(body.migrate.sql),
           String(body.migrate.table || "d1_migrations"),
         );
+      } else if (body.batch !== undefined) {
+        // The binding's batch(), one transaction and one result per
+        // statement, through the method and the result shaping the binding
+        // uses, so the operator sees exactly what a Worker would.
+        const statements = body.batch.statements;
+        if (
+          !Array.isArray(statements) ||
+          !statements.every((statement) =>
+            statement !== null && typeof statement === "object" &&
+            typeof statement.sql === "string" &&
+            (statement.params === undefined || Array.isArray(statement.params))
+          )
+        ) {
+          throw new Error(
+            "D1_ERROR: batch needs an array of { sql, params } statements",
+          );
+        }
+        result = this.__d1Batch(statements).map(__d1PublicResult);
       } else if (body.exec !== undefined) {
         // The CLI asks for rows; the Worker binding's exec() never does.
         result = __d1Run(this.ctx.storage.sql._scope, {

@@ -81,6 +81,12 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         print_help();
         return Ok(());
     };
+    // Read before any connection is made: a malformed batch is the operator's
+    // mistake, and it should not cost a bucket round trip to learn it.
+    let batch = match command.action {
+        Action::Batch => Some(read_batch(std::io::stdin().lock())?),
+        _ => None,
+    };
     let project = crate::deploy::read_d1_project(command.project.clone())?;
     // The declaration, not just the name: `migrations_dir` belongs to the
     // binding, so the directory has to come from the database the command
@@ -201,6 +207,18 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             };
             note!("Executed {count} statement(s) in {took}");
         }
+        Action::Batch => {
+            let statements = batch.expect("a batch action reads its statements first");
+            let count = statements.len();
+            let results = database.batch(statements).await?;
+            // One array, the shape `batch()` hands a Worker, so a script can
+            // treat the two alike. `Output` prints a row per line, which would
+            // split it, so this writes the whole array as one line.
+            drop(out);
+            Output::new(Format::Json).line(format_args!("{}", serde_json::to_string(&results)?))?;
+            note!("Executed {count} statement(s) in one batch");
+            return Ok(());
+        }
         Action::MigrationsList => {
             let pending = database.pending(declaration).await?;
             if pending.is_empty() {
@@ -245,6 +263,13 @@ impl Reachable {
         // `rows: true` is the CLI's difference from the Worker binding's
         // exec(): the operator asked to see the result, not only the count.
         self.call(serde_json::json!({ "exec": { "sql": source, "rows": true } }))
+            .await
+    }
+
+    /// `batch(statements)` as a Worker runs it: one transaction, so a failing
+    /// statement rolls the whole batch back, and one result per statement.
+    async fn batch(&self, statements: Vec<Value>) -> anyhow::Result<Value> {
+        self.call(serde_json::json!({ "batch": { "statements": statements } }))
             .await
     }
 
@@ -307,6 +332,69 @@ impl Reachable {
         .with_context(|| format!("apply {}", migration.name))?;
         Ok(())
     }
+}
+
+/// The most stdin a batch may carry. The cell's request body has a limit of
+/// its own; this one only stops an unbounded pipe from filling memory first.
+const MAX_BATCH_BYTES: u64 = 32 * 1024 * 1024;
+
+fn read_batch(input: impl std::io::Read) -> anyhow::Result<Vec<Value>> {
+    use std::io::Read as _;
+    let mut text = String::new();
+    // One byte past the cap tells a full read from an oversized one.
+    input
+        .take(MAX_BATCH_BYTES + 1)
+        .read_to_string(&mut text)
+        .context("read the batch from stdin")?;
+    if text.len() as u64 > MAX_BATCH_BYTES {
+        bail!("the batch on stdin is larger than {MAX_BATCH_BYTES} bytes");
+    }
+    parse_batch(&text)
+}
+
+/// A JSON array whose elements are each a SQL string, or `{ "sql", "params" }`
+/// as `prepare(sql).bind(...params)` builds one. Both normalize to the object
+/// form the cell takes. Anything else is refused by position, because an
+/// unknown key that is silently dropped (`"param"`) would run a statement
+/// without the values the operator meant to bind.
+fn parse_batch(text: &str) -> anyhow::Result<Vec<Value>> {
+    let value: Value = serde_json::from_str(text).context("the batch on stdin is not JSON")?;
+    let Value::Array(items) = value else {
+        bail!("the batch must be a JSON array of statements");
+    };
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| match item {
+            Value::String(sql) => Ok(serde_json::json!({ "sql": sql, "params": [] })),
+            Value::Object(mut object) => {
+                if let Some(key) = object
+                    .keys()
+                    .find(|key| !matches!(key.as_str(), "sql" | "params"))
+                {
+                    bail!(
+                        "statement {index} has an unknown key {key:?}; use \"sql\" and \"params\""
+                    );
+                }
+                if !matches!(object.get("sql"), Some(Value::String(_))) {
+                    bail!("statement {index} needs a \"sql\" string");
+                }
+                match object.remove("params") {
+                    None => {
+                        object.insert("params".into(), Value::Array(Vec::new()));
+                    }
+                    Some(params @ Value::Array(_)) => {
+                        object.insert("params".into(), params);
+                    }
+                    Some(_) => bail!("statement {index}: \"params\" must be an array"),
+                }
+                Ok(Value::Object(object))
+            }
+            _ => bail!(
+                "statement {index} must be a SQL string or a {{ \"sql\", \"params\" }} object"
+            ),
+        })
+        .collect()
 }
 
 fn has_sql_extension(path: &std::path::Path) -> bool {
@@ -413,6 +501,8 @@ enum Action {
         command: Option<String>,
         file: Option<PathBuf>,
     },
+    /// `execute --batch`: a JSON array of statements on stdin.
+    Batch,
     MigrationsList,
     MigrationsApply,
 }
@@ -459,6 +549,7 @@ impl Command {
         let mut project = None;
         let mut fleet = FleetFlags::default();
         let mut json = false;
+        let mut batch = false;
         let mut unsafe_public_advertise = false;
         while let Some(argument) = arguments.next() {
             let mut value = |flag: &str| {
@@ -470,6 +561,7 @@ impl Command {
                 "--command" => sql = Some(value("--command")?),
                 "--file" => file = Some(PathBuf::from(value("--file")?)),
                 "--json" => json = true,
+                "--batch" => batch = true,
                 "--unsafe-public-advertise" => unsafe_public_advertise = true,
                 "--help" | "-h" => return Ok(None),
                 other => {
@@ -496,7 +588,25 @@ impl Command {
                          migrations come from the migrations directory"
                     );
                 }
+                if batch {
+                    bail!("--batch belongs to `celld d1 execute`, not to migrations");
+                }
                 action
+            }
+            None if batch => {
+                if sql.is_some() || file.is_some() {
+                    bail!(
+                        "--batch reads its statements from stdin and takes no \
+                         --command or --file"
+                    );
+                }
+                // The result is one JSON array shaped like `batch()`'s; a table
+                // has no honest form for several result sets that must commit
+                // together, so the format is stated rather than defaulted.
+                if !json {
+                    bail!("--batch prints one JSON array, so it requires --json");
+                }
+                Action::Batch
             }
             None => {
                 if sql.is_some() == file.is_some() {
@@ -524,6 +634,7 @@ pub fn print_help() {
 
 USAGE:
   celld d1 execute DATABASE (--command SQL | --file PATH) [PROJECT] --bucket NAME
+  celld d1 execute DATABASE --batch --json [PROJECT] --bucket NAME < statements.json
   celld d1 migrations apply DATABASE [PROJECT] --bucket NAME
   celld d1 migrations list  DATABASE [PROJECT] --bucket NAME
 
@@ -549,9 +660,19 @@ bookkeeping table. celld records applied migrations in that table
 `execute` prints a table, and every message goes to stderr, so its stdout
 carries only result rows. Pass --json for one JSON object per row.
 
+`execute --batch` runs a JSON array of statements from stdin as one batch, the
+way `batch()` does in a Worker: one transaction, so a statement that fails
+rolls the whole batch back. Each element is a SQL string, or an object
+`{{"sql": "...", "params": [...]}}` whose params bind to `?` as `bind()` does.
+It prints one JSON array on stdout with one result per statement, shaped like
+`batch()`'s: `{{success, meta, results}}`, with `results` as row objects.
+
 OPTIONS:
   --command SQL       SQL to run; several statements are permitted
   --file PATH         Read the SQL from a file instead
+  --batch             Run the JSON array of statements on stdin as one
+                      transactional batch; requires --json and takes neither
+                      --command nor --file
   --json              Print one JSON object per row instead of a table
 {FLEET_HELP}
   --unsafe-public-advertise
@@ -559,4 +680,105 @@ OPTIONS:
   -h, --help          Show this help"#
     );
     let _ = Output::new(Format::Text).help(&text);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> anyhow::Result<Option<Command>> {
+        Command::parse(
+            arguments
+                .iter()
+                .map(|argument| argument.to_string())
+                .collect(),
+        )
+    }
+
+    fn refusal(arguments: &[&str]) -> String {
+        match parse(arguments) {
+            Ok(_) => panic!("{arguments:?} should be refused"),
+            Err(error) => format!("{error:#}"),
+        }
+    }
+
+    #[test]
+    fn batch_is_an_execute_action_that_needs_json() {
+        let command = parse(&["execute", "ledger", "--batch", "--json", "--bucket", "b"])
+            .unwrap()
+            .unwrap();
+        assert!(matches!(command.action, Action::Batch));
+        assert!(refusal(&["execute", "ledger", "--batch", "--bucket", "b"]).contains("--json"));
+    }
+
+    #[test]
+    fn batch_takes_its_statements_from_stdin_only() {
+        for source in [["--command", "select 1"], ["--file", "x.sql"]] {
+            let message = refusal(&[
+                "execute", "ledger", "--batch", "--json", source[0], source[1],
+            ]);
+            assert!(message.contains("stdin"), "{message}");
+        }
+        let message = refusal(&["migrations", "apply", "ledger", "--batch", "--json"]);
+        assert!(message.contains("execute"), "{message}");
+    }
+
+    #[test]
+    fn execute_still_wants_exactly_one_source() {
+        let message = refusal(&["execute", "ledger", "--json"]);
+        assert!(
+            message.contains("exactly one of --command or --file"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn statements_normalize_to_sql_and_params() {
+        let statements = parse_batch(
+            r#"["insert into t values (1)", {"sql": "select ?", "params": [7, null, [1, 2]]}, {"sql": "select 2"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            statements,
+            vec![
+                serde_json::json!({"sql": "insert into t values (1)", "params": []}),
+                serde_json::json!({"sql": "select ?", "params": [7, null, [1, 2]]}),
+                serde_json::json!({"sql": "select 2", "params": []}),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_malformed_batch_names_the_statement() {
+        for (input, needle) in [
+            ("not json", "not JSON"),
+            (r#"{"sql": "select 1"}"#, "JSON array"),
+            ("[1]", "statement 0 must be"),
+            (
+                r#"["select 1", {"params": []}]"#,
+                "statement 1 needs a \"sql\"",
+            ),
+            (r#"[{"sql": 1}]"#, "statement 0 needs a \"sql\""),
+            (
+                r#"[{"sql": "select ?", "param": [1]}]"#,
+                "unknown key \"param\"",
+            ),
+            (r#"[{"sql": "select ?", "params": 1}]"#, "must be an array"),
+        ] {
+            let message = format!("{:#}", parse_batch(input).unwrap_err());
+            assert!(message.contains(needle), "{input}: {message}");
+        }
+    }
+
+    #[test]
+    fn an_empty_batch_is_a_batch() {
+        assert!(parse_batch("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_oversized_batch_is_refused_before_it_is_parsed() {
+        let endless = std::io::repeat(b' ');
+        let message = format!("{:#}", read_batch(endless).unwrap_err());
+        assert!(message.contains("larger than"), "{message}");
+    }
 }
