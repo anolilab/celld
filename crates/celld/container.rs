@@ -264,6 +264,16 @@ enum Address {
     Published(HashMap<u16, u16>),
 }
 
+/// Where one run's start stands, for what must wait on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Started {
+    /// `begin_run` opened the run; the engine has not finished the start.
+    Pending,
+    Ready,
+    /// The start failed, or `destroy()` ended it, with this reason.
+    Failed(String),
+}
+
 pub struct CellContainer {
     scope: String,
     name: String,
@@ -277,6 +287,11 @@ pub struct CellContainer {
     /// Written with `send_replace`: a plain `send` discards the value
     /// while nobody subscribes, and `monitor()` usually subscribes late.
     exit: watch::Sender<Option<(u64, Result<i64, String>)>>,
+    /// The start of the newest run, which `exec()` waits on: the object's
+    /// `start()` returns before the engine has created the container, and an
+    /// `exec()` that follows it in the same turn would otherwise reach the
+    /// daemon first and be answered with a 404.
+    started: watch::Sender<(u64, Started)>,
 }
 
 impl CellContainer {
@@ -322,7 +337,60 @@ impl CellContainer {
         let run = state.run;
         drop(state);
         self.exit.send_replace(None);
+        self.started.send_replace((run, Started::Pending));
         run
+    }
+
+    /// Settle `run`'s start, unless it already settled or a newer run
+    /// replaced it: a late answer must not revive a destroyed start or speak
+    /// for the next one.
+    fn settle_start(&self, run: u64, outcome: Started) {
+        self.started.send_if_modified(|(current, started)| {
+            if *current != run || *started != Started::Pending {
+                return false;
+            }
+            *started = outcome;
+            true
+        });
+    }
+
+    /// The start of `run` succeeded: the container is up at `address`.
+    /// Whether the run was still waiting for that. It is not when `destroy()`
+    /// ended it while the engine was creating the container, or a newer run
+    /// replaced it, and the cell must then not take the container as its own.
+    fn finish_start(&self, run: u64, address: Address) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let pending = {
+            let started = self.started.borrow();
+            started.0 == run && started.1 == Started::Pending
+        };
+        if state.run != run || !pending {
+            return false;
+        }
+        state.running = true;
+        state.address = address;
+        drop(state);
+        self.settle_start(run, Started::Ready);
+        true
+    }
+
+    /// Wait until the newest run's start has settled. `Ok` when the container
+    /// is up; an error names why it will not be.
+    async fn wait_started(&self) -> anyhow::Result<()> {
+        let mut started = self.started.subscribe();
+        loop {
+            let (_, current) = started.borrow_and_update().clone();
+            match current {
+                Started::Ready => return Ok(()),
+                Started::Failed(reason) => {
+                    return Err(anyhow!("exec() requires a running container: {reason}"))
+                }
+                Started::Pending => {}
+            }
+            if started.changed().await.is_err() {
+                return Err(anyhow!("the container engine went away"));
+            }
+        }
     }
 
     /// The run `monitor()` waits on: the newest one.
@@ -857,6 +925,7 @@ impl ContainerEngine {
                     state: Mutex::new(CellState::default()),
                     processes: Mutex::new(Vec::new()),
                     exit: watch::channel(None).0,
+                    started: watch::channel((0, Started::Ready)).0,
                 })
             });
             // A returning cell cancels the destroy its eviction armed.
@@ -871,6 +940,7 @@ impl ContainerEngine {
         let adopted = running.is_some() && !cell.running();
         if adopted {
             let run = cell.begin_run();
+            cell.settle_start(run, Started::Ready);
             self.watch_exit(&cell, run);
         }
         let mut state = cell.state.lock().unwrap();
@@ -997,15 +1067,27 @@ impl ContainerEngine {
                 let mut state = cell.state.lock().unwrap();
                 state.running = false;
                 drop(state);
+                cell.settle_start(run, Started::Failed(format!("{error:#}")));
                 cell.exit
                     .send_replace(Some((run, Err(format!("{error:#}")))));
                 return Err(error);
             }
         };
-        {
-            let mut state = cell.state.lock().unwrap();
-            state.running = true;
-            state.address = address;
+        if !cell.finish_start(run, address) {
+            // `destroy()` ended this run while the container was being
+            // created. The container exists now and belongs to no run, so it
+            // goes, unless a newer run is under way: that one holds the name.
+            if cell.current_run() == run {
+                let _ = self
+                    .docker
+                    .call(
+                        "DELETE",
+                        &format!("/containers/{}?force=true", cell.name),
+                        None,
+                    )
+                    .await;
+            }
+            return Ok(());
         }
         self.watch_exit(cell, run);
         Ok(())
@@ -1269,6 +1351,12 @@ impl ContainerEngine {
         let mut state = cell.state.lock().unwrap();
         state.running = false;
         state.address = Address::None;
+        let run = state.run;
+        drop(state);
+        cell.settle_start(
+            run,
+            Started::Failed("the container was destroyed before it started".to_string()),
+        );
         Ok(())
     }
 
@@ -1332,6 +1420,9 @@ impl ContainerEngine {
         cell: &Arc<CellContainer>,
         params: ExecParams,
     ) -> anyhow::Result<Arc<ExecProcess>> {
+        // A start still in flight is what `running` already counts, so wait
+        // for it to settle before asking whether the container is up.
+        cell.wait_started().await?;
         if !cell.running() {
             return Err(anyhow!("exec() requires a running container."));
         }
