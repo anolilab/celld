@@ -1,0 +1,8 @@
+{
+  "name": "bench-do-sql-insert",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "durable_objects": { "bindings": [{ "name": "CELL", "class_name": "Cell" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Cell"] }]
+}

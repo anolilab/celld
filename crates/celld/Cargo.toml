@@ -13,6 +13,13 @@ path = "lib.rs"
 name = "celld"
 path = "main.rs"
 
+# Not part of `cargo test`: it needs minutes of load and its numbers are only
+# meaningful on a quiet machine. The nightly workflow runs it.
+[[bench]]
+name = "e2e"
+path = "benches/e2e.rs"
+harness = false
+
 [lints.rust.unexpected_cfgs]
 level = "warn"
 check-cfg = ["cfg(celld_internal_tests)", "cfg(celld_proxy_internals)"]
