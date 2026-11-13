@@ -22,7 +22,9 @@ every pull request:
   A WebCrypto test checks sign, verify, encrypt, decrypt, digest, derive and
   key generation for each implemented algorithm, against outputs and keys
   from Node's WebCrypto (`tests/fixtures/webcrypto/gen-vectors.mjs`), and
-  JWK, PKCS#8 and SPKI round trips for generated keys.
+  JWK, PKCS#8 and SPKI round trips for generated keys. A `node:crypto` test
+  runs the same deterministic code under Node and celld and compares the
+  answers (`tests/fixtures/node-crypto/gen-reference.mjs`).
 - **Unit tests** in the crates, such as the input gate's admission decisions in
   `celld-logic` and the known-answer tests of node-to-node authentication.
 - **The object-store contract** (`crates/celld/tests/store_contract.rs`)

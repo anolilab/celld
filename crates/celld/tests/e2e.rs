@@ -10,5 +10,6 @@ mod e2e {
     pub mod facets;
     pub mod harness;
     pub mod isolates;
+    pub mod node_crypto;
     pub mod webcrypto;
 }

@@ -358,10 +358,14 @@
         }
         const visibility = key.type;
         if (format === "jwk") {
-          return _extra("asym-key-export", {
+          const jwk = _extra("asym-key-export", {
             der: Array.from(material.bytes),
             visibility,
           }).jwk;
+          // Web Crypto names the algorithm on an Ed25519 JWK; node:crypto's
+          // `KeyObject.export`, which shares the host op, does not.
+          if (jwk.crv === "Ed25519") jwk.alg = "EdDSA";
+          return jwk;
         }
         if ((format === "spki" && visibility === "public") ||
             (format === "pkcs8" && visibility === "private")) {
