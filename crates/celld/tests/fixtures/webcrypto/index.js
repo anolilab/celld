@@ -146,11 +146,20 @@ async function agreement(name, vector, params) {
 }
 
 
+// Two generated pairs must not share a public key: a key generator that
+// repeats its random material would otherwise pass every other check.
+async function distinct(first, second) {
+  const spki = async (pair) => hex(await subtle.exportKey("spki", pair.publicKey));
+  equal((await spki(first)) === (await spki(second)), false, "two generated pairs are equal");
+}
+
 // A generated pair signs or encrypts and verifies or decrypts with itself,
 // and its JWK, PKCS#8 and SPKI exports import back to a key that does the
 // same.
 async function generated(algorithm, kind) {
-  const pair = await subtle.generateKey(algorithm, true, kind === "oaep" ? ["encrypt", "decrypt"] : ["sign", "verify"]);
+  const usages = kind === "oaep" ? ["encrypt", "decrypt"] : ["sign", "verify"];
+  const pair = await subtle.generateKey(algorithm, true, usages);
+  await distinct(pair, await subtle.generateKey(algorithm, true, usages));
   const use = async (priv, pub) => {
     if (kind === "oaep") {
       const sealed = await subtle.encrypt({ name: "RSA-OAEP" }, pub, message);
@@ -186,6 +195,7 @@ async function generatedAgreement(algorithm) {
   const usages = ["deriveBits"];
   const a = await subtle.generateKey(algorithm, true, usages);
   const b = await subtle.generateKey(algorithm, true, usages);
+  await distinct(a, b);
   const length = { "P-256": 256, "P-384": 384, "P-521": 528 }[algorithm.namedCurve] ?? 256;
   const ab = await subtle.deriveBits({ ...algorithm, public: b.publicKey }, a.privateKey, length);
   const ba = await subtle.deriveBits({ ...algorithm, public: a.publicKey }, b.privateKey, length);
