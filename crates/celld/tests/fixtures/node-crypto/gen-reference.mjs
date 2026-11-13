@@ -35,7 +35,7 @@ const write = (reference) => {
     `const REFERENCE = ${JSON.stringify(reference, null, 2)};\n${end}`;
   writeFileSync(path, source.slice(0, source.indexOf(begin)) + block + source.slice(source.indexOf(end) + end.length));
 };
-// Write the keys first, so `compute` runs on the keys being stored.
-write({});
-const { compute } = await import(`${path.href}?keys`);
+// `compute` takes the keys as an argument, so the fixture is imported as it
+// stands and the file is written once, after everything has succeeded.
+const { compute } = await import(path.href);
 write(compute(KEYS));
