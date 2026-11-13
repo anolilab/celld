@@ -311,6 +311,10 @@ const checks = {
     equal(hex(await subtle.decrypt(params, priv, unhex(vector.ciphertext))), hex(message), "reference plaintext");
     const own = await subtle.encrypt(params, pub, message);
     equal(hex(await subtle.decrypt(params, priv, own)), hex(message), "own plaintext");
+    // A label is a BufferSource, so bytes that are not UTF-8 are a label too.
+    const binary = { name: "RSA-OAEP", label: new Uint8Array([0xff, 0xfe, 0x00]) };
+    const sealed = await subtle.encrypt(binary, pub, message);
+    equal(hex(await subtle.decrypt(binary, priv, sealed)), hex(message), "non-UTF-8 label plaintext");
   },
   ...Object.fromEntries(
     ["P-256", "P-384", "P-521"].flatMap((curve) => [

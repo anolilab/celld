@@ -441,10 +441,8 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         console.detail("Watch", "disabled");
     }
 
-    let project_hash = format!(
-        "{:x}",
-        Sha256::digest(project.as_os_str().as_encoded_bytes())
-    );
+    let project_hash =
+        crate::control_plane::hex(&Sha256::digest(project.as_os_str().as_encoded_bytes()));
     let store = open_store(state.path(), &console).await?;
     run_stack(
         &config,

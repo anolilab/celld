@@ -358,7 +358,7 @@ impl ModuleRef {
             "deployment module {:?} has an invalid SHA-256 digest",
             self.name
         );
-        let actual = format!("{:x}", Sha256::digest(body));
+        let actual = crate::control_plane::hex(&Sha256::digest(body));
         anyhow::ensure!(
             actual.starts_with(&self.sha256),
             "deployment module digest mismatch for {:?}: expected {}, got {}",
@@ -502,5 +502,5 @@ pub fn deployment_version(
         hasher.update([0]);
         hasher.update(index);
     }
-    format!("{:x}", hasher.finalize())[..16].to_string()
+    crate::control_plane::hex(&hasher.finalize())[..16].to_string()
 }

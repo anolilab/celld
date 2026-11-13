@@ -444,7 +444,7 @@ pub(crate) fn durable_object_id_key(namespace_key: &str) -> [u8; 32] {
 
 pub(crate) fn durable_object_id_hmac(key: &[u8; 32], input: &[u8]) -> hmac::Hmac<sha2::Sha256> {
     use hmac::Mac;
-    let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(key)
+    let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::KeyInit>::new_from_slice(key)
         .expect("SHA-256 accepts any HMAC key");
     mac.update(input);
     mac

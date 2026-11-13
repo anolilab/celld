@@ -669,7 +669,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     let prefix = format!("deploy/{}/{}", project.script_name, version);
     let asset_reference = built_assets.as_ref().map(|assets| AssetManifestRef {
         index: "assets.json".to_string(),
-        sha256: format!("{:x}", Sha256::digest(&assets.index)),
+        sha256: crate::control_plane::hex(&Sha256::digest(&assets.index)),
         file_count: assets.file_count,
         total_bytes: assets.total_bytes,
     });
@@ -692,7 +692,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             .map(|(name, bytes)| ModuleRef {
                 name: name.clone(),
                 bytes: bytes.len(),
-                sha256: format!("{:x}", Sha256::digest(bytes)),
+                sha256: crate::control_plane::hex(&Sha256::digest(bytes)),
                 kind: wasm_names.contains(name).then_some(ModuleKind::Wasm),
             })
             .collect(),
@@ -837,7 +837,8 @@ fn resolve_image(root: &Path, image: &str, platform: Option<&str>) -> anyhow::Re
         ],
         "inspect container image",
     )?;
-    let reference = crate::container::image_reference(&format!("{:x}", Sha256::digest(&content)));
+    let reference =
+        crate::container::image_reference(&crate::control_plane::hex(&Sha256::digest(&content)));
     run_engine(&["tag", &id, &reference], "tag container image")?;
     Ok(reference)
 }
@@ -2670,7 +2671,7 @@ fn build_assets(project: &ProjectAssets) -> anyhow::Result<BuiltAssets> {
         if body.len() as u64 != metadata.len() {
             bail!("asset changed while being read: {}", path.display());
         }
-        let sha256 = format!("{:x}", Sha256::digest(&body));
+        let sha256 = crate::control_plane::hex(&Sha256::digest(&body));
         blobs.entry(sha256.clone()).or_insert(body);
         entries.insert(
             asset_path,
