@@ -395,10 +395,19 @@ object that another tool writes into the prefix is also readable, without
 `cacheExpiry` or checksums. `celld r2 get` streams the body to stdout, and
 `celld r2 head` prints the stored record; with `--json`, the
 `http` and `custom` fields hold `httpMetadata` and `customMetadata`.
+For a key that is not there, `get` and `head` fail with the same message and
+exit status as before; with `--json` they also print
+`{"error":"not_found","bucket":...,"key":...}` on stdout.
 
 `celld kv list` and `celld r2 list` print at most 1000 keys and print the
 `--after KEY` that continues the listing on stderr. Pass `--all` for every
 key and `--json` for one JSON object per key.
+
+`celld r2 list --page` prints one page as a single JSON object with
+`objects`, `delimitedPrefixes`, `truncated` and `cursor`. `--limit` sets the
+page size and `--after CURSOR` continues from a returned `cursor`.
+`--delimiter D` groups the keys under their first `D` after the `--prefix`,
+as R2's `delimiter` option does, and needs `--page`.
 
 Every celld command writes data to stdout and messages to stderr. A closed
 stdout pipe is a successful stop.
