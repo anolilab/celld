@@ -121,5 +121,6 @@ Scenarios:
   write is proven by an upload.
 
 The `$/mo @10K` column prices the per-agent requests at S3 Standard rates for
-10,000 agents alive at once, each living as long as a bench agent. `$/node-mo`
+10,000 agents alive at once, each living one turn interval per turn (60 s by
+default: six turns, one every 10 s). `$/node-mo`
 prices one node's shared requests under the same load.

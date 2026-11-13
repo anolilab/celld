@@ -399,16 +399,21 @@ impl Node {
         }
     }
 
+    /// Waits for celld's own health check, which also waits for the fleet
+    /// to settle, and for the Worker to answer.
     async fn wait_ready(&self, client: &reqwest::Client) {
         let deadline = Instant::now() + Duration::from_secs(120);
-        let url = format!("{}/__ready", self.public);
+        let paths = ["/.well-known/celld/health", "/__ready"];
         while Instant::now() < deadline {
-            if client
-                .get(&url)
-                .send()
-                .await
-                .is_ok_and(|r| r.status().is_success())
-            {
+            let mut ready = true;
+            for path in paths {
+                ready &= client
+                    .get(format!("{}{path}", self.public))
+                    .send()
+                    .await
+                    .is_ok_and(|r| r.status().is_success());
+            }
+            if ready {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -460,9 +465,14 @@ impl Proxy {
                         "BATCH_DELETE" => "(batch)".to_owned(),
                         _ => shape(&key_of(&request), &root),
                     };
-                    let key = (kind, shape);
-                    *tally.lock().unwrap().entry(key).or_default() += 1;
-                    forward(upstream.clone(), request)
+                    let (tally, upstream) = (tally.clone(), upstream.clone());
+                    async move {
+                        let response = forward(upstream, request).await?;
+                        // Counted only once the store answered: a request
+                        // that never reached it is not billed.
+                        *tally.lock().unwrap().entry((kind, shape)).or_default() += 1;
+                        Ok::<_, BoxError>(response)
+                    }
                 });
                 tokio::spawn(
                     hyper::server::conn::http1::Builder::new()
@@ -606,6 +616,8 @@ fn write_json(settings: &Settings, results: &[ScenarioResult]) {
     let path = std::env::var_os("CELLD_BENCH_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|| target_dir().join("storage-bench/results.json"));
+    // An agent lives one turn interval per turn: six turns ten seconds apart
+    // is a 60 s agent whose last turn is followed by one more interval.
     let lifetime = settings.turn * settings.turns as u32;
     let document = json!({
         "git_sha": git(&["rev-parse", "HEAD"]),
