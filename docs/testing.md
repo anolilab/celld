@@ -25,6 +25,13 @@ every pull request:
   JWK, PKCS#8 and SPKI round trips for generated keys. A `node:crypto` test
   runs the same deterministic code under Node and celld and compares the
   answers (`tests/fixtures/node-crypto/gen-reference.mjs`).
+- **Container tests** (`crates/celld/tests/e2e/`): fixture Workers with a
+  `containers` class run against a fake container engine
+  (`tests/e2e/fake_engine.rs`), which speaks the part of the Docker Engine API
+  that celld uses over a unix socket and runs `exec()` processes in memory.
+  They need no daemon, no image and no privileged fence container, and they
+  cover the `ctx.container` surface and the engine calls behind it, not the
+  kernel boundary.
 - **Unit tests** in the crates, such as the input gate's admission decisions in
   `celld-logic` and the known-answer tests of node-to-node authentication.
 - **The object-store contract** (`crates/celld/tests/store_contract.rs`)

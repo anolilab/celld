@@ -2455,9 +2455,13 @@ class ContainerPort {
   }
 }
 class Container {
-  constructor(scope) {
+  constructor(scope, config) {
     this._scope = scope;
     this._destroyReason = undefined;
+    // The names `start({ image })` accepts, each mapped to itself so
+    // `images.default` can be passed back.
+    this.images = Object.freeze(
+      Object.fromEntries(config.images.map((name) => [name, name])));
   }
   // The host's answer, not a JavaScript flag: a monitor() promise can be
   // dropped with its event, so the flag it would maintain could go stale.
@@ -2467,6 +2471,14 @@ class Container {
       throw new Error("start() cannot be called on a container that is already running.");
     const o = options ?? {};
     const params = { enableInternet: !!o.enableInternet, labels: [] };
+    if (o.image !== undefined) {
+      const image = String(o.image);
+      if (!Object.hasOwn(this.images, image))
+        throw new Error(
+          `start() image "${image}" is not declared for this container class; ` +
+          `declared: ${Object.keys(this.images).join(", ")}`);
+      params.image = image;
+    }
     if (o.entrypoint !== undefined) params.entrypoint = Array.from(o.entrypoint, String);
     params.env = __containerEnvList(o.env);
     if (o.labels !== undefined) {
@@ -2624,7 +2636,8 @@ class DurableObjectState {
     this.props = facet?.props;
     // A class outside `containers` has no `ctx.container`, which is what
     // the `@cloudflare/containers` constructor checks.
-    if (__cell.containers[className]) this.container = new Container(scope);
+    if (__cell.containers[className])
+      this.container = new Container(scope, __cell.containers[className]);
   }
   // Workerd's DurableObjectState.exports (actor-state.h): the same
   // loopback surface as ctx.exports on stateless entrypoints.

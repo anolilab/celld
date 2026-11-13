@@ -28,7 +28,7 @@ use crate::docker::{frame_header, Docker, Stream};
 use anyhow::{anyhow, Context};
 use bytes::Bytes;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -43,6 +43,12 @@ pub struct ContainerSpec {
     /// The image reference the engine starts, `celld-image:<content key>`,
     /// so two deployments of one image share one tar and one load.
     pub image: String,
+    /// The other images an object of this class may start, by name, each as
+    /// `celld-image:<content key>`. `start({ image })` names one of these or
+    /// `default`, which is `image`. A class that declares none serializes
+    /// exactly as before, so its deployment keeps its version.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub images: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,6 +61,28 @@ pub struct ContainerSpec {
     /// Cloudflare config here, which has no per-class runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+}
+
+/// The name `start({ image })` gives the class's own `image`.
+pub const DEFAULT_IMAGE_NAME: &str = "default";
+
+impl ContainerSpec {
+    /// The image reference a start names: the class's own for no name or
+    /// `default`, else the one declared under that name. The name is looked
+    /// up and never used as a reference, so what a Worker passes cannot
+    /// select an image the deployment did not declare, the fence image
+    /// included.
+    pub fn image_named(&self, name: Option<&str>) -> Option<&str> {
+        match name {
+            None | Some(DEFAULT_IMAGE_NAME) => Some(&self.image),
+            Some(name) => self.images.get(name).map(String::as_str),
+        }
+    }
+
+    /// Every image of the class: the default first, then the named ones.
+    pub fn all_images(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.image.as_str()).chain(self.images.values().map(String::as_str))
+    }
 }
 
 /// The reference every engine holds an image under, from its content key.
@@ -190,6 +218,8 @@ const DEFAULT_ENV: &[&str] = &[
 ];
 
 pub struct StartParams {
+    /// The name of the image to start; see [`ContainerSpec::image_named`].
+    pub image: Option<String>,
     pub entrypoint: Option<Vec<String>>,
     pub env: Vec<(String, String)>,
     pub enable_internet: bool,
@@ -471,13 +501,15 @@ pub async fn prewarm() {
     }
     let specs = SPECS.read().unwrap().clone();
     for spec in specs {
-        if let Err(error) = engine.ensure_image(&spec.image).await {
-            tracing::warn!(
-                class = %spec.class_name,
-                image = %spec.image,
-                error = %format!("{error:#}"),
-                "container image is unavailable"
-            );
+        for image in spec.all_images() {
+            if let Err(error) = engine.ensure_image(image).await {
+                tracing::warn!(
+                    class = %spec.class_name,
+                    image = %image,
+                    error = %format!("{error:#}"),
+                    "container image is unavailable"
+                );
+            }
         }
     }
 }
@@ -1019,9 +1051,20 @@ impl ContainerEngine {
         cell: &CellContainer,
         params: StartParams,
     ) -> anyhow::Result<Address> {
+        let image = cell
+            .spec
+            .image_named(params.image.as_deref())
+            .ok_or_else(|| {
+                anyhow!(
+                    "start() image {:?} is not declared for container class {}",
+                    params.image.as_deref().unwrap_or_default(),
+                    cell.spec.class_name
+                )
+            })?
+            .to_string();
         self.ensure_fence().await?;
         self.enforce_instance_ceiling(cell).await?;
-        self.ensure_image(&cell.spec.image).await?;
+        self.ensure_image(&image).await?;
         let (open, internal) = self.networks().await?;
         // A previous run's container may still be named: the wait task
         // observed its exit but nothing removed it, or a restart adopted a
@@ -1116,7 +1159,7 @@ impl ContainerEngine {
         host_config["Memory"] = json!(memory);
         host_config["MemorySwap"] = json!(memory);
         let mut body = json!({
-            "Image": cell.spec.image,
+            "Image": image,
             "Env": env,
             "Labels": labels,
             "HostConfig": host_config,
@@ -1158,7 +1201,7 @@ impl ContainerEngine {
                 .await?;
         }
         if reply.status.as_u16() == 404 {
-            return Err(anyhow!("No such image available named {}", cell.spec.image));
+            return Err(anyhow!("No such image available named {image}"));
         }
         if !reply.status.is_success() {
             return Err(anyhow!(
@@ -1634,5 +1677,52 @@ mod endpoint_tests {
         assert!(!published.serves("10.0.0.1:49153".parse().unwrap()));
 
         assert!(!Address::None.serves("127.0.0.1:49153".parse().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    fn spec(images: &[(&str, &str)]) -> ContainerSpec {
+        ContainerSpec {
+            class_name: "Box".to_string(),
+            image: "celld-image:base".to_string(),
+            images: images
+                .iter()
+                .map(|(name, image)| (name.to_string(), image.to_string()))
+                .collect(),
+            instance_type: None,
+            max_instances: None,
+            runtime: None,
+        }
+    }
+
+    #[test]
+    fn a_class_without_named_images_serializes_as_before() {
+        let value = serde_json::to_value(spec(&[])).unwrap();
+        assert_eq!(
+            value,
+            json!({ "class_name": "Box", "image": "celld-image:base" })
+        );
+        let old: ContainerSpec = serde_json::from_value(value).unwrap();
+        assert_eq!(old, spec(&[]));
+    }
+
+    #[test]
+    fn a_name_selects_a_declared_image_and_nothing_else() {
+        let spec = spec(&[("worker", "celld-image:worker")]);
+        assert_eq!(spec.image_named(None), Some("celld-image:base"));
+        assert_eq!(spec.image_named(Some("default")), Some("celld-image:base"));
+        assert_eq!(spec.image_named(Some("worker")), Some("celld-image:worker"));
+        // A reference is not a name, so a Worker cannot start an image of
+        // the engine that the deployment did not declare.
+        for refused in ["celld-image:base", "alpine:3.20", "nope", ""] {
+            assert_eq!(spec.image_named(Some(refused)), None, "{refused}");
+        }
+        assert_eq!(
+            spec.all_images().collect::<Vec<_>>(),
+            ["celld-image:base", "celld-image:worker"]
+        );
     }
 }

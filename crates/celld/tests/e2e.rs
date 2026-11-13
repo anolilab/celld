@@ -3,6 +3,7 @@
 mod e2e {
     pub mod alarms;
     pub mod body_clone;
+    pub mod container_images;
     pub mod d1_batch;
     pub mod d1_export;
     pub mod do_alarms;
@@ -12,6 +13,7 @@ mod e2e {
     pub mod do_storage;
     pub mod egress;
     pub mod facets;
+    pub mod fake_engine;
     pub mod harness;
     pub mod isolates;
     pub mod node_crypto;

@@ -65,6 +65,7 @@ pub(super) fn op_container_address(
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StartArgs {
+    image: Option<String>,
     entrypoint: Option<Vec<String>>,
     #[serde(default)]
     env: Vec<(String, String)>,
@@ -98,6 +99,7 @@ pub(super) fn op_container_start(
                 &cell,
                 run,
                 StartParams {
+                    image: request.image,
                     entrypoint: request.entrypoint,
                     env: request.env,
                     enable_internet: request.enable_internet,
