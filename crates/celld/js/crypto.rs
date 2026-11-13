@@ -66,6 +66,17 @@ fn digest_bytes(hash: &str, data: &[u8]) -> Result<Vec<u8>> {
     })
 }
 
+/// `digest` as the prehash for an ECDSA key whose field is `field` bytes.
+/// A digest shorter than half the field (SHA-256 on P-521) is left-padded
+/// with zeroes, which is the same integer FIPS 186 takes from it; the
+/// signer would otherwise refuse it.
+fn ecdsa_prehash(mut digest: Vec<u8>, field: usize) -> Vec<u8> {
+    if digest.len() < field {
+        digest.splice(0..0, std::iter::repeat_n(0, field - digest.len()));
+    }
+    digest
+}
+
 /// Algorithm OIDs, so a parsed key can say what it is. Same constants as
 /// Node's, via deno's `ext/node_crypto/keys.rs`.
 const RSA_ENCRYPTION_OID: rsa::pkcs8::ObjectIdentifier =
@@ -720,6 +731,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                         .map_err(|_| anyhow!("invalid {crv} PKCS#8 key"))?;
                     let key = $c::ecdsa::SigningKey::from_slice(secret.to_bytes().as_slice())
                         .map_err(|_| anyhow!("invalid {crv} signing key"))?;
+                    let digest = ecdsa_prehash(digest, $c::FieldBytes::default().len());
                     let signature: $c::ecdsa::Signature = key
                         .sign_prehash(&digest)
                         .map_err(|_| anyhow!("could not sign with {crv}"))?;
@@ -797,6 +809,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                         .map_err(|_| anyhow!("invalid {crv} PKCS#8 key"))?;
                     let key = $c::ecdsa::SigningKey::from_slice(secret.to_bytes().as_slice())
                         .map_err(|_| anyhow!("invalid {crv} signing key"))?;
+                    let digest = ecdsa_prehash(digest, $c::FieldBytes::default().len());
                     let signature: $c::ecdsa::Signature = key
                         .sign_prehash(&digest)
                         .map_err(|_| anyhow!("could not sign with {crv}"))?;
@@ -826,6 +839,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                     let point = public.to_encoded_point(false);
                     let key = $c::ecdsa::VerifyingKey::from_sec1_bytes(point.as_bytes())
                         .map_err(|_| anyhow!("invalid {crv} verifying key"))?;
+                    let digest = ecdsa_prehash(digest, $c::FieldBytes::default().len());
                     $c::ecdsa::DerSignature::try_from(signature.as_slice())
                         .ok()
                         .and_then(|signature| $c::ecdsa::Signature::try_from(signature).ok())
@@ -856,6 +870,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                     let point = public.to_encoded_point(false);
                     let key = $c::ecdsa::VerifyingKey::from_sec1_bytes(point.as_bytes())
                         .map_err(|_| anyhow!("invalid {crv} verifying key"))?;
+                    let digest = ecdsa_prehash(digest, $c::FieldBytes::default().len());
                     // A signature of the wrong length for the curve is a
                     // failed verification, not an error.
                     $c::ecdsa::Signature::from_slice(&signature)

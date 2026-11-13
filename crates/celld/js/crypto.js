@@ -599,6 +599,9 @@
               ? "rsa-pss-sign"
               : null;
       if (!operation) throw _notSupported("unsupported sign algorithm: " + name);
+      if (name === "ECDSA" && algorithm?.hash == null) {
+        throw new TypeError("EcdsaParams requires a hash");
+      }
       const result = _extra(operation, {
         key: Array.from(key?.__celldMaterial?.bytes || []),
         data: Array.from(bytes),
@@ -638,6 +641,9 @@
       }
       const material = key?.__celldMaterial?.bytes;
       if (!material) throw _notSupported("verify needs an spki public key");
+      if (name === "ECDSA" && algorithm?.hash == null) {
+        throw new TypeError("EcdsaParams requires a hash");
+      }
       return _extra(operation, {
         key: Array.from(material),
         data: Array.from(_toBuf(data)),

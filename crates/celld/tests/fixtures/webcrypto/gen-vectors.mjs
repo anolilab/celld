@@ -65,6 +65,12 @@ for (const [curve, hash] of [["P-256", "SHA-256"], ["P-384", "SHA-384"], ["P-521
   out[`ECDH ${curve}`] = { pkcs8: a.pkcs8, peer: b.spki, length, shared: hex(await subtle.deriveBits({ name: "ECDH", public: b.keys.publicKey }, a.keys.privateKey, length)) };
 }
 
+// A hash shorter or longer than the curve's field, both ways round.
+for (const [curve, hash] of [["P-521", "SHA-256"], ["P-384", "SHA-256"], ["P-256", "SHA-512"]]) {
+  const ecdsa = await pair({ name: "ECDSA", namedCurve: curve }, ["sign", "verify"]);
+  out[`ECDSA ${curve} ${hash}`] = { ...strip(ecdsa), curve, hash, signature: hex(await subtle.sign({ name: "ECDSA", hash }, ecdsa.keys.privateKey, message)) };
+}
+
 const ed = await pair({ name: "Ed25519" }, ["sign", "verify"]);
 out.Ed25519 = { ...strip(ed), signature: hex(await subtle.sign("Ed25519", ed.keys.privateKey, message)) };
 
