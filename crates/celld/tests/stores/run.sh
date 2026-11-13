@@ -24,14 +24,18 @@ cleanup() { "${compose[@]}" down -v >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 "${compose[@]}" up -d "$provider"
-image=$("${compose[@]}" config --images "$provider")
+container=$("${compose[@]}" ps -q "$provider")
+image=$(docker inspect --format '{{.Config.Image}}' "$container")
 
 # Wait for the S3 port to answer, then create the bucket from a container on
 # the same network, so no AWS CLI is needed on the host.
-timeout 90 bash -c "until curl -s -o /dev/null http://127.0.0.1:$port/; do sleep 1; done"
+for _ in $(seq 90); do
+  curl -s -o /dev/null "http://127.0.0.1:$port/" && break
+  sleep 1
+done
 # A store can answer on its port before it accepts a bucket, so retry.
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
-  if docker run --rm --network "container:$("${compose[@]}" ps -q "$provider")" \
+  if docker run --rm --network "container:$container" \
     -e AWS_ACCESS_KEY_ID="$key" -e AWS_SECRET_ACCESS_KEY="$key" -e AWS_DEFAULT_REGION=us-east-1 \
     amazon/aws-cli --endpoint-url "http://127.0.0.1:$port" s3 mb s3://contract >/dev/null 2>&1; then
     break
