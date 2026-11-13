@@ -700,15 +700,33 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 .map_err(|_| anyhow!("invalid Ed25519 PKCS#8 key"))?;
             Ok(serde_json::json!({ "bytes": key.sign(&data).to_bytes().to_vec() }))
         }
-        "p256-sign" => {
-            use p256::ecdsa::signature::Signer;
-            use p256::pkcs8::DecodePrivateKey;
+        // Web Crypto's ECDSA, on any NIST curve with the call's hash. The
+        // signature is raw r||s at the curve's field size, where the
+        // node:crypto ops below use DER.
+        "ecdsa-sign" => {
             let key = crypto_bytes(args, "key")?;
             let data = crypto_bytes(args, "data")?;
-            let key = p256::ecdsa::SigningKey::from_pkcs8_der(&key)
-                .map_err(|_| anyhow!("invalid P-256 PKCS#8 key"))?;
-            let signature: p256::ecdsa::Signature = key.sign(&data);
-            Ok(serde_json::json!({ "bytes": signature.to_bytes().to_vec() }))
+            let hash = args
+                .get("hash")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("SHA-256");
+            let digest = digest_bytes(hash, &data)?;
+            let crv = ec_jwk_crv(&describe_key(&key, true)?)?;
+            macro_rules! sign {
+                ($c:ident) => {{
+                    use $c::ecdsa::signature::hazmat::PrehashSigner;
+                    use $c::pkcs8::DecodePrivateKey;
+                    let secret = $c::SecretKey::from_pkcs8_der(&key)
+                        .map_err(|_| anyhow!("invalid {crv} PKCS#8 key"))?;
+                    let key = $c::ecdsa::SigningKey::from_slice(secret.to_bytes().as_slice())
+                        .map_err(|_| anyhow!("invalid {crv} signing key"))?;
+                    let signature: $c::ecdsa::Signature = key
+                        .sign_prehash(&digest)
+                        .map_err(|_| anyhow!("could not sign with {crv}"))?;
+                    signature.to_bytes().to_vec()
+                }};
+            }
+            Ok(serde_json::json!({ "bytes": ec_curve!(crv, sign) }))
         }
         // JWT verification is the reason these exist: RS256 and ES256 are what
         // token issuers sign with (denoland/celld#124). Both take an SPKI
@@ -818,18 +836,34 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             let ok = ec_curve!(crv, verify);
             Ok(serde_json::json!({ "ok": ok }))
         }
-        "p256-verify" => {
-            use p256::ecdsa::signature::Verifier;
-            use p256::pkcs8::DecodePublicKey;
+        "ecdsa-verify" => {
             let key = crypto_bytes(args, "key")?;
             let data = crypto_bytes(args, "data")?;
             let signature = crypto_bytes(args, "signature")?;
-            let key = p256::ecdsa::VerifyingKey::from_public_key_der(&key)
-                .map_err(|_| anyhow!("invalid P-256 SPKI key"))?;
-            // WebCrypto passes ECDSA signatures as raw r||s, not DER.
-            let ok = p256::ecdsa::Signature::from_slice(&signature)
-                .map(|signature| key.verify(&data, &signature).is_ok())
-                .unwrap_or(false);
+            let hash = args
+                .get("hash")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("SHA-256");
+            let digest = digest_bytes(hash, &data)?;
+            let crv = ec_jwk_crv(&describe_key(&key, false)?)?;
+            macro_rules! verify {
+                ($c:ident) => {{
+                    use $c::ecdsa::signature::hazmat::PrehashVerifier;
+                    use $c::elliptic_curve::sec1::ToEncodedPoint;
+                    use $c::pkcs8::DecodePublicKey;
+                    let public = $c::PublicKey::from_public_key_der(&key)
+                        .map_err(|_| anyhow!("invalid {crv} SPKI key"))?;
+                    let point = public.to_encoded_point(false);
+                    let key = $c::ecdsa::VerifyingKey::from_sec1_bytes(point.as_bytes())
+                        .map_err(|_| anyhow!("invalid {crv} verifying key"))?;
+                    // A signature of the wrong length for the curve is a
+                    // failed verification, not an error.
+                    $c::ecdsa::Signature::from_slice(&signature)
+                        .map(|signature| key.verify_prehash(&digest, &signature).is_ok())
+                        .unwrap_or(false)
+                }};
+            }
+            let ok = ec_curve!(crv, verify);
             Ok(serde_json::json!({ "ok": ok }))
         }
         "rsa-pkcs1-verify" => {

@@ -121,7 +121,8 @@ The `tail` and `email` handlers are unavailable.
 ### [Web Crypto](https://developers.cloudflare.com/workers/runtime-apis/web-crypto/)
 
 - HMAC accepts MD5, SHA-1, SHA-224, SHA-256, SHA-384, and SHA-512.
-- ECDSA supports only the P-256 curve with SHA-256.
+- ECDSA signs and verifies on P-256, P-384 and P-521 with SHA-256, SHA-384 or
+  SHA-512.
 - AES-GCM accepts authentication tags from 96 through 128 bits in 8-bit steps.
 - RSA-OAEP accepts SHA-1, SHA-256, SHA-384, and SHA-512. A nonempty label must
   contain valid UTF-8.

@@ -592,26 +592,19 @@
       const operation = _ED25519_ALGS.has(name)
         ? "ed25519-sign"
         : name === "ECDSA"
-          ? "p256-sign"
+          ? "ecdsa-sign"
           : name === "RSASSA-PKCS1-V1_5"
             ? "rsa-pkcs1-sign"
             : name === "RSA-PSS"
               ? "rsa-pss-sign"
               : null;
       if (!operation) throw _notSupported("unsupported sign algorithm: " + name);
-      if (name === "ECDSA") {
-        if (_canonicalEcCurve(key?.algorithm?.namedCurve) !== "P-256") {
-          throw _notSupported("ECDSA signatures support only P-256");
-        }
-        if (_hashName(algorithm?.hash) !== "SHA-256") {
-          throw _notSupported("ECDSA P-256 supports only SHA-256");
-        }
-      }
       const result = _extra(operation, {
         key: Array.from(key?.__celldMaterial?.bytes || []),
         data: Array.from(bytes),
-        // RSA carries its hash on the key; the others ignore the field.
-        hash: _hashName(key?.algorithm?.hash),
+        // ECDSA carries its hash on the call, RSA on the key; Ed25519
+        // ignores the field.
+        hash: _hashName(name === "ECDSA" ? algorithm?.hash : key?.algorithm?.hash),
         saltLength: Number(algorithm?.saltLength ?? 0),
       });
       return Uint8Array.from(result.bytes).buffer;
@@ -634,7 +627,7 @@
       const operation = _ED25519_ALGS.has(name)
         ? "ed25519-verify"
         : name === "ECDSA"
-        ? "p256-verify"
+        ? "ecdsa-verify"
         : name === "RSASSA-PKCS1-V1_5"
         ? "rsa-pkcs1-verify"
         : name === "RSA-PSS"
@@ -645,14 +638,6 @@
       }
       const material = key?.__celldMaterial?.bytes;
       if (!material) throw _notSupported("verify needs an spki public key");
-      if (name === "ECDSA") {
-        if (_canonicalEcCurve(key?.algorithm?.namedCurve) !== "P-256") {
-          throw _notSupported("ECDSA signatures support only P-256");
-        }
-        if (_hashName(algorithm?.hash) !== "SHA-256") {
-          throw _notSupported("ECDSA P-256 supports only SHA-256");
-        }
-      }
       return _extra(operation, {
         key: Array.from(material),
         data: Array.from(_toBuf(data)),
