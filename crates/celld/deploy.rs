@@ -828,19 +828,52 @@ fn resolve_image(root: &Path, image: &str, platform: Option<&str>) -> anyhow::Re
         run_engine(&inspect, "inspect container image")?
     };
     let content = run_engine(
-        &[
-            "image",
-            "inspect",
-            "--format",
-            "{{json .RootFS.Layers}}{{json .Config}}",
-            &id,
-        ],
+        &["image", "inspect", "--format", IMAGE_CONTENT_FORMAT, &id],
         "inspect container image",
     )?;
     let reference =
         crate::container::image_reference(&crate::control_plane::hex(&Sha256::digest(&content)));
-    run_engine(&["tag", &id, &reference], "tag container image")?;
+    tag_image(&run_engine, &id, &reference, &content)?;
     Ok(reference)
+}
+
+/// What an image's identity is made of: its layers and its config.
+const IMAGE_CONTENT_FORMAT: &str = "{{json .RootFS.Layers}}{{json .Config}}";
+
+/// Tag the image `id` as `reference`, the name its content hashes to.
+///
+/// Two deploys of the same content on one engine tag the same name. The
+/// containerd image store refuses the second tag with an AlreadyExists error
+/// even when it would point at the same image, so on that error the name is
+/// inspected again: an image with this content under it is the tag the
+/// caller wanted, and anything else is the refusal it was.
+fn tag_image(
+    engine: &dyn Fn(&[&str], &str) -> anyhow::Result<String>,
+    id: &str,
+    reference: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    let Err(refused) = engine(&["tag", id, reference], "tag container image") else {
+        return Ok(());
+    };
+    let message = format!("{refused:#}").to_ascii_lowercase();
+    if !(message.contains("already exists") || message.contains("alreadyexists")) {
+        return Err(refused);
+    }
+    let held = engine(
+        &[
+            "image",
+            "inspect",
+            "--format",
+            IMAGE_CONTENT_FORMAT,
+            reference,
+        ],
+        "inspect container image",
+    );
+    match held {
+        Ok(held) if held == content => Ok(()),
+        _ => Err(refused),
+    }
 }
 
 /// The image the node fences its bridges with: `nft` and nothing else.
@@ -3036,4 +3069,89 @@ fn strip_jsonc(source: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod image_tag_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    const REFUSED: &str = "tag container image failed:\nimage \"celld/app:abc\": already exists";
+
+    /// An engine that answers `tag` and `image inspect` as told, and records
+    /// every call.
+    fn engine<'a>(
+        tag: Result<&'a str, &'a str>,
+        inspect: Result<&'a str, &'a str>,
+        calls: &'a RefCell<Vec<String>>,
+    ) -> impl Fn(&[&str], &str) -> anyhow::Result<String> + 'a {
+        move |args, _| {
+            calls.borrow_mut().push(args[..2].join(" "));
+            let answer = if args[0] == "tag" { tag } else { inspect };
+            answer
+                .map(str::to_string)
+                .map_err(|message| anyhow!("{message}"))
+        }
+    }
+
+    #[test]
+    fn a_new_tag_needs_no_second_look() {
+        let calls = RefCell::new(Vec::new());
+        tag_image(
+            &engine(Ok(""), Err("unused"), &calls),
+            "id",
+            "ref",
+            "content",
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), ["tag id"]);
+    }
+
+    #[test]
+    fn a_tag_that_already_holds_the_same_content_is_a_success() {
+        let calls = RefCell::new(Vec::new());
+        let run = engine(Err(REFUSED), Ok("content"), &calls);
+        tag_image(&run, "id", "ref", "content").unwrap();
+        assert_eq!(*calls.borrow(), ["tag id", "image inspect"]);
+    }
+
+    #[test]
+    fn a_tag_that_holds_a_different_image_still_fails() {
+        let calls = RefCell::new(Vec::new());
+        let run = engine(Err(REFUSED), Ok("other content"), &calls);
+        let error = tag_image(&run, "id", "ref", "content").unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error}");
+    }
+
+    #[test]
+    fn a_tag_that_cannot_be_inspected_fails_with_the_original_error() {
+        let calls = RefCell::new(Vec::new());
+        let run = engine(Err(REFUSED), Err("no such image"), &calls);
+        let error = tag_image(&run, "id", "ref", "content").unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error}");
+    }
+
+    #[test]
+    fn any_other_refusal_is_not_looked_into() {
+        let calls = RefCell::new(Vec::new());
+        let run = engine(
+            Err("tag container image failed:\ndaemon not running"),
+            Ok("content"),
+            &calls,
+        );
+        let error = tag_image(&run, "id", "ref", "content").unwrap_err();
+        assert!(error.to_string().contains("daemon not running"), "{error}");
+        assert_eq!(*calls.borrow(), ["tag id"]);
+    }
+
+    #[test]
+    fn the_containerd_spelling_counts_too() {
+        let calls = RefCell::new(Vec::new());
+        let run = engine(
+            Err("rpc error: code = AlreadyExists desc = image exists"),
+            Ok("content"),
+            &calls,
+        );
+        tag_image(&run, "id", "ref", "content").unwrap();
+    }
 }
