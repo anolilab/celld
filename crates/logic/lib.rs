@@ -640,6 +640,11 @@ pub struct State {
     /// released, pumped at most `max_releases` at a time. Sticky -- a
     /// draining node never goes back to serving.
     draining: bool,
+    /// The most handoffs the drain tolerates in flight: the release bound, or
+    /// the count already moving when the drain began, whichever is larger.
+    /// Ordinary evictions started before the drain cannot be recalled, and
+    /// nothing the drain starts afterwards may push the count above this.
+    drain_handoff_ceiling: usize,
     /// Cells reserved at the shutdown or generation-swap quiesce boundary.
     /// The set is bounded by `max_releases`, so an actor event can promote an
     /// idle reservation without walking the complete resident table.
@@ -835,6 +840,7 @@ impl State {
             config,
             fenced: false,
             draining: false,
+            drain_handoff_ceiling: 0,
             quiescing_cells: BTreeSet::new(),
             releasing_cells: BTreeSet::new(),
             adopting_cells: BTreeSet::new(),
@@ -1258,10 +1264,10 @@ impl State {
             ));
         }
         let handoffs = self.handoffs_in_flight();
-        if self.draining && handoffs > self.config.max_releases {
+        if self.draining && handoffs > self.drain_handoff_ceiling {
             return Err(format!(
                 "handoffs {handoffs} exceeds release ceiling {}",
-                self.config.max_releases
+                self.drain_handoff_ceiling
             ));
         }
         if self.activation_permits.len() > self.config.max_activations {
@@ -3273,6 +3279,19 @@ impl State {
                 self.cells.insert(id.to_string(), cell);
                 return;
             }
+            // A balancing move is handing this cell away: keep the timer live
+            // and leave the wake to the next owner, as a drain does.
+            Phase::Dormant { .. } if cell.handoff => {
+                effects.push(Effect::ScheduleTimer {
+                    timer: Timer::CellAlarm {
+                        cell: id.to_string(),
+                        generation,
+                    },
+                    at_mono_ms: now_mono_ms.saturating_add(100),
+                });
+                self.cells.insert(id.to_string(), cell);
+                return;
+            }
             Phase::Dormant { .. } => {
                 cell.alarm_wake = true;
                 // Every activation takes a fresh epoch. The LTX metadata does
@@ -3814,6 +3833,13 @@ impl State {
             return;
         }
         let mut cell = self.cells.remove(&id).unwrap_or_default();
+        // A balancing move is handing this cell away. Waking it here would
+        // claim a record the move is releasing; the entry stays in shared
+        // storage and the next owner discovers it.
+        if cell.handoff {
+            self.cells.insert(id, cell);
+            return;
+        }
         cell.alarm_wake = true;
         match cell.phase {
             Phase::Inactive | Phase::Remote { .. } | Phase::Dormant { .. } => {
@@ -3933,6 +3959,10 @@ impl State {
                 cell.alarm_wake = false;
                 cell.resume_demand = false;
                 self.resuming_cells.remove(&id);
+                // A retired owner read leaves nothing to confirm.
+                if std::mem::take(&mut cell.confirming) {
+                    self.settle_confirmation(&id);
+                }
             }
             self.cells.insert(id, cell);
         }
@@ -5629,6 +5659,9 @@ impl State {
     /// thousands turns its own shutdown into the restore storm the eviction
     /// bound exists to prevent, and trips the `validate` ceiling besides.
     fn release_all(&mut self, effects: &mut Vec<Effect>) {
+        if !self.draining {
+            self.drain_handoff_ceiling = self.config.max_releases.max(self.handoffs_in_flight());
+        }
         self.draining = true;
         self.pump_release(effects);
     }
@@ -5946,6 +5979,13 @@ impl State {
             .is_none_or(|alarm| matches!(alarm, AlarmState::Armed { covered: true, .. }))
         {
             return Err(EvictRefusal::AlarmUncovered);
+        }
+        // Every handoff counts against the release bound, whichever path
+        // nominates it. The drain's own picks are already counted as
+        // quiescing; any other cell leaving during a drain is one more.
+        if self.draining && !cell.quiescing && self.handoffs_in_flight() >= self.config.max_releases
+        {
+            return Err(EvictRefusal::ConcurrencyLimit);
         }
         // The permit is taken here, so the ceiling holds here. A balancing
         // batch reserves more cells than permits, and the pump promotes
@@ -6733,6 +6773,8 @@ impl State {
             cell.waiting_for = None;
             cell.waiting_activation = None;
             cell.confirming = false;
+            // The move this mark belonged to ends with the phase it was in.
+            cell.handoff = false;
             cell.alarm = None;
             cell.alarm_wake = false;
             cell.websockets.clear();
@@ -7194,6 +7236,8 @@ fn runtime_epoch(phase: &Phase) -> Option<Epoch> {
 mod alarm_tests;
 #[cfg(test)]
 mod dead_owner_tests;
+#[cfg(test)]
+mod drain_tests;
 #[cfg(test)]
 mod fence_confirming_tests;
 #[cfg(test)]
