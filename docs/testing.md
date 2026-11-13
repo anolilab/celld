@@ -19,11 +19,12 @@ every pull request:
 - **End-to-end tests** (`crates/celld/tests/e2e/`): fixture Workers served by
   the real `celld dev` binary. They cover Durable Object storage, SQL, alarms,
   input gates and ids, plus regressions for alarms, isolate sharing and facets.
-  A WebCrypto test checks sign, verify, encrypt, decrypt, digest and derive
-  for each implemented algorithm against outputs and keys from Node's
-  WebCrypto (`tests/fixtures/webcrypto/gen-vectors.mjs`).
+  A WebCrypto test checks sign, verify, encrypt, decrypt, digest, derive and
+  key generation for each implemented algorithm, against outputs and keys
+  from Node's WebCrypto (`tests/fixtures/webcrypto/gen-vectors.mjs`), and
+  JWK, PKCS#8 and SPKI round trips for generated keys.
 - **Unit tests** in the crates, such as the input gate's admission decisions in
-  `celld-logic`.
+  `celld-logic` and the known-answer tests of node-to-node authentication.
 - **The object-store contract** (`crates/celld/tests/store_contract.rs`)
   against a local RustFS; see [below](#object-store-contract).
 - **Format, clippy and multi-platform builds.**
