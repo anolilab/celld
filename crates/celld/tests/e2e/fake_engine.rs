@@ -504,6 +504,10 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request, kill: Kill) -> Action {
             if let Some(error) = guard.resize_error.clone() {
                 return Action::Reply(500, message(&error));
             }
+            // As the daemon answers for a process that has already exited.
+            if !guard.execs.get(*id).is_some_and(|proc| proc.running) {
+                return gone("NotFound: process does not exist");
+            }
             if let Some(proc) = guard.execs.get_mut(*id) {
                 proc.size = (cols, rows);
             }
