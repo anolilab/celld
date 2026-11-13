@@ -293,7 +293,9 @@ fn write_json(settings: &Settings, results: &[LoadResult], cold: Option<&[f64]>)
         .map(PathBuf::from)
         .unwrap_or_else(|| target_dir().join("e2e-bench/results.json"));
     let mut document = json!({
-        "git_sha": git_sha(),
+        "git_sha": git(&["rev-parse", "HEAD"]),
+        // Uncommitted changes mean the binary is not exactly `git_sha`.
+        "git_dirty": git(&["status", "--porcelain"]).map(|changes| !changes.is_empty()),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "cpus": std::thread::available_parallelism().map_or(0, |n| n.get()),
@@ -332,10 +334,10 @@ fn target_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target"))
 }
 
-/// The commit the numbers belong to, or null outside a git checkout.
-fn git_sha() -> Option<String> {
+/// Trimmed output of a git command in this checkout, or `None` outside one.
+fn git(args: &[&str]) -> Option<String> {
     let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
+        .args(args)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .ok()?;

@@ -50,7 +50,7 @@ Each workload starts a fresh server on a fresh copy of its fixture
 
 ```json
 {
-  "git_sha": "…",
+  "git_sha": "…", "git_dirty": false,
   "os": "linux", "arch": "x86_64", "cpus": 4,
   "date": "2026-11-07T03:17:00Z",
   "settings": { "seconds": 10, "warmup_seconds": 2, "concurrency": 32, … },
@@ -71,4 +71,6 @@ Each workload starts a fresh server on a fresh copy of its fixture
   run exits non-zero after writing the JSON, as it does for a workload with no
   successful request at all.
 - `cold_start` is present only when the filter selects it.
-- `git_sha` is `null` outside a git checkout.
+- `git_sha` is `null` outside a git checkout. `git_dirty` is `true` when the
+  checkout had uncommitted or untracked changes, so the numbers belong to a
+  build that differs from `git_sha`.
