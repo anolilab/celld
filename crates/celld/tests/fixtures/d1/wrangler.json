@@ -4,6 +4,7 @@
   "no_bundle": true,
   "compatibility_date": "2026-01-01",
   "d1_databases": [
-    { "binding": "DB", "database_name": "ledger", "database_id": "ledger-id" }
+    { "binding": "DB", "database_name": "ledger", "database_id": "ledger-id" },
+    { "binding": "COPY", "database_name": "copy", "database_id": "copy-id" }
   ]
 }

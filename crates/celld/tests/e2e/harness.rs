@@ -102,6 +102,15 @@ impl Server {
         scope: &str,
         body: &serde_json::Value,
     ) -> (u16, serde_json::Value) {
+        let (status, text) = self.operator_text(scope, body).await;
+        let value = serde_json::from_str(&text).unwrap_or_else(|error| {
+            panic!("operator reply is not JSON ({status}): {text}: {error}")
+        });
+        (status, value)
+    }
+
+    /// [`Self::operator_call`] for a reply that is text, such as a SQL dump.
+    pub async fn operator_text(&self, scope: &str, body: &serde_json::Value) -> (u16, String) {
         let database = fs::canonicalize(self.project.join(".celld/dev"))
             .expect("resolve the dev state directory")
             .join("objects.sqlite3");
@@ -126,10 +135,7 @@ impl Server {
         let response = request.send().await.expect("send the operator request");
         let status = response.status().as_u16();
         let text = response.text().await.expect("read the operator reply");
-        let value = serde_json::from_str(&text).unwrap_or_else(|error| {
-            panic!("operator reply is not JSON ({status}): {text}: {error}")
-        });
-        (status, value)
+        (status, text)
     }
 
     /// A GET that must succeed: an error page would otherwise reach the

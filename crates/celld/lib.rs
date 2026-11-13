@@ -26,6 +26,7 @@ pub mod cli_output;
 pub mod container;
 pub mod control_plane;
 pub mod d1_cli;
+pub mod d1_export;
 pub mod dead_node_gc;
 pub mod deploy;
 pub mod dev;

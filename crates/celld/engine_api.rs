@@ -728,6 +728,9 @@ pub struct RuntimeFetch {
     /// The dispatching Worker's trace context, so the cell's span joins
     /// the caller's trace instead of rooting a disconnected one.
     pub parent: Option<crate::telemetry::TraceContext>,
+    /// The host authenticated this call as the fleet operator's; see
+    /// `DoCallReq::operator_ingress`.
+    pub operator_ingress: bool,
 }
 
 /// What a Durable Object RPC method returned, plus the position its writes

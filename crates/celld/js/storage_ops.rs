@@ -649,6 +649,24 @@ pub(super) fn op_d1_run(
     let out = storage::d1_run_json(&cell, &request);
     rv.set(v8::String::new(scope, &out).unwrap().into());
 }
+/// `__d1_export(cell, request)` returns the dump as one string, not inside a
+/// JSON envelope: it can be 32 MiB, and an envelope would hold it in memory
+/// two or three more times on its way to the response.
+pub(super) fn op_d1_export(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    let request = args.get(1).to_rust_string_lossy(scope);
+    match storage::d1_export_json(&cell, &request) {
+        Ok(sql) => match v8::String::new(scope, &sql) {
+            Some(text) => rv.set(text.into()),
+            None => loader_throw(scope, "D1_ERROR: the export does not fit in a string"),
+        },
+        Err(failure) => loader_throw(scope, &format!("{}: {}", failure.family, failure.message)),
+    }
+}
 pub(super) fn op_storage_transaction_control(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,

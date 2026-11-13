@@ -157,6 +157,10 @@ pub struct DoCallReq {
     /// The dispatching handler's trace context, read from CPED at the
     /// call site, so the cell's span joins the caller's trace.
     pub parent: Option<crate::telemetry::TraceContext>,
+    /// Set only by host code that has authenticated the caller as the fleet
+    /// operator (the signed `/runtime/` route). A script's own call never sets
+    /// it, so the cell can tell an operator's request from a Worker's.
+    pub operator_ingress: bool,
 }
 static DO_CALL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<DoCallReq>> = OnceLock::new();
 
@@ -456,6 +460,9 @@ pub enum CellJob {
         /// Where this call sits in its caller's order for this cell, if it
         /// came from a script rather than from a peer or the ingress.
         order: Option<CallOrder>,
+        /// The host authenticated the caller as the fleet operator. Reaches
+        /// the cell as membership in a set only the harness can add to.
+        operator_ingress: bool,
     },
     Rpc {
         request_id: Option<RequestId>,
@@ -4751,6 +4758,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
             headers,
             reply,
             order: _,
+            operator_ingress,
         } => {
             if let Err(error) = register_actor_name(tc, &scope, name.as_deref()) {
                 let _ = reply.send(Err(error));
@@ -4791,6 +4799,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                             None => v8::null(tc).into(),
                         },
                         stream_id,
+                        v8::Boolean::new(tc, operator_ingress).into(),
                     ];
                     let recv = v8::undefined(tc).into();
                     f.call(tc, recv, &arguments)
@@ -6112,6 +6121,7 @@ ops! { OP_NAMES, install_op_functions,
         "__sql_cursor_close" => storage_ops::op_sql_cursor_close,
         "__sql_database_size" => storage_ops::op_sql_database_size,
         "__d1_run" => storage_ops::op_d1_run,
+        "__d1_export" => storage_ops::op_d1_export,
         "__storage_transaction_control" => storage_ops::op_storage_transaction_control,
         "__log" => op_log,
         "__storage_put" => storage_ops::op_storage_put,
@@ -7834,6 +7844,7 @@ fn op_facet_fetch(
             headers,
             reply,
             order: None,
+            operator_ingress: false,
         };
         let driving = tokio::spawn(crate::runtime::drive_cell(
             facet.slot.affiliate(),
@@ -8089,6 +8100,7 @@ fn op_do_call_impl(
         reply: tx,
         order,
         parent: current_trace_context(scope),
+        operator_ingress: false,
     };
     let stream_service = http_stream_service();
     let id = asyncrt::enqueue(async move {
