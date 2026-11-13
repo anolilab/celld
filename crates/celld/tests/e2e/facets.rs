@@ -1,11 +1,13 @@
 use super::harness::Server;
 
-/// The fixture answers `<count>:<greeting>`.
+/// The fixture answers `<count>:<greeting>`; the greeting comes through the
+/// loopback binding's props, so it must arrive intact on every request.
 fn count(body: &str) -> u64 {
-    body.split(':')
-        .next()
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("unexpected facet response {body:?}"))
+    match body.split_once(':') {
+        Some((n, "hello, facet")) => n.parse().ok(),
+        _ => None,
+    }
+    .unwrap_or_else(|| panic!("unexpected facet response {body:?}"))
 }
 
 #[tokio::test]
