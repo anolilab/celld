@@ -416,7 +416,7 @@ fn collect_python_modules(
              `uv run pywrangler sync` to restore the Workers SDK"
         )
     })?;
-    let digest = format!("{:x}", Sha256::digest(entrypoints));
+    let digest = crate::control_plane::hex(&Sha256::digest(entrypoints));
     for (path, bytes) in vendored {
         files.insert(format!("python_modules/{path}"), bytes);
     }
@@ -503,7 +503,7 @@ fn sentinel_bytes(loader: &[u8]) -> anyhow::Result<Vec<u8>> {
             .find('"')
             .ok_or_else(|| anyhow!("unterminated sentinel in pyodide.mjs"))?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(&loader[start..end])?;
-    if format!("{:x}", Sha256::digest(&bytes)) != SENTINEL_SHA256 {
+    if crate::control_plane::hex(&Sha256::digest(&bytes)) != SENTINEL_SHA256 {
         bail!("pyodide.mjs carries an unexpected sentinel program");
     }
     Ok(bytes)
@@ -528,7 +528,7 @@ fn runtime_directory() -> anyhow::Result<PathBuf> {
 fn runtime_files() -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
     let directory = runtime_directory()?;
     let verified = |bytes: &[u8], size: u64, sha256: &str| {
-        bytes.len() as u64 == size && format!("{:x}", Sha256::digest(bytes)) == sha256
+        bytes.len() as u64 == size && crate::control_plane::hex(&Sha256::digest(bytes)) == sha256
     };
     let mut files = BTreeMap::new();
     let mut missing = Vec::new();

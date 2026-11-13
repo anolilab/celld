@@ -82,6 +82,12 @@ const REFERENCE = {
 const message = Buffer.from("celld node:crypto vector");
 const tampered = Buffer.from("celld node:crypto vectoR");
 
+// OpenSSL's traditional DSA PEM, which Node cannot write, and Node's PKCS#8
+// reading of it. Written by `openssl pkey -traditional`, outside the
+// generated block because gen-reference.mjs has no DSA writer.
+const DSA_TRADITIONAL = "-----BEGIN DSA PRIVATE KEY-----\nMIIDTwIBAAKCAQEA1U2rGMDpTQCTmPs3GlOVfiXE3bXnzk0AjSwfYIlK3RtkDZvN\no9uBAH0aZzpMaEor1QIrhhp9Oo9jUoxDKHk2j5r4GNlhlGfkpJETTXHQqZh0oLiF\nfvgoR3f+/qA3utnOIC9TTB83LB2s3AiiNEU3pIgQrKxPJE+XbOAxHWXVolqcAxUD\n7D6o+ZNzlpc4aEL+3eqQ8naUzXIgNyEJW5i+/nHEtsSaHK3yGwszOV2v2uZPY2N+\nNyC4glj4ZHPQdRiOUEqQpCBkxf/HLgK1pJAfiZTpcVse73RzOFxByoDzoP791MJn\nH/HlF+IqQS1Tcqy73ZcsA2cyFXOFRKBInof8hQIdAOnwiUfvGU4NkbhoicUZcLLO\nJp2ojvZVWVNIRjcCggEAOaIoE6n9g60n1DT5Ja2/QvU0Ky5D7wlyGoRH+KY/EK8R\nGgwBN1IAtG8YFHsrFcf5XSrRRTZAzy5h+lkxAx2UeZ0+NtBCoONswcE+XKwV8LCS\n6ZUc1XvBjxh2aYai3nHPvjnmua6nzBuKygo/5UHBENzN/RcCg5BtiG8NiJfS3c04\nS4Ww2ghTUFBQxPch7UnXOPdi0ocsqFq+x9S9b1Wkk3RhiJc1FE9tCG6i9jR68FLM\nyghekYbOy+GRpnPl7ckaveEbgCYnF0Y1PwtSHdzHj/FoQA3a58Xyn+7TD0slzldn\n9Uh8Gi+8WKt9TdkibQubQeheBv0i9N+2thOEv35DxAKCAQEAme90UHASvka4jSVZ\ncMQzEpVHbNRr2haBEdpGQQzbtLjX7k2by9oL1jqJ33ZvzexoGTV2HAKV84MdIieF\nAO9MKJI/bOYu9e8Ql5xZ74DqH0I8A4bVb3DJ2YeOVb4y0bkJKUIN1AqPoNBFxTHV\nR1NyE9Ylah/7rkn/lELkICTPJBeMHs84P5dyC9Znu15H3+s7LDq30KIMs0MUU6uD\netncTT9kr34tqS6KOv/pEtX9lZXBNc7AWqEukDSFhlPfOWvcpNICfcRdQeBpDPhg\ngH0g6N568VhxKDWoMF6fVttvRRLj7gFzmbBJRIJsjzjhCnZJHQ32qDQ8xdqWmFPW\n7BYsuQIdANzSXvJKEADAg/tzawMTaxD2D2/2c0bvRGbeHhc=\n-----END DSA PRIVATE KEY-----\n";
+const DSA_PKCS8 = "-----BEGIN PRIVATE KEY-----\nMIICXQIBADCCAjUGByqGSM44BAEwggIoAoIBAQDVTasYwOlNAJOY+zcaU5V+JcTd\ntefOTQCNLB9giUrdG2QNm82j24EAfRpnOkxoSivVAiuGGn06j2NSjEMoeTaPmvgY\n2WGUZ+SkkRNNcdCpmHSguIV++ChHd/7+oDe62c4gL1NMHzcsHazcCKI0RTekiBCs\nrE8kT5ds4DEdZdWiWpwDFQPsPqj5k3OWlzhoQv7d6pDydpTNciA3IQlbmL7+ccS2\nxJocrfIbCzM5Xa/a5k9jY343ILiCWPhkc9B1GI5QSpCkIGTF/8cuArWkkB+JlOlx\nWx7vdHM4XEHKgPOg/v3Uwmcf8eUX4ipBLVNyrLvdlywDZzIVc4VEoEieh/yFAh0A\n6fCJR+8ZTg2RuGiJxRlwss4mnaiO9lVZU0hGNwKCAQA5oigTqf2DrSfUNPklrb9C\n9TQrLkPvCXIahEf4pj8QrxEaDAE3UgC0bxgUeysVx/ldKtFFNkDPLmH6WTEDHZR5\nnT420EKg42zBwT5crBXwsJLplRzVe8GPGHZphqLecc++Oea5rqfMG4rKCj/lQcEQ\n3M39FwKDkG2Ibw2Il9LdzThLhbDaCFNQUFDE9yHtSdc492LShyyoWr7H1L1vVaST\ndGGIlzUUT20IbqL2NHrwUszKCF6Rhs7L4ZGmc+XtyRq94RuAJicXRjU/C1Id3MeP\n8WhADdrnxfKf7tMPSyXOV2f1SHwaL7xYq31N2SJtC5tB6F4G/SL037a2E4S/fkPE\nBB8CHQDc0l7yShAAwIP7c2sDE2sQ9g9v9nNG70Rm3h4X\n-----END PRIVATE KEY-----\n";
+
 // Deterministic results. gen-reference.mjs runs this same function under
 // Node and stores its answers in REFERENCE; the fixture runs it here and
 // compares, so every expected value comes from Node's implementation.
@@ -165,7 +171,7 @@ const checks = {
     // Each case names the key details Node reports for what was asked for,
     // so a generator that ignores the curve or the length fails here.
     const cases = [
-      ["rsa", { modulusLength: 1024 }, "sha256", { modulusLength: 1024 }],
+      ["rsa", { modulusLength: 1024 }, "sha256", { modulusLength: 1024, publicExponent: 65537n }],
       ["ec", { namedCurve: "P-256" }, "sha256", { namedCurve: "prime256v1" }],
       ["ec", { namedCurve: "secp384r1" }, "sha384", { namedCurve: "secp384r1" }],
       ["ec", { namedCurve: "P-521" }, "sha512", { namedCurve: "secp521r1" }],
@@ -191,6 +197,19 @@ const checks = {
       const again = crypto.sign(hash, message, crypto.createPrivateKey(pem));
       equal(crypto.verify(hash, message, a.publicKey, again), true, `${type}: verifies after a PEM round trip`);
     }
+  },
+  "private key round trips"() {
+    const pem = KEYS.rsa.private;
+    const rsa = crypto.createPrivateKey(pem);
+    const jwk = rsa.export({ format: "jwk" });
+    equal(crypto.createPrivateKey({ key: jwk, format: "jwk" }).export({ type: "pkcs8", format: "pem" }), pem, "RSA private JWK");
+    for (const cipher of ["aes-128-cbc", "aes-256-cbc"]) {
+      const sealed = rsa.export({ type: "pkcs8", format: "pem", cipher, passphrase: "secret" });
+      equal(crypto.createPrivateKey({ key: sealed, passphrase: "secret" }).export({ type: "pkcs8", format: "pem" }), pem, `encrypted PKCS#8 ${cipher}`);
+    }
+    const dsa = crypto.createPrivateKey(DSA_TRADITIONAL);
+    equal(dsa.export({ type: "pkcs8", format: "pem" }), DSA_PKCS8, "traditional DSA as PKCS#8");
+    equal(`${dsa.asymmetricKeyDetails.modulusLength}/${dsa.asymmetricKeyDetails.divisorLength}`, "2048/224", "traditional DSA sizes");
   },
   "random and comparison"() {
     equal(crypto.randomBytes(32).length, 32, "randomBytes length");

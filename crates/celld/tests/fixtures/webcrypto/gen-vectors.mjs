@@ -71,6 +71,33 @@ for (const [curve, hash] of [["P-521", "SHA-256"], ["P-384", "SHA-256"], ["P-256
   out[`ECDSA ${curve} ${hash}`] = { ...strip(ecdsa), curve, hash, signature: hex(await subtle.sign({ name: "ECDSA", hash }, ecdsa.keys.privateKey, message)) };
 }
 
+// Every hash the other algorithms take, so each dispatch arm is pinned.
+for (const hash of ["SHA-1", "SHA-384", "SHA-512"]) {
+  const key = await subtle.importKey("raw", bytes("Jefe"), { name: "HMAC", hash }, false, ["sign"]);
+  out[`hmac ${hash}`] = hex(await subtle.sign("HMAC", key, message));
+  const p = await subtle.importKey("raw", bytes("passwd"), "PBKDF2", false, ["deriveBits"]);
+  out[`pbkdf2 ${hash}`] = hex(await subtle.deriveBits({ name: "PBKDF2", hash, salt: bytes("salt"), iterations: 2 }, p, 256));
+  const h = await subtle.importKey("raw", bytes("ikm"), "HKDF", false, ["deriveBits"]);
+  out[`hkdf ${hash}`] = hex(await subtle.deriveBits({ name: "HKDF", hash, salt: bytes("salt"), info: bytes("info") }, h, 256));
+}
+for (const hash of ["SHA-1", "SHA-384", "SHA-512"]) {
+  const o = await pair({ name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash }, ["encrypt", "decrypt"]);
+  out[`RSA-OAEP ${hash}`] = { pkcs8: o.pkcs8, hash, ciphertext: hex(await subtle.encrypt({ name: "RSA-OAEP" }, o.keys.publicKey, message)) };
+}
+const aes256 = Uint8Array.from({ length: 32 }, (_, i) => i);
+const aesWith = async (name, raw, params) => {
+  const key = await subtle.importKey("raw", raw, name, false, ["encrypt"]);
+  return hex(await subtle.encrypt({ name, ...params }, key, message));
+};
+out["AES-256-GCM"] = await aesWith("AES-GCM", aes256, { iv: iv.slice(0, 12) });
+out["AES-256-CBC"] = await aesWith("AES-CBC", aes256, { iv });
+out["AES-256-CTR"] = await aesWith("AES-CTR", aes256, { counter: iv, length: 64 });
+for (const tagLength of [96, 112]) {
+  out[`AES-GCM tag ${tagLength}`] = await aesWith("AES-GCM", aesKey, { iv: iv.slice(0, 12), tagLength });
+}
+// The private JWK of the PKCS#1 v1.5 key above, member by member.
+out["RSA private JWK"] = await subtle.exportKey("jwk", await subtle.importKey("pkcs8", Buffer.from(out["RSASSA-PKCS1-v1_5"].pkcs8, "hex"), { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, true, ["sign"]));
+
 const ed = await pair({ name: "Ed25519" }, ["sign", "verify"]);
 out.Ed25519 = { ...strip(ed), signature: hex(await subtle.sign("Ed25519", ed.keys.privateKey, message)) };
 

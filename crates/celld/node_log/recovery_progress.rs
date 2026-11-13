@@ -72,7 +72,10 @@ impl Progress {
                 // Content-addressing keeps interrupted or corrupt metadata
                 // from over-reporting coverage. Unknown versions are hints
                 // we cannot use, not a reason to refuse a recoverable log.
-                let digest = format!("{:x}.json", sha2::Sha256::digest(&bytes));
+                let digest = format!(
+                    "{}.json",
+                    crate::control_plane::hex(&sha2::Sha256::digest(&bytes))
+                );
                 anyhow::ensure!(
                     key.rsplit('/').next() == Some(digest.as_str()),
                     "checkpoint digest mismatch"
@@ -138,7 +141,11 @@ impl Progress {
         };
         let write = async {
             let bytes = serde_json::to_vec(&checkpoint)?;
-            let key = format!("{}{:x}.json", self.prefix, sha2::Sha256::digest(&bytes));
+            let key = format!(
+                "{}{}.json",
+                self.prefix,
+                crate::control_plane::hex(&sha2::Sha256::digest(&bytes))
+            );
             bucket.put(&key, bytes).await
         };
         if let Err(error) = asyncrt::timeout(IO_TIMEOUT, write)

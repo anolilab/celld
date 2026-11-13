@@ -1584,5 +1584,5 @@ fn address_of(info: &Value) -> Address {
 fn container_name(node: &str, scope: &str) -> String {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(format!("{node}\n{scope}").as_bytes());
-    format!("celld-{:x}", digest)[..30].to_string()
+    format!("celld-{}", crate::control_plane::hex(&digest))[..30].to_string()
 }

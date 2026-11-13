@@ -153,7 +153,7 @@ impl AssetResolver {
                 bucket.name
             )
         })?;
-        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let sha256 = crate::control_plane::hex(&Sha256::digest(&bytes));
         if sha256 != reference.sha256 {
             return Err(anyhow!("asset index checksum mismatch"));
         }
@@ -607,7 +607,7 @@ impl AssetResolver {
             .get(&index_key)
             .await?
             .with_context(|| format!("read {index_key}"))?;
-        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let sha256 = crate::control_plane::hex(&Sha256::digest(&bytes));
         if sha256 != reference.sha256 {
             return Err(anyhow!("fallback asset index checksum mismatch"));
         }
@@ -713,7 +713,7 @@ impl AssetResolver {
             return Err(error);
         }
         drop(file);
-        let actual = format!("{:x}", Sha256::digest(&body));
+        let actual = crate::control_plane::hex(&Sha256::digest(&body));
         if actual != entry.sha256 {
             let _ = tokio::fs::remove_file(&temporary).await;
             return Err(anyhow!(

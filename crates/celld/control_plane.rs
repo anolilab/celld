@@ -1468,7 +1468,7 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> (String, bool) {
     (value[..end].to_string(), true)
 }
 
-fn hex(value: &[u8]) -> String {
+pub(crate) fn hex(value: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(value.len() * 2);
     for byte in value {
@@ -1786,7 +1786,7 @@ pub async fn apply_deployment(
             ));
         }
         let index_bytes = response.bytes().await?;
-        let index_hash = format!("{:x}", Sha256::digest(&index_bytes));
+        let index_hash = hex(&Sha256::digest(&index_bytes));
         if index_hash != assets.sha256 {
             return Err(anyhow!("asset index checksum mismatch"));
         }
@@ -1845,7 +1845,7 @@ pub async fn apply_deployment(
             if body.len() as u64 != *bytes {
                 return Err(anyhow!("asset blob {sha256} size mismatch"));
             }
-            let hash = format!("{:x}", Sha256::digest(&body));
+            let hash = hex(&Sha256::digest(&body));
             if hash != *sha256 {
                 return Err(anyhow!("asset blob {sha256} checksum mismatch"));
             }
@@ -1893,7 +1893,7 @@ pub async fn apply_deployment(
         if bytes.len() != expected_bytes {
             return Err(anyhow!("module {} size mismatch", module.name));
         }
-        let hash = format!("{:x}", Sha256::digest(&bytes));
+        let hash = hex(&Sha256::digest(&bytes));
         if hash != module.sha256 {
             return Err(anyhow!("module {} checksum mismatch", module.name));
         }

@@ -265,8 +265,8 @@ impl PeerAuth {
             "{DOMAIN}\n{PROTOCOL_VERSION}\n{method}\n{path_and_query}\n{body_hash}\n\
              {source}\n{target}\n{timestamp}\n{nonce}"
         );
-        let mut mac =
-            <Hmac<Sha256> as Mac>::new_from_slice(&self.key).expect("HMAC accepts a 32-byte key");
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&self.key)
+            .expect("HMAC accepts a 32-byte key");
         mac.update(canonical.as_bytes());
         mac
     }

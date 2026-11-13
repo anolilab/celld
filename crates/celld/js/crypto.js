@@ -93,13 +93,7 @@
   }
 
   function _rsaOaepLabel(algorithm) {
-    const label = _toBuf(algorithm?.label ?? new Uint8Array());
-    try {
-      new TextDecoder("utf-8", { fatal: true }).decode(label);
-    } catch {
-      throw _notSupported("RSA-OAEP labels must contain UTF-8 bytes");
-    }
-    return Array.from(label);
+    return Array.from(_toBuf(algorithm?.label ?? new Uint8Array()));
   }
 
   class CryptoKey {

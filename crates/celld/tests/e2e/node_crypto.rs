@@ -12,7 +12,7 @@ async fn node_crypto_matches_node() {
     let results: BTreeMap<String, String> = server.get_json("/").await;
     assert_eq!(
         results.len(),
-        5,
+        6,
         "the fixture ran a different set of checks: {results:#?}"
     );
     let failed: Vec<_> = results

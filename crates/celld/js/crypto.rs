@@ -13,7 +13,7 @@ fn crypto_bytes(value: &serde_json::Value, name: &str) -> Result<Vec<u8>> {
         .map_err(|_| anyhow!("invalid {name} bytes"))
 }
 
-fn rsa_jwk_uint(value: &serde_json::Value, name: &str) -> Result<rsa::BigUint> {
+fn rsa_jwk_uint(value: &serde_json::Value, name: &str) -> Result<rsa::BoxedUint> {
     use base64::Engine;
     let encoded = value
         .get(name)
@@ -22,38 +22,51 @@ fn rsa_jwk_uint(value: &serde_json::Value, name: &str) -> Result<rsa::BigUint> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|_| anyhow!("invalid RSA JWK {name}"))?;
-    Ok(rsa::BigUint::from_bytes_be(&bytes))
+    Ok(rsa::BoxedUint::from_be_slice_vartime(&bytes))
 }
 
-fn rsa_jwk_encode(value: &rsa::BigUint) -> String {
+fn rsa_jwk_encode(value: &rsa::BoxedUint) -> String {
     use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_bytes_be())
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_be_bytes_trimmed_vartime())
 }
 
-fn rsa_oaep_padding(hash: &str, label: Vec<u8>) -> Result<rsa::Oaep> {
-    let label = if label.is_empty() {
-        None
-    } else {
-        Some(
-            String::from_utf8(label)
-                .map_err(|_| anyhow!("RSA-OAEP labels must contain UTF-8 bytes"))?,
-        )
-    };
-    macro_rules! padding {
-        ($digest:ty) => {
-            match label {
-                Some(label) => rsa::Oaep::new_with_label::<$digest, _>(label),
-                None => rsa::Oaep::new::<$digest>(),
-            }
-        };
-    }
-    Ok(match hash {
-        "SHA-1" => padding!(sha1::Sha1),
-        "SHA-256" => padding!(sha2::Sha256),
-        "SHA-384" => padding!(sha2::Sha384),
-        "SHA-512" => padding!(sha2::Sha512),
-        other => return Err(anyhow!("unsupported RSA-OAEP hash {other}")),
-    })
+/// `e` as a number. rsa refuses any key whose exponent exceeds 2^33 - 1, so
+/// every parsed key's fits; `BoxedUint`'s own `Display` is zero-padded hex.
+fn rsa_exponent(e: &rsa::BoxedUint) -> u64 {
+    e.to_be_bytes_trimmed_vartime()
+        .iter()
+        .fold(0, |acc, byte| acc << 8 | u64::from(*byte))
+}
+
+/// The OS RNG in the `rand_core` 0.10 shape the RustCrypto crates take.
+fn os_rng() -> getrandom::rand_core::UnwrapErr<getrandom::SysRng> {
+    getrandom::rand_core::UnwrapErr(getrandom::SysRng)
+}
+
+/// Runs `$op` with the `rsa::Oaep` padding for a WebCrypto hash name. The
+/// padding is generic over its digest, so the hash is picked here rather than
+/// returned as one type.
+macro_rules! with_oaep {
+    ($hash:expr, $label:expr, |$padding:ident| $op:expr) => {{
+        let label: Vec<u8> = $label;
+        let label = (!label.is_empty()).then(|| label.into_boxed_slice());
+        macro_rules! run {
+            ($digest:ty) => {{
+                let $padding = match label {
+                    Some(label) => rsa::Oaep::<$digest>::new_with_label(label),
+                    None => rsa::Oaep::<$digest>::new(),
+                };
+                $op
+            }};
+        }
+        match $hash {
+            "SHA-1" => run!(sha1::Sha1),
+            "SHA-256" => run!(sha2::Sha256),
+            "SHA-384" => run!(sha2::Sha384),
+            "SHA-512" => run!(sha2::Sha512),
+            other => return Err(anyhow!("unsupported RSA-OAEP hash {other}")),
+        }
+    }};
 }
 
 fn digest_bytes(hash: &str, data: &[u8]) -> Result<Vec<u8>> {
@@ -173,7 +186,7 @@ fn x25519_material(der: &[u8], private: bool) -> Result<[u8; 32]> {
     use rsa::pkcs8::der::Decode;
 
     let raw = if private {
-        let info = rsa::pkcs8::PrivateKeyInfo::from_der(der)
+        let info = rsa::pkcs8::PrivateKeyInfoRef::from_der(der)
             .map_err(|_| anyhow!("invalid X25519 private key"))?;
         if info.algorithm.oid != X25519_OID {
             return Err(anyhow!("not an X25519 private key"));
@@ -181,7 +194,7 @@ fn x25519_material(der: &[u8], private: bool) -> Result<[u8; 32]> {
         // RFC 8410 wraps the scalar in a second OCTET STRING inside the
         // PKCS#8 privateKey field, so that header comes off before the
         // length test.
-        rsa::pkcs8::der::asn1::OctetStringRef::from_der(info.private_key)
+        <&rsa::pkcs8::der::asn1::OctetStringRef>::from_der(info.private_key.as_bytes())
             .map_err(|_| anyhow!("invalid X25519 private key"))?
             .as_bytes()
             .to_vec()
@@ -267,11 +280,11 @@ const PBES2_ITERATIONS: u32 = 2048;
 /// The cipher name arrives lower-cased from `node_crypto.js`, which is also
 /// where an unwritable cipher is refused. A name that reaches the fallback
 /// arm here is a bug on that side, not caller input.
-fn pbes2_parameters<'a>(
+fn pbes2_parameters(
     cipher: &str,
-    salt: &'a [u8],
-    iv: &'a [u8; 16],
-) -> Result<pkcs8::pkcs5::pbes2::Parameters<'a>> {
+    salt: &[u8],
+    iv: [u8; 16],
+) -> Result<pkcs8::pkcs5::pbes2::Parameters> {
     use pkcs8::pkcs5::pbes2::{EncryptionScheme, Parameters, Pbkdf2Params};
 
     let encryption = match cipher {
@@ -280,7 +293,7 @@ fn pbes2_parameters<'a>(
         "aes-256-cbc" => EncryptionScheme::Aes256Cbc { iv },
         other => return Err(anyhow!("unsupported cipher {other}")),
     };
-    let kdf = Pbkdf2Params::hmac_with_sha256(PBES2_ITERATIONS, salt)
+    let kdf = Pbkdf2Params::hmac_sha256(PBES2_ITERATIONS, salt)
         .map_err(|_| anyhow!("invalid PBKDF2 parameters"))?;
     Ok(Parameters {
         kdf: kdf.into(),
@@ -295,7 +308,7 @@ fn describe_key(der: &[u8], private: bool) -> Result<ParsedKey> {
     use rsa::traits::PublicKeyParts;
 
     let (algorithm, curve) = if private {
-        let info = rsa::pkcs8::PrivateKeyInfo::from_der(der)
+        let info = rsa::pkcs8::PrivateKeyInfoRef::from_der(der)
             .map_err(|_| anyhow!("invalid PKCS#8 private key"))?;
         (info.algorithm.oid, info.algorithm.parameters_oid().ok())
     } else {
@@ -310,14 +323,14 @@ fn describe_key(der: &[u8], private: bool) -> Result<ParsedKey> {
             // be parsed rather than merely recognized.
             let (modulus, exponent) = if private {
                 use rsa::pkcs8::DecodePrivateKey;
-                let key = rsa::RsaPrivateKey::from_pkcs8_der(der)
+                let key = rsa::PrivateKey::from_pkcs8_der(der)
                     .map_err(|_| anyhow!("invalid RSA private key"))?;
-                (key.n().bits(), key.e().clone())
+                (key.n().bit_width(), rsa_exponent(key.e()))
             } else {
                 use rsa::pkcs8::DecodePublicKey;
-                let key = rsa::RsaPublicKey::from_public_key_der(der)
+                let key = rsa::PublicKey::from_public_key_der(der)
                     .map_err(|_| anyhow!("invalid RSA public key"))?;
-                (key.n().bits(), key.e().clone())
+                (key.n().bit_width(), rsa_exponent(key.e()))
             };
             Ok(ParsedKey {
                 kind: "rsa",
@@ -352,7 +365,8 @@ fn describe_key(der: &[u8], private: bool) -> Result<ParsedKey> {
             use dsa::pkcs8::DecodePrivateKey;
             use dsa::pkcs8::DecodePublicKey;
             use dsa::Components;
-            let sizes = |components: &Components| (components.p().bits(), components.q().bits());
+            let sizes =
+                |components: &Components| (components.p().bit_width(), components.q().bit_width());
             let (modulus, divisor) = if private {
                 let key = dsa::SigningKey::from_pkcs8_der(der)
                     .map_err(|_| anyhow!("invalid DSA private key"))?;
@@ -416,13 +430,13 @@ fn normalize_key(der: &[u8], structure: &str) -> Result<(Vec<u8>, bool)> {
         "spki" => Ok((der.to_vec(), false)),
         "pkcs1" => {
             use rsa::pkcs1::DecodeRsaPrivateKey;
-            let key = rsa::RsaPrivateKey::from_pkcs1_der(der)
+            let key = rsa::PrivateKey::from_pkcs1_der(der)
                 .map_err(|_| anyhow!("invalid PKCS#1 RSA private key"))?;
             Ok((key.to_pkcs8_der()?.as_bytes().to_vec(), true))
         }
         "pkcs1-public" => {
             use rsa::pkcs1::DecodeRsaPublicKey;
-            let key = rsa::RsaPublicKey::from_pkcs1_der(der)
+            let key = rsa::PublicKey::from_pkcs1_der(der)
                 .map_err(|_| anyhow!("invalid PKCS#1 RSA public key"))?;
             Ok((key.to_public_key_der()?.as_bytes().to_vec(), false))
         }
@@ -438,13 +452,21 @@ fn normalize_key(der: &[u8], structure: &str) -> Result<(Vec<u8>, bool)> {
             let key = reader
                 .sequence(|seq| {
                     let _version = UintRef::decode(seq)?;
-                    let mut field = || -> Result<rsa::BigUint, dsa::pkcs8::der::Error> {
-                        Ok(rsa::BigUint::from_bytes_be(
-                            UintRef::decode(seq)?.as_bytes(),
-                        ))
-                    };
+                    let mut field = || UintRef::decode(seq).map(|uint| uint.as_bytes().to_vec());
                     let (p, q, g, y, x) = (field()?, field()?, field()?, field()?, field()?);
-                    let bad = || dsa::pkcs8::der::Tag::Sequence.value_error();
+                    let bad = || {
+                        dsa::pkcs8::der::Error::from(dsa::pkcs8::der::Tag::Sequence.value_error())
+                    };
+                    // Every DSA operation is mod p, so y and x take its
+                    // precision, as dsa does when it decodes its own PKCS#8.
+                    let p = dsa::BoxedUint::from_be_slice_vartime(&p);
+                    let precision = p.bits_precision();
+                    let at_p = |bytes: &[u8]| {
+                        dsa::BoxedUint::from_be_slice(bytes, precision).map_err(|_| bad())
+                    };
+                    let (y, x) = (at_p(&y)?, at_p(&x)?);
+                    let q = dsa::BoxedUint::from_be_slice_vartime(&q);
+                    let g = dsa::BoxedUint::from_be_slice_vartime(&g);
                     let components =
                         dsa::Components::from_components(p, q, g).map_err(|_| bad())?;
                     let verifying =
@@ -537,11 +559,11 @@ fn key_from_jwk(jwk: &serde_json::Value, want_private: bool) -> Result<Vec<u8>> 
                 let d = rsa_jwk_uint(jwk, "d")?;
                 let p = rsa_jwk_uint(jwk, "p")?;
                 let q = rsa_jwk_uint(jwk, "q")?;
-                let mut key = rsa::RsaPrivateKey::from_components(n, e, d, vec![p, q])?;
+                let mut key = rsa::PrivateKey::from_components(n, e, d, vec![p, q])?;
                 key.precompute()?;
                 Ok(key.to_pkcs8_der()?.as_bytes().to_vec())
             } else {
-                let key = rsa::RsaPublicKey::new(n, e)?;
+                let key = rsa::PublicKey::new(n, e)?;
                 Ok(key.to_public_key_der()?.as_bytes().to_vec())
             }
         }
@@ -561,8 +583,8 @@ fn key_from_jwk(jwk: &serde_json::Value, want_private: bool) -> Result<Vec<u8>> 
                         // different keys, and signing with it would produce
                         // signatures nobody can verify against the x/y the
                         // caller believes they imported.
-                        use $c::elliptic_curve::sec1::ToEncodedPoint;
-                        let point = key.public_key().to_encoded_point(false);
+                        use $c::elliptic_curve::sec1::ToSec1Point;
+                        let point = key.public_key().to_sec1_point(false);
                         if point.x().map(|v| v.as_slice()) != Some(x.as_slice())
                             || point.y().map(|v| v.as_slice()) != Some(y.as_slice())
                         {
@@ -654,7 +676,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             if !hash.eq_ignore_ascii_case("SHA-256") && !hash.eq_ignore_ascii_case("SHA256") {
                 return Err(anyhow!("unsupported HMAC hash"));
             }
-            let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(&key)
+            let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::KeyInit>::new_from_slice(&key)
                 .map_err(|_| anyhow!("invalid HMAC key"))?;
             mac.update(&data);
             Ok(serde_json::json!({ "bytes": mac.finalize().into_bytes().to_vec() }))
@@ -745,7 +767,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 .get("hash")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("SHA-256");
-            let key = rsa::RsaPrivateKey::from_pkcs8_der(&key)
+            let key = rsa::PrivateKey::from_pkcs8_der(&key)
                 .map_err(|_| anyhow!("invalid RSA private key"))?;
             macro_rules! sign {
                 ($hash:ty) => {
@@ -753,7 +775,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                         // PKCS#1 v1.5 produces the same signature with or
                         // without randomness. The RNG blinds the private-key
                         // operation, so its timing does not expose the key.
-                        .try_sign_with_rng(&mut rand::rngs::OsRng, &data)
+                        .try_sign_with_rng(&mut os_rng(), &data)
                         .map_err(|_| anyhow!("RSA signing failed"))?
                         .to_vec()
                 };
@@ -814,11 +836,11 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             macro_rules! verify {
                 ($c:ident) => {{
                     use $c::ecdsa::signature::hazmat::PrehashVerifier;
-                    use $c::elliptic_curve::sec1::ToEncodedPoint;
+                    use $c::elliptic_curve::sec1::ToSec1Point;
                     use $c::pkcs8::DecodePublicKey;
                     let public = $c::PublicKey::from_public_key_der(&key)
                         .map_err(|_| anyhow!("invalid {crv} SPKI key"))?;
-                    let point = public.to_encoded_point(false);
+                    let point = public.to_sec1_point(false);
                     let key = $c::ecdsa::VerifyingKey::from_sec1_bytes(point.as_bytes())
                         .map_err(|_| anyhow!("invalid {crv} verifying key"))?;
                     let digest = ecdsa_prehash(digest, $c::FieldBytes::default().len());
@@ -850,7 +872,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("SHA-256")
                 .to_string();
-            let key = rsa::RsaPublicKey::from_public_key_der(&key)
+            let key = rsa::PublicKey::from_public_key_der(&key)
                 .map_err(|_| anyhow!("invalid RSA SPKI key"))?;
             macro_rules! verify {
                 ($hash:ty) => {{
@@ -886,12 +908,12 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 .get("hash")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("SHA-256");
-            let key = rsa::RsaPrivateKey::from_pkcs8_der(&key)
+            let key = rsa::PrivateKey::from_pkcs8_der(&key)
                 .map_err(|_| anyhow!("invalid RSA private key"))?;
             macro_rules! sign {
                 ($hash:ty) => {
                     rsa::pss::SigningKey::<$hash>::new_with_salt_len(key, salt_len)
-                        .sign_with_rng(&mut rand::rngs::OsRng, &data)
+                        .sign_with_rng(&mut os_rng(), &data)
                         .to_vec()
                 };
             }
@@ -914,7 +936,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("SHA-256")
                 .to_string();
-            let key = rsa::RsaPublicKey::from_public_key_der(&key)
+            let key = rsa::PublicKey::from_public_key_der(&key)
                 .map_err(|_| anyhow!("invalid RSA SPKI key"))?;
             macro_rules! verify {
                 ($hash:ty) => {{
@@ -941,13 +963,13 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 .get("hash")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("SHA-256");
-            let key = rsa::RsaPublicKey::from_public_key_der(&key)
+            let key = rsa::PublicKey::from_public_key_der(&key)
                 .map_err(|_| anyhow!("invalid RSA public key"))?;
-            let bytes = key.encrypt(
-                &mut rand::rngs::OsRng,
-                rsa_oaep_padding(hash, label)?,
-                &data,
-            )?;
+            let bytes = with_oaep!(hash, label, |padding| key.encrypt(
+                &mut os_rng(),
+                padding,
+                &data
+            )?);
             Ok(serde_json::json!({ "bytes": bytes }))
         }
         "rsa-oaep-decrypt" => {
@@ -959,16 +981,16 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 .get("hash")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("SHA-256");
-            let key = rsa::RsaPrivateKey::from_pkcs8_der(&key)
+            let key = rsa::PrivateKey::from_pkcs8_der(&key)
                 .map_err(|_| anyhow!("invalid RSA private key"))?;
             // The plain decrypt API omits RSA blinding. Use the randomized
             // API so repeated attacker-controlled ciphertexts do not expose
             // the private key through operation timing.
-            let bytes = key.decrypt_blinded(
-                &mut rand::rngs::OsRng,
-                rsa_oaep_padding(hash, label)?,
-                &data,
-            )?;
+            let bytes = with_oaep!(hash, label, |padding| key.decrypt_blinded(
+                &mut os_rng(),
+                padding,
+                &data
+            )?);
             Ok(serde_json::json!({ "bytes": bytes }))
         }
         // `createPublicKey` / `createPrivateKey`. Accepts every input shape
@@ -1042,7 +1064,8 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                             .map_err(|_| anyhow!("invalid PEM key"))?;
                         normalize_key(document.as_bytes(), pem_structure(label)?)?
                     }
-                } else if let Ok(sealed) = pkcs8::EncryptedPrivateKeyInfo::try_from(key.as_slice())
+                } else if let Ok(sealed) =
+                    pkcs8::EncryptedPrivateKeyInfoRef::try_from(key.as_slice())
                 {
                     // An encrypted PKCS#8 blob is its own structure, so it is
                     // recognized before the sniffer runs: the sniffer would
@@ -1085,9 +1108,9 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             let public = match parsed.kind {
                 "rsa" => {
                     use rsa::pkcs8::DecodePrivateKey;
-                    let key = rsa::RsaPrivateKey::from_pkcs8_der(&der)
+                    let key = rsa::PrivateKey::from_pkcs8_der(&der)
                         .map_err(|_| anyhow!("invalid RSA private key"))?;
-                    rsa::RsaPublicKey::from(&key)
+                    rsa::PublicKey::from(&key)
                         .to_public_key_der()?
                         .as_bytes()
                         .to_vec()
@@ -1134,7 +1157,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 .get("type")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| anyhow!("missing key type"))?;
-            let mut rng = rand::rngs::OsRng;
+            let mut rng = os_rng();
             let (private, public) = match kind {
                 "rsa" => {
                     let bits = args
@@ -1142,9 +1165,9 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                         .and_then(serde_json::Value::as_u64)
                         .ok_or_else(|| anyhow!("missing modulusLength"))?
                         as usize;
-                    let mut key = rsa::RsaPrivateKey::new(&mut rng, bits)?;
+                    let mut key = rsa::PrivateKey::new(&mut rng, bits)?;
                     key.precompute()?;
-                    let public = rsa::RsaPublicKey::from(&key);
+                    let public = rsa::PublicKey::from(&key);
                     (
                         key.to_pkcs8_der()?.as_bytes().to_vec(),
                         public.to_public_key_der()?.as_bytes().to_vec(),
@@ -1159,7 +1182,10 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                         .unwrap_or("P-256");
                     macro_rules! generate {
                         ($c:ident) => {{
-                            let key = $c::SecretKey::random(&mut rng);
+                            let key =
+                                <$c::SecretKey as $c::elliptic_curve::Generate>::generate_from_rng(
+                                    &mut rng,
+                                );
                             (
                                 $c::pkcs8::EncodePrivateKey::to_pkcs8_der(&key)?
                                     .as_bytes()
@@ -1174,19 +1200,14 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 }
                 "ed25519" => {
                     use ed25519_dalek::pkcs8::EncodePrivateKey as _;
-                    // No `generate` on this build of ed25519-dalek (its
-                    // `rand_core` feature is off); the seed is 32 random
-                    // bytes either way.
-                    let mut seed = [0u8; 32];
-                    rand::RngCore::fill_bytes(&mut rng, &mut seed);
-                    let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+                    let key = ed25519_dalek::SigningKey::generate(&mut rng);
                     (
                         key.to_pkcs8_der()?.as_bytes().to_vec(),
                         key.verifying_key().to_public_key_der()?.as_bytes().to_vec(),
                     )
                 }
                 "x25519" => {
-                    let secret = x25519_dalek::StaticSecret::random_from_rng(rng);
+                    let secret = x25519_dalek::StaticSecret::random_from_rng(&mut rng);
                     let public = x25519_dalek::PublicKey::from(&secret);
                     (
                         x25519_pkcs8(&secret.to_bytes()),
@@ -1231,7 +1252,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 if !private {
                     return Err(anyhow!("only a private key can be encrypted"));
                 }
-                let info = pkcs8::PrivateKeyInfo::try_from(der.as_slice())
+                let info = pkcs8::PrivateKeyInfoRef::try_from(der.as_slice())
                     .map_err(|_| anyhow!("invalid PKCS#8 private key"))?;
                 let cipher = args
                     .get("cipher")
@@ -1242,7 +1263,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 let mut iv = [0u8; 16];
                 rand::rngs::OsRng.fill_bytes(&mut salt);
                 rand::rngs::OsRng.fill_bytes(&mut iv);
-                let params = pbes2_parameters(cipher, &salt, &iv)?;
+                let params = pbes2_parameters(cipher, &salt, iv)?;
                 let document = info
                     .encrypt_with_params(params, &passphrase)
                     .map_err(|_| anyhow!("could not encrypt the private key"))?;
@@ -1263,12 +1284,12 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 ("spki", _) => ("PUBLIC KEY", der.clone()),
                 ("pkcs1", "rsa") if private => {
                     use rsa::pkcs8::DecodePrivateKey;
-                    let key = rsa::RsaPrivateKey::from_pkcs8_der(&der)?;
+                    let key = rsa::PrivateKey::from_pkcs8_der(&der)?;
                     ("RSA PRIVATE KEY", key.to_pkcs1_der()?.as_bytes().to_vec())
                 }
                 ("pkcs1", "rsa") => {
                     use rsa::pkcs8::DecodePublicKey;
-                    let key = rsa::RsaPublicKey::from_public_key_der(&der)?;
+                    let key = rsa::PublicKey::from_public_key_der(&der)?;
                     ("RSA PUBLIC KEY", key.to_pkcs1_der()?.as_bytes().to_vec())
                 }
                 // With the curve named in `parameters`, as OpenSSL writes it:
@@ -1283,11 +1304,11 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                         .ok_or_else(|| anyhow!("unsupported EC curve {crv}"))?;
                     macro_rules! sec1 {
                         ($c:ident) => {{
-                            use $c::elliptic_curve::sec1::ToEncodedPoint;
+                            use $c::elliptic_curve::sec1::ToSec1Point;
                             use $c::pkcs8::DecodePrivateKey;
                             let key = $c::SecretKey::from_pkcs8_der(&der)?;
                             let private = key.to_bytes();
-                            let public = key.public_key().to_encoded_point(false);
+                            let public = key.public_key().to_sec1_point(false);
                             sec1::EcPrivateKey {
                                 private_key: &private,
                                 parameters: Some(sec1::EcParameters::NamedCurve(oid)),
@@ -1346,7 +1367,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 ("rsa", false) => {
                     use rsa::pkcs8::DecodePublicKey;
                     use rsa::traits::PublicKeyParts;
-                    let key = rsa::RsaPublicKey::from_public_key_der(&der)?;
+                    let key = rsa::PublicKey::from_public_key_der(&der)?;
                     serde_json::json!({
                         "kty": "RSA",
                         "n": rsa_jwk_encode(key.n()),
@@ -1356,7 +1377,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 ("rsa", true) => {
                     use rsa::pkcs8::DecodePrivateKey;
                     use rsa::traits::{PrivateKeyParts, PublicKeyParts};
-                    let key = rsa::RsaPrivateKey::from_pkcs8_der(&der)?;
+                    let key = rsa::PrivateKey::from_pkcs8_der(&der)?;
                     // The CRT parameters are part of the JWK, not an
                     // optimization detail: Node emits all of dp, dq and qi.
                     let missing = || anyhow!("RSA key has no CRT parameters");
@@ -1376,10 +1397,10 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                     let crv = ec_jwk_crv(&parsed)?;
                     macro_rules! export {
                         ($c:ident) => {{
-                            use $c::elliptic_curve::sec1::ToEncodedPoint;
+                            use $c::elliptic_curve::sec1::ToSec1Point;
                             use $c::pkcs8::DecodePublicKey;
                             let key = $c::PublicKey::from_public_key_der(&der)?;
-                            let point = key.to_encoded_point(false);
+                            let point = key.to_sec1_point(false);
                             serde_json::json!({
                                 "kty": "EC",
                                 "crv": crv,
@@ -1394,10 +1415,10 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                     let crv = ec_jwk_crv(&parsed)?;
                     macro_rules! export {
                         ($c:ident) => {{
-                            use $c::elliptic_curve::sec1::ToEncodedPoint;
+                            use $c::elliptic_curve::sec1::ToSec1Point;
                             use $c::pkcs8::DecodePrivateKey;
                             let key = $c::SecretKey::from_pkcs8_der(&der)?;
-                            let point = key.public_key().to_encoded_point(false);
+                            let point = key.public_key().to_sec1_point(false);
                             serde_json::json!({
                                 "kty": "EC",
                                 "crv": crv,
@@ -1588,7 +1609,7 @@ pub(super) fn op_webcrypto_hmac_sign(
     };
     macro_rules! sign {
         ($digest:ty) => {{
-            let Ok(mut mac) = <hmac::Hmac<$digest> as hmac::Mac>::new_from_slice(&key) else {
+            let Ok(mut mac) = <hmac::Hmac<$digest> as hmac::KeyInit>::new_from_slice(&key) else {
                 return;
             };
             mac.update(&data);
@@ -1597,58 +1618,6 @@ pub(super) fn op_webcrypto_hmac_sign(
     }
     let signature = dispatch_hmac_digest!(algorithm.as_str(), sign);
     webcrypto_return_bytes(scope, rv, &signature);
-}
-
-/// The digest bound `hmac::Hmac` carries: a digest whose core exposes the
-/// eager, block-level API. Naming it once keeps the two KDF signatures below
-/// readable, because `pbkdf2::pbkdf2_hmac` and `hkdf::Hkdf` both spell out the
-/// same eight lines. Every digest `dispatch_digest!` routes — MD5, SHA-1 and
-/// the four SHA-2 sizes — satisfies it, and a digest that did not would fail
-/// to compile at the macro rather than fall back to something slower.
-///
-/// `hmac::SimpleHmac` needs only `Digest + BlockSizeUser` and would let this
-/// bound go away, but it drives the digest through the generic `Digest`
-/// wrapper instead of the core, which is why it is the slower of the two.
-/// `op_webcrypto_hmac_sign` and `op_webcrypto_hmac_verify` in this file
-/// already use `Hmac`.
-///
-/// A bare `trait EagerDigest: CoreProxy where Self::Core: ...` does not work:
-/// a where-clause on a trait definition constrains implementors but is not
-/// elaborated for callers, so `D: EagerDigest` alone would not discharge the
-/// bound at the `pbkdf2_hmac` and `Hkdf` call sites. Carrying the two KDF
-/// entry points as trait methods discharges it inside the impl instead, which
-/// is the only reason this is a trait with methods rather than an alias.
-trait EagerDigest {
-    fn pbkdf2_into(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]);
-
-    /// `None` only when `out` is longer than the 255×hashLen of RFC 5869.
-    fn hkdf_into(ikm: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) -> Option<()>;
-}
-
-impl<D> EagerDigest for D
-where
-    D: hmac::digest::core_api::CoreProxy + hmac::digest::OutputSizeUser,
-    D::Core: hmac::digest::HashMarker
-        + hmac::digest::core_api::UpdateCore
-        + hmac::digest::core_api::FixedOutputCore
-        + hmac::digest::core_api::BufferKindUser<BufferKind = hmac::digest::block_buffer::Eager>
-        + Default
-        + Clone
-        + Sync,
-    <D::Core as hmac::digest::core_api::BlockSizeUser>::BlockSize:
-        hmac::digest::typenum::IsLess<hmac::digest::typenum::U256>,
-    hmac::digest::typenum::Le<
-        <D::Core as hmac::digest::core_api::BlockSizeUser>::BlockSize,
-        hmac::digest::typenum::U256,
-    >: hmac::digest::typenum::NonZero,
-{
-    fn pbkdf2_into(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
-        pbkdf2::pbkdf2_hmac::<D>(password, salt, iterations, out);
-    }
-
-    fn hkdf_into(ikm: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) -> Option<()> {
-        hkdf::Hkdf::<D>::new(Some(salt), ikm).expand(info, out).ok()
-    }
 }
 
 /// PBKDF2 (RFC 2898) for node:crypto, over the `pbkdf2` crate.
@@ -1661,14 +1630,14 @@ where
 /// allocated a `Vec` on every one of the 100,000-plus iterations a real
 /// caller asks for; the crate primes one HMAC and clones the primed state per
 /// iteration, which is about twice as fast.
-fn pbkdf2_kdf<D: EagerDigest>(
+fn pbkdf2_kdf<D: hmac::EagerHash>(
     password: &[u8],
     salt: &[u8],
     iterations: u32,
     keylen: usize,
 ) -> Vec<u8> {
     let mut out = vec![0u8; keylen];
-    D::pbkdf2_into(password, salt, iterations, &mut out);
+    pbkdf2::pbkdf2_hmac::<D>(password, salt, iterations, &mut out);
     out
 }
 
@@ -1686,14 +1655,16 @@ fn pbkdf2_kdf<D: EagerDigest>(
 /// the length check from the KDF instead of asserting it in a doc comment
 /// keeps the ops correct whatever JS does, which matters because the ops are
 /// own properties of the user's `globalThis` and only non-enumerable.
-fn hkdf_kdf<D: EagerDigest>(
+fn hkdf_kdf<D: hmac::EagerHash>(
     ikm: &[u8],
     salt: &[u8],
     info: &[u8],
     length: usize,
 ) -> Option<Vec<u8>> {
     let mut out = vec![0u8; length];
-    D::hkdf_into(ikm, salt, info, &mut out)?;
+    hkdf::Hkdf::<D>::new(Some(salt), ikm)
+        .expand(info, &mut out)
+        .ok()?;
     Some(out)
 }
 
@@ -1800,7 +1771,7 @@ pub(super) fn op_webcrypto_hmac_verify(
     };
     macro_rules! verify {
         ($digest:ty) => {{
-            let Ok(mut mac) = <hmac::Hmac<$digest> as hmac::Mac>::new_from_slice(&key) else {
+            let Ok(mut mac) = <hmac::Hmac<$digest> as hmac::KeyInit>::new_from_slice(&key) else {
                 return;
             };
             mac.update(&data);
@@ -1832,7 +1803,7 @@ fn webcrypto_aes_gcm(
         ($aes:ty, $nonce_size:ty, $tag_size:ty) => {{
             type Gcm = aes_gcm::AesGcm<$aes, $nonce_size, $tag_size>;
             let cipher = <Gcm as KeyInit>::new_from_slice(key).ok()?;
-            let nonce = aes_gcm::Nonce::<$nonce_size>::from_slice(iv);
+            let nonce = &aes_gcm::Nonce::<$nonce_size>::try_from(iv).ok()?;
             let payload = Payload {
                 msg: data,
                 aad: additional_data,
@@ -1946,7 +1917,7 @@ fn webcrypto_aes_block_mode(
         return Ok(out);
     }
     use cbc::cipher::block_padding::Pkcs7;
-    use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+    use cbc::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
     if iv.len() != 16 {
         return Err(anyhow!("AES-CBC requires a 16-byte IV"));
     }
@@ -1955,11 +1926,11 @@ fn webcrypto_aes_block_mode(
             if encrypting {
                 cbc::Encryptor::<$aes>::new_from_slices(key, iv)
                     .map_err(|_| anyhow!("invalid AES-CBC key or IV"))?
-                    .encrypt_padded_vec_mut::<Pkcs7>(data)
+                    .encrypt_padded_vec::<Pkcs7>(data)
             } else {
                 cbc::Decryptor::<$aes>::new_from_slices(key, iv)
                     .map_err(|_| anyhow!("invalid AES-CBC key or IV"))?
-                    .decrypt_padded_vec_mut::<Pkcs7>(data)
+                    .decrypt_padded_vec::<Pkcs7>(data)
                     .map_err(|_| anyhow!("AES-CBC decryption failed"))?
             }
         }};
