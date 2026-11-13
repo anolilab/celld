@@ -20,6 +20,11 @@ name = "e2e"
 path = "benches/e2e.rs"
 harness = false
 
+[[bench]]
+name = "storage_requests"
+path = "benches/storage_requests.rs"
+harness = false
+
 [lints.clippy]
 disallowed_macros = "forbid"
 

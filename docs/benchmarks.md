@@ -74,3 +74,53 @@ Each workload starts a fresh server on a fresh copy of its fixture
 - `git_sha` is `null` outside a git checkout. `git_dirty` is `true` when the
   checkout had uncommitted or untracked changes, so the numbers belong to a
   build that differs from `git_sha`.
+
+## Object-store requests per agent
+
+`storage_requests` counts what a short-lived Durable Object costs in bucket
+requests. It runs real fleet nodes against an S3-compatible store through a
+proxy that tallies every request by the price class the store bills it at:
+PUT, COPY, POST (batch deletes included) and LIST are class A; GET and HEAD
+are class B; a single DELETE is free.
+
+Each agent is a new object that takes six SQLite writes ten seconds apart and
+is never used again. Requests under `cells/` belong to one agent and are
+reported per 1000 agents. Bundles, leases and maintenance are shared by a node,
+so they are reported per node-hour instead.
+
+It needs a plain-HTTP S3 endpoint (`http://host:port`, no path) and a bucket.
+With the store from the contract suite:
+
+```sh
+export AWS_ACCESS_KEY_ID=rustfsadmin AWS_SECRET_ACCESS_KEY=rustfsadmin AWS_REGION=us-east-1
+docker compose -f crates/celld/tests/stores/compose.yml -p celld-bench up -d rustfs
+aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://bench
+CELLD_BENCH_S3_ENDPOINT=http://127.0.0.1:9000 CELLD_BENCH_BUCKET=s3://bench \
+  cargo bench -p celld --bench storage_requests --profile lab
+```
+
+| Variable                  | Default | Meaning                                                    |
+| ------------------------- | ------- | ---------------------------------------------------------- |
+| `CELLD_BENCH_AGENTS`      | `200`   | Agents per scenario.                                       |
+| `CELLD_BENCH_TURNS`       | `6`     | Writes per agent.                                          |
+| `CELLD_BENCH_TURN_MS`     | `10000` | Gap between an agent's writes.                             |
+| `CELLD_BENCH_SPREAD_S`    | `60`    | Agents start evenly over this window.                      |
+| `CELLD_BENCH_SETTLE_S`    | `40`    | Wait after start, so maintenance can recruit a follower.   |
+| `CELLD_BENCH_FILTER`      | all     | Run scenarios whose name contains this text.               |
+| `CELLD_BENCH_OUT`         | `target/storage-bench/results.json` | Where to write the JSON. |
+
+Scenarios:
+
+- `fleet`: two nodes, fleet durability, no idle eviction. Agents stay
+  resident, so this is the claim cost alone.
+- `fleet_evict`: as `fleet`, with each agent evicted once after its last turn.
+  The steady state for agents that come and go.
+- `fleet_wake_each_turn`: idle eviction shorter than the gap between turns, so
+  each turn after the first wakes an evicted agent.
+- `bucket`, `bucket_evict`: one node with `CELLD_DURABILITY=bucket`, where each
+  write is proven by an upload.
+
+The `$/mo @10K` column prices the per-agent requests at S3 Standard rates for
+10,000 agents alive at once, each living one turn interval per turn (60 s by
+default: six turns, one every 10 s). `$/node-mo`
+prices one node's shared requests under the same load.
