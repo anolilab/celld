@@ -584,9 +584,12 @@ pub type AlarmReporter = Arc<dyn Fn(String, celld_logic::wake::AlarmSnapshot) + 
 /// core overwrites on observation and deletes the wake entry on `None`,
 /// so that ordering loses the alarm outright. The observer only sends on
 /// an unbounded channel, so holding the lock across it cannot block.
-fn alarm_reporter(cells: &Arc<Mutex<CellRegistry>>, observe: &AlarmObserver) -> AlarmReporter {
+fn alarm_reporter(
+    cells: &Arc<Mutex<CellRegistry>>,
+    core: &crate::cell_runtime::CellRuntime,
+) -> AlarmReporter {
     let cells_ = cells.clone();
-    let observe_ = observe.clone();
+    let core_ = core.clone();
     Arc::new(
         move |scope: String, alarm: celld_logic::wake::AlarmSnapshot| {
             let mut registry = cells_.lock().expect("cell registry poisoned");
@@ -596,12 +599,17 @@ fn alarm_reporter(cells: &Arc<Mutex<CellRegistry>>, observe: &AlarmObserver) -> 
                 registry.starting.get_mut(&scope)
             };
             if let Some(handle) = handle {
-                let changed = handle.alarm.at_ms() != alarm.at_ms();
+                // A new installation is news even at the same time: it has no
+                // wake entry yet, so its coverage differs from its
+                // predecessor's. A position that moved without an installation
+                // is not, because other SQLite writes advance it.
+                let changed = !handle.alarm.same_installation(alarm);
                 // Refresh the revision even when a same-time rearm needs no timer
                 // change. An ActivityFinished must use that source's snapshot.
                 handle.alarm = alarm;
                 if changed {
-                    observe_(scope, alarm);
+                    let covered = core_.alarm_covered(&scope, alarm);
+                    (core_.alarm_observer)(scope, alarm, covered);
                 }
             }
         },
@@ -743,7 +751,7 @@ impl RuntimeManager {
             region,
         )?;
         let cells = Arc::new(Mutex::new(CellRegistry::default()));
-        let alarm_reporter = alarm_reporter(&cells, &core.alarm_observer);
+        let alarm_reporter = alarm_reporter(&cells, &core);
         let manager = Self {
             core,
             cells,
@@ -1274,7 +1282,6 @@ impl RuntimeManager {
                 return Err(error);
             }
         };
-        (self.alarm_observer)(cell.clone(), alarm);
         let startup_us = startup_timing.emit("ready", "");
 
         {
@@ -1297,6 +1304,11 @@ impl RuntimeManager {
                     }),
                 },
             );
+            // Observe only once the cell is registered, and under the same
+            // lock the reporter sends under: before this the observation
+            // could reach the core ahead of a registry entry that a later
+            // report or coverage read depends on.
+            (self.alarm_observer)(cell.clone(), alarm, self.alarm_covered(&cell, alarm));
             Ok((placed_in, generation.id))
         }
     }
@@ -1608,6 +1620,19 @@ impl RuntimeManager {
     /// reach the core after a fresher report (see `alarm_reporter`).
     pub fn with_alarm<T>(&self, cell: &str, f: impl FnOnce(Option<i64>) -> T) -> T {
         self.with_alarm_snapshot(cell, |alarm| f(alarm.at_ms()))
+    }
+
+    /// Tell the core that the flusher now covers this cell's current alarm.
+    /// Read and sent under the registry lock like every report, so the
+    /// confirmation describes the installation that is current when it is
+    /// sent, never an older one a re-arm has replaced. Nothing is sent while
+    /// the current installation is uncovered or the cell has no alarm.
+    pub(crate) fn report_alarm_coverage(&self, cell: &str) {
+        self.with_alarm_snapshot(cell, |alarm| {
+            if alarm.at_ms().is_some() && self.alarm_covered(cell, alarm) {
+                (self.alarm_observer)(cell.to_string(), alarm, true);
+            }
+        });
     }
 
     pub(crate) fn with_alarm_snapshot<T>(

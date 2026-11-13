@@ -610,7 +610,9 @@ pub(crate) fn decode_durable_object_id(value: &str) -> Option<[u8; 32]> {
     }
     Some(output)
 }
-pub type AlarmObserver = Arc<dyn Fn(String, celld_logic::wake::AlarmSnapshot) + Send + Sync>;
+/// Reports an alarm observation and whether the wake flusher covers that
+/// installation, so the core learns both from one call.
+pub type AlarmObserver = Arc<dyn Fn(String, celld_logic::wake::AlarmSnapshot, bool) + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) enum StopMode {
