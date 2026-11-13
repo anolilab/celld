@@ -1599,6 +1599,11 @@ pub fn drop_process(id: u64) {
     processes().lock().unwrap().remove(&id);
 }
 
+/// Whether the process has exited. A process the node no longer knows has.
+pub fn process_ended(id: u64) -> bool {
+    process(id).is_none_or(|process| *process.ended.borrow())
+}
+
 impl ExecProcess {
     /// One chunk of stdout (`1`) or stderr (`2`); empty at end of stream.
     pub async fn read(&self, which: u8) -> Bytes {

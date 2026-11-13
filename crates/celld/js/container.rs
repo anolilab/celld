@@ -334,6 +334,15 @@ pub(super) fn op_container_exec_drop(
     container::drop_process(id);
 }
 
+pub(super) fn op_container_exec_ended(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let ended = container::process_ended(number_arg(scope, &args, 0));
+    rv.set(v8::Boolean::new(scope, ended).into());
+}
+
 pub(super) fn op_container_exec_resize(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,

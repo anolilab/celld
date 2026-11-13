@@ -97,6 +97,80 @@ export class Runner extends DurableObject {
           container.start();
           return await container.exec(["hold"], { pty: true }).then(() => "started");
         });
+      // An exec whose signal is aborted before it spawns.
+      case "/abort-before": {
+        const controller = new AbortController();
+        controller.abort(new Error("stop now"));
+        return run(async () => {
+          container.start();
+          await container.exec(["hold"], { signal: controller.signal });
+        });
+      }
+      // An exec aborted after it spawned: SIGKILL, in the same event.
+      case "/abort-after":
+        return run(async () => {
+          container.start();
+          const controller = new AbortController();
+          const process = await container.exec(["hold"], { signal: controller.signal });
+          controller.abort();
+          return { exitCode: await process.exitCode };
+        });
+      // The abort listener is gone once the process has exited.
+      case "/abort-listener":
+        return run(async () => {
+          container.start();
+          const controller = new AbortController();
+          const signal = controller.signal;
+          const counts = { added: 0, removed: 0 };
+          const add = signal.addEventListener.bind(signal);
+          const remove = signal.removeEventListener.bind(signal);
+          signal.addEventListener = (type, ...rest) => {
+            if (type === "abort") counts.added++;
+            return add(type, ...rest);
+          };
+          signal.removeEventListener = (type, ...rest) => {
+            if (type === "abort") counts.removed++;
+            return remove(type, ...rest);
+          };
+          const process = await container.exec(["hello"], { signal });
+          const output = await process.output();
+          return { exitCode: output.exitCode, ...counts };
+        });
+      // A process that exits after the event that spawned it has ended, and
+      // that nothing awaits: the listener it put on the signal must go anyway.
+      case "/abort-leak-spawn":
+        return run(async () => {
+          container.start();
+          const controller = new AbortController();
+          const signal = controller.signal;
+          const counts = { added: 0, removed: 0 };
+          const add = signal.addEventListener.bind(signal);
+          const remove = signal.removeEventListener.bind(signal);
+          signal.addEventListener = (type, ...rest) => {
+            if (type === "abort") counts.added++;
+            return add(type, ...rest);
+          };
+          signal.removeEventListener = (type, ...rest) => {
+            if (type === "abort") counts.removed++;
+            return remove(type, ...rest);
+          };
+          this.leak = { signal, counts };
+          await container.exec(["hello"], { signal });
+          return "spawned";
+        });
+      // The same signal again, from a later event, after the first process
+      // has exited: its listener is gone before the new one is added.
+      case "/abort-leak-sweep":
+        return run(async () => {
+          const { signal, counts } = this.leak;
+          const before = { ...counts };
+          const process = await container.exec(["hello"], { signal });
+          // Read before the new process can have exited and taken its own
+          // listener off, so only the first process's is counted.
+          const after = { ...counts };
+          await process.output();
+          return { before, after };
+        });
       default:
         return new Response("not found", { status: 404 });
     }
