@@ -102,3 +102,98 @@ fn a_reset_settles_a_running_alarm_handler_as_failed() {
     shell.send(Event::RuntimeStopped { op: stop });
     assert!(matches!(shell.state.phase("a"), Some(Phase::Inactive)));
 }
+
+#[test]
+fn a_reset_drops_the_sockets_of_the_runtime_it_discards() {
+    let mut shell = Shell::new(config());
+    let request = shell.request("a");
+    shell.send(Event::WebSocketOpened {
+        cell: "a".into(),
+        websocket: 7,
+        kind: WebSocketKind::Regular,
+    });
+    assert_eq!(shell.state.websocket_count("a"), 1);
+
+    fail_a_write(&mut shell, request);
+
+    assert_eq!(shell.state.websocket_count("a"), 0);
+}
+
+#[test]
+fn a_hibernatable_socket_event_waits_for_the_restarted_runtime() {
+    let mut shell = Shell::new(config());
+    let busy = shell.request("a");
+    shell.send(Event::WebSocketOpened {
+        cell: "a".into(),
+        websocket: 7,
+        kind: WebSocketKind::Hibernatable,
+    });
+    // A new generation quiesces the cell: it waits for `busy` to finish and
+    // queues new traffic for the restarted runtime.
+    let now_mono_ms = shell.tick(1);
+    shell.send(Event::GenerationChanged {
+        generation: 1,
+        now_mono_ms,
+        max_age_ms: 3_600_000,
+        eager_classes: Vec::new(),
+    });
+    assert!(shell.state.swapping() > 0);
+
+    let effects = shell.send(Event::WebSocketRequestAt {
+        request: 100,
+        cell: "a".into(),
+        websocket: 7,
+        now_ms: now_mono_ms,
+        now_mono_ms,
+    });
+
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Complete { request: 100, .. })),
+        "the event ran on the runtime that is being replaced: {effects:?}"
+    );
+    // Once the old runtime is gone the event is served by the new one.
+    shell.finish(busy);
+    let stop = shell.expect("the swap stop", |effect| match effect {
+        Effect::StopRuntime { op, .. } => Some(*op),
+        _ => None,
+    });
+    shell.send(Event::RuntimeStopped { op: stop });
+    shell.settle();
+    assert!(shell.state.is_active("a"));
+}
+
+#[test]
+fn a_regular_socket_event_still_runs_on_a_quiescing_cell() {
+    let mut shell = Shell::new(config());
+    let _busy = shell.request("a");
+    shell.send(Event::WebSocketOpened {
+        cell: "a".into(),
+        websocket: 7,
+        kind: WebSocketKind::Regular,
+    });
+    let now_mono_ms = shell.tick(1);
+    shell.send(Event::GenerationChanged {
+        generation: 1,
+        now_mono_ms,
+        max_age_ms: 3_600_000,
+        eager_classes: Vec::new(),
+    });
+
+    let effects = shell.send(Event::WebSocketRequestAt {
+        request: 100,
+        cell: "a".into(),
+        websocket: 7,
+        now_ms: now_mono_ms,
+        now_mono_ms,
+    });
+
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Complete {
+            request: 100,
+            result: Ok(Route::Local)
+        }
+    )));
+}
