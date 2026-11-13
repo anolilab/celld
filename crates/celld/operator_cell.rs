@@ -249,3 +249,38 @@ pub(crate) fn report(refused: &[String]) -> String {
         format!("\n  {}", refused.join("\n  "))
     }
 }
+
+#[cfg(test)]
+mod operator_token_tests {
+    use super::*;
+    use crate::operator_token::OperatorToken;
+
+    #[tokio::test]
+    async fn an_operator_call_carries_the_operator_token() {
+        let stub = crate::test_stub::Recorder::start().await;
+        let token = OperatorToken::parse(std::ffi::OsStr::new("tok-6")).unwrap();
+        let auth = crate::peer_auth::PeerAuth::new([6; 32], "d1-cli")
+            .unwrap()
+            .with_operator_token(Some(token));
+        let path = "/runtime/scope".to_string();
+        let reachable = Reachable {
+            http: reqwest::Client::new(),
+            auth,
+            entrances: vec![Entrance {
+                node: "node-b".to_string(),
+                url: format!("http://{}{path}", stub.addr()),
+                path,
+            }],
+            subject: Subject {
+                noun: "database",
+                source: "d1-cli",
+                timeout: Duration::from_secs(5),
+            },
+        };
+        let _ = reachable.call(serde_json::json!({})).await;
+        assert_eq!(
+            stub.authorizations(),
+            vec![Some("Bearer tok-6".to_string())]
+        );
+    }
+}

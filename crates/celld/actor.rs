@@ -4228,3 +4228,7 @@ type ActorState = State;
 fn apply_core_event(state: &mut ActorState, event: Event) -> Vec<Effect> {
     on_event(state, event)
 }
+
+#[cfg(test)]
+#[path = "actor/operator_token_tests.rs"]
+mod operator_token_tests;

@@ -900,6 +900,21 @@ async fn stop_running_node(mut running: RunningNode) {
     let _ = running.output.await;
 }
 
+/// The same-node preserve request to the node's internal listener. The node
+/// inherits `CELLD_OPERATOR_TOKEN` from this process, so the request carries
+/// it too.
+fn shutdown_request(
+    client: &reqwest::Client,
+    internal: &str,
+    token: Option<&crate::operator_token::OperatorToken>,
+) -> reqwest::RequestBuilder {
+    let request = client.post(format!("{internal}/shutdown?handoff=preserve"));
+    match token {
+        Some(token) => request.header(reqwest::header::AUTHORIZATION, token.bearer()),
+        None => request,
+    }
+}
+
 #[allow(clippy::disallowed_methods)] // Shutdown deadlines govern a real child process.
 async fn stop_child(child: &mut Child, internal: Option<&str>) {
     let requested = if let Some(internal) = internal {
@@ -907,11 +922,15 @@ async fn stop_child(child: &mut Child, internal: Option<&str>) {
             .timeout(Duration::from_secs(2))
             .build()
         {
-            Ok(client) => client
-                .post(format!("{internal}/shutdown?handoff=preserve"))
-                .send()
-                .await
-                .is_ok_and(|response| response.status().is_success()),
+            Ok(client) => match crate::operator_token::OperatorToken::from_env() {
+                Ok(token) => shutdown_request(&client, internal, token.as_ref())
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status().is_success()),
+                // An invalid token is refused at startup, so this is not
+                // reachable in practice. Never send the request without it.
+                Err(_) => false,
+            },
             Err(_) => false,
         }
     } else {
@@ -973,5 +992,29 @@ mod tests {
             listener_address("celld internal listening on 127.0.0.1:1 (advertise=x)"),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod operator_token_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_shutdown_request_carries_the_operator_token() {
+        let stub = crate::test_stub::Recorder::start().await;
+        let token =
+            crate::operator_token::OperatorToken::parse(std::ffi::OsStr::new("tok-7")).unwrap();
+        let _ = shutdown_request(
+            &reqwest::Client::new(),
+            &format!("http://{}", stub.addr()),
+            Some(&token),
+        )
+        .send()
+        .await;
+        assert_eq!(
+            stub.authorizations(),
+            vec![Some("Bearer tok-7".to_string())]
+        );
+        assert!(stub.heads()[0].starts_with("POST /shutdown?handoff=preserve "));
     }
 }

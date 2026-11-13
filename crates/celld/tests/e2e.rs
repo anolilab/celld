@@ -12,6 +12,7 @@ mod e2e {
     pub mod harness;
     pub mod isolates;
     pub mod node_crypto;
+    pub mod operator_token;
     pub mod ownership;
     pub mod version;
     pub mod webcrypto;

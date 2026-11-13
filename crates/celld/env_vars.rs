@@ -290,6 +290,8 @@ pub fn validate() -> anyhow::Result<()> {
 
     shutdown_timing()?;
 
+    crate::operator_token::OperatorToken::from_env()?;
+
     positive::<usize>("CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES")?;
 
     if let Some(value) = optional::<u64>("CELLD_PRESENCE_HEARTBEAT_MS")? {

@@ -3199,6 +3199,45 @@ fn spawn_shutdown_acceptor(
     });
 }
 
+/// Refuse a request to the internal listener that lacks the operator token.
+///
+/// It runs ahead of routing, body collection, upgrades and signature checks,
+/// so an unknown path answers 401 as a known one does, and an unauthenticated
+/// caller reaches no handler and spends no replay-cache entry. Both the
+/// internal surface and the recovery-time surface are gated. The public
+/// listener is never gated: it serves the Worker and the health endpoint.
+fn operator_gate(
+    surface: HttpSurface,
+    token: Option<&celld::operator_token::OperatorToken>,
+    headers: &mut hyper::HeaderMap,
+) -> Option<HttpReply> {
+    if matches!(surface, HttpSurface::Public) {
+        return None;
+    }
+    let token = token?;
+    if token.authorizes(headers) {
+        // The credential is for this gate only. `/do/<ID>` forwards the
+        // request headers to a Durable Object, here or on a remote owner, so
+        // the token must not travel with them.
+        headers.remove(hyper::header::AUTHORIZATION);
+        return None;
+    }
+    let mut refusal = response(
+        StatusCode::UNAUTHORIZED,
+        "{\"error\":\"operator token required\"}",
+    );
+    refusal.headers_mut().insert(
+        hyper::header::WWW_AUTHENTICATE,
+        hyper::header::HeaderValue::from_static("Bearer"),
+    );
+    // The request body is never read, so do not keep the connection for it.
+    refusal.headers_mut().insert(
+        hyper::header::CONNECTION,
+        hyper::header::HeaderValue::from_static("close"),
+    );
+    Some(peer_response(refusal))
+}
+
 fn serve_http_connection(
     stream: tokio::net::TcpStream,
     surface: HttpSurface,
@@ -3225,6 +3264,14 @@ fn serve_http_connection(
                 let shutdown = shutdown.clone();
                 let service_requests = service_requests.clone();
                 async move {
+                    let mut request = request;
+                    if let Some(refusal) = operator_gate(
+                        surface,
+                        app.peer_auth.operator_token(),
+                        request.headers_mut(),
+                    ) {
+                        return Ok(refusal);
+                    }
                     match surface {
                         HttpSurface::Public => handle_public(request, app, service_requests).await,
                         HttpSurface::Internal => handle_internal(request, app, shutdown).await,
@@ -5538,3 +5585,11 @@ fn forwarder_response_stream(
         },
     ))
 }
+
+#[cfg(test)]
+#[path = "test_stub.rs"]
+mod test_stub;
+
+#[cfg(test)]
+#[path = "main/operator_token_tests.rs"]
+mod operator_token_tests;

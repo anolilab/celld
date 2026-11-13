@@ -74,6 +74,25 @@ impl Server {
         format!("http://127.0.0.1:{}{path}", self.port)
     }
 
+    /// The node's internal listener, from the line it prints at startup. The
+    /// supervisor forwards that line on its own task, so it can trail the
+    /// first response by a moment.
+    pub async fn internal_url(&self, path: &str) -> String {
+        let log = self.log.clone();
+        let address = wait_until("the internal listener announcement", READY_TIMEOUT, || {
+            let log = log.clone();
+            async move {
+                let text = fs::read_to_string(&log).unwrap_or_default();
+                text.lines().find_map(|line| {
+                    let rest = line.split("celld internal listening on ").nth(1)?;
+                    rest.split_whitespace().next().map(str::to_owned)
+                })
+            }
+        })
+        .await;
+        format!("http://{address}{path}")
+    }
+
     pub async fn get_text(&self, path: &str) -> String {
         self.get(path)
             .await

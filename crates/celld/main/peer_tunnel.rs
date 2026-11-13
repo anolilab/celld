@@ -356,7 +356,7 @@ fn park(key: &str, sender: TunnelSender) {
 /// Establish a fresh tunnel to `addr` and hand back its inner h1 client.
 /// The establishment is a bodiless GET, so the fleet HMAC signs it whole —
 /// the one signature every call on this tunnel then rides.
-async fn establish(peer: &Peer<'_>, kind: &'static str) -> anyhow::Result<TunnelSender> {
+pub(super) async fn establish(peer: &Peer<'_>, kind: &'static str) -> anyhow::Result<TunnelSender> {
     let request = peer
         .http
         .get(format!("http://{}/peer/tunnel", peer.addr))

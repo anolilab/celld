@@ -49,6 +49,7 @@ pub mod machine;
 pub mod memory;
 pub mod node_log;
 pub(crate) mod operator_cell;
+pub mod operator_token;
 #[doc(hidden)]
 pub mod otlp;
 pub mod ownership_store;
@@ -201,3 +202,6 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
         queue_json_messages: switch("queue_json_messages", "queue_v8_messages", "2024-03-18"),
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_stub;

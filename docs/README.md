@@ -718,6 +718,7 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_ADDR` | The public Worker listener. The same as `--listen` |
 | `CELLD_INTERNAL_ADDR` | The peer and operator listener. The same as `--internal-listen` |
 | `CELLD_ADVERTISE` | The internal address that peers can reach. The same as `--advertise` |
+| `CELLD_OPERATOR_TOKEN` | When set, every request to the internal listener must send `Authorization: Bearer <token>`, and every celld command that calls it sends the token. Set the same value on every node and in each operator command. celld refuses an empty value, whitespace, or non-printable characters. Unset: no token. See [Require an operator token](security.md#require-an-operator-token) |
 | `CELLD_UNSAFE_PUBLIC_ADVERTISE` | Set to `1` to permit a literal public IP in `CELLD_ADVERTISE`. It does not resolve a DNS name or restrict the internal listener |
 | `CELLD_NODE` | An explicit node-session ID: 1 to 128 ASCII letters, numbers, dots, dashes, or underscores, but not `.` or `..` |
 | `CELLD_WATCH` | The local work directory for SQLite and replication |
