@@ -5924,8 +5924,14 @@ impl State {
         // defaults to an hour, so on an alarm-driven workload this would hold
         // most of the node and pin it at its ceiling -- trading a real
         // admission failure for a saved activation. Under pressure the node
-        // takes the wake.
-        if self.alarm_is_imminent(cell) && !self.shedding && !self.draining {
+        // takes the wake. A waiter is the same fact seen from the other side:
+        // it is parked because the node is full, and keeping the cell would
+        // hold it until its deadline.
+        if self.alarm_is_imminent(cell)
+            && !self.shedding
+            && !self.draining
+            && self.capacity_waiters.is_empty()
+        {
             return Err(EvictRefusal::AlarmImminent);
         }
         if self.is_active(id) {
@@ -7190,6 +7196,8 @@ mod alarm_tests;
 mod dead_owner_tests;
 #[cfg(test)]
 mod fence_confirming_tests;
+#[cfg(test)]
+mod imminent_alarm_tests;
 #[cfg(test)]
 mod reset_tests;
 #[cfg(test)]
