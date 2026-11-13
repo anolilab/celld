@@ -309,7 +309,30 @@ images are shared between versions and stay. Do not run `celld discard` and
 `celld activate` for the same version at the same time: the check and the
 deletion are not one atomic step.
 
-Both commands take the fleet flags of `celld deploy` and `--json`. A
+`celld invoke SCRIPT=VERSION [PATH]` checks a staged version before you
+activate it: the node answers one HTTP request on it and retires the
+version again, and nothing that serves changes.
+
+```sh
+export CELLD_OPERATOR_TOKEN=...   # the same value as on the nodes
+export APP_API_KEY=...            # a secret the staged request needs
+celld invoke api=3f9c2a71b0d4e8a5 /health \
+  --header-env x-api-key=APP_API_KEY --bucket "$CELLD_BUCKET"
+```
+
+The command prints the response body on standard output and the status and
+headers on standard error; `--json` prints one object with the base64 body.
+`-X`, `-H`, `-d` and `--data-file` set the method, a header and the body.
+`--header-env NAME=VAR` reads a header value from the environment so a secret
+never appears in the process list. The node needs `CELLD_OPERATOR_TOKEN`, and
+the command needs the same value; the request is also signed with the fleet
+secret. The staged version runs with its own declared variables and service
+bindings against the fleet's real data. Durable Object, D1, KV and queue cells
+run the serving version's code, so a version that adds a class or a first
+storage binding fails when it reaches the new one. See [Run a request on a staged
+version](security.md#run-a-request-on-a-staged-version).
+
+Both `celld activate` and `celld discard` take the fleet flags of `celld deploy` and `--json`. A
 `celld deploy` without `--no-activate` keeps the `components` map of a fleet
 that uses it. A managed deployment writes the pointer without the map, so a
 fleet that uses managed deployments does not stage.

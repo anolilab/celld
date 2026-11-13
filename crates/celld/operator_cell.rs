@@ -71,19 +71,6 @@ impl Reachable {
         name: Option<&str>,
     ) -> anyhow::Result<Self> {
         let bucket = crate::fleet::bucket_client(fleet.bucket, fleet.endpoint, fleet.region)?;
-        let nodes = live_nodes(&bucket, fleet.unsafe_public_advertise, subject.source).await?;
-        // The same secret and the same source shape `celld diagnose` uses.
-        let auth = crate::peer_auth::PeerAuth::new(
-            crate::peer_auth::load_existing(&bucket).await?,
-            subject.source,
-        )?;
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            // A migration on a large table is not a diagnostic ping, so this
-            // budget is the handler budget's order rather than the probe's.
-            .timeout(subject.timeout)
-            .build()
-            .with_context(|| format!("build the {} client", subject.noun))?;
         let mut path = format!("/runtime/{scope}");
         if let Some(name) = name {
             // An operator command can be the first request to construct a
@@ -96,6 +83,35 @@ impl Reachable {
                     .finish(),
             );
         }
+        Self::open_at(&bucket, fleet.unsafe_public_advertise, subject, path, None).await
+    }
+
+    /// Reach a route of the internal listener on any live node of the fleet in
+    /// `bucket`. `auth` replaces the credentials read from the bucket and the
+    /// environment, for a caller that holds its own.
+    pub(crate) async fn open_at(
+        bucket: &Bucket,
+        unsafe_public_advertise: bool,
+        subject: Subject,
+        path: String,
+        auth: Option<crate::peer_auth::PeerAuth>,
+    ) -> anyhow::Result<Self> {
+        let nodes = live_nodes(bucket, unsafe_public_advertise, subject.source).await?;
+        // The same secret and the same source shape `celld diagnose` uses.
+        let auth = match auth {
+            Some(auth) => auth,
+            None => crate::peer_auth::PeerAuth::new(
+                crate::peer_auth::load_existing(bucket).await?,
+                subject.source,
+            )?,
+        };
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            // A migration on a large table is not a diagnostic ping, so this
+            // budget is the handler budget's order rather than the probe's.
+            .timeout(subject.timeout)
+            .build()
+            .with_context(|| format!("build the {} client", subject.noun))?;
         Ok(Self {
             http,
             auth,

@@ -48,6 +48,24 @@ impl Target {
     }
 }
 
+/// A script name and version that cannot leave the script's key space, since
+/// both become object keys.
+pub fn validate_target(script: &str, version: &str) -> anyhow::Result<()> {
+    if !crate::deploy::valid_script_name(script) {
+        bail!("{script:?} is not a valid script name");
+    }
+    let valid_version = !version.is_empty()
+        && version.len() <= 128
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && !version.starts_with('.');
+    if !valid_version {
+        bail!("{version:?} is not a valid version");
+    }
+    Ok(())
+}
+
 /// Parse `SCRIPT=VERSION` arguments. A name or version that could leave the
 /// script's key space is refused here, because both become object keys.
 pub fn parse_targets(arguments: &[String]) -> anyhow::Result<Vec<Target>> {
@@ -56,18 +74,7 @@ pub fn parse_targets(arguments: &[String]) -> anyhow::Result<Vec<Target>> {
         let (script, version) = argument
             .split_once('=')
             .with_context(|| format!("expected SCRIPT=VERSION, got {argument:?}"))?;
-        if !crate::deploy::valid_script_name(script) {
-            bail!("{script:?} is not a valid script name in {argument:?}");
-        }
-        let valid_version = !version.is_empty()
-            && version.len() <= 128
-            && version
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-            && !version.starts_with('.');
-        if !valid_version {
-            bail!("{version:?} is not a valid version in {argument:?}");
-        }
+        validate_target(script, version).with_context(|| format!("in {argument:?}"))?;
         if targets.iter().any(|target| target.script == script) {
             bail!("script {script:?} is listed twice; name one version for each script");
         }

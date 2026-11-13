@@ -983,6 +983,37 @@ fn internal_rebalance_switch(paused: bool) -> HttpReply {
     response(StatusCode::OK, format!("{{\"rebalance_paused\":{paused}}}"))
 }
 
+/// `POST /invoke`: run one request on a staged version. The listener gate
+/// has already checked the operator token when one is configured; the route
+/// itself refuses on a node without one and checks the fleet signature.
+async fn internal_invoke(request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    // A node without a token refuses before it buffers a body.
+    if let Some((status, text)) = celld::invoke::refuse_without_token(&app) {
+        return peer_response(response(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
+            text,
+        ));
+    }
+    let method = request.method().clone();
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_string(), ToString::to_string);
+    let headers = request.headers().clone();
+    // The body is the signed request plus its base64 payload.
+    let limit = celld::invoke::MAX_BODY_BYTES * 2;
+    let body = match collect_limited_body(request.into_body(), limit).await {
+        Ok(body) => body,
+        Err(error) => return peer_response(body_read_error("invoke", error)),
+    };
+    let (status, text) =
+        celld::invoke::handle(&app, &method, &path_and_query, &headers, &body).await;
+    peer_response(response(
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        text,
+    ))
+}
+
 async fn internal_reload(app: AppHandle) -> HttpReply {
     let (reply, receive) = tokio::sync::oneshot::channel();
     let sent = app
@@ -2889,6 +2920,10 @@ async fn handle_internal(
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
         "/reload" => internal_reload(app).await,
+        "/invoke" if request.method() != hyper::Method::POST => {
+            response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+        }
+        "/invoke" => internal_invoke(request, app).await,
         "/rebalance/pause" | "/rebalance/resume" if request.method() != hyper::Method::POST => {
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
@@ -3508,6 +3543,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
         Action::Activate(arguments) => return celld::staged::run_activate(arguments).await,
         Action::Discard(arguments) => return celld::staged::run_discard(arguments).await,
+        Action::Invoke(arguments) => return celld::invoke_cli::run(arguments).await,
         Action::Dev(arguments) => return celld::dev::run(arguments).await,
         Action::Cell(arguments) => return celld::cell_cli::run(arguments).await,
         Action::D1(arguments) => return celld::d1_cli::run(arguments).await,
@@ -4663,6 +4699,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // a cron change travels with the deployment that carries it.
     spawn_cron_arm(app.clone());
     if let Some(bucket) = deploy_bucket {
+        celld::invoke::set_context(bucket.clone(), node.clone(), settings.region.clone());
         start_pointer_watcher(
             app.clone(),
             bucket,

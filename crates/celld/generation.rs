@@ -153,6 +153,29 @@ impl DeploymentGraph {
         pointer: DeployPointer,
         node: String,
     ) -> anyhow::Result<Self> {
+        Self::resolve(bucket, pointer, node, true).await
+    }
+
+    /// The graph a staged request runs on. It resolves scripts only through
+    /// service bindings and skips the queue-consumer walk: a queue
+    /// attachment names the version that serves, so it would contradict a
+    /// staged consumer, and the shadow generation hosts no queue cell. A
+    /// producer binding still reaches the real queue, whose cell runs on
+    /// the serving generation.
+    pub async fn load_shadow(
+        bucket: &Bucket,
+        pointer: DeployPointer,
+        node: String,
+    ) -> anyhow::Result<Self> {
+        Self::resolve(bucket, pointer, node, false).await
+    }
+
+    async fn resolve(
+        bucket: &Bucket,
+        pointer: DeployPointer,
+        node: String,
+        with_queues: bool,
+    ) -> anyhow::Result<Self> {
         let components = pointer.components.clone();
         let primary = fleet::load_primary_worker(bucket, pointer.clone(), node.clone()).await?;
         let primary_script = primary.script_name.clone();
@@ -160,7 +183,7 @@ impl DeploymentGraph {
         let mut loaded_consumers =
             BTreeMap::from([(primary_script.clone(), consumed_queues(&primary.options))]);
         let mut visited_queues = BTreeSet::new();
-        let mut dependencies = dependencies_of(&primary);
+        let mut dependencies = dependencies_of(&primary, with_queues);
         let mut cohosted = Vec::new();
         while let Some(dependency) = dependencies.pop_front() {
             let loaded = match dependency {
@@ -233,7 +256,7 @@ impl DeploymentGraph {
                 "script {target:?} was loaded twice"
             );
             loaded_consumers.insert(target.clone(), consumed_queues(&loaded.options));
-            dependencies.extend(dependencies_of(&loaded));
+            dependencies.extend(dependencies_of(&loaded, with_queues));
             // A node runs the schedule of the deployment it was given and of
             // no other. The reserved class is one key, so a second script's
             // cron cell would resolve to the first script's config and run
@@ -272,7 +295,7 @@ fn consumed_queues(options: &WorkerConfigOptions) -> BTreeSet<String> {
         .collect()
 }
 
-fn dependencies_of(loaded: &LoadedDeployment) -> VecDeque<Dependency> {
+fn dependencies_of(loaded: &LoadedDeployment, with_queues: bool) -> VecDeque<Dependency> {
     let queues = loaded
         .options
         .queue_bindings
@@ -281,6 +304,7 @@ fn dependencies_of(loaded: &LoadedDeployment) -> VecDeque<Dependency> {
         .chain(loaded.options.queue_consumers.iter().flat_map(|consumer| {
             std::iter::once(consumer.queue.clone()).chain(consumer.dead_letter_queue.clone())
         }))
+        .filter(|_| with_queues)
         .collect::<BTreeSet<_>>();
     loaded
         .services

@@ -70,6 +70,18 @@ impl Server {
         self.boot
     }
 
+    /// What the node and its supervisor have logged so far.
+    #[allow(dead_code)]
+    pub fn log_text(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// The project directory the server was started on, a private copy of the
+    /// fixture. Its local state is under `.celld/dev`.
+    pub fn project_dir(&self) -> &Path {
+        &self.project
+    }
+
     pub fn url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{path}", self.port)
     }
@@ -301,7 +313,7 @@ pub struct Exited {
 /// handed exactly once, and a `#[tokio::test]` runtime ends with its test. So
 /// the reads that open the dev store run on a runtime of their own that lives
 /// for the whole test binary.
-fn host_runtime() -> &'static tokio::runtime::Runtime {
+pub fn host_runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RUNTIME.get_or_init(|| {
         let runtime = tokio::runtime::Runtime::new().expect("build the host runtime");

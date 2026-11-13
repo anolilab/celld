@@ -76,7 +76,8 @@ constant time.
 
 Every in-tree client reads the same variable and sends the token: peer
 forwarding, handoff, abort, the log tier, the signed probe, `celld diagnose`,
-`celld d1`, `celld kv`, `celld queue` and the `celld dev` shutdown request. Set
+`celld d1`, `celld kv`, `celld queue`, `celld invoke` and the `celld dev`
+shutdown request. Set
 the same value on every node and in the environment of every operator command.
 During a rolling change, nodes with different values answer 401 to each other,
 so set the value on all nodes in one step, or stop the fleet first. A node on
@@ -151,6 +152,58 @@ The filter does not apply to what a container does. A container has its own
 network: use `enableInternet: false`, or a firewall on the container network.
 It also does not replace a firewall: it stops a Worker, not another process on
 the node.
+
+## Run a request on a staged version
+
+`celld invoke SCRIPT=VERSION [PATH]` runs one HTTP request on a version that
+`celld deploy --no-activate` uploaded, on one node, and prints the answer.
+It executes code that no pointer selects, so it asks for more than any other
+operator command:
+
+- **The node needs `CELLD_OPERATOR_TOKEN`.** The listener gate lets every
+  request through when no token is set, so `POST /invoke` refuses on its own
+  with 403 on such a node. A node that was never given a token runs no
+  staged code for anyone.
+- **The request needs the token and the fleet HMAC.** The token is the
+  bearer credential every internal route needs. The HMAC signs the request
+  body, the node name and a timestamp, with replay protection, as on
+  `/runtime/<SCOPE>`. Neither alone runs code: a leaked token without the
+  fleet secret gets 401, and a leaked fleet secret without the token gets 401
+  at the listener.
+- **The application's request is inside the signed body.** Its method, path,
+  headers and body travel as JSON, so an `Authorization` header of the
+  application never shares a header with the operator token, and the node
+  removes only the operator one.
+- **Secret headers stay off the command line.** `--header-env NAME=VAR` sends
+  header `NAME` with the value of the environment variable `VAR`, read by the
+  `celld invoke` process. The value is never an argument, so it does not
+  appear in `ps` or shell history. An unset variable stops the command, and
+  neither that error nor the one for an invalid value repeats the variable's
+  name or the value. `-H` puts the value on the command line; use it only for
+  values that are not secret.
+
+What the staged version can reach:
+
+- The node builds the version into a generation of its own with the
+  bindings its own configuration declares, answers the one request and
+  retires the generation. No pointer, serving generation, cron schedule or
+  container specification changes, and the request is not routed anywhere
+  else.
+- Durable Object, D1, KV and queue bindings reach the **real data** of the
+  fleet. A request that writes through one of them writes real data, so
+  invoke only what you would let write.
+- Those cells **run the serving version's code**, not the staged
+  version's: a cell belongs to the serving generation. A staged class that
+  differs from the serving one is not exercised through its own cell, and a
+  staged version that declares a Durable Object class the serving version
+  lacks, or a first D1, KV or queue binding, fails when it reaches that cell.
+  Invoke checks what a version does on its own, not a new storage class.
+- Service bindings resolve through the serving selection with the staged
+  script in place, so the staged version calls the versions that serve now.
+- The staged module's top-level code runs when the node builds the
+  generation, before the request.
+- A request body and a response body are limited to 8 MiB, and a request
+  that runs longer than 60 seconds is abandoned.
 
 ## Use the internal operator API
 

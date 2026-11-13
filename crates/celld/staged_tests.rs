@@ -138,10 +138,9 @@ async fn no_activate_moves_no_pointer() {
     );
 }
 
-#[tokio::test]
-async fn staging_publishes_no_queue_consumer_attachment() {
-    let fleet = fleet();
-    let mut staged = built("worker", "v1", &[]);
+/// A deployment of `worker` that consumes the queue `jobs`.
+fn consumer(version: &str) -> Built {
+    let mut staged = built("worker", version, &[]);
     staged.manifest.required_features = vec![crate::protocol::FEATURE_QUEUES_V1.to_string()];
     staged.manifest.do_classes = vec![celld_logic::queue::RESERVED_CLASS.to_string()];
     staged.manifest.sqlite_classes = vec![celld_logic::queue::RESERVED_CLASS.to_string()];
@@ -154,6 +153,13 @@ async fn staging_publishes_no_queue_consumer_attachment() {
         max_concurrency: None,
         retry_delay: None,
     }];
+    staged
+}
+
+#[tokio::test]
+async fn staging_publishes_no_queue_consumer_attachment() {
+    let fleet = fleet();
+    let staged = consumer("v1");
     crate::deploy::write(&fleet.bucket, &staged, false)
         .await
         .expect("stage");
@@ -483,4 +489,29 @@ fn a_pointer_without_components_reads_and_writes_as_before() {
     assert!(!serde_json::to_string(&pointer)
         .unwrap()
         .contains("components"));
+}
+
+#[tokio::test]
+async fn a_staged_queue_consumer_loads_as_a_shadow_but_not_as_a_deployment() {
+    let fleet = fleet();
+    crate::deploy::write(&fleet.bucket, &consumer("v1"), true)
+        .await
+        .expect("serve v1");
+    crate::deploy::write(&fleet.bucket, &consumer("v2"), false)
+        .await
+        .expect("stage v2");
+    let (serving, _) = fleet_pointer(&fleet).await;
+    let pointer = crate::invoke::shadow_pointer(Some(&serving), "worker", "v2");
+
+    // The attachment names v1, so a deployment that selected v2 beside it
+    // is contradictory and refused...
+    DeploymentGraph::load_pointer(&fleet.bucket, pointer.clone(), "node".to_string())
+        .await
+        .err()
+        .expect("the attachment names another version");
+    // ...while a shadow generation runs v2 and consults no attachment.
+    let graph = DeploymentGraph::load_shadow(&fleet.bucket, pointer, "node".to_string())
+        .await
+        .expect("a shadow ignores the attachment");
+    assert_eq!(graph.primary.version, "v2");
 }
