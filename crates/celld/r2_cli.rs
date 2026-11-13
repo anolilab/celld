@@ -59,6 +59,65 @@ struct Object {
     uploaded_ms: i64,
 }
 
+impl Object {
+    fn from_json(object: &Value) -> Self {
+        Self {
+            key: object
+                .get("key")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            size: object
+                .get("size")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            etag: object
+                .get("etag")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            uploaded_ms: object
+                .get("uploaded")
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// What `--json` prints on stdout for a key that is not there, ahead of the
+/// error on stderr, so a script can tell an absent key from a failure.
+fn not_found_json(bucket: &str, key: &str) -> Value {
+    json!({ "error": "not_found", "bucket": bucket, "key": key })
+}
+
+/// One page of a listing in the shape of R2's `R2Objects`: each object as
+/// `--json` prints it in a listing, the delimited prefixes, whether the
+/// listing was cut off, and the cursor that continues it.
+fn page_json(page: &Value) -> anyhow::Result<Value> {
+    let objects = page
+        .get("objects")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("the listing carried no objects: {page}"))?;
+    Ok(json!({
+        "objects": objects
+            .iter()
+            .map(|object| Object::from_json(object).json())
+            .collect::<Vec<_>>(),
+        "delimitedPrefixes": page.get("prefixes").cloned().unwrap_or_else(|| json!([])),
+        "truncated": page.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+        "cursor": page.get("cursor").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+/// The error for a key that is not there. With `--json` the same fact goes to
+/// stdout first as one object; the message, and the exit status it brings,
+/// are the same either way.
+fn missing_object(json: bool, bucket: &str, key: &str) -> anyhow::Error {
+    if json {
+        let _ = Output::new(Format::Text).line(format_args!("{}", not_found_json(bucket, key)));
+    }
+    anyhow!("no object {key:?} in r2 bucket {bucket:?}")
+}
+
 impl Record for Object {
     fn json(&self) -> Value {
         json!({
@@ -150,7 +209,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                 // An unconditional read cannot be refused, so the only
                 // other answer is an absent key.
                 crate::bucket::BlobRead::Missing | crate::bucket::BlobRead::Unmet(_) => {
-                    bail!("no object {key:?} in r2 bucket {bucket:?}")
+                    return Err(missing_object(command.json, bucket, &key))
                 }
             }
         }
@@ -158,7 +217,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             let meta = crate::js::r2_ops::head(bucket, &key)
                 .await
                 .map_err(anyhow::Error::msg)?
-                .ok_or_else(|| anyhow!("no object {key:?} in r2 bucket {bucket:?}"))?;
+                .ok_or_else(|| missing_object(command.json, bucket, &key))?;
             let mut out = Output::new(if command.json {
                 Format::Json
             } else {
@@ -201,7 +260,27 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                 .map_err(anyhow::Error::msg)?;
             note!("deleted {} object(s)", keys.len());
         }
-        Action::List { prefix, bounds } => {
+        Action::List {
+            prefix,
+            bounds,
+            delimiter,
+            page: true,
+        } => {
+            let page = crate::js::r2_ops::list(
+                bucket,
+                &json!({
+                    "prefix": prefix,
+                    "cursor": bounds.after,
+                    "limit": bounds.limit,
+                    "delimiter": delimiter,
+                })
+                .to_string(),
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            Output::new(Format::Text).line(format_args!("{}", page_json(&page)?))?;
+        }
+        Action::List { prefix, bounds, .. } => {
             let mut out = Output::new(if command.json {
                 Format::Json
             } else {
@@ -234,28 +313,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                         .get("objects")
                         .and_then(Value::as_array)
                         .ok_or_else(|| anyhow!("the listing carried no objects: {page}"))?;
-                    let rows = objects
-                        .iter()
-                        .map(|object| Object {
-                            key: object
-                                .get("key")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            size: object
-                                .get("size")
-                                .and_then(Value::as_u64)
-                                .unwrap_or_default(),
-                            etag: object
-                                .get("etag")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                            uploaded_ms: object
-                                .get("uploaded")
-                                .and_then(Value::as_i64)
-                                .unwrap_or_default(),
-                        })
-                        .collect();
+                    let rows = objects.iter().map(Object::from_json).collect();
                     // The store's own truncation signal, never a row
                     // count: a page filled exactly to its bound is not
                     // evidence that another object exists.
@@ -323,6 +381,11 @@ enum Action {
     List {
         prefix: String,
         bounds: Bounds,
+        /// Group keys under their first `delimiter`, as R2's `delimiter`
+        /// option does. Only a `page` can carry the groups.
+        delimiter: Option<String>,
+        /// Print one page as a single JSON object, with its cursor.
+        page: bool,
     },
 }
 
@@ -380,6 +443,8 @@ impl Command {
         let mut fleet = crate::cli_options::FleetFlags::default();
         let mut bounds = Bounds::default();
         let mut json = false;
+        let mut delimiter = None;
+        let mut page = false;
         while let Some(argument) = arguments.next() {
             let mut value = |flag: &str| {
                 arguments
@@ -398,6 +463,8 @@ impl Command {
                 }
                 "--prefix" => prefix = value("--prefix")?,
                 "--json" => json = true,
+                "--delimiter" => delimiter = Some(value("--delimiter")?),
+                "--page" => page = true,
                 // celld has neither concept, and a flag that silently means
                 // nothing is the gap the compatibility page forbids.
                 flag @ ("--local" | "--remote" | "--jurisdiction") => bail!(
@@ -450,6 +517,7 @@ impl Command {
                 refuse("--path", file.is_some())?;
                 refuse("--pipe", pipe)?;
                 refuse("--metadata or a content flag", write_flags)?;
+                refuse("--delimiter or --page", delimiter.is_some() || page)?;
                 let key = one_key(&verb)?;
                 match verb.as_str() {
                     "get" => Action::Get { key },
@@ -457,6 +525,7 @@ impl Command {
                 }
             }
             "put" => {
+                refuse("--delimiter or --page", delimiter.is_some() || page)?;
                 let key = one_key("put")?;
                 // Reading a body from a terminal by default would hang
                 // with no output, so standard input is opt-in.
@@ -478,6 +547,7 @@ impl Command {
                 refuse("--path", file.is_some())?;
                 refuse("--pipe", pipe)?;
                 refuse("--metadata or a content flag", write_flags)?;
+                refuse("--delimiter or --page", delimiter.is_some() || page)?;
                 if positional.is_empty() {
                     bail!("celld r2 delete needs at least one key");
                 }
@@ -490,9 +560,23 @@ impl Command {
                 if !positional.is_empty() {
                     bail!("celld r2 list takes no positional arguments; use --prefix");
                 }
+                if delimiter.as_deref() == Some("") {
+                    bail!("--delimiter needs a non-empty value");
+                }
+                // The groups ride on a page's `delimitedPrefixes`; a stream
+                // of rows has nowhere to put them, and a cursor taken from
+                // the middle of one would skip or repeat keys.
+                if delimiter.is_some() && !page {
+                    bail!("--delimiter needs --page, which carries the prefixes and the cursor");
+                }
+                if page && bounds.all {
+                    bail!("--page prints one page, so it cannot be combined with --all");
+                }
                 Action::List {
                     prefix,
                     bounds: bounds.clone(),
+                    delimiter,
+                    page,
                 }
             }
             _ => unreachable!("the verb was matched above"),
@@ -560,11 +644,11 @@ pub fn print_help() {
         "celld r2 — read and write the objects behind an `r2_buckets` binding
 
 USAGE
-  celld r2 get    <bucket-name> <key>    [fleet options]
+  celld r2 get    <bucket-name> <key>    [--json] [fleet options]
   celld r2 head   <bucket-name> <key>    [--json] [fleet options]
   celld r2 put    <bucket-name> <key>    --path FILE | --pipe [put options]
   celld r2 delete <bucket-name> <key>... [fleet options]
-  celld r2 list   <bucket-name>          [--prefix P] [listing options]
+  celld r2 list   <bucket-name>          [--prefix P] [--delimiter D --page] [listing options]
 
 The bucket name is the `bucket_name` from the project's `r2_buckets` entry,
 not the binding name. `get` writes the object to stdout as bytes, so an
@@ -578,7 +662,14 @@ PUT OPTIONS
 
 LISTING OPTIONS (list)
   --prefix P          list only the keys under this prefix
+  --delimiter D       group keys under their first D after the prefix; needs --page
+  --page              print one page as a JSON object with `objects`,
+                      `delimitedPrefixes`, `truncated` and `cursor`; --limit
+                      sizes it and --after CURSOR continues it
 {LISTING_HELP}
+
+With --json, `get` and `head` print {{\"error\":\"not_found\",\"bucket\":...,\"key\":...}}
+on stdout for an absent key, before the error on stderr and the failing exit.
 
 FLEET OPTIONS
 {FLEET_HELP}
@@ -589,4 +680,135 @@ beside the five content headers. A copy made with another tool still reads
 through the binding, and its user metadata becomes its customMetadata."
     );
     let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text).help(&text);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> anyhow::Result<Option<Command>> {
+        Command::parse(
+            arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+        )
+    }
+
+    fn list_action(arguments: &[&str]) -> (String, Bounds, Option<String>, bool) {
+        let command = parse(arguments).unwrap().unwrap();
+        match command.action {
+            Action::List {
+                prefix,
+                bounds,
+                delimiter,
+                page,
+            } => (prefix, bounds, delimiter, page),
+            _ => panic!("not a list"),
+        }
+    }
+
+    #[test]
+    fn an_absent_key_is_reported_as_one_json_object() {
+        assert_eq!(
+            not_found_json("assets", "a/b.txt"),
+            json!({"error": "not_found", "bucket": "assets", "key": "a/b.txt"})
+        );
+    }
+
+    #[test]
+    fn list_takes_a_delimiter_with_a_page() {
+        let (prefix, bounds, delimiter, page) = list_action(&[
+            "list",
+            "assets",
+            "--prefix",
+            "a/",
+            "--delimiter",
+            "/",
+            "--page",
+            "--limit",
+            "5",
+            "--after",
+            "a/m",
+        ]);
+        assert_eq!(prefix, "a/");
+        assert_eq!(delimiter.as_deref(), Some("/"));
+        assert!(page);
+        assert_eq!(bounds.limit, 5);
+        assert_eq!(bounds.after.as_deref(), Some("a/m"));
+    }
+
+    #[test]
+    fn list_without_the_new_flags_is_unchanged() {
+        let (_, _, delimiter, page) = list_action(&["list", "assets"]);
+        assert_eq!(delimiter, None);
+        assert!(!page);
+    }
+
+    #[test]
+    fn a_delimiter_needs_a_page_to_be_resumable() {
+        let error = parse(&["list", "assets", "--delimiter", "/"])
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("--page"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_delimiter_is_refused() {
+        assert!(parse(&["list", "assets", "--delimiter", "", "--page"]).is_err());
+    }
+
+    #[test]
+    fn a_page_and_a_full_walk_contradict() {
+        let error = parse(&["list", "assets", "--page", "--all"]).err().unwrap();
+        assert!(error.to_string().contains("--all"), "{error}");
+    }
+
+    #[test]
+    fn the_listing_flags_are_refused_on_other_verbs() {
+        for verb in ["get", "head"] {
+            for flag in [&["--page"][..], &["--delimiter", "/"][..]] {
+                let mut arguments = vec![verb, "assets", "key"];
+                arguments.extend_from_slice(flag);
+                let error = parse(&arguments).err().unwrap();
+                assert!(error.to_string().contains(verb), "{error}");
+            }
+        }
+        assert!(parse(&["delete", "assets", "key", "--page"]).is_err());
+    }
+
+    #[test]
+    fn a_page_carries_objects_prefixes_truncation_and_cursor() {
+        let listed = json!({
+            "objects": [
+                {"key": "a/1", "size": 3, "etag": "e1", "uploaded": 10, "http": {}, "custom": {}},
+            ],
+            "prefixes": ["a/b/"],
+            "truncated": true,
+            "cursor": "a/b/",
+        });
+        assert_eq!(
+            page_json(&listed).unwrap(),
+            json!({
+                "objects": [{"key": "a/1", "size": 3, "etag": "e1", "uploaded": 10}],
+                "delimitedPrefixes": ["a/b/"],
+                "truncated": true,
+                "cursor": "a/b/",
+            })
+        );
+    }
+
+    #[test]
+    fn a_final_page_has_no_cursor() {
+        let listed = json!({"objects": [], "prefixes": [], "truncated": false, "cursor": null});
+        assert_eq!(
+            page_json(&listed).unwrap(),
+            json!({
+                "objects": [],
+                "delimitedPrefixes": [],
+                "truncated": false,
+                "cursor": null,
+            })
+        );
+    }
 }
