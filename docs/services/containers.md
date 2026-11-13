@@ -90,6 +90,25 @@ node that predates it refuses the deployment. The container that is running
 keeps the image it started with, and an object that starts again can pick
 another one. Cloudflare has no `images` key, so `celld` adds it, like `runtime`.
 
+## Running a process with `exec()`
+
+`exec(cmd, options)` runs a command in the running container and returns a
+process with `stdin`, `stdout`, `stderr`, `exitCode`, `output()`, `kill()`, and
+`pid`. It accepts `env`, `cwd`, `user`, `stdin`, `stdout`, and `stderr`. The
+`pid` is the one the container engine reports, which the engine takes from the
+host, so it does not name the process inside the container.
+
+`pty` runs the command on a pseudo-terminal. `pty: true` is 80 columns by 24
+rows, and `pty: { cols, rows }` sets the size, each an integer from 1 to
+65535. A process on a terminal has one output stream: `stdout` carries what
+`stderr` would, `stderr` is `null`, and `output().stderr` is empty. `isPty`
+reports whether the process has a terminal, and `resize(cols, rows)` changes
+its size and rejects with a `RangeError` for a bad size, or with an `Error` when
+the process has no terminal. The terminal has its size from the exec's creation,
+and a process whose terminal cannot be sized at the start is killed, and
+`exec()` rejects with the engine's error. A command that has already exited when
+the node sizes it is not an error.
+
 ## The image and the node
 
 `celld deploy` builds a Dockerfile in the project, or pulls an image reference,
@@ -189,6 +208,8 @@ count against `max_instances`. A start over the cap fails, and the node logs
   that opened it. See [TCP sockets](../cloudflare-compat.md#tcp-sockets).
 - A `monitor()` promise and an `exec()` process do not keep the object active
   after the handler answers.
+- An `exec()` with `pty` has one output stream. `stdout` carries what `stderr`
+  would, `stderr` is `null`, and `output().stderr` is empty.
 - On macOS, the node reaches a container through a published port, so the image
   must declare the port with `EXPOSE`. `enableInternet: false` has no effect on
   macOS.

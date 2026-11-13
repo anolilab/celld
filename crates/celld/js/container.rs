@@ -194,6 +194,13 @@ struct ExecArgs {
     user: Option<String>,
     #[serde(default)]
     combined: bool,
+    pty: Option<PtyArgs>,
+}
+
+#[derive(serde::Deserialize)]
+struct PtyArgs {
+    cols: u16,
+    rows: u16,
 }
 
 pub(super) fn op_container_exec(
@@ -218,6 +225,7 @@ pub(super) fn op_container_exec(
                     cwd: request.cwd,
                     user: request.user,
                     combined: request.combined,
+                    pty: request.pty.map(|pty| (pty.cols, pty.rows)),
                 },
             )
             .await
@@ -324,4 +332,22 @@ pub(super) fn op_container_exec_drop(
 ) {
     let id = number_arg(scope, &args, 0);
     container::drop_process(id);
+}
+
+pub(super) fn op_container_exec_resize(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let process = process_arg(scope, &args);
+    let cols = number_arg(scope, &args, 1).min(u64::from(u16::MAX)) as u16;
+    let rows = number_arg(scope, &args, 2).min(u64::from(u16::MAX)) as u16;
+    let async_id = asyncrt::enqueue_unrefed(async move {
+        process?
+            .resize(cols, rows)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        Ok::<String, String>(String::new())
+    });
+    rv.set(promise_for(scope, async_id));
 }
