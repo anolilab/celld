@@ -331,7 +331,14 @@ pub fn build(
         ),
         ("sentinel.wasm".to_string(), sentinel),
     ];
-    Ok((BundleOutput { bundle, wasm }, descriptor))
+    Ok((
+        BundleOutput {
+            bundle,
+            wasm,
+            map: None,
+        },
+        descriptor,
+    ))
 }
 
 fn is_identifier(name: &str) -> bool {

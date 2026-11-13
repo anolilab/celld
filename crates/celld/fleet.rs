@@ -585,6 +585,11 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     }
     let built = deploy::build(&options)?;
     built.report();
+    if let (Some(path), Some(map)) = (&options.sourcemap, &built.sourcemap) {
+        std::fs::write(path, map)
+            .with_context(|| format!("write the source map to {}", path.display()))?;
+        note!("Wrote the source map to {}", path.display());
+    }
     let mut out = Output::new(if options.json {
         Format::Json
     } else {

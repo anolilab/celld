@@ -464,13 +464,13 @@ fn announced_port(log: &Path) -> Option<u16> {
     line.rsplit(':').next()?.trim().parse().ok()
 }
 
-fn fixture_dir(name: &str) -> PathBuf {
+pub fn fixture_dir(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name)
 }
 
-fn copy_dir(from: &Path, to: &Path) {
+pub fn copy_dir(from: &Path, to: &Path) {
     fs::create_dir_all(to).expect("create project dir");
     for entry in fs::read_dir(from).expect("read fixture dir") {
         let entry = entry.expect("read fixture entry");

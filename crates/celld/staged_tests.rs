@@ -66,6 +66,7 @@ fn built(script: &str, version: &str, services: &[(&str, &str)]) -> Built {
         images: Vec::new(),
         fence_image: None,
         upload_images: false,
+        sourcemap: None,
     }
 }
 

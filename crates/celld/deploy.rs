@@ -36,6 +36,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod python;
+mod sourcemap;
 
 /// Config keys we understand. Anything else is an error: refusing is
 /// compat-safe, guessing produces confusing activation failures later.
@@ -212,6 +213,9 @@ pub struct Options {
     /// the bucket. `celld dev` runs its node on the same engine that built
     /// them; a fleet needs the tar.
     pub local_images: bool,
+    /// Where to write the entry's source map, with `sources` relative to the
+    /// project. The map stays out of the deployment.
+    pub sourcemap: Option<PathBuf>,
 }
 
 /// Local Worker variables, tagged with the kind of file that supplied them.
@@ -237,7 +241,7 @@ pub fn print_help() {
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate the version but select nothing; the\n                         fleet keeps serving what it serves. `celld activate`\n                         selects the version later and `celld discard` removes it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
+OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --sourcemap PATH       Write the entry's source map to PATH, with its sources\n                         relative to the project. The deployed module does not\n                         change. With `no_bundle`, the map is the file the\n                         entry's own build wrote beside it, <entry>.map\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate the version but select nothing; the\n                         fleet keeps serving what it serves. `celld activate`\n                         selects the version later and `celld discard` removes it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain, from Google\n\
 Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
 account key, managed identity, or workload identity for an az:// bucket.\n\n\
@@ -267,6 +271,7 @@ pub fn options_from_arguments(
         local_images: false,
         json: false,
         vars: VarOverrides::None,
+        sourcemap: None,
     };
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -289,6 +294,11 @@ pub fn options_from_arguments(
             }
             "--region" => {
                 options.region = Some(arguments.next().context("--region requires a value")?);
+            }
+            "--sourcemap" => {
+                options.sourcemap = Some(PathBuf::from(
+                    arguments.next().context("--sourcemap requires a value")?,
+                ));
             }
             other if other.starts_with('-') => {
                 bail!("unknown argument for `celld deploy`: {other}")
@@ -437,6 +447,8 @@ pub struct Built {
     /// See `Manifest::fence_image`; saved beside `images`, reported apart.
     pub fence_image: Option<String>,
     pub upload_images: bool,
+    /// The entry's source map, when `--sourcemap` asked for it.
+    pub sourcemap: Option<Vec<u8>>,
 }
 
 impl Built {
@@ -624,11 +636,18 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .transpose()?;
     let started = Instant::now();
     let built_assets = project.assets.as_ref().map(build_assets).transpose()?;
+    let want_map = options.sourcemap.is_some();
+    if want_map && project.entry.is_none() {
+        bail!("--sourcemap needs a Worker entry, and this project has none");
+    }
     let bundle = project
         .entry
         .as_deref()
         .map(|entry| {
             if let Some(compat) = &project.python {
+                if want_map {
+                    bail!("--sourcemap is not available for a Python Worker");
+                }
                 let (output, descriptor) = python::build(&root, entry, compat)?;
                 project.metadata["python_runtime"] = descriptor;
                 Ok(output)
@@ -647,13 +666,31 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                 )?;
                 // Directory iteration order must not change deployment identity.
                 wasm.sort_by(|a, b| a.0.cmp(&b.0));
-                Ok(BundleOutput { bundle, wasm })
+                let map = want_map
+                    .then(|| {
+                        let root = root
+                            .canonicalize()
+                            .with_context(|| format!("resolve {}", root.display()))?;
+                        sourcemap::read_sibling(&root, &path)
+                    })
+                    .transpose()?;
+                Ok(BundleOutput { bundle, wasm, map })
             } else {
-                run_esbuild(&root, entry, &project.bundle)
+                run_esbuild(&root, entry, &project.bundle, want_map)
             }
         })
         .transpose()?;
     let bundled_in = started.elapsed();
+    let sourcemap = bundle
+        .as_ref()
+        .and_then(|output| output.map.as_ref())
+        .map(|(map, directory)| {
+            let root = root
+                .canonicalize()
+                .with_context(|| format!("resolve {}", root.display()))?;
+            sourcemap::rebase(map, directory, &root)
+        })
+        .transpose()?;
 
     // Both build paths emit one JS module and its sibling wasm modules.
     let module_name = "index.js".to_string();
@@ -759,6 +796,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         images,
         fence_image,
         upload_images: !options.local_images,
+        sourcemap,
     })
 }
 
@@ -2953,6 +2991,9 @@ fn asset_content_type(path: &Path) -> Option<&'static str> {
 struct BundleOutput {
     bundle: Vec<u8>,
     wasm: Vec<(String, Vec<u8>)>,
+    /// The entry's map as its build wrote it, and the directory its relative
+    /// sources are relative to. Only set when a map was asked for.
+    map: Option<(Vec<u8>, PathBuf)>,
 }
 
 /// Wrangler's default unbundled WASM rule discovers `**/*.wasm` and
@@ -3021,12 +3062,23 @@ fn collect_unbundled_wasm(
     Ok(())
 }
 
-fn run_esbuild(root: &Path, entry: &str, config: &BundleConfig) -> anyhow::Result<BundleOutput> {
+fn run_esbuild(
+    root: &Path,
+    entry: &str,
+    config: &BundleConfig,
+    sourcemap: bool,
+) -> anyhow::Result<BundleOutput> {
     // node: builtins stay external. Wrangler polyfills them with unenv; celld
     // implements the workerd `nodejs_compat` subset itself, so the runtime
     // provides them.
     let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
     let outdir = tempfile::tempdir().context("create esbuild output directory")?;
+    // esbuild writes the map's sources relative to its output directory's real
+    // path, so that is the path it is given.
+    let outdir_path = outdir
+        .path()
+        .canonicalize()
+        .context("resolve the esbuild output directory")?;
     // esbuild leaves an external builtin from a CommonJS dependency behind
     // its synchronous __require helper. Workerd's Wrangler plugin rewrites
     // that call to an ESM import, but the esbuild CLI has no equivalent
@@ -3069,8 +3121,11 @@ fn run_esbuild(root: &Path, entry: &str, config: &BundleConfig) -> anyhow::Resul
                     .iter()
                     .map(|(key, value)| format!("--define:{key}={value}")),
             )
-            .arg(format!("--outdir={}", outdir.path().display()))
+            .arg(format!("--outdir={}", outdir_path.display()))
             .arg("--entry-names=index")
+            // An external map leaves the bundle without a `sourceMappingURL`
+            // line, so the module is the same bytes with or without one.
+            .args(sourcemap.then_some("--sourcemap=external"))
             .output()
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
@@ -3129,7 +3184,14 @@ fn run_esbuild(root: &Path, entry: &str, config: &BundleConfig) -> anyhow::Resul
     // read_dir order is platform-defined; the deployment version hashes the
     // module list, so keep it stable.
     wasm.sort();
-    Ok(BundleOutput { bundle, wasm })
+    let map = sourcemap
+        .then(|| {
+            std::fs::read(outdir.path().join("index.js.map"))
+                .map(|map| (map, outdir_path.clone()))
+                .context("read esbuild source map")
+        })
+        .transpose()?;
+    Ok(BundleOutput { bundle, wasm, map })
 }
 
 /// Minimal JSONC support: line and block comments, and trailing commas.
