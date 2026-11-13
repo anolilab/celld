@@ -1285,7 +1285,7 @@ pub struct LtxRepl {
     truncate_pages: Option<u32>,
     /// Every cell with per-cell LTX, as far as this node has read. The store
     /// registers a cell here before its first artifact is written.
-    cell_directory: Arc<crate::cell_directory::CellDirectory>,
+    cell_directory: Option<Arc<crate::cell_directory::CellDirectory>>,
 }
 
 impl LtxRepl {
@@ -1319,15 +1319,28 @@ impl LtxRepl {
         // Every per-cell LTX write goes through this store, so wrapping it
         // here puts a durable directory entry in front of the first artifact
         // of each cell. The reader needs no registration, so it holds the
-        // wrapper too, which forwards reads.
-        let directory = Arc::new(crate::cell_directory::CellDirectory::new());
-        let store: Arc<dyn ObjectStore> = Arc::new(crate::cell_directory::RegisteringStore::new(
-            store,
-            directory.clone(),
-            prefix.clone(),
-            node.to_owned(),
-            crate::machine::random_process_generation(),
-        ));
+        // wrapper too, which forwards reads. Opt-in while the directory only
+        // shadows the claim listing: until it replaces that LIST, its
+        // segment writes are pure added cost.
+        let (store, directory) = if crate::env_vars::flag("CELLD_CELL_DIRECTORY_SHADOW", false)? {
+            let directory = Arc::new(crate::cell_directory::CellDirectory::new());
+            let batch_window = Duration::from_millis(crate::env_vars::with_default(
+                "CELLD_CELL_DIRECTORY_BATCH_MS",
+                0,
+            )?);
+            let store: Arc<dyn ObjectStore> =
+                Arc::new(crate::cell_directory::RegisteringStore::new(
+                    store,
+                    directory.clone(),
+                    prefix.clone(),
+                    node.to_owned(),
+                    crate::machine::random_process_generation(),
+                    batch_window,
+                ));
+            (store, Some(directory))
+        } else {
+            (store, None)
+        };
         // Azure blob metadata names must be C# identifiers, so the standard
         // Litestream key cannot carry its hyphen there. External Litestream
         // tooling reads that key, therefore an az:// replica gives up
@@ -1383,7 +1396,7 @@ impl LtxRepl {
         ltx_host: LtxHost,
         durability_timeout_ms: u64,
         config: LtxConfig,
-        cell_directory: Arc<crate::cell_directory::CellDirectory>,
+        cell_directory: Option<Arc<crate::cell_directory::CellDirectory>>,
     ) -> Self {
         let cells: Arc<Mutex<BTreeMap<(String, u64), CellHandle>>> = Arc::default();
         let dirty = Arc::new(Notify::new());
@@ -1425,13 +1438,12 @@ impl LtxRepl {
             "ltx_bundle",
             bundle_loop(cells.clone(), registration.clone(), stop.clone(), flush_ms),
         );
-        tasks.spawn_owned("cell_directory", {
-            let directory = cell_directory.clone();
-            let store = store.clone();
-            let prefix = prefix.clone();
-            let stop = stop.clone();
-            async move { directory.run_refresh(store, prefix, stop).await }
-        });
+        if let Some(directory) = cell_directory.clone() {
+            let (store, prefix, stop) = (store.clone(), prefix.clone(), stop.clone());
+            tasks.spawn_owned("cell_directory", async move {
+                directory.run_refresh(store, prefix, stop).await
+            });
+        }
         let compaction_queue =
             compaction.map(|config| start_compaction_loop(config, tasks.clone()));
         Self {
@@ -1484,7 +1496,7 @@ impl LtxRepl {
     }
 
     /// The node's view of the fleet directory of cells with LTX.
-    pub fn cell_directory(&self) -> Arc<crate::cell_directory::CellDirectory> {
+    pub fn cell_directory(&self) -> Option<Arc<crate::cell_directory::CellDirectory>> {
         self.cell_directory.clone()
     }
 

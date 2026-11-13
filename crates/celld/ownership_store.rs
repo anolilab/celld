@@ -517,9 +517,9 @@ impl BucketOwnership {
 
     pub fn with_cell_directory(
         mut self,
-        directory: Arc<crate::cell_directory::CellDirectory>,
+        directory: Option<Arc<crate::cell_directory::CellDirectory>>,
     ) -> Self {
-        self.cell_directory = Some(directory);
+        self.cell_directory = directory;
         self
     }
 

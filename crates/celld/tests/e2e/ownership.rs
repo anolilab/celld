@@ -16,7 +16,7 @@ fn store(project: &Path) -> rusqlite::Connection {
 
 #[tokio::test]
 async fn lost_record_beside_ltx_is_refused_not_reclaimed() {
-    let mut server = Server::start("bench-agents", &[]).await;
+    let mut server = Server::start("bench-agents", &[("CELLD_CELL_DIRECTORY_SHADOW", "1")]).await;
     for _ in 0..3 {
         assert_eq!(server.get_text("/agent/kept").await, "ok");
     }

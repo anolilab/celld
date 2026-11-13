@@ -236,8 +236,13 @@ struct Registrar {
     pending: Mutex<Pending>,
     /// One segment write at a time. Whoever holds it flushes every cell that
     /// queued while the previous write was in flight, which is the group
-    /// commit; an idle registrar flushes at once.
+    /// commit.
     flushing: tokio::sync::Mutex<()>,
+    /// How long the flusher waits for more cells before it writes. Zero
+    /// flushes at once, which keeps a first write that waits on its
+    /// registration as fast as before; a longer window makes one segment
+    /// carry more cells.
+    batch_window: Duration,
 }
 
 impl Registrar {
@@ -255,6 +260,9 @@ impl Registrar {
             done: false,
         };
         let _turn = self.flushing.lock().await;
+        if !self.batch_window.is_zero() && !self.pending.lock().unwrap().registered.contains(cell) {
+            crate::asyncrt::sleep(self.batch_window).await;
+        }
         let (batch, seq) = {
             let mut pending = self.pending.lock().unwrap();
             if pending.registered.contains(cell) {
@@ -314,6 +322,7 @@ impl RegisteringStore {
         prefix: String,
         node: String,
         generation: String,
+        batch_window: Duration,
     ) -> Self {
         Self {
             registrar: Registrar {
@@ -324,6 +333,7 @@ impl RegisteringStore {
                 generation,
                 pending: Mutex::default(),
                 flushing: tokio::sync::Mutex::new(()),
+                batch_window,
             },
             inner,
         }
@@ -436,6 +446,7 @@ mod tests {
             PREFIX.to_owned(),
             "node-a".to_owned(),
             "gen1".to_owned(),
+            Duration::ZERO,
         )
     }
 

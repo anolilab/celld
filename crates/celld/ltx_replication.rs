@@ -52,7 +52,7 @@ impl Replication {
     }
 
     /// The node's view of the fleet directory of cells with LTX.
-    pub fn cell_directory(&self) -> Arc<crate::cell_directory::CellDirectory> {
+    pub fn cell_directory(&self) -> Option<Arc<crate::cell_directory::CellDirectory>> {
         self.ltx.cell_directory()
     }
 
