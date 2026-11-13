@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::harness::{wait_until, Server};
+use super::harness::{observe_for, wait_until, Server};
 
 async fn log(server: &Server, object: &str) -> Value {
     server.get_json(&format!("/log?o={object}")).await
@@ -64,13 +64,20 @@ async fn finished_alarm_leaves_none_pending() {
     let server = Server::start("do-alarms", &[]).await;
     server.get_json::<Value>("/set?o=done&ms=0").await;
 
-    let seen = wait_until("the alarm to clear", Duration::from_secs(5), || async {
+    wait_until("the alarm to fire", Duration::from_secs(5), || async {
         let seen = log(&server, "done").await;
-        (!deliveries(&seen).is_empty() && seen["alarm"].is_null()).then_some(seen)
+        (!deliveries(&seen).is_empty()).then_some(())
     })
     .await;
 
+    // The log is written before the handler returns, and `getAlarm()` hides a
+    // running alarm, so look again once the handler has long settled and the
+    // first retry (two seconds) would have come: an alarm left behind is
+    // either still pending or delivered again.
+    observe_for(Duration::from_secs(3)).await;
+    let seen = log(&server, "done").await;
     assert_eq!(deliveries(&seen).len(), 1, "{seen}");
+    assert_eq!(seen["alarm"], Value::Null, "{seen}");
 }
 
 #[tokio::test]
