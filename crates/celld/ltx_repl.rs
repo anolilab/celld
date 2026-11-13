@@ -3091,7 +3091,11 @@ impl LtxRepl {
                 self.publish_handoff_snapshot(cell, epoch, &snapshot),
             )
             .await;
-            if matches!(published, Ok(Ok(()))) && self.epoch_replicated(cell, epoch).await {
+            if matches!(published, Ok(Ok(()))) {
+                // A successful PUT is read-after-write, so the snapshot is the
+                // proof the epoch holds an object; a listing would only add a
+                // request and a false refusal under delayed listing.
+                //
                 // The snapshot is a per-cell object through its txid, so it
                 // covers every fleet-acked row of this closed database. No
                 // later sync or bundle flush credits a removed handle, so
@@ -3505,8 +3509,8 @@ impl LtxRepl {
         Ok((snapshot, pause))
     }
 
-    /// Publish one full L9 snapshot of a closed cell. A successful visibility
-    /// check makes this snapshot the authoritative handoff proof.
+    /// Publish one full L9 snapshot of a closed cell. A successful write with
+    /// matching metadata makes this snapshot the authoritative handoff proof.
     async fn publish_handoff_snapshot(
         &self,
         cell: &str,
