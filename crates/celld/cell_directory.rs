@@ -37,13 +37,8 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 /// one or two failed refreshes pass without making every answer `Unknown`.
 const MAX_VIEW_AGE_MS: u64 = 3 * REFRESH_INTERVAL.as_millis() as u64;
 
-/// The segment directory of one writer process.
-fn segment_dir(prefix: &str, node: &str, generation: &str) -> String {
-    format!("{prefix}fleet/born/{node}/{generation}")
-}
-
 fn segment_key(prefix: &str, node: &str, generation: &str, seq: u64) -> String {
-    format!("{}/{seq:08}", segment_dir(prefix, node, generation))
+    format!("{prefix}fleet/born/{node}/{generation}/{seq:08}")
 }
 
 /// The writer of a segment key, from the right: a node name that holds a `/`
