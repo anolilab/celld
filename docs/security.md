@@ -92,6 +92,66 @@ encrypt traffic, so keep the listener on a trusted private network. A Worker
 that calls the internal port with `fetch()` gets a 401 on every route, unless
 it holds the token.
 
+## Limit Worker egress
+
+A Worker's `fetch()` and sockets start on the node, so by default they can
+reach everything the node reaches: the internal listener, other services on
+the host network, and the cloud metadata endpoint. Set `CELLD_EGRESS=public` to
+refuse a Worker's `fetch()`, `connect()` and outbound WebSocket dials to any
+address that is not on the public internet. A refused `fetch()` or WebSocket
+dial rejects with a `TypeError` whose message begins `egress refused:`, and a
+refused `connect()` rejects its `opened` promise with the same message.
+
+celld refuses these address classes:
+
+| Class | Ranges |
+| --- | --- |
+| Unspecified, loopback | `0.0.0.0/8`, `127.0.0.0/8`, `::`, `::1` |
+| Private | `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` |
+| CGNAT | `100.64.0.0/10` |
+| Link-local | `169.254.0.0/16`, `fe80::/10` |
+| Metadata | `169.254.169.254`, `169.254.170.2`, `100.100.100.200`, `192.0.0.192`, `fd00:ec2::254` |
+| Unique-local | `fc00::/7` |
+| Multicast | `224.0.0.0/4`, `ff00::/8` |
+| Reserved | `240.0.0.0/4` including the broadcast address, `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `2001::/23`, `2001:db8::/32`, `3fff::/20`, `100::/64`, `fec0::/10`, `64:ff9b:1::/48`, and every IPv6 address outside `2000::/3` |
+| IPv4 inside IPv6 | IPv4-mapped (`::ffff:a.b.c.d`), NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`) addresses are public only when the embedded IPv4 address is. An ISATAP address (`::5efe:a.b.c.d`) is public only when its prefix and its embedded IPv4 address both are. Teredo (`2001::/32`) is always refused |
+
+The check runs on the address celld connects to, not on the hostname. A name
+that resolves to a refused address is refused, and celld connects only to the
+addresses that passed, so a name cannot answer with a public address for the
+check and a private one for the connection. An IP literal skips DNS, so celld
+checks it before the request. `fetch()` checks every redirect hop, so a public
+server cannot redirect a Worker to `http://169.254.169.254/`. With
+`redirect: "manual"`, the Worker receives the redirect and its next `fetch()`
+is checked as a new request.
+
+`CELLD_EGRESS_ALLOW` lists exceptions, separated by commas or whitespace:
+
+| Entry | Effect |
+| --- | --- |
+| `10.0.0.0/8`, `fd00::/8` | Permits every address in the range on every port, however the Worker names it. A name that resolves into the range needs the range here: use `10.0.0.5/32` for one address. |
+| `10.0.0.5:5432`, `[fd00::5]:5432` | Permits that address on that port when the request names the address itself. |
+| `db.internal:5432` | Permits any address the name resolves to, on that port only. The name is refused on every other port, so the exception does not open the rest of the host. |
+
+celld refuses to start on an invalid value, on `CELLD_EGRESS_ALLOW` without
+`CELLD_EGRESS=public`, and on a mode other than `open` or `public`.
+
+These do not use the filter:
+
+- celld's own traffic: peers, the bucket, the control plane and telemetry.
+- The endpoints of the node's running containers. `getTcpPort()` reaches a
+  container on its private bridge address or its published loopback port, and
+  celld permits exactly those addresses.
+
+`CELLD_EGRESS=public` also stops a Worker's `fetch()` from using an
+`HTTP_PROXY` or `ALL_PROXY` proxy. A proxy receives the name and resolves it
+where the filter cannot see the address.
+
+The filter does not apply to what a container does. A container has its own
+network: use `enableInternet: false`, or a firewall on the container network.
+It also does not replace a firewall: it stops a Worker, not another process on
+the node.
+
 ## Use the internal operator API
 
 The operator API is an alpha interface. A release can change its paths or

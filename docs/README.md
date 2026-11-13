@@ -720,6 +720,8 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_ADVERTISE` | The internal address that peers can reach. The same as `--advertise` |
 | `CELLD_OPERATOR_TOKEN` | When set, every request to the internal listener must send `Authorization: Bearer <token>`, and every celld command that calls it sends the token. Set the same value on every node and in each operator command. celld refuses an empty value, whitespace, or non-printable characters. Unset: no token. See [Require an operator token](security.md#require-an-operator-token) |
 | `CELLD_UNSAFE_PUBLIC_ADVERTISE` | Set to `1` to permit a literal public IP in `CELLD_ADVERTISE`. It does not resolve a DNS name or restrict the internal listener |
+| `CELLD_EGRESS` | `open` (default) or `public`. `public` refuses a Worker's `fetch()`, `connect()` and outbound WebSocket dials to loopback, private, link-local, CGNAT, unique-local, unspecified, multicast and reserved addresses, the metadata addresses, and IPv4 addresses carried in IPv6, on the resolved address and on every redirect hop. See [Limit Worker egress](security.md#limit-worker-egress) |
+| `CELLD_EGRESS_ALLOW` | Exceptions to `CELLD_EGRESS=public`, separated by commas: CIDR ranges and `host:port` destinations. Setting it without `CELLD_EGRESS=public` is an error |
 | `CELLD_NODE` | An explicit node-session ID: 1 to 128 ASCII letters, numbers, dots, dashes, or underscores, but not `.` or `..` |
 | `CELLD_WATCH` | The local work directory for SQLite and replication |
 | `CELLD_ESBUILD` | The path of the esbuild executable |

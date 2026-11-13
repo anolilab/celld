@@ -109,6 +109,22 @@ fn accept_key(key: &str) -> String {
 /// The caller owns the timeout: nothing here bounds how long a server may take
 /// to answer.
 pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
+    connect_filtered(url, extra, None).await
+}
+
+/// [`connect`] for a Worker's outbound WebSocket: with `CELLD_EGRESS=public`
+/// it dials only addresses the egress policy permits. celld's own
+/// connections use [`connect`] and are not filtered.
+pub async fn connect_for_worker(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
+    let filter = crate::egress_filter::active();
+    connect_filtered(url, extra, filter.as_deref()).await
+}
+
+async fn connect_filtered(
+    url: &str,
+    extra: HeaderMap,
+    filter: Option<&crate::egress_filter::Filter>,
+) -> Result<Connection, Error> {
     let url = url::Url::parse(url).context("parse WebSocket URL")?;
     // `fetch("http://…", { headers: { Upgrade: "websocket" } })` is the
     // Workers idiom for an outbound socket, and the only form a container
@@ -132,9 +148,18 @@ pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
         None => url.path().to_string(),
     };
 
-    let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
-        .await
-        .with_context(|| format!("connect {authority}"))?;
+    let tcp = match filter {
+        Some(filter) => {
+            // The refusal carries its own text, so it is not wrapped.
+            let addrs = filter
+                .resolve(&host, port)
+                .await
+                .map_err(|refused| anyhow!("{refused}"))?;
+            tokio::net::TcpStream::connect(&addrs[..]).await
+        }
+        None => tokio::net::TcpStream::connect((host.as_str(), port)).await,
+    }
+    .with_context(|| format!("connect {authority}"))?;
     let stream: Box<dyn Stream> = if tls {
         let name = rustls::pki_types::ServerName::try_from(host.clone())
             .map_err(|_| anyhow!("invalid TLS server name: {host}"))?;

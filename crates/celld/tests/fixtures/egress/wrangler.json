@@ -1,0 +1,6 @@
+{
+  "name": "egress",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01"
+}

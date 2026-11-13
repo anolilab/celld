@@ -578,16 +578,31 @@ impl CellJob {
 thread_local! {
     // One outbound HTTP client per JS thread — building it per fetch rebuilds
     // the TLS stack every call (async-op-hazards.md).
-    static HTTP: reqwest::Client = reqwest::Client::new();
-    static HTTP_MANUAL: reqwest::Client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    static HTTP: reqwest::Client = match crate::egress_filter::active() {
+        None => reqwest::Client::new(),
+        Some(filter) => crate::egress_filter::guard(reqwest::Client::builder(), Some(&filter))
+            .redirect(crate::egress_filter::redirect_policy(
+                filter,
+                crate::egress_filter::default_redirect_limit,
+            ))
+            .build()
+            .unwrap(),
+    };
+    static HTTP_MANUAL: reqwest::Client = crate::egress_filter::guard(
+        reqwest::Client::builder(),
+        crate::egress_filter::active().as_ref(),
+    )
+    .redirect(reqwest::redirect::Policy::none()).build().unwrap();
     // A separate policy stops an `error` request before reqwest can replay it
     // at the destination. Inspecting the final response would be too late:
     // the method, body, and credentials could already have left the process.
-    static HTTP_ERROR: reqwest::Client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            attempt.error("fetch redirect mode is error")
-        })).build().unwrap();
+    static HTTP_ERROR: reqwest::Client = crate::egress_filter::guard(
+        reqwest::Client::builder(),
+        crate::egress_filter::active().as_ref(),
+    )
+    .redirect(reqwest::redirect::Policy::custom(|attempt| {
+        attempt.error("fetch redirect mode is error")
+    })).build().unwrap();
 }
 
 #[derive(Debug)]
@@ -606,6 +621,9 @@ fn fetch_request_error(error: &reqwest::Error) -> String {
     loop {
         if let Some(limit) = source.downcast_ref::<RedirectSubrequestLimit>() {
             return limit.0.clone();
+        }
+        if let Some(refused) = source.downcast_ref::<crate::egress_filter::Refused>() {
+            return format!("fetch: {refused}");
         }
         let Some(next) = source.source() else {
             return format!("fetch: {error}");
@@ -8435,6 +8453,19 @@ fn op_fetch(
         rv.set(promise);
         return;
     }
+    // The first destination, checked before the request is built. An IP
+    // literal never reaches the guarded resolver, and each redirect hop is
+    // checked by its client's policy.
+    if let Some(filter) = crate::egress_filter::active() {
+        match url::Url::parse(&url) {
+            Ok(parsed) => {
+                if let Err(refused) = filter.check_url(&parsed) {
+                    return loader_throw(scope, &format!("fetch: {refused}"));
+                }
+            }
+            Err(error) => return loader_throw(scope, &format!("fetch: invalid URL: {error}")),
+        }
+    }
     // Select the client only for direct egress: a broker must not initialize
     // an unused network client and its TLS stack.
     let client = match redirect.as_str() {
@@ -10111,8 +10142,15 @@ impl IoContext {
         self.redirect_client
             .get_or_init(|| {
                 let context = Arc::downgrade(self);
-                reqwest::Client::builder()
+                let filter = crate::egress_filter::active();
+                crate::egress_filter::guard(reqwest::Client::builder(), filter.as_ref())
                     .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                        // Each hop is checked before it is counted or followed.
+                        if let Some(filter) = &filter {
+                            if let Err(refused) = filter.check_url(attempt.url()) {
+                                return attempt.error(refused);
+                            }
+                        }
                         if attempt.previous().len() >= 10 {
                             return attempt.error("too many redirects");
                         }

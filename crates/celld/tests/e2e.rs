@@ -9,6 +9,7 @@ mod e2e {
     pub mod do_ids;
     pub mod do_sql;
     pub mod do_storage;
+    pub mod egress;
     pub mod facets;
     pub mod harness;
     pub mod isolates;
