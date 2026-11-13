@@ -412,6 +412,9 @@ pub struct BucketOwnership {
     /// Each cell whose record this node found lost, with the monotonic time
     /// at which its hold ends. See [`LOST_RECORD_RECHECK_MS`].
     lost_records: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+    /// The fleet directory of cells with LTX, when this node writes LTX. It
+    /// only shadows the lost-record listing; see [`Self::directory_answer`].
+    cell_directory: Option<Arc<crate::cell_directory::CellDirectory>>,
 }
 
 /// What this node currently looks like, for peers deciding where to place a
@@ -508,7 +511,16 @@ impl BucketOwnership {
             own_log: std::sync::Mutex::new((0, None)),
             applied: tokio::sync::watch::channel((String::new(), 0)).0,
             lost_records: std::sync::Mutex::default(),
+            cell_directory: None,
         }
+    }
+
+    pub fn with_cell_directory(
+        mut self,
+        directory: Arc<crate::cell_directory::CellDirectory>,
+    ) -> Self {
+        self.cell_directory = Some(directory);
+        self
     }
 
     /// The lease lifetime this fleet renews on, used to decide which node
@@ -570,6 +582,17 @@ impl BucketOwnership {
     /// first, so LTX proves that a record existed before the listing.
     pub async fn ltx_exists(&self, cell: &str) -> anyhow::Result<bool> {
         self.bucket.list_any(&format!("cells/{cell}/ltx")).await
+    }
+
+    /// What the fleet directory says about `cell`, or `None` on a node without
+    /// one. The claim guard compares it with the listing and decides by the
+    /// listing alone.
+    pub(crate) fn directory_answer(
+        &self,
+        cell: &str,
+    ) -> Option<celld_logic::cell_directory::DirectoryAnswer> {
+        let directory = self.cell_directory.as_ref()?;
+        Some(directory.answer(cell, crate::asyncrt::mono_ms()))
     }
 
     /// Whether this node found the record of `cell` lost less than

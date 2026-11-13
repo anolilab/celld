@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub mod alarm;
 pub mod cache;
 pub mod cell;
+pub mod cell_directory;
 pub mod cron;
 pub mod dead_node_reconciliation;
 pub mod drain;

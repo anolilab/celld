@@ -220,13 +220,31 @@ impl Ownership {
             return Err(Failure::Definite);
         }
         let record = self.read_owner(cell).await?;
-        if record.is_some()
-            || !bucket
-                .ltx_exists(cell)
-                .await
-                .map_err(ownership_read_failed)?
+        if record.is_some() {
+            return Ok(record);
+        }
+        // Asked before the listing, so a registration that lands during the
+        // listing cannot make the directory look wrong.
+        let directory = bucket.directory_answer(cell);
+        if !bucket
+            .ltx_exists(cell)
+            .await
+            .map_err(ownership_read_failed)?
         {
             return Ok(record);
+        }
+        // The listing decides. A directory that calls the cell new while LTX
+        // exists is the gap that must stay empty before the directory may
+        // replace the listing.
+        if let Some(answer) = directory {
+            if celld_logic::cell_directory::contradicts_listing(answer, true) {
+                tracing::warn!(
+                    event = "cell_directory_mismatch",
+                    cell,
+                    ?answer,
+                    "the cell directory called a cell new while its LTX exists"
+                );
+            }
         }
         // A claim writes the record before any LTX, and celld never deletes
         // the record, so LTX proves that a record existed before the listing.

@@ -35,6 +35,7 @@ impl Replication {
         endpoint: Option<String>,
         region: String,
         credentials: Option<StorageCredentials>,
+        node: &str,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             ltx: Arc::new(LtxRepl::start(
@@ -45,8 +46,14 @@ impl Replication {
                 endpoint,
                 region,
                 credentials,
+                node,
             )?),
         })
+    }
+
+    /// The node's view of the fleet directory of cells with LTX.
+    pub fn cell_directory(&self) -> Arc<crate::cell_directory::CellDirectory> {
+        self.ltx.cell_directory()
     }
 
     /// The log tier installs its shipper and takeover interlock here.
