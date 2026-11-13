@@ -117,3 +117,55 @@ fn an_absent_lease_is_still_proof_that_nothing_was_acknowledged() {
 
     assert!(claims(&effects), "{effects:?}");
 }
+
+/// The session behind a log-less lease is still running when a recoverer
+/// seals the absent log: its renewal loses the conditional write, and the
+/// readback finds the lease carrying a sealed log it never wrote. It must
+/// stop, not adopt the new record and renew again.
+#[test]
+fn a_session_whose_lease_was_sealed_under_it_fences_itself() {
+    let mut shell = Shell::leased(crate::test_support::config());
+    shell.local_cells(&[]);
+    let now = shell.tick(10_000);
+    shell.send(Event::NudgeNodeLease {
+        now_ms: now,
+        now_mono_ms: now,
+    });
+    let renewal = shell.expect("a renewal write", |effect| match effect {
+        Effect::CasNodeLease { op, .. } => Some(*op),
+        _ => None,
+    });
+    shell.send(Event::NodeLeaseCasCompleted {
+        op: renewal,
+        now_mono_ms: now,
+        result: Ok(LeaseCasOutcome::Rejected),
+        stamped_log_state: None,
+    });
+    let read = shell.expect("a readback", |effect| match effect {
+        Effect::ReadSelfNodeLease { op } => Some(*op),
+        _ => None,
+    });
+
+    let effects = shell.send(Event::SelfNodeLeaseRead {
+        op: read,
+        now_ms: now,
+        now_mono_ms: now,
+        result: Ok(Some(NodeLeaseRecord {
+            node: "node".into(),
+            addr: "node:8081".into(),
+            expires_ms: now + 20_000,
+            peer_protocol: 1,
+            generation: "g".into(),
+            log_state: Some(LogState::Sealed),
+            etag: "sealed-etag".into(),
+        })),
+    });
+
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Halt { .. })),
+        "the sealed-under session kept its authority: {effects:?}"
+    );
+    assert!(!shell.state.node_authoritative());
+}
