@@ -83,9 +83,6 @@ The hooks below are not tied to a cfg and remain in the code:
 
 - `CellHost` is an enum with one variant. A scripted host for simulation would
   be added as a second variant.
-- `LtxRepl`'s `vfs_name` and the `vfs` argument of `sqlite_snapshot` are
-  always `None` now: only the removed test constructor set them. They are the
-  seam for a fault-injecting SQLite VFS ([#7](https://github.com/anolilab/celld/issues/7)).
 - Test-only environment variables read by debug builds or by the JavaScript
   layer: `CELLD_TEST_KV` and `CELLD_TEST_CELL_STARTUP_FAILURE`. The
   end-to-end tests can use them.

@@ -61,13 +61,6 @@ use celld_logic::durability::{proof_deadline, ProofProgress, ProofWait};
 /// and in-flight object-store requests under high write fan-out.
 const SYNC_CONCURRENCY: usize = 64;
 
-/// The upload slots this node starts with. The simulation narrows them to
-/// put a second cell's upload in the queue on purpose, which is the state
-/// the durability wait's queued regime exists for.
-fn sync_concurrency() -> usize {
-    SYNC_CONCURRENCY
-}
-
 /// Max LTX object downloads across every restore on this node. A hot cell can
 /// contain thousands of L0 files, so serial reads turn a takeover into minutes
 /// of terminal failures. This shared ceiling hides round-trip latency without
@@ -1187,9 +1180,6 @@ pub struct LtxRepl {
     /// One connection pool for the whole node, shared by every cell client.
     store: Arc<dyn ObjectStore>,
     ltx_host: LtxHost,
-    /// An explicit SQLite VFS for both managed connections. Production keeps
-    /// this unset.
-    vfs_name: Option<String>,
     cells: Arc<Mutex<BTreeMap<(String, u64), CellHandle>>>,
     stopped_cells: Arc<Mutex<BTreeMap<(String, u64), CellHandle>>>,
     /// Serializes a release admission with the final shutdown snapshot. A
@@ -1353,7 +1343,6 @@ impl LtxRepl {
             compaction,
             flush_ms,
             production_ltx_host(),
-            None,
             durability_timeout_ms,
             LtxConfig::from_env(),
         ))
@@ -1373,7 +1362,6 @@ impl LtxRepl {
         compaction: Option<CompactionConfig>,
         flush_ms: u64,
         ltx_host: LtxHost,
-        vfs_name: Option<String>,
         durability_timeout_ms: u64,
         config: LtxConfig,
     ) -> Self {
@@ -1396,7 +1384,7 @@ impl LtxRepl {
             sync_loop(
                 cells.clone(),
                 dirty.clone(),
-                Arc::new(Semaphore::new(sync_concurrency())),
+                Arc::new(Semaphore::new(SYNC_CONCURRENCY)),
                 registration.clone(),
                 stop.clone(),
                 tasks.clone(),
@@ -1429,7 +1417,6 @@ impl LtxRepl {
             credentials,
             store,
             ltx_host,
-            vfs_name,
             cells,
             stopped_cells: Arc::new(Mutex::new(BTreeMap::new())),
             replica_close_gate: Mutex::new(()),
@@ -2316,7 +2303,7 @@ impl LtxRepl {
                     let name = celld_ltx::paged_vfs::next_registration_name();
                     celld_ltx::paged_vfs::register_paged_vfs(
                         &name,
-                        self.vfs_name.as_deref(),
+                        None,
                         &dst,
                         std::sync::Arc::new(source),
                     )
@@ -2401,8 +2388,7 @@ impl LtxRepl {
         let db_open_started_mono_ms = asyncrt::mono_ms();
         let dst_ = dst.clone();
         let ltx_host = self.ltx_host.clone();
-        // The paged VFS (this activation) takes precedence over the fault VFS.
-        let vfs_name = paged_vfs_name.clone().or_else(|| self.vfs_name.clone());
+        let vfs_name = paged_vfs_name.clone();
         let truncate_pages = self.truncate_pages_for_cell(cell);
         // Capture must finish opening before the application's SQLite connection
         // or schema setup runs. An earlier write can hide a torn WAL header and
@@ -3584,7 +3570,7 @@ impl LtxRepl {
             self.paged_vfs_name(cell, epoch).is_none(),
             "{cell} epoch {epoch} is paged in; inspect it from the bucket"
         );
-        sqlite_snapshot(&source, &path, self.vfs_name.as_deref())?;
+        sqlite_snapshot(&source, &path)?;
         Ok(Some(RestoredSnapshot::new(
             epoch,
             path,
