@@ -146,7 +146,7 @@ fn main() {
             "no workload matches CELLD_BENCH_FILTER={:?}\n",
             settings.filter.unwrap_or_default()
         ));
-        return;
+        std::process::exit(1);
     }
     out(&table(&results, cold.as_deref()));
     write_json(&settings, &results, cold.as_deref());
