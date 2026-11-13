@@ -33,7 +33,11 @@ celld implements this part of `ctx.container`:
 - `destroy()` stops the container, and `signal()` sends it a signal.
 - `getTcpPort(port).fetch()` sends an HTTP request to a port, and
   `getTcpPort(port).connect()` opens a raw socket.
-- `exec()` runs a process in the container.
+- `exec()` runs a process in the container. Called while a `start()` is still
+  in flight, it waits for the container to come up, and it rejects with the
+  reason when the start fails or `destroy()` ends it. A container that the
+  engine finishes creating after `destroy()` ended its start is removed, and
+  `running` stays `false`.
 - `setInactivityTimeout()` sets the idle window.
 
 On Linux, `getTcpPort(port)` reaches every port through the bridge address of

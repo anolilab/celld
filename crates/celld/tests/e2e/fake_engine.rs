@@ -386,8 +386,11 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request, kill: Kill) -> Action {
         }
         ("POST", ["containers", name, "start"]) => {
             let name = name.trim_start_matches("id-");
-            if let Some(error) = guard.start_error.take() {
-                return Action::Reply(500, message(&error));
+            // The fence's start is the node's, not the test's.
+            if !guard.containers.get(name).is_some_and(|c| c.fence) {
+                if let Some(error) = guard.start_error.take() {
+                    return Action::Reply(500, message(&error));
+                }
             }
             match guard.containers.get_mut(name) {
                 Some(container) => {
