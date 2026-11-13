@@ -31,6 +31,8 @@ pub(crate) struct Deployed {
     version: String,
     location: String,
     dry_run: bool,
+    /// The version is uploaded and selected by nothing.
+    staged: bool,
 }
 
 impl Record for Deployed {
@@ -40,6 +42,7 @@ impl Record for Deployed {
             "version": self.version,
             "location": self.location,
             "dry_run": self.dry_run,
+            "staged": self.staged,
         })
     }
 
@@ -49,6 +52,8 @@ impl Record for Deployed {
                 "Current Version ID: {} (dry run; nothing written)",
                 self.version
             )
+        } else if self.staged {
+            format!("Staged Version ID: {} (not serving)", self.version)
         } else {
             format!("Current Version ID: {}", self.version)
         })
@@ -591,6 +596,7 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
             version: built.version.clone(),
             location: String::new(),
             dry_run: true,
+            staged: options.no_activate,
         })?;
         return out.finish();
     }
@@ -600,7 +606,7 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     validate_bucket(&store).await?;
     crate::wake_format::ensure_ready(&store).await?;
     let started = std::time::Instant::now();
-    deploy::write(&store, &built).await?;
+    deploy::write(&store, &built, !options.no_activate).await?;
     let location = format!(
         "{}://{}/{}{}",
         store.scheme(),
@@ -619,8 +625,17 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
         version: built.version.clone(),
         location,
         dry_run: false,
+        staged: options.no_activate,
     })?;
-    note!("Nodes adopt this version at their next pointer poll, without a restart.");
+    if options.no_activate {
+        note!(
+            "Nothing serves this version yet. Select it with `celld activate {}={}`.",
+            built.script_name,
+            built.version
+        );
+    } else {
+        note!("Nodes adopt this version at their next pointer poll, without a restart.");
+    }
     out.finish()
 }
 
@@ -643,11 +658,15 @@ async fn get_bytes(bucket: &Bucket, key: &str) -> anyhow::Result<bytes::Bytes> {
 /// The fleet-wide pointer: the bucket's only application commit point.
 pub const CURRENT_POINTER_KEY: &str = "deploy/current.json";
 
-pub async fn load_current_worker(
+/// Load the primary script of the fleet pointer the caller already read.
+/// The graph resolves every service from this same pointer, so one adoption
+/// never mixes two reads of it.
+pub async fn load_primary_worker(
     bucket: &Bucket,
+    pointer: DeployPointer,
     node: String,
 ) -> anyhow::Result<LoadedDeployment> {
-    load_worker_from_pointer(bucket, CURRENT_POINTER_KEY, node).await
+    load_worker_at_pointer(bucket, pointer, CURRENT_POINTER_KEY, node).await
 }
 
 /// Block until the fleet-wide pointer exists, so a self-hosted node that
@@ -687,12 +706,29 @@ pub async fn read_current_pointer(bucket: &Bucket) -> anyhow::Result<DeployPoint
         .with_context(|| format!("decode {CURRENT_POINTER_KEY}"))
 }
 
-pub async fn load_named_worker(
+/// Load a service-binding target. The fleet pointer's component map names
+/// its deployment when it lists the script; otherwise the script's own
+/// pointer does, which is how every deployment resolved before the map.
+pub async fn load_service_worker(
     bucket: &Bucket,
+    fleet: &DeployPointer,
     script: &str,
     node: String,
 ) -> anyhow::Result<LoadedDeployment> {
-    load_worker_from_pointer(bucket, &format!("deploy/{script}/current.json"), node).await
+    if let Some(selected) = fleet.components.get(script) {
+        let pointer = DeployPointer {
+            script_name: Some(script.to_string()),
+            version: selected.version.clone(),
+            prefix: selected.prefix.clone(),
+            rollout: Rollout { percent: 100 },
+            components: Default::default(),
+        };
+        return load_worker_at_pointer(bucket, pointer, CURRENT_POINTER_KEY, node).await;
+    }
+    let pointer_key = format!("deploy/{script}/current.json");
+    let pointer: DeployPointer = serde_json::from_str(&get_string(bucket, &pointer_key).await?)
+        .with_context(|| format!("decode {pointer_key}"))?;
+    load_worker_at_pointer(bucket, pointer, &pointer_key, node).await
 }
 
 pub async fn load_queue_consumer_attachment(
@@ -721,6 +757,7 @@ pub async fn load_queue_consumer_worker(
         version: consumer.version.clone(),
         prefix: consumer.prefix.clone(),
         rollout: Rollout { percent: 100 },
+        components: Default::default(),
     };
     let pointer_key = format!("deploy/{}/current.json", consumer.script_name);
     let loaded = load_worker_at_pointer(bucket, pointer, &pointer_key, node).await?;
@@ -735,16 +772,6 @@ pub async fn load_queue_consumer_worker(
         consumer.script_name
     );
     Ok(loaded)
-}
-
-async fn load_worker_from_pointer(
-    bucket: &Bucket,
-    pointer_key: &str,
-    node: String,
-) -> anyhow::Result<LoadedDeployment> {
-    let pointer: DeployPointer = serde_json::from_str(&get_string(bucket, pointer_key).await?)
-        .with_context(|| format!("decode {pointer_key}"))?;
-    load_worker_at_pointer(bucket, pointer, pointer_key, node).await
 }
 
 async fn load_worker_at_pointer(
@@ -909,6 +936,7 @@ async fn load_worker_at_pointer(
                 Some(crate::assets::FallbackSource {
                     pointer_key: pointer_key.to_string(),
                     boot_prefix: pointer.prefix.clone(),
+                    script: manifest.script_name.clone(),
                 }),
             )
             .await?,

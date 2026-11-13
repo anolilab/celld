@@ -463,6 +463,42 @@ pub struct DeployPointer {
     pub version: String,
     pub prefix: String,
     pub rollout: Rollout,
+    /// The version of each co-hosted script that a service binding resolves,
+    /// by script name. A script absent from the map resolves through its
+    /// named pointer, so a fleet that never stages a deployment has no map.
+    /// A node reads this pointer once, so a map written in one update moves
+    /// every script it names together.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub components: BTreeMap<String, ComponentPointer>,
+}
+
+/// One script's deployment as a [`DeployPointer`] names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentPointer {
+    pub version: String,
+    pub prefix: String,
+}
+
+impl DeployPointer {
+    /// The deployment this pointer selects for `script`: the primary script
+    /// is the pointer itself, any other script comes from `components`.
+    pub fn selection_for(&self, script: &str) -> Option<ComponentPointer> {
+        if self.script_name.as_deref() == Some(script) {
+            return Some(ComponentPointer {
+                version: self.version.clone(),
+                prefix: self.prefix.clone(),
+            });
+        }
+        self.components.get(script).cloned()
+    }
+
+    /// Whether `other` selects exactly the same deployments, so a node that
+    /// serves one has nothing to adopt from the other.
+    pub fn selects_same(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.prefix == other.prefix
+            && self.components == other.components
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

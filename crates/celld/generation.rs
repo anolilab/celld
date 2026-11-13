@@ -25,6 +25,7 @@ use crate::assets::AssetResolver;
 use crate::bucket::Bucket;
 use crate::fleet::{self, LoadedDeployment};
 use crate::js::{WorkerConfig, WorkerConfigOptions};
+use crate::protocol::{ComponentPointer, DeployPointer};
 
 /// Which generation, within this process. Monotonic from one at boot; never
 /// reused, never persisted, and never compared across nodes — the fleet-wide
@@ -113,6 +114,10 @@ pub fn max_age() -> std::time::Duration {
 pub struct DeploymentGraph {
     pub primary: LoadedDeployment,
     pub cohosted: Vec<LoadedDeployment>,
+    /// The component map of the pointer this graph was resolved from. A node
+    /// compares it with the pointer it reads next, so a pointer that moves
+    /// only a co-hosted script still reads as a new deployment.
+    pub components: BTreeMap<String, ComponentPointer>,
 }
 
 impl DeploymentGraph {
@@ -123,6 +128,7 @@ impl DeploymentGraph {
         Self {
             primary,
             cohosted: Vec::new(),
+            components: BTreeMap::new(),
         }
     }
 
@@ -135,7 +141,20 @@ impl DeploymentGraph {
     /// than the one already loaded, because either would give one script two
     /// bodies in one process.
     pub async fn load(bucket: &Bucket, node: String) -> anyhow::Result<Self> {
-        let primary = fleet::load_current_worker(bucket, node.clone()).await?;
+        let pointer = fleet::read_current_pointer(bucket).await?;
+        Self::load_pointer(bucket, pointer, node).await
+    }
+
+    /// [`Self::load`] for a pointer the caller already read. Every script of
+    /// the graph resolves from this one value, so a pointer that moves while
+    /// the graph loads cannot give it two different versions.
+    pub async fn load_pointer(
+        bucket: &Bucket,
+        pointer: DeployPointer,
+        node: String,
+    ) -> anyhow::Result<Self> {
+        let components = pointer.components.clone();
+        let primary = fleet::load_primary_worker(bucket, pointer.clone(), node.clone()).await?;
         let primary_script = primary.script_name.clone();
         let mut loaded_scripts = BTreeMap::from([(primary_script.clone(), primary.prefix.clone())]);
         let mut loaded_consumers =
@@ -149,9 +168,10 @@ impl DeploymentGraph {
                     if target == primary_script || loaded_scripts.contains_key(&target) {
                         continue;
                     }
-                    let loaded = fleet::load_named_worker(bucket, &target, node.clone())
-                        .await
-                        .with_context(|| format!("load service binding target {target}"))?;
+                    let loaded =
+                        fleet::load_service_worker(bucket, &pointer, &target, node.clone())
+                            .await
+                            .with_context(|| format!("load service binding target {target}"))?;
                     if loaded.script_name != target {
                         anyhow::bail!(
                             "service pointer {target} resolved script {}",
@@ -231,7 +251,11 @@ impl DeploymentGraph {
             }
             cohosted.push(loaded);
         }
-        Ok(Self { primary, cohosted })
+        Ok(Self {
+            primary,
+            cohosted,
+            components,
+        })
     }
 }
 
@@ -283,6 +307,8 @@ pub struct Generation {
     pub(crate) version: String,
     pub(crate) prefix: String,
     pub(crate) script_name: String,
+    /// The component map of the pointer this generation was built from.
+    pub(crate) components: BTreeMap<String, ComponentPointer>,
     pub(crate) stateless: crate::runtime::StatelessRuntime,
     pub(crate) services: HashMap<String, crate::runtime::StatelessRuntime>,
     pub(crate) cell_configs: HashMap<String, Arc<WorkerConfig>>,
@@ -311,6 +337,14 @@ impl Generation {
 
     pub fn prefix(&self) -> &str {
         &self.prefix
+    }
+
+    /// Whether `pointer` selects the deployments this generation was built
+    /// from, the primary script and every component.
+    pub fn is_selected_by(&self, pointer: &DeployPointer) -> bool {
+        pointer.version == self.version
+            && pointer.prefix == self.prefix
+            && pointer.components == self.components
     }
 
     /// The primary script: the one ingress serves and whose assets ingress
@@ -466,7 +500,11 @@ impl Generation {
         options: GenerationOptions,
     ) -> anyhow::Result<Self> {
         let GenerationOptions { node, region } = options;
-        let DeploymentGraph { primary, cohosted } = graph;
+        let DeploymentGraph {
+            primary,
+            cohosted,
+            components,
+        } = graph;
         crate::runtime::init_engine();
 
         // A Queue class is shared by every co-hosted script, but its broker
@@ -617,6 +655,7 @@ impl Generation {
             version,
             prefix,
             script_name: primary_script,
+            components,
             stateless,
             services: service_pools,
             cell_configs,

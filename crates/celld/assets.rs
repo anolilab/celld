@@ -44,6 +44,10 @@ pub struct FallbackSource {
     /// The deployment prefix loaded at boot; a pointer naming another
     /// prefix names a newer deployment.
     pub boot_prefix: String,
+    /// The script this resolver belongs to. The fleet pointer names it as its
+    /// primary or as a component, and a later activation can move it from one
+    /// to the other, so the pointer is asked by script name.
+    pub script: String,
 }
 
 /// The newest foreign index this resolver has adopted, plus the throttle
@@ -578,8 +582,18 @@ impl AssetResolver {
             .get(&source.pointer_key)
             .await?
             .with_context(|| format!("read {}", source.pointer_key))?;
-        let pointer: DeployPointer =
+        let mut pointer: DeployPointer =
             serde_json::from_slice(&bytes).context("decode deploy pointer")?;
+        // An older script pointer names no script and selects this one.
+        if pointer.script_name.is_some() {
+            // A script the pointer no longer lists has nothing newer to
+            // offer, so it serves the index it booted with.
+            let Some(selected) = pointer.selection_for(&source.script) else {
+                return Ok(Adoption::Booted);
+            };
+            pointer.version = selected.version;
+            pointer.prefix = selected.prefix;
+        }
         if pointer.prefix == source.boot_prefix {
             return Ok(Adoption::Booted);
         }

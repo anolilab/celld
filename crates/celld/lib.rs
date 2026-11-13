@@ -63,6 +63,7 @@ pub mod r2_cli;
 pub(crate) mod r2_store;
 pub mod replication;
 pub mod runtime;
+pub mod staged;
 pub mod startup;
 pub mod storage;
 pub mod telemetry;

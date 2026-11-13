@@ -265,6 +265,55 @@ deployment can call a Durable Object on the other, so two adjacent
 versions must accept each other's calls. `/state` reports the deployment
 of each resident object.
 
+### Stage a deployment and activate it later
+
+`celld deploy --no-activate` uploads and validates a version and selects
+nothing. It moves no pointer and attaches no queue consumer, so the fleet
+keeps serving what it served. The command prints the version it staged.
+
+```sh
+celld deploy . --no-activate --bucket "$CELLD_BUCKET"
+celld activate api=3f9c2a71b0d4e8a5 worker=91ab04c2d7e6f318 --bucket "$CELLD_BUCKET"
+```
+
+`celld activate SCRIPT=VERSION...` selects one or several uploaded versions
+with one conditional write of `deploy/current.json`. A node never serves
+one new script beside an old one, because it reads the pointer once and the
+pointer names every script. The pointer holds a `components` map from script
+name to version. A service binding of the primary script resolves a target
+through that map first, and through the target's own pointer for a script the
+map does not list. A node adopts a selection that changes only a component,
+as it adopts a new primary.
+
+The primary script is the one that serves requests. An activation never
+changes it by accident:
+
+- The serving primary stays primary, whether or not you list it.
+- `--primary SCRIPT` names another one. It must be among the listed scripts,
+  and the previous primary stays selected at the version it served.
+- When nothing serves yet, a single listed script becomes primary. Several
+  listed scripts need `--primary`.
+
+Activation checks that every listed version is uploaded and that no queue
+has a competing consumer before it writes anything. It then attaches queue
+consumers, writes the fleet pointer, and last writes each script's own
+pointer. If the fleet pointer was written and a script pointer was not, the
+command says so; run it again with the same arguments. A concurrent deploy
+or activation makes one of the two fail, never lose a write.
+
+`celld discard SCRIPT=VERSION...` deletes the objects of uploaded versions.
+It refuses a version that the fleet pointer (as primary or component), the
+script's own pointer, or a queue consumer attachment names, and then deletes
+nothing, even for the other versions in the list. Asset bodies and container
+images are shared between versions and stay. Do not run `celld discard` and
+`celld activate` for the same version at the same time: the check and the
+deletion are not one atomic step.
+
+Both commands take the fleet flags of `celld deploy` and `--json`. A
+`celld deploy` without `--no-activate` keeps the `components` map of a fleet
+that uses it. A managed deployment writes the pointer without the map, so a
+fleet that uses managed deployments does not stage.
+
 ## Develop an application locally
 
 ```sh
@@ -554,6 +603,12 @@ release, so keep operator tooling and celld releases together.
   first time a facet opened, so a facet that no v0.6 node has opened since
   starts with an empty database on v0.7.0. Before the upgrade, open each
   such facet once on v0.6.3.
+- **Staged activation: rolling.** A node that predates `celld activate` does
+  not read the `components` map of the fleet pointer. It resolves service
+  bindings through each script's own pointer, which `celld activate` also
+  writes, so it serves the selection once it adopts the pointer, but it
+  adopts a selection that changes only a component at its next primary change
+  or `POST /reload`. Upgrade every node before you use `celld activate`.
 
 ## Diagnose a fleet
 

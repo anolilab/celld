@@ -15,11 +15,11 @@ use crate::bucket::Bucket;
 use crate::container::ContainerSpec;
 use crate::note;
 use crate::protocol::{
-    asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
-    ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment,
-    Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1, FEATURE_CRON_V1,
-    FEATURE_D1_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1,
-    FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, ComponentPointer,
+    DeployPointer, Manifest, ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig,
+    QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1,
+    FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1,
+    FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
     QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
@@ -201,6 +201,9 @@ pub struct Options {
     pub region: Option<String>,
     pub dry_run: bool,
     pub json: bool,
+    /// Upload the version and validate it, but move no pointer and publish no
+    /// queue consumer attachment. `celld activate` selects it later.
+    pub no_activate: bool,
     /// Worker variables that override the `vars` of the config. `celld dev`
     /// reads them from `.dev.vars` or the dotenv files; `celld deploy`
     /// supplies none, so a local credential cannot reach a fleet.
@@ -234,7 +237,7 @@ pub fn print_help() {
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
+OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate the version but select nothing; the\n                         fleet keeps serving what it serves. `celld activate`\n                         selects the version later and `celld discard` removes it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain, from Google\n\
 Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
 account key, managed identity, or workload identity for an az:// bucket.\n\n\
@@ -260,6 +263,7 @@ pub fn options_from_arguments(
         endpoint: None,
         region: None,
         dry_run: false,
+        no_activate: false,
         local_images: false,
         json: false,
         vars: VarOverrides::None,
@@ -269,6 +273,7 @@ pub fn options_from_arguments(
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
             "--dry-run" => options.dry_run = true,
+            "--no-activate" => options.no_activate = true,
             "--json" => options.json = true,
             "--config" => {
                 options.config = Some(PathBuf::from(
@@ -879,10 +884,15 @@ async fn ensure_image_tar(bucket: &Bucket, image: &str) -> anyhow::Result<()> {
     bucket.put(&key, output.stdout).await
 }
 
-pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
+/// Upload a deployment. With `activate` it also becomes the serving one:
+/// queue consumers attach to it and the pointers move. Without it the version
+/// is complete and validated but inert, and only `celld activate` can select it.
+pub async fn write(bucket: &Bucket, built: &Built, activate: bool) -> anyhow::Result<()> {
     // Read every attachment before uploading immutable deployment objects.
     // A competing consumer is a deploy refusal, so it must not leave a new
     // version in the bucket that an operator can mistake for a published one.
+    // A staged version is checked the same way, so activation cannot be the
+    // first place that refusal appears.
     let queue_attachments = prepare_queue_attachments(bucket, &built.manifest).await?;
 
     // Images are fleet-wide and content-addressed like asset bodies, and
@@ -922,30 +932,115 @@ pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
         )
         .await?;
 
+    if !activate {
+        return Ok(());
+    }
+
     // An attachment names this exact immutable prefix. Publish it only after
     // the prefix is complete, so a node can never resolve a consumer to a
     // half-uploaded deployment. The named and fleet pointers can move later
     // without tearing this queue-to-consumer relationship.
     publish_queue_attachments(bucket, &built.manifest, &built.prefix, queue_attachments).await?;
 
-    let pointer = DeployPointer {
-        script_name: Some(built.script_name.clone()),
+    let selection = ComponentPointer {
         version: built.version.clone(),
         prefix: built.prefix.clone(),
-        rollout: Rollout { percent: 100 },
     };
-    let encoded = serde_json::to_vec_pretty(&pointer)?;
     // The named pointer resolves service-binding components; the fleet-wide
     // one is the sole application selector, so it moves last. A concurrent
     // deploy must produce a loser, not a lost write.
+    put_named_pointer(bucket, &built.script_name, &selection).await?;
+    let current = read_fleet_pointer(bucket).await?;
+    let mut components = current
+        .as_ref()
+        .map(|(pointer, _)| pointer.components.clone())
+        .unwrap_or_default();
+    // A fleet that selects its scripts through the map keeps doing so: the
+    // script that stops being primary stays selected at the version it served.
+    if let Some((previous, _)) = current.as_ref().filter(|_| !components.is_empty()) {
+        if let Some(script) = previous
+            .script_name
+            .as_ref()
+            .filter(|script| **script != built.script_name)
+        {
+            components.insert(
+                script.clone(),
+                ComponentPointer {
+                    version: previous.version.clone(),
+                    prefix: previous.prefix.clone(),
+                },
+            );
+        }
+    }
+    components.remove(&built.script_name);
+    let pointer = DeployPointer {
+        script_name: Some(built.script_name.clone()),
+        version: selection.version,
+        prefix: selection.prefix,
+        rollout: Rollout { percent: 100 },
+        components,
+    };
+    write_fleet_pointer(bucket, current.map(|(_, token)| token), &pointer).await
+}
+
+/// The fleet pointer and the token a conditional write must present, or
+/// `None` when no deployment exists. A pointer that does not decode is
+/// replaced rather than preserved: no node can read it, so a deploy is the
+/// way to repair it.
+pub(crate) async fn read_fleet_pointer(
+    bucket: &Bucket,
+) -> anyhow::Result<Option<(DeployPointer, String)>> {
+    let Some((body, token)) = bucket.get(crate::fleet::CURRENT_POINTER_KEY).await? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        serde_json::from_slice(&body).unwrap_or_else(|_| DeployPointer {
+            script_name: None,
+            version: String::new(),
+            prefix: String::new(),
+            rollout: Rollout { percent: 100 },
+            components: BTreeMap::new(),
+        }),
+        token,
+    )))
+}
+
+/// Replace the fleet pointer, only if it still holds what `token` read. A
+/// concurrent deploy or activation produces a loser, never a lost write.
+pub(crate) async fn write_fleet_pointer(
+    bucket: &Bucket,
+    token: Option<String>,
+    pointer: &DeployPointer,
+) -> anyhow::Result<()> {
+    cas_pointer(
+        bucket,
+        crate::fleet::CURRENT_POINTER_KEY,
+        token,
+        serde_json::to_vec_pretty(pointer)?,
+    )
+    .await
+}
+
+/// The per-script pointer that resolves a service binding of a node that
+/// reads no component map, and any script the map does not list.
+pub(crate) async fn put_named_pointer(
+    bucket: &Bucket,
+    script: &str,
+    selection: &ComponentPointer,
+) -> anyhow::Result<()> {
+    let pointer = DeployPointer {
+        script_name: Some(script.to_string()),
+        version: selection.version.clone(),
+        prefix: selection.prefix.clone(),
+        rollout: Rollout { percent: 100 },
+        components: BTreeMap::new(),
+    };
     put_pointer(
         bucket,
-        &format!("deploy/{}/current.json", built.script_name),
-        encoded.clone(),
+        &format!("deploy/{script}/current.json"),
+        serde_json::to_vec_pretty(&pointer)?,
     )
-    .await?;
-    put_pointer(bucket, "deploy/current.json", encoded).await?;
-    Ok(())
+    .await
 }
 
 pub(crate) struct QueueAttachmentState {
@@ -1011,17 +1106,31 @@ async fn current_queue_consumers(
     bucket: &Bucket,
     script_name: &str,
 ) -> anyhow::Result<BTreeSet<String>> {
-    let pointer_key = format!("deploy/{script_name}/current.json");
-    let Some((pointer_body, _)) = bucket.get(&pointer_key).await? else {
-        return Ok(BTreeSet::new());
+    // What serves is what the fleet pointer selects, so a script the
+    // component map lists is read from there. The named pointer answers for
+    // any script the map does not list.
+    let selected = match read_fleet_pointer(bucket).await? {
+        Some((fleet, _)) => fleet.selection_for(script_name),
+        None => None,
     };
-    let pointer: DeployPointer =
-        serde_json::from_slice(&pointer_body).with_context(|| format!("decode {pointer_key}"))?;
-    anyhow::ensure!(
-        pointer.script_name.as_deref() == Some(script_name),
-        "named deployment pointer {pointer_key} does not identify script {script_name:?}"
-    );
-    let manifest_key = format!("{}/manifest.json", pointer.prefix);
+    let prefix = match selected {
+        Some(selected) => selected.prefix,
+        None => {
+            let pointer_key = format!("deploy/{script_name}/current.json");
+            let Some((pointer_body, _)) = bucket.get(&pointer_key).await? else {
+                return Ok(BTreeSet::new());
+            };
+            let pointer: DeployPointer = serde_json::from_slice(&pointer_body)
+                .with_context(|| format!("decode {pointer_key}"))?;
+            anyhow::ensure!(
+                pointer.script_name.as_deref() == Some(script_name),
+                "named deployment pointer {pointer_key} does not identify script {script_name:?}"
+            );
+            pointer.prefix
+        }
+    };
+    let pointer_key = format!("deploy/{script_name}/current.json");
+    let manifest_key = format!("{prefix}/manifest.json");
     let (manifest_body, _) = bucket
         .get(&manifest_key)
         .await?
@@ -1080,13 +1189,13 @@ pub(crate) async fn publish_queue_attachments(
             Ok(Some(_)) => {}
             Ok(None) => {
                 bail!(
-                    "queue consumer attachment {} lost a race; another deploy may have landed first; re-run `celld deploy`",
+                    "queue consumer attachment {} lost a race; another deploy or activation may have landed first; re-run the command",
                     state.key
                 )
             }
             Err(error) => {
                 return Err(error.context(
-                    "a queue consumer attachment write may have committed; re-run `celld deploy`",
+                    "a queue consumer attachment write may have committed; re-run the command",
                 ));
             }
         }
@@ -1110,17 +1219,25 @@ async fn ensure_asset_blob(bucket: &Bucket, sha256: &str, body: &[u8]) -> anyhow
 /// exactly the value we read.
 async fn put_pointer(bucket: &Bucket, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
     let etag = bucket.head(key).await.ok().flatten().map(|(_, etag)| etag);
-    match bucket.put_cas(key, body, etag.as_deref()).await {
+    cas_pointer(bucket, key, etag, body).await
+}
+
+async fn cas_pointer(
+    bucket: &Bucket,
+    key: &str,
+    token: Option<String>,
+    body: Vec<u8>,
+) -> anyhow::Result<()> {
+    match bucket.put_cas(key, body, token.as_deref()).await {
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err(anyhow!(
             "write {}://{}/{key} lost a race\n\
-             Another deploy may have landed first; re-run `celld deploy`.",
+             Another deploy or activation may have landed first; re-run the command.",
             bucket.scheme(),
             bucket.name
         )),
-        Err(error) => {
-            Err(error.context("Another deploy may have landed first; re-run `celld deploy`."))
-        }
+        Err(error) => Err(error
+            .context("Another deploy or activation may have landed first; re-run the command.")),
     }
 }
 
@@ -2312,7 +2429,7 @@ pub(crate) fn valid_resource_name(name: &str) -> bool {
 /// The Wrangler-compatible Worker name that is safe in every place where
 /// celld reuses it. Checking only the generated Workflow class would leave
 /// deployment keys and operator output with a different accepted language.
-fn valid_script_name(name: &str) -> bool {
+pub(crate) fn valid_script_name(name: &str) -> bool {
     name.len() <= MAX_SCRIPT_NAME_BYTES
         && name
             .bytes()

@@ -819,7 +819,7 @@ async fn adopt_deployment(
         };
     };
     let current = runtime.generation();
-    if !force && pointer.version == current.version() && pointer.prefix == current.prefix() {
+    if !force && current.is_selected_by(&pointer) {
         return ReloadOutcome::Unchanged {
             generation: current.id(),
             version: current.version().to_string(),
@@ -830,7 +830,8 @@ async fn adopt_deployment(
         prefix: pointer.prefix.clone(),
         error,
     };
-    let graph = match DeploymentGraph::load(bucket, node.to_string()).await {
+    let graph = match DeploymentGraph::load_pointer(bucket, pointer.clone(), node.to_string()).await
+    {
         Ok(graph) => graph,
         Err(error) => return failed(format!("{error:#}")),
     };
@@ -884,6 +885,10 @@ fn start_pointer_watcher(
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut failed: Option<ReloadOutcome> = None;
+        // The pointer `failed` is the outcome of. Its version and prefix are
+        // not enough: a pointer that changes only a co-hosted script is a
+        // different deployment and must be built, not answered from memory.
+        let mut failed_pointer: Option<DeployPointer> = None;
         loop {
             let request = celld::asyncrt::select! {
                 _ = tick.tick() => ReloadRequest { force: false, reply: None },
@@ -892,6 +897,7 @@ fn start_pointer_watcher(
                     None => return,
                 },
             };
+            let mut read_pointer = None;
             let outcome = match fleet::read_current_pointer(&bucket).await {
                 Err(error) => {
                     tracing::warn!(event = "deployment_pointer_unreadable", %error);
@@ -901,20 +907,23 @@ fn start_pointer_watcher(
                         error: format!("{error:#}"),
                     }
                 }
-                Ok(pointer) => match &failed {
-                    Some(ReloadOutcome::Failed {
-                        version, prefix, ..
-                    }) if !request.force
-                        && version == &pointer.version
-                        && prefix == &pointer.prefix =>
-                    {
-                        failed.clone().expect("matched above")
+                Ok(pointer) => {
+                    read_pointer = Some(pointer.clone());
+                    match &failed {
+                        Some(remembered)
+                            if !request.force
+                                && failed_pointer
+                                    .as_ref()
+                                    .is_some_and(|failed| failed.selects_same(&pointer)) =>
+                        {
+                            remembered.clone()
+                        }
+                        _ => {
+                            adopt_deployment(&app, &bucket, &node, &region, pointer, request.force)
+                                .await
+                        }
                     }
-                    _ => {
-                        adopt_deployment(&app, &bucket, &node, &region, pointer, request.force)
-                            .await
-                    }
-                },
+                }
             };
             match &outcome {
                 ReloadOutcome::Adopted {
@@ -923,6 +932,7 @@ fn start_pointer_watcher(
                     prefix,
                 } => {
                     failed = None;
+                    failed_pointer = None;
                     tracing::info!(
                         event = "deployment_adopted",
                         generation,
@@ -948,6 +958,7 @@ fn start_pointer_watcher(
                     }
                     if !version.is_empty() {
                         failed = Some(outcome.clone());
+                        failed_pointer = read_pointer;
                     }
                 }
             }
@@ -3433,6 +3444,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     celld::memory::tune_allocator();
     let mut settings = match action {
         Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
+        Action::Activate(arguments) => return celld::staged::run_activate(arguments).await,
+        Action::Discard(arguments) => return celld::staged::run_discard(arguments).await,
         Action::Dev(arguments) => return celld::dev::run(arguments).await,
         Action::Cell(arguments) => return celld::cell_cli::run(arguments).await,
         Action::D1(arguments) => return celld::d1_cli::run(arguments).await,
