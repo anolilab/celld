@@ -6463,6 +6463,24 @@ impl State {
                 });
             }
         }
+        // A handler that has not reached its commit holds no barrier above,
+        // yet its runtime goes with the reset like every other. Settle it as a
+        // failed handler: re-armed, its op retired, the wake entry left for
+        // the next activation. Its late report then finds no owner.
+        if let Some(AlarmState::Firing { op, .. }) =
+            self.cells.get(id).and_then(|cell| cell.alarm.as_ref())
+        {
+            let op = *op;
+            let (now_ms, now_mono_ms) = (self.now_ms, self.now_mono_ms);
+            self.alarm_finished(
+                op,
+                (id.to_string(), epoch),
+                now_ms,
+                now_mono_ms,
+                Err(Failure::Ambiguous),
+                effects,
+            );
+        }
         // Requests already running against this runtime lose it here, exactly
         // as a fence does. Leaving them in `active_requests` would leave the
         // core believing a stopped cell is still serving, which its own
@@ -7172,6 +7190,8 @@ mod alarm_tests;
 mod dead_owner_tests;
 #[cfg(test)]
 mod fence_confirming_tests;
+#[cfg(test)]
+mod reset_tests;
 #[cfg(test)]
 mod scripted;
 #[cfg(test)]
