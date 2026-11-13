@@ -4541,14 +4541,15 @@ impl State {
                 // core just read (lease-fold): a dead owner whose folded
                 // log state is not sealed may hold acked writes only on
                 // its followers, and claiming before recovery fixes a
-                // bucket state that excludes them. Absence of a lease —
-                // or a lease that never opened a log — keeps its meaning
-                // as a proof: nothing was acked past the bucket.
+                // bucket state that excludes them. Absence of a lease keeps
+                // its meaning as a proof: nothing was acked past the bucket.
+                // A lease that never opened a log does not: its session may
+                // still be running past the expiry we read, and a renewal
+                // could open a log and acknowledge into the epoch this claim
+                // supersedes. Recovery seals the absent log by compare-and-
+                // set, which fails that renewal, so the claim waits for it.
                 let unrecovered = lease.as_ref().is_some_and(|lease| {
-                    !matches!(
-                        lease.record.log_state,
-                        None | Some(crate::log_tier::LogState::Sealed)
-                    )
+                    lease.record.log_state != Some(crate::log_tier::LogState::Sealed)
                 });
                 // An ingress-only node leaves the dead owner's log to the
                 // peer that takes the cell.
@@ -7241,6 +7242,8 @@ fn runtime_epoch(phase: &Phase) -> Option<Epoch> {
     }
 }
 
+#[cfg(test)]
+mod absent_log_tests;
 #[cfg(test)]
 mod alarm_tests;
 #[cfg(test)]

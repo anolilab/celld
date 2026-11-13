@@ -618,6 +618,52 @@ pub(crate) async fn write_dead_record(
     bucket.put_cas(&lease_key(node), body, Some(token)).await
 }
 
+/// Seal the absent log of a node whose lease carries none.
+///
+/// A lease that never opened a log proves nothing by itself: the session may
+/// still be running past the expiry the caller read, and a renewal could open
+/// a log and acknowledge writes into an epoch a takeover is about to
+/// supersede. Writing a sealed record into the lease by compare-and-set makes
+/// that renewal's own conditional write lose. The seal refuses a lease that
+/// reads live, so it can only fence an owner that peers already treat as dead.
+/// A lease that has gained a log meanwhile, or is gone, is left to the
+/// ordinary recovery.
+pub(crate) async fn seal_absent_log(bucket: &Bucket, node: &str) -> anyhow::Result<()> {
+    for _attempt in 0..5 {
+        let Some((bytes, token)) = bucket.get(&lease_key(node)).await? else {
+            return Ok(());
+        };
+        let wire: crate::ownership_store::NodeLeaseWire = serde_json::from_slice(&bytes)?;
+        if wire.log.is_some() {
+            return Ok(());
+        }
+        let now = crate::ownership_store::now_ms();
+        anyhow::ensure!(
+            wire.expires_ms <= now,
+            "refusing to seal the absent log of {node}: its lease is live (expires in {}ms)",
+            wire.expires_ms.saturating_sub(now)
+        );
+        let sealed = log_tier::LogRecord {
+            epoch: 0,
+            ensemble: BTreeSet::new(),
+            tiered: 0,
+            state: LogState::Sealed,
+            claimant: None,
+            claimed_ms: None,
+        };
+        if write_dead_record(bucket, node, &wire, &sealed, false, &token)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        // A lost CAS is a concurrent write to the lease: read it again.
+    }
+    Err(anyhow!(
+        "sealing the absent log of {node} lost every CAS race"
+    ))
+}
+
 /// The LIVE session's writer for its own folded log: publish the desired
 /// object to the ownership store, nudge the core into an immediate
 /// renewal, and wait until an APPLIED lease write carries it. The lease
@@ -5333,7 +5379,12 @@ impl NodeLogManager {
         // lease record holds at most one session's state — recovery-
         // before-install is what keeps a predecessor's Open state from
         // being replaced unrecovered — so a single GET decides.
-        let folded = read_record(&self.bucket, prior).await?;
+        let mut folded = read_record(&self.bucket, prior).await?;
+        if folded.is_none() {
+            // No folded log is not yet proof; the lease itself decides.
+            seal_absent_log(&self.bucket, prior).await?;
+            folded = read_record(&self.bucket, prior).await?;
+        }
         let session = folded
             .as_ref()
             .map(|folded| format!("{prior}/{}", folded.wire.generation));
@@ -6845,3 +6896,95 @@ impl NodeLogManager {
 #[cfg(test)]
 #[path = "node_log/operator_token_tests.rs"]
 mod operator_token_tests;
+
+#[cfg(test)]
+mod seal_absent_log_tests {
+    use super::*;
+
+    /// The local store runs on the process's execution domain, which a test
+    /// binary has to bind once.
+    fn run<T>(future: impl std::future::Future<Output = T>) -> T {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        let runtime = RUNTIME.get_or_init(|| {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            crate::asyncrt::set_host_handle(runtime.handle().clone());
+            runtime
+        });
+        runtime.block_on(future)
+    }
+
+    async fn lease_in(bucket: &Bucket, expires_ms: u64) -> String {
+        let wire: crate::ownership_store::NodeLeaseWire =
+            serde_json::from_value(serde_json::json!({
+                "node": "dead",
+                "expires_ms": expires_ms,
+                "ownership_index_generation": "g",
+            }))
+            .unwrap();
+        bucket
+            .put_cas(&lease_key("dead"), serde_json::to_vec(&wire).unwrap(), None)
+            .await
+            .unwrap()
+            .expect("the lease is new")
+    }
+
+    fn bucket() -> (tempfile::TempDir, Bucket) {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+        (dir, bucket)
+    }
+
+    #[test]
+    fn an_expired_lease_without_a_log_is_sealed_and_a_stale_renewal_loses() {
+        run(async {
+            let (_dir, bucket) = bucket();
+            let stale_token = lease_in(&bucket, 1).await;
+
+            seal_absent_log(&bucket, "dead").await.unwrap();
+
+            let folded = read_record(&bucket, "dead").await.unwrap().expect("a log");
+            assert_eq!(folded.record.state, LogState::Sealed);
+            assert_eq!(
+                log_tier::takeover_gate(Some(&folded.record)),
+                log_tier::TakeoverGate::BucketComplete
+            );
+            // The stale session renews with the token it holds, to open a log.
+            let mut renewal = folded.wire.clone();
+            renewal.expires_ms = u64::MAX;
+            renewal.log = None;
+            let renewed = bucket
+                .put_cas(
+                    &lease_key("dead"),
+                    serde_json::to_vec(&renewal).unwrap(),
+                    Some(&stale_token),
+                )
+                .await;
+            assert!(
+                !matches!(renewed, Ok(Some(_))),
+                "a renewal on the pre-seal token must not apply"
+            );
+        });
+    }
+
+    #[test]
+    fn a_live_lease_is_not_sealed() {
+        run(async {
+            let (_dir, bucket) = bucket();
+            lease_in(&bucket, crate::ownership_store::now_ms() + 60_000).await;
+
+            let error = seal_absent_log(&bucket, "dead").await.unwrap_err();
+
+            assert!(format!("{error:#}").contains("lease is live"));
+            assert!(read_record(&bucket, "dead").await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn a_missing_lease_is_left_alone() {
+        run(async {
+            let (_dir, bucket) = bucket();
+            seal_absent_log(&bucket, "dead").await.unwrap();
+            assert!(bucket.get(&lease_key("dead")).await.unwrap().is_none());
+        });
+    }
+}
