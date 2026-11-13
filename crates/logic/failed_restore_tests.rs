@@ -68,3 +68,16 @@ fn a_later_restore_that_succeeds_makes_the_cell_movable_again() {
 
     assert!(released(&shell, "a"));
 }
+
+#[test]
+fn the_drain_finishes_with_such_a_cell_still_on_the_node() {
+    let mut shell = after_a_failed_restore();
+
+    shell.send(Event::ReleaseAll);
+
+    // Nothing is left that the shutdown loop waits on, so a cell kept for its
+    // tail never holds a stop to its grace deadline.
+    assert_eq!(shell.state.occupied(), 0);
+    assert_eq!(shell.state.handoffs_in_flight(), 0);
+    assert_eq!(shell.state.activating(), 0);
+}
