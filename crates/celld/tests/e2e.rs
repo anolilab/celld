@@ -4,6 +4,7 @@ mod e2e {
     pub mod alarms;
     pub mod body_clone;
     pub mod container_exec;
+    pub mod container_fence;
     pub mod container_images;
     pub mod d1_batch;
     pub mod d1_export;

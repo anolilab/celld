@@ -199,6 +199,39 @@ starts no container on a node that has the fence.
 route out. On macOS, an internal network publishes no port, so `celld dev` on
 macOS keeps egress on and logs a warning. The fence still applies.
 
+### A node in a container
+
+The fence runs on the host of the container engine. A node that is itself a
+container has a network namespace of its own, so its connection to an
+application container crosses the host's forward chain, and the reply of the
+application container to the node's private address meets the fence's reject of
+the private ranges there. Such a node sets `CELLD_FENCE_NODE_NETNS=auto`. When
+the node finds `/.dockerenv` or `/run/.containerenv`, the fence admits packets
+from the container bridges that belong to an established or related connection
+and are addressed to the node's own addresses, ahead of the rejects: the
+unicast addresses of the node's interfaces, without loopback and link-local
+ones. A node that finds none exits at startup instead of running with a fence it
+cannot use. A container still cannot start a connection to the node or to a
+private range, because a new connection is neither, and it cannot hold a session
+with any other private peer that connects to it, because the reply to such a peer
+is not addressed to the node. A node in a Kubernetes pod or another runtime has
+no marker, and sets `CELLD_FENCE_NODE_ADDRS` to its own addresses, such as
+`172.17.0.2,fd00::2`; the fence then uses those and does not look at the
+interfaces. A container network that is connected to the node after it started
+gives it an address the node did not see, so name its addresses in
+`CELLD_FENCE_NODE_ADDRS` too. A node run with `--network host` has the markers
+as well, and the addresses it finds are the host's own: a packet to one of them
+is never forwarded, so the allowance matches nothing there. The default, `off`,
+installs the rules as they were before this setting. Both variables are checked
+at startup, and the addresses must be unicast IP addresses and nothing else (not
+loopback, link-local, unspecified, multicast or broadcast ones), because the node writes them into the rules that a privileged container loads.
+
+The fence is one table for the whole host, and every node that fences replaces
+it. Nodes that share one container engine must therefore run the same
+`CELLD_FENCE_NODE_NETNS` and set `CELLD_FENCE_NODE_ADDRS` to the addresses of all
+of them, the same list on every node, in any order; a node that finds its own
+addresses would otherwise replace the allowance of the others with its own.
+
 `CELLD_CONTAINER_RUNTIME` names the OCI runtime for every container on the node,
 for example `runsc` for gVisor or `kata` for a virtual machine. A `runtime` key
 in a `containers` entry overrides it for that class; Cloudflare has no such key.

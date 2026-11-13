@@ -785,6 +785,8 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_LTX_PAGED_MIN_MB` | The chain size, in MiB, from which a restore pages (default: 256; `0` pages every chain) |
 | `CELLD_LTX_HYDRATE_MBPS` | The background fill rate of a paged cell, in MiB per second, one cell at a time per node (default: 16; `0` keeps the cell sparse) |
 | `CELLD_LTX_DURABILITY_TIMEOUT_SECS` | The budget for one durability proof, and for the final snapshot of a handoff (default: 10). A queued write waits at most six budgets. A slow store can need more |
+| `CELLD_FENCE_NODE_NETNS` | `off` (default) or `auto`. For a node that runs in a container's network namespace: the [container fence](services/containers.md#a-node-in-a-container) then lets the replies of a container to the node's own addresses through. `auto` acts when the node finds `/.dockerenv` or `/run/.containerenv`, or when `CELLD_FENCE_NODE_ADDRS` is set. `off` leaves the fence as it is |
+| `CELLD_FENCE_NODE_ADDRS` | With `CELLD_FENCE_NODE_NETNS=auto`: the node's own IP addresses, comma-separated, such as `172.17.0.2,fd00::2`. The fence admits replies to these addresses only, and does not look for a container marker. Without it, a node that finds a marker uses the unicast addresses of its own interfaces, and exits at startup if it has none. Nodes that share one container engine must all set the same list, since each node's fence replaces the one table of the host. celld exits at startup on a value that is not a list of unicast IP addresses, or when this is set without `auto` |
 | `CELLD_TOKIO_THREADS` | Host Tokio worker threads (default: the CPU count). The `host_runtime` log event at startup reports `worker_count` |
 | `RUST_LOG` | The runtime log filter |
 

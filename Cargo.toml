@@ -87,7 +87,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 lz4_flex = { version = "0.11", features = ["frame"] }
 md-5 = "0.11"
-nix = { version = "0.31", features = ["feature", "fs"] }
+nix = { version = "0.31", features = ["feature", "fs", "net"] }
 notify = "8"
 nu-ansi-term = "0.50"
 object_store = { version = "0.14.2", default-features = false }
