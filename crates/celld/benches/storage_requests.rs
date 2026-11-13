@@ -257,6 +257,10 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
         .trim_start_matches("http://")
         .trim_end_matches('/')
         .to_owned();
+    assert!(
+        !upstream.contains('/'),
+        "CELLD_BENCH_S3_ENDPOINT must be http://host:port, without a path"
+    );
     let bucket = format!(
         "{}/{run}/{}",
         settings.bucket.trim_end_matches('/'),
@@ -271,7 +275,8 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(FIXTURE);
-    let deployed = Command::new(CELLD)
+    // Asynchronous, so the runtime can serve the proxy the deploy talks to.
+    let deployed = tokio::process::Command::new(CELLD)
         .arg("deploy")
         .arg(&fixture)
         .args([
@@ -284,6 +289,7 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
         ])
         .current_dir(dir.path())
         .output()
+        .await
         .expect("run celld deploy");
     assert!(
         deployed.status.success(),

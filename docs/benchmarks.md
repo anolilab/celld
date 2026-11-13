@@ -88,14 +88,14 @@ is never used again. Requests under `cells/` belong to one agent and are
 reported per 1000 agents. Bundles, leases and maintenance are shared by a node,
 so they are reported per node-hour instead.
 
-It needs a plain-HTTP S3 endpoint and a bucket. With the store from the
-contract suite:
+It needs a plain-HTTP S3 endpoint (`http://host:port`, no path) and a bucket.
+With the store from the contract suite:
 
 ```sh
+export AWS_ACCESS_KEY_ID=rustfsadmin AWS_SECRET_ACCESS_KEY=rustfsadmin AWS_REGION=us-east-1
 docker compose -f crates/celld/tests/stores/compose.yml -p celld-bench up -d rustfs
-# create the bucket, e.g. with the aws CLI: aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://bench
+aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://bench
 CELLD_BENCH_S3_ENDPOINT=http://127.0.0.1:9000 CELLD_BENCH_BUCKET=s3://bench \
-AWS_ACCESS_KEY_ID=rustfsadmin AWS_SECRET_ACCESS_KEY=rustfsadmin AWS_REGION=us-east-1 \
   cargo bench -p celld --bench storage_requests --profile lab
 ```
 
