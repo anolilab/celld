@@ -37,8 +37,16 @@ async fn set_alarm_is_returned_by_get_alarm() {
 #[tokio::test]
 async fn delete_alarm_clears_it() {
     let server = Server::start("do-alarms", &[]).await;
-    let out: Value = server.get_json("/delete?o=delete").await;
+    let out: Value = server.get_json("/delete?o=delete&ms=500").await;
     assert_eq!(out["alarm"], Value::Null, "{out}");
+
+    // The deleted alarm must stay cancelled past the time it was set for.
+    observe_for(Duration::from_millis(1500)).await;
+    let seen = log(&server, "delete").await;
+    assert!(
+        deliveries(&seen).is_empty(),
+        "a deleted alarm fired: {seen}"
+    );
 }
 
 #[tokio::test]

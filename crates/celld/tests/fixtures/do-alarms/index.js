@@ -33,7 +33,7 @@ export class Cell extends DurableObject {
         return Response.json({ at, alarm: await storage.getAlarm() });
       }
       case "/delete": {
-        await storage.setAlarm(Date.now() + 60000);
+        await storage.setAlarm(Date.now() + ms);
         await storage.deleteAlarm();
         return Response.json({ alarm: await storage.getAlarm() });
       }
