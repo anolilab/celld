@@ -29,6 +29,7 @@ use std::time::Duration;
 use anyhow::anyhow;
 use celld_ltx::client::epochs::EpochChain;
 use celld_ltx::object_store::ObjectStore;
+use celld_ltx::object_store::ObjectStoreExt;
 use celld_ltx::replica;
 use celld_ltx::replica_compactor::{CompactionResult, ReplicaCompactor};
 use celld_ltx::Db;

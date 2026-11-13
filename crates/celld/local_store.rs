@@ -17,9 +17,9 @@ use futures_util::StreamExt as _;
 use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
 use object_store::path::Path;
 use object_store::{
-    Attribute, AttributeValue, Attributes, Error, GetOptions, GetResult, GetResultPayload,
-    ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions,
-    PutPayload, PutResult,
+    Attribute, AttributeValue, Attributes, CopyMode, CopyOptions, Error, GetOptions, GetResult,
+    GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use rusqlite::{params, Connection, OptionalExtension as _, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -184,6 +184,7 @@ impl LocalStore {
         Ok(PutResult {
             e_tag: Some(etag.to_string()),
             version: None,
+            extensions: Default::default(),
         })
     }
 
@@ -277,21 +278,34 @@ impl ObjectStore for LocalStore {
             meta,
             range,
             attributes: decode_attributes(&object.attributes)?,
+            extensions: Default::default(),
         })
     }
 
-    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
         let store = self.clone();
-        let key = location.to_string();
-        crate::asyncrt::blocking(move || {
-            store
-                .connect()?
-                .execute("DELETE FROM objects WHERE key = ?1", [key])
-                .map_err(db_error)?;
-            Ok(())
-        })
-        .await
-        .map_err(db_error)?
+        locations
+            .then(move |location| {
+                let store = store.clone();
+                async move {
+                    let location = location?;
+                    let key = location.to_string();
+                    crate::asyncrt::blocking(move || -> object_store::Result<()> {
+                        store
+                            .connect()?
+                            .execute("DELETE FROM objects WHERE key = ?1", [key])
+                            .map_err(db_error)?;
+                        Ok(())
+                    })
+                    .await
+                    .map_err(db_error)??;
+                    Ok(location)
+                }
+            })
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -330,7 +344,7 @@ impl ObjectStore for LocalStore {
                 continue;
             };
             if remainder.next().is_some() {
-                common_prefixes.insert(prefix.child(child));
+                common_prefixes.insert(prefix.clone().join(child));
             } else {
                 objects.push(object_meta(&object)?);
             }
@@ -338,23 +352,24 @@ impl ObjectStore for LocalStore {
         Ok(ListResult {
             common_prefixes: common_prefixes.into_iter().collect(),
             objects,
+            extensions: Default::default(),
         })
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        let create = match options.mode {
+            CopyMode::Overwrite => false,
+            CopyMode::Create => true,
+        };
         let store = self.clone();
         let from = from.to_string();
         let to = to.to_string();
-        crate::asyncrt::blocking(move || store.copy_sync(&from, &to, false))
-            .await
-            .map_err(db_error)?
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        let store = self.clone();
-        let from = from.to_string();
-        let to = to.to_string();
-        crate::asyncrt::blocking(move || store.copy_sync(&from, &to, true))
+        crate::asyncrt::blocking(move || store.copy_sync(&from, &to, create))
             .await
             .map_err(db_error)?
     }
@@ -405,6 +420,7 @@ impl PaginatedListStore for LocalStore {
         let mut result = ListResult {
             common_prefixes: Vec::new(),
             objects: Vec::new(),
+            extensions: Default::default(),
         };
         for (_, common, object) in entries {
             if let Some(common) = common {
