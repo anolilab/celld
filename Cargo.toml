@@ -29,6 +29,10 @@ debug = "line-tables-only"
 opt-level = 3
 [profile.dev.package.rsa]
 opt-level = 3
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
 
 # Every direct dependency lives here so the crates can never drift onto two
 # versions of the same crate; members add their own features.
@@ -62,12 +66,15 @@ futures-util = "0.3"
 getrandom = { version = "0.4", features = ["sys_rng"] }
 glob = "0.3"
 hex = "0.4"
-# The two node:crypto KDFs. Both crates already reach this build without a
-# line here -- `pbkdf2` through `pkcs5`, `hkdf` through `elliptic-curve` --
-# so declaring them costs no compile time and adds no supply-chain surface.
+# The node:crypto KDFs. All three crates already reach this build without a
+# line here -- `pbkdf2` and `scrypt` through `pkcs5`, `hkdf` through
+# `elliptic-curve` -- so declaring them costs no compile time and adds no
+# supply-chain surface. scrypt keeps off its password-hash features, which
+# would add crates for a format celld never reads.
 hkdf = "0.13"
 hmac = "0.13"
 pbkdf2 = "0.13"
+scrypt = { version = "0.12", default-features = false }
 http-body-util = "0.1"
 # hyper also accepts h2 releases before 0.4.18, which retain the remotely
 # triggerable resource-exhaustion advisory. Keep a direct floor here because a

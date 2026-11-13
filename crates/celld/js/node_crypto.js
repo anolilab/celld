@@ -13,7 +13,7 @@
 //   src/node/internal/validators.ts, internal_errors.ts (subsets)
 //
 // Types are stripped; the C++ `node-internal:crypto` builtin maps onto the
-// $$digest / $$hmacSign / $$pbkdf2 / $$hkdf / $$randomValues /
+// $$digest / $$hmacSign / $$pbkdf2 / $$hkdf / $$scrypt / $$randomValues /
 // $$timingSafeEqual host ops, with hash state buffered on the JS side (digest
 // runs once, at finalization).
 // checkPrime/generatePrime are pure-JS BigInt Miller-Rabin, mirroring
@@ -197,10 +197,10 @@
       throw ERR_OUT_OF_RANGE(name, "an integer", value);
     if (value !== value >>> 0) {
       const min = positive ? 1 : 0;
-      throw ERR_OUT_OF_RANGE(name, `>= ${min} && < 4294967296`, value);
+      throw ERR_OUT_OF_RANGE(name, `>= ${min} && <= 4294967295`, value);
     }
     if (positive && value === 0)
-      throw ERR_OUT_OF_RANGE(name, ">= 1 && < 4294967296", value);
+      throw ERR_OUT_OF_RANGE(name, ">= 1 && <= 4294967295", value);
   }
   function validateOneOf(value, name, oneOf) {
     if (!oneOf.includes(value)) {
@@ -1153,6 +1153,87 @@
     );
   }
 
+  // ---- scrypt --------------------------------------------------------------
+  // Node's defaults, and the rules it applies to the options: N, r and p are
+  // unsigned 32-bit values with cost, blockSize and parallelization as aliases
+  // (naming both spellings of one parameter is an error), and 0 means the
+  // default.
+  const kScryptDefaults = { N: 16384, r: 8, p: 1, maxmem: 32 * 1024 * 1024 };
+  function scryptCheck(password, salt, keylen, options) {
+    password = getArrayBufferOrView(password, "password");
+    salt = getArrayBufferOrView(salt, "salt");
+    validateInt32(keylen, "keylen", 0);
+    let { N, r, p, maxmem } = kScryptDefaults;
+    if (options && options !== kScryptDefaults) {
+      let hasN, hasR, hasP;
+      if ((hasN = options.N !== undefined)) {
+        validateUint32(options.N, "N");
+        N = options.N;
+      }
+      if (options.cost !== undefined) {
+        if (hasN) throw ERR_INCOMPATIBLE_OPTION_PAIR("N", "cost");
+        validateUint32(options.cost, "cost");
+        N = options.cost;
+      }
+      if ((hasR = options.r !== undefined)) {
+        validateUint32(options.r, "r");
+        r = options.r;
+      }
+      if (options.blockSize !== undefined) {
+        if (hasR) throw ERR_INCOMPATIBLE_OPTION_PAIR("r", "blockSize");
+        validateUint32(options.blockSize, "blockSize");
+        r = options.blockSize;
+      }
+      if ((hasP = options.p !== undefined)) {
+        validateUint32(options.p, "p");
+        p = options.p;
+      }
+      if (options.parallelization !== undefined) {
+        if (hasP) throw ERR_INCOMPATIBLE_OPTION_PAIR("p", "parallelization");
+        validateUint32(options.parallelization, "parallelization");
+        p = options.parallelization;
+      }
+      if (options.maxmem !== undefined) {
+        validateInteger(options.maxmem, "maxmem", 0);
+        maxmem = options.maxmem;
+      }
+      if (N === 0) N = kScryptDefaults.N;
+      if (r === 0) r = kScryptDefaults.r;
+      if (p === 0) p = kScryptDefaults.p;
+      if (maxmem === 0) maxmem = kScryptDefaults.maxmem;
+    }
+    return { password, salt, keylen, N, r, p, maxmem };
+  }
+  // The derivation runs where the parameters are checked, so a request the
+  // memory limit or the shape of N refuses throws from scrypt() as well as
+  // from scryptSync(), as it does in Node.
+  function scryptDerive({ password, salt, keylen, N, r, p, maxmem }) {
+    const key = $$scrypt(asU8(password), asU8(salt), N, r, p, maxmem, keylen);
+    if (typeof key === "number") {
+      throw nodeErr(RangeError, "ERR_CRYPTO_INVALID_SCRYPT_PARAMS",
+        key === 2
+          ? "Invalid scrypt params: error:030000AC:digital envelope " +
+            "routines::memory limit exceeded"
+          : "Invalid scrypt params");
+    }
+    return Buffer.from(key);
+  }
+  function scryptSync(password, salt, keylen, options = kScryptDefaults) {
+    return scryptDerive(scryptCheck(password, salt, keylen, options));
+  }
+  function scrypt(password, salt, keylen, options, callback = kScryptDefaults) {
+    // The options argument is optional, so a lone trailing argument is the
+    // callback.
+    if (callback === kScryptDefaults) {
+      callback = options;
+      options = kScryptDefaults;
+    }
+    const params = scryptCheck(password, salt, keylen, options);
+    validateFunction(callback, "callback");
+    const key = scryptDerive(params);
+    Promise.resolve().then(() => callback(null, key));
+  }
+
   // ---- hkdf ----------------------------------------------------------------
   function hkdfPrepareKey(key) {
     key = toBuf(key);
@@ -1648,8 +1729,7 @@
     publicDecrypt: notImplemented("publicDecrypt"),
     privateEncrypt: notImplemented("privateEncrypt"),
     privateDecrypt: notImplemented("privateDecrypt"),
-    scrypt: notImplemented("scrypt"),
-    scryptSync: notImplemented("scryptSync"),
+    scrypt, scryptSync,
     createDiffieHellman: notImplemented("createDiffieHellman"),
     createDiffieHellmanGroup: notImplemented("createDiffieHellmanGroup"),
     getDiffieHellman: notImplemented("getDiffieHellman"),
