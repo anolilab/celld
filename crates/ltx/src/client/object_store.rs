@@ -37,7 +37,7 @@ use object_store::client::HttpRequestBody;
 use object_store::path::Path as ObjPath;
 use object_store::{
     Attribute, AttributeValue, Attributes, ClientOptions, GetOptions, GetRange, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, RetryConfig,
+    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, RetryConfig,
 };
 
 use crate::paged::RangeReader;
@@ -1237,7 +1237,9 @@ impl S3RangeReader {
             .body(HttpRequestBody::empty())
             .map_err(|e| Error::Other(format!("paged: build request: {e}").into()))?;
         let credential = self.credential.read().unwrap().clone();
-        AwsAuthorizer::new(&credential, "s3", &self.region).authorize(&mut signed, None);
+        AwsAuthorizer::new(&credential, "s3", &self.region)
+            .try_authorize(&mut signed, None)
+            .map_err(|e| Error::Other(format!("paged: sign request: {e}").into()))?;
         let mut request = self.agent.get(url);
         for (name, value) in signed.headers() {
             // ureq sets Host from the URL itself, identically to the signed
