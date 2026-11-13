@@ -865,14 +865,22 @@
         "public",
       );
     }
-    // A private key in PEM or JWK form yields its public half as well.
-    const prepared = prepareAsymmetricKey(key, KeyContext.kCreatePublic);
-    const holdsPrivate = prepared.format === "jwk"
-      ? prepared.key.d !== undefined
-      : prepared.format === "pem" &&
-        new TextDecoder().decode(asU8(prepared.key)).includes("PRIVATE KEY");
-    if (holdsPrivate) return createPublicKey(createPrivateKey(key));
-    return importAsymmetric(prepared, "public");
+    // A private key in PEM or JWK form yields its public half as well. It is
+    // recognized before the public-key validation, which would refuse a
+    // private `type` such as pkcs8 or sec1.
+    if (holdsPrivateKey(key)) return createPublicKey(createPrivateKey(key));
+    return importAsymmetric(
+      prepareAsymmetricKey(key, KeyContext.kCreatePublic), "public");
+  }
+  function holdsPrivateKey(key) {
+    const { key: data, encoding = "utf8", format = "pem" } =
+      isStringOrBuffer(key) ? { key } : key ?? {};
+    if (data == null || isKeyObject(data) || data instanceof CryptoKey) {
+      return false;
+    }
+    if (!isStringOrBuffer(data)) return typeof data === "object" && data.d !== undefined;
+    return format === "pem" && new TextDecoder().decode(
+      asU8(getArrayBufferOrView(data, "key", encoding))).includes("PRIVATE KEY");
   }
 
   function generateKey(type, options, callback) {
