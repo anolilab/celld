@@ -39,9 +39,9 @@ Each workload starts a fresh server on a fresh copy of its fixture
 - `do_sql_insert`: every request goes to one Durable Object that inserts a row
   with `ctx.storage.sql.exec`.
 - `do_fanout`: requests cycle over 1000 object names. The objects keep no
-  state, and the warm-up activates all of them, so this measures routing
-  across many resident objects rather than a single one. First activation is
-  not measured here.
+  state, and each is requested once before the clock starts, so this measures
+  routing across many resident objects rather than a single one. First
+  activation is not measured here.
 - `cold_start`: time from spawning `celld dev` to its first successful
   response, over 5 runs on the `hello` fixture. It includes the readiness
   polling interval of 50 ms.

@@ -37,8 +37,7 @@ use harness::Server;
 
 const DEFAULT_SECONDS: u64 = 10;
 const DEFAULT_CONCURRENCY: usize = 32;
-/// Long enough for the JIT, connection pools and every fan-out object's first
-/// activation to settle.
+/// Long enough for the JIT and connection pools to settle.
 const WARMUP: Duration = Duration::from_secs(2);
 const COLD_START_RUNS: usize = 5;
 const FANOUT_NAMES: u64 = 1000;
@@ -54,6 +53,10 @@ struct Workload {
     name: &'static str,
     fixture: &'static str,
     path: fn(u64) -> String,
+    /// How many distinct paths `path` cycles over. Each is requested once,
+    /// and must succeed, before the clock starts, so no object's first
+    /// activation lands in the measured window.
+    distinct: u64,
 }
 
 const WORKLOADS: [Workload; 4] = [
@@ -61,21 +64,25 @@ const WORKLOADS: [Workload; 4] = [
         name: "hello",
         fixture: "bench-hello",
         path: |_| "/".into(),
+        distinct: 1,
     },
     Workload {
         name: "do_counter",
         fixture: "bench-do-counter",
         path: |_| "/".into(),
+        distinct: 1,
     },
     Workload {
         name: "do_sql_insert",
         fixture: "bench-do-sql-insert",
         path: |_| "/".into(),
+        distinct: 1,
     },
     Workload {
         name: "do_fanout",
         fixture: "bench-do-fanout",
         path: |i| format!("/?name=object-{}", i % FANOUT_NAMES),
+        distinct: FANOUT_NAMES,
     },
 ];
 
@@ -174,6 +181,9 @@ async fn run_load(workload: &Workload, settings: &Settings) -> LoadResult {
         .build()
         .expect("build http client");
 
+    for i in 0..workload.distinct {
+        server.get_text(&(workload.path)(i)).await;
+    }
     let measure_from = Instant::now() + WARMUP;
     let end = measure_from + Duration::from_secs(settings.seconds);
     let next = Arc::new(AtomicU64::new(0));
