@@ -1304,10 +1304,10 @@ impl RuntimeManager {
                     }),
                 },
             );
-            // Observe only once the cell is registered, and under the same
-            // lock the reporter sends under: before this the observation
-            // could reach the core ahead of a registry entry that a later
-            // report or coverage read depends on.
+            // Observe once the cell is registered, under the lock the
+            // reporter sends under, so the observation cannot reach the core
+            // ahead of the registry entry that later reports and coverage
+            // reads depend on.
             (self.alarm_observer)(cell.clone(), alarm, self.alarm_covered(&cell, alarm));
             Ok((placed_in, generation.id))
         }
