@@ -4076,6 +4076,7 @@ const __rsDisconnect = () => new Error(
   "ReadableStream received over RPC disconnected prematurely.");
 // Receiver wrapper stream -> its handle meta, for forwarding.
 const __rpcStreamMeta = new WeakMap();
+const __rpcStreamFinalizer = new FinalizationRegistry((meta) => __disposeStub(meta));
 const __readableBridge = (reader) => {
   const bridge = {
     done: false,
@@ -4423,7 +4424,7 @@ const __reviveResponse = (marker, revive) => {
 // real errors back through the write loop).
 const __foreignStreamOp = () => Promise.reject(new Error(
   "RPC streams cannot cross isolate boundaries yet."));
-const __reviveStream = (marker, id, readable, handles) => {
+const __reviveStream = (marker, id, readable) => {
   const entry = marker.t === __stubIsolate
     ? __stubEntries.get(id) : undefined;
   if (entry === undefined)
@@ -4431,9 +4432,12 @@ const __reviveStream = (marker, id, readable, handles) => {
       ? new ReadableStream({ pull: __foreignStreamOp })
       : new WritableStream({ write: __foreignStreamOp,
           close: __foreignStreamOp, abort: __foreignStreamOp });
+  // Unlike a stub, a received stream is not a parameter of the call that
+  // carried it: the receiver can keep it for later calls, so neither the end
+  // of that call nor of its context disposes it. The handle is released when
+  // the stream ends, is cancelled or aborted, or is collected unread.
   const meta = { entry, disposed: false, ctx: __ctxNow() };
-  __ctxRegister(meta);
-  handles.push(meta);
+  const release = () => __disposeStub(meta);
   const stream = readable
     ? new ReadableStream({
         async pull(controller) {
@@ -4441,21 +4445,25 @@ const __reviveStream = (marker, id, readable, handles) => {
           try {
             result = await __stubOp(meta, ["read"], []);
           } catch {
+            release();
             throw __rsDisconnect();
           }
-          if (result.done) controller.close();
-          else controller.enqueue(result.value);
+          if (result.done) {
+            controller.close();
+            release();
+          } else controller.enqueue(result.value);
         },
         cancel: () =>
-          __stubOp(meta, ["cancel"], []).catch(() => {}),
+          __stubOp(meta, ["cancel"], []).catch(() => {}).finally(release),
       }, { highWaterMark: 0 })
     : new WritableStream({
         write: (chunk) => __stubOp(meta, ["write"], [chunk]),
-        close: () => __stubOp(meta, ["close"], []),
+        close: () => __stubOp(meta, ["close"], []).finally(release),
         abort: () =>
-          __stubOp(meta, ["abort"], []).catch(() => {}),
+          __stubOp(meta, ["abort"], []).catch(() => {}).finally(release),
       });
   __rpcStreamMeta.set(stream, meta);
+  __rpcStreamFinalizer.register(stream, meta);
   return stream;
 };
 const __reviveSignal = (marker, id) => {
@@ -4518,10 +4526,10 @@ const __stubRevive = (value) => {
       return __reviveResponse(v, revive);
     const rsId = v["__celld$rs"];
     if (rsId !== undefined)
-      return __reviveStream(v, rsId, true, handles);
+      return __reviveStream(v, rsId, true);
     const wsId = v["__celld$ws"];
     if (wsId !== undefined)
-      return __reviveStream(v, wsId, false, handles);
+      return __reviveStream(v, wsId, false);
     const sigId = v["__celld$sig"];
     if (sigId !== undefined) return __reviveSignal(v, sigId);
     if (seen.has(v)) return v;
