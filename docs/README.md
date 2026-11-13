@@ -687,6 +687,12 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_TOKIO_THREADS` | Host Tokio worker threads (default: the CPU count). The `host_runtime` log event at startup reports `worker_count` |
 | `RUST_LOG` | The runtime log filter |
 
+`CELLD_VERSION` is read when celld is built, not when it runs. A build with
+`CELLD_VERSION=0.6.3+ci.5` reports `celld 0.6.3+ci.5` from `celld --version`;
+without it the crate's own version is reported. The build fails on a value
+with a character outside `0-9`, `A-Z`, `a-z`, `.`, `_`, `+` and `-`, and an
+empty value counts as unset.
+
 An L1 compaction merges at most 256 source objects within a 64 MiB buffer.
 A larger source object spills to temporary files in the cell's local LTX
 directory, so the node needs free disk for the source and the output.

@@ -12,5 +12,6 @@ mod e2e {
     pub mod isolates;
     pub mod node_crypto;
     pub mod ownership;
+    pub mod version;
     pub mod webcrypto;
 }
