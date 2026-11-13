@@ -302,11 +302,13 @@ const checks = {
   // Keys made by generateKey must work with the same algorithm's other
   // operations, and survive export and import in every format the runtime
   // offers, so a change in the random-number or key-encoding layer shows here.
+  // RSA keys are 1024 bits: generating twelve 2048-bit keys in a debug build
+  // outlasts the harness's request timeout, and strength is not under test.
   ...Object.fromEntries(
     [
-      ["RSASSA-PKCS1-v1_5", { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, "signature"],
-      ["RSA-PSS", { name: "RSA-PSS", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, "signature"],
-      ["RSA-OAEP", { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, "oaep"],
+      ["RSASSA-PKCS1-v1_5", { name: "RSASSA-PKCS1-v1_5", modulusLength: 1024, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, "signature"],
+      ["RSA-PSS", { name: "RSA-PSS", modulusLength: 1024, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, "signature"],
+      ["RSA-OAEP", { name: "RSA-OAEP", modulusLength: 1024, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, "oaep"],
       ["ECDSA P-256", { name: "ECDSA", namedCurve: "P-256" }, "signature"],
       ["ECDSA P-384", { name: "ECDSA", namedCurve: "P-384" }, "signature"],
       ["ECDSA P-521", { name: "ECDSA", namedCurve: "P-521" }, "signature"],
@@ -329,6 +331,8 @@ const checks = {
       const params = { name: "AES-GCM", iv: iv.slice(0, 12) };
       const sealed = await subtle.encrypt(params, key, message);
       equal(hex(await subtle.decrypt(params, key, sealed)), hex(message), "plaintext");
+      const again = await subtle.importKey("raw", raw, "AES-GCM", false, ["decrypt"]);
+      equal(hex(await subtle.decrypt(params, again, sealed)), hex(message), "plaintext after a raw round trip");
     }
     const a = hex(await subtle.exportKey("raw", await subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"])));
     const b = hex(await subtle.exportKey("raw", await subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"])));
@@ -339,6 +343,8 @@ const checks = {
     const mac = await subtle.sign("HMAC", key, message);
     equal(await subtle.verify("HMAC", key, mac, message), true, "mac verifies");
     equal(await subtle.verify("HMAC", key, mac, tampered), false, "tampered verifies");
+    const again = await subtle.importKey("raw", await subtle.exportKey("raw", key), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+    equal(await subtle.verify("HMAC", again, mac, message), true, "mac verifies after a raw round trip");
   },
   Ed25519: () => signature("Ed25519", V.Ed25519, {}, true),
   X25519: () => agreement("X25519", V.X25519, {}),
