@@ -277,7 +277,7 @@ is `http://127.0.0.1:9876` by default.
 
 | flag | effect |
 | --- | --- |
-| `--port PORT` | The Worker listener port |
+| `--port PORT` | The Worker listener port. `0` picks a free port, named on the `ready` line and kept across rebuilds |
 | `--host ADDR` | The Worker listener interface. The operator listener stays on loopback |
 | `--logs` | Show the node warning and information logs |
 | `--clean` | Delete `.celld/dev` before the start |

@@ -127,7 +127,8 @@ celld dev
 The command starts one celld node with a local object store, so it needs
 no Docker or cloud bucket. The Worker listener uses
 `http://127.0.0.1:9876`. Use `celld dev --port PORT` to select a different
-Worker port. Use `celld dev --host IP` to select a different interface. A
+Worker port, or `--port 0` to let the system pick a free one; the `ready` line
+names the address in use, and a rebuild keeps it. Use `celld dev --host IP` to select a different interface. A
 non-loopback IP exposes the Worker listener to the network, and the internal
 operator listener stays on loopback. The command keeps the application state
 in `.celld/dev`, so a later invocation uses the same durable data.
