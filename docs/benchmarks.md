@@ -80,7 +80,8 @@ Each workload starts a fresh server on a fresh copy of its fixture
 `storage_requests` counts what a short-lived Durable Object costs in bucket
 requests. It runs real fleet nodes against an S3-compatible store through a
 proxy that tallies every request by the price class the store bills it at:
-PUT, COPY, POST and LIST are class A; GET and HEAD are class B; DELETE is free.
+PUT, COPY, POST (batch deletes included) and LIST are class A; GET and HEAD
+are class B; a single DELETE is free.
 
 Each agent is a new object that takes six SQLite writes ten seconds apart and
 is never used again. Requests under `cells/` belong to one agent and are

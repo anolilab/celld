@@ -60,8 +60,13 @@ const MONTH_SECONDS: f64 = 730.0 * 3600.0;
 /// Longer than the default gap between turns, so an agent is evicted once,
 /// after its last turn, not between turns.
 const IDLE_EVICT_S: &str = "15";
-/// Time after the last write for the flush, the eviction and its upload.
+/// Time after the last write for the flush and the evictions to start.
 const DRAIN: Duration = Duration::from_secs(25);
+/// The run ends once no agent request has reached the store for this long.
+const QUIET: Duration = Duration::from_secs(10);
+/// A run whose agents are still making requests this long after the drain
+/// fails, rather than reporting a partial count.
+const QUIET_TIMEOUT: Duration = Duration::from_secs(300);
 
 struct Settings {
     endpoint: String,
@@ -252,12 +257,16 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
         .trim_start_matches("http://")
         .trim_end_matches('/')
         .to_owned();
-    let proxy = Proxy::start(upstream).await;
     let bucket = format!(
         "{}/{run}/{}",
         settings.bucket.trim_end_matches('/'),
         scenario.name
     );
+    // The store path of this scenario's keys: bucket, any key prefix, run.
+    let root = bucket
+        .split_once("://")
+        .map_or(bucket.as_str(), |(_, path)| path);
+    let proxy = Proxy::start(upstream, root.to_owned()).await;
     let dir = tempfile::TempDir::new().expect("create temp dir");
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -328,6 +337,7 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
         task.await.expect("agent task");
     }
     tokio::time::sleep(DRAIN).await;
+    proxy.wait_quiet().await;
     let elapsed = started.elapsed();
     let load = diff(&proxy.take(), &base);
     drop(nodes);
@@ -433,16 +443,24 @@ struct Proxy {
 }
 
 impl Proxy {
-    async fn start(upstream: String) -> Proxy {
+    /// `root` is the path every key of the run starts with, which `shape`
+    /// strips.
+    async fn start(upstream: String, root: String) -> Proxy {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let url = format!("http://{}", listener.local_addr().expect("address"));
         let tally = Arc::new(Mutex::new(Tally::new()));
         let shared = tally.clone();
         let accept = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let (tally, upstream) = (shared.clone(), upstream.clone());
+                let (tally, upstream, root) = (shared.clone(), upstream.clone(), root.clone());
                 let service = service_fn(move |request: Request<Incoming>| {
-                    let key = (kind(&request), shape(&key_of(&request)));
+                    let kind = kind(&request);
+                    // The keys of a batch delete are in its body.
+                    let shape = match kind {
+                        "BATCH_DELETE" => "(batch)".to_owned(),
+                        _ => shape(&key_of(&request), &root),
+                    };
+                    let key = (kind, shape);
                     *tally.lock().unwrap().entry(key).or_default() += 1;
                     forward(upstream.clone(), request)
                 });
@@ -457,6 +475,32 @@ impl Proxy {
 
     fn take(&self) -> Tally {
         self.tally.lock().unwrap().clone()
+    }
+
+    fn cell_requests(&self) -> u64 {
+        self.take()
+            .iter()
+            .filter(|((_, shape), _)| per_cell(shape))
+            .map(|(_, n)| n)
+            .sum()
+    }
+
+    /// Waits until no agent request has arrived for `QUIET`, so evictions
+    /// that queue behind each other are counted.
+    async fn wait_quiet(&self) {
+        let deadline = Instant::now() + QUIET_TIMEOUT;
+        let (mut last, mut since) = (self.cell_requests(), Instant::now());
+        while since.elapsed() < QUIET {
+            assert!(
+                Instant::now() < deadline,
+                "agent requests still arriving {QUIET_TIMEOUT:?} after the drain"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let now = self.cell_requests();
+            if now != last {
+                (last, since) = (now, Instant::now());
+            }
+        }
     }
 }
 
@@ -490,7 +534,8 @@ fn kind(request: &Request<Incoming>) -> &'static str {
         Method::HEAD => "HEAD",
         Method::PUT if request.headers().contains_key("x-amz-copy-source") => "COPY",
         Method::PUT => "PUT",
-        Method::POST if query.starts_with("delete") => "DELETE",
+        // DeleteObjects is a POST, billed as class A unlike a single DELETE.
+        Method::POST if query.starts_with("delete") => "BATCH_DELETE",
         Method::POST => "POST",
         Method::DELETE => "DELETE",
         _ => "OTHER",
@@ -527,16 +572,16 @@ fn decode(text: &str) -> String {
         .into_owned()
 }
 
-/// The key without its bucket and run prefix, with long hex ids as `*` and
-/// other numbers as `#`, so requests for different cells and sequence
-/// numbers group.
-fn shape(key: &str) -> String {
-    let mut segments: Vec<&str> = key.trim_matches('/').split('/').collect();
-    // The bucket, the run and the scenario.
-    segments.drain(..segments.len().min(3));
-    let key = segments.join("/");
+/// The key without `root`, with long hex ids as `*` and other numbers as
+/// `#`, so requests for different cells and sequence numbers group.
+fn shape(key: &str, root: &str) -> String {
+    let key = key.trim_start_matches('/');
+    let key = key
+        .strip_prefix(root)
+        .unwrap_or(key)
+        .trim_start_matches('/');
     let mut masked = String::new();
-    let mut rest = key.as_str();
+    let mut rest = key;
     while let Some(c) = rest.chars().next() {
         let hex = rest.len()
             - rest
