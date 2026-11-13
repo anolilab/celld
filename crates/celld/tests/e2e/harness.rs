@@ -110,8 +110,35 @@ impl Server {
     /// Stops the server and starts it again on the same project directory, so
     /// the state under `.celld/` carries over.
     pub async fn restart(&mut self) {
+        self.restart_after(|_| {}).await;
+    }
+
+    /// `restart`, running `between` on the project directory while the server
+    /// is stopped, so a test can change the state the next start reads.
+    pub async fn restart_after(&mut self, between: impl FnOnce(&Path)) {
         self.stop();
+        between(&self.project);
         self.launch().await;
+    }
+
+    /// A GET whose status the test checks itself.
+    pub async fn get_status(&self, path: &str) -> reqwest::StatusCode {
+        self.client
+            .get(self.url(path))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("GET {path}: {error}"))
+            .status()
+    }
+
+    /// The project directory the server serves.
+    pub fn project(&self) -> &Path {
+        &self.project
+    }
+
+    /// Everything the server has written to its log so far.
+    pub fn log_text(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
     }
 
     /// Picks a free port and starts the process, retrying when the port was
