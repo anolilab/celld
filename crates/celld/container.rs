@@ -336,42 +336,103 @@ impl CellContainer {
         state.address = Address::None;
         let run = state.run;
         drop(state);
-        self.exit.send_replace(None);
+        // The exit of an earlier run stays: `monitor()` takes an exit only
+        // from the run it was asked about or a later one, and a monitor that
+        // has not polled yet must still find the end of its own run.
         self.started.send_replace((run, Started::Pending));
         run
     }
 
     /// Settle `run`'s start, unless it already settled or a newer run
     /// replaced it: a late answer must not revive a destroyed start or speak
-    /// for the next one.
-    fn settle_start(&self, run: u64, outcome: Started) {
+    /// for the next one. Whether this call settled it.
+    fn settle_start(&self, run: u64, outcome: Started) -> bool {
         self.started.send_if_modified(|(current, started)| {
             if *current != run || *started != Started::Pending {
                 return false;
             }
             *started = outcome;
             true
+        })
+    }
+
+    /// Publish how `run` ended for `monitor()`, unless a newer run has
+    /// already published: a late answer of an old run must not replace the
+    /// result its successor's monitor is waiting for.
+    fn publish_exit(&self, run: u64, result: Result<i64, String>) {
+        self.exit.send_if_modified(|current| {
+            if current.as_ref().is_some_and(|(ended, _)| *ended > run) {
+                return false;
+            }
+            *current = Some((run, result));
+            true
         });
+    }
+
+    /// `destroy()` ended the current run. The state, the start and the exit
+    /// change under one hold of the state lock, so a `finish_start` cannot
+    /// run between them and find a start that is still pending, which would
+    /// mark a destroyed container as running. A run whose start was still
+    /// pending has no wait task to report its end, because its container is
+    /// removed when the engine finishes creating it, so the end is published
+    /// here: a destroyed container reports 137.
+    ///
+    /// `run` is the run `destroy()` meant, read before its engine calls: those
+    /// take time, and a `start()` that opened a newer run meanwhile is not
+    /// the one being destroyed.
+    fn end_run_destroyed(&self, run: u64) {
+        let mut state = self.state.lock().unwrap();
+        if state.run != run {
+            return;
+        }
+        state.running = false;
+        state.address = Address::None;
+        let ended_before_it_started = self.settle_start(
+            run,
+            Started::Failed("the container was destroyed before it started".to_string()),
+        );
+        drop(state);
+        if ended_before_it_started {
+            self.publish_exit(run, Ok(DESTROYED_EXIT_CODE));
+        }
     }
 
     /// The start of `run` succeeded: the container is up at `address`.
     /// Whether the run was still waiting for that. It is not when `destroy()`
     /// ended it while the engine was creating the container, or a newer run
     /// replaced it, and the cell must then not take the container as its own.
+    ///
+    /// The start settles while the state lock is held, as `end_run_destroyed`
+    /// settles it: a `destroy()` that ended the run in between would otherwise
+    /// publish its 137 and be followed by a wait task for a removed container,
+    /// whose error would replace it.
     fn finish_start(&self, run: u64, address: Address) -> bool {
         let mut state = self.state.lock().unwrap();
-        let pending = {
-            let started = self.started.borrow();
-            started.0 == run && started.1 == Started::Pending
-        };
-        if state.run != run || !pending {
+        if state.run != run || !self.settle_start(run, Started::Ready) {
             return false;
         }
         state.running = true;
         state.address = address;
-        drop(state);
-        self.settle_start(run, Started::Ready);
         true
+    }
+
+    /// The start of `run` will never finish, because the future that drove
+    /// it was dropped with its event: end it as failed, so an `exec()` that
+    /// waits on it, and a `monitor()`, are answered instead of hanging.
+    /// Nothing is done for a run that settled, which is every run whose start
+    /// finished.
+    fn abandon_start(&self, run: u64) {
+        let mut state = self.state.lock().unwrap();
+        let reason = "the start was abandoned before it finished";
+        if !self.settle_start(run, Started::Failed(reason.to_string())) {
+            return;
+        }
+        if state.run == run {
+            state.running = false;
+            state.address = Address::None;
+        }
+        drop(state);
+        self.publish_exit(run, Err(reason.to_string()));
     }
 
     /// Wait until the newest run's start has settled. `Ok` when the container
@@ -396,6 +457,29 @@ impl CellContainer {
     /// The run `monitor()` waits on: the newest one.
     pub fn current_run(&self) -> u64 {
         self.state.lock().unwrap().run
+    }
+}
+
+/// Held by whatever drives the start of a run. If it is dropped before the
+/// start settled, the run ends as failed; see `CellContainer::abandon_start`.
+pub struct StartGuard {
+    cell: Arc<CellContainer>,
+    run: u64,
+}
+
+impl StartGuard {
+    pub fn new(cell: Arc<CellContainer>, run: u64) -> Self {
+        Self { cell, run }
+    }
+
+    pub fn run(&self) -> u64 {
+        self.run
+    }
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        self.cell.abandon_start(self.run);
     }
 }
 
@@ -438,6 +522,9 @@ struct Config {
     /// the lab mounts the directory one-to-one.
     data_dir: PathBuf,
 }
+
+/// The exit code a destroyed container reports: 128 plus SIGKILL.
+const DESTROYED_EXIT_CODE: i64 = 137;
 
 static CONFIG: RwLock<Option<Config>> = RwLock::new(None);
 /// The deployment's container classes. Replaced on every generation swap;
@@ -941,7 +1028,7 @@ impl ContainerEngine {
         if adopted {
             let run = cell.begin_run();
             cell.settle_start(run, Started::Ready);
-            self.watch_exit(&cell, run);
+            self.watch_exit(&cell, run, cell.name.clone());
         }
         let mut state = cell.state.lock().unwrap();
         state.running = running.is_some();
@@ -1050,7 +1137,11 @@ impl ContainerEngine {
         run: u64,
         params: StartParams,
     ) -> anyhow::Result<()> {
-        let started = self.create_and_start(cell, params).await;
+        // The id of the container this run created. Everything the run does
+        // to its container goes by id: the name is the cell's, and a newer
+        // run can hold it by the time this one fails or finishes late.
+        let mut container_id = None;
+        let started = self.create_and_start(cell, params, &mut container_id).await;
         let address = match started {
             Ok(address) => address,
             Err(error) => {
@@ -1064,43 +1155,68 @@ impl ContainerEngine {
                     error = %format!("{error:#}"),
                     "the container did not start"
                 );
-                let mut state = cell.state.lock().unwrap();
-                state.running = false;
-                drop(state);
-                cell.settle_start(run, Started::Failed(format!("{error:#}")));
-                cell.exit
-                    .send_replace(Some((run, Err(format!("{error:#}")))));
+                // A `destroy()` that ended the run before this failure has
+                // already told its monitor.
+                if cell.settle_start(run, Started::Failed(format!("{error:#}"))) {
+                    cell.publish_exit(run, Err(format!("{error:#}")));
+                }
+                // Only the run that is still the cell's has anything of the
+                // cell to undo. A start that fails late, after `destroy()` and
+                // a newer `start()`, would otherwise mark the newer run as not
+                // running.
+                {
+                    let mut state = cell.state.lock().unwrap();
+                    if state.run == run {
+                        state.running = false;
+                    }
+                }
+                // The container the failed start created, or left half
+                // started, belongs to no run: the next start would otherwise
+                // find the name taken, and a node that never starts again
+                // would keep it until restart. It goes by its id, so a newer
+                // run's container under the same name is not touched. A
+                // create the engine never answered has no id; whatever it
+                // makes later is removed by the cell's next start, or by the
+                // node when it restarts or shuts down.
+                self.remove_container(container_id.as_deref()).await;
                 return Err(error);
             }
         };
         if !cell.finish_start(run, address) {
             // `destroy()` ended this run while the container was being
             // created. The container exists now and belongs to no run, so it
-            // goes, unless a newer run is under way: that one holds the name.
-            if cell.current_run() == run {
-                let _ = self
-                    .docker
-                    .call(
-                        "DELETE",
-                        &format!("/containers/{}?force=true", cell.name),
-                        None,
-                    )
-                    .await;
-            }
+            // goes, by its id: a newer run may hold the name already.
+            self.remove_container(container_id.as_deref()).await;
             return Ok(());
         }
-        self.watch_exit(cell, run);
+        // `finish_start` took the container for the run, so it has an id.
+        if let Some(id) = container_id {
+            self.watch_exit(cell, run, id);
+        }
         Ok(())
     }
 
-    /// Wait for the container's root process to end and publish the exit
-    /// for `run`; a later run's start has already replaced the state.
-    fn watch_exit(&self, cell: &Arc<CellContainer>, run: u64) {
+    /// Remove the container with this id, if there is one. Best effort: the
+    /// run that asks has already failed or ended.
+    async fn remove_container(&self, id: Option<&str>) {
+        let Some(id) = id else {
+            return;
+        };
+        let _ = self
+            .docker
+            .call("DELETE", &format!("/containers/{id}?force=true"), None)
+            .await;
+    }
+
+    /// Wait for the container `target` (its id, or the cell's name for one
+    /// adopted from an earlier owner) to end and publish the exit for `run`;
+    /// a later run's start has already replaced the state.
+    fn watch_exit(&self, cell: &Arc<CellContainer>, run: u64, target: String) {
         let docker = self.docker.clone();
         let cell_ = cell.clone();
         asyncrt::spawn(async move {
             let result = docker
-                .call("POST", &format!("/containers/{}/wait", cell_.name), None)
+                .call("POST", &format!("/containers/{target}/wait"), None)
                 .await
                 .and_then(|reply| {
                     if !reply.status.is_success() {
@@ -1123,7 +1239,7 @@ impl ContainerEngine {
                 state.address = Address::None;
             }
             drop(state);
-            cell_.exit.send_replace(Some((run, result)));
+            cell_.publish_exit(run, result);
         })
         .detach();
     }
@@ -1132,6 +1248,7 @@ impl ContainerEngine {
         &self,
         cell: &CellContainer,
         params: StartParams,
+        created: &mut Option<String>,
     ) -> anyhow::Result<Address> {
         let image = cell
             .spec
@@ -1292,10 +1409,17 @@ impl ContainerEngine {
                 reply.message()
             ));
         }
+        let id = reply
+            .json()?
+            .get("Id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("create container answered without an id"))?
+            .to_string();
+        *created = Some(id.clone());
         self.docker
             .expect(
                 "POST",
-                &format!("/containers/{}/start", cell.name),
+                &format!("/containers/{id}/start"),
                 None,
                 "start container",
             )
@@ -1304,7 +1428,7 @@ impl ContainerEngine {
             .docker
             .expect(
                 "GET",
-                &format!("/containers/{}/json", cell.name),
+                &format!("/containers/{id}/json"),
                 None,
                 "inspect container",
             )
@@ -1329,9 +1453,17 @@ impl ContainerEngine {
         }
     }
 
-    pub async fn destroy(&self, cell: &Arc<CellContainer>) -> anyhow::Result<()> {
+    /// End `run`'s container, the run that was current when `destroy()` was
+    /// called: the engine calls take long, and a `start()` may open a newer
+    /// run meanwhile. It is destroyed only once the engine confirms
+    /// the removal, or says there is nothing to remove: an engine that did not
+    /// answer, or refused, leaves the run as it was and the error goes to the
+    /// caller, who can ask again, rather than report a container gone that
+    /// may still be running.
+    pub async fn destroy(&self, cell: &Arc<CellContainer>, run: u64) -> anyhow::Result<()> {
         // Kill first so the wait task reports 137 before the removal makes
-        // the name disappear under it.
+        // the name disappear under it. The removal is forced and ends the
+        // container anyway, so a kill that failed need not stop it.
         let _ = self
             .docker
             .call(
@@ -1340,23 +1472,27 @@ impl ContainerEngine {
                 None,
             )
             .await;
-        let _ = self
+        let removed = self
             .docker
             .call(
                 "DELETE",
                 &format!("/containers/{}?force=true", cell.name),
                 None,
             )
-            .await;
-        let mut state = cell.state.lock().unwrap();
-        state.running = false;
-        state.address = Address::None;
-        let run = state.run;
-        drop(state);
-        cell.settle_start(
-            run,
-            Started::Failed("the container was destroyed before it started".to_string()),
-        );
+            .await
+            .context("remove container")?;
+        // 404: there is no container of that name, which is what a start that
+        // has not created one yet, or one that already ended, looks like. 409
+        // on a forced removal is the daemon saying another removal of it is
+        // already in progress, as the create path above also meets.
+        if !removed.status.is_success() && !matches!(removed.status.as_u16(), 404 | 409) {
+            return Err(anyhow!(
+                "remove container failed with [{}] {}",
+                removed.status.as_u16(),
+                removed.message()
+            ));
+        }
+        cell.end_run_destroyed(run);
         Ok(())
     }
 
@@ -1402,7 +1538,16 @@ impl ContainerEngine {
     }
 
     async fn forget(&self, cell: &Arc<CellContainer>) {
-        let _ = self.destroy(cell).await;
+        // Nobody is left to ask again, so a removal the engine did not
+        // confirm is told here; the cell's next start removes the name.
+        if let Err(error) = self.destroy(cell, cell.current_run()).await {
+            tracing::warn!(
+                event = "container_destroy_failed",
+                cell = %cell.scope,
+                error = %format!("{error:#}"),
+                "the container may still exist"
+            );
+        }
         for id in cell.processes.lock().unwrap().drain(..) {
             drop_process(id);
         }
@@ -1427,6 +1572,8 @@ impl ContainerEngine {
             return Err(anyhow!("exec() requires a running container."));
         }
         let tty = params.pty.is_some();
+        let id = next_exec_id();
+        let marker = exec_marker(id);
         let mut body = json!({
             "AttachStdin": true,
             "AttachStdout": true,
@@ -1441,13 +1588,19 @@ impl ContainerEngine {
         if let Some((cols, rows)) = params.pty {
             body["ConsoleSize"] = json!([rows, cols]);
         }
-        if !params.env.is_empty() {
-            body["Env"] = json!(params
-                .env
-                .iter()
-                .map(|(name, value)| format!("{name}={value}"))
-                .collect::<Vec<_>>());
-        }
+        // The marker rides in the environment of the process and of every
+        // process it starts that keeps its environment, which, with the
+        // parent of each, is how a kill finds them. The name is
+        // reserved: the object's own value of it is dropped, so it can
+        // neither spoof another exec's marker nor hide this one's.
+        let env: Vec<String> = params
+            .env
+            .iter()
+            .filter(|(name, _)| name != EXEC_MARKER_NAME)
+            .map(|(name, value)| format!("{name}={value}"))
+            .chain(std::iter::once(marker.clone()))
+            .collect();
+        body["Env"] = json!(env);
         if let Some(cwd) = &params.cwd {
             body["WorkingDir"] = json!(cwd);
         }
@@ -1518,7 +1671,9 @@ impl ContainerEngine {
         })
         .detach();
         let process = Arc::new(ExecProcess {
-            id: next_exec_id(),
+            id,
+            marker,
+            user: params.user.clone(),
             exec_id,
             container: cell.name.clone(),
             pid,
@@ -1568,6 +1723,13 @@ type WriteHalf = tokio::io::WriteHalf<Box<dyn Stream>>;
 
 pub struct ExecProcess {
     pub id: u64,
+    /// `CELLD_EXEC=...`, in the environment of the process; see
+    /// [`exec_marker`].
+    marker: String,
+    /// The user the process runs as, which the kill runs as too: it can read
+    /// and signal the processes of its own user, and a container has dropped
+    /// every capability that would let it do more.
+    user: Option<String>,
     exec_id: String,
     container: String,
     pub pid: i64,
@@ -1747,13 +1909,23 @@ impl ExecProcess {
         Ok(())
     }
 
-    /// The Engine API has no exec kill, so the signal is delivered by a
-    /// second exec of `kill`, as workerd does.
+    /// Signal the process and every process it started.
+    ///
+    /// The Engine API has no exec kill. The pid that an exec inspect reports
+    /// is the daemon's, a host pid, and names nothing inside the container,
+    /// and an image need not have a `kill` executable, so signalling that pid
+    /// by an exec of `kill` reached nothing and said nothing. The exec's
+    /// processes are instead found by the marker in their environment, and
+    /// by their ancestry, in a shell scan of the container's `/proc`, which
+    /// needs only `sh`, `cat` and `tr`; see [`kill_script`].
     pub async fn kill(&self, signal: u32) -> anyhow::Result<()> {
-        let body = json!({
+        let mut body = json!({
             "AttachStdin": false, "AttachStdout": false, "AttachStderr": false,
-            "Cmd": ["kill", format!("-{signal}"), self.pid.to_string()],
+            "Cmd": ["sh", "-c", kill_script("/proc", &self.marker, signal)],
         });
+        if let Some(user) = &self.user {
+            body["User"] = json!(user);
+        }
         let created = self
             .docker
             .expect(
@@ -1778,6 +1950,67 @@ impl ExecProcess {
             .await?;
         Ok(())
     }
+}
+
+/// The environment variable that names an exec's processes.
+const EXEC_MARKER_NAME: &str = "CELLD_EXEC";
+
+/// The marker of exec number `id`: the name and a value made of this node's
+/// random tag and the number. The numbers restart with the node, and a
+/// container can outlive the node that started its execs, so the tag keeps
+/// the marker of a new exec 1 from being the marker of an old one that is
+/// still running. The value is letters and digits, which the script embeds.
+fn exec_marker(id: u64) -> String {
+    static TAG: OnceLock<u64> = OnceLock::new();
+    let tag = TAG.get_or_init(|| rand::RngCore::next_u64(&mut asyncrt::rng("exec_marker")));
+    format!("{EXEC_MARKER_NAME}=n{tag:016x}e{id}")
+}
+
+/// A shell script that sends `signal` to the processes of one exec: the
+/// ones that carry `marker` as an environment entry of their own, and every
+/// descendant of those, however they set their environment.
+///
+/// It uses what a minimal image has: `sh`, `cat`, `tr` and the shell's
+/// `kill`. The environment of a process is NUL-separated. `tr` turns the NULs
+/// into newlines, and the newlines a value holds into a byte that is not one,
+/// so each line is one entry and a value cannot spell out a line of its own;
+/// the marker has to be a whole line. The parent of a process is in its
+/// `stat`, after the command name, which may hold spaces and brackets and is
+/// skipped up to its last closing bracket.
+///
+/// Everything is read first and the set of processes is complete before the
+/// first signal is sent, so each is signalled once. Pid 1 and the script's
+/// own shell are never in it.
+fn kill_script(proc_dir: &str, marker: &str, signal: u32) -> String {
+    format!(
+        r#"hit=" "; pairs=""
+for p in {proc_dir}/[0-9]*; do
+  pid=${{p##*/}}
+  st=$(cat "$p/stat" 2>/dev/null) || continue
+  st=${{st##*) }}
+  set -- $st
+  [ -n "$2" ] || continue
+  pairs="$pairs$pid:$2 "
+  env=$(tr '\n\000' '\001\n' 2>/dev/null < "$p/environ")
+  case "
+$env
+" in *"
+{marker}
+"*) hit="$hit$pid ";; esac
+done
+more=1
+while [ "$more" = 1 ]; do
+  more=0
+  for pr in $pairs; do
+    pid=${{pr%%:*}}; parent=${{pr#*:}}
+    case "$hit" in *" $parent "*) case "$hit" in *" $pid "*) ;; *) hit="$hit$pid "; more=1;; esac;; esac
+  done
+done
+for pid in $hit; do
+  [ "$pid" -gt 1 ] && [ "$pid" != "$$" ] && kill -{signal} "$pid" 2>/dev/null
+done
+true"#
+    )
 }
 
 /// Copy a terminal's unframed output to `stdout` until the daemon closes it.
@@ -1976,5 +2209,343 @@ mod output_tests {
             assert_eq!(output.chunk(3).await, "");
             assert_eq!(output.chunk(3).await, "");
         });
+    }
+}
+
+// These tests drive child processes and wall-clock deadlines from outside the
+// node, so they are not part of the execution boundary the policy protects.
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod kill_tests {
+    use super::*;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// A `sleep`, and a stand-in for its `/proc/<pid>` under `proc_dir`, which
+    /// is how a container shows it: `environ` is NUL-separated entries and
+    /// `stat` names the parent, after a command name that may hold anything.
+    fn process_in(proc_dir: &std::path::Path, environ: &str, parent: u32) -> Child {
+        let child = Command::new("sleep")
+            .arg("30")
+            .env_clear()
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let dir = proc_dir.join(child.id().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("environ"), environ).unwrap();
+        let stat = format!("{} (sl) eep) S {parent} 1 1 0 -1 4194560\n", child.id());
+        std::fs::write(dir.join("stat"), stat).unwrap();
+        child
+    }
+
+    /// A process that carries `marker` in its environment.
+    fn marked_process(proc_dir: &std::path::Path, marker: &str) -> Child {
+        let environ = format!("PATH=/usr/bin\0{marker}\0HOME=/root\0");
+        process_in(proc_dir, &environ, 1)
+    }
+
+    fn scan(proc_dir: &std::path::Path, marker: &str, signal: u32) {
+        let script = kill_script(proc_dir.to_str().unwrap(), marker, signal);
+        let status = Command::new("sh").arg("-c").arg(&script).status().unwrap();
+        assert!(status.success());
+    }
+
+    fn survives(child: &mut Child, what: &str) {
+        assert!(
+            !exited_within(child, Duration::from_millis(300)),
+            "{what} was signalled"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    fn exited_within(child: &mut Child, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn the_scan_signals_the_marked_process_and_no_other() {
+        let proc_dir = tempfile::tempdir().unwrap();
+        let mut target = marked_process(proc_dir.path(), &exec_marker(5));
+        // The next exec number that begins with the same digit, and a process
+        // with no marker at all, which a substring match must not confuse.
+        let mut neighbour = marked_process(proc_dir.path(), &exec_marker(50));
+        let mut bystander = marked_process(proc_dir.path(), "OTHER=1");
+
+        let script = kill_script(proc_dir.path().to_str().unwrap(), &exec_marker(5), 9);
+        let status = Command::new("sh").arg("-c").arg(&script).status().unwrap();
+        assert!(status.success());
+
+        assert!(
+            exited_within(&mut target, Duration::from_secs(5)),
+            "the marked process lived"
+        );
+        assert!(
+            !exited_within(&mut neighbour, Duration::from_millis(300)),
+            "exec 50 was signalled"
+        );
+        assert!(
+            !exited_within(&mut bystander, Duration::from_millis(100)),
+            "an unmarked process was signalled"
+        );
+        let _ = neighbour.kill();
+        let _ = bystander.kill();
+        let _ = neighbour.wait();
+        let _ = bystander.wait();
+    }
+
+    // The marker is an environment entry, not text that may occur in one.
+    #[test]
+    fn a_marker_inside_another_variables_value_is_not_the_marker() {
+        let proc_dir = tempfile::tempdir().unwrap();
+        let marker = exec_marker(5);
+        let mut target = marked_process(proc_dir.path(), &marker);
+        let mut embedded = process_in(
+            proc_dir.path(),
+            &format!("PATH=/usr/bin\0NOTE={marker}\0"),
+            1,
+        );
+        // A value with a newline cannot start a line of its own that reads as
+        // the marker, either.
+        let mut forged = process_in(
+            proc_dir.path(),
+            &format!("PATH=/usr/bin\0NOTE=x\n{marker}\ny\0"),
+            1,
+        );
+        let mut suffixed = process_in(proc_dir.path(), &format!("PATH=/usr/bin\0{marker}0\0"), 1);
+
+        scan(proc_dir.path(), &marker, 9);
+
+        assert!(
+            exited_within(&mut target, Duration::from_secs(5)),
+            "the marked process lived"
+        );
+        survives(&mut embedded, "a process that holds the marker in a value");
+        survives(&mut forged, "a process with a forged line in a value");
+        survives(&mut suffixed, "a process whose marker only begins with it");
+    }
+
+    // A process that cleared its environment still has its ancestry.
+    #[test]
+    fn the_scan_signals_the_descendants_of_a_marked_process() {
+        let proc_dir = tempfile::tempdir().unwrap();
+        let marker = exec_marker(5);
+        let mut parent = marked_process(proc_dir.path(), &marker);
+        // `env -i`: no marker, and the marked process is its parent; so is its
+        // child's, a generation further down.
+        let mut child = process_in(proc_dir.path(), "", parent.id());
+        let mut grandchild = process_in(proc_dir.path(), "", child.id());
+        // Another exec's tree, and a process that belongs to neither.
+        let mut other = marked_process(proc_dir.path(), &exec_marker(6));
+        let mut other_child = process_in(proc_dir.path(), "", other.id());
+        let mut stranger = process_in(proc_dir.path(), "", 1);
+
+        scan(proc_dir.path(), &marker, 9);
+
+        for (what, process) in [
+            ("the marked process", &mut parent),
+            ("its child", &mut child),
+            ("its grandchild", &mut grandchild),
+        ] {
+            assert!(
+                exited_within(process, Duration::from_secs(5)),
+                "{what} lived"
+            );
+        }
+        survives(&mut other, "another exec");
+        survives(&mut other_child, "another exec's child");
+        survives(&mut stranger, "an unrelated process");
+    }
+
+    #[test]
+    fn the_scan_finds_nothing_when_the_process_has_gone() {
+        let proc_dir = tempfile::tempdir().unwrap();
+        let script = kill_script(proc_dir.path().to_str().unwrap(), &exec_marker(1), 15);
+        assert!(Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .status()
+            .unwrap()
+            .success());
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+
+    fn cell() -> CellContainer {
+        CellContainer {
+            scope: "Runner:one".to_string(),
+            name: "cell".to_string(),
+            spec: Arc::new(ContainerSpec {
+                class_name: "Runner".to_string(),
+                image: "celld-image:test".to_string(),
+                images: BTreeMap::new(),
+                instance_type: None,
+                max_instances: None,
+                runtime: None,
+            }),
+            state: Mutex::new(CellState::default()),
+            processes: Mutex::new(Vec::new()),
+            exit: watch::channel(None).0,
+            started: watch::channel((0, Started::Ready)).0,
+        }
+    }
+
+    fn exit_of(cell: &CellContainer) -> Option<(u64, Result<i64, String>)> {
+        cell.exit.borrow().clone()
+    }
+
+    // A monitor that has not polled yet when the cell starts again must still
+    // find the end of the run it was asked about.
+    #[test]
+    fn a_new_run_does_not_erase_the_exit_of_a_destroyed_start() {
+        let cell = cell();
+        let first = cell.begin_run();
+        cell.end_run_destroyed(first);
+        let second = cell.begin_run();
+        assert!(second > first);
+        assert_eq!(
+            exit_of(&cell),
+            Some((first, Ok(DESTROYED_EXIT_CODE))),
+            "the exit of the destroyed start was reset by the next run"
+        );
+    }
+
+    // The states `destroy()` leaves are checked together, because the gap
+    // between them was the bug: a start that finished in it took the
+    // container for a run `destroy()` had ended.
+    #[test]
+    fn destroying_a_pending_start_ends_it_in_one_step() {
+        let cell = cell();
+        let run = cell.begin_run();
+        cell.end_run_destroyed(run);
+        assert!(!cell.running());
+        assert!(matches!(
+            cell.started.borrow().clone(),
+            (ended, Started::Failed(_)) if ended == run
+        ));
+        // The engine finishing the create afterwards does not take the
+        // container, so the cell stays not running.
+        assert!(!cell.finish_start(run, Address::Ip("172.30.0.2".to_string())));
+        assert!(!cell.running());
+        // Nothing will wait on the container, so the end is published.
+        assert_eq!(exit_of(&cell), Some((run, Ok(DESTROYED_EXIT_CODE))));
+    }
+
+    #[test]
+    fn destroying_a_run_that_started_leaves_its_exit_to_the_wait() {
+        let cell = cell();
+        let run = cell.begin_run();
+        assert!(cell.finish_start(run, Address::None));
+        cell.end_run_destroyed(run);
+        assert!(!cell.running());
+        assert_eq!(exit_of(&cell), None);
+    }
+
+    // The destroy that read the run before its engine calls must not end a
+    // run a `start()` opened while they were in flight.
+    #[test]
+    fn a_late_destroy_leaves_the_next_start_alone() {
+        let cell = cell();
+        let destroyed = cell.begin_run();
+        let next = cell.begin_run();
+        assert!(cell.running());
+        cell.end_run_destroyed(destroyed);
+        assert!(
+            cell.running(),
+            "the destroy of an old run ended the new one"
+        );
+        assert_eq!(cell.started.borrow().clone(), (next, Started::Pending));
+        assert!(cell.finish_start(next, Address::None));
+        assert_eq!(exit_of(&cell), None, "the new run was reported destroyed");
+    }
+
+    // `finish_start` and `end_run_destroyed` race for one pending start: the
+    // start is either taken, with no exit published, or destroyed, with 137.
+    // Both at once, which was possible, lost the 137 to a wait on a container
+    // that was already removed. The gap was a few instructions wide, so this
+    // guards the rule rather than reproducing the old failure.
+    #[test]
+    fn a_start_is_either_taken_or_destroyed_never_both() {
+        for _ in 0..2000 {
+            let cell = Arc::new(cell());
+            let run = cell.begin_run();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let finishing = {
+                let (cell, barrier) = (cell.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cell.finish_start(run, Address::None)
+                })
+            };
+            barrier.wait();
+            cell.end_run_destroyed(run);
+            let taken = finishing.join().unwrap();
+            assert_eq!(
+                exit_of(&cell).is_some(),
+                !taken,
+                "taken: {taken}, exit: {:?}",
+                exit_of(&cell)
+            );
+            assert!(!cell.running(), "the destroy left the cell running");
+        }
+    }
+
+    // A start whose future is dropped part-way must not leave the run pending.
+    #[test]
+    fn an_abandoned_start_ends_as_failed() {
+        let cell = Arc::new(cell());
+        let run = cell.begin_run();
+        drop(StartGuard::new(cell.clone(), run));
+        assert!(!cell.running());
+        assert!(matches!(
+            cell.started.borrow().clone(),
+            (ended, Started::Failed(_)) if ended == run
+        ));
+        assert!(matches!(exit_of(&cell), Some((ended, Err(_))) if ended == run));
+        let waited = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(cell.wait_started());
+        assert!(waited.is_err());
+    }
+
+    #[test]
+    fn a_guard_dropped_after_the_start_settled_changes_nothing() {
+        let cell = Arc::new(cell());
+        let run = cell.begin_run();
+        let guard = StartGuard::new(cell.clone(), run);
+        assert!(cell.finish_start(run, Address::None));
+        drop(guard);
+        assert!(cell.running());
+        assert_eq!(exit_of(&cell), None);
+        // And one that outlived a newer run does not end that run.
+        let old = StartGuard::new(cell.clone(), run);
+        let newer = cell.begin_run();
+        drop(old);
+        assert!(cell.running());
+        assert_eq!(cell.started.borrow().clone(), (newer, Started::Pending));
+    }
+
+    #[test]
+    fn a_late_exit_does_not_replace_a_newer_runs() {
+        let cell = cell();
+        let first = cell.begin_run();
+        let second = cell.begin_run();
+        cell.publish_exit(second, Ok(0));
+        cell.publish_exit(first, Err("late".to_string()));
+        assert_eq!(exit_of(&cell), Some((second, Ok(0))));
+        cell.publish_exit(second, Ok(3));
+        assert_eq!(exit_of(&cell), Some((second, Ok(3))));
     }
 }

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::fake_engine::{FakeEngine, Kill};
+use super::fake_engine::FakeEngine;
 use super::harness::{wait_until, Server};
 
 async fn server(engine: &FakeEngine) -> Server {
@@ -28,7 +28,7 @@ async fn wait_created(engine: &FakeEngine, count: usize) -> Vec<Value> {
 
 #[tokio::test]
 async fn the_object_lists_the_images_its_class_declares() {
-    let engine = FakeEngine::start(Kill::Realistic).await;
+    let engine = FakeEngine::start().await;
     let server = server(&engine).await;
     let images: Value = server.get_json("/images").await;
     assert_eq!(images, json!({ "default": "default", "alt": "alt" }));
@@ -36,7 +36,7 @@ async fn the_object_lists_the_images_its_class_declares() {
 
 #[tokio::test]
 async fn start_without_an_image_runs_the_default() {
-    let engine = FakeEngine::start(Kill::Realistic).await;
+    let engine = FakeEngine::start().await;
     let server = server(&engine).await;
     let out: Value = server.get_json("/start").await;
     assert_eq!(out, json!({ "started": true, "running": true }));
@@ -46,7 +46,7 @@ async fn start_without_an_image_runs_the_default() {
 
 #[tokio::test]
 async fn start_runs_the_named_image() {
-    let engine = FakeEngine::start(Kill::Realistic).await;
+    let engine = FakeEngine::start().await;
     let server = server(&engine).await;
     let out: Value = server.get_json("/start?image=alt").await;
     assert_eq!(out, json!({ "started": true, "running": true }));
@@ -66,7 +66,7 @@ async fn start_runs_the_named_image() {
 
 #[tokio::test]
 async fn an_undeclared_image_is_refused_and_never_reaches_the_engine() {
-    let engine = FakeEngine::start(Kill::Realistic).await;
+    let engine = FakeEngine::start().await;
     let server = server(&engine).await;
     for image in ["nope", "celld-image:abc", "alpine:3.20"] {
         let out: Value = server.get_json(&format!("/start?image={image}")).await;

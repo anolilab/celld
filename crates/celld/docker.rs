@@ -16,6 +16,7 @@ use hyper::header::{CONNECTION, CONTENT_TYPE, HOST, UPGRADE};
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 
@@ -25,9 +26,56 @@ use tokio::net::UnixStream;
 /// 29 did for 1.41.
 const API: &str = "";
 
+/// How long a single-shot control call may take: an inspect, a kill, an
+/// exec create, a resize. The daemon is local, so one that has not answered
+/// is stuck, and a start that waited on it would never fail.
+pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The same for a call that creates, starts, or removes a container, which
+/// can wait on the disk and on the runtime.
+pub const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The kind of time a request is given; see [`budget`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Budget {
+    /// A single-shot control call.
+    Control,
+    /// A call that creates, starts, or removes a container.
+    Lifecycle,
+    /// A long-poll, which answers when the container exits.
+    Wait,
+}
+
+/// The budget of a request.
+///
+/// The policy is by request and not by caller, so a call added later is
+/// bounded unless it is a long-poll. `wait` can take days. An image load and
+/// a hijacked exec do not come through `call`, and are not bounded either.
+pub fn budget(method: &str, path: &str) -> Budget {
+    let path = path.split('?').next().unwrap_or(path);
+    if path.ends_with("/wait") {
+        return Budget::Wait;
+    }
+    let lifecycle = match method {
+        "DELETE" => path.starts_with("/containers/"),
+        "POST" => {
+            path == "/containers/create"
+                || (path.starts_with("/containers/") && path.ends_with("/start"))
+        }
+        _ => false,
+    };
+    if lifecycle {
+        Budget::Lifecycle
+    } else {
+        Budget::Control
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Docker {
     socket: PathBuf,
+    control: Duration,
+    lifecycle: Duration,
 }
 
 /// A raw bidirectional stream the daemon hijacked for an exec or attach.
@@ -57,7 +105,18 @@ impl Docker {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
         Self {
             socket: socket.into(),
+            control: CONTROL_TIMEOUT,
+            lifecycle: LIFECYCLE_TIMEOUT,
         }
+    }
+
+    /// The same daemon with other limits, for a test that cannot wait for
+    /// the real ones.
+    #[cfg(test)]
+    fn with_timeouts(mut self, control: Duration, lifecycle: Duration) -> Self {
+        self.control = control;
+        self.lifecycle = lifecycle;
+        self
     }
 
     /// The daemon socket: `DOCKER_HOST` when it names a unix socket, else
@@ -134,9 +193,32 @@ impl Docker {
         Ok((response, sender))
     }
 
-    /// One call, whole body. A long-polled `wait` is fine here: the body
-    /// arrives only when the container exits.
+    /// One call, whole body, within the time `call_limit` allows it. A
+    /// long-polled `wait` has none: the body arrives only when the container
+    /// exits.
     pub async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> anyhow::Result<Reply> {
+        let limit = match budget(method, path) {
+            Budget::Wait => return self.call_unbounded(method, path, body).await,
+            Budget::Control => self.control,
+            Budget::Lifecycle => self.lifecycle,
+        };
+        crate::asyncrt::timeout(limit, self.call_unbounded(method, path, body))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "the container engine did not answer {method} {} within {} s",
+                    path.split('?').next().unwrap_or(path),
+                    limit.as_secs_f64()
+                )
+            })?
+    }
+
+    async fn call_unbounded(
         &self,
         method: &str,
         path: &str,
@@ -264,4 +346,93 @@ fn drive(connection: hyper::client::conn::http1::Connection<TokioIo<UnixStream>,
 pub fn frame_header(header: &[u8; 8]) -> (u8, usize) {
     let length = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
     (header[0], length)
+}
+
+// The tests stand a daemon up beside the client, outside the execution
+// boundary the policy protects.
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod tests {
+    use super::*;
+    /// The process domain the timeout needs, bound once for the test binary.
+    fn runtime() -> tokio::runtime::Handle {
+        crate::asyncrt::install_test_host_runtime()
+    }
+
+    #[test]
+    fn a_wait_has_no_limit_and_a_lifecycle_call_has_the_longer_one() {
+        assert_eq!(budget("POST", "/containers/abc/wait"), Budget::Wait);
+        for lifecycle in [
+            ("POST", "/containers/create?name=x"),
+            ("POST", "/containers/abc/start"),
+            ("DELETE", "/containers/abc?force=true"),
+        ] {
+            assert_eq!(
+                budget(lifecycle.0, lifecycle.1),
+                Budget::Lifecycle,
+                "{lifecycle:?}"
+            );
+        }
+        for control in [
+            ("GET", "/containers/abc/json"),
+            ("POST", "/containers/abc/kill?signal=9"),
+            ("POST", "/containers/abc/exec"),
+            ("POST", "/exec/e1/start"),
+            ("POST", "/exec/e1/resize?h=24&w=80"),
+            ("GET", "/exec/e1/json"),
+            ("GET", "/images/x/json"),
+            ("DELETE", "/networks/celld"),
+            ("POST", "/networks/create"),
+        ] {
+            assert_eq!(budget(control.0, control.1), Budget::Control, "{control:?}");
+        }
+    }
+
+    /// A daemon that accepts a connection and never answers.
+    fn stuck_daemon(runtime: &tokio::runtime::Handle, socket: &Path) {
+        let _guard = runtime.enter();
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+    }
+
+    #[test]
+    fn a_call_the_daemon_never_answers_fails_and_a_wait_keeps_waiting() {
+        let runtime = runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("stuck.sock");
+        stuck_daemon(&runtime, &socket);
+        let docker = Docker::new(&socket)
+            .with_timeouts(Duration::from_millis(100), Duration::from_millis(100));
+        for (method, path) in [
+            ("GET", "/containers/abc/json"),
+            ("POST", "/containers/create?name=x"),
+            ("DELETE", "/containers/abc?force=true"),
+        ] {
+            let started = std::time::Instant::now();
+            let error = runtime
+                .block_on(docker.call(method, path, None))
+                .err()
+                .unwrap_or_else(|| panic!("{method} {path} answered"));
+            assert!(error.to_string().contains("did not answer"), "{error}");
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+        // A wait is not cut off by the limit that bounds the others.
+        let waited = runtime.block_on(async {
+            crate::asyncrt::timeout(
+                Duration::from_millis(500),
+                docker.call("POST", "/containers/abc/wait", None),
+            )
+            .await
+        });
+        assert!(
+            waited.is_err(),
+            "the wait ended early: {:?}",
+            waited.map(|_| ())
+        );
+    }
 }
