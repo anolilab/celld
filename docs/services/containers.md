@@ -37,7 +37,12 @@ celld implements this part of `ctx.container`:
   in flight, it waits for the container to come up, and it rejects with the
   reason when the start fails or `destroy()` ends it. A container that the
   engine finishes creating after `destroy()` ended its start is removed, and
-  `running` stays `false`.
+  `running` stays `false`; a `monitor()` waiting on that start settles with the
+  exit code 137 of a destroyed container. A start removes only the container it
+  created, by its id, so a newer `start()` that holds the name is not affected.
+  If the engine never answers a create, the node cannot know whether a
+  container will appear later: such a container is removed by the next
+  `start()` of the object, or when the node restarts or shuts down.
 - `setInactivityTimeout()` sets the idle window.
 
 On Linux, `getTcpPort(port)` reaches every port through the bridge address of
@@ -95,9 +100,27 @@ another one. Cloudflare has no `images` key, so `celld` adds it, like `runtime`.
 `exec(cmd, options)` runs a command in the running container and returns a
 process with `stdin`, `stdout`, `stderr`, `exitCode`, `output()`, `kill()`, and
 `pid`. It accepts `env`, `cwd`, `user`, `stdin`, `stdout`, `stderr`, `pty`, and
-`signal`. The
-`pid` is the one the container engine reports, which the engine takes from the
-host, so it does not name the process inside the container.
+`signal`. The `pid` is the one the container engine reports, which the engine
+takes from the host, so it does not name the process inside the container.
+
+`kill(signal)` and `signal` signal the process and every process it started.
+Because the `pid` names nothing in the container, and an image need not have a
+`kill` executable, celld marks each exec with the environment variable
+`CELLD_EXEC`, with a value that is unique to the exec, and delivers a signal by
+a second exec, as the same user, that runs a shell scan of `/proc`. The scan
+signals the processes that carry the marker as an environment entry of their
+own, and every process that descends from one of them, found by the parent in
+`/proc/<pid>/stat`, so a child that cleared its environment is still reached.
+The image needs `sh`, `cat` and `tr`. `CELLD_EXEC` is reserved: an `env` that
+names it makes `exec()` throw.
+
+An exec's processes that the scan cannot tie to it are not signalled: a process
+that cleared its environment and whose parent has already exited, which the
+kernel then reparents, one that a fork created after the scan read `/proc`, and
+one that runs as another user than the exec. To stop those, `destroy()` the
+container, which removes everything in it. A `kill()`, or the close of a stdin
+that no event waits on, still reaches the container when the event that asked
+for it ends.
 
 `pty` runs the command on a pseudo-terminal. `pty: true` is 80 columns by 24
 rows, and `pty: { cols, rows }` sets the size, each an integer from 1 to
@@ -181,6 +204,16 @@ cannot reach the built-in resolver of the engine. The fence permits the public
 resolver. A container on the default runtime keeps the engine resolver unless
 the operator sets `CELLD_CONTAINER_DNS`.
 
+## Engine calls and a failed start
+
+Each single-shot call to the container engine has a time limit, and a call
+that does not answer fails with an error that names it. A call to create,
+start, or remove a container may take 60 seconds, and every other call, such as
+an inspect, a kill, or an exec create, 10 seconds. Waiting for a container to
+exit, loading an image, and the stream of an exec have no limit. A `start()`
+that fails removes the container it created, so the name is free for the next
+start.
+
 ## Sleep, wake, and the node's resources
 
 `setInactivityTimeout()` sets the idle window, and the default is 10 minutes, as
@@ -232,6 +265,11 @@ count against `max_instances`. A start over the cap fails, and the node logs
   awaits the `read()` of `getReader()` or `exitCode`, or reads the stream
   again. A consumer that read through `pipeTo()`, `tee()`, or `Response` keeps
   the limit that its pending read needs the event that started it.
+- `exec()` signals a process by a shell scan of `/proc`, so the image needs `sh`,
+  `cat` and `tr`. The scan reaches the exec's process and its descendants; an
+  orphan that cleared its environment, a fork that races the scan, and a
+  process of another user are not reached. The environment variable
+  `CELLD_EXEC` is reserved, and an `env` that names it throws.
 - On macOS, the node reaches a container through a published port, so the image
   must declare the port with `EXPOSE`. `enableInternet: false` has no effect on
   macOS.

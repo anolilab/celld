@@ -41,17 +41,6 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixListener;
 use tokio::sync::watch;
 
-/// How a signal reaches a process in the fake container.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Kill {
-    /// The daemon as it is: no `kill` executable, and a pid that names
-    /// nothing inside the container. Only a scan of the container's processes
-    /// by the marker in their environment can signal a process.
-    Realistic,
-    /// An image that has `kill`, and a pid that names the process.
-    Binary,
-}
-
 struct Proc {
     pid: i64,
     cmd: Vec<String>,
@@ -64,6 +53,10 @@ struct Proc {
 }
 
 struct Container {
+    /// What `containers/create` answered with: unique per container, so a
+    /// request for the id of a container that was removed finds nothing even
+    /// when a newer container took its name.
+    id: String,
     running: bool,
     exit: watch::Sender<Option<i64>>,
     fence: bool,
@@ -83,6 +76,8 @@ struct State {
     next: i64,
     start_error: Option<String>,
     create_delay: Duration,
+    /// Hold the next removal of a container that exists, for this long.
+    delete_delay: Option<Duration>,
     resize_error: Option<String>,
     resizes: Vec<(String, u64, u64)>,
 }
@@ -91,11 +86,10 @@ pub struct FakeEngine {
     dir: TempDir,
     socket: PathBuf,
     state: Arc<Mutex<State>>,
-    kill: Kill,
 }
 
 impl FakeEngine {
-    pub async fn start(kill: Kill) -> FakeEngine {
+    pub async fn start() -> FakeEngine {
         let dir = TempDir::new().expect("create fake engine directory");
         let socket = dir.path().join("engine.sock");
         let listener = UnixListener::bind(&socket).expect("bind the fake engine socket");
@@ -106,15 +100,10 @@ impl FakeEngine {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                tokio::spawn(serve(stream, served.clone(), kill));
+                tokio::spawn(serve(stream, served.clone()));
             }
         });
-        let engine = FakeEngine {
-            dir,
-            socket,
-            state,
-            kill,
-        };
+        let engine = FakeEngine { dir, socket, state };
         engine.write_cli();
         engine
     }
@@ -218,6 +207,25 @@ esac
         self.state.lock().unwrap().create_delay = delay;
     }
 
+    /// Hold the next removal of an existing container for `delay` before the
+    /// fake acts on it, as a slow daemon does.
+    pub fn delay_next_delete(&self, delay: Duration) {
+        self.state.lock().unwrap().delete_delay = Some(delay);
+    }
+
+    /// The names of the application containers that exist now.
+    pub fn live(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        let mut names: Vec<String> = state
+            .containers
+            .iter()
+            .filter(|(_, container)| !container.fence)
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Make every exec resize fail with `message`.
     pub fn fail_resize(&self, message: &str) {
         self.state.lock().unwrap().resize_error = Some(message.to_string());
@@ -230,10 +238,6 @@ esac
         let mut ids: Vec<&String> = state.execs.keys().collect();
         ids.sort_by_key(|id| id.trim_start_matches("exec-").parse::<i64>().unwrap_or(0));
         state.execs[ids[index]].running
-    }
-
-    pub fn kill_mode(&self) -> Kill {
-        self.kill
     }
 }
 
@@ -309,7 +313,7 @@ enum Action {
     },
 }
 
-async fn serve(stream: tokio::net::UnixStream, state: Arc<Mutex<State>>, kill: Kill) {
+async fn serve(stream: tokio::net::UnixStream, state: Arc<Mutex<State>>) {
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
     let Some(request) = read_request(&mut reader).await else {
@@ -326,7 +330,20 @@ async fn serve(stream: tokio::net::UnixStream, state: Arc<Mutex<State>>, kill: K
             tokio::time::sleep(delay).await;
         }
     }
-    match handle(&state, &request, kill) {
+    if request.method == "DELETE" && request.path.starts_with("/containers/") {
+        let delay = {
+            let mut guard = state.lock().unwrap();
+            let key = request.path.trim_start_matches("/containers/");
+            match container_named(&guard, key) {
+                Some(name) if !guard.containers[&name].fence => guard.delete_delay.take(),
+                _ => None,
+            }
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
+    match handle(&state, &request) {
         Action::Reply(status, body) => reply(&mut write, status, body).await,
         Action::Wait(mut exit) => {
             let code = loop {
@@ -354,7 +371,16 @@ async fn serve(stream: tokio::net::UnixStream, state: Arc<Mutex<State>>, kill: K
     }
 }
 
-fn handle(state: &Arc<Mutex<State>>, request: &Request, kill: Kill) -> Action {
+/// The name of the container `key` names, which is its name or its id.
+fn container_named(guard: &State, key: &str) -> Option<String> {
+    guard
+        .containers
+        .iter()
+        .find(|(name, container)| name.as_str() == key || container.id == key)
+        .map(|(name, _)| name.clone())
+}
+
+fn handle(state: &Arc<Mutex<State>>, request: &Request) -> Action {
     let segments: Vec<&str> = request.path.trim_matches('/').split('/').collect();
     let gone = |what: &str| Action::Reply(404, message(what));
     let mut guard = state.lock().unwrap();
@@ -371,9 +397,12 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request, kill: Kill) -> Action {
                 .unwrap_or("fence")
                 .to_string();
             let fence = request.body["Labels"]["celld.fence"].is_string();
+            guard.next += 1;
+            let id = format!("id-{name}-{}", guard.next);
             guard.containers.insert(
                 name.clone(),
                 Container {
+                    id: id.clone(),
                     running: false,
                     exit: watch::channel(None).0,
                     fence,
@@ -384,10 +413,11 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request, kill: Kill) -> Action {
                 body["_name"] = json!(name);
                 guard.created.push(body);
             }
-            Action::Reply(201, json!({ "Id": format!("id-{name}") }))
+            Action::Reply(201, json!({ "Id": id }))
         }
         ("POST", ["containers", name, "start"]) => {
-            let name = name.trim_start_matches("id-");
+            let name = container_named(&guard, name).unwrap_or_default();
+            let name = name.as_str();
             // The fence's start is the node's, not the test's.
             if !guard.containers.get(name).is_some_and(|c| c.fence) {
                 if let Some(error) = guard.start_error.take() {
@@ -403,7 +433,10 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request, kill: Kill) -> Action {
             }
         }
         ("GET", ["containers", name, "json"]) => {
-            match guard.containers.get(name.trim_start_matches("id-")) {
+            match guard
+                .containers
+                .get(container_named(&guard, name).unwrap_or_default().as_str())
+            {
                 Some(container) => Action::Reply(
                     200,
                     json!({
@@ -418,18 +451,25 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request, kill: Kill) -> Action {
             }
         }
         ("POST", ["containers", name, "wait"]) => {
-            match guard.containers.get(name.trim_start_matches("id-")) {
+            match guard
+                .containers
+                .get(container_named(&guard, name).unwrap_or_default().as_str())
+            {
                 Some(container) if container.fence => Action::Reply(200, json!({"StatusCode": 0})),
                 Some(container) => Action::Wait(container.exit.subscribe()),
                 None => gone("No such container"),
             }
         }
         ("POST", ["containers", name, "kill"]) => {
-            end_container(&guard, name.trim_start_matches("id-"));
+            end_container(
+                &guard,
+                container_named(&guard, name).unwrap_or_default().as_str(),
+            );
             Action::Reply(204, Value::Null)
         }
         ("DELETE", ["containers", name]) => {
-            let name = name.trim_start_matches("id-");
+            let name = container_named(&guard, name).unwrap_or_default();
+            let name = name.as_str();
             let existed = end_container(&guard, name);
             if existed {
                 guard.containers.remove(name);
@@ -439,7 +479,8 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request, kill: Kill) -> Action {
         }
         ("GET", ["containers", _, "logs"]) => Action::Reply(200, json!(null)),
         ("POST", ["containers", name, "exec"]) => {
-            let name = name.trim_start_matches("id-");
+            let name = container_named(&guard, name).unwrap_or_default();
+            let name = name.as_str();
             if !guard.containers.get(name).is_some_and(|c| c.running) {
                 return gone(&format!("No such container: {name}"));
             }
@@ -476,7 +517,7 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request, kill: Kill) -> Action {
         }
         ("POST", ["exec", id, "start"]) => {
             if request.body["Detach"].as_bool().unwrap_or(false) {
-                run_detached(&mut guard, id, kill);
+                run_detached(&mut guard, id);
                 return Action::Reply(200, Value::Null);
             }
             let tty = request.body["Tty"].as_bool().unwrap_or(false);
@@ -547,7 +588,7 @@ fn end_container(guard: &State, name: &str) -> bool {
 
 /// A detached exec: the kills. The fake plays what the daemon would do with
 /// the command; it does not run a shell.
-fn run_detached(guard: &mut State, id: &str, kill: Kill) {
+fn run_detached(guard: &mut State, id: &str) {
     let Some(cmd) = guard.execs.get(id).map(|proc| proc.cmd.clone()) else {
         return;
     };
@@ -561,18 +602,7 @@ fn run_detached(guard: &mut State, id: &str, kill: Kill) {
             .parse::<i64>()
             .ok()
     };
-    if cmd.first().map(String::as_str) == Some("kill") && kill == Kill::Binary {
-        let signal = cmd
-            .get(1)
-            .and_then(|flag| flag.trim_start_matches('-').parse::<i64>().ok())
-            .unwrap_or(15);
-        let pid = cmd.get(2).and_then(|pid| pid.parse::<i64>().ok());
-        for proc in guard.execs.values() {
-            if Some(proc.pid) == pid {
-                proc.signal.send_replace(Some(signal));
-            }
-        }
-    } else if cmd.first().map(String::as_str) == Some("sh") {
+    if cmd.first().map(String::as_str) == Some("sh") {
         if let (Some(marker), Some(signal)) = (
             script.find("CELLD_EXEC=").map(|at| {
                 script[at..]

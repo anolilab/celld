@@ -43,6 +43,29 @@ export class Runner extends DurableObject {
           await new Promise((resolve) => setTimeout(resolve, 1500));
           return { running: container.running };
         });
+      // A monitor() waiting while destroy() ends the start it follows.
+      case "/monitor-destroyed-start":
+        return run(async () => {
+          container.start();
+          const monitored = attempt(() => container.monitor());
+          await container.destroy();
+          const hung = new Promise((resolve) => setTimeout(() => resolve("hung"), 2500));
+          return await Promise.race([monitored, hung]);
+        });
+      // A start that fails, then a second start, in one object.
+      case "/restart-after-failed-start":
+        return run(async () => {
+          container.start();
+          for (let waited = 0; container.running && waited < 2000; waited += 20) {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          const failed = !container.running;
+          container.start();
+          // Long enough for the first start's cleanup, held by the engine, to
+          // reach it.
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          return { failed, running: container.running };
+        });
       // A pty exec of `size`: it prints the terminal size after one line of stdin.
       case "/pty": {
         const pty = JSON.parse(url.searchParams.get("pty") ?? "true");
@@ -212,6 +235,41 @@ export class Runner extends DurableObject {
           const first = decode(await this.pending);
           const second = decode(await fresh);
           return { first, second };
+        });
+      // Signals, kills and stdin closes that the event does not wait for.
+      case "/signal-return":
+        return run(async () => {
+          container.start();
+          const process = await container.exec(["hello"]);
+          await process.exitCode;
+          container.signal(15);
+          return "signaled";
+        });
+      case "/kill-return":
+        return run(async () => {
+          container.start();
+          const process = await container.exec(["hold"]);
+          process.kill(9);
+          return "killed";
+        });
+      // `eof` exits only when its stdin ends, and this exec has no stdin.
+      case "/stdin-none":
+        return run(async () => {
+          container.start();
+          await container.exec(["eof"]);
+          return "spawned";
+        });
+      case "/kill-and-wait":
+        return run(async () => {
+          container.start();
+          const process = await container.exec(["hold"]);
+          process.kill(15);
+          return { exitCode: await process.exitCode };
+        });
+      case "/exec-reserved":
+        return run(async () => {
+          container.start();
+          await container.exec(["hello"], { env: { CELLD_EXEC: "spoofed" } });
         });
       default:
         return new Response("not found", { status: 404 });

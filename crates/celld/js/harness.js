@@ -2701,9 +2701,13 @@ class Container {
       else if (o.stdin instanceof ReadableStream) stdinMode = "stream";
       else throw new TypeError('stdin must be a ReadableStream or the string "pipe".');
     }
+    const env = __containerEnvList(o.env);
+    if (env.some(([name]) => name === "CELLD_EXEC"))
+      throw new Error(
+        "Environment variable name CELLD_EXEC is reserved: celld uses it to find the process.");
     const params = {
       cmd: Array.from(cmd, String),
-      env: __containerEnvList(o.env),
+      env,
       combined,
     };
     if (pty !== null) params.pty = pty;

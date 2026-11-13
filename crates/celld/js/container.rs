@@ -20,6 +20,21 @@ async fn cell_for(scope: &str) -> Result<(Arc<ContainerEngine>, Arc<CellContaine
     Ok((engine, cell))
 }
 
+/// Start `effect` on the host runtime now, apart from the event that asked
+/// for it, and answer with a future of its result.
+///
+/// An op is dropped when its event ends, and an op that has not been polled by
+/// then never runs: a kill or a stdin close asked for in the last turn of a
+/// handler was never delivered. The object does not wait for these
+/// effects, so they are spawned when the op is called, and the op only awaits
+/// the task. The task runs to the end whether or not anything still awaits it.
+fn outlive<T: Send + 'static>(
+    effect: impl std::future::Future<Output = Result<T, String>> + Send + 'static,
+) -> impl std::future::Future<Output = Result<T, String>> + Send {
+    let task = asyncrt::spawn(effect);
+    async move { task.await.map_err(|panic| panic.to_string())? }
+}
+
 fn string_arg(
     scope: &mut v8::PinScope,
     args: &v8::FunctionCallbackArguments,
@@ -287,10 +302,11 @@ pub(super) fn op_container_exec_close(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let process = process_arg(scope, &args);
-    let async_id = asyncrt::enqueue_unrefed(async move {
+    let effect = outlive(async move {
         process?.close_stdin().await;
         Ok::<String, String>(String::new())
     });
+    let async_id = asyncrt::enqueue_unrefed(effect);
     rv.set(promise_for(scope, async_id));
 }
 
@@ -317,13 +333,14 @@ pub(super) fn op_container_exec_kill(
 ) {
     let process = process_arg(scope, &args);
     let signal = number_arg(scope, &args, 1) as u32;
-    let async_id = asyncrt::enqueue_unrefed(async move {
+    let effect = outlive(async move {
         process?
             .kill(signal)
             .await
             .map_err(|error| format!("{error:#}"))?;
         Ok::<String, String>(String::new())
     });
+    let async_id = asyncrt::enqueue_unrefed(effect);
     rv.set(promise_for(scope, async_id));
 }
 
