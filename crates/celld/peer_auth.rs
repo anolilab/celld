@@ -503,38 +503,30 @@ mod tests {
     fn a_stale_timestamp_is_rejected() {
         let auth = node_a();
         let mut headers = signed(&auth, b"payload");
-        let stale = now_ms().unwrap() - 2 * CLOCK_WINDOW_MS;
         let body_hash = sha256_hex(b"payload");
         let nonce = header(&headers, HEADER_NONCE).unwrap().to_string();
-        let signature = auth.signature(&CanonicalRequest {
-            method: "POST",
-            path_and_query: PATH,
-            body_hash: &body_hash,
-            source: "node-a",
-            target: "node-b",
-            timestamp: stale,
-            nonce: &nonce,
-        });
-        headers.insert(HEADER_TIMESTAMP, HeaderValue::from(stale));
-        headers.insert(HEADER_SIGNATURE, HeaderValue::from_str(&signature).unwrap());
+        let mut resign = |timestamp: u64| {
+            let signature = auth.signature(&CanonicalRequest {
+                method: "POST",
+                path_and_query: PATH,
+                body_hash: &body_hash,
+                source: "node-a",
+                target: "node-b",
+                timestamp,
+                nonce: &nonce,
+            });
+            headers.insert(HEADER_TIMESTAMP, HeaderValue::from(timestamp));
+            headers.insert(HEADER_SIGNATURE, HeaderValue::from_str(&signature).unwrap());
+            headers.clone()
+        };
+        let stale = resign(now_ms().unwrap() - 2 * CLOCK_WINDOW_MS);
         assert!(matches!(
-            verify(&auth, &headers, b"payload"),
+            verify(&auth, &stale, b"payload"),
             Err(VerifyError::Unauthorized)
         ));
         // The same request inside the window verifies, so the rejection
         // above came from the clock check.
-        let fresh = now_ms().unwrap();
-        let signature = auth.signature(&CanonicalRequest {
-            method: "POST",
-            path_and_query: PATH,
-            body_hash: &body_hash,
-            source: "node-a",
-            target: "node-b",
-            timestamp: fresh,
-            nonce: &nonce,
-        });
-        headers.insert(HEADER_TIMESTAMP, HeaderValue::from(fresh));
-        headers.insert(HEADER_SIGNATURE, HeaderValue::from_str(&signature).unwrap());
-        verify(&auth, &headers, b"payload").expect("a fresh timestamp verifies");
+        let fresh = resign(now_ms().unwrap());
+        verify(&auth, &fresh, b"payload").expect("a fresh timestamp verifies");
     }
 }
