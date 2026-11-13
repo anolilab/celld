@@ -52,7 +52,8 @@ async fn lost_record_beside_ltx_is_refused_not_reclaimed() {
         "the refusal was not logged"
     );
     // The refusal is held, so a retry inside the hold is refused without
-    // another read of the bucket.
+    // checking the bucket again. Here the record stays missing and the store
+    // answers, so a check that ran would find the loss again and log it.
     assert!(!server.get_status("/agent/kept").await.is_success());
     assert_eq!(
         server
@@ -60,7 +61,7 @@ async fn lost_record_beside_ltx_is_refused_not_reclaimed() {
             .matches("celld ownership record lost")
             .count(),
         1,
-        "a retry inside the hold read the bucket again"
+        "a retry inside the hold checked the bucket again"
     );
     // The store still has no record: nothing was claimed at epoch one.
     let records: i64 = store(server.project())
