@@ -20,6 +20,21 @@ async fn cell_for(scope: &str) -> Result<(Arc<ContainerEngine>, Arc<CellContaine
     Ok((engine, cell))
 }
 
+/// Start `effect` on the host runtime now, apart from the event that asked
+/// for it, and answer with a future of its result.
+///
+/// An op is dropped when its event ends, and an op that has not been polled by
+/// then never runs: a kill or a stdin close asked for in the last turn of a
+/// handler was never delivered. The object does not wait for these
+/// effects, so they are spawned when the op is called, and the op only awaits
+/// the task. The task runs to the end whether or not anything still awaits it.
+fn outlive<T: Send + 'static>(
+    effect: impl std::future::Future<Output = Result<T, String>> + Send + 'static,
+) -> impl std::future::Future<Output = Result<T, String>> + Send {
+    let task = asyncrt::spawn(effect);
+    async move { task.await.map_err(|panic| panic.to_string())? }
+}
+
 fn string_arg(
     scope: &mut v8::PinScope,
     args: &v8::FunctionCallbackArguments,
@@ -88,16 +103,25 @@ pub(super) fn op_container_start(
     };
     // The run opens here, on the calling thread, so the monitor() that
     // follows this call in the same turn waits for this start's exit.
-    let run = container::engine_if_ready()
+    // The guard goes into the future with it: if the future is dropped before
+    // the start settles, the run ends as failed rather than staying pending
+    // for every `exec()` and `monitor()` that waits on it.
+    let opened = container::engine_if_ready()
         .and_then(|engine| engine.cell(&cell))
-        .map(|cell| cell.begin_run());
+        .map(|cell| {
+            let run = cell.begin_run();
+            container::StartGuard::new(cell, run)
+        });
     let async_id = asyncrt::enqueue_io_context(async move {
         let (engine, cell) = cell_for(&cell).await?;
-        let run = run.unwrap_or_else(|| cell.begin_run());
+        let guard = opened.unwrap_or_else(|| {
+            let run = cell.begin_run();
+            container::StartGuard::new(cell.clone(), run)
+        });
         engine
             .start(
                 &cell,
-                run,
+                guard.run(),
                 StartParams {
                     image: request.image,
                     entrypoint: request.entrypoint,
@@ -141,10 +165,15 @@ pub(super) fn op_container_destroy(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = string_arg(scope, &args, 0);
+    // The run is read now, as `monitor()` reads it: a `start()` later in the
+    // same turn opens a newer run that this destroy must not end.
+    let run = container::engine_if_ready()
+        .and_then(|engine| engine.cell(&cell))
+        .map_or(0, |cell| cell.current_run());
     let async_id = asyncrt::enqueue(async move {
         let (engine, cell) = cell_for(&cell).await?;
         engine
-            .destroy(&cell)
+            .destroy(&cell, run)
             .await
             .map_err(|error| format!("{error:#}"))?;
         Ok::<String, String>(String::new())
@@ -287,10 +316,11 @@ pub(super) fn op_container_exec_close(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let process = process_arg(scope, &args);
-    let async_id = asyncrt::enqueue_unrefed(async move {
+    let effect = outlive(async move {
         process?.close_stdin().await;
         Ok::<String, String>(String::new())
     });
+    let async_id = asyncrt::enqueue_unrefed(effect);
     rv.set(promise_for(scope, async_id));
 }
 
@@ -317,13 +347,14 @@ pub(super) fn op_container_exec_kill(
 ) {
     let process = process_arg(scope, &args);
     let signal = number_arg(scope, &args, 1) as u32;
-    let async_id = asyncrt::enqueue_unrefed(async move {
+    let effect = outlive(async move {
         process?
             .kill(signal)
             .await
             .map_err(|error| format!("{error:#}"))?;
         Ok::<String, String>(String::new())
     });
+    let async_id = asyncrt::enqueue_unrefed(effect);
     rv.set(promise_for(scope, async_id));
 }
 
