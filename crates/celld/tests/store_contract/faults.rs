@@ -31,11 +31,11 @@ where
     Fut: Future<Output = ()>,
 {
     let upstream = std::env::var("AWS_ENDPOINT_URL").ok().and_then(|url| {
-        Some(
-            url.strip_prefix("http://")?
-                .trim_end_matches('/')
-                .to_string(),
-        )
+        let url: hyper::Uri = url.parse().ok()?;
+        if url.scheme_str() != Some("http") {
+            return None;
+        }
+        Some(format!("{}:{}", url.host()?, url.port_u16().unwrap_or(80)))
     });
     let Some(upstream) = upstream else {
         let _ = writeln!(
