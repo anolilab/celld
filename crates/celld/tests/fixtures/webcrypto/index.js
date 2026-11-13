@@ -145,6 +145,56 @@ async function agreement(name, vector, params) {
   equal(hex(shared), vector.shared, "shared secret");
 }
 
+
+// A generated pair signs or encrypts and verifies or decrypts with itself,
+// and its JWK, PKCS#8 and SPKI exports import back to a key that does the
+// same.
+async function generated(algorithm, kind) {
+  const pair = await subtle.generateKey(algorithm, true, kind === "oaep" ? ["encrypt", "decrypt"] : ["sign", "verify"]);
+  const use = async (priv, pub) => {
+    if (kind === "oaep") {
+      const sealed = await subtle.encrypt({ name: "RSA-OAEP" }, pub, message);
+      equal(hex(await subtle.decrypt({ name: "RSA-OAEP" }, priv, sealed)), hex(message), "plaintext");
+      return;
+    }
+    const params = algorithm.name === "ECDSA" ? { name: "ECDSA", hash: "SHA-512" } : algorithm.name === "RSA-PSS" ? { name: "RSA-PSS", saltLength: 32 } : algorithm.name;
+    const sig = await subtle.sign(params, priv, message);
+    equal(await subtle.verify(params, pub, sig, message), true, "verifies");
+    equal(await subtle.verify(params, pub, sig, tampered), false, "tampered verifies");
+  };
+  await use(pair.privateKey, pair.publicKey);
+  for (const [format, privFormat] of [["jwk", "jwk"], ["pkcs8", "spki"]]) {
+    const priv = await subtle.importKey(
+      format,
+      await subtle.exportKey(format, pair.privateKey),
+      algorithm,
+      true,
+      [kind === "oaep" ? "decrypt" : "sign"],
+    );
+    const pub = await subtle.importKey(
+      privFormat,
+      await subtle.exportKey(privFormat, pair.publicKey),
+      algorithm,
+      true,
+      [kind === "oaep" ? "encrypt" : "verify"],
+    );
+    await use(priv, pub);
+  }
+}
+
+async function generatedAgreement(algorithm) {
+  const usages = ["deriveBits"];
+  const a = await subtle.generateKey(algorithm, true, usages);
+  const b = await subtle.generateKey(algorithm, true, usages);
+  const length = { "P-256": 256, "P-384": 384, "P-521": 528 }[algorithm.namedCurve] ?? 256;
+  const ab = await subtle.deriveBits({ ...algorithm, public: b.publicKey }, a.privateKey, length);
+  const ba = await subtle.deriveBits({ ...algorithm, public: a.publicKey }, b.privateKey, length);
+  equal(hex(ab), hex(ba), "the two sides agree");
+  const jwk = await subtle.exportKey("jwk", a.privateKey);
+  const again = await subtle.importKey("jwk", jwk, algorithm, true, usages);
+  equal(hex(await subtle.deriveBits({ ...algorithm, public: b.publicKey }, again, length)), hex(ab), "after a JWK round trip");
+}
+
 const checks = {
   ...Object.fromEntries(
     ["SHA-1", "SHA-256", "SHA-384", "SHA-512"].map((hash) => [
@@ -234,6 +284,47 @@ const checks = {
       (error) => error.name,
     );
     equal(outcome, "TypeError", "sign without a hash");
+  },
+  // Keys made by generateKey must work with the same algorithm's other
+  // operations, and survive export and import in every format the runtime
+  // offers, so a change in the random-number or key-encoding layer shows here.
+  ...Object.fromEntries(
+    [
+      ["RSASSA-PKCS1-v1_5", { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, "signature"],
+      ["RSA-PSS", { name: "RSA-PSS", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, "signature"],
+      ["RSA-OAEP", { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, "oaep"],
+      ["ECDSA P-256", { name: "ECDSA", namedCurve: "P-256" }, "signature"],
+      ["ECDSA P-384", { name: "ECDSA", namedCurve: "P-384" }, "signature"],
+      ["ECDSA P-521", { name: "ECDSA", namedCurve: "P-521" }, "signature"],
+      ["Ed25519", { name: "Ed25519" }, "signature"],
+    ].map(([label, algorithm, kind]) => [`generateKey ${label}`, () => generated(algorithm, kind)]),
+  ),
+  ...Object.fromEntries(
+    [
+      ["ECDH P-256", { name: "ECDH", namedCurve: "P-256" }],
+      ["ECDH P-384", { name: "ECDH", namedCurve: "P-384" }],
+      ["ECDH P-521", { name: "ECDH", namedCurve: "P-521" }],
+      ["X25519", { name: "X25519" }],
+    ].map(([label, algorithm]) => [`generateKey ${label}`, () => generatedAgreement(algorithm)]),
+  ),
+  async "generateKey AES-GCM"() {
+    for (const length of [128, 256]) {
+      const key = await subtle.generateKey({ name: "AES-GCM", length }, true, ["encrypt", "decrypt"]);
+      const raw = await subtle.exportKey("raw", key);
+      equal(raw.byteLength * 8, length, "key length");
+      const params = { name: "AES-GCM", iv: iv.slice(0, 12) };
+      const sealed = await subtle.encrypt(params, key, message);
+      equal(hex(await subtle.decrypt(params, key, sealed)), hex(message), "plaintext");
+    }
+    const a = hex(await subtle.exportKey("raw", await subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"])));
+    const b = hex(await subtle.exportKey("raw", await subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"])));
+    equal(a === b, false, "two generated keys are equal");
+  },
+  async "generateKey HMAC"() {
+    const key = await subtle.generateKey({ name: "HMAC", hash: "SHA-256" }, true, ["sign", "verify"]);
+    const mac = await subtle.sign("HMAC", key, message);
+    equal(await subtle.verify("HMAC", key, mac, message), true, "mac verifies");
+    equal(await subtle.verify("HMAC", key, mac, tampered), false, "tampered verifies");
   },
   Ed25519: () => signature("Ed25519", V.Ed25519, {}, true),
   X25519: () => agreement("X25519", V.X25519, {}),
