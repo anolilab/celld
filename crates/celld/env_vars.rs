@@ -294,6 +294,7 @@ pub fn validate() -> anyhow::Result<()> {
 
     crate::operator_token::OperatorToken::from_env()?;
     crate::egress_filter::from_env()?;
+    crate::container::FenceNodeNetns::from_env()?;
 
     positive::<usize>("CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES")?;
 

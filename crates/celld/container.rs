@@ -171,21 +171,223 @@ const BRIDGE_NAME_OPTION: &str = "com.docker.network.bridge.name";
 /// the metadata service live. Rules on the host side of the bridge cover
 /// every runtime, gVisor included, and no process inside a container can
 /// see them, let alone remove them.
-const FENCE_RULES: &str = r#"table inet celld
+///
+/// A node that itself runs in a container has its own network namespace, so
+/// its connections to a container cross the host's forward chain, and the
+/// reply from the container to the node's private address meets the reject
+/// of the private ranges there, not the allowance in the input chain.
+/// [`FenceNodeNetns`] adds the allowance to the forward chain, ahead of the
+/// rejects. Without it the text is the same as ever.
+pub fn fence_rules(netns: &FenceNodeNetns) -> String {
+    let replies = netns.forward_replies();
+    format!(
+        r#"table inet celld
 delete table inet celld
-table inet celld {
-  chain input {
+table inet celld {{
+  chain input {{
     type filter hook input priority -10; policy accept;
-    iifname { "celld0", "celld1" } ct state established,related accept
-    iifname { "celld0", "celld1" } reject
-  }
-  chain forward {
+    iifname {{ "celld0", "celld1" }} ct state established,related accept
+    iifname {{ "celld0", "celld1" }} reject
+  }}
+  chain forward {{
     type filter hook forward priority -10; policy accept;
-    iifname { "celld0", "celld1" } ip daddr { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } reject
-    iifname { "celld0", "celld1" } ip6 daddr { fe80::/10, fc00::/7 } reject
-  }
+{replies}    iifname {{ "celld0", "celld1" }} ip daddr {{ 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 }} reject
+    iifname {{ "celld0", "celld1" }} ip6 daddr {{ fe80::/10, fc00::/7 }} reject
+  }}
+}}
+"#
+    )
 }
-"#;
+
+/// How the fence treats a node that runs inside a container's network
+/// namespace: `CELLD_FENCE_NODE_NETNS` and `CELLD_FENCE_NODE_ADDRS`.
+///
+/// The default is the fence as it has always been. With `auto`, a node that
+/// finds it is in a container (`/.dockerenv` or `/run/.containerenv`), or is
+/// told its addresses, lets the containers reply to the connections the node
+/// opened through the fence, and only to the node's own addresses: the ones
+/// it is given, or else the unicast addresses of its own interfaces. Only a
+/// packet of a connection that is already established, or related to one,
+/// passes; a container still cannot start a connection to the node or to a
+/// private range, and cannot hold a session with any other private peer.
+///
+/// The fence is one table for the whole host, and every node that fences
+/// replaces it. Nodes that share an engine must therefore run the same
+/// setting and pin the same addresses, all of them, in any order: the rules
+/// are a function of the set of addresses.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FenceNodeNetns {
+    /// The addresses replies are admitted to, sorted, without duplicates.
+    /// Empty is the fence as it has always been.
+    addrs: Vec<std::net::IpAddr>,
+}
+
+impl FenceNodeNetns {
+    /// Read the two variables, as the node does at startup.
+    pub fn from_env() -> anyhow::Result<Self> {
+        let read = |name: &str| match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(error) => Err(anyhow!("{name} is not valid text: {error}")),
+        };
+        Self::parse(
+            read("CELLD_FENCE_NODE_NETNS")?.as_deref(),
+            read("CELLD_FENCE_NODE_ADDRS")?.as_deref(),
+            in_container_netns(),
+            node_interface_addrs,
+        )
+    }
+
+    /// The mode and the addresses as written. `in_container` is what the
+    /// node found about itself and `interface_addrs` lists the addresses of
+    /// its own interfaces, passed in so the rule can be tested. The list is
+    /// asked for only when the node must pin its own addresses.
+    pub fn parse(
+        mode: Option<&str>,
+        addrs: Option<&str>,
+        in_container: bool,
+        interface_addrs: impl FnOnce() -> Vec<std::net::IpAddr>,
+    ) -> anyhow::Result<Self> {
+        match mode {
+            None | Some("off") => {
+                anyhow::ensure!(
+                    addrs.is_none(),
+                    "CELLD_FENCE_NODE_ADDRS needs CELLD_FENCE_NODE_NETNS=auto"
+                );
+                Ok(Self::default())
+            }
+            Some("auto") => {
+                let addrs = match addrs {
+                    Some(text) => parse_node_addrs(text)?,
+                    None if in_container => {
+                        let own = own_unicast_addrs(interface_addrs());
+                        anyhow::ensure!(
+                            !own.is_empty(),
+                            "CELLD_FENCE_NODE_NETNS=auto found no address of this node's own to admit replies to; set CELLD_FENCE_NODE_ADDRS to them"
+                        );
+                        own
+                    }
+                    None => Vec::new(),
+                };
+                Ok(Self { addrs })
+            }
+            Some(other) => Err(anyhow!(
+                "CELLD_FENCE_NODE_NETNS must be auto or off, not {other:?}"
+            )),
+        }
+    }
+
+    /// The addresses replies are admitted to; empty when the fence has no
+    /// allowance.
+    pub fn addrs(&self) -> &[std::net::IpAddr] {
+        &self.addrs
+    }
+
+    /// The lines that let the replies to the node through the forward chain,
+    /// or nothing.
+    fn forward_replies(&self) -> String {
+        let bridges = r#"iifname { "celld0", "celld1" }"#;
+        let mut lines = String::new();
+        for (family, v6) in [("ip", false), ("ip6", true)] {
+            let addrs = self
+                .addrs
+                .iter()
+                .filter(|addr| addr.is_ipv6() == v6)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !addrs.is_empty() {
+                lines.push_str(&format!(
+                    "    {bridges} ct state established,related {family} daddr {{ {addrs} }} accept\n"
+                ));
+            }
+        }
+        lines
+    }
+}
+
+/// Whether a reply can be addressed to `addr`: not loopback, not unspecified,
+/// not multicast, not the IPv4 broadcast address, and not link-local, which
+/// the fence rejects whatever the allowance says.
+fn is_node_unicast(addr: &std::net::IpAddr) -> bool {
+    // `::ffff:224.0.0.1` is the IPv4 address, whatever the IPv6 predicates say.
+    let addr = &addr.to_canonical();
+    let link_local = match addr {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
+    };
+    let broadcast = matches!(addr, std::net::IpAddr::V4(v4) if v4.is_broadcast());
+    !addr.is_loopback()
+        && !addr.is_unspecified()
+        && !addr.is_multicast()
+        && !broadcast
+        && !link_local
+}
+
+/// What of a list of interface addresses a reply can be addressed to; see
+/// [`is_node_unicast`]. Sorted, without duplicates.
+fn own_unicast_addrs(addrs: Vec<std::net::IpAddr>) -> Vec<std::net::IpAddr> {
+    let mut own: Vec<std::net::IpAddr> = addrs.into_iter().filter(is_node_unicast).collect();
+    own.sort();
+    own.dedup();
+    own
+}
+
+/// The addresses of this process's own network interfaces.
+fn node_interface_addrs() -> Vec<std::net::IpAddr> {
+    let Ok(interfaces) = nix::ifaddrs::getifaddrs() else {
+        return Vec::new();
+    };
+    interfaces
+        .filter_map(|interface| {
+            let address = interface.address?;
+            match (address.as_sockaddr_in(), address.as_sockaddr_in6()) {
+                (Some(v4), _) => Some(std::net::IpAddr::V4(v4.ip())),
+                (_, Some(v6)) => Some(std::net::IpAddr::V6(v6.ip())),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The node's own addresses as an operator pins them: a comma-separated list
+/// of IP addresses, nothing else, because they are written into a ruleset
+/// that a privileged container loads. Sorted, without duplicates, so nodes
+/// that share an engine render the same rules whatever order they list them in.
+fn parse_node_addrs(text: &str) -> anyhow::Result<Vec<std::net::IpAddr>> {
+    let mut addrs = Vec::new();
+    for part in text.split(',') {
+        let part = part.trim();
+        let addr: std::net::IpAddr = part.parse().map_err(|_| {
+            anyhow!("CELLD_FENCE_NODE_ADDRS names {part:?}, which is not an IP address")
+        })?;
+        anyhow::ensure!(
+            is_node_unicast(&addr),
+            "CELLD_FENCE_NODE_ADDRS names {part:?}, which is not a unicast address of a node: \
+             loopback, link-local, unspecified, multicast and broadcast addresses never are"
+        );
+        addrs.push(addr.to_canonical());
+    }
+    addrs.sort();
+    addrs.dedup();
+    Ok(addrs)
+}
+
+/// Whether this process runs in a container, by the marker files Docker and
+/// Podman leave in the container's root. A node in a Kubernetes pod or
+/// another runtime has neither and sets `CELLD_FENCE_NODE_ADDRS`. The marker
+/// does not say the container has a network namespace of its own: a node run
+/// with `--network host` has the markers too, and then the addresses it pins
+/// are the host's own, which no packet to is ever forwarded, so the allowance
+/// it gets there matches nothing.
+// A look at the process's own root, not node storage, and startup validation
+// reads it before the execution domain exists.
+#[allow(clippy::disallowed_methods)]
+fn in_container_netns() -> bool {
+    ["/.dockerenv", "/run/.containerenv"]
+        .iter()
+        .any(|marker| std::path::Path::new(marker).exists())
+}
 
 /// Docker's bridge option that forbids traffic between two containers on
 /// the same bridge. The node still reaches every container, because it
@@ -494,6 +696,8 @@ pub struct ContainerEngine {
     docker: Docker,
     node: String,
     bucket: Option<crate::bucket::Bucket>,
+    /// See `Config::fence_netns`.
+    fence_netns: FenceNodeNetns,
     /// Per-image load lock, so two cells of one class starting together
     /// load the tar once.
     images: Mutex<HashMap<String, Arc<tokio::sync::Mutex<bool>>>>,
@@ -521,6 +725,9 @@ struct Config {
     /// celld sees it; a self-hosted node runs celld as a host process, and
     /// the lab mounts the directory one-to-one.
     data_dir: PathBuf,
+    /// `CELLD_FENCE_NODE_NETNS` and `CELLD_FENCE_NODE_ADDRS`: how the fence
+    /// treats a node that runs in a container's network namespace.
+    fence_netns: FenceNodeNetns,
 }
 
 /// The exit code a destroyed container reports: 128 plus SIGKILL.
@@ -546,12 +753,30 @@ pub fn configure(node: String, bucket: Option<crate::bucket::Bucket>, data_dir: 
         .map(|resolver| resolver.trim().to_string())
         .filter(|resolver| !resolver.is_empty())
         .collect();
+    // The node validated both variables at startup. A value that is bad
+    // anyway gives the fence as it has always been, which is the stricter one.
+    let fence_netns = FenceNodeNetns::from_env().unwrap_or_else(|error| {
+        tracing::error!(error = %format!("{error:#}"), "the fence keeps its default rules");
+        FenceNodeNetns::default()
+    });
+    if !fence_netns.addrs().is_empty() {
+        tracing::info!(
+            addrs = %fence_netns
+                .addrs()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            "the fence admits replies of containers to these addresses of the node"
+        );
+    }
     *CONFIG.write().unwrap() = Some(Config {
         node,
         bucket,
         runtime,
         dns,
         data_dir,
+        fence_netns,
     });
 }
 
@@ -574,7 +799,7 @@ pub fn spec(class: &str) -> Option<Arc<ContainerSpec>> {
 pub async fn engine() -> anyhow::Result<Arc<ContainerEngine>> {
     ENGINE
         .get_or_try_init(|| async {
-            let (node, bucket, runtime, dns, data_dir) = {
+            let (node, bucket, runtime, dns, data_dir, fence_netns) = {
                 let config = CONFIG.read().unwrap();
                 let config = config.as_ref().ok_or_else(|| {
                     anyhow!("the container engine is not configured on this node")
@@ -585,6 +810,7 @@ pub async fn engine() -> anyhow::Result<Arc<ContainerEngine>> {
                     config.runtime.clone(),
                     config.dns.clone(),
                     config.data_dir.clone(),
+                    config.fence_netns.clone(),
                 )
             };
             let docker = Docker::discover().ok_or_else(|| {
@@ -594,7 +820,8 @@ pub async fn engine() -> anyhow::Result<Arc<ContainerEngine>> {
                 )
             })?;
             Ok(Arc::new(
-                ContainerEngine::connect(docker, node, bucket, runtime, dns, data_dir).await?,
+                ContainerEngine::connect(docker, node, bucket, runtime, dns, data_dir, fence_netns)
+                    .await?,
             ))
         })
         .await
@@ -682,6 +909,7 @@ impl ContainerEngine {
         runtime: Option<String>,
         dns: Vec<String>,
         data_dir: PathBuf,
+        fence_netns: FenceNodeNetns,
     ) -> anyhow::Result<Self> {
         // Write the resolv.conf once, to bind into every container that runs
         // under a non-default runtime. gVisor cannot reach Docker's embedded
@@ -717,6 +945,7 @@ impl ContainerEngine {
             docker,
             node,
             bucket,
+            fence_netns,
             runtime,
             dns,
             resolv_conf,
@@ -908,7 +1137,7 @@ impl ContainerEngine {
         self.networks().await?;
         let body = json!({
             "Image": image,
-            "Env": [format!("CELLD_NFT={FENCE_RULES}")],
+            "Env": [format!("CELLD_NFT={}", fence_rules(&self.fence_netns))],
             "Cmd": ["sh", "-c", "printf '%s' \"$CELLD_NFT\" | nft -f -"],
             "Labels": { "celld.node": self.node, "celld.fence": "1" },
             "HostConfig": { "NetworkMode": "host", "CapAdd": ["NET_ADMIN"] },
@@ -2547,5 +2776,192 @@ mod run_tests {
         assert_eq!(exit_of(&cell), Some((second, Ok(0))));
         cell.publish_exit(second, Ok(3));
         assert_eq!(exit_of(&cell), Some((second, Ok(3))));
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+
+    /// The rules as they were before the node's network namespace was a
+    /// setting. `off` must render these bytes.
+    const LEGACY: &str = r#"table inet celld
+delete table inet celld
+table inet celld {
+  chain input {
+    type filter hook input priority -10; policy accept;
+    iifname { "celld0", "celld1" } ct state established,related accept
+    iifname { "celld0", "celld1" } reject
+  }
+  chain forward {
+    type filter hook forward priority -10; policy accept;
+    iifname { "celld0", "celld1" } ip daddr { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } reject
+    iifname { "celld0", "celld1" } ip6 daddr { fe80::/10, fc00::/7 } reject
+  }
+}
+"#;
+
+    /// The addresses of the node's own interfaces in these tests: loopback,
+    /// a bridge address and a link-local one, which never count.
+    fn interfaces() -> Vec<std::net::IpAddr> {
+        [
+            "127.0.0.1",
+            "172.17.0.2",
+            "fe80::1",
+            "::1",
+            "fd00::2",
+            "172.17.0.2",
+        ]
+        .iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect()
+    }
+
+    fn parse(mode: Option<&str>, addrs: Option<&str>, in_container: bool) -> FenceNodeNetns {
+        FenceNodeNetns::parse(mode, addrs, in_container, interfaces).unwrap()
+    }
+
+    #[test]
+    fn off_and_unset_render_the_rules_as_they_were() {
+        for in_container in [false, true] {
+            assert_eq!(fence_rules(&parse(None, None, in_container)), LEGACY);
+            assert_eq!(fence_rules(&parse(Some("off"), None, in_container)), LEGACY);
+        }
+        assert_eq!(fence_rules(&FenceNodeNetns::default()), LEGACY);
+    }
+
+    #[test]
+    fn auto_outside_a_container_is_off() {
+        assert_eq!(fence_rules(&parse(Some("auto"), None, false)), LEGACY);
+    }
+
+    #[test]
+    fn auto_in_a_container_admits_replies_to_the_nodes_own_addresses_only() {
+        let rules = fence_rules(&parse(Some("auto"), None, true));
+        let added = concat!(
+            r#"    iifname { "celld0", "celld1" } ct state established,related ip daddr { 172.17.0.2 } accept"#,
+            "\n",
+            r#"    iifname { "celld0", "celld1" } ct state established,related ip6 daddr { fd00::2 } accept"#,
+        );
+        let first_reject = r#"    iifname { "celld0", "celld1" } ip daddr { 169"#;
+        let expected = LEGACY.replacen(first_reject, &format!("{added}\n{first_reject}"), 1);
+        // The added lines are the first of the forward chain, ahead of the
+        // rejects, and nothing else differs from the rules as they were. No
+        // line admits an established connection to a destination of its own
+        // choosing.
+        assert_eq!(rules, expected);
+        let forward = rules.split("chain forward").nth(1).unwrap();
+        assert!(!forward.contains("related accept"), "{rules}");
+    }
+
+    #[test]
+    fn a_node_in_a_container_that_finds_no_address_of_its_own_is_refused() {
+        for found in [
+            vec![],
+            vec!["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()],
+            vec!["fe80::1".parse().unwrap(), "169.254.3.4".parse().unwrap()],
+            vec!["0.0.0.0".parse().unwrap(), "224.0.0.1".parse().unwrap()],
+        ] {
+            let error = FenceNodeNetns::parse(Some("auto"), None, true, || found.clone())
+                .expect_err("the node pinned nothing");
+            assert!(
+                error.to_string().contains("CELLD_FENCE_NODE_ADDRS"),
+                "{error}"
+            );
+            assert!(
+                !error.to_string().contains("  "),
+                "a run of spaces in {error}"
+            );
+        }
+        // Pinned, the node need not find any, and is not asked to.
+        let pinned = FenceNodeNetns::parse(Some("auto"), Some("172.17.0.2"), true, || {
+            panic!("the interfaces were listed for a node that pinned its addresses")
+        });
+        assert!(pinned.is_ok());
+    }
+
+    #[test]
+    fn pinned_addresses_limit_the_allowance_to_them_by_family() {
+        let rules = fence_rules(&parse(
+            Some("auto"),
+            Some("172.17.0.2, fd00::2,172.17.0.3,172.17.0.2"),
+            false,
+        ));
+        let forward = rules.split("chain forward").nth(1).unwrap();
+        assert!(
+            forward.contains(
+                r#"iifname { "celld0", "celld1" } ct state established,related ip daddr { 172.17.0.2, 172.17.0.3 } accept"#
+            ),
+            "{rules}"
+        );
+        assert!(
+            forward.contains(
+                r#"iifname { "celld0", "celld1" } ct state established,related ip6 daddr { fd00::2 } accept"#
+            ),
+            "{rules}"
+        );
+        // Pinned, the allowance is not the unrestricted one.
+        assert!(!forward.contains("related accept"), "{rules}");
+    }
+
+    // Every node that fences replaces the one table of the host, so nodes that
+    // share an engine and pin the same addresses must install the same bytes,
+    // whatever order they list them in.
+    #[test]
+    fn nodes_pinning_the_same_addresses_render_the_same_rules() {
+        let rules = |addrs| fence_rules(&parse(Some("auto"), Some(addrs), false));
+        let one = rules("172.17.0.3,fd00::3,172.17.0.2");
+        assert_eq!(one, rules("fd00::3, 172.17.0.2 ,172.17.0.3,172.17.0.3"));
+        assert_ne!(one, rules("172.17.0.2,172.17.0.3"));
+    }
+
+    #[test]
+    fn the_interfaces_of_this_machine_are_listed() {
+        // Every machine that runs the tests has a loopback interface.
+        assert!(
+            node_interface_addrs().contains(&"127.0.0.1".parse().unwrap()),
+            "{:?}",
+            node_interface_addrs()
+        );
+    }
+
+    #[test]
+    fn a_bad_setting_is_refused() {
+        for (mode, addrs) in [
+            (Some("on"), None),
+            (Some(""), None),
+            (Some("AUTO"), None),
+            (Some("off"), Some("172.17.0.2")),
+            (None, Some("172.17.0.2")),
+            (Some("auto"), Some("")),
+            (Some("auto"), Some("not-an-ip")),
+            (Some("auto"), Some("172.17.0.2,")),
+            (Some("auto"), Some("0.0.0.0")),
+            (Some("auto"), Some("224.0.0.1")),
+            (Some("auto"), Some("::")),
+            (Some("auto"), Some("ff02::1")),
+            // A reply is never addressed to these, and a link-local one would
+            // be accepted ahead of the rule that rejects its range.
+            (Some("auto"), Some("127.0.0.1")),
+            (Some("auto"), Some("::1")),
+            (Some("auto"), Some("169.254.169.254")),
+            (Some("auto"), Some("fe80::1")),
+            (Some("auto"), Some("255.255.255.255")),
+            (Some("auto"), Some("::ffff:224.0.0.1")),
+            (Some("auto"), Some("::ffff:0.0.0.0")),
+            (Some("auto"), Some("::ffff:127.0.0.1")),
+            (Some("auto"), Some("::ffff:169.254.0.5")),
+            (Some("auto"), Some("172.17.0.2,169.254.0.5")),
+            // The addresses are written into a ruleset a privileged
+            // container loads, so anything but an address is refused.
+            (Some("auto"), Some("10.0.0.1 } accept; flush ruleset; {")),
+            (Some("auto"), Some("10.0.0.1/8")),
+            (Some("auto"), Some("fe80::1%eth0")),
+        ] {
+            assert!(
+                FenceNodeNetns::parse(mode, addrs, true, interfaces).is_err(),
+                "{mode:?} {addrs:?}"
+            );
+        }
     }
 }

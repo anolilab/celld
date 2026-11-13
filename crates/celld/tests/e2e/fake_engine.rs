@@ -68,6 +68,8 @@ struct State {
     /// Bodies of every `containers/create`, the fence's excluded, with the
     /// requested name under `_name`.
     created: Vec<Value>,
+    /// The same for the fence container.
+    fence_created: Vec<Value>,
     requests: Vec<String>,
     removed: Vec<String>,
     execs: HashMap<String, Proc>,
@@ -172,6 +174,17 @@ esac
     /// The `containers/create` bodies of the application containers.
     pub fn created(&self) -> Vec<Value> {
         self.state.lock().unwrap().created.clone()
+    }
+
+    /// The nftables rules the node gave its fence container.
+    pub fn fence_rules(&self) -> Option<String> {
+        let state = self.state.lock().unwrap();
+        let fence = state.fence_created.last()?;
+        fence["Env"]
+            .as_array()?
+            .iter()
+            .find_map(|entry| entry.as_str()?.strip_prefix("CELLD_NFT="))
+            .map(str::to_string)
     }
 
     /// Every request the node made, as `METHOD path`.
@@ -417,9 +430,11 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request) -> Action {
                     fence,
                 },
             );
-            if !fence {
-                let mut body = request.body.clone();
-                body["_name"] = json!(name);
+            let mut body = request.body.clone();
+            body["_name"] = json!(name);
+            if fence {
+                guard.fence_created.push(body);
+            } else {
                 guard.created.push(body);
             }
             Action::Reply(201, json!({ "Id": id }))
