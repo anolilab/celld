@@ -977,14 +977,6 @@ fn percell_coverage(handle: &Cell) -> u64 {
     )
 }
 
-/// The position an eviction's confirm asks the bucket for, and the file the
-/// newest upload wrote when that file ends there.
-fn confirm_position(handle: &Cell) -> (u64, Option<(u64, u64)>) {
-    let position = percell_coverage(handle);
-    let newest = (*handle.last_percell_file.lock().unwrap()).filter(|(_, max)| *max == position);
-    (position, newest)
-}
-
 /// Credit an upload that the per-cell prefix holds through `txid`. A per-cell
 /// object is also bucket coverage, so both watermarks move together. Per-cell
 /// coverage is published first: a concurrent stop reads the bucket credit
@@ -2245,7 +2237,7 @@ impl LtxRepl {
     ///
     /// `newest` is the level-0 file the caller last wrote, which answers with
     /// one HEAD when `txid` is its end.
-    pub async fn epoch_covers(
+    async fn epoch_covers(
         &self,
         cell: &str,
         epoch: u64,
@@ -2257,13 +2249,20 @@ impl LtxRepl {
         matches!(client.covers_txid(TXID(txid), newest).await, Ok(true))
     }
 
-    /// Whether the full snapshot this pass just published is listed. The
-    /// transaction alone would pass on an L0 object that holds it, and a
-    /// handoff that took its snapshot has told the successor to restore that
-    /// image.
-    async fn snapshot_visible(&self, cell: &str, epoch: u64, txid: u64) -> bool {
-        let client = self.client_for(cell, epoch);
-        matches!(client.has_snapshot_through(TXID(txid)).await, Ok(true))
+    /// Whether the bucket holds the position this closed cell's per-cell
+    /// watermark stands at, asking for the newest file the node wrote first.
+    /// Fails with the refusal an eviction returns.
+    async fn confirm_closed(&self, cell: &str, epoch: u64, handle: &Cell) -> anyhow::Result<()> {
+        let position = percell_coverage(handle);
+        let newest =
+            (*handle.last_percell_file.lock().unwrap()).filter(|(_, max)| *max == position);
+        if self.epoch_covers(cell, epoch, position, newest).await {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "no replica objects through txid {position} for {cell} epoch {epoch}; \
+             refusing to evict state the bucket cannot restore"
+        ))
     }
 
     /// Put the database a same-epoch wake continues at its live path.
@@ -2378,7 +2377,7 @@ impl LtxRepl {
         let client = self.client_for(cell, epoch);
         let mut attempt = 1;
         let files = loop {
-            match client.ltx_files(replica::SNAPSHOT_LEVEL, TXID(0)).await {
+            match client.full_snapshots().await {
                 Ok(files) => break files,
                 Err(error) if attempt < SNAPSHOT_CUT_ATTEMPTS => {
                     warn!(cell, epoch, attempt, %error, "listing the snapshots of a reopened epoch failed; retrying");
@@ -2392,11 +2391,7 @@ impl LtxRepl {
                 }
             }
         };
-        Ok(files
-            .iter()
-            .filter(|file| file.min_txid == TXID(1))
-            .map(|file| file.max_txid.0)
-            .collect())
+        Ok(files.iter().map(|file| file.max_txid.0).collect())
     }
 
     pub async fn activate(
@@ -3145,18 +3140,14 @@ impl LtxRepl {
         if revocable && matches!(proof, celld_logic::ProofSource::Bucket) {
             // The per-cell watermark, not `durable_txid`: a bundle flush
             // credits that one without writing anything under this prefix.
-            let (position, newest) = self
+            let handle = self
                 .cells
                 .lock()
                 .unwrap()
                 .get(&(cell.to_string(), epoch))
-                .map_or((0, None), |handle| confirm_position(handle));
-            if !self.epoch_covers(cell, epoch, position, newest).await {
-                return Err(anyhow!(
-                    "no replica objects through txid {position} for {cell} epoch {epoch}; \
-                     refusing to evict state the bucket cannot restore"
-                ));
-            }
+                .cloned()
+                .ok_or_else(|| anyhow!("ltx cell not resident: {cell} epoch {epoch}"))?;
+            self.confirm_closed(cell, epoch, &handle).await?;
         }
         Ok(())
     }
@@ -3463,10 +3454,16 @@ impl LtxRepl {
                 self.publish_handoff_snapshot(cell, epoch, &snapshot),
             )
             .await;
+            // The snapshot itself must be listed: a handoff that took it has
+            // told the successor to restore that image, and the transaction
+            // alone would pass on an L0 object that holds it.
             if matches!(published, Ok(Ok(())))
-                && self
-                    .snapshot_visible(cell, epoch, snapshot.max_txid.0)
-                    .await
+                && matches!(
+                    self.client_for(cell, epoch)
+                        .has_snapshot_through(TXID(snapshot.max_txid.0))
+                        .await,
+                    Ok(true)
+                )
             {
                 // The snapshot is a per-cell object through its txid, so it
                 // covers every fleet-acked row of this closed database. No
@@ -3502,12 +3499,7 @@ impl LtxRepl {
                 {
                     return Err(anyhow!("final durability failed for {cell} epoch {epoch}"));
                 }
-                let (position, newest) = confirm_position(&handle);
-                if !self.epoch_covers(cell, epoch, position, newest).await {
-                    return Err(anyhow!(
-                        "no replica objects through txid {position} for {cell} epoch {epoch}; refusing to evict state the bucket cannot restore"
-                    ));
-                }
+                self.confirm_closed(cell, epoch, &handle).await?;
                 EvictionRestoreArtifact::L0Chain
             }
         };

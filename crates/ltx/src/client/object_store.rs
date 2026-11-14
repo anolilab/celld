@@ -766,15 +766,20 @@ impl ObjectStoreClient {
         Ok(false)
     }
 
-    /// Whether the epoch holds a full snapshot through `txid`: an object at
-    /// the snapshot level that starts at transaction 1 and ends at or above it.
-    pub async fn has_snapshot_through(&self, txid: TXID) -> Result<bool> {
-        let files = self
+    /// The epoch's full snapshots, oldest first: the objects at the snapshot
+    /// level that start at transaction 1.
+    pub async fn full_snapshots(&self) -> Result<Vec<FileInfo>> {
+        let mut files = self
             .ltx_files(crate::compaction_level::SNAPSHOT_LEVEL, TXID(0))
             .await?;
-        Ok(files
-            .iter()
-            .any(|file| file.min_txid == TXID(1) && file.max_txid >= txid))
+        files.retain(|file| file.min_txid == TXID(1));
+        Ok(files)
+    }
+
+    /// Whether the epoch holds a full snapshot through `txid`.
+    pub async fn has_snapshot_through(&self, txid: TXID) -> Result<bool> {
+        let snapshots = self.full_snapshots().await?;
+        Ok(snapshots.iter().any(|file| file.max_txid >= txid))
     }
 
     /// Build the S3 key for an LTX file: `{path}/{level:04x}/{min}-{max}.ltx`.
