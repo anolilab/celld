@@ -34,7 +34,10 @@ every pull request:
   holds its name, so a test can tell a call that reached the wrong run.
   They need no daemon, no image and no privileged fence container, and they
   cover the `ctx.container` surface and the engine calls behind it, not the
-  kernel boundary.
+  kernel boundary. The unit tests of `container.rs` run the node's engine
+  against the same fake in process, with the engine's call limits cut to a few
+  hundred milliseconds, to cover a create that the engine does not answer in
+  time and the removals the node retries.
 - **Unit tests** in the crates, such as the input gate's admission decisions in
   `celld-logic` and the known-answer tests of node-to-node authentication.
 - **The object-store contract** (`crates/celld/tests/store_contract.rs`)

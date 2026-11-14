@@ -111,9 +111,10 @@ impl Docker {
     }
 
     /// The same daemon with other limits, for a test that cannot wait for
-    /// the real ones.
+    /// the real ones: the seam that lets a test see a create the daemon never
+    /// answers in time.
     #[cfg(test)]
-    fn with_timeouts(mut self, control: Duration, lifecycle: Duration) -> Self {
+    pub(crate) fn with_timeouts(mut self, control: Duration, lifecycle: Duration) -> Self {
         self.control = control;
         self.lifecycle = lifecycle;
         self
@@ -144,6 +145,11 @@ impl Docker {
             .flatten()
             .find(|path| std::os::unix::net::UnixStream::connect(path).is_ok())
             .map(Self::new)
+    }
+
+    /// How long a call that creates, starts or removes a container may take.
+    pub fn lifecycle_timeout(&self) -> Duration {
+        self.lifecycle
     }
 
     pub fn socket(&self) -> &Path {

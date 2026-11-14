@@ -322,6 +322,22 @@ esac
         self.state.lock().unwrap().inspect_delay = Some(delay);
     }
 
+    /// Remove every application container without the node asking, as an
+    /// operator or a crashed daemon does.
+    pub fn vanish(&self) {
+        let mut state = self.state.lock().unwrap();
+        let ids: Vec<String> = state
+            .containers
+            .iter()
+            .filter(|(_, container)| !container.fence)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            end_container(&state, &id);
+            state.containers.remove(&id);
+        }
+    }
+
     /// Hold the next `containers/{x}/exec` for `delay` before it resolves the
     /// container it names, as a daemon that is slow to take the request does.
     pub fn delay_next_exec_create(&self, delay: Duration) {
@@ -701,9 +717,16 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request) -> Action {
         ("POST", ["containers", key, "exec"]) => {
             let container = container_named(&guard, key);
             guard.exec_targets.push(container.clone());
-            let Some(container) = container.filter(|id| guard.containers[id].running) else {
+            let Some(container) = container else {
                 return gone(&format!("No such container: {key}"));
             };
+            // As the daemon refuses an exec in a container that is not running.
+            if !guard.containers[&container].running {
+                return Action::Reply(
+                    409,
+                    message(&format!("Container {container} is not running")),
+                );
+            }
             guard.next += 1;
             let id = format!("exec-{}", guard.next);
             let words = |key: &str| -> Vec<String> {

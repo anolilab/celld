@@ -48,9 +48,11 @@ celld implements this part of `ctx.container`:
   `running` stays `false`; a `monitor()` waiting on that start settles with the
   exit code 137 of a destroyed container. A start removes only the container it
   created, by its id, so a newer `start()` that holds the name is not affected.
-  If the engine never answers a create, the node cannot know whether a
-  container will appear later: such a container is removed by the next
-  `start()` of the object, or when the node restarts or shuts down.
+  If the engine never answers a create, the node cannot know the id of the
+  container that the engine may have made: the create carries a label that
+  belongs to that one `start()`, and the node removes the container that has
+  it, as described under
+  [Engine calls and a failed start](#engine-calls-and-a-failed-start).
   The name of the container belongs to the object and every `start()` reuses
   it, so a call never addresses the container by it. The node keeps the id
   that the engine gave each run's container, and `exec()`, `signal()` and
@@ -264,6 +266,20 @@ an inspect, a kill, or an exec create, 10 seconds. Waiting for a container to
 exit, loading an image, and the stream of an exec have no limit. A `start()`
 that fails removes the container it created, so the name is free for the next
 start.
+
+Two things can leave a container behind: a removal that the engine refused or
+did not answer when the object's stop destroyed its container, and a `start()`
+that stopped after the engine had made the container, because the call timed
+out or its event ended before the engine's answer arrived. The node keeps the
+removal, by the container's id when it has one, and otherwise by a label that
+the create carried for that one `start()`, so no other container can match it.
+It tries again in the background, after 1 second and then after twice the
+previous wait up to 60 seconds, and gives up after 12 failed tries. The next
+`start()` of the same object finishes it first, and the node's reap at startup
+and shutdown removes every container of the node. A retry by label looks
+again until twice the limit of a create has passed, because the engine may not
+have handled the create yet; it never removes a container of a later
+`start()`.
 
 ## Sleep, wake, and the node's resources
 

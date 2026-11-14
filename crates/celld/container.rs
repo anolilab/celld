@@ -458,6 +458,13 @@ struct CellState {
     /// Bumped by every `attach`, so a stop that began before an activation
     /// came back can tell that the cell is wanted again.
     attached: u64,
+    /// The runs whose start has begun to create a container that no run
+    /// owns yet, each with the label value (`celld.run`) the create carries.
+    /// The container exists from the moment the engine handles the create,
+    /// before its answer reaches the node, so a start that stops there knows
+    /// the label and not the id. It is cleared when the start takes the
+    /// container for its run, or the engine answers that it created none.
+    starting: BTreeMap<u64, String>,
 }
 
 impl Address {
@@ -512,6 +519,8 @@ pub struct CellContainer {
     /// `exec()` that follows it in the same turn would otherwise reach the
     /// daemon first and be answered with a 404.
     started: watch::Sender<(u64, Started)>,
+    /// Containers the node still has to remove; the engine's.
+    removals: Arc<Removals>,
 }
 
 impl CellContainer {
@@ -641,6 +650,7 @@ impl CellContainer {
         if state.run != run || !self.settle_start(run, Started::Ready) {
             return false;
         }
+        state.starting.remove(&run);
         state.running = true;
         state.address = address;
         true
@@ -654,15 +664,51 @@ impl CellContainer {
     fn abandon_start(&self, run: u64) {
         let mut state = self.state.lock().unwrap();
         let reason = "the start was abandoned before it finished";
-        if !self.settle_start(run, Started::Failed(reason.to_string())) {
-            return;
-        }
-        if state.run == run {
+        // A container the engine created, or may have, that the run never took
+        // for its own, whether or not `destroy()` already ended the run. The
+        // future that drove the start is gone, so what is left to do is only
+        // noted here, and the engine's worker removes it.
+        let unclaimed = state.starting.remove(&run).map(|token| {
+            let id = state.containers.remove(&run);
+            (token, id)
+        });
+        let settled = self.settle_start(run, Started::Failed(reason.to_string()));
+        if settled && state.run == run {
             state.running = false;
             state.address = Address::None;
         }
         drop(state);
-        self.publish_exit(run, Err(reason.to_string()));
+        if let Some((token, id)) = unclaimed {
+            match id {
+                Some(id) => self.removals.add(&self.name, Target::Id(id)),
+                None => self.removals.add(&self.name, Target::Label(token)),
+            }
+        }
+        if settled {
+            self.publish_exit(run, Err(reason.to_string()));
+        }
+    }
+
+    /// Note that `run`'s create carries `token` and may have made a container.
+    fn begin_create(&self, run: u64, token: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .starting
+            .insert(run, token.to_string());
+    }
+
+    /// The engine answered that it made no container for `run`.
+    fn end_create(&self, run: u64) {
+        self.state.lock().unwrap().starting.remove(&run);
+    }
+
+    /// Take what `run`'s start left unclaimed: the label its create carried,
+    /// if it was not cleared, and the id the engine answered, if it did.
+    fn take_unclaimed(&self, run: u64) -> Option<(String, Option<String>)> {
+        let mut state = self.state.lock().unwrap();
+        let token = state.starting.remove(&run)?;
+        Some((token, state.containers.remove(&run)))
     }
 
     /// Wait until `run`'s start has settled. `Ok` when the container is up;
@@ -787,6 +833,264 @@ impl Drop for StartGuard {
     }
 }
 
+/// What a container left behind is found by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Target {
+    /// The engine's id of it.
+    Id(String),
+    /// The `celld.run` label of the one run that created it, which no other
+    /// container carries. For a create whose answer never reached the node.
+    Label(String),
+}
+
+/// A container the node has to remove and did not manage to: a `destroy()`
+/// the engine refused or did not answer, or a start that ended with the
+/// engine's answer to its create unseen.
+struct Leftover {
+    /// The cell's container name, so that the next start of that cell can
+    /// finish the removal. Empty for one that belongs to no cell.
+    name: String,
+    target: Target,
+    /// `None` until the worker first sees it: noting one is synchronous and
+    /// may happen where there is no clock.
+    born_ms: Option<u64>,
+    due_ms: u64,
+    /// Attempts that failed.
+    attempts: u32,
+}
+
+/// How long after the first failure a removal is tried again, the longest
+/// wait between two tries, and how many failed tries it is given.
+const REMOVAL_RETRY_FIRST: Duration = Duration::from_secs(1);
+const REMOVAL_RETRY_CAP: Duration = Duration::from_secs(60);
+const REMOVAL_ATTEMPTS: u32 = 12;
+
+fn removal_backoff(failed: u32) -> Duration {
+    REMOVAL_RETRY_FIRST
+        .saturating_mul(1u32 << failed.min(16))
+        .min(REMOVAL_RETRY_CAP)
+}
+
+/// The containers left behind, kept by the engine because the cell that made
+/// them may be gone. A worker the engine starts retries them with a bounded
+/// backoff; the next start of the cell, and the node's reap at startup and
+/// shutdown, finish them too.
+struct Removals {
+    entries: Mutex<Vec<Leftover>>,
+    wake: tokio::sync::Notify,
+    /// How long an empty answer for a label is not proof that the engine
+    /// made no container: the create the node gave up on is still being
+    /// handled until about then.
+    settle: Duration,
+}
+
+impl Removals {
+    fn new(settle: Duration) -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+            wake: tokio::sync::Notify::new(),
+            settle,
+        }
+    }
+
+    /// Note a container to remove. Synchronous, so a dropped future can do it.
+    fn add(&self, name: &str, target: Target) {
+        self.put_back(Leftover {
+            name: name.to_string(),
+            target,
+            born_ms: None,
+            due_ms: 0,
+            attempts: 0,
+        });
+    }
+
+    fn put_back(&self, entry: Leftover) {
+        let mut entries = self.entries.lock().unwrap();
+        if !entries
+            .iter()
+            .any(|held| held.name == entry.name && held.target == entry.target)
+        {
+            entries.push(entry);
+        }
+        drop(entries);
+        self.wake.notify_one();
+    }
+
+    /// Start the clock of what was noted without one.
+    fn start_clocks(entries: &mut [Leftover], now: u64) {
+        for entry in entries {
+            if entry.born_ms.is_none() {
+                entry.born_ms = Some(now);
+                entry.due_ms = now + REMOVAL_RETRY_FIRST.as_millis() as u64;
+            }
+        }
+    }
+
+    /// The entries whose time has come, taken out.
+    fn take_due(&self, now: u64) -> Vec<Leftover> {
+        let mut entries = self.entries.lock().unwrap();
+        Self::start_clocks(&mut entries, now);
+        let (due, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *entries)
+            .into_iter()
+            .partition(|entry| entry.due_ms <= now);
+        *entries = rest;
+        due
+    }
+
+    /// The entries of one cell, taken out, due or not.
+    fn take_for(&self, name: &str) -> Vec<Leftover> {
+        let mut entries = self.entries.lock().unwrap();
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *entries)
+            .into_iter()
+            .partition(|entry| entry.name == name);
+        *entries = rest;
+        mine
+    }
+
+    fn next_due(&self, now: u64) -> Option<u64> {
+        let mut entries = self.entries.lock().unwrap();
+        Self::start_clocks(&mut entries, now);
+        entries.iter().map(|entry| entry.due_ms).min()
+    }
+
+    /// Whether a label that matches nothing may still match later.
+    fn settling(&self, entry: &Leftover, now: u64) -> bool {
+        entry
+            .born_ms
+            .is_none_or(|born| now < born + self.settle.as_millis() as u64)
+    }
+
+    #[cfg(test)]
+    fn pending(&self) -> Vec<Target> {
+        let entries = self.entries.lock().unwrap();
+        entries.iter().map(|entry| entry.target.clone()).collect()
+    }
+}
+
+/// How an attempt to remove a leftover ended.
+enum Attempt {
+    Done,
+    Retry(String),
+}
+
+async fn attempt_removal(docker: &Docker, removals: &Removals, entry: &Leftover) -> Attempt {
+    match &entry.target {
+        Target::Id(id) => match remove_by_id(docker, id).await {
+            Ok(Removal::Gone) => Attempt::Done,
+            Ok(Removal::InProgress) => Attempt::Retry("the removal is in progress".to_string()),
+            Err(error) => Attempt::Retry(format!("{error:#}")),
+        },
+        Target::Label(token) => {
+            let ids = match ids_by_label(docker, &format!("celld.run={token}")).await {
+                Ok(ids) => ids,
+                Err(error) => return Attempt::Retry(format!("{error:#}")),
+            };
+            let mut open = None;
+            for id in &ids {
+                match remove_by_id(docker, id).await {
+                    Ok(Removal::Gone) => {}
+                    Ok(Removal::InProgress) => {
+                        open = Some("the removal is in progress".to_string())
+                    }
+                    Err(error) => open = Some(format!("{error:#}")),
+                }
+            }
+            if let Some(reason) = open {
+                return Attempt::Retry(reason);
+            }
+            // Nothing matched: the engine may not have handled the create yet.
+            if ids.is_empty() && removals.settling(entry, asyncrt::mono_ms()) {
+                return Attempt::Retry("no container carries the label yet".to_string());
+            }
+            Attempt::Done
+        }
+    }
+}
+
+/// The retry worker: runs for the life of the engine.
+async fn run_removals(docker: Docker, removals: Arc<Removals>) {
+    const IDLE: Duration = Duration::from_secs(3600);
+    loop {
+        for mut entry in removals.take_due(asyncrt::mono_ms()) {
+            if let Attempt::Retry(reason) = attempt_removal(&docker, &removals, &entry).await {
+                entry.attempts += 1;
+                if entry.attempts >= REMOVAL_ATTEMPTS {
+                    tracing::warn!(
+                        event = "container_removal_abandoned",
+                        target = ?entry.target,
+                        reason = %reason,
+                        "the container may still exist until the node restarts"
+                    );
+                    continue;
+                }
+                entry.due_ms =
+                    asyncrt::mono_ms() + removal_backoff(entry.attempts).as_millis() as u64;
+                removals.put_back(entry);
+            }
+        }
+        let now = asyncrt::mono_ms();
+        let wait = removals
+            .next_due(now)
+            .map_or(IDLE, |due| Duration::from_millis(due.saturating_sub(now)));
+        let _ = asyncrt::timeout(wait, removals.wake.notified()).await;
+    }
+}
+
+/// How the engine answered a removal.
+enum Removal {
+    /// Removed, or there is no such container.
+    Gone,
+    /// The daemon says another removal of it is already in progress.
+    InProgress,
+}
+
+async fn remove_by_id(docker: &Docker, id: &str) -> anyhow::Result<Removal> {
+    let removed = docker
+        .call("DELETE", &format!("/containers/{id}?force=true"), None)
+        .await
+        .context("remove container")?;
+    match removed.status.as_u16() {
+        200..=299 | 404 => Ok(Removal::Gone),
+        409 => Ok(Removal::InProgress),
+        status => Err(anyhow!(
+            "remove container failed with [{status}] {}",
+            removed.message()
+        )),
+    }
+}
+
+/// The ids of the containers carrying `label` (`key=value`).
+async fn ids_by_label(docker: &Docker, label: &str) -> anyhow::Result<Vec<String>> {
+    let filters = json!({ "label": [label] }).to_string();
+    let reply = docker
+        .expect(
+            "GET",
+            &format!(
+                "/containers/json?all=true&filters={}",
+                percent_encoding::utf8_percent_encode(&filters, percent_encoding::NON_ALPHANUMERIC)
+            ),
+            None,
+            "list containers",
+        )
+        .await?;
+    Ok(reply
+        .json()?
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("Id").and_then(Value::as_str).map(str::to_string))
+        .collect())
+}
+
+/// A label value no other create carries: this process's random tag and a
+/// count, so the container of one run is never mistaken for another's.
+fn run_token() -> String {
+    static TAG: OnceLock<u64> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let tag = TAG.get_or_init(|| rand::RngCore::next_u64(&mut asyncrt::rng("run_token")));
+    format!("{tag:016x}-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 pub struct ContainerEngine {
     /// See `Config::runtime`.
     runtime: Option<String>,
@@ -800,6 +1104,8 @@ pub struct ContainerEngine {
     bucket: Option<crate::bucket::Bucket>,
     /// See `Config::fence_netns`.
     fence_netns: FenceNodeNetns,
+    /// The containers left behind that the node still has to remove.
+    removals: Arc<Removals>,
     /// Per-image load lock, so two cells of one class starting together
     /// load the tar once.
     images: Mutex<HashMap<String, Arc<tokio::sync::Mutex<bool>>>>,
@@ -1043,8 +1349,10 @@ impl ContainerEngine {
                 }
             }
         };
+        let removals = Arc::new(Removals::new(docker.lifecycle_timeout() * 2));
         let engine = Self {
             docker,
+            removals,
             node,
             bucket,
             fence_netns,
@@ -1057,6 +1365,9 @@ impl ContainerEngine {
             fenced: tokio::sync::Mutex::new(false),
         };
         engine.reap().await?;
+        // Only an engine that connected has a worker: a failed connect is not
+        // cached, and the next call tries again.
+        asyncrt::spawn(run_removals(engine.docker.clone(), engine.removals.clone())).detach();
         Ok(engine)
     }
 
@@ -1064,30 +1375,13 @@ impl ContainerEngine {
         self.docker.socket()
     }
 
+    /// Remove every container of this node, which finishes what the retry
+    /// worker had not yet. One the engine will not remove is noted for the
+    /// worker.
     async fn reap(&self) -> anyhow::Result<()> {
-        let filters = json!({ "label": [format!("celld.node={}", self.node)] }).to_string();
-        let reply = self
-            .docker
-            .expect(
-                "GET",
-                &format!(
-                    "/containers/json?all=true&filters={}",
-                    percent_encoding::utf8_percent_encode(
-                        &filters,
-                        percent_encoding::NON_ALPHANUMERIC
-                    )
-                ),
-                None,
-                "list containers",
-            )
-            .await?;
-        let list = reply.json()?;
-        for entry in list.as_array().into_iter().flatten() {
-            if let Some(id) = entry.get("Id").and_then(Value::as_str) {
-                let _ = self
-                    .docker
-                    .call("DELETE", &format!("/containers/{id}?force=true"), None)
-                    .await;
+        for id in ids_by_label(&self.docker, &format!("celld.node={}", self.node)).await? {
+            if !matches!(remove_by_id(&self.docker, &id).await, Ok(Removal::Gone)) {
+                self.removals.add("", Target::Id(id));
             }
         }
         Ok(())
@@ -1352,6 +1646,7 @@ impl ContainerEngine {
                     processes: Mutex::new(Vec::new()),
                     exit: watch::channel(None).0,
                     started: watch::channel((0, Started::Ready)).0,
+                    removals: self.removals.clone(),
                 })
             });
             // A returning cell cancels the destroy its eviction armed, and
@@ -1541,10 +1836,10 @@ impl ContainerEngine {
                 // find the name taken, and a node that never starts again
                 // would keep it until restart. It goes by its id, so a newer
                 // run's container under the same name is not touched. A
-                // create the engine never answered has no id; whatever it
-                // makes later is removed by the cell's next start, or by the
-                // node when it restarts or shuts down.
-                self.remove_run_container(cell, run).await;
+                // create the engine never answered has no id; what carries the
+                // run's label is removed by the engine's worker, by the cell's
+                // next start, or by the node's reap.
+                self.remove_unclaimed(cell, run).await;
                 return Err(error);
             }
         };
@@ -1552,7 +1847,7 @@ impl ContainerEngine {
             // `destroy()` ended this run while the container was being
             // created. The container exists now and belongs to no run, so it
             // goes, by its id: a newer run may hold the name already.
-            self.remove_run_container(cell, run).await;
+            self.remove_unclaimed(cell, run).await;
             return Ok(());
         }
         // `finish_start` took the container for the run, so it has an id.
@@ -1562,44 +1857,51 @@ impl ContainerEngine {
         Ok(())
     }
 
-    /// Remove the container `run` created, by its id, if there is one. Best
-    /// effort: the run that asks has already failed or ended.
-    async fn remove_run_container(&self, cell: &CellContainer, run: u64) {
-        let Some(id) = cell.container_id(run) else {
-            return;
-        };
-        if self.remove_container(&id).await.is_ok() {
-            cell.forget_container(run, &id);
-        }
-    }
-
     /// Remove the container with this id. Done when the engine confirms the
     /// removal or says there is no such container, as it does for one that
     /// already ended; also done on 409, the daemon saying another removal of
     /// it is already in progress. An engine that did not answer, or refused,
     /// is an error, because the container may still be running.
     async fn remove_container(&self, id: &str) -> anyhow::Result<()> {
-        let removed = self
-            .docker
-            .call("DELETE", &format!("/containers/{id}?force=true"), None)
-            .await
-            .context("remove container")?;
-        if !removed.status.is_success() && !matches!(removed.status.as_u16(), 404 | 409) {
-            return Err(anyhow!(
-                "remove container failed with [{}] {}",
-                removed.status.as_u16(),
-                removed.message()
-            ));
+        remove_by_id(&self.docker, id).await.map(|_| ())
+    }
+
+    /// Remove a container `run` created that no call can mean any more, by its
+    /// id. One the engine does not confirm gone stays on the engine's list, to
+    /// be tried again in the background and by the cell's next start.
+    async fn remove_or_note(&self, cell: &CellContainer, run: u64, id: &str) {
+        if !matches!(remove_by_id(&self.docker, id).await, Ok(Removal::Gone)) {
+            cell.removals.add(&cell.name, Target::Id(id.to_string()));
         }
-        Ok(())
+        cell.forget_container(run, id);
+    }
+
+    /// Remove what `run`'s start left that no run owns: the container it
+    /// created, by its id, and when the engine never answered the create,
+    /// whatever carries the run's label. Best effort: the run has already
+    /// failed or ended.
+    async fn remove_unclaimed(&self, cell: &CellContainer, run: u64) {
+        match cell.take_unclaimed(run) {
+            Some((_, Some(id))) => self.remove_or_note(cell, run, &id).await,
+            Some((token, None)) => cell.removals.add(&cell.name, Target::Label(token)),
+            None => {}
+        }
     }
 
     /// Remove what the runs before `run` left. Each goes by its id, so
     /// nothing of a later run is reached.
     async fn remove_earlier_containers(&self, cell: &CellContainer, run: u64) {
         for (earlier, id) in cell.containers_before(run) {
-            if self.remove_container(&id).await.is_ok() {
-                cell.forget_container(earlier, &id);
+            self.remove_or_note(cell, earlier, &id).await;
+        }
+    }
+
+    /// Finish the removals noted for this cell, whenever their time is: a
+    /// start is about to need the name they may hold.
+    async fn finish_leftovers(&self, cell: &CellContainer) {
+        for entry in self.removals.take_for(&cell.name) {
+            if let Attempt::Retry(_) = attempt_removal(&self.docker, &self.removals, &entry).await {
+                self.removals.put_back(entry);
             }
         }
     }
@@ -1661,22 +1963,10 @@ impl ContainerEngine {
         self.ensure_image(&image).await?;
         let (open, internal) = self.networks().await?;
         // A previous run's container may still be named: the wait task
-        // observed its exit but nothing removed it. It goes by its id.
+        // observed its exit but nothing removed it. It goes by its id, and so
+        // does a removal that was noted and not yet done.
         self.remove_earlier_containers(cell, run).await;
-        // A container under the name that no run of this node knows, such as
-        // the one an abandoned create made, goes by the name, but only while
-        // this run is still the cell's: a start that was overtaken must not
-        // remove the container of the run that overtook it.
-        if cell.is_current(run) {
-            let _ = self
-                .docker
-                .call(
-                    "DELETE",
-                    &format!("/containers/{}?force=true", cell.name),
-                    None,
-                )
-                .await;
-        }
+        self.finish_leftovers(cell).await;
         let mut env: Vec<String> = DEFAULT_ENV.iter().map(|entry| entry.to_string()).collect();
         env.push(format!("CLOUDFLARE_DURABLE_OBJECT_ID={}", cell.scope));
         env.extend(
@@ -1689,6 +1979,10 @@ impl ContainerEngine {
         labels.insert("celld.node".into(), json!(self.node));
         labels.insert("celld.cell".into(), json!(cell.scope));
         labels.insert("celld.class".into(), json!(cell.spec.class_name));
+        // Unique to this create, so a container whose id never reached the
+        // node can be found, and no other run's can be mistaken for it.
+        let token = run_token();
+        labels.insert("celld.run".into(), json!(token));
         for (name, value) in &params.labels {
             labels.insert(format!("celld.user.{name}"), json!(value));
         }
@@ -1769,7 +2063,11 @@ impl ContainerEngine {
         }
         // The daemon can answer 409 for a name whose previous container is
         // still being removed, so a fresh start after `destroy()` retries
-        // briefly, as workerd's engine does.
+        // briefly, as workerd's engine does. The container exists as soon as
+        // the engine handles the create, so from the call until its answer the
+        // run knows the label and not yet the id: a call that never returns, or
+        // a future dropped meanwhile, leaves the label to be found by.
+        cell.begin_create(run, &token);
         let mut reply = self
             .docker
             .call(
@@ -1782,19 +2080,14 @@ impl ContainerEngine {
             if reply.status.as_u16() != 409 {
                 break;
             }
+            cell.end_create(run);
             asyncrt::sleep(Duration::from_millis(100)).await;
             self.remove_earlier_containers(cell, run).await;
+            self.finish_leftovers(cell).await;
             if !cell.is_current(run) {
                 return Err(anyhow!("the start was overtaken by a newer start"));
             }
-            let _ = self
-                .docker
-                .call(
-                    "DELETE",
-                    &format!("/containers/{}?force=true", cell.name),
-                    None,
-                )
-                .await;
+            cell.begin_create(run, &token);
             reply = self
                 .docker
                 .call(
@@ -1803,6 +2096,9 @@ impl ContainerEngine {
                     Some(body.clone()),
                 )
                 .await?;
+        }
+        if !reply.status.is_success() {
+            cell.end_create(run);
         }
         if reply.status.as_u16() == 404 {
             return Err(anyhow!("No such image available named {image}"));
@@ -1894,6 +2190,8 @@ impl ContainerEngine {
                 .await;
             self.remove_container(&id).await?;
             cell.forget_container(run, &id);
+            // Nothing of the run's create is left to look for.
+            cell.end_create(run);
         }
         // The run is over once its own container is, whatever became of the
         // containers of earlier runs, which are reported below.
@@ -1955,7 +2253,8 @@ impl ContainerEngine {
 
     async fn forget(&self, cell: &Arc<CellContainer>) {
         // Nobody is left to ask again, so a removal the engine did not
-        // confirm is told here; the cell's next start removes the name.
+        // confirm is told here and noted: the engine's worker retries it, and
+        // the cell's next start and the node's reap finish it.
         let (run, attached) = {
             let state = cell.state.lock().unwrap();
             (state.run, state.attached)
@@ -1965,8 +2264,14 @@ impl ContainerEngine {
                 event = "container_destroy_failed",
                 cell = %cell.scope,
                 error = %format!("{error:#}"),
-                "the container may still exist"
+                "the container may still exist; the node will try to remove it again"
             );
+            // `destroy` removed what it could, so what is still tracked is
+            // what the engine refused: the run's own and any earlier run's.
+            for (held, id) in cell.containers_before(run + 1) {
+                cell.removals.add(&cell.name, Target::Id(id.clone()));
+                cell.forget_container(held, &id);
+            }
         }
         // The destroy took time, and a start or an activation that came in
         // meanwhile wants the handle and its processes. Whether it did is
@@ -2044,9 +2349,10 @@ impl ContainerEngine {
             .docker
             .call("POST", &format!("/containers/{container}/exec"), Some(body))
             .await?;
-        // The engine knows no container of that id once it was removed, which
-        // is how a run that ended after the exec began looks.
-        if created.status.as_u16() == 404 {
+        // The engine knows no container of that id once it was removed (404),
+        // and refuses an exec in one that stopped (409), which is how a run
+        // that ended after the exec began looks.
+        if matches!(created.status.as_u16(), 404 | 409) {
             return Err(anyhow!(
                 "exec() requires a running container: the container of this run ended"
             ));
@@ -2847,6 +3153,7 @@ mod run_tests {
             processes: Mutex::new(Vec::new()),
             exit: watch::channel(None).0,
             started: watch::channel((0, Started::Ready)).0,
+            removals: Arc::new(Removals::new(Duration::from_secs(1))),
         }
     }
 
@@ -3244,6 +3551,10 @@ mod engine_tests {
     use super::fake_engine::FakeEngine;
     use super::*;
 
+    /// How long a create may take where a test needs one that is not
+    /// answered in time. Every other call keeps its real limit.
+    const SHORT_CREATE: Duration = Duration::from_millis(300);
+
     struct Rig {
         runtime: tokio::runtime::Handle,
         fake: FakeEngine,
@@ -3251,14 +3562,16 @@ mod engine_tests {
         _dir: tempfile::TempDir,
     }
 
-    fn rig() -> Rig {
+    fn rig(lifecycle: Duration) -> Rig {
         let runtime = asyncrt::install_test_host_runtime();
         *FENCE_IMAGE.write().unwrap() = Some("celld-fence:test".to_string());
         let dir = tempfile::tempdir().unwrap();
         let (fake, engine) = runtime.block_on(async {
             let fake = FakeEngine::start().await;
+            let docker =
+                Docker::new(fake.socket()).with_timeouts(crate::docker::CONTROL_TIMEOUT, lifecycle);
             let engine = ContainerEngine::connect(
-                Docker::new(fake.socket()),
+                docker,
                 "test-node".to_string(),
                 None,
                 None,
@@ -3301,6 +3614,7 @@ mod engine_tests {
                         processes: Mutex::new(Vec::new()),
                         exit: watch::channel(None).0,
                         started: watch::channel((0, Started::Ready)).0,
+                        removals: self.engine.removals.clone(),
                     })
                 })
                 .clone()
@@ -3335,13 +3649,20 @@ mod engine_tests {
                 }
             });
         }
+
+        /// Wait out the retry worker's first two waits, for a check that
+        /// something does not happen.
+        fn settle(&self) {
+            self.runtime
+                .block_on(async { tokio::time::sleep(Duration::from_millis(3500)).await });
+        }
     }
 
     // A stop whose destroy is still in the engine when the object starts the
     // container again must leave the new run its handle and its processes.
     #[test]
     fn a_stop_that_overlaps_a_new_start_leaves_the_new_runs_handle() {
-        let rig = rig();
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
         let scope = "Runner:one";
         let cell = rig.cell(scope);
         rig.start(&cell);
@@ -3378,7 +3699,7 @@ mod engine_tests {
     // The same, for an activation that comes back and cancels the sweep.
     #[test]
     fn a_stop_that_overlaps_an_activation_leaves_the_handle() {
-        let rig = rig();
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
         let scope = "Runner:one";
         let cell = rig.cell(scope);
         rig.start(&cell);
@@ -3405,7 +3726,7 @@ mod engine_tests {
     // keeps its own state.
     #[test]
     fn an_activation_does_not_mark_a_newer_run_stopped() {
-        let rig = rig();
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
         let scope = "Runner:one";
         let cell = rig.cell(scope);
         rig.start(&cell);
@@ -3442,7 +3763,7 @@ mod engine_tests {
     // says so.
     #[test]
     fn exec_on_a_destroyed_run_says_the_run_ended() {
-        let rig = rig();
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
         let cell = rig.cell("Runner:one");
         let run = rig.start(&cell);
         rig.runtime
@@ -3468,7 +3789,7 @@ mod engine_tests {
     // container will not go; the error still reaches the caller.
     #[test]
     fn destroy_ends_the_run_when_only_an_earlier_container_will_not_go() {
-        let rig = rig();
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
         let cell = rig.cell("Runner:one");
         rig.start(&cell);
         // The second run has begun and has no container yet.
@@ -3492,7 +3813,7 @@ mod engine_tests {
 
     #[test]
     fn destroy_removes_the_container_an_earlier_run_left() {
-        let rig = rig();
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
         let cell = rig.cell("Runner:one");
         rig.start(&cell);
         assert_eq!(rig.fake.live_ids().len(), 1);
@@ -3514,7 +3835,7 @@ mod engine_tests {
 
     #[test]
     fn destroy_reports_an_earlier_container_it_could_not_remove() {
-        let rig = rig();
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
         let cell = rig.cell("Runner:one");
         rig.start(&cell);
         let second = cell.begin_run();
@@ -3536,6 +3857,147 @@ mod engine_tests {
             .block_on(rig.engine.destroy(&cell, second))
             .unwrap();
         assert!(rig.fake.live_ids().is_empty());
+    }
+
+    #[test]
+    fn a_failed_destroy_leaves_a_retry_that_later_succeeds() {
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
+        let cell = rig.cell("Runner:one");
+        rig.start(&cell);
+        assert_eq!(rig.fake.live_ids().len(), 1);
+        rig.fake.fail_next_delete("daemon is overloaded");
+        rig.runtime.block_on(rig.engine.forget(&cell));
+        // The engine refused, so the container is still there, and the node
+        // has not forgotten it.
+        assert_eq!(rig.fake.live_ids().len(), 1);
+        assert_eq!(rig.engine.removals.pending().len(), 1);
+        assert!(rig.engine.cell("Runner:one").is_none());
+        rig.wait_for("the retry to remove the container", |fake| {
+            fake.live_ids().is_empty()
+        });
+        assert!(rig.engine.removals.pending().is_empty());
+    }
+
+    // The one retry covers what `destroy` left tracked, an earlier run's
+    // container included.
+    #[test]
+    fn a_failed_stop_notes_the_container_an_earlier_run_left() {
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
+        let cell = rig.cell("Runner:one");
+        rig.start(&cell);
+        let second = cell.begin_run();
+        let _ = rig
+            .runtime
+            .block_on(rig.engine.start(&cell, second, Rig::params(Some("nope"))));
+        rig.fake.fail_next_delete("daemon is overloaded");
+        rig.runtime.block_on(rig.engine.forget(&cell));
+        assert_eq!(rig.fake.live_ids().len(), 1);
+        assert_eq!(rig.engine.removals.pending().len(), 1);
+        rig.wait_for("the retry to remove the earlier container", |fake| {
+            fake.live_ids().is_empty()
+        });
+    }
+
+    #[test]
+    fn the_next_start_of_the_cell_finishes_a_removal_that_is_pending() {
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
+        let cell = rig.cell("Runner:one");
+        rig.start(&cell);
+        let first = rig.fake.live_ids();
+        rig.fake.fail_next_delete("daemon is overloaded");
+        rig.runtime.block_on(rig.engine.forget(&cell));
+        // The cell's container is still named, and a new handle for the cell
+        // starts at once, before the worker's first retry.
+        let cell = rig.cell("Runner:one");
+        rig.start(&cell);
+        let live = rig.fake.live_ids();
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert_ne!(live, first, "the first container was adopted");
+    }
+
+    /// Hold the engine's answer to a create longer than the call may wait, and
+    /// start the cell: the container exists, and the node never learns its id.
+    fn start_with_unanswered_create(rig: &Rig, cell: &Arc<CellContainer>) -> u64 {
+        // The fence goes first, so that the create is the call that stalls.
+        rig.runtime.block_on(rig.engine.ensure_fence()).unwrap();
+        rig.fake.delay_create_reply(Duration::from_secs(2));
+        let run = cell.begin_run();
+        let started = rig
+            .runtime
+            .block_on(rig.engine.start(cell, run, Rig::params(None)));
+        assert!(started.is_err(), "the create was answered");
+        rig.fake.delay_create_reply(Duration::ZERO);
+        run
+    }
+
+    #[test]
+    fn a_start_whose_create_timed_out_removes_the_container_the_engine_made() {
+        let rig = rig(SHORT_CREATE);
+        let cell = rig.cell("Runner:one");
+        start_with_unanswered_create(&rig, &cell);
+        // The engine made the container, and the node holds no id for it.
+        assert_eq!(rig.fake.live_ids().len(), 1);
+        assert_eq!(cell.container_id(1), None);
+        rig.wait_for("the container to be removed by its label", |fake| {
+            fake.live_ids().is_empty()
+        });
+    }
+
+    #[test]
+    fn a_start_dropped_while_its_create_is_in_flight_removes_the_container() {
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
+        let cell = rig.cell("Runner:one");
+        rig.runtime.block_on(rig.engine.ensure_fence()).unwrap();
+        rig.fake.delay_create_reply(Duration::from_secs(5));
+        let run = cell.begin_run();
+        let guard = StartGuard::new(cell.clone(), run);
+        let engine = rig.engine.clone();
+        let driven = cell.clone();
+        let task = rig.runtime.spawn(async move {
+            let _guard = guard;
+            let _ = engine.start(&driven, run, Rig::params(None)).await;
+        });
+        rig.wait_for("the engine to handle the create", |fake| {
+            !fake.created().is_empty()
+        });
+        // The event that drove the start ends, and its future goes with it.
+        task.abort();
+        rig.runtime.block_on(async {
+            let _ = task.await;
+        });
+        rig.fake.delay_create_reply(Duration::ZERO);
+        assert_eq!(rig.fake.live_ids().len(), 1);
+        rig.wait_for("the container to be removed by its label", |fake| {
+            fake.live_ids().is_empty()
+        });
+    }
+
+    #[test]
+    fn a_retry_never_removes_a_newer_runs_container() {
+        let rig = rig(SHORT_CREATE);
+        let cell = rig.cell("Runner:one");
+        start_with_unanswered_create(&rig, &cell);
+        // The engine loses the first container before anything finds it, so
+        // the label matches nothing, and a second run takes the name.
+        rig.fake.vanish();
+        let second = rig.start(&cell);
+        let live = rig.fake.live_ids();
+        assert_eq!(live.len(), 1, "{live:?}");
+        // The worker looks again, more than once, while the second run lives.
+        rig.settle();
+        assert_eq!(rig.fake.live_ids(), live, "the second run's container went");
+        assert!(rig.engine.cell("Runner:one").unwrap().running());
+        // The container is the one the second run's create labelled.
+        let labels = rig.fake.labels_of(&live[0]).unwrap();
+        assert!(labels["celld.run"].is_string(), "{labels}");
+        assert!(cell.container_id(second).is_some());
+    }
+
+    #[test]
+    fn a_removal_is_retried_with_a_growing_wait_that_has_a_ceiling() {
+        let waits: Vec<u64> = (0..8).map(|n| removal_backoff(n).as_secs()).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60, 60]);
+        assert_eq!(removal_backoff(1000), REMOVAL_RETRY_CAP);
     }
 }
 
