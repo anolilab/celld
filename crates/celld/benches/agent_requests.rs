@@ -43,10 +43,8 @@ fn main() {
     let turns = positive("BENCH_TURNS", 6);
     let turn = Duration::from_millis(positive("BENCH_TURN_MS", 10_000));
     let spread = Duration::from_secs(positive("BENCH_SPREAD_S", 60));
-    let idle_window = std::env::var("BENCH_IDLE_S")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(|_| Duration::from_secs(positive("BENCH_IDLE_S", 1)));
+    let idle_window =
+        env_text("BENCH_IDLE_S").map(|_| Duration::from_secs(positive("BENCH_IDLE_S", 1)));
     let end = EndRule::from_env();
     let run = format!(
         "req-{}",

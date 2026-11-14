@@ -126,21 +126,12 @@ impl Classifier {
             }
         }
         if agent.is_empty() {
-            return Classifier {
-                background: Self::background_from_env(),
-                ..Self::default_layout()
-            };
+            agent = Self::default_layout().agent;
         }
-        Classifier {
-            agent,
-            background: Self::background_from_env(),
-        }
-    }
-
-    fn background_from_env() -> Vec<Regex> {
-        env_text("BENCH_BACKGROUND_REGEX")
+        let background = env_text("BENCH_BACKGROUND_REGEX")
             .map(|p| vec![compile("BENCH_BACKGROUND_REGEX", &p)])
-            .unwrap_or_default()
+            .unwrap_or_default();
+        Classifier { agent, background }
     }
 
     pub fn part(&self, key: &str) -> Part {
