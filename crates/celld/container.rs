@@ -1556,9 +1556,8 @@ impl ContainerEngine {
         }
     }
 
-    /// Wait for the container `target` (its id, or the cell's name for one
-    /// adopted from an earlier owner) to end and publish the exit for `run`;
-    /// a later run's start has already replaced the state.
+    /// Wait for the container with id `target` to end and publish the exit
+    /// for `run`; a later run's start has already replaced the state.
     fn watch_exit(&self, cell: &Arc<CellContainer>, run: u64, target: String) {
         let docker = self.docker.clone();
         let cell_ = cell.clone();

@@ -1207,8 +1207,9 @@ impl RuntimeManager {
             .cell_config(class)
             .ok_or_else(|| anyhow!("no Worker exports Durable Object class {class}"))?;
         // The object's `running` is read synchronously, so the engine
-        // answers it here, before the object exists. A container a previous
-        // activation on this node left running is adopted by name.
+        // answers it here, before the object exists. A container is found
+        // only through the id its run recorded; one left under the cell's
+        // name is not reconnected.
         if config.container_class(class) {
             let engine = crate::container::engine().await?;
             engine.attach(&cell, class).await?;
