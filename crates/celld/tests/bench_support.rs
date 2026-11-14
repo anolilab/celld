@@ -318,10 +318,9 @@ fn an_unknown_eviction_time_cannot_be_checked() {
 fn agents_must_be_created_and_warmed_before_the_eviction_time() {
     let warmup = 2 * SECOND;
     assert_eq!(require_resident(2 * SECOND, warmup, 10 * SECOND), Ok(()));
+    // Right at the limit, the first agent may already be gone.
     let error = require_resident(8 * SECOND, warmup, 10 * SECOND).unwrap_err();
     assert!(error.contains("evicted"), "{error}");
-    // Right at the limit, the first agent may already be gone.
-    assert!(require_resident(8 * SECOND, warmup, 10 * SECOND).is_err());
     assert!(require_resident(7 * SECOND, warmup, 10 * SECOND).is_ok());
 }
 
