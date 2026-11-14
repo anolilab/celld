@@ -330,7 +330,9 @@ impl PreservedCache {
                         evicted += 1;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        self.remove_beside(&paths[index]);
+                        // Not removed here: the entry is stale because a
+                        // resume renamed the snapshot, and the files beside it
+                        // now belong to the live database.
                         self.forget(&paths[index]);
                         evicted += 1;
                     }

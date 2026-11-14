@@ -2193,6 +2193,15 @@ impl LtxRepl {
         matches!(client.covers_txid(TXID(txid)).await, Ok(true))
     }
 
+    /// Whether the full snapshot this pass just published is listed. The
+    /// transaction alone would pass on an L0 object that holds it, and a
+    /// handoff that took its snapshot has told the successor to restore that
+    /// image.
+    async fn snapshot_visible(&self, cell: &str, epoch: u64, txid: u64) -> bool {
+        let client = self.client_for(cell, epoch);
+        matches!(client.has_snapshot_through(TXID(txid)).await, Ok(true))
+    }
+
     /// Put the database a same-epoch wake continues at its live path.
     ///
     /// A clean reload left it there. A dormant cell left it as `.evicted`, and
@@ -2204,34 +2213,39 @@ impl LtxRepl {
     /// starts a writer lineage at TXID 1 inside an epoch that already holds
     /// files (#158), so a missing directory fails the wake and the core claims
     /// the next epoch instead.
-    fn take_retained_database(&self, cell: &str, epoch: u64, dst: &Path) -> anyhow::Result<()> {
+    ///
+    /// Answers whether the database came from `.evicted`.
+    fn take_retained_database(&self, cell: &str, epoch: u64, dst: &Path) -> anyhow::Result<bool> {
         let is_file = |path: &Path| {
             self.ltx_host
                 .metadata(path)
                 .is_ok_and(|metadata| metadata.is_file)
         };
-        if !is_file(dst) {
-            let retained = dst.with_extension("evicted");
-            anyhow::ensure!(
-                is_file(&retained),
-                "no retained database for {cell} epoch {epoch}: {}",
-                dst.display()
-            );
-            let meta = Db::meta_path_for_path(dst);
-            anyhow::ensure!(
-                self.ltx_host
-                    .metadata(&meta)
-                    .is_ok_and(|metadata| metadata.is_dir),
-                "no LTX metadata retained for {cell} epoch {epoch}: {}",
-                meta.display()
-            );
+        // A live file with its metadata gone is what a failed rename leaves,
+        // so the metadata is checked whichever name holds the database.
+        let meta = Db::meta_path_for_path(dst);
+        let retained = dst.with_extension("evicted");
+        let from_eviction = !is_file(dst);
+        anyhow::ensure!(
+            !from_eviction || is_file(&retained),
+            "no retained database for {cell} epoch {epoch}: {}",
+            dst.display()
+        );
+        anyhow::ensure!(
+            self.ltx_host
+                .metadata(&meta)
+                .is_ok_and(|metadata| metadata.is_dir),
+            "no LTX metadata retained for {cell} epoch {epoch}: {}",
+            meta.display()
+        );
+        if from_eviction {
             self.ltx_host.rename(&retained, dst)?;
             self.preserved
                 .lock()
                 .expect("preserved cache poisoned")
                 .forget(&retained);
         }
-        Ok(())
+        Ok(from_eviction)
     }
 
     /// Remove what a retained epoch kept beside its database, once the next
@@ -2245,19 +2259,6 @@ impl LtxRepl {
             sibling.push(suffix);
             let _ = self.ltx_host.remove_file(&PathBuf::from(sibling));
         }
-    }
-
-    /// Whether this node holds a database a same-epoch wake could reopen: the
-    /// live file a clean reload left, or the `.evicted` copy of a dormant cell.
-    pub(crate) fn holds_local(&self, cell: &str, epoch: u64) -> bool {
-        let db = self.db_path(cell, epoch);
-        [db.clone(), db.with_extension("evicted")]
-            .iter()
-            .any(|path| {
-                self.ltx_host
-                    .metadata(path)
-                    .is_ok_and(|metadata| metadata.is_file)
-            })
     }
 
     pub async fn activate(
@@ -2351,8 +2352,15 @@ impl LtxRepl {
         // A paged activation continues its chain from the cut: (last txid of
         // the chain, page count at the cut).
         let mut continuation: Option<(TXID, u32)> = None;
+        // A retained database is evicted state: the bucket holds a snapshot
+        // at its position, and the rows at or below it can exist nowhere else
+        // once the bundles that carried them are collected. Compaction
+        // continues a level from the position it already holds, so a round on
+        // this handle would find rows above a gap and fail on every retry. The
+        // next eviction's snapshot covers what compaction would have folded.
+        let mut from_eviction = false;
         if resume_local {
-            self.take_retained_database(cell, epoch, &dst)?;
+            from_eviction = self.take_retained_database(cell, epoch, &dst)?;
             info!(cell, epoch, "resumed clean local replica");
         } else if let Some(snapshot) = local_snapshot {
             self.ltx_host.rename(&snapshot, &dst)?;
@@ -2657,41 +2665,45 @@ impl LtxRepl {
             percell_txid: AtomicU64::new(seed.map_or(0, |pos| pos.txid.0)),
             syncing: AtomicBool::new(false),
             ready: Notify::new(),
-            compaction: self.compaction_queue.as_ref().map(|queue| {
-                let fetcher = Arc::new(SinkFetcher {
-                    registration: self.registration.clone(),
-                    cell: cell.to_string(),
-                    epoch,
-                    rows: tokio::sync::Mutex::new(None),
-                });
-                CellCompaction {
-                    cell: cell.to_string(),
-                    epoch,
-                    // The overlay lets compaction read bundle-resident frames
-                    // beside the per-cell objects; its output stays pure
-                    // per-cell L1s, which is the continuous drain.
-                    client: celld_ltx::BundleOverlayClient::new(
-                        client.clone(),
-                        Some(fetcher.clone()),
-                    ),
-                    fetcher,
-                    local_path: Db::meta_path_for_path(&dst),
-                    host: self.ltx_host.clone(),
-                    queue: queue.clone(),
-                    base_txid: continuation.map_or(1, |(txid, _)| txid.0),
-                    min_txids: self.compaction_min_txids,
-                    min_bytes: self.compaction_min_bytes,
-                    pending_bytes: AtomicU64::new(0),
-                    compacted_txid: AtomicU64::new(0),
-                    retry_after_ms: AtomicU64::new(0),
-                    failures: AtomicU64::new(0),
-                    queued: AtomicBool::new(false),
-                    cancelled: AtomicBool::new(false),
-                    handoff_paused: AtomicBool::new(false),
-                    cancel: Notify::new(),
-                    run: tokio::sync::Mutex::new(()),
-                }
-            }),
+            compaction: self
+                .compaction_queue
+                .as_ref()
+                .filter(|_| !from_eviction)
+                .map(|queue| {
+                    let fetcher = Arc::new(SinkFetcher {
+                        registration: self.registration.clone(),
+                        cell: cell.to_string(),
+                        epoch,
+                        rows: tokio::sync::Mutex::new(None),
+                    });
+                    CellCompaction {
+                        cell: cell.to_string(),
+                        epoch,
+                        // The overlay lets compaction read bundle-resident frames
+                        // beside the per-cell objects; its output stays pure
+                        // per-cell L1s, which is the continuous drain.
+                        client: celld_ltx::BundleOverlayClient::new(
+                            client.clone(),
+                            Some(fetcher.clone()),
+                        ),
+                        fetcher,
+                        local_path: Db::meta_path_for_path(&dst),
+                        host: self.ltx_host.clone(),
+                        queue: queue.clone(),
+                        base_txid: continuation.map_or(1, |(txid, _)| txid.0),
+                        min_txids: self.compaction_min_txids,
+                        min_bytes: self.compaction_min_bytes,
+                        pending_bytes: AtomicU64::new(0),
+                        compacted_txid: AtomicU64::new(0),
+                        retry_after_ms: AtomicU64::new(0),
+                        failures: AtomicU64::new(0),
+                        queued: AtomicBool::new(false),
+                        cancelled: AtomicBool::new(false),
+                        handoff_paused: AtomicBool::new(false),
+                        cancel: Notify::new(),
+                        run: tokio::sync::Mutex::new(()),
+                    }
+                }),
         });
         // Shutdown publishes stop before it takes the close gate and this map.
         // An activation that linearizes first is in shutdown's snapshot; one
@@ -2941,11 +2953,16 @@ impl LtxRepl {
     /// The fleet proof therefore keeps the window this closes for the bucket
     /// proof. Moving the handoff snapshot forward would not close it: the
     /// snapshot is a full image at one txid, `evict` publishes it as the
-    /// successor's authoritative restore artifact, and a cell that keeps
-    /// serving can commit past it. A cancelled eviction would then leave an
-    /// image in the bucket that a later restore reads as complete. The cost
-    /// of the remaining window is revocability and not durability, because
-    /// `evict` still refuses to give up state the bucket cannot restore.
+    /// successor's restore artifact, and a cell that keeps serving can commit
+    /// past it, with those rows in node bundles and not under the per-cell
+    /// prefix. A restore reads the highest snapshot of an epoch and the
+    /// per-cell files above it, so it would stop short of them until a
+    /// recovery gathers the bundles, which every takeover and restart does
+    /// first. That is a second mechanism, so the snapshot is published only
+    /// when the stop is past revoking. The cost of the remaining window is
+    /// revocability and not durability, because `evict` still refuses to give
+    /// up state the bucket cannot restore, and its confirm names the position
+    /// it closed, not merely an object of the epoch.
     /// Closing it needs the core to accept a request during `Phase::Cleaning`,
     /// which is an open decision (#818). Do not read the scoping as a claim
     /// that the fleet path needs no gate.
@@ -3282,7 +3299,9 @@ impl LtxRepl {
             )
             .await;
             if matches!(published, Ok(Ok(())))
-                && self.epoch_covers(cell, epoch, snapshot.max_txid.0).await
+                && self
+                    .snapshot_visible(cell, epoch, snapshot.max_txid.0)
+                    .await
             {
                 // The snapshot is a per-cell object through its txid, so it
                 // covers every fleet-acked row of this closed database. No

@@ -103,10 +103,10 @@ impl FacetStreams {
         };
         match (replication, spec) {
             (Some(replication), Some(mut spec)) => {
-                // A clean reload or a dormant wake resumes the files it
-                // closed. A facet that was not open then has none, so it
-                // restores as any facet of this epoch does.
-                if spec.resume_local && !replication.ltx().holds_local(&facet, epoch) {
+                // A clean reload resumes the files it closed. A facet that
+                // was not open then has none, so it restores as any facet
+                // of this epoch does.
+                if spec.resume_local && crate::asyncrt::fs().metadata(&path).is_err() {
                     spec.resume_local = false;
                 }
                 let (restored_path, _, _) = replication.restore(&facet, &spec, false).await?;

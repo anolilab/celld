@@ -15,6 +15,7 @@ mod e2e {
     pub mod do_ids;
     pub mod do_sql;
     pub mod do_storage;
+    pub mod dormant_resume;
     pub mod egress;
     pub mod facets;
     pub mod fake_engine;

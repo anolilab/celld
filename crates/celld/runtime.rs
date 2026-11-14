@@ -1364,7 +1364,7 @@ impl RuntimeManager {
     ) -> anyhow::Result<()> {
         // No facet opens once the stop begins; the facet loop below stops
         // the streams this answers again, with any that opened before.
-        self.facets.stopping(cell, epoch);
+        let facet_streams = self.facets.stopping(cell, epoch);
         if let Some(engine) = crate::container::engine_if_ready() {
             // Only an idle eviction keeps the cell on this node, so only it
             // keeps the container: the next activation here reconnects.
@@ -1454,7 +1454,15 @@ impl RuntimeManager {
                     .evict(
                         cell,
                         epoch,
-                        crate::ltx_repl::Retained::of_stop(*preserve_local, *resumable),
+                        // A facet keeps no database past its stop, and its
+                        // epoch already holds the objects it published, so a
+                        // facet that opened at the epoch the root resumes at
+                        // could be restored into neither. The root's wake
+                        // claims the next epoch instead.
+                        crate::ltx_repl::Retained::of_stop(
+                            *preserve_local,
+                            *resumable && facet_streams.is_empty(),
+                        ),
                         abandon.as_deref(),
                     )
                     .await
@@ -1476,22 +1484,13 @@ impl RuntimeManager {
                     return Ok(());
                 }
                 match mode {
-                    // A facet keeps no local file past an eviction that gives
-                    // the cell away: its handler writes through a connection of
-                    // its own, which can outlive the root's stop, and a
-                    // preserved file would become the next activation's
-                    // baseline. One that keeps the root dormant here retains
-                    // it for the root's own wake, which reopens the facet at
-                    // the same epoch and has no remote image to restore
-                    // instead. The root is gone by now, so the eviction is not
-                    // abandoned.
-                    StopMode::Evict { resumable, .. } => replication
-                        .evict(
-                            &facet,
-                            epoch,
-                            crate::ltx_repl::Retained::of_stop(*resumable, *resumable),
-                            None,
-                        )
+                    // A facet keeps no local file past an eviction: its handler
+                    // writes through a connection of its own, which can outlive
+                    // the root's stop, and a preserved file would become the
+                    // next activation's baseline. The root is gone by now, so
+                    // the eviction is not abandoned.
+                    StopMode::Evict { .. } => replication
+                        .evict(&facet, epoch, crate::ltx_repl::Retained::Nothing, None)
                         .await
                         .map(|_| ()),
                     StopMode::Rebase => replication.release(&facet, epoch).await,

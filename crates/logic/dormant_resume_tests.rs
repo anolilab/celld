@@ -477,3 +477,46 @@ fn a_resume_the_host_cannot_open_claims_the_next_epoch_in_the_same_wake() {
     ));
     assert!(!shell.state.resumable(CELL));
 }
+
+#[test]
+fn a_resumed_cell_reaches_a_release_only_through_a_new_proof_and_stop() {
+    let mut shell = dormant(config());
+    let effects = wake_by_request(&mut shell);
+    assert_resumed_in_place(&mut shell, &effects);
+    shell.finish(WAKE_REQUEST);
+
+    let effects = shell.send(Event::ReleaseAll);
+
+    // The cell is resident again, so its rows are in no snapshot yet: the
+    // handoff proves and stops it first, and its record is released only
+    // after that stop.
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ReleaseOwner { .. })),
+        "the record was released before the cell's new rows were proved: {effects:?}"
+    );
+    let op = shell.expect("a new durability proof", |effect| match effect {
+        Effect::EnsureDurable {
+            op, cell, epoch, ..
+        } if cell == CELL && *epoch == 1 => Some(*op),
+        _ => None,
+    });
+    let effects = shell.send(Event::DurabilityChecked { op, result: Ok(()) });
+    assert!(!effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::ReleaseOwner { .. })));
+    let stop = shell.expect("a stop that gives the cell away", |effect| match effect {
+        Effect::StopRuntime {
+            op,
+            cause: StopCause::Evict { rebalance: true },
+            ..
+        } => Some(*op),
+        _ => None,
+    });
+    let effects = shell.send(Event::RuntimeStopped { op: stop });
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::ReleaseOwner { epoch: 1, .. })));
+    assert!(!shell.state.resumable(CELL));
+}
