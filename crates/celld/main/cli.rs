@@ -364,6 +364,11 @@ TUNING:
   CELLD_PLACEMENT_WEIGHT          Relative ownership share (default: the
                                   CPU count)
   CELLD_IDLE_EVICT_S              Idle-cell eviction age (disabled unless set)
+  CELLD_EGRESS                    `public` refuses Worker fetch(), connect() and
+                                  WebSocket dials to non-public addresses
+                                  (default: open)
+  CELLD_EGRESS_ALLOW              CIDR and host:port exceptions to
+                                  CELLD_EGRESS=public, comma separated
   CELLD_RECOVERY_RETRY_MS         Dead-owner recovery retry backoff (default: 1000)
   CELLD_RECOVERY_RETRIES          Recovery retries before a request fails (default: 240)
   CELLD_LOCAL_CACHE_MAX_BYTES     Hibernated SQLite cache limit (default: 2 GiB; 0 disables)

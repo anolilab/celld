@@ -32,6 +32,7 @@ pub mod deploy;
 pub mod dev;
 pub mod docker;
 pub mod drain_token;
+pub mod egress_filter;
 pub mod engine_api;
 pub mod env_vars;
 pub(crate) mod facet_streams;

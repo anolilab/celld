@@ -140,14 +140,25 @@ pub(super) fn op_tcp_connect(
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
-        let stream = tokio::net::TcpStream::connect((request.hostname.as_str(), request.port))
-            .await
-            .map_err(|error| {
-                format!(
-                    "connection to {}:{} failed: {error}",
-                    request.hostname, request.port
-                )
-            })?;
+        // With `CELLD_EGRESS=public`, connect to the addresses the policy
+        // permits and to nothing else: the check and the connection use the
+        // same resolved addresses.
+        let connected = match crate::egress_filter::active() {
+            Some(filter) => {
+                let addrs = filter
+                    .resolve(&request.hostname, request.port)
+                    .await
+                    .map_err(|refused| refused.to_string())?;
+                tokio::net::TcpStream::connect(&addrs[..]).await
+            }
+            None => tokio::net::TcpStream::connect((request.hostname.as_str(), request.port)).await,
+        };
+        let stream = connected.map_err(|error| {
+            format!(
+                "connection to {}:{} failed: {error}",
+                request.hostname, request.port
+            )
+        })?;
         let remote = stream.peer_addr().map(|a| a.to_string()).ok();
         let local = stream.local_addr().map(|a| a.to_string()).ok();
         let mut stream: Duplex = Box::new(stream);

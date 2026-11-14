@@ -210,6 +210,22 @@ struct CellState {
     run: u64,
 }
 
+impl Address {
+    /// Whether `addr` is where one of this container's ports answers: its
+    /// bridge address on any port, or a published loopback port.
+    fn serves(&self, addr: std::net::SocketAddr) -> bool {
+        match self {
+            Self::None => false,
+            Self::Ip(ip) => ip
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip == addr.ip()),
+            Self::Published(ports) => {
+                addr.ip().is_loopback() && ports.values().any(|host| *host == addr.port())
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 enum Address {
     #[default]
@@ -398,6 +414,18 @@ pub async fn engine() -> anyhow::Result<Arc<ContainerEngine>> {
         })
         .await
         .cloned()
+}
+
+/// Whether `addr` is the endpoint of a running container on this node. A
+/// Worker reaches a container's port through an ordinary `fetch()` or
+/// `connect()` to that address, so the egress filter permits exactly these.
+pub fn is_endpoint(addr: std::net::SocketAddr) -> bool {
+    engine_if_ready().is_some_and(|engine| {
+        engine.cells.lock().unwrap().values().any(|cell| {
+            let state = cell.state.lock().unwrap();
+            state.running && state.address.serves(addr)
+        })
+    })
 }
 
 /// The engine only if a previous call connected it.
@@ -1585,4 +1613,26 @@ fn container_name(node: &str, scope: &str) -> String {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(format!("{node}\n{scope}").as_bytes());
     format!("celld-{}", crate::control_plane::hex(&digest))[..30].to_string()
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn an_address_serves_only_its_container_endpoints() {
+        let bridge = Address::Ip("172.20.0.5".to_string());
+        assert!(bridge.serves("172.20.0.5:8080".parse().unwrap()));
+        assert!(bridge.serves("172.20.0.5:1".parse().unwrap()));
+        assert!(!bridge.serves("172.20.0.6:8080".parse().unwrap()));
+        assert!(!bridge.serves("127.0.0.1:8080".parse().unwrap()));
+
+        let published = Address::Published(HashMap::from([(8080, 49153)]));
+        assert!(published.serves("127.0.0.1:49153".parse().unwrap()));
+        assert!(published.serves("[::1]:49153".parse().unwrap()));
+        assert!(!published.serves("127.0.0.1:8080".parse().unwrap()));
+        assert!(!published.serves("10.0.0.1:49153".parse().unwrap()));
+
+        assert!(!Address::None.serves("127.0.0.1:49153".parse().unwrap()));
+    }
 }

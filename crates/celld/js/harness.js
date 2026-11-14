@@ -697,6 +697,11 @@ globalThis.fetch = async (input, init) => {
     if (req.redirect === "error") {
       throw new TypeError(error?.message ?? String(error));
     }
+    // An address the egress policy refuses (CELLD_EGRESS=public) is a
+    // network error too.
+    if (String(error?.message).includes("egress refused:")) {
+      throw new TypeError(error.message);
+    }
     throw error;
   }
   const r = JSON.parse(raw);
@@ -741,6 +746,9 @@ const __fetchWebSocketUpgrade = __celld.__fetchWebSocketUpgrade =
     ));
   } catch (error) {
     __sockets.delete(id);
+    if (String(error?.message).includes("egress refused:")) {
+      throw new TypeError(error.message);
+    }
     throw error;
   }
   if (!raw.upgraded) {
