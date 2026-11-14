@@ -1,0 +1,19 @@
+{
+  "name": "scoping",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "d1_databases": [
+    { "binding": "DB", "database_name": "ledger", "database_id": "ledger-id" }
+  ],
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "workflows": [{ "binding": "FLOW", "name": "probe", "class_name": "Probe" }],
+  "durable_objects": {
+    "bindings": [
+      { "name": "VAULT", "class_name": "Vault" },
+      { "name": "THIEF", "class_name": "Thief" },
+      { "name": "HOST", "class_name": "Host" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Vault", "Thief", "Host"] }]
+}

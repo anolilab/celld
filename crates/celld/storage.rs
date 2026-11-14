@@ -2040,6 +2040,26 @@ pub fn sql_cursor_next(cursor_id: u64) -> Result<(Option<Vec<SqlValue>>, u64), S
     })
 }
 
+/// The cell a SQL cursor reads, while the cursor is open.
+pub fn sql_cursor_scope(cursor_id: u64) -> Option<String> {
+    sql_cursors(|cursors| {
+        cursors
+            .borrow()
+            .get(&cursor_id)
+            .map(|cursor| cursor.scope.clone())
+    })
+}
+
+/// The cell a key listing cursor reads, while the cursor is open.
+pub fn sync_list_cursor_scope(cursor_id: u64) -> Option<String> {
+    sync_list_cursors(|cursors| {
+        cursors
+            .borrow()
+            .get(&cursor_id)
+            .map(|cursor| cursor.scope.clone())
+    })
+}
+
 pub fn sql_cursor_close(cursor_id: u64) {
     sql_cursors(|cursors| {
         cursors.borrow_mut().remove(&cursor_id);
