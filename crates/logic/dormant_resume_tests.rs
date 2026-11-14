@@ -397,3 +397,25 @@ fn a_queued_wake_whose_caller_leaves_keeps_the_promise() {
     let effects = wake_by_request(&mut shell);
     assert_resumed_in_place(&mut shell, &effects);
 }
+
+#[test]
+fn a_request_during_an_idle_stop_resumes_the_epoch_in_place() {
+    let mut shell = Shell::new(config());
+    let request = shell.request(CELL);
+    shell.finish(request);
+    shell.send(Event::Evict { cell: CELL.into() });
+    let op = shell.expect("an eviction proof", |effect| match effect {
+        Effect::EnsureDurable { op, .. } => Some(*op),
+        _ => None,
+    });
+    shell.send(Event::DurabilityChecked { op, result: Ok(()) });
+    let stop = shell.expect("an eviction stop", |effect| match effect {
+        Effect::StopRuntime { op, .. } => Some(*op),
+        _ => None,
+    });
+    wake_by_request(&mut shell);
+
+    let effects = shell.send(Event::RuntimeStopped { op: stop });
+
+    assert_resumed_in_place(&mut shell, &effects);
+}

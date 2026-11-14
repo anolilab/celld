@@ -1951,15 +1951,15 @@ impl State {
     /// process kept its database, at the epoch it already holds.
     fn dormant_wake(&self, cell: &Cell) -> ColdStart {
         match cell.phase {
-            Phase::Dormant { epoch } if cell.resumable => ColdStart::Restore(RestoreSpec {
-                epoch,
-                fresh: false,
-                took_over: false,
-                resume_local: true,
-                prior: None,
-            }),
+            Phase::Dormant { epoch } if cell.resumable => resume_in_place(epoch),
             _ => ColdStart::ReadOwner,
         }
+    }
+
+    /// Whether an eviction's stop left this process holding the cell's live
+    /// database at its epoch: it kept ownership and nothing is releasing it.
+    fn eviction_keeps_database(&self, rebalance: bool, cell: &Cell) -> bool {
+        self.config.resume_dormant_local && !rebalance && !self.draining && cell.releasing.is_none()
     }
 
     fn begin_cold_route(
@@ -5266,10 +5266,7 @@ impl State {
                 if cell.requests.is_empty() || (self.draining && rebalance) =>
             {
                 set_phase(&mut self.occupied, &mut cell, Phase::Dormant { epoch });
-                cell.resumable = self.config.resume_dormant_local
-                    && !rebalance
-                    && !self.draining
-                    && cell.releasing.is_none();
+                cell.resumable = self.eviction_keeps_database(rebalance, &cell);
                 self.eviction_permits.remove(&id);
                 // The record still names this node, which is the whole cost of
                 // stopping here: every later request for the cell routes to a
@@ -5293,13 +5290,20 @@ impl State {
                     });
                 }
             }
-            StopCause::Evict { .. } => {
+            StopCause::Evict { rebalance } => {
                 // A request arrived mid-eviction, so the cell turns straight
                 // back around. The eviction is over either way.
                 self.eviction_permits.remove(&id);
-                // The stop discarded the LTX metadata. Re-read ownership and
-                // claim epoch+1 before reusing the preserved SQLite image.
-                self.admit_or_queue_activation(&id, &mut cell, ColdStart::ReadOwner, effects);
+                // A stop that kept the database resumes its epoch in place.
+                // Otherwise the stop discarded the LTX metadata: re-read
+                // ownership and claim epoch+1 before reusing the preserved
+                // SQLite image.
+                let start = if self.eviction_keeps_database(rebalance, &cell) {
+                    resume_in_place(epoch)
+                } else {
+                    ColdStart::ReadOwner
+                };
+                self.admit_or_queue_activation(&id, &mut cell, start, effects);
             }
             // The swap's second half: the same epoch, the same owner record,
             // the same replica, a new isolate. `Starting` without `Restore`
@@ -7273,6 +7277,17 @@ fn set_phase(occupied: &mut usize, cell: &mut Cell, phase: Phase) {
         _ => {}
     }
     cell.phase = phase;
+}
+
+/// A wake at the epoch this process already holds, from its own database.
+fn resume_in_place(epoch: Epoch) -> ColdStart {
+    ColdStart::Restore(RestoreSpec {
+        epoch,
+        fresh: false,
+        took_over: false,
+        resume_local: true,
+        prior: None,
+    })
 }
 
 /// Phases that keep a dormant cell's promise to resume in place.
