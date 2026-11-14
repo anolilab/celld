@@ -161,11 +161,14 @@ pub struct Config {
     /// pressure involved. `None` keeps every cell resident until something
     /// needs the room.
     pub idle_evict_ms: Option<u64>,
-    /// An idle eviction keeps the cell's live database and its LTX metadata
-    /// open in this process, so a wake on this node resumes at the same epoch
-    /// with neither an owner read nor an epoch claim. Only the host that
-    /// retains them may enable it: a cell whose metadata is gone must still
-    /// claim the next epoch (#158).
+    /// Every eviction stop with `StopCause::Evict { rebalance: false }` keeps
+    /// the cell's live database and its LTX metadata in this process, so a
+    /// wake on this node resumes at the same epoch with neither an owner read
+    /// nor an epoch claim. That covers idle evictions and the room and
+    /// pressure evictions that keep ownership (`OwnershipOnEvict::Sticky`),
+    /// keyed on the same flag as the stop's `preserve_local`. Only a host that
+    /// retains them for every such stop may enable it: a cell whose metadata
+    /// is gone must still claim the next epoch (#158).
     pub resume_dormant_local: bool,
     /// Ceilings and low watermarks for load shedding.
     ///
