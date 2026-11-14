@@ -70,6 +70,30 @@ impl Drop for Waiter<'_> {
     }
 }
 
+/// The cells a flush has taken from the queue, returned to it unless the
+/// segment write committed. It takes the queue lock when it drops, so a flush
+/// never holds that lock across the write it guards.
+struct Taken<'a> {
+    registrar: &'a Registrar,
+    cells: Option<BTreeSet<String>>,
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        let Some(cells) = self.cells.take() else {
+            return;
+        };
+        let mut pending = self.registrar.pending.lock().unwrap();
+        let returned: Vec<String> = cells
+            .into_iter()
+            .filter(|cell| !pending.registered.contains(&registration_key(cell)))
+            .collect();
+        pending.waiting.extend(returned);
+        drop(pending);
+        self.registrar.queued.notify_one();
+    }
+}
+
 /// Registers cells in segments before their first LTX write.
 ///
 /// A cell is queued when it is first claimed and a background flusher writes
@@ -126,10 +150,11 @@ impl Registrar {
         self.queued.notify_one();
     }
 
-    /// Write the queue as one segment. The caller holds the turn. A failed
-    /// write returns every cell to the queue, so the next flush carries them in
-    /// one segment instead of one each while the store is failing; an entry for
-    /// a write that landed anyway only says "exists", the safe answer.
+    /// Write the queue as one segment. The caller holds the turn. A write that
+    /// fails, or a flush that is cancelled while it waits, returns every cell
+    /// to the queue, so the next flush carries them in one segment instead of
+    /// one each while the store is failing; an entry for a write that landed
+    /// anyway only says "exists", the safe answer.
     async fn flush(&self) -> object_store::Result<()> {
         let (batch, seq) = {
             let mut pending = self.pending.lock().unwrap();
@@ -143,30 +168,28 @@ impl Registrar {
             (std::mem::take(&mut pending.waiting), seq)
         };
         let key = segment_key(&self.prefix, &self.node, &self.generation, seq);
-        let written = self
-            .store
+        let payload = PutPayload::from_bytes(encode_segment(Kind::Born, &batch));
+        let mut taken = Taken {
+            registrar: self,
+            cells: Some(batch),
+        };
+        self.store
             .put_opts(
                 &Path::from(key.as_str()),
-                PutPayload::from_bytes(encode_segment(Kind::Born, &batch)),
+                payload,
                 PutOptions::from(PutMode::Create),
             )
-            .await;
-        let mut pending = self.pending.lock().unwrap();
-        if let Err(error) = written {
-            let returned: Vec<String> = batch
-                .into_iter()
-                .filter(|cell| !pending.registered.contains(&registration_key(cell)))
-                .collect();
-            pending.waiting.extend(returned);
-            return Err(error);
+            .await?;
+        let batch = taken.cells.take().expect("held until the write commits");
+        {
+            let mut pending = self.pending.lock().unwrap();
+            for cell in &batch {
+                pending.registered.insert(registration_key(cell));
+                pending.claimed.remove(cell);
+            }
         }
-        for cell in &batch {
-            pending.registered.insert(registration_key(cell));
-            pending.claimed.remove(cell);
-        }
-        drop(pending);
         self.directory
-            .own_durable(&batch, crate::ownership_store::now_ms());
+            .own_durable(&batch, crate::asyncrt::mono_ms());
         self.flushed.notify_waiters();
         Ok(())
     }
@@ -174,7 +197,7 @@ impl Registrar {
     /// Wait for the flusher to make `cell` durable, for as long as it should
     /// take. A flusher that is stopped or failing leaves the cell to the caller.
     async fn await_background_flush(&self, cell: &str) {
-        let bound = self.batch_window.saturating_mul(3) / 2;
+        let bound = crate::cell_directory::first_write_wait(self.batch_window);
         let durable = async {
             loop {
                 let flushed = self.flushed.notified();
@@ -451,14 +474,6 @@ pub(crate) mod testing {
 
     pub(crate) const PREFIX: &str = "fleet-a/";
 
-    /// Both clocks at `ms`.
-    pub(crate) fn at(ms: u64) -> crate::cell_directory::Now {
-        crate::cell_directory::Now {
-            mono_ms: ms,
-            wall_ms: ms,
-        }
-    }
-
     pub(crate) fn names(cells: &[&str]) -> BTreeSet<String> {
         cells.iter().map(|cell| (*cell).to_owned()).collect()
     }
@@ -471,6 +486,8 @@ pub(crate) mod testing {
         inner: &Arc<InMemory>,
         directory: &Arc<CellDirectory>,
     ) -> RegisteringStore {
+        // A flush stamps its cells with the node's monotonic clock.
+        crate::asyncrt::install_test_host_runtime();
         RegisteringStore::new(
             inner.clone(),
             directory.clone(),
@@ -494,7 +511,7 @@ pub(crate) mod testing {
     /// Every segment, with its born cells; tombstones are prefixed with `-`.
     pub(crate) async fn segments(inner: &InMemory) -> Vec<(String, Vec<String>)> {
         let mut found = Vec::new();
-        let mut listing = inner.list(Some(&Path::from("fleet-a/fleet/born")));
+        let mut listing = inner.list(Some(&Path::from("fleet-a/fleet/dir/v2/born")));
         while let Some(meta) = listing.next().await {
             let location = meta.unwrap().location;
             let body = inner.get(&location).await.unwrap().bytes().await.unwrap();
@@ -543,7 +560,7 @@ mod tests {
         assert_eq!(
             segments(&inner).await,
             [(
-                "fleet-a/fleet/born/node-a/gen1/00000000".to_owned(),
+                "fleet-a/fleet/dir/v2/born/node-a/gen1/00000000".to_owned(),
                 vec!["c1".to_owned()]
             )]
         );
@@ -551,11 +568,8 @@ mod tests {
             .head(&Path::from("fleet-a/cells/c1/ltx/e1/0000/0001.ltx"))
             .await
             .unwrap();
-        assert_eq!(directory.lookup("c1", at(0)).await, DirectoryAnswer::Exists);
-        assert_eq!(
-            directory.lookup("c2", at(0)).await,
-            DirectoryAnswer::Unknown
-        );
+        assert_eq!(directory.lookup("c1", 0).await, DirectoryAnswer::Exists);
+        assert_eq!(directory.lookup("c2", 0).await, DirectoryAnswer::Unknown);
     }
 
     #[test]
@@ -632,7 +646,12 @@ mod tests {
         let store = store_over(&inner, &directory);
         // The create-only key of the first segment is taken, so the write of
         // the registration is refused.
-        put_segment(&inner, "fleet-a/fleet/born/node-a/gen1/00000000", b"").await;
+        put_segment(
+            &inner,
+            "fleet-a/fleet/dir/v2/born/node-a/gen1/00000000",
+            b"",
+        )
+        .await;
 
         let ltx = Path::from("fleet-a/cells/c1/ltx/e1/0000/0001.ltx");
         store
@@ -641,7 +660,7 @@ mod tests {
             .expect_err("the LTX write must fail with its registration");
         assert!(inner.head(&ltx).await.is_err(), "LTX exists unregistered");
         assert_eq!(
-            directory.lookup("c1", at(0)).await,
+            directory.lookup("c1", 0).await,
             DirectoryAnswer::Unknown,
             "a registration that failed is not vouched for"
         );
@@ -652,7 +671,7 @@ mod tests {
             .await
             .unwrap();
         inner.head(&ltx).await.unwrap();
-        assert_eq!(directory.lookup("c1", at(0)).await, DirectoryAnswer::Exists);
+        assert_eq!(directory.lookup("c1", 0).await, DirectoryAnswer::Exists);
     }
 
     #[tokio::test]
@@ -660,7 +679,12 @@ mod tests {
         let inner = Arc::new(InMemory::new());
         let store = Arc::new(store_over(&inner, &directory_over(&inner)));
         // The first segment's key is taken, so the first flush fails.
-        put_segment(&inner, "fleet-a/fleet/born/node-a/gen1/00000000", b"").await;
+        put_segment(
+            &inner,
+            "fleet-a/fleet/dir/v2/born/node-a/gen1/00000000",
+            b"",
+        )
+        .await;
         let in_flight = store.registrar.flushing.lock().await;
         let mut writes = Box::pin(futures_util::future::join_all((0..4).map(|index| {
             let store = store.clone();
@@ -863,6 +887,37 @@ mod tests {
         });
     }
 
+    #[test]
+    fn a_cancelled_first_write_leaves_the_other_queued_cells_for_the_next_flush() {
+        crate::asyncrt::install_test_host_runtime().block_on(async {
+            let node = gated(Duration::from_secs(30));
+            node.directory.register_at_claim("c1");
+            // A write for a cell nobody queued takes the turn and flushes both,
+            // and the segment write waits at the closed gate.
+            let path = Path::from("fleet-a/cells/c9/ltx/e1/0000/0001.ltx");
+            let mut write = Box::pin(node.store.put(&path, PutPayload::from_static(b"x")));
+            assert!(write.as_mut().now_or_never().is_none());
+            drop(write);
+
+            let registrar = node.store.registrar();
+            {
+                let pending = registrar.pending.lock().unwrap();
+                assert!(
+                    pending.waiting.contains("c1"),
+                    "the cancelled flush took a queued cell with it"
+                );
+                assert!(!pending.waiting.contains("c9"), "{:?}", pending.waiting);
+            }
+            node.gate.add_permits(1);
+            {
+                let _turn = registrar.flushing.lock().await;
+                registrar.flush().await.unwrap();
+            }
+            assert!(registrar.is_registered("c1"));
+            node.finish().await;
+        });
+    }
+
     #[tokio::test]
     async fn a_failed_write_does_not_take_back_a_cell_queued_at_its_claim() {
         let inner = Arc::new(InMemory::new());
@@ -873,7 +928,12 @@ mod tests {
         // A flush in flight holds the cell, so it is out of the queue.
         registrar.pending.lock().unwrap().waiting.clear();
         // The segment key the write's flush uses is taken, so it fails.
-        put_segment(&inner, "fleet-a/fleet/born/node-a/gen1/00000000", b"").await;
+        put_segment(
+            &inner,
+            "fleet-a/fleet/dir/v2/born/node-a/gen1/00000000",
+            b"",
+        )
+        .await;
         let ltx = Path::from("fleet-a/cells/c1/ltx/e1/0000/0001.ltx");
         store
             .put(&ltx, PutPayload::from_static(b"x"))
@@ -904,7 +964,7 @@ mod tests {
             // Queued cells answer Exists at once, and a second claim is a no-op.
             node.directory.register_at_claim("c1");
             assert_eq!(
-                node.directory.lookup("c2", at(0)).await,
+                node.directory.lookup("c2", 0).await,
                 DirectoryAnswer::Exists
             );
             node.finish().await;
@@ -918,7 +978,7 @@ mod tests {
             // The first segment's key is taken, so the first flush fails.
             put_segment(
                 &node.counting.inner,
-                "fleet-a/fleet/born/node-a/gen1/00000000",
+                "fleet-a/fleet/dir/v2/born/node-a/gen1/00000000",
                 b"",
             )
             .await;
@@ -1018,7 +1078,7 @@ mod tests {
         let store = store_over(&inner, &directory);
 
         ltx_put(&store, "c1").await;
-        assert_eq!(directory.lookup("c1", at(0)).await, DirectoryAnswer::Exists);
+        assert_eq!(directory.lookup("c1", 0).await, DirectoryAnswer::Exists);
 
         store.registrar().tombstone(&names(&["c1"])).await.unwrap();
         assert_eq!(
@@ -1027,15 +1087,12 @@ mod tests {
             "the tombstone is a segment"
         );
         // This node no longer vouches for the cell; the tiers decide.
-        assert_eq!(
-            directory.lookup("c1", at(1)).await,
-            DirectoryAnswer::Unknown
-        );
+        assert_eq!(directory.lookup("c1", 1).await, DirectoryAnswer::Unknown);
 
         // The recreated stream registers again, in a later segment.
         ltx_put(&store, "c1").await;
         assert_eq!(segments(&inner).await.len(), 3);
-        assert_eq!(directory.lookup("c1", at(2)).await, DirectoryAnswer::Exists);
+        assert_eq!(directory.lookup("c1", 2).await, DirectoryAnswer::Exists);
     }
 
     #[tokio::test]
@@ -1045,13 +1102,18 @@ mod tests {
         let store = store_over(&inner, &directory);
         ltx_put(&store, "c1").await;
         // The next sequence number is taken, so the tombstone write fails.
-        put_segment(&inner, "fleet-a/fleet/born/node-a/gen1/00000001", b"").await;
+        put_segment(
+            &inner,
+            "fleet-a/fleet/dir/v2/born/node-a/gen1/00000001",
+            b"",
+        )
+        .await;
         store
             .registrar()
             .tombstone(&names(&["c1"]))
             .await
             .expect_err("a tombstone that is not durable must fail the deletion");
-        assert_eq!(directory.lookup("c1", at(0)).await, DirectoryAnswer::Exists);
+        assert_eq!(directory.lookup("c1", 0).await, DirectoryAnswer::Exists);
         // The cell registers again with its next write, which outranks a
         // tombstone that may have landed anyway.
         ltx_put(&store, "c1").await;

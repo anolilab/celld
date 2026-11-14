@@ -631,11 +631,7 @@ impl BucketOwnership {
         cell: &str,
     ) -> Option<celld_logic::cell_directory::DirectoryAnswer> {
         let directory = self.cell_directory.as_ref()?;
-        Some(
-            directory
-                .lookup(cell, crate::cell_directory::Now::current())
-                .await,
-        )
+        Some(directory.lookup(cell, crate::asyncrt::mono_ms()).await)
     }
 
     /// Count one answer of the directory beside the listing of the same claim.

@@ -132,7 +132,7 @@ struct ScenarioResult {
 
 /// The compactor reads its ledger once per pass and nothing else reads it. The
 /// shape has the partition count's digits masked.
-const LEDGER: &str = "fleet/dir/k#/ledger";
+const LEDGER: &str = "fleet/dir/v#/ledger";
 
 impl ScenarioResult {
     /// Requests of `class` per agent whose key `keep` accepts, nothing

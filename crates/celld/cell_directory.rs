@@ -3,34 +3,38 @@
 //! The fleet directory of cells that have per-cell LTX.
 //!
 //! A node that writes LTX for a cell registers the cell in a create-only
-//! segment, `fleet/born/<node>/<generation>/<seq:08>`, before the cell's first
-//! LTX object exists. The registration is queued when the cell is first claimed
-//! and written by a background flusher every batch window, so a first write
-//! waits only when its segment is not durable yet (see
-//! `cell_directory_registrar`). A segment body is sorted cell ids, one per
-//! line; a line that starts with a tab is a tombstone. No production path
-//! writes one yet, so no entry ends.
+//! segment, `fleet/dir/v2/born/<node>/<generation>/<seq:08>`, before the cell's
+//! first LTX object exists. The registration is queued when the cell is first
+//! claimed and written by a background flusher every batch window; the cell's
+//! first write waits for that flush (see `cell_directory_registrar`). A segment
+//! body is sorted cell ids, one per line; a line that starts with a tab is a
+//! tombstone. No production path writes one yet, so no entry ends.
 //!
 //! Only the compactor (see `cell_directory_compactor`) lists and reads
 //! segments. Every pass folds them into partitioned runs of 64-bit fingerprints
-//! under `fleet/dir/k256/` and then publishes a freshness marker: when it
-//! published, and how old its oldest unfolded segment was. A node never reads a
-//! segment. A lookup is the node's own registrations, which it keeps in memory
+//! under `fleet/dir/v2/` and then publishes a freshness marker: a generation,
+//! and how old its oldest unfolded segment was, as a duration. A node never reads
+//! a segment. A lookup is the node's own registrations, which it keeps in memory
 //! until a marker covers them, then the marker, the cell's partition head, and
 //! one ranged read per tier. Memory is bounded by the registrations of the last
 //! few minutes, never by the number of cells.
 //!
-//! A lookup answers `New` only while the marker is recent, and the blind window
-//! is [`BLIND_WINDOW_MS`]: a cell whose registration became durable less than
-//! that ago, by another node or by an earlier process of this one, may be
-//! missing from the runs, and reads `New`. The window is counted from the
-//! durable segment, which precedes the cell's first LTX object, so it is also
-//! how long LTX can exist beside a `New`. A reader whose wall clock differs
-//! from the compactor's trusts a marker for less time, never more; the bucket's
-//! clock against the compactor's moves the age of a segment a pass left
-//! unfolded by their difference. A
-//! missing or unreadable marker, a marker older than the window, a dead
-//! compactor, or a failed read answers `Unknown`, which sends the caller to the
+//! A cell found in the runs is `Exists` whatever the marker says: a registration
+//! is never removed. `New` needs a marker that is known to be recent, and a
+//! reader knows that without comparing its clock with the compactor's: it notes
+//! its own monotonic time at each read of the marker, and when a read returns a
+//! marker other than the last, that marker was published after the previous
+//! read, so the time since that read is at least its age. A marker seen for the
+//! first time, or after the reader's cache was empty, has no such time and
+//! answers nothing about absence. The blind window is [`BLIND_WINDOW_MS`] of
+//! that age plus the marker's own unfolded backlog: a cell whose registration
+//! became durable less than that ago, by another node or by an earlier process of
+//! this one, may be missing from the runs, and reads `New`. The window is
+//! counted from the durable segment, which precedes the cell's first LTX object,
+//! so it is also how long LTX can exist beside a `New`. A compactor that stops
+//! shows as a generation that does not change. A missing or unreadable marker, a
+//! marker with no observed age or older than the window, or a failed read answers
+//! `Unknown` for a cell the runs do not hold, which sends the caller to the
 //! listing.
 //!
 //! This is the shadow stage: the claim guard still decides with a LIST and
@@ -40,18 +44,20 @@ use crate::cell_directory_registrar::Registrar;
 use crate::cell_directory_runs::{probe_run, read_head, read_marker, Head, Marker};
 use crate::cell_directory_segments::fingerprint;
 use celld_logic::cell_directory::{
-    answer_from_tiers, marker_allows_new, marker_covers, partition_of, presence_across_tiers,
-    view_is_fresh, DirectoryAnswer, Presence, TierProbe,
+    answer_from_tiers, marker_allows_new, partition_of, presence_across_tiers,
+    registration_covered, view_is_fresh, DirectoryAnswer, Presence, TierProbe,
 };
 use object_store::ObjectStore;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
 /// How far behind the directory is allowed to be and still rule a cell out:
 /// three compaction intervals. A healthy marker is at most one interval and a
-/// pass old, its own age counts the pass once more, and the cache and clock
-/// skew take the rest, so a pass that finishes in 55 s keeps every answer
-/// available. A longer window would only widen what `New` can miss.
+/// pass old, its own age counts the pass once more, and the reader's last read
+/// before it appeared (at most the cache's age, or a gap between lookups) the
+/// rest, so a pass that finishes in 55 s keeps every answer available. A longer
+/// window would only widen what `New` can miss.
 pub(crate) const BLIND_WINDOW_MS: u64 = 180_000;
 
 /// How long a node trusts the marker it read. A newer marker only ever helps,
@@ -59,9 +65,8 @@ pub(crate) const BLIND_WINDOW_MS: u64 = 180_000;
 /// the staleness of an answer.
 pub(crate) const MARKER_TTL_MS: u64 = 5_000;
 
-/// The allowance for two nodes' wall clocks to differ, where one node's time is
-/// compared with another's: an own registration with the compactor's marker, and
-/// a ledger one compactor wrote with the pass of the next.
+/// The allowance for two compactors' wall clocks to differ, where a ledger one
+/// wrote is read by the pass of the next. Readers compare no clocks.
 pub(crate) const CLOCK_SKEW_MS: u64 = 5_000;
 
 /// Registrations a node holds while it waits for a marker to cover them: three
@@ -69,35 +74,26 @@ pub(crate) const CLOCK_SKEW_MS: u64 = 5_000;
 /// stalled compactor reaches it after days at the planned rate.
 const OWN_CAP: usize = 1 << 19;
 
-/// Both clocks a lookup needs: the monotonic one times caches, the wall clock
-/// is the only one a marker's publisher and its readers share. They are never
-/// subtracted from each other.
-#[derive(Debug, Clone, Copy)]
-pub struct Now {
-    pub mono_ms: u64,
-    pub wall_ms: u64,
+/// The longest a first write waits for the background flush of a cell queued at
+/// its claim before it flushes itself: one and a half windows, the window the
+/// flusher lets cells gather and the time its write then takes.
+pub(crate) fn first_write_wait(batch_window: Duration) -> Duration {
+    batch_window.saturating_mul(3) / 2
 }
 
-impl Now {
-    pub fn current() -> Self {
-        Self {
-            mono_ms: crate::asyncrt::mono_ms(),
-            wall_ms: crate::ownership_store::now_ms(),
-        }
-    }
-}
-
-/// Refuse a batch window of half the durability budget or more. A first write
-/// for a cell queued at its claim waits for the flush, up to one and a half
-/// windows, and then writes its own segment, so a window of half the budget or
-/// more can leave no time for the upload itself and nothing would be tiered.
+/// Refuse a batch window whose longest first-write wait would use three
+/// quarters of the durability budget or more, which is a window of half the
+/// budget or more. The write must still make its own segment upload inside the
+/// budget, and one that misses it is never tiered.
 pub(crate) fn check_batch_window(batch_ms: u64, durability_timeout_ms: u64) -> anyhow::Result<()> {
+    let wait = first_write_wait(Duration::from_millis(batch_ms));
     anyhow::ensure!(
-        batch_ms < durability_timeout_ms / 2,
+        wait < Duration::from_millis(durability_timeout_ms) / 4 * 3,
         "CELLD_CELL_DIRECTORY_BATCH_MS={batch_ms} must be below half of \
          CELLD_LTX_DURABILITY_TIMEOUT_SECS ({durability_timeout_ms} ms): a cell's first LTX \
-         write waits for its registration, and one that waits that long misses its durability \
-         deadline, so nothing would reach the bucket"
+         write waits up to 1.5 times the window for its registration, {} ms here, and then \
+         needs the rest of the deadline for its own upload, so nothing would reach the bucket",
+        wait.as_millis()
     );
     Ok(())
 }
@@ -114,8 +110,8 @@ struct CachedHead {
 /// This process's own registrations.
 #[derive(Debug, Default)]
 struct Own {
-    /// Fingerprints with the wall clock at which their segment became durable,
-    /// `None` while it is not. An entry stays until a marker covers it.
+    /// Fingerprints with the node's monotonic time at which their segment became
+    /// durable, `None` while it is not. An entry stays until a marker covers it.
     cells: HashMap<u64, Option<u64>>,
     /// Set when entries were dropped at the cap: the latest time at which a
     /// dropped entry's segment became durable, `u64::MAX` if one was not yet.
@@ -158,10 +154,19 @@ impl Own {
     }
 }
 
+/// The marker as this node last read it, and what it knows about its age.
 #[derive(Debug, Default)]
-struct CachedMarker {
+struct MarkerView {
     marker: Option<Marker>,
-    fetched_mono_ms: Option<u64>,
+    /// When the node last read the marker, or found there was none.
+    read_ms: Option<u64>,
+    /// When the node last tried to read it, for the cache: a read that failed
+    /// counts, and changes nothing else.
+    attempted_ms: Option<u64>,
+    /// A time on the node's clock before which the marker was not published: the
+    /// node's last read that still returned the marker before it. `None` for a
+    /// marker the node saw first, or after a read that found none.
+    anchor_ms: Option<u64>,
 }
 
 /// One node's view of the directory: its own registrations, the marker it last
@@ -174,7 +179,7 @@ pub struct CellDirectory {
     own: Mutex<Own>,
     own_cap: usize,
     /// Held across a read, so a burst of lookups reads the marker once.
-    marker: tokio::sync::Mutex<CachedMarker>,
+    marker: tokio::sync::Mutex<MarkerView>,
     heads: Mutex<HashMap<u16, CachedHead>>,
     registrar: OnceLock<Weak<Registrar>>,
 }
@@ -212,44 +217,38 @@ impl CellDirectory {
         }
     }
 
-    /// What the directory says about `cell`. A lookup this node's own
-    /// registrations settle costs no request; otherwise it is the marker, which
-    /// is cached, one head read and one ranged read per tier.
-    pub async fn lookup(&self, cell: &str, now: Now) -> DirectoryAnswer {
+    /// What the directory says about `cell` at `now_ms` on the node's monotonic
+    /// clock. A lookup this node's own registrations settle costs no request;
+    /// otherwise it is the marker, which is cached, one head read and one ranged
+    /// read per tier.
+    pub async fn lookup(&self, cell: &str, now_ms: u64) -> DirectoryAnswer {
         let fp = fingerprint(cell);
-        let forgotten_ms = {
+        let forgotten = {
             let own = self.own.lock().unwrap();
             if own.cells.contains_key(&fp) {
                 return DirectoryAnswer::Exists;
             }
-            own.forgotten_ms
+            own.forgotten_ms.is_some()
         };
-        let Some(marker) = self.marker(now.mono_ms).await else {
+        let Some((marker, anchor_ms)) = self.marker(now_ms).await else {
             return DirectoryAnswer::Unknown;
         };
-        if !marker_allows_new(
-            marker.published_ms,
-            marker.oldest_unfolded_age_ms,
-            now.wall_ms,
-            BLIND_WINDOW_MS,
-        ) {
-            return DirectoryAnswer::Unknown;
-        }
-        if forgotten_ms.is_some_and(|forgotten| {
-            !marker_covers(
-                Some(forgotten),
-                marker.published_ms,
-                marker.oldest_unfolded_age_ms,
-                CLOCK_SKEW_MS,
-            )
-        }) {
-            return DirectoryAnswer::Unknown;
-        }
         let partition = partition_of(fp);
         let Some(head) = self.head(partition, &marker).await else {
             return DirectoryAnswer::Unknown;
         };
-        answer_from_tiers(self.presence_in(&head, partition, fp).await)
+        let presence = self.presence_in(&head, partition, fp).await;
+        let recent = anchor_ms.is_some_and(|anchor_ms| {
+            marker_allows_new(
+                now_ms.saturating_sub(anchor_ms),
+                marker.oldest_unfolded_age_ms,
+                BLIND_WINDOW_MS,
+            )
+        });
+        if presence == Presence::Absent && (!recent || forgotten) {
+            return DirectoryAnswer::Unknown;
+        }
+        answer_from_tiers(presence)
     }
 
     async fn presence_in(&self, head: &Head, partition: u16, fp: u64) -> Presence {
@@ -267,45 +266,50 @@ impl CellDirectory {
         presence_across_tiers(&[l0, l1, l2])
     }
 
-    /// The marker, from the cache while it is younger than [`MARKER_TTL_MS`].
-    /// One that is missing or unreadable is `None`, and cached like any other
-    /// so a node without a compactor does not read it per lookup. A marker
-    /// read that differs from the last releases the own registrations it
-    /// covers.
-    async fn marker(&self, now_mono_ms: u64) -> Option<Marker> {
-        let mut cached = self.marker.lock().await;
-        if view_is_fresh(cached.fetched_mono_ms, now_mono_ms, MARKER_TTL_MS) {
-            return cached.marker.clone();
-        }
-        let read = match read_marker(self.store.as_ref(), &self.prefix).await {
-            Ok(read) => read,
-            Err(error) => {
-                tracing::debug!(%error, "cell directory marker unreadable");
-                None
+    /// The marker with the time it is known to be no older than, from the cache
+    /// while the last attempt is younger than [`MARKER_TTL_MS`]. One that is
+    /// missing is `None`, and cached like any other so a node without a
+    /// compactor does not read it per lookup. A read that fails leaves the
+    /// marker and its age as they were, so a bucket error does not discard what
+    /// the node knows, and the marker ages out on its own if the errors last. A
+    /// read that finds a marker other than the last dates it from the read
+    /// before, and releases the own registrations it covers.
+    async fn marker(&self, now_ms: u64) -> Option<(Marker, Option<u64>)> {
+        let mut view = self.marker.lock().await;
+        if !view_is_fresh(view.attempted_ms, now_ms, MARKER_TTL_MS) {
+            view.attempted_ms = Some(now_ms);
+            match read_marker(self.store.as_ref(), &self.prefix).await {
+                Ok(read) => self.observe(&mut view, now_ms, read),
+                Err(error) => {
+                    tracing::warn!(%error, "cell directory marker unreadable; keeping the last one");
+                }
             }
-        };
-        cached.fetched_mono_ms = Some(now_mono_ms);
-        if let Some(marker) = &read {
-            self.release_covered(marker);
         }
-        cached.marker = read.clone();
-        read
+        view.marker.clone().map(|marker| (marker, view.anchor_ms))
     }
 
-    fn release_covered(&self, marker: &Marker) {
-        let covers = |durable_ms| {
-            marker_covers(
-                durable_ms,
-                marker.published_ms,
-                marker.oldest_unfolded_age_ms,
-                CLOCK_SKEW_MS,
-            )
+    /// Take a marker read, or the finding that there is none, into the view.
+    fn observe(&self, view: &mut MarkerView, now_ms: u64, read: Option<Marker>) {
+        view.anchor_ms = match (&view.marker, &read) {
+            (Some(last), Some(read)) if same_marker(last, read) => view.anchor_ms,
+            (Some(_), Some(_)) => view.read_ms,
+            _ => None,
         };
+        view.read_ms = Some(now_ms);
+        view.marker = read;
+        if let (Some(marker), Some(anchor_ms)) = (&view.marker, view.anchor_ms) {
+            self.release_covered(anchor_ms, marker.oldest_unfolded_age_ms);
+        }
+    }
+
+    fn release_covered(&self, anchor_ms: u64, oldest_unfolded_age_ms: u64) {
+        let covered =
+            |durable_ms| registration_covered(durable_ms, anchor_ms, oldest_unfolded_age_ms);
         let mut own = self.own.lock().unwrap();
-        own.cells.retain(|_, durable_ms| !covers(*durable_ms));
+        own.cells.retain(|_, durable_ms| !covered(*durable_ms));
         if own
             .forgotten_ms
-            .is_some_and(|forgotten| covers(Some(forgotten)))
+            .is_some_and(|forgotten| covered(Some(forgotten)))
         {
             own.forgotten_ms = None;
         }
@@ -350,11 +354,12 @@ impl CellDirectory {
             .insert(self.own_cap, fingerprint(cell), None);
     }
 
-    /// The segment carrying `cells` is durable as of `wall_ms`.
-    pub(crate) fn own_durable(&self, cells: &BTreeSet<String>, wall_ms: u64) {
+    /// The segment carrying `cells` is durable as of `now_ms`, on the node's
+    /// monotonic clock.
+    pub(crate) fn own_durable(&self, cells: &BTreeSet<String>, now_ms: u64) {
         let mut own = self.own.lock().unwrap();
         for cell in cells {
-            own.insert(self.own_cap, fingerprint(cell), Some(wall_ms));
+            own.insert(self.own_cap, fingerprint(cell), Some(now_ms));
         }
     }
 
@@ -367,6 +372,12 @@ impl CellDirectory {
             own.cells.remove(&fingerprint(cell));
         }
     }
+}
+
+/// Whether two reads returned the same marker. A marker recreated after a loss
+/// starts its generation over, so the publish time is part of the identity.
+fn same_marker(left: &Marker, right: &Marker) -> bool {
+    left.generation == right.generation && left.published_ms == right.published_ms
 }
 
 #[cfg(test)]
@@ -383,6 +394,22 @@ mod tests {
     use object_store::path::Path;
     use object_store::ObjectStoreExt as _;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn the_longest_first_write_wait_leaves_a_quarter_of_the_budget_for_the_upload() {
+        for budget_ms in [2_000_u64, 10_000, 21_000, 60_000] {
+            let longest = (0..budget_ms)
+                .rev()
+                .find(|batch_ms| check_batch_window(*batch_ms, budget_ms).is_ok())
+                .expect("a window is accepted");
+            let wait = first_write_wait(Duration::from_millis(longest));
+            assert!(
+                wait <= Duration::from_millis(budget_ms) / 4 * 3,
+                "{budget_ms}: a window of {longest} ms waits {wait:?}"
+            );
+            assert!(check_batch_window(longest + 1, budget_ms).is_err());
+        }
+    }
 
     #[test]
     fn a_batch_window_at_or_above_half_the_durability_budget_is_refused() {
@@ -429,14 +456,13 @@ mod tests {
         assert_eq!(result, Cas::Applied);
     }
 
-    /// A marker published at `published_ms`, as a compactor with a clock in
-    /// step with the test's does: each later one has a later time and a later
-    /// generation.
-    async fn publish(inner: &Arc<InMemory>, published_ms: u64, oldest_unfolded_age_ms: u64) {
-        publish_generation(inner, published_ms, published_ms, oldest_unfolded_age_ms).await;
+    /// A marker of `generation`, published at a time no clock here agrees with:
+    /// a reader must not depend on it.
+    async fn publish(inner: &Arc<InMemory>, generation: u64, oldest_unfolded_age_ms: u64) {
+        publish_at(inner, generation, 7, oldest_unfolded_age_ms).await;
     }
 
-    async fn publish_generation(
+    async fn publish_at(
         inner: &Arc<InMemory>,
         generation: u64,
         published_ms: u64,
@@ -450,6 +476,17 @@ mod tests {
         .await;
     }
 
+    /// Two reads that return different markers, the first at `0` and the second
+    /// after the cache's time, which gives the reader `0` to count the marker's
+    /// age from. Neither marker has an unfolded backlog, and the next generation
+    /// is `3`.
+    async fn observe_a_change(inner: &Arc<InMemory>, reader: &CellDirectory) {
+        publish(inner, 1, 0).await;
+        let _ = reader.lookup("probe", 0).await;
+        publish(inner, 2, 0).await;
+        let _ = reader.lookup("probe", MARKER_TTL_MS + 1).await;
+    }
+
     fn a_cell_in(partition: u16, not: &str) -> String {
         (0..)
             .map(|index| format!("cell-{index}"))
@@ -458,36 +495,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fresh_marker_lets_the_tiers_answer_new() {
+    async fn a_marker_seen_for_the_first_time_rules_no_cell_out() {
         let inner = Arc::new(InMemory::new());
         let partition = partition_of(fingerprint("old"));
         write_head(&inner, partition, &["old"], "l2").await;
-        publish(&inner, 1_000, 0).await;
+        // However recent its publish time says it is, a reader that has seen
+        // nothing before it cannot know how long ago it was published.
+        publish_at(&inner, 5, u64::MAX, 0).await;
         let reader = directory_over(&inner);
-        assert_eq!(
-            reader.lookup("old", at(1_001)).await,
-            DirectoryAnswer::Exists
-        );
         let other = a_cell_in(partition, "old");
-        assert_eq!(reader.lookup(&other, at(1_001)).await, DirectoryAnswer::New);
+        assert_eq!(reader.lookup(&other, 1).await, DirectoryAnswer::Unknown);
+        // A cell the runs hold is `Exists` all the same: a registration never ends.
+        assert_eq!(reader.lookup("old", 1).await, DirectoryAnswer::Exists);
+        // The same marker, read again, is still not a change.
         assert_eq!(
-            reader.lookup(&other, at(1_000 + BLIND_WINDOW_MS)).await,
+            reader.lookup(&other, 2 * MARKER_TTL_MS).await,
+            DirectoryAnswer::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn a_marker_that_changes_between_reads_lets_the_tiers_answer_new() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("old"));
+        write_head(&inner, partition, &["old"], "l2").await;
+        let reader = directory_over(&inner);
+        observe_a_change(&inner, &reader).await;
+        let other = a_cell_in(partition, "old");
+        let at_ms = MARKER_TTL_MS + 2;
+        assert_eq!(reader.lookup("old", at_ms).await, DirectoryAnswer::Exists);
+        assert_eq!(reader.lookup(&other, at_ms).await, DirectoryAnswer::New);
+        // Counted from the read before the change, which was at 0.
+        assert_eq!(
+            reader.lookup(&other, BLIND_WINDOW_MS).await,
             DirectoryAnswer::New
         );
     }
 
     #[tokio::test]
-    async fn a_marker_older_than_the_blind_window_answers_unknown() {
+    async fn the_publish_time_is_never_compared_with_the_readers_clock() {
         let inner = Arc::new(InMemory::new());
         let partition = partition_of(fingerprint("old"));
         write_head(&inner, partition, &["old"], "l2").await;
-        publish(&inner, 1_000, 0).await;
-        let reader = directory_over(&inner);
         let other = a_cell_in(partition, "old");
-        // A compactor that died leaves its last marker to age.
+        // A compactor whose clock is a day behind, and one a day ahead.
+        for published_ms in [0, 1, u64::MAX] {
+            let reader = directory_over(&inner);
+            publish_at(&inner, 1, published_ms, 0).await;
+            let _ = reader.lookup("probe", 0).await;
+            publish_at(&inner, 2, published_ms, 0).await;
+            let _ = reader.lookup("probe", MARKER_TTL_MS + 1).await;
+            assert_eq!(
+                reader.lookup(&other, MARKER_TTL_MS + 2).await,
+                DirectoryAnswer::New,
+                "published_ms {published_ms}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_marker_that_stops_changing_ages_out() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("old"));
+        write_head(&inner, partition, &["old"], "l2").await;
+        let reader = directory_over(&inner);
+        observe_a_change(&inner, &reader).await;
+        let other = a_cell_in(partition, "old");
+        // A compactor that died leaves its last marker, and the reader counts
+        // the time it has gone unchanged.
         assert_eq!(
-            reader.lookup(&other, at(1_000 + BLIND_WINDOW_MS + 1)).await,
+            reader.lookup(&other, BLIND_WINDOW_MS + 1).await,
             DirectoryAnswer::Unknown
+        );
+        assert_eq!(
+            reader.lookup("old", BLIND_WINDOW_MS + 1).await,
+            DirectoryAnswer::Exists
         );
     }
 
@@ -497,19 +579,31 @@ mod tests {
         let partition = partition_of(fingerprint("old"));
         write_head(&inner, partition, &["old"], "l2").await;
         let other = a_cell_in(partition, "old");
+        let observe = |age: u64| {
+            let inner = inner.clone();
+            async move {
+                let reader = directory_over(&inner);
+                publish(&inner, 1, 0).await;
+                let _ = reader.lookup("probe", 0).await;
+                publish(&inner, 2, age).await;
+                let _ = reader.lookup("probe", MARKER_TTL_MS + 1).await;
+                reader
+            }
+        };
         // The backlog's age counts against the window from the start.
-        publish(&inner, 1_000, BLIND_WINDOW_MS + 1).await;
-        let reader = directory_over(&inner);
+        let reader = observe(BLIND_WINDOW_MS + 1).await;
         assert_eq!(
-            reader.lookup(&other, at(1_000)).await,
+            reader.lookup(&other, MARKER_TTL_MS + 2).await,
             DirectoryAnswer::Unknown
         );
         // One that leaves room is a shorter window, not an unknown.
-        publish(&inner, 1_000, BLIND_WINDOW_MS - 10_000).await;
-        let reader = directory_over(&inner);
-        assert_eq!(reader.lookup(&other, at(1_000)).await, DirectoryAnswer::New);
+        let reader = observe(BLIND_WINDOW_MS - 10_000).await;
         assert_eq!(
-            reader.lookup(&other, at(1_000 + 10_001)).await,
+            reader.lookup(&other, MARKER_TTL_MS + 2).await,
+            DirectoryAnswer::New
+        );
+        assert_eq!(
+            reader.lookup(&other, 10_001).await,
             DirectoryAnswer::Unknown
         );
     }
@@ -521,18 +615,18 @@ mod tests {
         write_head(&inner, partition, &["old"], "l2").await;
         let other = a_cell_in(partition, "old");
         let reader = directory_over(&inner);
+        assert_eq!(reader.lookup(&other, 10).await, DirectoryAnswer::Unknown);
+        // A marker that appears later is a first sight, not a change.
+        observe_a_change(&inner, &reader).await;
         assert_eq!(
-            reader.lookup(&other, at(10)).await,
+            reader.lookup(&other, MARKER_TTL_MS + 2).await,
             DirectoryAnswer::Unknown
         );
 
         let key = crate::cell_directory_runs::marker_key(PREFIX);
         put_segment(&inner, &key, b"{").await;
         let reader = directory_over(&inner);
-        assert_eq!(
-            reader.lookup(&other, at(10)).await,
-            DirectoryAnswer::Unknown
-        );
+        assert_eq!(reader.lookup(&other, 10).await, DirectoryAnswer::Unknown);
         // A marker of another format.
         let marker = Marker {
             v: 99,
@@ -540,49 +634,132 @@ mod tests {
         };
         put_segment(&inner, &key, &encode_json(&marker)).await;
         let reader = directory_over(&inner);
+        assert_eq!(reader.lookup(&other, 10).await, DirectoryAnswer::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_failed_marker_read_keeps_the_last_marker_and_its_age() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("old"));
+        write_head(&inner, partition, &["old"], "l2").await;
+        let other = a_cell_in(partition, "old");
+        let reader = directory_over(&inner);
+        observe_a_change(&inner, &reader).await;
         assert_eq!(
-            reader.lookup(&other, at(10)).await,
+            reader.lookup(&other, MARKER_TTL_MS + 2).await,
+            DirectoryAnswer::New
+        );
+
+        // The marker can not be read now. The node still knows what it read, and
+        // counts its age from the same time.
+        let key = crate::cell_directory_runs::marker_key(PREFIX);
+        put_segment(&inner, &key, b"{").await;
+        assert_eq!(
+            reader.lookup(&other, 3 * MARKER_TTL_MS).await,
+            DirectoryAnswer::New,
+            "a read error discarded the marker the node had"
+        );
+        // If the errors last, the marker ages out like one that stopped changing.
+        assert_eq!(
+            reader.lookup(&other, BLIND_WINDOW_MS + 1).await,
             DirectoryAnswer::Unknown
         );
     }
 
     #[tokio::test]
-    async fn the_marker_is_read_once_per_ttl_and_the_age_is_judged_on_every_lookup() {
+    async fn a_marker_that_is_gone_is_forgotten_with_its_age() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("old"));
+        write_head(&inner, partition, &["old"], "l2").await;
+        let other = a_cell_in(partition, "old");
+        let reader = directory_over(&inner);
+        observe_a_change(&inner, &reader).await;
+
+        // Not an error: there is no marker. A later one starts over.
+        let key = crate::cell_directory_runs::marker_key(PREFIX);
+        inner.delete(&Path::from(key.as_str())).await.unwrap();
+        assert_eq!(
+            reader.lookup(&other, 3 * MARKER_TTL_MS).await,
+            DirectoryAnswer::Unknown
+        );
+        publish(&inner, 3, 0).await;
+        assert_eq!(
+            reader.lookup(&other, 5 * MARKER_TTL_MS).await,
+            DirectoryAnswer::Unknown,
+            "a marker seen after none is a first sight"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_marker_without_this_layouts_version_is_not_read() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("old"));
+        write_head(&inner, partition, &["old"], "l2").await;
+        let other = a_cell_in(partition, "old");
+        let key = crate::cell_directory_runs::marker_key(PREFIX);
+        // No version at all; the version of the layout before this one, which
+        // had the same fields; and a later one.
+        let bodies = [
+            r#"{"generation":GEN,"published_ms":1,"oldest_unfolded_age_ms":0}"#,
+            r#"{"v":2,"generation":GEN,"published_ms":1,"oldest_unfolded_age_ms":0}"#,
+            r#"{"v":4,"generation":GEN,"published_ms":1,"oldest_unfolded_age_ms":0}"#,
+        ];
+        for body in bodies {
+            let reader = directory_over(&inner);
+            // Two reads that would each be a change, if the marker were read.
+            for generation in ["1", "2"] {
+                let body = body.replace("GEN", generation);
+                put_segment(&inner, &key, body.as_bytes()).await;
+                let at_ms = if generation == "1" {
+                    0
+                } else {
+                    MARKER_TTL_MS + 1
+                };
+                let _ = reader.lookup("probe", at_ms).await;
+            }
+            assert_eq!(
+                reader.lookup(&other, MARKER_TTL_MS + 2).await,
+                DirectoryAnswer::Unknown,
+                "{body}"
+            );
+        }
+        // The same fields with this layout's version are read.
+        let reader = directory_over(&inner);
+        observe_a_change(&inner, &reader).await;
+        assert_eq!(
+            reader.lookup(&other, MARKER_TTL_MS + 2).await,
+            DirectoryAnswer::New
+        );
+    }
+
+    #[tokio::test]
+    async fn the_marker_is_read_once_per_ttl_and_its_age_is_judged_on_every_lookup() {
         let counting = Arc::new(Counting::default());
         let partition = partition_of(fingerprint("old"));
         write_head(&counting.inner, partition, &["old"], "l2").await;
-        publish(&counting.inner, 1_000, 0).await;
         let other = a_cell_in(partition, "old");
         let reader = CellDirectory::new(counting.clone(), PREFIX.to_owned());
-        let at_ms = |mono_ms: u64, wall_ms: u64| Now { mono_ms, wall_ms };
+        observe_a_change(&counting.inner, &reader).await;
+        counting.reset();
 
-        assert_eq!(
-            reader.lookup(&other, at_ms(0, 1_000)).await,
-            DirectoryAnswer::New
-        );
+        let first = MARKER_TTL_MS + 2;
+        assert_eq!(reader.lookup(&other, first).await, DirectoryAnswer::New);
+        assert_eq!(counting.whole_gets.load(Ordering::SeqCst), 1, "head only");
+        // Within the cache's time the marker is not read again: the read that
+        // `observe_a_change` made was at one more than the cache's time.
         counting.reset();
         assert_eq!(
-            reader.lookup(&other, at_ms(MARKER_TTL_MS, 1_000)).await,
+            reader.lookup(&other, 2 * MARKER_TTL_MS + 1).await,
             DirectoryAnswer::New
         );
-        assert_eq!(
-            counting.whole_gets.load(Ordering::SeqCst),
-            0,
-            "marker cached"
-        );
+        assert_eq!(counting.whole_gets.load(Ordering::SeqCst), 0, "all cached");
         // The cache does not stretch the marker's own age.
         assert_eq!(
-            reader
-                .lookup(&other, at_ms(MARKER_TTL_MS, 1_000 + BLIND_WINDOW_MS + 1))
-                .await,
+            reader.lookup(&other, BLIND_WINDOW_MS + 1).await,
             DirectoryAnswer::Unknown
         );
-        assert_eq!(counting.whole_gets.load(Ordering::SeqCst), 0);
-        let _ = reader.lookup(&other, at_ms(MARKER_TTL_MS + 1, 1_000)).await;
-        assert!(
-            counting.whole_gets.load(Ordering::SeqCst) >= 1,
-            "marker re-read"
-        );
+        let reads = counting.whole_gets.load(Ordering::SeqCst);
+        assert_eq!(reads, 1, "one marker read after the cache expired");
     }
 
     #[tokio::test]
@@ -590,106 +767,78 @@ mod tests {
         let counting = Arc::new(Counting::default());
         let partition = partition_of(fingerprint("old"));
         write_head(&counting.inner, partition, &["old"], "l2").await;
-        publish(&counting.inner, 1_000, 0).await;
         let reader = CellDirectory::new(counting.clone(), PREFIX.to_owned());
-        let at_ms = |mono_ms: u64, wall_ms: u64| Now { mono_ms, wall_ms };
         let other = a_cell_in(partition, "old");
+        observe_a_change(&counting.inner, &reader).await;
         assert_eq!(
-            reader.lookup(&other, at_ms(0, 1_001)).await,
+            reader.lookup(&other, MARKER_TTL_MS + 2).await,
             DirectoryAnswer::New
         );
 
         // A pass folded `other`: a new head, and a marker after it.
-        let key = run_key(partition, "l0", "gen2", 2);
-        let run = write_run(
-            counting.inner.as_ref(),
-            PREFIX,
-            &key,
-            &[Record {
-                fp: fingerprint(&other),
-                kind: Kind::Born,
-            }],
-        )
-        .await
-        .unwrap();
-        let mut head =
-            crate::cell_directory_runs::read_head(counting.inner.as_ref(), PREFIX, partition)
-                .await
-                .unwrap()
-                .unwrap();
-        head.value.l0 = Some(run);
-        head.value.rev += 1;
-        put_if(
-            counting.inner.as_ref(),
-            &head_key(PREFIX, partition),
-            encode_json(&head.value),
-            Some(head.version),
-        )
-        .await
-        .unwrap();
-        publish(&counting.inner, 61_000, 0).await;
+        fold_into_l0(&counting.inner, partition, &other).await;
+        publish(&counting.inner, 3, 0).await;
 
-        // The marker is not re-read yet, so the old head still stands in for it.
+        // The marker is not read again yet, so the old head still stands in for it.
         assert_eq!(
-            reader.lookup(&other, at_ms(MARKER_TTL_MS, 61_001)).await,
+            reader.lookup(&other, 2 * MARKER_TTL_MS).await,
             DirectoryAnswer::New
         );
         // Once it is, the cached head is older than the marker and is read again.
         assert_eq!(
-            reader
-                .lookup(&other, at_ms(MARKER_TTL_MS + 1, 61_002))
-                .await,
+            reader.lookup(&other, 3 * MARKER_TTL_MS).await,
             DirectoryAnswer::Exists
         );
     }
 
-    #[tokio::test]
-    async fn a_later_marker_from_an_earlier_clock_still_replaces_the_cached_head() {
-        let counting = Arc::new(Counting::default());
-        let partition = partition_of(fingerprint("old"));
-        write_head(&counting.inner, partition, &["old"], "l2").await;
-        let other = a_cell_in(partition, "old");
-        // A compactor whose clock runs ahead published generation 1.
-        publish_generation(&counting.inner, 1, 100_000, 0).await;
-        let reader = CellDirectory::new(counting.clone(), PREFIX.to_owned());
-        let at_ms = |mono_ms: u64| Now {
-            mono_ms,
-            wall_ms: 100_001,
-        };
-        assert_eq!(reader.lookup(&other, at_ms(0)).await, DirectoryAnswer::New);
-
-        // The lease moved to a compactor whose clock is behind. Its pass folds
-        // `other` and publishes generation 2 with an earlier time.
+    /// A pass of another compactor, which folds `cell` into the partition's L0.
+    async fn fold_into_l0(inner: &Arc<InMemory>, partition: u16, cell: &str) {
         let key = run_key(partition, "l0", "gen2", 2);
         let run = write_run(
-            counting.inner.as_ref(),
+            inner.as_ref(),
             PREFIX,
             &key,
             &[Record {
-                fp: fingerprint(&other),
+                fp: fingerprint(cell),
                 kind: Kind::Born,
             }],
         )
         .await
         .unwrap();
-        let mut head = read_head(counting.inner.as_ref(), PREFIX, partition)
+        let mut head = read_head(inner.as_ref(), PREFIX, partition)
             .await
             .unwrap()
             .unwrap();
         head.value.l0 = Some(run);
         head.value.rev += 1;
         put_if(
-            counting.inner.as_ref(),
+            inner.as_ref(),
             &head_key(PREFIX, partition),
             encode_json(&head.value),
             Some(head.version),
         )
         .await
         .unwrap();
-        publish_generation(&counting.inner, 2, 50_000, 0).await;
+    }
+
+    #[tokio::test]
+    async fn a_later_marker_from_an_earlier_clock_still_replaces_the_cached_head() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("old"));
+        write_head(&inner, partition, &["old"], "l2").await;
+        let other = a_cell_in(partition, "old");
+        // A compactor whose clock runs ahead published generation 1.
+        publish_at(&inner, 1, 100_000, 0).await;
+        let reader = directory_over(&inner);
+        assert_eq!(reader.lookup(&other, 0).await, DirectoryAnswer::Unknown);
+
+        // The lease moved to a compactor whose clock is behind. Its pass folds
+        // `other` and publishes generation 2 with an earlier time.
+        fold_into_l0(&inner, partition, &other).await;
+        publish_at(&inner, 2, 50_000, 0).await;
 
         assert_eq!(
-            reader.lookup(&other, at_ms(10 * MARKER_TTL_MS)).await,
+            reader.lookup(&other, 10 * MARKER_TTL_MS).await,
             DirectoryAnswer::Exists,
             "a head read before generation 2 was reused for it"
         );
@@ -697,50 +846,60 @@ mod tests {
 
     #[tokio::test]
     async fn the_own_set_is_bounded_and_a_dropped_cell_is_unknown_until_a_marker_covers_it() {
-        let counting = Arc::new(Counting::default());
-        let directory = CellDirectory::new(counting.clone(), PREFIX.to_owned()).with_own_cap(4);
+        let inner = Arc::new(InMemory::new());
+        let directory = CellDirectory::new(inner.clone(), PREFIX.to_owned()).with_own_cap(4);
         let partition = partition_of(fingerprint("c0"));
-        write_head(&counting.inner, partition, &["other"], "l2").await;
+        write_head(&inner, partition, &["other"], "l2").await;
         for cell in ["c0", "c1", "c2", "c3"] {
             directory.note_own(cell);
         }
-        directory.own_durable(&names(&["c0", "c1", "c2", "c3"]), 1_000);
+        directory.own_durable(&names(&["c0", "c1", "c2", "c3"]), 20_000);
         directory.note_own("c4");
         assert_eq!(directory.own.lock().unwrap().cells.len(), 1);
 
-        // The marker is fresh and the head does not hold c0, which is the
+        // The marker is trusted and the head does not hold c0, which is the
         // answer `New` the dropped entry must not turn into.
-        publish(&counting.inner, 3_000, 0).await;
-        let at_ms = |mono_ms: u64, wall_ms: u64| Now { mono_ms, wall_ms };
+        observe_a_change(&inner, &directory).await;
+        let at_ms = MARKER_TTL_MS + 2;
         assert_eq!(
-            directory.lookup("c0", at_ms(0, 3_001)).await,
+            directory.lookup("c0", at_ms).await,
             DirectoryAnswer::Unknown
         );
         // A cell the node never held is as doubtful until the marker catches up.
         assert_eq!(
-            directory.lookup("never-held", at_ms(0, 3_001)).await,
+            directory.lookup("never-held", at_ms).await,
             DirectoryAnswer::Unknown
         );
 
-        publish(&counting.inner, 1_000 + CLOCK_SKEW_MS + 1_001, 0).await;
-        let later = at_ms(10 * MARKER_TTL_MS, 1_000 + CLOCK_SKEW_MS + 1_002);
-        assert_eq!(directory.lookup("c0", later).await, DirectoryAnswer::New);
+        // A later change, read after the dropped segments became durable and
+        // with nothing unfolded, covers them.
+        publish(&inner, 3, 0).await;
+        let _ = directory.lookup("probe", 4 * MARKER_TTL_MS + 20_000).await;
+        publish(&inner, 4, 0).await;
+        let later = 8 * MARKER_TTL_MS + 20_000;
+        let _ = directory.lookup("probe", later).await;
         assert_eq!(directory.own.lock().unwrap().forgotten_ms, None);
+        assert_eq!(
+            directory.lookup("c0", later + 1).await,
+            DirectoryAnswer::New
+        );
     }
 
     #[tokio::test]
     async fn dropping_a_registration_that_is_not_durable_is_never_covered() {
-        let counting = Arc::new(Counting::default());
-        let directory = CellDirectory::new(counting.clone(), PREFIX.to_owned()).with_own_cap(2);
+        let inner = Arc::new(InMemory::new());
+        let directory = CellDirectory::new(inner.clone(), PREFIX.to_owned()).with_own_cap(2);
         let partition = partition_of(fingerprint("c0"));
-        write_head(&counting.inner, partition, &["other"], "l2").await;
+        write_head(&inner, partition, &["other"], "l2").await;
         for cell in ["c0", "c1", "c2"] {
             directory.note_own(cell);
         }
         assert_eq!(directory.own.lock().unwrap().cells.len(), 1);
-        publish(&counting.inner, 1_000_000, 0).await;
+        observe_a_change(&inner, &directory).await;
+        publish(&inner, 3, 0).await;
+        let _ = directory.lookup("probe", 10_000_000).await;
         assert_eq!(
-            directory.lookup("c0", at(1_000_001)).await,
+            directory.lookup("c0", 10_000_001).await,
             DirectoryAnswer::Unknown,
             "no marker can cover a segment that was not durable"
         );
@@ -748,6 +907,7 @@ mod tests {
 
     #[tokio::test]
     async fn readers_never_request_a_segment() {
+        crate::asyncrt::install_test_host_runtime();
         let counting = Arc::new(Counting::default());
         let node = RegisteringStore::new(
             counting.clone(),
@@ -768,57 +928,55 @@ mod tests {
         assert!(written >= 1, "the writer wrote its segment");
         let partition = partition_of(fingerprint("old"));
         write_head(&counting.inner, partition, &["old"], "l2").await;
-        publish(&counting.inner, 1_000, 0).await;
 
         counting.born_requests.store(0, Ordering::SeqCst);
         let reader = CellDirectory::new(counting.clone(), PREFIX.to_owned());
+        observe_a_change(&counting.inner, &reader).await;
         let other = a_cell_in(partition, "old");
-        for (cell, wall_ms) in [
-            ("old", 1_001),
-            (other.as_str(), 1_001),
-            ("c1", 1_001),
-            (other.as_str(), 1_000 + BLIND_WINDOW_MS + 1),
-            ("never-seen", 1_001),
+        for (cell, at_ms) in [
+            ("old", MARKER_TTL_MS + 2),
+            (other.as_str(), MARKER_TTL_MS + 2),
+            ("c1", MARKER_TTL_MS + 2),
+            (other.as_str(), BLIND_WINDOW_MS + 1),
+            ("never-seen", MARKER_TTL_MS + 2),
         ] {
-            let _ = reader.lookup(cell, at(wall_ms)).await;
+            let _ = reader.lookup(cell, at_ms).await;
         }
         assert_eq!(
             counting.born_requests.load(Ordering::SeqCst),
             0,
-            "a lookup touched fleet/born/"
+            "a lookup touched the segments"
         );
     }
 
     #[tokio::test]
     async fn an_own_registration_answers_exists_until_a_marker_covers_it() {
-        let counting = Arc::new(Counting::default());
-        let directory = CellDirectory::new(counting.clone(), PREFIX.to_owned());
+        let inner = Arc::new(InMemory::new());
+        let directory = directory_over(&inner);
         let partition = partition_of(fingerprint("c1"));
-        write_head(&counting.inner, partition, &["other"], "l2").await;
+        write_head(&inner, partition, &["other"], "l2").await;
         directory.note_own("c1");
-        counting.reset();
-        // Queued, not durable: no request, and no marker can cover it.
-        assert_eq!(directory.lookup("c1", at(5)).await, DirectoryAnswer::Exists);
-        assert_eq!(counting.requests.load(Ordering::SeqCst), 0);
-
+        // Queued, not durable: no marker can cover it.
+        assert_eq!(directory.lookup("c1", 5).await, DirectoryAnswer::Exists);
         directory.own_durable(&names(&["c1"]), 1_000);
-        // A marker whose unfolded backlog reaches back past the segment does
-        // not cover it, whatever its publish time. Any lookup that is not
-        // settled by memory reads the marker.
-        publish(&counting.inner, 1_000 + CLOCK_SKEW_MS + 10_000, 20_000).await;
-        let _ = directory.lookup("probe", at(1_001)).await;
+
+        // Read at 0 and 6_000, and changed at 12_000: that marker was published
+        // after 6_000. With a backlog reaching back past the segment it covers
+        // nothing, however late it is.
+        publish(&inner, 1, 0).await;
+        let _ = directory.lookup("probe", 0).await;
+        let _ = directory.lookup("probe", 6_000).await;
+        publish(&inner, 2, 20_000).await;
+        let _ = directory.lookup("probe", 12_000).await;
         assert_eq!(directory.own.lock().unwrap().cells.len(), 1);
 
-        // One that folded everything older than the segment plus the skew does.
-        publish(&counting.inner, 1_000 + CLOCK_SKEW_MS + 1_001, 1_000).await;
-        let later = Now {
-            mono_ms: 10 * MARKER_TTL_MS,
-            wall_ms: 1_000 + CLOCK_SKEW_MS + 1_002,
-        };
-        let _ = directory.lookup("probe", later).await;
+        // The next one, with nothing unfolded, was published after the read at
+        // 12_000, and a pass that began after that listed the segment.
+        publish(&inner, 3, 0).await;
+        let _ = directory.lookup("probe", 18_000).await;
         assert!(directory.own.lock().unwrap().cells.is_empty());
         // The folded cell is no longer vouched for by memory: the head decides.
-        assert_eq!(directory.lookup("c1", later).await, DirectoryAnswer::New);
+        assert_eq!(directory.lookup("c1", 18_001).await, DirectoryAnswer::New);
     }
 
     #[tokio::test]
@@ -826,21 +984,18 @@ mod tests {
         let inner = Arc::new(InMemory::new());
         let partition = partition_of(fingerprint("old"));
         write_head(&inner, partition, &["old"], "l1").await;
-        publish(&inner, 1_000, 0).await;
+        publish(&inner, 1, 0).await;
         let reader = directory_over(&inner);
-        assert_eq!(
-            reader.lookup("old", at(1_001)).await,
-            DirectoryAnswer::Exists
-        );
+        assert_eq!(reader.lookup("old", 1_001).await, DirectoryAnswer::Exists);
     }
 
     #[tokio::test]
     async fn a_missing_head_is_unknown_not_new() {
         let inner = Arc::new(InMemory::new());
-        publish(&inner, 1_000, 0).await;
+        publish(&inner, 1, 0).await;
         let reader = directory_over(&inner);
         assert_eq!(
-            reader.lookup("anything", at(1_001)).await,
+            reader.lookup("anything", 1_001).await,
             DirectoryAnswer::Unknown
         );
     }
@@ -850,21 +1005,15 @@ mod tests {
         let inner = Arc::new(InMemory::new());
         let partition = partition_of(fingerprint("c1"));
         write_head(&inner, partition, &["c1"], "l1").await;
-        publish(&inner, 1_000, 0).await;
+        publish(&inner, 1, 0).await;
         let reader = directory_over(&inner);
-        assert_eq!(
-            reader.lookup("c1", at(1_001)).await,
-            DirectoryAnswer::Exists
-        );
+        assert_eq!(reader.lookup("c1", 1_001).await, DirectoryAnswer::Exists);
 
         // The run is gone: a newer head replaced it and the cached one is stale.
         let run = Path::from(format!("fleet-a/{}", run_key(partition, "l1", "gen1", 1)));
         inner.delete(&run).await.unwrap();
         reader.heads.lock().unwrap().clear();
-        assert_eq!(
-            reader.lookup("c1", at(1_002)).await,
-            DirectoryAnswer::Unknown
-        );
+        assert_eq!(reader.lookup("c1", 1_002).await, DirectoryAnswer::Unknown);
         assert!(
             reader.heads.lock().unwrap().is_empty(),
             "a head that names a missing run is not kept"
@@ -872,20 +1021,14 @@ mod tests {
 
         // A head that does not decode.
         put_segment(&inner, &head_key(PREFIX, partition), b"{").await;
-        assert_eq!(
-            reader.lookup("c1", at(1_003)).await,
-            DirectoryAnswer::Unknown
-        );
+        assert_eq!(reader.lookup("c1", 1_003).await, DirectoryAnswer::Unknown);
         // A head of another format.
         let head = Head {
             v: 99,
             ..Head::default()
         };
         put_segment(&inner, &head_key(PREFIX, partition), &encode_json(&head)).await;
-        assert_eq!(
-            reader.lookup("c1", at(1_004)).await,
-            DirectoryAnswer::Unknown
-        );
+        assert_eq!(reader.lookup("c1", 1_004).await, DirectoryAnswer::Unknown);
     }
 
     #[tokio::test]
@@ -893,7 +1036,7 @@ mod tests {
         let inner = Arc::new(InMemory::new());
         let partition = partition_of(fingerprint("c1"));
         write_head(&inner, partition, &["c1"], "l0").await;
-        publish(&inner, 1_000, 0).await;
+        publish(&inner, 1, 0).await;
         let mut head = read_head(inner.as_ref(), PREFIX, partition)
             .await
             .unwrap()
@@ -902,10 +1045,7 @@ mod tests {
         head.l0.as_mut().unwrap().count = 5_000;
         put_segment(&inner, &head_key(PREFIX, partition), &encode_json(&head)).await;
         let reader = directory_over(&inner);
-        assert_eq!(
-            reader.lookup("c1", at(1_001)).await,
-            DirectoryAnswer::Unknown
-        );
+        assert_eq!(reader.lookup("c1", 1_001).await, DirectoryAnswer::Unknown);
     }
 
     #[tokio::test]
@@ -913,7 +1053,7 @@ mod tests {
         let inner = Arc::new(InMemory::new());
         let partition = partition_of(fingerprint("c1"));
         write_head(&inner, partition, &["c1"], "l0").await;
-        publish(&inner, 1_000, 0).await;
+        publish(&inner, 1, 0).await;
         let mut head = read_head(inner.as_ref(), PREFIX, partition)
             .await
             .unwrap()
@@ -922,10 +1062,7 @@ mod tests {
         head.l0.as_mut().unwrap().count = u64::MAX - 3;
         put_segment(&inner, &head_key(PREFIX, partition), &encode_json(&head)).await;
         let reader = directory_over(&inner);
-        assert_eq!(
-            reader.lookup("c1", at(1_001)).await,
-            DirectoryAnswer::Unknown
-        );
+        assert_eq!(reader.lookup("c1", 1_001).await, DirectoryAnswer::Unknown);
     }
 
     #[tokio::test]
@@ -940,13 +1077,10 @@ mod tests {
             .value;
         head.rev = 5;
         put_segment(&inner, &head_key(PREFIX, partition), &encode_json(&head)).await;
-        publish(&inner, 1_000, 0).await;
+        publish(&inner, 1, 0).await;
         let reader = directory_over(&inner);
         let other = a_cell_in(partition, "old");
-        assert_eq!(
-            reader.lookup("old", at(1_001)).await,
-            DirectoryAnswer::Exists
-        );
+        assert_eq!(reader.lookup("old", 1_001).await, DirectoryAnswer::Exists);
 
         // The partition is rebuilt: a new run, and a rev that starts over.
         let key = run_key(partition, "rec", "gen2", 2);
@@ -967,11 +1101,8 @@ mod tests {
             ..Head::default()
         };
         put_segment(&inner, &head_key(PREFIX, partition), &encode_json(&rebuilt)).await;
-        publish(&inner, 61_000, 0).await;
-        let later = Now {
-            mono_ms: 1_001 + MARKER_TTL_MS + 1,
-            wall_ms: 61_001,
-        };
+        publish(&inner, 2, 0).await;
+        let later = 1_001 + MARKER_TTL_MS + 1;
         assert_eq!(reader.lookup(&other, later).await, DirectoryAnswer::Exists);
     }
 
@@ -980,12 +1111,12 @@ mod tests {
         assert_eq!(PARTITIONS, 256);
         assert_eq!(
             head_key("p/", 0xab),
-            "p/fleet/dir/k256/ab/head",
+            "p/fleet/dir/v2/ab/head",
             "a K=4096 head sat at fleet/dir/0ab/head"
         );
         assert_eq!(
             run_key(0xab, "l0", "g", 7),
-            "fleet/dir/k256/ab/run/l0-g-00000007"
+            "fleet/dir/v2/ab/run/l0-g-00000007"
         );
         assert!((0..PARTITIONS).all(|p| p <= 0xff));
         let partitions: std::collections::BTreeSet<u16> = (0..20_000)
@@ -1028,15 +1159,15 @@ mod tests {
         put_segment(
             &inner,
             &format!("{PREFIX}fleet/dir/ledger"),
-            br#"{"v":1,"segments":{"fleet-a/fleet/born/node-a/gen0/00000000":1}}"#,
+            br#"{"v":1,"segments":{"fleet-a/fleet/dir/v2/born/node-a/gen0/00000000":1}}"#,
         )
         .await;
         // A marker is published for the new layout, with no head for the
         // partition: the old head is not found under the new keys.
-        publish(&inner, 1_000, 0).await;
+        publish(&inner, 1, 0).await;
         let reader = directory_over(&inner);
         assert_eq!(
-            reader.lookup(old, at(1_001)).await,
+            reader.lookup(old, 1_001).await,
             DirectoryAnswer::Unknown,
             "the old head must not be read as a K=256 head"
         );
@@ -1051,21 +1182,15 @@ mod tests {
         let counting = Arc::new(Counting::default());
         let partition = partition_of(fingerprint("old"));
         write_head(&counting.inner, partition, &["old"], "l2").await;
-        publish(&counting.inner, 1_000, 0).await;
+        publish(&counting.inner, 1, 0).await;
         let reader = CellDirectory::new(counting.clone(), PREFIX.to_owned());
 
         // The marker, the head, and one ranged read per tier that exists.
-        assert_eq!(
-            reader.lookup("old", at(1_001)).await,
-            DirectoryAnswer::Exists
-        );
+        assert_eq!(reader.lookup("old", 1_001).await, DirectoryAnswer::Exists);
         assert_eq!(counting.whole_gets.load(Ordering::SeqCst), 2);
         assert_eq!(counting.ranged_gets.load(Ordering::SeqCst), 1);
         counting.reset();
-        assert_eq!(
-            reader.lookup("old", at(1_002)).await,
-            DirectoryAnswer::Exists
-        );
+        assert_eq!(reader.lookup("old", 1_002).await, DirectoryAnswer::Exists);
         assert_eq!(counting.whole_gets.load(Ordering::SeqCst), 0);
     }
 }

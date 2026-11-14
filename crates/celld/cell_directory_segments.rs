@@ -3,6 +3,7 @@
 //! The format of the cell directory's segments: their keys, the cells they
 //! record, and the fingerprints those cells have in segments and in runs.
 
+use crate::cell_directory_runs::ROOT;
 use anyhow::Context as _;
 use bytes::Bytes;
 use celld_logic::cell_directory::Kind;
@@ -28,8 +29,14 @@ pub(crate) fn registration_key(cell: &str) -> u128 {
     u128::from_be_bytes(digest(cell)[..16].try_into().unwrap())
 }
 
+/// Where segments live: under the directory's own root, not `fleet/born/`,
+/// which a compactor of another layout lists and deletes from.
+pub(crate) fn born_root(prefix: &str) -> String {
+    format!("{prefix}{ROOT}/born")
+}
+
 pub(crate) fn segment_key(prefix: &str, node: &str, generation: &str, seq: u64) -> String {
-    format!("{prefix}fleet/born/{node}/{generation}/{seq:08}")
+    format!("{}/{node}/{generation}/{seq:08}", born_root(prefix))
 }
 
 /// The writer of a segment key, from the right: a node name that holds a `/`
@@ -42,7 +49,7 @@ pub(crate) struct SegmentKey<'a> {
 }
 
 pub(crate) fn parse_segment_key<'a>(prefix: &str, key: &'a str) -> Option<SegmentKey<'a>> {
-    let rest = key.strip_prefix(prefix)?.strip_prefix("fleet/born/")?;
+    let rest = key.strip_prefix(&born_root(prefix))?.strip_prefix('/')?;
     let (rest, seq) = rest.rsplit_once('/')?;
     let (node, generation) = rest.rsplit_once('/')?;
     // A pointer or snapshot object beside the segments is not a segment.
@@ -118,7 +125,7 @@ mod tests {
     #[test]
     fn segment_keys_round_trip() {
         let key = segment_key("p/", "node-a", "g1", 7);
-        assert_eq!(key, "p/fleet/born/node-a/g1/00000007");
+        assert_eq!(key, "p/fleet/dir/v2/born/node-a/g1/00000007");
         assert_eq!(
             parse_segment_key("p/", &key),
             Some(SegmentKey {
@@ -128,7 +135,7 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_segment_key("", "fleet/born/a/b/g1/00000012")
+            parse_segment_key("", "fleet/dir/v2/born/a/b/g1/00000012")
                 .unwrap()
                 .node,
             "a/b"
@@ -143,12 +150,17 @@ mod tests {
     #[test]
     fn keys_beside_the_segments_are_not_segments() {
         for key in [
-            "p/fleet/born/snap-3",
-            "p/fleet/born/seeded",
-            "p/fleet/born/node-a/g1/7",
-            "p/fleet/born/node-a/g1/0000000x",
-            "p/fleet/born/g1/00000001",
-            "q/fleet/born/node-a/g1/00000001",
+            // The layout before this one kept its segments there, and a node
+            // of that layout lists and deletes everything under it, including
+            // what is nested.
+            "p/fleet/born/node-a/g1/00000001",
+            "p/fleet/born/k256/node-a/g1/00000001",
+            "p/fleet/dir/v2/born/snap-3",
+            "p/fleet/dir/v2/born/seeded",
+            "p/fleet/dir/v2/born/node-a/g1/7",
+            "p/fleet/dir/v2/born/node-a/g1/0000000x",
+            "p/fleet/dir/v2/born/g1/00000001",
+            "q/fleet/dir/v2/born/node-a/g1/00000001",
             "p/other/born/node-a/g1/00000001",
             // The compacted tiers live beside, not under, the segments.
             "p/fleet/dir/00a/run/l0-gen1-00000001",
@@ -175,7 +187,7 @@ mod tests {
             "p/cells/ltx/e1/x",
             "p/cells//ltx/x",
             "q/cells/agent:1/ltx/e1/x",
-            "p/fleet/born/n/g/00000000",
+            "p/fleet/dir/v2/born/n/g/00000000",
             // A nested stream is not a registered cell.
             "p/cells/agent:1/facets/ab/ltx/e1/x",
         ] {

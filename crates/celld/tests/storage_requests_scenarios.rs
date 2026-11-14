@@ -135,11 +135,11 @@ fn directory_load() -> Tally {
     let mut add = |kind: &str, key: &str, count: u64| {
         load.insert((kind.to_owned(), key.to_owned(), Part::Shared), count);
     };
-    add("PUT", "fleet/born/node-#/*/#", 10);
-    add("GET", "fleet/born/node-#/*/#", 20);
-    add("BATCH_DELETE", "(batch) fleet/born/node-#/*/#", 2);
-    add("PUT", "fleet/dir/#/run/rec-*-#", 6);
-    add("GET", "fleet/dir/#/head", 40);
+    add("PUT", "fleet/dir/v#/born/node-#/*/#", 10);
+    add("GET", "fleet/dir/v#/born/node-#/*/#", 20);
+    add("BATCH_DELETE", "(batch) fleet/dir/v#/born/node-#/*/#", 2);
+    add("PUT", "fleet/dir/v#/#/run/rec-*-#", 6);
+    add("GET", "fleet/dir/v#/#/head", 40);
     add("PUT", "nodes/node-#.json", 999);
     load
 }
@@ -152,6 +152,21 @@ fn with_agents_the_directory_requests_are_per_agent() {
     assert_eq!(requests["runs_class_a_per_agent"], 1.5);
     assert_eq!(requests["runs_class_b_per_agent"], 10.0);
     assert!(requests.get("segments_class_a_per_node_hour").is_none());
+}
+
+#[test]
+fn the_compactors_listing_of_the_segments_counts_as_segments_not_runs() {
+    let mut load = Tally::new();
+    let mut add = |kind: &str, key: &str, count: u64| {
+        load.insert((kind.to_owned(), key.to_owned(), Part::Shared), count);
+    };
+    // The compactor lists the segments by their bare prefix, and each
+    // partition's runs by theirs.
+    add("LIST", "fleet/dir/v#/born", 8);
+    add("LIST", "fleet/dir/v#/#/run", 4);
+    let requests = directory_requests(&load, 4, 2.0);
+    assert_eq!(requests["segments_class_a_per_agent"], 2.0);
+    assert_eq!(requests["runs_class_a_per_agent"], 1.0);
 }
 
 #[test]

@@ -44,7 +44,7 @@ async fn lost_record_beside_ltx_is_refused_not_reclaimed() {
             assert!(ltx > 0, "the writes left no LTX in the store");
             let registered: i64 = store
                 .query_row(
-                    "SELECT count(*) FROM objects WHERE key LIKE '%fleet/born/%'",
+                    "SELECT count(*) FROM objects WHERE key LIKE '%fleet/dir/v2/born/%'",
                     [],
                     |row| row.get(0),
                 )
@@ -110,7 +110,7 @@ fn folded(project: &Path) -> bool {
     let store = store(project);
     let ledger: Option<Vec<u8>> = store
         .query_row(
-            "SELECT body FROM objects WHERE key LIKE '%fleet/dir/k256/ledger'",
+            "SELECT body FROM objects WHERE key LIKE '%fleet/dir/v2/ledger'",
             [],
             |row| row.get(0),
         )
@@ -122,7 +122,8 @@ fn folded(project: &Path) -> bool {
             |row| row.get(0),
         )
         .expect("count runs");
-    runs > 0 && ledger.is_some_and(|body| String::from_utf8_lossy(&body).contains("fleet/born/"))
+    runs > 0
+        && ledger.is_some_and(|body| String::from_utf8_lossy(&body).contains("fleet/dir/v2/born/"))
 }
 
 async fn answers(server: &Server) -> Value {
@@ -164,7 +165,10 @@ async fn the_directory_answers_new_for_a_fresh_cell_and_exists_for_one_with_ltx(
         .restart_after(|project| {
             let store = store(project);
             store
-                .execute("DELETE FROM objects WHERE key LIKE '%fleet/born/%'", [])
+                .execute(
+                    "DELETE FROM objects WHERE key LIKE '%fleet/dir/v2/born/%'",
+                    [],
+                )
                 .expect("delete the segments");
             let deleted = store
                 .execute("DELETE FROM objects WHERE key LIKE '%cells/%/own.json'", [])

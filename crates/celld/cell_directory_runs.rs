@@ -1,16 +1,16 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The compacted tiers of the cell directory: partition heads, run objects, the
-//! compactor's ledger and its freshness marker, under `fleet/dir/k<K>/`.
+//! compactor's ledger and its freshness marker, under [`ROOT`].
 //!
 //! A partition is the top bits of a cell's fingerprint (see
 //! `celld_logic::cell_directory`). Its head names the current run of each tier
 //! and the highest segment read per writer stream. Runs are create-only and
 //! never rewritten; only a head is replaced, by a conditional write.
 //!
-//! The root names the partition count, so a layout with another count is a
-//! different set of keys: an old head, run or ledger is never read as the new
-//! layout, and is left where it is.
+//! The root names the layout, so a layout with another partition count, another
+//! format or another compactor is a different set of keys: an old head, run,
+//! ledger or marker is never read as the new layout, and is left where it is.
 
 use anyhow::Context as _;
 use bytes::Bytes;
@@ -24,41 +24,39 @@ use object_store::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// The version of the head and ledger bodies. A reader that finds another
-/// answers `Unknown` rather than guess at the layout.
-const FORMAT: u32 = 2;
+/// The version of the head, ledger and marker bodies. A reader that finds another,
+/// or none, answers `Unknown` rather than guess at the layout.
+const FORMAT: u32 = 3;
 
 const _: () = assert!(PARTITIONS <= 256, "a partition is two hex digits in a key");
 
-/// Below the fleet prefix: everything the compacted layout of this partition
-/// count holds.
-fn root() -> String {
-    format!("fleet/dir/k{PARTITIONS}")
-}
+/// Below the fleet prefix: everything the directory of this layout holds, its
+/// segments and its lease as well as its heads, runs, ledger and marker. Another
+/// layout's keys are never listed, read, written or deleted from here, nor these
+/// from there, so a layout change of any kind (the partition count, a body
+/// format, how a compactor works) takes a new root.
+pub(crate) const ROOT: &str = "fleet/dir/v2";
 
 pub(crate) fn head_key(prefix: &str, partition: u16) -> String {
-    format!("{prefix}{}/{partition:02x}/head", root())
+    format!("{prefix}{ROOT}/{partition:02x}/head")
 }
 
 pub(crate) fn ledger_key(prefix: &str) -> String {
-    format!("{prefix}{}/ledger", root())
+    format!("{prefix}{ROOT}/ledger")
 }
 
 pub(crate) fn marker_key(prefix: &str) -> String {
-    format!("{prefix}{}/fresh", root())
+    format!("{prefix}{ROOT}/fresh")
 }
 
 /// A partition's run objects, as a listing prefix.
 pub(crate) fn runs_root(prefix: &str, partition: u16) -> String {
-    format!("{prefix}{}/{partition:02x}/run", root())
+    format!("{prefix}{ROOT}/{partition:02x}/run")
 }
 
 /// A run's key below the fleet prefix, which is what a head stores.
 pub(crate) fn run_key(partition: u16, tier: &str, generation: &str, pass: u64) -> String {
-    format!(
-        "{}/{partition:02x}/run/{tier}-{generation}-{pass:08}",
-        root()
-    )
+    format!("{ROOT}/{partition:02x}/run/{tier}-{generation}-{pass:08}")
 }
 
 /// A writer stream, `<node>/<generation>`.
@@ -459,7 +457,10 @@ pub(crate) mod testing {
         pub whole_gets: AtomicUsize,
         pub lists: AtomicUsize,
         pub puts: AtomicUsize,
-        /// Requests of any kind that name something under `fleet/born/`.
+        /// Every key a request named, whatever the request: a write, a read, a
+        /// listing's prefix or a delete.
+        pub touched: Arc<std::sync::Mutex<Vec<String>>>,
+        /// Requests of any kind that name a directory segment.
         pub born_requests: AtomicUsize,
         /// Segment writes wait for a permit, when set. A permit is consumed by
         /// the write that takes it.
@@ -507,8 +508,12 @@ pub(crate) mod testing {
             Ok(())
         }
 
+        fn touch(&self, path: &str) {
+            self.touched.lock().unwrap().push(path.to_owned());
+        }
+
         fn note_born(&self, path: &str) {
-            if path.contains("fleet/born") {
+            if path.ends_with("/born") || path.contains("/born/") {
                 self.born_requests.fetch_add(1, Ordering::SeqCst);
             }
         }
@@ -549,9 +554,10 @@ pub(crate) mod testing {
         ) -> object_store::Result<PutResult> {
             self.begin()?;
             self.puts.fetch_add(1, Ordering::SeqCst);
+            self.touch(location.as_ref());
             self.note_born(location.as_ref());
             let gate = self.segment_gate.lock().unwrap().clone();
-            if let Some(gate) = gate.filter(|_| location.as_ref().contains("fleet/born")) {
+            if let Some(gate) = gate.filter(|_| location.as_ref().contains("/born/")) {
                 gate.acquire().await.expect("the gate stays open").forget();
             }
             if self.dropping_puts.load(Ordering::SeqCst) {
@@ -625,6 +631,7 @@ pub(crate) mod testing {
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
             self.begin()?;
+            self.touch(location.as_ref());
             self.note_born(location.as_ref());
             let swap = {
                 let mut pending = self.swap_on_first_get.lock().unwrap();
@@ -678,6 +685,14 @@ pub(crate) mod testing {
             if self.hanging_deletes.load(Ordering::SeqCst) {
                 return futures_util::stream::pending().boxed();
             }
+            let touched = self.touched.clone();
+            let locations = locations
+                .inspect(move |location| {
+                    if let Ok(location) = location {
+                        touched.lock().unwrap().push(location.to_string());
+                    }
+                })
+                .boxed();
             self.inner.delete_stream(locations)
         }
 
@@ -687,6 +702,7 @@ pub(crate) mod testing {
         ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
             self.lists.fetch_add(1, Ordering::SeqCst);
             if let Some(prefix) = prefix {
+                self.touch(prefix.as_ref());
                 self.note_born(prefix.as_ref());
             }
             if let Err(error) = self.begin() {

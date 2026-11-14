@@ -161,9 +161,9 @@ traffic it spreads that traffic over the run's agents, so it is no projection to
 
 `cell_directory` in a scenario of the JSON breaks out what the directory sent,
 per agent and with nothing subtracted (`…_per_agent`; a scenario without agents
-reports `…_per_node_hour` instead, since it has no agents to divide by): `fleet/born/` (segments) and
-`fleet/dir/` (heads, runs, ledger, lease), class A and B. A batch delete is
-named for the first key in its body (`(batch) fleet/born/…`), so the compactor's
+reports `…_per_node_hour` instead, since it has no agents to divide by): `fleet/dir/v2/born/` (segments) and
+`fleet/dir/v2/` (heads, runs, ledger, marker, lease), class A and B. A batch delete is
+named for the first key in its body (`(batch) fleet/dir/v2/born/…`), so the compactor's
 deletions are counted with the keys they remove, and each billed batch once; a
 batch that removes several kinds of key is named for its first. The proxy reads a batch-delete body up to 2 MiB (a store sends at most 1,000 keys); a larger body is refused with a 413 and not counted. `setup_requests`
 holds the directory's traffic from before the window, where the first
@@ -192,12 +192,14 @@ reports mostly `unknown` shows a directory that could not have replaced the
 listing.
 
 The compactor's first pass runs a minute after the nodes start and the next
-ones a minute after the previous pass ends. The directory answers `new` only
-while the compactor's freshness marker is within three minutes, so raise the
-settle past the first pass, and let the window hold a few more:
+ones a minute after the previous pass ends. A node answers `new` only after it
+has seen the compactor's freshness marker change, which takes two passes from
+its first lookup, and only while the marker is within three minutes, so lookups
+before that answer `unknown`. Raise the settle past the first two passes, and
+let the window hold a few more:
 
 ```sh
-CELLD_BENCH_FILTER=fleet_evict CELLD_BENCH_SETTLE_S=120 BENCH_MIN_WAIT_S=250 \
+CELLD_BENCH_FILTER=fleet_evict CELLD_BENCH_SETTLE_S=150 BENCH_MIN_WAIT_S=250 \
 CELLD_CELL_DIRECTORY_SHADOW=1 CELLD_CELL_DIRECTORY_BATCH_MS=2000 \
 CELLD_BENCH_S3_ENDPOINT=http://127.0.0.1:9000 CELLD_BENCH_BUCKET=s3://bench \
   cargo bench -p celld --bench storage_requests --profile lab
