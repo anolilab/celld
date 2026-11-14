@@ -167,11 +167,11 @@ pub struct Config {
     /// claim. That covers idle evictions and the room and pressure evictions
     /// that keep ownership (`OwnershipOnEvict::Sticky`). The actor maps
     /// `rebalance` and this option onto `Retained::Resumable` in
-    /// `StopMode::Evict`. The host keeps files and no open
-    /// handle, so a room eviction pins neither a descriptor nor page cache.
-    /// A host that cannot reopen what it kept fails the restore, and the core
-    /// claims the next epoch in the same wake: a cell whose metadata is gone
-    /// must not continue its epoch (#158).
+    /// `StopMode::Evict`. The host keeps files and no open handle, so a room
+    /// eviction pins neither a descriptor nor page cache. A host that cannot
+    /// reopen what it kept fails the restore, and the core claims the next
+    /// epoch in the same wake: a cell whose metadata is gone must not
+    /// continue its epoch (#158).
     pub resume_dormant_local: bool,
     /// Ceilings and low watermarks for load shedding.
     ///
