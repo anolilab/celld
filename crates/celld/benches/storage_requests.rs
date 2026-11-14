@@ -9,7 +9,10 @@
 //!
 //! Requests under `cells/` belong to one agent and are reported per agent.
 //! Everything else (bundles, leases, maintenance) is shared by the node and
-//! reported per node-hour, since it grows with time, not with agents.
+//! reported per node-hour, since it grows with time, not with agents. The
+//! all-in column adds back what the per-node-hour figure holds beyond an idle
+//! fleet, so an opt-in feature whose traffic is shared still shows its cost
+//! per agent.
 //!
 //! ```text
 //! docker compose -f crates/celld/tests/stores/compose.yml up -d rustfs
@@ -23,7 +26,8 @@
 //! endpoint. Settings: `CELLD_BENCH_AGENTS` (200), `CELLD_BENCH_TURNS` (6),
 //! `CELLD_BENCH_TURN_MS` (10000), `CELLD_BENCH_SPREAD_S` (60),
 //! `CELLD_BENCH_SETTLE_S` (40, long enough for maintenance to recruit a
-//! follower), `CELLD_BENCH_FILTER` (substring of the scenario name),
+//! follower), `CELLD_BENCH_DRAIN_S` (25, the time after the last write that the
+//! run keeps counting), `CELLD_BENCH_FILTER` (substring of the scenario name),
 //! `CELLD_BENCH_OUT` (the JSON file).
 
 // The load generator drives child processes from the outside, so it is not
@@ -60,8 +64,6 @@ const MONTH_SECONDS: f64 = 730.0 * 3600.0;
 /// Longer than the default gap between turns, so an agent is evicted once,
 /// after its last turn, not between turns.
 const IDLE_EVICT_S: &str = "15";
-/// Time after the last write for the flush and the evictions to start.
-const DRAIN: Duration = Duration::from_secs(25);
 /// The run ends once no agent request has reached the store for this long.
 const QUIET: Duration = Duration::from_secs(10);
 /// A run whose agents are still making requests this long after the drain
@@ -76,6 +78,8 @@ struct Settings {
     turn: Duration,
     spread: Duration,
     settle: Duration,
+    /// Time after the last write for the flush and the evictions to start.
+    drain: Duration,
     filter: Option<String>,
 }
 
@@ -83,18 +87,48 @@ struct Scenario {
     name: &'static str,
     nodes: usize,
     env: &'static [(&'static str, &'static str)],
+    /// Whether agents run. A scenario without them waits as long as one that
+    /// has them, so its rates are the nodes' own.
+    agents: bool,
 }
 
-const SCENARIOS: [Scenario; 5] = [
+const BASELINE: &str = "fleet_evict_idle";
+
+const SCENARIOS: [Scenario; 7] = [
+    Scenario {
+        // The nodes of `fleet_evict` with no agents and the cell directory
+        // forced off: the traffic of a fleet that only waits, which the
+        // all-in column of every other scenario subtracts.
+        name: BASELINE,
+        nodes: 2,
+        env: &[
+            ("CELLD_IDLE_EVICT_S", IDLE_EVICT_S),
+            ("CELLD_CELL_DIRECTORY_SHADOW", "0"),
+        ],
+        agents: false,
+    },
     Scenario {
         name: "fleet",
         nodes: 2,
         env: &[],
+        agents: true,
     },
     Scenario {
         name: "fleet_evict",
         nodes: 2,
         env: &[("CELLD_IDLE_EVICT_S", IDLE_EVICT_S)],
+        agents: true,
+    },
+    Scenario {
+        // The same idle fleet with the cell directory on: what the directory
+        // costs per node-hour before a single cell is born.
+        name: "directory_idle",
+        nodes: 2,
+        env: &[
+            ("CELLD_IDLE_EVICT_S", IDLE_EVICT_S),
+            ("CELLD_CELL_DIRECTORY_SHADOW", "1"),
+        ],
+        agents: false,
     },
     Scenario {
         // Idle eviction shorter than the gap between turns: every turn after
@@ -102,11 +136,13 @@ const SCENARIOS: [Scenario; 5] = [
         name: "fleet_wake_each_turn",
         nodes: 2,
         env: &[("CELLD_IDLE_EVICT_S", "5")],
+        agents: true,
     },
     Scenario {
         name: "bucket",
         nodes: 1,
         env: &[("CELLD_DURABILITY", "bucket")],
+        agents: true,
     },
     Scenario {
         name: "bucket_evict",
@@ -115,6 +151,7 @@ const SCENARIOS: [Scenario; 5] = [
             ("CELLD_DURABILITY", "bucket"),
             ("CELLD_IDLE_EVICT_S", IDLE_EVICT_S),
         ],
+        agents: true,
     },
 ];
 
@@ -142,6 +179,7 @@ fn main() {
         turn: Duration::from_millis(positive("CELLD_BENCH_TURN_MS", 10_000)),
         spread: Duration::from_secs(positive("CELLD_BENCH_SPREAD_S", 60)),
         settle: Duration::from_secs(positive("CELLD_BENCH_SETTLE_S", 40)),
+        drain: Duration::from_secs(positive("CELLD_BENCH_DRAIN_S", 25)),
         filter: std::env::var("CELLD_BENCH_FILTER")
             .ok()
             .filter(|f| !f.is_empty()),
@@ -167,10 +205,21 @@ fn main() {
         }
         out(&format!("{}: running\n", scenario.name));
         let result = runtime.block_on(run_scenario(&settings, scenario, &run));
-        out(&result.table());
+        out(&result.table(baseline_of(&results, &result)));
         results.push(result);
     }
     write_json(&settings, &results);
+}
+
+/// The idle fleet this run measured with as many nodes as `of` runs, when it
+/// ran one: a rate per node-hour is only comparable across equal fleets.
+fn baseline_of<'a>(
+    results: &'a [ScenarioResult],
+    of: &ScenarioResult,
+) -> Option<&'a ScenarioResult> {
+    results
+        .iter()
+        .find(|r| r.name == BASELINE && r.nodes == of.nodes)
 }
 
 struct ScenarioResult {
@@ -182,6 +231,12 @@ struct ScenarioResult {
     load: Tally,
     /// How long they ran, settling time excluded.
     elapsed: Duration,
+    /// Shared requests under the cell directory made before the window began:
+    /// the bootstrap of its partitions falls here when the settle outlasts the
+    /// compactor's first tick.
+    setup: Tally,
+    /// The directory answers the nodes counted, summed. `Null` without one.
+    answers: Value,
 }
 
 /// Whether a request belongs to one agent's object.
@@ -189,17 +244,60 @@ fn per_cell(shape: &str) -> bool {
     shape.starts_with("cells/")
 }
 
+/// Whether a request belongs to the cell directory's segments or its runs.
+fn born(shape: &str) -> bool {
+    shape.starts_with("fleet/born/")
+}
+
+fn runs(shape: &str) -> bool {
+    shape.starts_with("fleet/dir/")
+}
+
+/// The compactor reads its ledger once per pass and nothing else reads it.
+const LEDGER: &str = "fleet/dir/ledger";
+
 impl ScenarioResult {
     fn count(&self, class: Class, cell: bool) -> u64 {
+        self.count_where(class, |shape| per_cell(shape) == cell)
+    }
+
+    /// The divisor of every per-agent figure; a scenario without agents has
+    /// no such figures and divides by one.
+    fn agent_count(&self) -> f64 {
+        self.agents.max(1) as f64
+    }
+
+    fn per_agent(&self, class: Class) -> f64 {
+        self.count(class, true) as f64 / self.agent_count()
+    }
+
+    fn count_where(&self, class: Class, keep: impl Fn(&str) -> bool) -> u64 {
         self.load
             .iter()
-            .filter(|((kind, shape), _)| class_of(kind) == class && per_cell(shape) == cell)
+            .filter(|((kind, shape), _)| class_of(kind) == class && keep(shape))
             .map(|(_, n)| n)
             .sum()
     }
 
-    fn per_agent(&self, class: Class) -> f64 {
-        self.count(class, true) as f64 / self.agents as f64
+    /// Requests under `keep` per agent, nothing subtracted.
+    fn per_agent_where(&self, class: Class, keep: impl Fn(&str) -> bool) -> f64 {
+        self.count_where(class, keep) as f64 / self.agent_count()
+    }
+
+    /// Compaction passes that read their ledger inside the window.
+    fn passes(&self) -> u64 {
+        self.load
+            .get(&("GET", LEDGER.to_owned()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Per agent: the `cells/` requests plus what the shared requests hold
+    /// beyond the idle fleet's rate, over the time this scenario ran. A rate
+    /// below the baseline's is noise, and it is not clipped.
+    fn all_in(&self, class: Class, baseline: &ScenarioResult) -> f64 {
+        let extra = self.per_node_hour(class) - baseline.per_node_hour(class);
+        (self.count(class, true) as f64 + extra * self.node_hours()) / self.agent_count()
     }
 
     fn node_hours(&self) -> f64 {
@@ -225,7 +323,7 @@ impl ScenarioResult {
                 + self.per_node_hour(Class::B) * CLASS_B_PRICE)
     }
 
-    fn table(&self) -> String {
+    fn table(&self, baseline: Option<&ScenarioResult>) -> String {
         let mut text = format!(
             "  {} node(s), {} agents, {} failed requests\n  per 1000 agents: class A {:.0}, class B {:.0}\n",
             self.nodes,
@@ -235,7 +333,7 @@ impl ScenarioResult {
             self.per_agent(Class::B) * 1000.0,
         );
         for ((kind, shape), count) in self.load.iter().filter(|((_, s), _)| per_cell(s)) {
-            let per_1000 = *count as f64 * 1000.0 / self.agents as f64;
+            let per_1000 = *count as f64 * 1000.0 / self.agent_count();
             text += &format!("    {kind:<6} {per_1000:>8.0}  {shape}\n");
         }
         text += &format!(
@@ -246,6 +344,27 @@ impl ScenarioResult {
         for ((kind, shape), count) in self.load.iter().filter(|((_, s), _)| !per_cell(s)) {
             let rate = *count as f64 / self.node_hours();
             text += &format!("    {kind:<6} {rate:>8.0}  {shape}\n");
+        }
+        if self.agents > 0 {
+            text += &format!(
+                "  per 1000 agents, cell directory: segments class A {:.0}, B {:.0}; \
+                 runs class A {:.0}, B {:.0}; {} compaction pass(es)\n",
+                self.per_agent_where(Class::A, born) * 1000.0,
+                self.per_agent_where(Class::B, born) * 1000.0,
+                self.per_agent_where(Class::A, runs) * 1000.0,
+                self.per_agent_where(Class::B, runs) * 1000.0,
+                self.passes(),
+            );
+        }
+        if let Some(baseline) = baseline.filter(|_| self.agents > 0) {
+            text += &format!(
+                "  all-in per 1000 agents: class A {:.0}, class B {:.0}\n",
+                self.all_in(Class::A, baseline) * 1000.0,
+                self.all_in(Class::B, baseline) * 1000.0,
+            );
+        }
+        if !self.answers.is_null() {
+            text += &format!("  cell directory answers: {}\n", self.answers);
         }
         text
     }
@@ -311,9 +430,10 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
 
     let started = Instant::now();
     let base = proxy.take();
+    let agents = if scenario.agents { settings.agents } else { 0 };
     let errors = Arc::new(AtomicUsize::new(0));
     let mut tasks = Vec::new();
-    for agent in 0..settings.agents {
+    for agent in 0..agents {
         let delay = settings.spread * agent as u32 / settings.agents as u32;
         let url = format!("{}/agent/{run}-{agent}", nodes[agent % nodes.len()].public);
         let (client, errors, turns, turn) = (
@@ -339,22 +459,68 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
             }
         }));
     }
+    if !scenario.agents {
+        tokio::time::sleep(settings.spread + settings.turn * (settings.turns as u32 - 1)).await;
+    }
     for task in tasks {
         task.await.expect("agent task");
     }
-    tokio::time::sleep(DRAIN).await;
+    tokio::time::sleep(settings.drain).await;
     proxy.wait_quiet().await;
     let elapsed = started.elapsed();
     let load = diff(&proxy.take(), &base);
+    let answers = directory_answers(&client, &nodes).await;
     drop(nodes);
     ScenarioResult {
         name: scenario.name,
         nodes: scenario.nodes,
-        agents: settings.agents,
+        agents,
         errors: errors.load(Ordering::Relaxed),
         load,
         elapsed,
+        setup: base
+            .into_iter()
+            .filter(|((_, shape), _)| born(shape) || runs(shape))
+            .collect(),
+        answers,
     }
+}
+
+/// What the nodes counted of the cell directory's answers beside the claim
+/// listing, summed over the nodes. `Null` when no node runs a directory.
+async fn directory_answers(client: &reqwest::Client, nodes: &[Node]) -> Value {
+    let mut total: Option<[[u64; 2]; 3]> = None;
+    for node in nodes {
+        let state = async {
+            client
+                .get(format!("{}/state", node.internal))
+                .send()
+                .await?
+                .json::<Value>()
+                .await
+        };
+        let Ok(state) = state.await else {
+            out(&format!(
+                "  node at {} did not answer /state; its directory answers are not counted\n",
+                node.public
+            ));
+            continue;
+        };
+        let counts = &state["cell_directory_answers"];
+        if counts.is_null() {
+            continue;
+        }
+        let total = total.get_or_insert_with(Default::default);
+        for (row, answer) in ["new", "exists", "unknown"].into_iter().enumerate() {
+            for (column, listing) in ["no_ltx", "ltx"].into_iter().enumerate() {
+                total[row][column] += counts[answer][listing].as_u64().unwrap_or(0);
+            }
+        }
+    }
+    total.map_or(Value::Null, |t| {
+        let pair = |row: [u64; 2]| json!({ "no_ltx": row[0], "ltx": row[1] });
+        json!({ "new": pair(t[0]), "exists": pair(t[1]), "unknown": pair(t[2]) })
+    })
 }
 
 fn diff(after: &Tally, before: &Tally) -> Tally {
@@ -369,6 +535,7 @@ fn diff(after: &Tally, before: &Tally) -> Tally {
 struct Node {
     child: Child,
     public: String,
+    internal: String,
 }
 
 impl Node {
@@ -402,6 +569,7 @@ impl Node {
         Node {
             child,
             public: format!("http://127.0.0.1:{public}"),
+            internal: format!("http://127.0.0.1:{internal}"),
         }
     }
 
@@ -634,23 +802,49 @@ fn write_json(settings: &Settings, results: &[ScenarioResult]) {
             "turn_ms": settings.turn.as_millis() as u64,
             "spread_s": settings.spread.as_secs(),
             "projected_concurrent": PROJECTED_CONCURRENT,
+            "settle_s": settings.settle.as_secs(),
+            "ltx_durability_timeout_s": std::env::var("CELLD_LTX_DURABILITY_TIMEOUT_SECS").ok(),
+            "drain_s": settings.drain.as_secs(),
+            "cell_directory_shadow": std::env::var("CELLD_CELL_DIRECTORY_SHADOW").ok(),
+            "cell_directory_batch_ms": std::env::var("CELLD_CELL_DIRECTORY_BATCH_MS").ok(),
         },
-        "scenarios": results.iter().map(|r| json!({
-            "name": r.name,
-            "nodes": r.nodes,
-            "agents": r.agents,
-            "failed_requests": r.errors,
-            "class_a_per_1000": r.per_agent(Class::A) * 1000.0,
-            "class_b_per_1000": r.per_agent(Class::B) * 1000.0,
-            "monthly_usd": r.monthly(lifetime),
-            "elapsed_s": r.elapsed.as_secs_f64(),
-            "node_class_a_per_hour": r.per_node_hour(Class::A),
-            "node_class_b_per_hour": r.per_node_hour(Class::B),
-            "node_monthly_usd": r.node_monthly(),
-            "requests": r.load.iter().map(|((kind, shape), n)| json!({
-                "kind": kind, "key": shape, "count": n,
-            })).collect::<Vec<Value>>(),
-        })).collect::<Vec<_>>(),
+        "scenarios": results.iter().map(|r| {
+            let all_in = baseline_of(results, r)
+                .filter(|_| r.agents > 0)
+                .map(|baseline| json!({
+                    "baseline": BASELINE,
+                    "class_a_per_agent": r.all_in(Class::A, baseline),
+                    "class_b_per_agent": r.all_in(Class::B, baseline),
+                }));
+            json!({
+                "name": r.name,
+                "nodes": r.nodes,
+                "agents": r.agents,
+                "failed_requests": r.errors,
+                "class_a_per_1000": r.per_agent(Class::A) * 1000.0,
+                "class_b_per_1000": r.per_agent(Class::B) * 1000.0,
+                "monthly_usd": r.monthly(lifetime),
+                "elapsed_s": r.elapsed.as_secs_f64(),
+                "node_class_a_per_hour": r.per_node_hour(Class::A),
+                "node_class_b_per_hour": r.per_node_hour(Class::B),
+                "node_monthly_usd": r.node_monthly(),
+                "compaction_passes": r.passes(),
+                "cell_directory": {
+                    "segments_class_a_per_agent": r.per_agent_where(Class::A, born),
+                    "segments_class_b_per_agent": r.per_agent_where(Class::B, born),
+                    "runs_class_a_per_agent": r.per_agent_where(Class::A, runs),
+                    "runs_class_b_per_agent": r.per_agent_where(Class::B, runs),
+                    "setup_requests": r.setup.iter().map(|((kind, shape), n)| json!({
+                        "kind": kind, "key": shape, "count": n,
+                    })).collect::<Vec<Value>>(),
+                    "answers": r.answers,
+                },
+                "all_in": all_in,
+                "requests": r.load.iter().map(|((kind, shape), n)| json!({
+                    "kind": kind, "key": shape, "count": n,
+                })).collect::<Vec<Value>>(),
+            })
+        }).collect::<Vec<_>>(),
     });
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("create the results directory");
@@ -658,17 +852,25 @@ fn write_json(settings: &Settings, results: &[ScenarioResult]) {
     let text = serde_json::to_string_pretty(&document).expect("serialize results");
     std::fs::write(&path, text + "\n").expect("write results");
     let mut summary = format!(
-        "\n{:<22} {:>8} {:>8} {:>12} {:>12}\n",
-        "scenario", "A/1000", "B/1000", "$/mo @10K", "$/node-mo"
+        "\n{:<22} {:>8} {:>8} {:>12} {:>12} {:>11} {:>11}\n",
+        "scenario", "A/1000", "B/1000", "$/mo @10K", "$/node-mo", "allin A/1k", "allin B/1k"
     );
     for r in results {
+        let all_in = baseline_of(results, r).filter(|_| r.agents > 0);
+        let cell = |value: Option<f64>, width: usize, precision: usize| {
+            value.map_or(format!("{:>width$}", "-"), |v| {
+                format!("{v:>width$.precision$}")
+            })
+        };
         summary += &format!(
-            "{:<22} {:>8.0} {:>8.0} {:>12.0} {:>12.2}\n",
+            "{:<22} {:>8.0} {:>8.0} {:>12.0} {:>12.2} {} {}\n",
             r.name,
             r.per_agent(Class::A) * 1000.0,
             r.per_agent(Class::B) * 1000.0,
             r.monthly(lifetime),
             r.node_monthly(),
+            cell(all_in.map(|b| r.all_in(Class::A, b) * 1000.0), 11, 0),
+            cell(all_in.map(|b| r.all_in(Class::B, b) * 1000.0), 11, 0),
         );
     }
     out(&summary);
