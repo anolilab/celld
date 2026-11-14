@@ -618,6 +618,10 @@ pub(crate) struct LtxConfig {
     /// The TRUNCATE checkpoint threshold of a non-Queue cell, 0 to disable
     /// truncation (`CELLD_LTX_TRUNCATE_PAGES`).
     pub(crate) truncate_pages: u32,
+    /// Whether an eviction keeps the database for a wake at its own epoch
+    /// (`CELLD_RESUME_DORMANT_LOCAL`). Only such an epoch can hold a snapshot
+    /// that a reopened handle compacts from.
+    pub(crate) resume_dormant_local: bool,
 }
 
 impl LtxConfig {
@@ -665,6 +669,15 @@ impl LtxConfig {
                 .ok()
                 .flatten()
                 .unwrap_or(DEFAULT_TRUNCATE_PAGES),
+            resume_dormant_local: lookup("CELLD_RESUME_DORMANT_LOCAL")
+                .and_then(|value| {
+                    crate::env_vars::parse_flag(
+                        "CELLD_RESUME_DORMANT_LOCAL",
+                        value.as_deref(),
+                        false,
+                    )
+                })
+                .unwrap_or(false),
         }
     }
 }
@@ -776,6 +789,38 @@ struct RemoteRestoreTiming {
     bytes: u64,
     levels: String,
     paged: bool,
+}
+
+/// A retained database that a resume renamed to its live name. Unless the
+/// activation reaches its handle, it goes back to `.evicted` and into the
+/// preserved cache: the core then claims the next epoch, and nothing else
+/// counts or removes files at the epoch this node leaves.
+struct ReturnToCache<'a> {
+    repl: &'a LtxRepl,
+    retained: PathBuf,
+    live: PathBuf,
+    armed: bool,
+}
+
+impl Drop for ReturnToCache<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = self.repl.ltx_host.rename(&self.live, &self.retained) {
+            warn!(path = %self.live.display(), %error, "return a failed resume's database to the cache failed");
+            return;
+        }
+        if let Err(error) = self
+            .repl
+            .preserved
+            .lock()
+            .expect("preserved cache poisoned")
+            .insert(self.retained.clone())
+        {
+            warn!(path = %self.retained.display(), %error, "index a failed resume's database failed");
+        }
+    }
 }
 
 /// A paged VFS registration that unregisters itself unless the activation
@@ -1259,6 +1304,8 @@ pub struct LtxRepl {
     /// Bytes per second a paged cell hydrates in the background, 0 for none
     /// (`CELLD_LTX_HYDRATE_MBPS`). A hydrated cell reads only its file.
     hydrate_bytes_per_s: u64,
+    /// `LtxConfig::resume_dormant_local`.
+    resume_dormant_local: bool,
     /// One paged cell hydrates at a time: a node with several whales pages
     /// them all and fills them in turn.
     hydrations: Arc<Semaphore>,
@@ -1540,6 +1587,7 @@ impl LtxRepl {
             paged_fleet: AtomicBool::new(false),
             paged_min_bytes: AtomicU64::new(config.paged_min_bytes),
             hydrate_bytes_per_s: config.hydrate_bytes_per_s,
+            resume_dormant_local: config.resume_dormant_local,
             hydrations: Arc::new(Semaphore::new(1)),
             preserved,
             dirty_ship,
@@ -2239,7 +2287,16 @@ impl LtxRepl {
     /// starts a writer lineage at TXID 1 inside an epoch that already holds
     /// files (#158), so a missing directory fails the wake and the core claims
     /// the next epoch instead.
-    fn take_retained_database(&self, cell: &str, epoch: u64, dst: &Path) -> anyhow::Result<()> {
+    ///
+    /// A database that was renamed goes back to `.evicted`, and into the
+    /// cache, when the activation does not reach its handle: the guard
+    /// answered holds it until then.
+    fn take_retained_database(
+        &self,
+        cell: &str,
+        epoch: u64,
+        dst: &Path,
+    ) -> anyhow::Result<Option<ReturnToCache<'_>>> {
         let is_file = |path: &Path| {
             self.ltx_host
                 .metadata(path)
@@ -2267,14 +2324,20 @@ impl LtxRepl {
         {
             return Err(unavailable("LTX metadata"));
         }
-        if from_eviction {
-            self.ltx_host.rename(&retained, dst)?;
-            self.preserved
-                .lock()
-                .expect("preserved cache poisoned")
-                .forget(&retained);
+        if !from_eviction {
+            return Ok(None);
         }
-        Ok(())
+        self.ltx_host.rename(&retained, dst)?;
+        self.preserved
+            .lock()
+            .expect("preserved cache poisoned")
+            .forget(&retained);
+        Ok(Some(ReturnToCache {
+            repl: self,
+            retained,
+            live: dst.to_path_buf(),
+            armed: true,
+        }))
     }
 
     /// Whether the write-ahead log of the database at `db` holds pages. SQLite
@@ -2313,15 +2376,15 @@ impl LtxRepl {
         Ok(())
     }
 
-    /// The position of the newest full snapshot an epoch holds at or below
-    /// `position`, or 0 when it holds none. Rows at or below it are the
-    /// snapshot's, not any per-cell level's, so a handle reopened there
-    /// compacts from the next transaction.
+    /// The end of every full snapshot an epoch holds. Rows at or below the
+    /// newest one at or below a reopened handle's position are the snapshot's,
+    /// not any per-cell level's, so the handle compacts from the next
+    /// transaction.
     ///
     /// A listing that keeps failing is an error and not a position: a cut
     /// that was guessed would pin the handle's compaction to the wrong base
     /// for as long as it lives.
-    async fn snapshot_cut(&self, cell: &str, epoch: u64, position: u64) -> anyhow::Result<u64> {
+    async fn snapshot_ends(&self, cell: &str, epoch: u64) -> anyhow::Result<Vec<u64>> {
         let client = self.client_for(cell, epoch);
         let mut attempt = 1;
         let files = loop {
@@ -2341,10 +2404,9 @@ impl LtxRepl {
         };
         Ok(files
             .iter()
-            .filter(|file| file.min_txid == TXID(1) && file.max_txid.0 <= position)
+            .filter(|file| file.min_txid == TXID(1))
             .map(|file| file.max_txid.0)
-            .max()
-            .unwrap_or(0))
+            .collect())
     }
 
     pub async fn activate(
@@ -2452,8 +2514,17 @@ impl LtxRepl {
         // A paged activation continues its chain from the cut: (last txid of
         // the chain, page count at the cut).
         let mut continuation: Option<(TXID, u32)> = None;
+        // Listed before the database changes name: a listing that fails then
+        // leaves the retained files where the cache and a retry find them.
+        let snapshot_ends =
+            if resume_local && self.resume_dormant_local && self.compaction_queue.is_some() {
+                self.snapshot_ends(cell, epoch).await?
+            } else {
+                Vec::new()
+            };
+        let mut taken = None;
         if resume_local {
-            self.take_retained_database(cell, epoch, &dst)?;
+            taken = self.take_retained_database(cell, epoch, &dst)?;
             info!(cell, epoch, "resumed clean local replica");
         } else if let Some(snapshot) = local_snapshot {
             self.forget_lineage(cell, epoch - 1)?;
@@ -2738,13 +2809,13 @@ impl LtxRepl {
         // fleet proof the rows at or below it are in no per-cell L0 file, so
         // its compaction continues from the next transaction. A clean reload
         // of such a cell finds the same snapshot.
-        let resume_cut = match (resume_local, &self.compaction_queue) {
-            (true, Some(_)) => {
-                self.snapshot_cut(cell, epoch, seed.map_or(0, |pos| pos.txid.0))
-                    .await?
-            }
-            _ => 0,
-        };
+        let position = seed.map_or(0, |pos| pos.txid.0);
+        let resume_cut = snapshot_ends
+            .iter()
+            .copied()
+            .filter(|end| *end <= position)
+            .max()
+            .unwrap_or(0);
         let handle = Arc::new(Cell {
             snapshot_declined: AtomicBool::new(false),
             paged_vfs: paged_vfs_name.clone(),
@@ -2828,6 +2899,9 @@ impl LtxRepl {
             } else {
                 cells.insert((cell.to_string(), epoch), handle.clone());
                 registration.keep();
+                if let Some(taken) = &mut taken {
+                    taken.armed = false;
+                }
                 (true, false)
             }
         };

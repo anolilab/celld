@@ -39,6 +39,21 @@ fn owner_record(project: &Path) -> (String, Vec<u8>, i64) {
         .expect("the ownership record")
 }
 
+/// Remove the clean-reload certificate and every cell's local files, so the
+/// next start restores from the bucket alone.
+fn forget_local_state(project: &Path) {
+    let runtime = project.join(".celld/dev/runtime");
+    let _ = std::fs::remove_file(runtime.join(".clean-reload.json"));
+    for entry in std::fs::read_dir(&runtime)
+        .expect("runtime directory")
+        .flatten()
+    {
+        if entry.path().is_dir() {
+            std::fs::remove_dir_all(entry.path()).expect("remove local cell state");
+        }
+    }
+}
+
 async fn evictions(server: &Server, at_least: usize) {
     wait_until("an idle eviction", Duration::from_secs(60), || async {
         let seen = server
@@ -76,26 +91,13 @@ async fn a_cell_woken_from_idle_keeps_its_epoch_and_every_row() {
     );
 
     // A restart that keeps nothing local reads the bucket alone.
-    server
-        .restart_after(|project| {
-            let runtime = project.join(".celld/dev/runtime");
-            let _ = std::fs::remove_file(runtime.join(".clean-reload.json"));
-            for entry in std::fs::read_dir(&runtime)
-                .expect("runtime directory")
-                .flatten()
-            {
-                if entry.path().is_dir() {
-                    std::fs::remove_dir_all(entry.path()).expect("remove local cell state");
-                }
-            }
-        })
-        .await;
+    server.restart_after(forget_local_state).await;
     assert_eq!(server.get_text("/list").await, "a,b");
 }
 
 #[tokio::test]
 async fn with_the_option_off_a_wake_claims_the_next_epoch() {
-    let server = Server::start("dormant-rows", &[("CELLD_IDLE_EVICT_S", "1")]).await;
+    let mut server = Server::start("dormant-rows", &[("CELLD_IDLE_EVICT_S", "1")]).await;
     assert_eq!(server.get_text("/add?label=a").await, "ok");
     evictions(&server, 1).await;
     let record = owner_record(server.project());
@@ -105,6 +107,20 @@ async fn with_the_option_off_a_wake_claims_the_next_epoch() {
     assert_eq!(server.get_text("/list").await, "a,b");
     assert_ne!(owner_record(server.project()), record);
     assert!(!server.log_text().contains("resumed clean local replica"));
+    // The second epoch took the first one's kept database as its base.
+    assert!(server.log_text().contains("reused local eviction snapshot"));
+
+    // Evict again and restart from the bucket alone: the second epoch's
+    // snapshot confirms on its own position and carries both rows.
+    evictions(&server, 2).await;
+    server.restart_after(forget_local_state).await;
+    assert_eq!(server.get_text("/list").await, "a,b");
+    assert!(
+        !server
+            .log_text()
+            .contains("write-ahead log still holds pages"),
+        "an eviction discarded a base whose log it should have folded"
+    );
 }
 
 /// A facet keeps no database past its stop, and its epoch already holds what

@@ -92,9 +92,9 @@ pub struct RestoreSpec {
     /// a previous local eviction cache is not authoritative.
     pub took_over: bool,
     /// This exact local epoch remains authoritative, either because the
-    /// node-level lease handoff proved it or because an idle eviction kept the
-    /// live database in this process. The adapter must not consult the remote
-    /// replica.
+    /// node-level lease handoff proved it or because an eviction kept the
+    /// database on this node. The adapter restores nothing from the remote
+    /// replica; it may still read what places the handle's compaction.
     pub resume_local: bool,
     /// The resume reopens the database an eviction kept on this node, not one
     /// a clean reload left. If the host cannot reopen it, the core claims the

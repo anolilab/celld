@@ -39,6 +39,20 @@ struct Forgetful {
     windows: std::sync::atomic::AtomicUsize,
     /// How many of the next such listings fail.
     failing_windows: std::sync::atomic::AtomicUsize,
+    /// Every request fails, as in a bucket outage.
+    down: AtomicBool,
+}
+
+impl Forgetful {
+    fn outage(&self) -> celld_ltx::object_store::Result<()> {
+        if self.down.load(Ordering::SeqCst) {
+            return Err(celld_ltx::object_store::Error::Generic {
+                store: "forgetful",
+                source: "the bucket is down".into(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for Forgetful {
@@ -55,6 +69,7 @@ impl ObjectStore for Forgetful {
         payload: PutPayload,
         options: PutOptions,
     ) -> celld_ltx::object_store::Result<PutResult> {
+        self.outage()?;
         if self.dropping.load(Ordering::SeqCst) {
             return Ok(PutResult {
                 e_tag: None,
@@ -78,6 +93,7 @@ impl ObjectStore for Forgetful {
         location: &ObjPath,
         options: GetOptions,
     ) -> celld_ltx::object_store::Result<GetResult> {
+        self.outage()?;
         self.inner.get_opts(location, options).await
     }
 
@@ -101,6 +117,15 @@ impl ObjectStore for Forgetful {
         prefix: Option<&ObjPath>,
     ) -> BoxStream<'static, celld_ltx::object_store::Result<ObjectMeta>> {
         self.lists.fetch_add(1, Ordering::SeqCst);
+        if self.outage().is_err() {
+            return futures_util::stream::once(async {
+                Err(celld_ltx::object_store::Error::Generic {
+                    store: "forgetful",
+                    source: "the bucket is down".into(),
+                })
+            })
+            .boxed();
+        }
         self.inner.list(prefix)
     }
 
@@ -115,7 +140,8 @@ impl ObjectStore for Forgetful {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 left.checked_sub(1)
             })
-            .is_ok();
+            .is_ok()
+            || self.outage().is_err();
         if failing {
             return futures_util::stream::once(async {
                 Err(celld_ltx::object_store::Error::Generic {
@@ -132,6 +158,7 @@ impl ObjectStore for Forgetful {
         &self,
         prefix: Option<&ObjPath>,
     ) -> celld_ltx::object_store::Result<ListResult> {
+        self.outage()?;
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -169,6 +196,15 @@ fn rig_with(compaction: Option<CompactionConfig>) -> Rig {
 }
 
 fn rig_on(compaction: Option<CompactionConfig>, host: LtxHost) -> Rig {
+    rig_configured(compaction, host, true)
+}
+
+/// `resume_dormant_local` is the node's `CELLD_RESUME_DORMANT_LOCAL`.
+fn rig_configured(
+    compaction: Option<CompactionConfig>,
+    host: LtxHost,
+    resume_dormant_local: bool,
+) -> Rig {
     let directory = tempfile::tempdir().expect("temporary directory");
     let store = Arc::new(Forgetful::default());
     let ltx = LtxRepl::assemble(
@@ -185,7 +221,12 @@ fn rig_on(compaction: Option<CompactionConfig>, host: LtxHost) -> Rig {
         3_600_000,
         host,
         5_000,
-        LtxConfig::from_lookup(|_| Ok(None)),
+        LtxConfig::from_lookup(|name| {
+            Ok(
+                (name == "CELLD_RESUME_DORMANT_LOCAL" && resume_dormant_local)
+                    .then(|| "1".to_string()),
+            )
+        }),
         None,
     );
     Rig {
@@ -814,6 +855,9 @@ fn a_clean_reload_of_a_resumed_cell_keeps_compacting_from_the_snapshot() {
 struct RefusesRemoval {
     inner: celld_ltx::DirectFileSystem,
     refusing: Arc<AtomicBool>,
+    /// Creating a LTX metadata directory fails while set, which fails
+    /// opening a database after its files are in place.
+    refusing_meta: Arc<AtomicBool>,
 }
 
 impl celld_ltx::FileSystem for RefusesRemoval {
@@ -851,6 +895,12 @@ impl celld_ltx::FileSystem for RefusesRemoval {
         self.inner.remove_dir_all(path)
     }
     fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        let meta = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with("-litestream"));
+        if meta && self.refusing_meta.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("refused"));
+        }
         self.inner.create_dir_all(path)
     }
 }
@@ -862,6 +912,7 @@ fn a_base_whose_lineage_cannot_be_removed_is_not_taken_and_strands_nothing() {
         let host = ltx_host_over(Arc::new(RefusesRemoval {
             inner: celld_ltx::DirectFileSystem,
             refusing: refusing.clone(),
+            refusing_meta: Arc::default(),
         }));
         let rig = rig_on(None, host);
         first_lifetime(&rig).await;
@@ -1034,12 +1085,79 @@ fn a_snapshot_listing_that_keeps_failing_fails_the_resume_instead_of_guessing_a_
         assert!(error.to_string().contains("list the snapshots"));
         assert!(!rig.ltx.is_resident(CELL, 1));
 
-        // The files stay where a retry finds them.
+        // The files stay where the cache and a retry find them.
+        assert!(evicted(&rig, 1).is_file() && !live(&rig, 1).exists());
         rig.store.failing_windows.store(0, Ordering::SeqCst);
         rig.ltx
             .activate(options(1, false, true))
             .await
             .expect("the retry");
         assert_eq!(resident(&rig, 1).compaction.as_ref().unwrap().base_txid, 2);
+    });
+}
+
+#[test]
+fn a_clean_reload_lists_nothing_on_a_node_that_keeps_no_dormant_databases() {
+    run(async {
+        let rig = rig_configured(Some(EVERY_ROW), production_ltx_host(), false);
+        first_lifetime(&rig).await;
+        rig.ltx.close_for_reload(CELL, 1).await.expect("reload");
+        let before = rig.store.windows.load(Ordering::SeqCst);
+
+        rig.ltx
+            .activate(options(1, false, true))
+            .await
+            .expect("reopen");
+
+        assert_eq!(rig.store.windows.load(Ordering::SeqCst), before);
+        assert_eq!(resident(&rig, 1).compaction.as_ref().unwrap().base_txid, 1);
+    });
+}
+
+#[test]
+fn a_clean_reload_needs_no_bucket_on_a_node_that_keeps_no_dormant_databases() {
+    run(async {
+        let rig = rig_configured(Some(EVERY_ROW), production_ltx_host(), false);
+        first_lifetime(&rig).await;
+        rig.ltx.close_for_reload(CELL, 1).await.expect("reload");
+
+        rig.store.down.store(true, Ordering::SeqCst);
+        rig.ltx
+            .activate(options(1, false, true))
+            .await
+            .expect("a reload reads nothing remote");
+    });
+}
+
+#[test]
+fn a_failed_resume_returns_the_database_to_the_cache() {
+    run(async {
+        let refusing_meta = Arc::new(AtomicBool::new(false));
+        let host = ltx_host_over(Arc::new(RefusesRemoval {
+            inner: celld_ltx::DirectFileSystem,
+            refusing: Arc::default(),
+            refusing_meta: refusing_meta.clone(),
+        }));
+        let rig = rig_on(None, host);
+        first_lifetime(&rig).await;
+        rig.ltx
+            .evict(CELL, 1, Retained::Resumable, None)
+            .await
+            .expect("eviction");
+        // The cache has read the disk once, so it knows only what it is told.
+        rig.ltx.prune_local_cache(u64::MAX).expect("prune");
+
+        refusing_meta.store(true, Ordering::SeqCst);
+        rig.ltx
+            .activate(options(1, false, true))
+            .await
+            .map(|_| ())
+            .expect_err("a database that cannot be opened");
+        refusing_meta.store(false, Ordering::SeqCst);
+
+        // Neither a live file nor an unaccounted base is left at the epoch.
+        assert!(evicted(&rig, 1).is_file() && !live(&rig, 1).exists());
+        rig.ltx.prune_local_cache(0).expect("prune");
+        assert!(!evicted(&rig, 1).exists() && !meta(&rig, 1).exists());
     });
 }

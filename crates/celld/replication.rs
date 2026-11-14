@@ -159,8 +159,9 @@ pub struct ActivationOptions<'a> {
     pub took_over: bool,
     /// Open the exact existing local epoch after a certified node-level
     /// handoff or an eviction that kept the cell dormant on this node. This
-    /// path performs no restore, and reads only the epoch's snapshot listing
-    /// to place the handle's compaction.
+    /// path performs no restore. A node that keeps dormant databases reads
+    /// the epoch's snapshot listing to place the handle's compaction; every
+    /// other node reads nothing.
     pub resume_local: bool,
     /// The owner a takeover displaced, from the record version the acquire
     /// consumed. The node-log takeover interlock recovers that node's log
