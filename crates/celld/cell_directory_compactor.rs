@@ -16,7 +16,11 @@
 //! (see `cell_directory`): the time, and the age of the oldest segment not
 //! folded. A segment that became durable after the listing began is not in it,
 //! so the age is never less than the pass's own duration. A segment this pass
-//! deferred, skipped or held back counts as unfolded.
+//! deferred, skipped or held back counts as unfolded, and its age comes from the
+//! compactor's own clock alone: the ledger remembers, for each such segment, the
+//! time before which it cannot have been durable, which is when the listing that
+//! first showed it began, or the listing before that. The store's modification
+//! time is never compared with this clock.
 //!
 //! Segments are deleted last and latest. The ledger records the exact key of
 //! every segment a pass read and folded, and it is written only after all of
@@ -37,11 +41,10 @@
 //! which errs toward `Exists`, the answer that costs only a listing. No
 //! production path writes a tombstone yet.
 
-use crate::cell_directory::BLIND_WINDOW_MS;
+use crate::cell_directory::{BLIND_WINDOW_MS, CLOCK_SKEW_MS};
 use crate::cell_directory_runs::{
-    encode_json, head_key, ledger_key, put_if, read_head, read_ledger, read_run, run_key,
-    runs_root, stream_name, write_marker, write_run, Cas, Head, Ledger, Marker, Retired, RunRef,
-    Versioned,
+    encode_json, head_key, ledger_key, publish_marker, put_if, read_head, read_ledger, read_run,
+    run_key, runs_root, stream_name, write_run, Cas, Head, Ledger, Retired, RunRef, Versioned,
 };
 use crate::cell_directory_segments::{fingerprint, parse_segment_key, read_segment};
 use celld_logic::cell_directory::{
@@ -123,8 +126,6 @@ struct Listed {
     key: String,
     stream: String,
     seq: u64,
-    /// The store's modification time, wall clock milliseconds.
-    modified_ms: u64,
 }
 
 enum Outcome {
@@ -193,8 +194,7 @@ pub(crate) async fn compact_pass_capped(
     let mut listing = store.list(Some(&root));
     let mut listed = Vec::new();
     while let Some(meta) = listing.next().await {
-        let meta = meta?;
-        let location = meta.location.clone();
+        let location = meta?.location;
         let Some(key) = parse_segment_key(prefix, location.as_ref()) else {
             continue;
         };
@@ -204,7 +204,6 @@ pub(crate) async fn compact_pass_capped(
             location,
             stream,
             seq,
-            modified_ms: meta.last_modified.timestamp_millis().max(0) as u64,
         });
     }
     report.segments_listed = listed.len();
@@ -234,9 +233,20 @@ pub(crate) async fn compact_pass_capped(
     let mut by_partition: BTreeMap<u16, Vec<(u64, Op)>> = BTreeMap::new();
     let mut read_keys: Vec<(String, Vec<u16>)> = Vec::new();
     unfolded.sort_unstable_by(|a, b| a.key.cmp(&b.key));
-    let unfolded_modified: Vec<(String, u64)> = unfolded
+    // The earliest each could have become durable, on this clock: the listing
+    // that first showed it, or the one before that if the ledger remembers none.
+    // A first-ever pass knows nothing, so it counts from zero.
+    let unfolded_since: Vec<(String, u64)> = unfolded
         .iter()
-        .map(|item| (item.key.clone(), item.modified_ms))
+        .map(|item| {
+            let since = ledger
+                .unfolded_since
+                .get(&item.key)
+                .copied()
+                .or(ledger.listing_began_ms)
+                .unwrap_or(0);
+            (item.key.clone(), since)
+        })
         .collect();
     report.segments_deferred = unfolded.len().saturating_sub(max_segments);
     unfolded.truncate(max_segments);
@@ -348,17 +358,24 @@ pub(crate) async fn compact_pass_capped(
         let durable_ms = clock();
         let changed = !folded.is_empty();
         let folded: HashSet<String> = folded.into_iter().collect();
-        let oldest_unfolded_ms = unfolded_modified
-            .iter()
+        let still_unfolded: BTreeMap<String, u64> = unfolded_since
+            .into_iter()
             .filter(|(key, _)| !folded.contains(key))
-            .map(|(_, modified_ms)| *modified_ms)
-            .min();
+            .collect();
+        let oldest_unfolded_ms = still_unfolded.values().copied().min();
         for key in folded {
             ledger.segments.insert(key, durable_ms);
         }
         let before = ledger.segments.len();
         ledger.segments.retain(|key, _| present.contains(key));
-        if changed || ledger.segments.len() != before || ledger_version.is_none() {
+        let remembered_changed = ledger.unfolded_since != still_unfolded;
+        if remembered_changed
+            || changed
+            || ledger.segments.len() != before
+            || ledger_version.is_none()
+        {
+            ledger.unfolded_since = still_unfolded;
+            ledger.listing_began_ms = Some(now_ms);
             match put_if(
                 store,
                 &ledger_key(prefix),
@@ -377,9 +394,18 @@ pub(crate) async fn compact_pass_capped(
         // The heads are durable, and a segment the ledger failed to name is
         // folded all the same, so the marker may claim it.
         let published_ms = clock();
-        let age_ms = oldest_unfolded_age_ms(published_ms, now_ms, oldest_unfolded_ms);
-        match write_marker(store, prefix, &Marker::new(published_ms, age_ms)).await {
-            Ok(()) => report.marker_age_ms = Some(age_ms),
+        // Another compactor's clock made some of these times, so a segment
+        // still unfolded is counted older by the skew allowance.
+        let skew_ms = if oldest_unfolded_ms.is_some() {
+            CLOCK_SKEW_MS
+        } else {
+            0
+        };
+        let age_ms = oldest_unfolded_age_ms(published_ms, now_ms, oldest_unfolded_ms)
+            .saturating_add(skew_ms);
+        match publish_marker(store, prefix, published_ms, age_ms).await {
+            Ok(Some(_)) => report.marker_age_ms = Some(age_ms),
+            Ok(None) => tracing::debug!("another compactor published first; its marker stands"),
             Err(error) => tracing::warn!(%error, "cell directory marker write failed"),
         }
     }

@@ -2,10 +2,12 @@
 
 //! The writer side of the cell directory: registers a cell in a create-only
 //! segment before its first LTX object. A cell is queued at its first claim and
-//! a background flusher writes the queue every batch window; a write whose cell
-//! is not durable yet flushes the queue itself. Segments are written in groups,
-//! one write at a time per node. The tombstone write is kept for a deletion
-//! path that does not exist yet; only tests call it.
+//! a background flusher writes the queue every batch window. A write for a cell
+//! queued at its claim waits for that flush, so a window gathers the cells that
+//! claim and write within it; a write for a cell nobody queued flushes the queue
+//! itself, with no window. Segments are written in groups, one write at a time
+//! per node. The tombstone write is kept for a deletion path that does not
+//! exist yet; only tests call it.
 
 use crate::cell_directory::CellDirectory;
 use crate::cell_directory_segments::{
@@ -20,7 +22,7 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
@@ -39,6 +41,10 @@ const RETRY_AFTER: Duration = Duration::from_secs(1);
 struct Pending {
     /// Cells queued for a segment that no write has taken yet.
     waiting: BTreeSet<String>,
+    /// Cells queued at their claim that have no durable segment yet, whether
+    /// they are in `waiting` or in a write in flight. Only the write that made
+    /// a registration may take it back, so these are never taken back.
+    claimed: HashSet<String>,
     /// Cells with a durable segment from this process, most recent first to be
     /// forgotten last.
     registered: RecentSet<u128>,
@@ -47,7 +53,8 @@ struct Pending {
 
 /// Removes a cell the write path queued when the write leaves without a
 /// durable registration, so a cancelled or failed write does not register a
-/// cell that never got an artifact. A cell queued at its claim stays queued.
+/// cell that never got an artifact. A cell queued at its claim is not the
+/// write's to remove, so it is never taken back.
 struct Waiter<'a> {
     pending: &'a Mutex<Pending>,
     cell: &'a str,
@@ -66,10 +73,12 @@ impl Drop for Waiter<'_> {
 /// Registers cells in segments before their first LTX write.
 ///
 /// A cell is queued when it is first claimed and a background flusher writes
-/// the queue as one segment every batch window, so the window is not on any
-/// write's path. A write whose cell is not durable yet takes the same turn and
-/// flushes the queue itself, with no window: it waits for the write in flight
-/// and its own, never for a signal only the flusher sends.
+/// the queue as one segment every batch window. A write for such a cell waits
+/// for that flush, for at most one and a half windows, and then flushes the
+/// queue itself, so a stopped flusher delays a write and never hangs it. The
+/// startup check keeps the window under half the durability budget. A write for
+/// a cell nobody queued takes the flush turn at once, with no window: it waits
+/// for the write in flight and its own.
 #[derive(Debug)]
 pub(crate) struct Registrar {
     /// The store beneath the wrapper, so a segment write never registers.
@@ -85,10 +94,12 @@ pub(crate) struct Registrar {
     flushing: tokio::sync::Mutex<()>,
     /// How long the flusher lets cells gather before it writes. Zero flushes as
     /// soon as the flusher wakes; a longer window makes one segment carry more
-    /// cells and delays only the registrations nobody waits for.
+    /// cells, and a first write for a queued cell waits for it.
     batch_window: Duration,
     /// Wakes the flusher when a cell is queued.
     queued: tokio::sync::Notify,
+    /// Wakes the writes that wait for a flush when one has made cells durable.
+    flushed: tokio::sync::Notify,
 }
 
 impl Registrar {
@@ -109,6 +120,7 @@ impl Registrar {
                 return;
             }
             pending.waiting.insert(cell.to_owned());
+            pending.claimed.insert(cell.to_owned());
         }
         self.directory.note_own(cell);
         self.queued.notify_one();
@@ -150,11 +162,29 @@ impl Registrar {
         }
         for cell in &batch {
             pending.registered.insert(registration_key(cell));
+            pending.claimed.remove(cell);
         }
         drop(pending);
         self.directory
             .own_durable(&batch, crate::ownership_store::now_ms());
+        self.flushed.notify_waiters();
         Ok(())
+    }
+
+    /// Wait for the flusher to make `cell` durable, for as long as it should
+    /// take. A flusher that is stopped or failing leaves the cell to the caller.
+    async fn await_background_flush(&self, cell: &str) {
+        let bound = self.batch_window.saturating_mul(3) / 2;
+        let durable = async {
+            loop {
+                let flushed = self.flushed.notified();
+                if self.is_registered(cell) {
+                    return;
+                }
+                flushed.await;
+            }
+        };
+        let _ = crate::asyncrt::timeout(bound, durable).await;
     }
 
     /// Make `cell`'s registration durable before the write that needs it.
@@ -162,7 +192,17 @@ impl Registrar {
         if self.is_registered(cell) {
             return Ok(());
         }
-        let queued_here = self.pending.lock().unwrap().waiting.insert(cell.to_owned());
+        let claimed = self.pending.lock().unwrap().claimed.contains(cell);
+        if claimed && !self.batch_window.is_zero() {
+            self.await_background_flush(cell).await;
+            if self.is_registered(cell) {
+                return Ok(());
+            }
+        }
+        let queued_here = {
+            let mut pending = self.pending.lock().unwrap();
+            !pending.claimed.contains(cell) && pending.waiting.insert(cell.to_owned())
+        };
         let mut waiter = Waiter {
             pending: &self.pending,
             cell,
@@ -291,12 +331,14 @@ impl RegisteringStore {
             generation,
             pending: Mutex::new(Pending {
                 waiting: BTreeSet::new(),
+                claimed: HashSet::new(),
                 registered: RecentSet::new(REGISTERED_CAP),
                 next_seq: 0,
             }),
             flushing: tokio::sync::Mutex::new(()),
             batch_window,
             queued: tokio::sync::Notify::new(),
+            flushed: tokio::sync::Notify::new(),
         });
         directory.attach_registrar(&registrar);
         Self { inner, registrar }
@@ -761,26 +803,90 @@ mod tests {
     }
 
     #[test]
-    fn a_first_write_never_waits_out_the_batch_window() {
+    fn a_write_for_a_cell_nobody_queued_never_waits_out_the_batch_window() {
         crate::asyncrt::install_test_host_runtime().block_on(async {
             let node = gated(Duration::from_secs(30));
-            // Queued at its claim, and the flusher is asleep for the window.
-            node.directory.register_at_claim("c1");
-            node.gate.add_permits(2);
-            assert!(
-                node.ltx_within("c1", Duration::from_secs(5)).await,
-                "a queued cell's write waited for the window"
-            );
+            node.gate.add_permits(1);
             // Never claimed here, as after a restore, a takeover or a recovery upload.
             assert!(
                 node.ltx_within("c2", Duration::from_secs(5)).await,
                 "a cell nobody queued waited for the window"
             );
-            let segments = segments(&node.counting.inner).await;
-            let all: Vec<&String> = segments.iter().flat_map(|(_, cells)| cells).collect();
-            assert!(all.contains(&&"c1".to_owned()) && all.contains(&&"c2".to_owned()));
+            let found = segments(&node.counting.inner).await;
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].1, ["c2"]);
             node.finish().await;
         });
+    }
+
+    #[test]
+    fn writes_for_queued_cells_wait_for_the_flush_and_share_its_segment() {
+        crate::asyncrt::install_test_host_runtime().block_on(async {
+            let node = gated(Duration::from_millis(300));
+            node.gate.add_permits(10);
+            let mut writes = Vec::new();
+            for cell in ["c1", "c2", "c3"] {
+                node.directory.register_at_claim(cell);
+                let store = node.store.clone();
+                writes.push(crate::asyncrt::spawn(async move {
+                    let path = Path::from(format!("fleet-a/cells/{cell}/ltx/e1/0000/0001.ltx"));
+                    store.put(&path, PutPayload::from_static(b"x")).await
+                }));
+                crate::asyncrt::sleep(Duration::from_millis(20)).await;
+            }
+            for write in writes {
+                write.await.unwrap().unwrap();
+            }
+            // Each write came right after its claim, inside the window, and
+            // none flushed on its own.
+            let found = segments(&node.counting.inner).await;
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].1, ["c1", "c2", "c3"]);
+            node.finish().await;
+        });
+    }
+
+    #[test]
+    fn a_write_for_a_queued_cell_falls_back_when_the_flusher_is_gone() {
+        crate::asyncrt::install_test_host_runtime().block_on(async {
+            let node = gated(Duration::from_millis(200));
+            node.gate.add_permits(10);
+            node.stop.request_stop();
+            node.directory.register_at_claim("c1");
+            assert!(
+                node.ltx_within("c1", Duration::from_secs(5)).await,
+                "a write waited for a flusher that no longer runs"
+            );
+            let found = segments(&node.counting.inner).await;
+            assert_eq!(found.len(), 1, "{found:?}");
+            node.finish().await;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_does_not_take_back_a_cell_queued_at_its_claim() {
+        let inner = Arc::new(InMemory::new());
+        let directory = directory_over(&inner);
+        let store = store_over(&inner, &directory);
+        let registrar = store.registrar();
+        registrar.enqueue("c1");
+        // A flush in flight holds the cell, so it is out of the queue.
+        registrar.pending.lock().unwrap().waiting.clear();
+        // The segment key the write's flush uses is taken, so it fails.
+        put_segment(&inner, "fleet-a/fleet/born/node-a/gen1/00000000", b"").await;
+        let ltx = Path::from("fleet-a/cells/c1/ltx/e1/0000/0001.ltx");
+        store
+            .put(&ltx, PutPayload::from_static(b"x"))
+            .await
+            .expect_err("the write fails with its registration");
+
+        assert!(
+            registrar.pending.lock().unwrap().waiting.contains("c1"),
+            "the write took back the registration queued at the claim"
+        );
+        // The flusher's retry still has it to write.
+        registrar.flush().await.unwrap();
+        assert!(registrar.is_registered("c1"));
     }
 
     #[test]

@@ -1,11 +1,11 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 use super::*;
-use crate::cell_directory::{CellDirectory, Now};
+use crate::cell_directory::{CellDirectory, Now, BLIND_WINDOW_MS, CLOCK_SKEW_MS};
 use crate::cell_directory_registrar::{RegisteringStore, Registrar};
 use crate::cell_directory_runs::testing::{keys, Counting};
 use crate::cell_directory_runs::{
-    read_ledger, read_marker, read_run, run_key, write_marker, write_run, Marker,
+    publish_marker, read_ledger, read_marker, read_run, run_key, write_marker, write_run, Marker,
 };
 use celld_logic::cell_directory::{DirectoryAnswer, Kind, Record};
 use object_store::PutPayload;
@@ -414,9 +414,7 @@ async fn a_lookup_that_finds_nothing_reads_three_ranges_and_no_run_whole() {
     )
     .await
     .unwrap();
-    write_marker(store.as_ref(), PREFIX, &Marker::new(1_000, 0))
-        .await
-        .unwrap();
+    write_marker(store.as_ref(), PREFIX, &Marker::new(1, 1_000, 0)).await;
     let reader = CellDirectory::new(store.clone(), PREFIX.to_owned());
     let cell = cells_in_partition(partition, 1).remove(0);
     let now = after_marker(&store).await;
@@ -457,9 +455,7 @@ async fn a_tombstone_in_a_newer_tier_hides_an_older_birth() {
     )
     .await
     .unwrap();
-    write_marker(store.as_ref(), PREFIX, &Marker::new(1_000, 0))
-        .await
-        .unwrap();
+    write_marker(store.as_ref(), PREFIX, &Marker::new(1, 1_000, 0)).await;
     let reader = CellDirectory::new(store.clone(), PREFIX.to_owned());
     assert_eq!(
         reader.lookup(cell, after_marker(&store).await).await,
@@ -832,11 +828,23 @@ async fn one_failed_partition_holds_back_only_the_segments_that_touch_it() {
         segments(&store).await,
         vec!["fleet-a/fleet/born/node-b/g9/00000001".to_owned()]
     );
+    // The segment that could not be folded is by now older than the blind
+    // window, so the marker no longer vouches for anything; the other cell is
+    // in its partition's runs all the same.
     let reader = a.fresh_reader().await;
     assert_eq!(
         reader.lookup(&other, after_marker(&store).await).await,
-        DirectoryAnswer::Exists
+        DirectoryAnswer::Unknown
     );
+    let head = read_head(store.as_ref(), PREFIX, partition_of(fingerprint(&other)))
+        .await
+        .unwrap()
+        .unwrap()
+        .value;
+    let records = read_run(store.as_ref(), PREFIX, &head.l0).await.unwrap();
+    assert!(records
+        .iter()
+        .any(|record| record.fp == fingerprint(&other)));
 }
 
 #[tokio::test]
@@ -993,11 +1001,11 @@ async fn a_pass_publishes_its_marker_after_the_heads_are_durable() {
     assert!(read_marker(store.as_ref(), PREFIX).await.unwrap().is_none());
     let report = pass(&store, 1, 1_000).await;
     // Everything was folded, so only the pass's own duration is in the age.
-    assert_eq!(marker(&store).await, Marker::new(1_000, 0));
+    assert_eq!(marker(&store).await, Marker::new(1, 1_000, 0));
     assert_eq!(report.marker_age_ms, Some(0));
     // Passes with nothing to fold still publish, or readers would age out.
     pass(&store, 2, 2_000).await;
-    assert_eq!(marker(&store).await, Marker::new(2_000, 0));
+    assert_eq!(marker(&store).await, Marker::new(2, 2_000, 0));
 }
 
 #[tokio::test]
@@ -1023,16 +1031,16 @@ async fn the_marker_age_is_never_less_than_the_pass_that_wrote_it() {
 #[tokio::test]
 async fn the_marker_age_counts_segments_a_pass_left_unfolded() {
     let store = Arc::new(Counting::default());
-    // The store stamps segments with the real time, so the pass runs a
-    // virtual 100 s later.
-    let written = crate::ownership_store::now_ms();
-    let later = written + 100_000;
+    // The first pass has nothing to fold, and the ledger it writes remembers
+    // when its listing began.
+    pass(&store, 1, 1_000).await;
     put_segment(&store, "node-b/g9/00000000", b"c0\n").await;
     put_segment(&store, "node-b/g9/00000001", b"c1\n").await;
     put_segment(&store, "node-b/g9/00000002", &[0xff]).await;
 
-    // Capped: one deferred, one unreadable.
-    let report = compact_pass_capped(store.as_ref(), PREFIX, GEN, 1, &|| later, 2)
+    // Capped: one deferred. Not durable before the listing that showed it, and
+    // not before the one before, so it is at least a pass interval old.
+    let report = compact_pass_capped(store.as_ref(), PREFIX, GEN, 2, &|| 61_000, 2)
         .await
         .unwrap();
     assert_eq!(
@@ -1040,15 +1048,20 @@ async fn the_marker_age_counts_segments_a_pass_left_unfolded() {
         (2, 1),
         "{report:?}"
     );
-    let age = marker(&store).await.oldest_unfolded_age_ms;
-    assert!((99_000..=101_000).contains(&age), "{age}");
+    assert_eq!(
+        marker(&store).await.oldest_unfolded_age_ms,
+        60_000 + CLOCK_SKEW_MS
+    );
 
-    // The deferred one folds next; the unreadable one still holds the age back.
-    compact_pass_capped(store.as_ref(), PREFIX, GEN, 2, &|| later, 2)
+    // The deferred one is unreadable, so it holds the age back, and it grows
+    // from the first listing that showed it, not from the latest.
+    compact_pass_capped(store.as_ref(), PREFIX, GEN, 3, &|| 121_000, 2)
         .await
         .unwrap();
-    let age = marker(&store).await.oldest_unfolded_age_ms;
-    assert!((99_000..=101_000).contains(&age), "{age}");
+    assert_eq!(
+        marker(&store).await.oldest_unfolded_age_ms,
+        120_000 + CLOCK_SKEW_MS
+    );
 
     // Remove the broken segment: nothing is unfolded, and the age is the floor.
     store
@@ -1056,19 +1069,65 @@ async fn the_marker_age_counts_segments_a_pass_left_unfolded() {
         .delete(&Path::from("fleet-a/fleet/born/node-b/g9/00000002"))
         .await
         .unwrap();
-    compact_pass_capped(store.as_ref(), PREFIX, GEN, 3, &|| later, 2)
+    compact_pass_capped(store.as_ref(), PREFIX, GEN, 4, &|| 181_000, 2)
         .await
         .unwrap();
-    assert_eq!(marker(&store).await, Marker::new(later, 0));
+    assert_eq!(marker(&store).await, Marker::new(4, 181_000, 0));
+}
+
+#[tokio::test]
+async fn an_old_unfolded_segment_is_not_hidden_by_a_store_clock_that_runs_ahead() {
+    let store = Arc::new(Counting::default());
+    // The store stamps a segment with the real time, far ahead of the
+    // compactor's clock here, which is how a bucket clock that runs ahead looks.
+    pass(&store, 1, 1_000).await;
+    put_segment(&store, "node-b/g9/00000000", &[0xff]).await;
+    let mut now = 1_000;
+    for number in 2..=4 {
+        now += 400_000;
+        pass(&store, number, now).await;
+    }
+    let published = marker(&store).await;
+    assert_eq!(
+        published.oldest_unfolded_age_ms,
+        3 * 400_000 + CLOCK_SKEW_MS,
+        "the age ran from the store's time, which is later than every pass"
+    );
+    let reader = CellDirectory::new(store.clone(), PREFIX.to_owned());
+    assert_eq!(
+        reader
+            .lookup(
+                "anything",
+                Now {
+                    mono_ms: 0,
+                    wall_ms: published.published_ms
+                }
+            )
+            .await,
+        DirectoryAnswer::Unknown
+    );
+}
+
+#[tokio::test]
+async fn a_segment_nothing_is_known_about_makes_the_marker_doubtful() {
+    let store = Arc::new(Counting::default());
+    // The first pass ever, with a segment it cannot fold: no listing came
+    // before it, so the segment may be any age.
+    put_segment(&store, "node-b/g9/00000000", &[0xff]).await;
+    pass(&store, 1, 1_000).await;
+    assert_eq!(
+        marker(&store).await.oldest_unfolded_age_ms,
+        1_000 + CLOCK_SKEW_MS
+    );
+    pass(&store, 2, 1_000 + BLIND_WINDOW_MS).await;
+    assert!(marker(&store).await.oldest_unfolded_age_ms > BLIND_WINDOW_MS);
 }
 
 #[tokio::test]
 async fn a_segment_held_back_by_a_failed_partition_keeps_the_marker_age() {
     let store = Arc::new(Counting::default());
-    let written = crate::ownership_store::now_ms();
-    let later = written + 100_000;
     put_segment(&store, "node-b/g9/00000000", b"seed\n").await;
-    pass(&store, 1, later).await;
+    pass(&store, 1, 1_000).await;
     let broken = partition_of(fingerprint("seed"));
     store
         .inner
@@ -1079,10 +1138,35 @@ async fn a_segment_held_back_by_a_failed_partition_keeps_the_marker_age() {
         .await
         .unwrap();
     put_segment(&store, "node-b/g9/00000001", b"seed\n").await;
-    let report = pass(&store, 2, later).await;
+    let report = pass(&store, 2, 61_000).await;
     assert_eq!(report.partitions_failed, 1, "{report:?}");
-    let age = marker(&store).await.oldest_unfolded_age_ms;
-    assert!(age >= 99_000, "{age}");
+    assert_eq!(
+        marker(&store).await.oldest_unfolded_age_ms,
+        60_000 + CLOCK_SKEW_MS
+    );
+}
+
+#[tokio::test]
+async fn markers_are_numbered_by_a_conditional_write_whatever_the_clock() {
+    let store = Arc::new(Counting::default());
+    // A compactor with a fast clock, then one whose clock is behind.
+    pass(&store, 1, 100_000).await;
+    pass(&store, 2, 50_000).await;
+    assert_eq!(marker(&store).await, Marker::new(2, 50_000, 0));
+
+    // A marker that does not decode is replaced, not left to block publishing.
+    store
+        .inner
+        .put(
+            &Path::from(crate::cell_directory_runs::marker_key(PREFIX)),
+            PutPayload::from_static(b"{"),
+        )
+        .await
+        .unwrap();
+    let published = publish_marker(store.as_ref(), PREFIX, 70_000, 0)
+        .await
+        .unwrap();
+    assert_eq!(published, Some(Marker::new(1, 70_000, 0)));
 }
 
 #[tokio::test]
@@ -1094,7 +1178,7 @@ async fn a_pass_that_fails_leaves_the_marker_to_age() {
         .await
         .expect_err("a pass in an outage fails");
     store.down.store(false, Ordering::SeqCst);
-    assert_eq!(marker(&store).await, Marker::new(1_000, 0));
+    assert_eq!(marker(&store).await, Marker::new(1, 1_000, 0));
 }
 
 #[test]

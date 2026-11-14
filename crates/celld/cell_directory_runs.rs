@@ -133,10 +133,17 @@ impl Head {
 /// folded into the heads it touched, and when the last of those heads became
 /// durable. A segment is named only after it was read; a key below another's
 /// sequence number says nothing about it.
+///
+/// It also carries what the freshness marker's age is measured from, on the
+/// compactor's own clock: for each segment listed and not folded, a time before
+/// which it cannot have become durable, and when the listing that wrote the
+/// ledger began. A segment that listing did not show became durable after it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Ledger {
     pub v: u32,
     pub segments: BTreeMap<String, u64>,
+    pub unfolded_since: BTreeMap<String, u64>,
+    pub listing_began_ms: Option<u64>,
 }
 
 impl Default for Ledger {
@@ -144,6 +151,8 @@ impl Default for Ledger {
         Self {
             v: FORMAT,
             segments: BTreeMap::new(),
+            unfolded_since: BTreeMap::new(),
+            listing_began_ms: None,
         }
     }
 }
@@ -154,15 +163,21 @@ impl Default for Ledger {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Marker {
     pub v: u32,
+    /// One more than the marker this one replaced, by a conditional write, so
+    /// markers are ordered whatever clock each compactor's `published_ms` is
+    /// read from. A reader compares it for identity, to tell whether a head it
+    /// holds was read after this marker.
+    pub generation: u64,
     /// The compactor's wall clock when it published.
     pub published_ms: u64,
     pub oldest_unfolded_age_ms: u64,
 }
 
 impl Marker {
-    pub(crate) fn new(published_ms: u64, oldest_unfolded_age_ms: u64) -> Self {
+    pub(crate) fn new(generation: u64, published_ms: u64, oldest_unfolded_age_ms: u64) -> Self {
         Self {
             v: FORMAT,
+            generation,
             published_ms,
             oldest_unfolded_age_ms,
         }
@@ -242,23 +257,54 @@ pub(crate) async fn read_marker(
     Ok(marker.map(|marker| marker.value))
 }
 
-/// Replace the marker. Unconditional: a compactor that lost its lease and
-/// publishes late writes an older time, which only makes readers doubt more.
-pub(crate) async fn write_marker(
+/// Publish the next marker by a conditional write on the one it replaces, so
+/// its generation follows the last by one. `None` when another compactor
+/// published first: its marker stands, and ours would only be older. A marker
+/// that does not decode counts as generation zero, so it is replaced instead of
+/// blocking every later pass.
+pub(crate) async fn publish_marker(
     store: &dyn ObjectStore,
     prefix: &str,
-    marker: &Marker,
-) -> anyhow::Result<()> {
+    published_ms: u64,
+    oldest_unfolded_age_ms: u64,
+) -> anyhow::Result<Option<Marker>> {
     let key = marker_key(prefix);
+    let (generation, version) = match store.get(&Path::from(key.as_str())).await {
+        Ok(result) => {
+            let version = UpdateVersion {
+                e_tag: result.meta.e_tag.clone(),
+                version: result.meta.version.clone(),
+            };
+            let body = result
+                .bytes()
+                .await
+                .with_context(|| format!("read body of {key}"))?;
+            let current = serde_json::from_slice::<Marker>(&body)
+                .ok()
+                .filter(|marker| marker.v == FORMAT);
+            (current.map_or(0, |marker| marker.generation), Some(version))
+        }
+        Err(object_store::Error::NotFound { .. }) => (0, None),
+        Err(error) => return Err(error).with_context(|| format!("read {key}")),
+    };
+    let marker = Marker::new(generation + 1, published_ms, oldest_unfolded_age_ms);
+    match put_if(store, &key, encode_json(&marker), version).await? {
+        Cas::Applied => Ok(Some(marker)),
+        Cas::Lost => Ok(None),
+    }
+}
+
+/// Write `marker` as it is, which a test does to stand in for a compactor.
+#[cfg(test)]
+pub(crate) async fn write_marker(store: &dyn ObjectStore, prefix: &str, marker: &Marker) {
     store
         .put_opts(
-            &Path::from(key.as_str()),
+            &Path::from(marker_key(prefix).as_str()),
             PutPayload::from_bytes(Bytes::from(encode_json(marker))),
             PutOptions::default(),
         )
         .await
-        .with_context(|| format!("write {key}"))?;
-    Ok(())
+        .expect("write a marker");
 }
 
 /// How a conditional write ended.
