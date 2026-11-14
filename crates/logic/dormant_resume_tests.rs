@@ -365,3 +365,35 @@ fn with_the_option_off_a_wake_claims_the_next_epoch() {
 
     assert_claims_next_epoch(&mut shell, &effects);
 }
+
+#[test]
+fn a_queued_wake_whose_caller_leaves_keeps_the_promise() {
+    let mut shell = dormant(Config {
+        max_activations: 1,
+        ..config()
+    });
+    let now_mono_ms = shell.tick(1);
+    shell.send(Event::RequestAt {
+        request: WAKE_REQUEST + 1,
+        cell: "b".into(),
+        now_mono_ms,
+    });
+    wake_by_request(&mut shell);
+    assert!(matches!(
+        shell.state.phase(CELL),
+        Some(Phase::WaitingActivation)
+    ));
+
+    shell.send(Event::Cancel {
+        request: WAKE_REQUEST,
+    });
+
+    assert!(matches!(
+        shell.state.phase(CELL),
+        Some(Phase::Dormant { epoch: 1 })
+    ));
+    assert!(shell.state.resumable(CELL));
+    shell.settle();
+    let effects = wake_by_request(&mut shell);
+    assert_resumed_in_place(&mut shell, &effects);
+}

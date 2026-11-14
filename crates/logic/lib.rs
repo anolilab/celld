@@ -1323,11 +1323,9 @@ impl State {
         }
 
         for (id, cell) in &self.cells {
-            if cell.resumable
-                && !(matches!(cell.phase, Phase::Dormant { .. }) && cell.releasing.is_none())
-            {
+            if cell.resumable && !(keeps_resume(&cell.phase) && cell.releasing.is_none()) {
                 return Err(format!(
-                    "resumable cell {id:?} is not dormant and unreleased in {:?}",
+                    "resumable cell {id:?} is not dormant or queued, and unreleased, in {:?}",
                     cell.phase
                 ));
             }
@@ -7226,9 +7224,10 @@ fn set_phase(occupied: &mut usize, cell: &mut Cell, phase: Phase) {
     if !matches!(&phase, Phase::Resident { .. }) {
         cell.quiescing = false;
     }
-    // The retained database is only promised to a cell that stays dormant. A
-    // wake, a fence, a reset or a lost record ends the promise.
-    if !matches!(&phase, Phase::Dormant { .. }) {
+    // The retained database is only promised to a cell that stays dormant,
+    // or waits for a slot to wake and returns to dormant if every caller
+    // leaves. A wake, a fence, a reset or a lost record ends the promise.
+    if !keeps_resume(&phase) {
         cell.resumable = false;
     }
     // Ownership follows the confirmed phases and survives the transient
@@ -7274,6 +7273,14 @@ fn set_phase(occupied: &mut usize, cell: &mut Cell, phase: Phase) {
         _ => {}
     }
     cell.phase = phase;
+}
+
+/// Phases that keep a dormant cell's promise to resume in place.
+fn keeps_resume(phase: &Phase) -> bool {
+    matches!(
+        phase,
+        Phase::Dormant { .. } | Phase::WaitingActivation | Phase::WaitingCapacity
+    )
 }
 
 /// The in-flight operation a phase is waiting on, if it is waiting on one.
