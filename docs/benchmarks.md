@@ -119,11 +119,87 @@ Scenarios:
   each turn after the first wakes an evicted agent.
 - `bucket`, `bucket_evict`: one node with `CELLD_DURABILITY=bucket`, where each
   write is proven by an upload.
+- `fleet_evict_idle`: the nodes of `fleet_evict` with no agents and
+  `CELLD_CELL_DIRECTORY_SHADOW=0`, waiting as long as a run with agents does.
+  Its rates are what a fleet costs with nothing to do. It runs first, and a
+  scenario with agents and the same node count runs it before itself even when
+  `CELLD_BENCH_FILTER` does not name it. A scenario with another node count
+  (`bucket`, `bucket_evict`) has no idle fleet to subtract and gets no all-in
+  column.
+- `directory_idle`: the same idle fleet with the cell directory on. Its rates
+  beyond `fleet_evict_idle` are the directory's fixed cost per node-hour.
 
 The `$/mo @10K` column prices the per-agent requests at S3 Standard rates for
 10,000 agents alive at once, each living one turn interval per turn (60 s by
 default: six turns, one every 10 s). `$/node-mo`
 prices one node's shared requests under the same load.
+
+### All-in cost of an opt-in feature
+
+Requests outside `cells/` land in the per-node-hour figure, so a feature whose
+traffic is shared by the fleet, such as the cell directory
+(`CELLD_CELL_DIRECTORY_SHADOW=1`), looks free in the per-agent columns. The
+all-in columns, `allin A/1k` and `allin B/1k` in the summary and
+`net_class_a_per_1000` and `net_class_b_per_1000` in the JSON, put that traffic
+back:
+
+```text
+all-in class X per agent =
+  (cells/ class X + (node-hour class X − idle node-hour class X) × node-hours) / agents
+```
+
+which is every request of the run minus the idle fleet's request rate times the
+run length, over the agents. The idle fleet is `fleet_evict_idle` of the same
+invocation, and it runs with the directory off, so the directory's own fixed
+traffic (its listing every 30 s per node, the compactor's passes) is part of the
+difference. The figure is not below zero. `net_monthly_usd` prices it the way
+`monthly_usd` prices the per-agent requests; for a feature with time-driven
+traffic it spreads that traffic over the run's agents, so it is no projection to
+10,000 agents. Project the per-agent and the per-node-hour parts separately.
+
+`cell_directory` in a scenario of the JSON breaks out what the directory sent,
+per agent and with nothing subtracted: `fleet/born/` (segments) and
+`fleet/dir/` (heads, runs, ledger, lease), class A and B. A batch delete is
+named for the first key in its body (`(batch) fleet/born/…`), so the compactor's
+deletions are counted with the keys they remove, and each billed batch once; a
+batch that removes several kinds of key is named for its first. `setup_requests`
+holds the directory's traffic from before the window, where the first
+compaction pass bootstraps the 4096 partition heads when the settle outlasts the
+compactor's first tick (one minute). `compaction_passes` counts the passes that
+read their ledger inside the window. `env` records the cell directory variables
+each scenario ran with: its own value where it sets one, else the bench
+process's.
+
+`answers` is the directory's answers beside the claim listing, summed over the
+nodes, with `nodes_counted` and `nodes_unreadable` so that a node whose `/state`
+could not be read is visible. A run with an unreadable node is not a complete
+count.
+
+| Directory answer | LTX not found | LTX found |
+| ---------------- | ------------- | --------- |
+| `new`            | the cell is new, as the listing says | the directory was wrong, or a first claim on another node wrote LTX after the directory was read; the guard's re-read of the record separates them, and only a lost record logs `cell_directory_mismatch` |
+| `exists`         | the cell is registered and its LTX is not listed yet, or no longer | the directory answered and was right |
+| `unknown`        | the listing decided | the listing decided |
+
+The same counters are under `cell_directory_answers` in the node's `/state`,
+counted only for a cell whose claim found no ownership record. A shadow run that
+reports mostly `unknown` shows a directory that could not have replaced the
+listing.
+
+The compactor's first pass runs a minute after the nodes start and the next
+ones ten minutes apart. With the settle past the first pass, a window of about
+1,300 s holds two more, so raise the settle and the minimum wait:
+
+```sh
+CELLD_BENCH_FILTER=fleet_evict CELLD_BENCH_SETTLE_S=120 BENCH_MIN_WAIT_S=1250 \
+CELLD_CELL_DIRECTORY_SHADOW=1 CELLD_CELL_DIRECTORY_BATCH_MS=2000 \
+CELLD_BENCH_S3_ENDPOINT=http://127.0.0.1:9000 CELLD_BENCH_BUCKET=s3://bench \
+  cargo bench -p celld --bench storage_requests --profile lab
+```
+
+Keep the batch window under `CELLD_LTX_DURABILITY_TIMEOUT_SECS` (default 10 s):
+with a 10 s window and the default deadline a bench run acknowledged its writes
+and no LTX reached the bucket.
 
 ### Classifying keys
 
