@@ -4,204 +4,353 @@
 //!
 //! A node that writes LTX for a cell first records the cell in a create-only
 //! segment, `fleet/born/<node>/<generation>/<seq:08>`, and the LTX write waits
-//! until the segment is durable. Every node reads all segments into one set.
-//! Because a registration precedes the first artifact and is never removed, a
-//! cell missing from a view that began after the cell's first LTX write is a
-//! cell that never had LTX.
+//! until the segment is durable. A segment body is sorted cell ids, one per
+//! line; a line that starts with a tab is a tombstone. No production path
+//! writes one yet, so no entry ends: a registration precedes the first
+//! artifact, and a cell missing from a view that began after the cell's first
+//! LTX write is a cell that never had LTX.
+//!
+//! Segments are the uncompacted tail. The compactor (see
+//! `cell_directory_compactor`) folds them into partitioned runs of 64-bit
+//! fingerprints under `fleet/dir/` and deletes them once the runs are durable
+//! and every reader's cache has moved past them. A node keeps only the tail in
+//! memory: it lists `fleet/born/` every 30 s and reads the segments it has not
+//! seen. A lookup answers from the tail, or reads the cell's partition in each
+//! tier with one ranged GET apiece. Memory is bounded by the uncompacted tail
+//! and the head cache, never by the number of cells.
+//!
+//! A lookup answers `New` only when no doubt remains: the tail is fresh, and
+//! the partition head and every run it names were read. Anything else is
+//! `Unknown`, which sends the caller to the listing. The compactor deletes a
+//! merged segment only a grace period after its heads became durable, and the
+//! grace outlasts the head cache, so a view that no longer lists a segment
+//! holds a head that contains it.
 //!
 //! This is the shadow stage: the claim guard still decides with a LIST and
-//! only logs when the directory would have decided differently. Segments are
-//! not compacted yet, so every refresh lists the whole `fleet/born/` prefix.
+//! only logs when the directory would have decided differently.
 
-use anyhow::Context as _;
-use async_trait::async_trait;
-use bytes::Bytes;
-use celld_logic::cell_directory::{directory_answer, view_is_fresh, DirectoryAnswer};
-use futures_util::stream::BoxStream;
+use crate::cell_directory_runs::{probe_run, read_head, stream_name, Head};
+use crate::cell_directory_segments::{fingerprint, parse_segment_key, read_segment};
+use celld_logic::cell_directory::{
+    answer_from_tail, answer_from_tiers, partition_of, presence_across_tiers, supersedes,
+    tombstone_is_newest, view_is_fresh, DirectoryAnswer, Kind, Op, Presence, TailHit, TierProbe,
+};
 use futures_util::StreamExt as _;
 use object_store::path::Path;
-use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    ObjectStoreExt as _, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    RenameOptions,
-};
-use std::collections::{BTreeSet, HashSet};
-use std::fmt;
-use std::ops::Range;
+use object_store::ObjectStore;
+use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Segment reads a refresh keeps in flight.
-const SEGMENT_READS: usize = 16;
+pub(crate) const SEGMENT_READS: usize = 16;
 
 /// How often a node lists `fleet/born/` for segments it has not read.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How old a view may be and still rule a cell out. Three refresh periods let
+/// How old the tail may be and still rule a cell out. Three refresh periods let
 /// one or two failed refreshes pass without making every answer `Unknown`.
-const MAX_VIEW_AGE_MS: u64 = 3 * REFRESH_INTERVAL.as_millis() as u64;
+pub(crate) const MAX_VIEW_AGE_MS: u64 = 3 * REFRESH_INTERVAL.as_millis() as u64;
 
-fn segment_key(prefix: &str, node: &str, generation: &str, seq: u64) -> String {
-    format!("{prefix}fleet/born/{node}/{generation}/{seq:08}")
+/// How long a lookup trusts a cached partition head. The compactor's grace
+/// before it deletes anything is a multiple of this.
+pub(crate) const HEAD_TTL_MS: u64 = 60_000;
+
+#[derive(Debug)]
+struct TailSegment {
+    id: u64,
+    /// The number of listings begun when the segment entered the tail. A
+    /// listing that began after that must show it, unless the compactor
+    /// deleted it.
+    added: u64,
 }
 
-/// The writer of a segment key, from the right: a node name that holds a `/`
-/// still parses, and only the sequence and generation are fixed in shape.
-#[derive(Debug, PartialEq, Eq)]
-struct SegmentKey<'a> {
-    node: &'a str,
-    generation: &'a str,
-    seq: u64,
+#[derive(Debug, Clone, Copy)]
+struct TailEntry {
+    op: Op,
+    segment: u64,
 }
 
-fn parse_segment_key<'a>(prefix: &str, key: &'a str) -> Option<SegmentKey<'a>> {
-    let rest = key.strip_prefix(prefix)?.strip_prefix("fleet/born/")?;
-    let (rest, seq) = rest.rsplit_once('/')?;
-    let (node, generation) = rest.rsplit_once('/')?;
-    // A pointer or snapshot object beside the segments is not a segment.
-    // `{seq:08}` is a minimum width: a process past 99,999,999 segments
-    // writes longer numbers.
-    if seq.len() < 8 || !seq.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    if node.is_empty() || generation.is_empty() {
-        return None;
-    }
-    Some(SegmentKey {
-        node,
-        generation,
-        seq: seq.parse().ok()?,
-    })
-}
-
-/// The cell whose per-cell LTX tree holds `key`, or `None` for any other key.
-/// Cell scopes never contain `/` (`valid_cell_scope`), so the cell is the one
-/// path component between `cells/` and `ltx/`.
-fn cell_of_ltx_key<'a>(prefix: &str, key: &'a str) -> Option<&'a str> {
-    let rest = key.strip_prefix(prefix)?.strip_prefix("cells/")?;
-    let (cell, tail) = rest.split_once('/')?;
-    (!cell.is_empty() && tail.starts_with("ltx/")).then_some(cell)
-}
-
-/// Sorted, newline-separated cell ids, which is the whole segment body.
-fn encode_segment(cells: &BTreeSet<String>) -> Bytes {
-    let mut body = String::new();
-    for cell in cells {
-        body.push_str(cell);
-        body.push('\n');
-    }
-    Bytes::from(body)
-}
-
-fn decode_segment(body: &[u8]) -> anyhow::Result<Vec<String>> {
-    let text = std::str::from_utf8(body)?;
-    Ok(text
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect())
-}
-
+/// The uncompacted tail: one entry per fingerprint that a segment not yet
+/// deleted mentions.
 #[derive(Debug, Default)]
-struct ViewState {
-    cells: HashSet<String>,
-    /// Segment keys already read, so a refresh GETs only new ones.
-    seen: HashSet<String>,
+struct Tail {
+    /// The writer streams the index entries name, by id.
+    streams: HashMap<u32, String>,
+    stream_ids: HashMap<String, u32>,
+    next_stream: u32,
+    /// Segment keys in the tail, so a refresh reads only new ones.
+    segments: HashMap<String, TailSegment>,
+    index: HashMap<u64, TailEntry>,
+    next_segment: u64,
+    listings_begun: u64,
     /// When the last complete refresh began, on the node's monotonic clock.
     refreshed_at_ms: Option<u64>,
 }
 
-/// One node's in-memory view of the directory: its own registrations as soon
-/// as they are durable, and every segment a refresh has read.
-#[derive(Debug, Default)]
+impl Tail {
+    fn hit(&self, fp: u64) -> TailHit {
+        match self.index.get(&fp).map(|entry| entry.op.kind) {
+            Some(Kind::Born) => TailHit::Born,
+            Some(Kind::Tombstone) => TailHit::Tombstone,
+            None => TailHit::Miss,
+        }
+    }
+
+    /// The stream and segment sequence of the tombstone that is the entry for
+    /// `fp`, if the entry is one.
+    fn tombstone_of(&self, fp: u64) -> Option<(String, u64)> {
+        let op = self.index.get(&fp)?.op;
+        (op.kind == Kind::Tombstone).then(|| (self.streams[&op.stream].clone(), op.seq))
+    }
+
+    fn stream_id(&mut self, name: &str) -> u32 {
+        if let Some(id) = self.stream_ids.get(name) {
+            return *id;
+        }
+        let id = self.next_stream;
+        self.next_stream += 1;
+        self.streams.insert(id, name.to_owned());
+        self.stream_ids.insert(name.to_owned(), id);
+        id
+    }
+
+    /// Forget the segments that a listing begun at `epoch` does not show. A
+    /// segment that entered the tail at or after that listing began may simply
+    /// be missing from it.
+    fn drop_unlisted(&mut self, epoch: u64, listed: impl Fn(&str) -> bool) {
+        let gone: HashSet<u64> = self
+            .segments
+            .iter()
+            .filter(|(key, segment)| segment.added < epoch && !listed(key))
+            .map(|(_, segment)| segment.id)
+            .collect();
+        if !gone.is_empty() {
+            self.segments
+                .retain(|_, segment| !gone.contains(&segment.id));
+            self.index.retain(|_, entry| !gone.contains(&entry.segment));
+            // A writer name outlives its segments only while an entry names it.
+            let named: HashSet<u32> = self.index.values().map(|entry| entry.op.stream).collect();
+            self.streams.retain(|id, _| named.contains(id));
+            self.stream_ids.retain(|_, id| named.contains(id));
+        }
+    }
+
+    fn apply(
+        &mut self,
+        key: String,
+        stream: &str,
+        seq: u64,
+        ops: impl IntoIterator<Item = (u64, Kind)>,
+    ) {
+        if self.segments.contains_key(&key) {
+            return;
+        }
+        let stream = self.stream_id(stream);
+        let id = self.next_segment;
+        self.next_segment += 1;
+        self.segments.insert(
+            key,
+            TailSegment {
+                id,
+                added: self.listings_begun,
+            },
+        );
+        for (fp, kind) in ops {
+            let op = Op { kind, stream, seq };
+            match self.index.entry(fp) {
+                Entry::Occupied(mut entry) => {
+                    if supersedes(op, entry.get().op) {
+                        entry.insert(TailEntry { op, segment: id });
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(TailEntry { op, segment: id });
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CachedHead {
+    head: Arc<Head>,
+    fetched_ms: u64,
+}
+
+/// One node's view of the directory: the uncompacted tail in memory, the
+/// partition heads it has fetched recently, and the tiers behind them, which
+/// it reads by range.
+#[derive(Debug)]
 pub struct CellDirectory {
-    state: Mutex<ViewState>,
+    store: Arc<dyn ObjectStore>,
+    prefix: String,
+    tail: Mutex<Tail>,
+    heads: Mutex<HashMap<u16, CachedHead>>,
 }
 
 impl CellDirectory {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(store: Arc<dyn ObjectStore>, prefix: String) -> Self {
+        Self {
+            store,
+            prefix,
+            tail: Mutex::default(),
+            heads: Mutex::default(),
+        }
     }
 
-    /// What the view says about `cell` at `now_ms`.
-    pub fn answer(&self, cell: &str, now_ms: u64) -> DirectoryAnswer {
-        let state = self.state.lock().unwrap();
-        directory_answer(
-            view_is_fresh(state.refreshed_at_ms, now_ms, MAX_VIEW_AGE_MS),
-            state.cells.contains(cell),
+    /// What the directory says about `cell` at `now_ms`, on the node's
+    /// monotonic clock. A lookup the tail settles costs no request; otherwise
+    /// it is at most one head read and one ranged read per tier.
+    pub async fn lookup(&self, cell: &str, now_ms: u64) -> DirectoryAnswer {
+        let fp = fingerprint(cell);
+        let (fresh, hit, tombstone) = {
+            let tail = self.tail.lock().unwrap();
+            (
+                view_is_fresh(tail.refreshed_at_ms, now_ms, MAX_VIEW_AGE_MS),
+                tail.hit(fp),
+                tail.tombstone_of(fp),
+            )
+        };
+        if let Some(answer) = answer_from_tail(fresh, hit) {
+            return answer;
+        }
+        let Some(head) = self.head(partition_of(fp), now_ms).await else {
+            return DirectoryAnswer::Unknown;
+        };
+        if let Some((stream, seq)) = tombstone {
+            if tombstone_is_newest(head.watermarks.get(&stream).copied(), seq) {
+                return DirectoryAnswer::New;
+            }
+        }
+        answer_from_tiers(self.presence_in(&head, partition_of(fp), fp).await)
+    }
+
+    async fn presence_in(&self, head: &Head, partition: u16, fp: u64) -> Presence {
+        let store = self.store.as_ref();
+        let (l0, l1, l2) = futures_util::future::join3(
+            probe_run(store, &self.prefix, head.l0.as_ref(), fp),
+            probe_run(store, &self.prefix, head.l1.as_ref(), fp),
+            probe_run(store, &self.prefix, head.l2.as_ref(), fp),
         )
+        .await;
+        if [l0, l1, l2].contains(&TierProbe::Unknown) {
+            // A run that cannot be read may be one a newer head replaced.
+            self.heads.lock().unwrap().remove(&partition);
+        }
+        presence_across_tiers(&[l0, l1, l2])
     }
 
-    /// Own registrations are in the view at once, and their segment is not read
+    /// The partition's head, from the cache while it is younger than
+    /// [`HEAD_TTL_MS`]. A head that is missing or unreadable is doubt, and a
+    /// partition that was compacted always has one.
+    async fn head(&self, partition: u16, now_ms: u64) -> Option<Arc<Head>> {
+        if let Some(cached) = self.heads.lock().unwrap().get(&partition) {
+            if view_is_fresh(Some(cached.fetched_ms), now_ms, HEAD_TTL_MS) {
+                return Some(cached.head.clone());
+            }
+        }
+        let head = match read_head(self.store.as_ref(), &self.prefix, partition).await {
+            Ok(Some(read)) => Arc::new(read.value),
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::debug!(%error, partition, "cell directory head unreadable");
+                return None;
+            }
+        };
+        // A read is the head as of now, whatever its `rev`: a rebuilt head
+        // starts over, and the cache must not outlive it.
+        self.heads.lock().unwrap().insert(
+            partition,
+            CachedHead {
+                head: head.clone(),
+                fetched_ms: now_ms,
+            },
+        );
+        Some(head)
+    }
+
+    /// Own registrations are in the tail at once, and their segment is not read
     /// back by a refresh.
-    fn record_own(&self, cells: &BTreeSet<String>, key: String) {
-        let mut state = self.state.lock().unwrap();
-        state.cells.extend(cells.iter().cloned());
-        state.seen.insert(key);
+    pub(crate) fn record_own(
+        &self,
+        stream: &str,
+        seq: u64,
+        kind: Kind,
+        cells: &BTreeSet<String>,
+        key: String,
+    ) {
+        self.tail.lock().unwrap().apply(
+            key,
+            stream,
+            seq,
+            cells.iter().map(|cell| (fingerprint(cell), kind)),
+        );
     }
 
-    /// Read the segments this view has not seen. The view counts as refreshed
-    /// from the start of this call, and only when every segment read, so one
-    /// failed GET leaves the view as stale as it was.
-    pub async fn refresh(
-        &self,
-        store: &dyn ObjectStore,
-        prefix: &str,
-        now_ms: u64,
-    ) -> anyhow::Result<()> {
-        let root = Path::from(format!("{prefix}fleet/born"));
-        let mut listing = store.list(Some(&root));
-        let mut listed = Vec::new();
+    /// List the segments, read those the tail has not seen, and drop those the
+    /// compactor deleted. The tail counts as refreshed from the start of this
+    /// call, and only when every segment read, so one failed GET leaves it as
+    /// stale as it was.
+    pub async fn refresh(&self, now_ms: u64) -> anyhow::Result<()> {
+        let epoch = {
+            let mut tail = self.tail.lock().unwrap();
+            tail.listings_begun += 1;
+            tail.listings_begun
+        };
+        let root = Path::from(format!("{}fleet/born", self.prefix));
+        let mut listing = self.store.list(Some(&root));
+        let mut listed: HashMap<String, Path> = HashMap::new();
         while let Some(meta) = listing.next().await {
-            listed.push(meta?.location);
+            let location = meta?.location;
+            if parse_segment_key(&self.prefix, location.as_ref()).is_some() {
+                listed.insert(location.to_string(), location);
+            }
         }
         let unseen: Vec<Path> = {
-            let state = self.state.lock().unwrap();
+            let tail = self.tail.lock().unwrap();
             listed
-                .into_iter()
-                .filter(|location| {
-                    let key = location.as_ref();
-                    parse_segment_key(prefix, key).is_some() && !state.seen.contains(key)
-                })
+                .iter()
+                .filter(|(key, _)| !tail.segments.contains_key(key.as_str()))
+                .map(|(_, location)| location.clone())
                 .collect()
         };
         // A node that starts beside many segments reads them a batch at a
         // time, so its first view does not take the sum of their latencies.
+        let store = self.store.as_ref();
         let mut reads = futures_util::stream::iter(unseen)
             .map(|location| async move {
-                let read =
-                    async { Ok::<_, anyhow::Error>(store.get(&location).await?.bytes().await?) };
-                let body = read
-                    .await
-                    .with_context(|| format!("read cell directory segment {location}"))?;
-                let cells = decode_segment(&body)
-                    .with_context(|| format!("decode cell directory segment {location}"))?;
-                Ok::<_, anyhow::Error>((location, cells))
+                let ops = read_segment(store, &location).await?;
+                Ok::<_, anyhow::Error>((location, ops))
             })
             .buffer_unordered(SEGMENT_READS);
         while let Some(read) = reads.next().await {
-            let (location, cells) = read?;
-            let mut state = self.state.lock().unwrap();
-            state.cells.extend(cells);
-            state.seen.insert(location.to_string());
+            let (location, ops) = read?;
+            let key = parse_segment_key(&self.prefix, location.as_ref())
+                .expect("a listed segment parses");
+            let stream = stream_name(key.node, key.generation);
+            let seq = key.seq;
+            let ops = ops
+                .into_iter()
+                .map(|(kind, cell)| (fingerprint(&cell), kind));
+            let mut tail = self.tail.lock().unwrap();
+            // A segment read now was listed now.
+            tail.apply(location.to_string(), &stream, seq, ops);
         }
-        self.state.lock().unwrap().refreshed_at_ms = Some(now_ms);
+        let mut tail = self.tail.lock().unwrap();
+        tail.drop_unlisted(epoch, |key| listed.contains_key(key));
+        tail.refreshed_at_ms = Some(now_ms);
         Ok(())
     }
 
-    /// Load the view, then refresh it until `stop` ends the loop.
-    pub(crate) async fn run_refresh(
-        &self,
-        store: Arc<dyn ObjectStore>,
-        prefix: String,
-        stop: crate::ltx_repl::StopToken,
-    ) {
+    /// Load the tail, then refresh it until `stop` ends the loop.
+    pub(crate) async fn run_refresh(&self, stop: crate::ltx_repl::StopToken) {
         loop {
             let started = crate::asyncrt::mono_ms();
             crate::asyncrt::select_biased! {
                 "a stop request ends a refresh in flight, so shutdown never waits on a listing";
                 _ = stop.stopped() => return,
-                result = self.refresh(store.as_ref(), &prefix, started) => {
+                result = self.refresh(started) => {
                     if let Err(error) = result {
                         tracing::warn!(%error, "cell directory refresh failed; the view keeps its age");
                     }
@@ -216,640 +365,380 @@ impl CellDirectory {
     }
 }
 
-#[derive(Debug, Default)]
-struct Pending {
-    /// Cells whose LTX write is waiting for a segment, so the flush in front
-    /// of them carries them too.
-    waiting: BTreeSet<String>,
-    /// Cells with a durable segment from this process.
-    registered: HashSet<String>,
-    next_seq: u64,
-}
-
-/// Removes a waiter's cell from the batch when the waiter leaves without a
-/// durable registration, so a cancelled or failed write does not register a
-/// cell that never got an artifact.
-struct Waiter<'a> {
-    pending: &'a Mutex<Pending>,
-    cell: &'a str,
-    done: bool,
-}
-
-impl Drop for Waiter<'_> {
-    fn drop(&mut self) {
-        if !self.done {
-            self.pending.lock().unwrap().waiting.remove(self.cell);
-        }
-    }
-}
-
-/// Registers cells in segments before their first LTX write.
-#[derive(Debug)]
-struct Registrar {
-    /// The store beneath the wrapper, so a segment write never registers.
-    store: Arc<dyn ObjectStore>,
-    directory: Arc<CellDirectory>,
-    prefix: String,
-    node: String,
-    generation: String,
-    pending: Mutex<Pending>,
-    /// One segment write at a time. Whoever holds it flushes every cell that
-    /// queued while the previous write was in flight, which is the group
-    /// commit.
-    flushing: tokio::sync::Mutex<()>,
-    /// How long the flusher waits for more cells before it writes. Zero
-    /// flushes at once, which keeps a first write that waits on its
-    /// registration as fast as before; a longer window makes one segment
-    /// carry more cells.
-    batch_window: Duration,
-}
-
-impl Registrar {
-    async fn register(&self, cell: &str) -> object_store::Result<()> {
-        {
-            let mut pending = self.pending.lock().unwrap();
-            if pending.registered.contains(cell) {
-                return Ok(());
-            }
-            pending.waiting.insert(cell.to_owned());
-        }
-        let mut waiter = Waiter {
-            pending: &self.pending,
-            cell,
-            done: false,
-        };
-        let _turn = self.flushing.lock().await;
-        if !self.batch_window.is_zero() && !self.pending.lock().unwrap().registered.contains(cell) {
-            crate::asyncrt::sleep(self.batch_window).await;
-        }
-        let (batch, seq) = {
-            let mut pending = self.pending.lock().unwrap();
-            if pending.registered.contains(cell) {
-                waiter.done = true;
-                return Ok(());
-            }
-            // A failed flush ahead of this one took the cell out of the batch.
-            pending.waiting.insert(cell.to_owned());
-            let seq = pending.next_seq;
-            // A failed or abandoned write may have landed, so its number is
-            // never reused.
-            pending.next_seq += 1;
-            (std::mem::take(&mut pending.waiting), seq)
-        };
-        let key = segment_key(&self.prefix, &self.node, &self.generation, seq);
-        let written = self
-            .store
-            .put_opts(
-                &Path::from(key.as_str()),
-                PutPayload::from_bytes(encode_segment(&batch)),
-                PutOptions::from(PutMode::Create),
-            )
-            .await;
-        if let Err(error) = written {
-            // The other cells of the batch go back to the queue, so the next
-            // flusher writes them in one segment instead of one each while
-            // the store is failing. An extra entry for a write that was
-            // cancelled meanwhile only says "exists", the safe answer.
-            let mut pending = self.pending.lock().unwrap();
-            let returned: Vec<String> = batch
-                .into_iter()
-                .filter(|other| other != cell && !pending.registered.contains(other))
-                .collect();
-            pending.waiting.extend(returned);
-            return Err(error);
-        }
-        self.pending
-            .lock()
-            .unwrap()
-            .registered
-            .extend(batch.iter().cloned());
-        self.directory.record_own(&batch, key);
-        waiter.done = true;
-        Ok(())
-    }
-
-    async fn register_for(&self, location: &Path) -> object_store::Result<()> {
-        match cell_of_ltx_key(&self.prefix, location.as_ref()) {
-            Some(cell) => self.register(cell).await,
-            None => Ok(()),
-        }
-    }
-}
-
-/// The shared object store of a node, with registration in front of every
-/// write under `cells/<cell>/ltx/`. A write whose registration fails fails
-/// too: LTX never exists without a durable directory entry.
-#[derive(Debug)]
-pub struct RegisteringStore {
-    inner: Arc<dyn ObjectStore>,
-    registrar: Registrar,
-}
-
-impl RegisteringStore {
-    /// `generation` names this process's segments. It is random per process,
-    /// so a restarted node never collides with the create-only keys of its
-    /// previous run.
-    pub fn new(
-        inner: Arc<dyn ObjectStore>,
-        directory: Arc<CellDirectory>,
-        prefix: String,
-        node: String,
-        generation: String,
-        batch_window: Duration,
-    ) -> Self {
-        Self {
-            registrar: Registrar {
-                store: inner.clone(),
-                directory,
-                prefix,
-                node,
-                generation,
-                pending: Mutex::default(),
-                flushing: tokio::sync::Mutex::new(()),
-                batch_window,
-            },
-            inner,
-        }
-    }
-}
-
-/// The inner store's name, unchanged: the paged reader picks its native S3
-/// path by that name (`blocking_range_reader`), and the wrapper only adds
-/// work in front of writes.
-impl fmt::Display for RegisteringStore {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.inner, formatter)
-    }
-}
-
-#[async_trait]
-impl ObjectStore for RegisteringStore {
-    async fn put_opts(
-        &self,
-        location: &Path,
-        payload: PutPayload,
-        options: PutOptions,
-    ) -> object_store::Result<PutResult> {
-        self.registrar.register_for(location).await?;
-        self.inner.put_opts(location, payload, options).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &Path,
-        options: PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        self.registrar.register_for(location).await?;
-        self.inner.put_multipart_opts(location, options).await
-    }
-
-    async fn get_opts(
-        &self,
-        location: &Path,
-        options: GetOptions,
-    ) -> object_store::Result<GetResult> {
-        self.inner.get_opts(location, options).await
-    }
-
-    async fn get_ranges(
-        &self,
-        location: &Path,
-        ranges: &[Range<u64>],
-    ) -> object_store::Result<Vec<Bytes>> {
-        self.inner.get_ranges(location, ranges).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: BoxStream<'static, object_store::Result<Path>>,
-    ) -> BoxStream<'static, object_store::Result<Path>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    fn list_with_offset(
-        &self,
-        prefix: Option<&Path>,
-        offset: &Path,
-    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list_with_offset(prefix, offset)
-    }
-
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        options: CopyOptions,
-    ) -> object_store::Result<()> {
-        self.registrar.register_for(to).await?;
-        self.inner.copy_opts(from, to, options).await
-    }
-
-    async fn rename_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        options: RenameOptions,
-    ) -> object_store::Result<()> {
-        self.registrar.register_for(to).await?;
-        self.inner.rename_opts(from, to, options).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::FutureExt as _;
+    use crate::cell_directory_registrar::testing::*;
+    use crate::cell_directory_runs::{encode_json, head_key, put_if, run_key, write_run, Cas};
+    use crate::cell_directory_segments::segment_key;
+    use celld_logic::cell_directory::Record;
     use object_store::memory::InMemory;
-
-    const PREFIX: &str = "fleet-a/";
-
-    fn names(cells: &[&str]) -> BTreeSet<String> {
-        cells.iter().map(|cell| (*cell).to_owned()).collect()
-    }
-
-    fn store_over(inner: &Arc<InMemory>, directory: &Arc<CellDirectory>) -> RegisteringStore {
-        RegisteringStore::new(
-            inner.clone(),
-            directory.clone(),
-            PREFIX.to_owned(),
-            "node-a".to_owned(),
-            "gen1".to_owned(),
-            Duration::ZERO,
-        )
-    }
-
-    async fn segments(inner: &InMemory) -> Vec<(String, Vec<String>)> {
-        let mut found = Vec::new();
-        let mut listing = inner.list(Some(&Path::from("fleet-a/fleet/born")));
-        while let Some(meta) = listing.next().await {
-            let location = meta.unwrap().location;
-            let body = inner.get(&location).await.unwrap().bytes().await.unwrap();
-            found.push((location.to_string(), decode_segment(&body).unwrap()));
-        }
-        found.sort();
-        found
-    }
-
-    #[test]
-    fn segment_keys_round_trip() {
-        let key = segment_key("p/", "node-a", "g1", 7);
-        assert_eq!(key, "p/fleet/born/node-a/g1/00000007");
-        assert_eq!(
-            parse_segment_key("p/", &key),
-            Some(SegmentKey {
-                node: "node-a",
-                generation: "g1",
-                seq: 7
-            })
-        );
-        assert_eq!(
-            parse_segment_key("", "fleet/born/a/b/g1/00000012")
-                .unwrap()
-                .node,
-            "a/b"
-        );
-        let past_width = segment_key("p/", "node-a", "g1", 100_000_000);
-        assert_eq!(
-            parse_segment_key("p/", &past_width).map(|key| key.seq),
-            Some(100_000_000)
-        );
-    }
-
-    #[test]
-    fn keys_beside_the_segments_are_not_segments() {
-        for key in [
-            "p/fleet/born/snap-3",
-            "p/fleet/born/seeded",
-            "p/fleet/born/node-a/g1/7",
-            "p/fleet/born/node-a/g1/0000000x",
-            "p/fleet/born/g1/00000001",
-            "q/fleet/born/node-a/g1/00000001",
-            "p/other/born/node-a/g1/00000001",
-        ] {
-            assert_eq!(parse_segment_key("p/", key), None, "{key}");
-        }
-    }
-
-    #[test]
-    fn ltx_keys_name_their_cell() {
-        assert_eq!(
-            cell_of_ltx_key("p/", "p/cells/agent:1/ltx/e3/0000/0001.ltx"),
-            Some("agent:1")
-        );
-        assert_eq!(
-            cell_of_ltx_key("p/", "p/cells/agent:1/ltx/retired.json"),
-            Some("agent:1")
-        );
-        for key in [
-            "p/cells/agent:1/own.json",
-            "p/cells/agent:1/ltx",
-            "p/cells/ltx/e1/x",
-            "p/cells//ltx/x",
-            "q/cells/agent:1/ltx/e1/x",
-            "p/fleet/born/n/g/00000000",
-        ] {
-            assert_eq!(cell_of_ltx_key("p/", key), None, "{key}");
-        }
-        assert_eq!(cell_of_ltx_key("", "cells/c/ltx/e1/x"), Some("c"));
-    }
-
-    #[test]
-    fn segment_bodies_are_sorted_lines() {
-        let body = encode_segment(&names(&["b", "a", "c"]));
-        assert_eq!(&body[..], b"a\nb\nc\n");
-        assert_eq!(decode_segment(&body).unwrap(), ["a", "b", "c"]);
-        assert!(decode_segment(b"").unwrap().is_empty());
-        assert!(decode_segment(&[0xff, 0xfe]).is_err());
-    }
-
-    #[tokio::test]
-    async fn a_cell_is_registered_before_its_first_ltx_object() {
-        let inner = Arc::new(InMemory::new());
-        let directory = Arc::new(CellDirectory::new());
-        let store = store_over(&inner, &directory);
-
-        store
-            .put(
-                &Path::from("fleet-a/cells/c1/ltx/e1/0000/0001.ltx"),
-                PutPayload::from_static(b"x"),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            segments(&inner).await,
-            [(
-                "fleet-a/fleet/born/node-a/gen1/00000000".to_owned(),
-                vec!["c1".to_owned()]
-            )]
-        );
-        inner
-            .head(&Path::from("fleet-a/cells/c1/ltx/e1/0000/0001.ltx"))
-            .await
-            .unwrap();
-        assert_eq!(directory.answer("c1", 0), DirectoryAnswer::Exists);
-        assert_eq!(directory.answer("c2", 0), DirectoryAnswer::Unknown);
-    }
-
-    #[test]
-    fn the_wrapper_keeps_the_inner_store_name() {
-        // The paged reader recognises native S3 by this name.
-        let inner = Arc::new(InMemory::new());
-        let store = store_over(&inner, &Arc::new(CellDirectory::new()));
-        assert_eq!(store.to_string(), inner.to_string());
-    }
-
-    #[tokio::test]
-    async fn a_second_write_for_the_cell_writes_no_segment() {
-        let inner = Arc::new(InMemory::new());
-        let store = store_over(&inner, &Arc::new(CellDirectory::new()));
-        for object in [
-            "fleet-a/cells/c1/ltx/e1/0000/0001.ltx",
-            "fleet-a/cells/c1/ltx/e1/0000/0002.ltx",
-            "fleet-a/cells/c1/ltx/retired.json",
-        ] {
-            store
-                .put(&Path::from(object), PutPayload::from_static(b"x"))
-                .await
-                .unwrap();
-        }
-        assert_eq!(segments(&inner).await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn other_keys_register_nothing() {
-        let inner = Arc::new(InMemory::new());
-        let store = store_over(&inner, &Arc::new(CellDirectory::new()));
-        store
-            .put(
-                &Path::from("fleet-a/cells/c1/own.json"),
-                PutPayload::from_static(b"{}"),
-            )
-            .await
-            .unwrap();
-        assert!(segments(&inner).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn copies_and_multipart_uploads_register_their_destination() {
-        let inner = Arc::new(InMemory::new());
-        let store = store_over(&inner, &Arc::new(CellDirectory::new()));
-        inner
-            .put(&Path::from("scratch/a"), PutPayload::from_static(b"x"))
-            .await
-            .unwrap();
-        store
-            .copy(
-                &Path::from("scratch/a"),
-                &Path::from("fleet-a/cells/c1/ltx/e1/0000/0001.ltx"),
-            )
-            .await
-            .unwrap();
-        let upload = store
-            .put_multipart(&Path::from("fleet-a/cells/c2/ltx/e1/0000/0001.ltx"))
-            .await
-            .unwrap();
-        drop(upload);
-        let all: Vec<String> = segments(&inner)
-            .await
-            .into_iter()
-            .flat_map(|(_, cells)| cells)
-            .collect();
-        assert_eq!(all, ["c1", "c2"]);
-    }
-
-    #[tokio::test]
-    async fn a_failed_segment_write_fails_the_ltx_write() {
-        let inner = Arc::new(InMemory::new());
-        let directory = Arc::new(CellDirectory::new());
-        let store = store_over(&inner, &directory);
-        // The create-only key of the first segment is taken, so the write of
-        // the registration is refused.
-        inner
-            .put(
-                &Path::from("fleet-a/fleet/born/node-a/gen1/00000000"),
-                PutPayload::from_static(b""),
-            )
-            .await
-            .unwrap();
-
-        let ltx = Path::from("fleet-a/cells/c1/ltx/e1/0000/0001.ltx");
-        store
-            .put(&ltx, PutPayload::from_static(b"x"))
-            .await
-            .expect_err("the LTX write must fail with its registration");
-        assert!(inner.head(&ltx).await.is_err(), "LTX exists unregistered");
-        assert_eq!(directory.answer("c1", 0), DirectoryAnswer::Unknown);
-
-        // The next attempt uses a new sequence number and goes through.
-        store
-            .put(&ltx, PutPayload::from_static(b"x"))
-            .await
-            .unwrap();
-        inner.head(&ltx).await.unwrap();
-        assert_eq!(directory.answer("c1", 0), DirectoryAnswer::Exists);
-    }
-
-    #[tokio::test]
-    async fn a_failed_flush_hands_its_other_cells_to_one_segment() {
-        let inner = Arc::new(InMemory::new());
-        let store = Arc::new(store_over(&inner, &Arc::new(CellDirectory::new())));
-        // The first segment's key is taken, so the first flush fails.
-        inner
-            .put(
-                &Path::from("fleet-a/fleet/born/node-a/gen1/00000000"),
-                PutPayload::from_static(b""),
-            )
-            .await
-            .unwrap();
-        let in_flight = store.registrar.flushing.lock().await;
-        let mut writes = Box::pin(futures_util::future::join_all((0..4).map(|index| {
-            let store = store.clone();
-            async move {
-                store
-                    .put(
-                        &Path::from(format!("fleet-a/cells/c{index}/ltx/e1/0000/0001.ltx")),
-                        PutPayload::from_static(b"x"),
-                    )
-                    .await
-            }
-        })));
-        assert!(writes.as_mut().now_or_never().is_none());
-        drop(in_flight);
-        let failed = writes.await.iter().filter(|result| result.is_err()).count();
-        assert_eq!(failed, 1, "only the flusher whose segment failed fails");
-        let found = segments(&inner).await;
-        assert_eq!(found.len(), 2, "{found:?}");
-        assert_eq!(found[1].1.len(), 3, "{found:?}");
-    }
-
-    #[tokio::test]
-    async fn writes_queued_behind_a_flush_share_the_next_segment() {
-        let inner = Arc::new(InMemory::new());
-        let store = Arc::new(store_over(&inner, &Arc::new(CellDirectory::new())));
-        let in_flight = store.registrar.flushing.lock().await;
-        let mut writes = Box::pin(futures_util::future::join_all((0..8).map(|index| {
-            let store = store.clone();
-            async move {
-                store
-                    .put(
-                        &Path::from(format!("fleet-a/cells/c{index}/ltx/e1/0000/0001.ltx")),
-                        PutPayload::from_static(b"x"),
-                    )
-                    .await
-            }
-        })));
-        assert!(
-            writes.as_mut().now_or_never().is_none(),
-            "the writes must wait for the flush in flight"
-        );
-        drop(in_flight);
-        for result in writes.await {
-            result.unwrap();
-        }
-        let found = segments(&inner).await;
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].1.len(), 8);
-    }
+    use object_store::ObjectStoreExt as _;
 
     #[tokio::test]
     async fn a_refresh_reads_more_segments_than_it_keeps_in_flight() {
         let inner = Arc::new(InMemory::new());
         let count = SEGMENT_READS * 3 + 1;
         for seq in 0..count {
-            inner
-                .put(
-                    &Path::from(segment_key(PREFIX, "node-b", "g9", seq as u64)),
-                    PutPayload::from(format!("c{seq}\n")),
-                )
-                .await
-                .unwrap();
+            put_segment(
+                &inner,
+                &segment_key(PREFIX, "node-b", "g9", seq as u64),
+                format!("c{seq}\n").as_bytes(),
+            )
+            .await;
         }
-        let reader = CellDirectory::new();
-        reader.refresh(inner.as_ref(), PREFIX, 10).await.unwrap();
+        let reader = directory_over(&inner);
+        reader.refresh(10).await.unwrap();
         for seq in 0..count {
             assert_eq!(
-                reader.answer(&format!("c{seq}"), 11),
+                reader.lookup(&format!("c{seq}"), 11).await,
                 DirectoryAnswer::Exists
             );
         }
-        assert_eq!(reader.state.lock().unwrap().seen.len(), count);
+        assert_eq!(reader.tail.lock().unwrap().segments.len(), count);
     }
 
     #[tokio::test]
-    async fn a_refresh_reads_each_segment_once_and_fresh_absence_means_new() {
+    async fn a_refresh_reads_each_segment_once_and_keeps_only_the_tail() {
         let inner = Arc::new(InMemory::new());
-        let writer = store_over(&inner, &Arc::new(CellDirectory::new()));
-        writer
-            .put(
-                &Path::from("fleet-a/cells/c1/ltx/e1/0000/0001.ltx"),
-                PutPayload::from_static(b"x"),
-            )
-            .await
-            .unwrap();
-        // Another node's segment, and an object that is not a segment.
-        inner
-            .put(
-                &Path::from("fleet-a/fleet/born/node-b/g9/00000000"),
-                PutPayload::from_static(b"c2\nc3\n"),
-            )
-            .await
-            .unwrap();
-        inner
-            .put(
-                &Path::from("fleet-a/fleet/born/snap-1"),
-                PutPayload::from_static(b"not a segment"),
-            )
-            .await
-            .unwrap();
+        let writer = store_over(&inner, &directory_over(&inner));
+        ltx_put(&writer, "c1").await;
+        // Another node's segment, and objects that are not segments.
+        put_segment(&inner, "fleet-a/fleet/born/node-b/g9/00000000", b"c2\nc3\n").await;
+        put_segment(&inner, "fleet-a/fleet/born/snap-1", b"not a segment").await;
 
-        let reader = CellDirectory::new();
-        assert_eq!(reader.answer("c2", 10), DirectoryAnswer::Unknown);
-        reader.refresh(inner.as_ref(), PREFIX, 10).await.unwrap();
-        assert_eq!(reader.answer("c1", 11), DirectoryAnswer::Exists);
-        assert_eq!(reader.answer("c3", 11), DirectoryAnswer::Exists);
-        assert_eq!(reader.answer("c4", 11), DirectoryAnswer::New);
-        assert_eq!(
-            reader.answer("c4", 10 + MAX_VIEW_AGE_MS + 1),
-            DirectoryAnswer::Unknown
-        );
-        assert_eq!(reader.state.lock().unwrap().seen.len(), 2);
+        let reader = directory_over(&inner);
+        assert_eq!(reader.lookup("c2", 10).await, DirectoryAnswer::Unknown);
+        reader.refresh(10).await.unwrap();
+        assert_eq!(reader.lookup("c1", 11).await, DirectoryAnswer::Exists);
+        assert_eq!(reader.lookup("c3", 11).await, DirectoryAnswer::Exists);
+        assert_eq!(reader.tail.lock().unwrap().segments.len(), 2);
 
+        put_segment(&inner, "fleet-a/fleet/born/node-b/g9/00000001", b"c4\n").await;
+        reader.refresh(20).await.unwrap();
+        assert_eq!(reader.lookup("c4", 21).await, DirectoryAnswer::Exists);
+        assert_eq!(reader.tail.lock().unwrap().segments.len(), 3);
+
+        // The compactor deleted a segment: its entries leave the tail.
         inner
-            .put(
-                &Path::from("fleet-a/fleet/born/node-b/g9/00000001"),
-                PutPayload::from_static(b"c4\n"),
-            )
+            .delete(&Path::from("fleet-a/fleet/born/node-b/g9/00000000"))
             .await
             .unwrap();
-        reader.refresh(inner.as_ref(), PREFIX, 20).await.unwrap();
-        assert_eq!(reader.answer("c4", 21), DirectoryAnswer::Exists);
-        assert_eq!(reader.state.lock().unwrap().seen.len(), 3);
+        reader.refresh(30).await.unwrap();
+        assert_eq!(reader.tail.lock().unwrap().segments.len(), 2);
+        assert!(!reader
+            .tail
+            .lock()
+            .unwrap()
+            .index
+            .contains_key(&fingerprint("c3")));
+        assert!(reader
+            .tail
+            .lock()
+            .unwrap()
+            .index
+            .contains_key(&fingerprint("c4")));
+    }
+
+    #[test]
+    fn a_listing_drops_only_segments_that_were_in_the_tail_before_it_began() {
+        let mut tail = Tail {
+            listings_begun: 1,
+            ..Tail::default()
+        };
+        let ops = |cell: &str| [(fingerprint(cell), Kind::Born)];
+        tail.apply("before".to_owned(), "n/g", 0, ops("c1"));
+        tail.listings_begun = 2;
+        // Registered while the second listing was running.
+        tail.apply("during".to_owned(), "n/g", 1, ops("c2"));
+        tail.drop_unlisted(2, |_| false);
+        assert!(!tail.segments.contains_key("before"));
+        assert!(tail.segments.contains_key("during"));
+        assert_eq!(tail.hit(fingerprint("c1")), TailHit::Miss);
+        assert_eq!(tail.hit(fingerprint("c2")), TailHit::Born);
+        tail.drop_unlisted(3, |key| key == "during");
+        assert_eq!(tail.hit(fingerprint("c2")), TailHit::Born);
+        tail.drop_unlisted(3, |_| false);
+        assert_eq!(tail.hit(fingerprint("c2")), TailHit::Miss);
+    }
+
+    #[test]
+    fn a_stream_with_no_segment_left_is_forgotten() {
+        let mut tail = Tail {
+            listings_begun: 1,
+            ..Tail::default()
+        };
+        let ops = |cell: &str| [(fingerprint(cell), Kind::Born)];
+        tail.apply("a".to_owned(), "n1/g1", 0, ops("c1"));
+        tail.apply("b".to_owned(), "n2/g2", 0, ops("c2"));
+        tail.drop_unlisted(2, |key| key == "b");
+        assert_eq!(tail.stream_ids.len(), 1);
+        assert_eq!(tail.streams.len(), 1);
+        assert_eq!(tail.hit(fingerprint("c2")), TailHit::Born);
+        tail.apply("c".to_owned(), "n1/g1", 1, ops("c3"));
+        assert_eq!(tail.hit(fingerprint("c3")), TailHit::Born);
+        tail.drop_unlisted(2, |_| false);
+        assert!(tail.stream_ids.is_empty() && tail.streams.is_empty());
     }
 
     #[tokio::test]
     async fn an_unreadable_segment_leaves_the_view_unrefreshed() {
         let inner = Arc::new(InMemory::new());
-        inner
-            .put(
-                &Path::from("fleet-a/fleet/born/node-b/g9/00000000"),
-                PutPayload::from_static(&[0xff]),
-            )
-            .await
-            .unwrap();
-        let reader = CellDirectory::new();
+        put_segment(&inner, "fleet-a/fleet/born/node-b/g9/00000000", &[0xff]).await;
+        let reader = directory_over(&inner);
         reader
-            .refresh(inner.as_ref(), PREFIX, 10)
+            .refresh(10)
             .await
             .expect_err("a segment that does not decode is an error");
-        assert_eq!(reader.answer("c1", 11), DirectoryAnswer::Unknown);
+        assert_eq!(reader.lookup("c1", 11).await, DirectoryAnswer::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_birth_beats_a_tombstone_from_another_stream() {
+        let inner = Arc::new(InMemory::new());
+        put_segment(&inner, "fleet-a/fleet/born/node-a/g1/00000003", b"\tc1\n").await;
+        put_segment(&inner, "fleet-a/fleet/born/node-b/g2/00000001", b"c1\n").await;
+        put_segment(&inner, "fleet-a/fleet/born/node-a/g1/00000004", b"\tc2\n").await;
+        write_empty_head(&inner, "c2").await;
+        let reader = directory_over(&inner);
+        reader.refresh(10).await.unwrap();
+        assert_eq!(reader.lookup("c1", 11).await, DirectoryAnswer::Exists);
+        assert_eq!(reader.lookup("c2", 11).await, DirectoryAnswer::New);
+    }
+
+    /// A head with one run holding `fps`, written beside the segments.
+    async fn write_head(inner: &Arc<InMemory>, partition: u16, born: &[&str], tier: &str) {
+        let mut records: Vec<Record> = born
+            .iter()
+            .map(|cell| Record {
+                fp: fingerprint(cell),
+                kind: Kind::Born,
+            })
+            .collect();
+        records.sort_by_key(|record| record.fp);
+        let key = run_key(partition, tier, "gen1", 1);
+        let run = write_run(inner.as_ref(), PREFIX, &key, &records)
+            .await
+            .unwrap();
+        let mut head = Head::default();
+        match tier {
+            "l0" => head.l0 = Some(run),
+            "l1" => head.l1 = Some(run),
+            _ => head.l2 = Some(run),
+        }
+        let result = put_if(
+            inner.as_ref(),
+            &head_key(PREFIX, partition),
+            encode_json(&head),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Cas::Applied);
+    }
+
+    #[tokio::test]
+    async fn the_tiers_answer_what_the_tail_does_not_hold() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("old"));
+        write_head(&inner, partition, &["old"], "l2").await;
+        let reader = directory_over(&inner);
+        reader.refresh(10).await.unwrap();
+        assert_eq!(reader.lookup("old", 11).await, DirectoryAnswer::Exists);
+        // A cell of a partition with a head that does not hold it is new.
+        let other = (0..)
+            .map(|index| format!("cell-{index}"))
+            .find(|cell| partition_of(fingerprint(cell)) == partition)
+            .unwrap();
+        assert_eq!(reader.lookup(&other, 11).await, DirectoryAnswer::New);
+    }
+
+    #[tokio::test]
+    async fn a_missing_head_is_unknown_not_new() {
+        let inner = Arc::new(InMemory::new());
+        let reader = directory_over(&inner);
+        reader.refresh(10).await.unwrap();
+        assert_eq!(
+            reader.lookup("anything", 11).await,
+            DirectoryAnswer::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn a_head_or_run_that_cannot_be_read_is_unknown() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("c1"));
+        write_head(&inner, partition, &["c1"], "l1").await;
+        let reader = directory_over(&inner);
+        reader.refresh(10).await.unwrap();
+        assert_eq!(reader.lookup("c1", 11).await, DirectoryAnswer::Exists);
+
+        // The run is gone: a newer head replaced it and the cached one is stale.
+        let run = Path::from(format!("fleet-a/{}", run_key(partition, "l1", "gen1", 1)));
+        inner.delete(&run).await.unwrap();
+        reader.heads.lock().unwrap().clear();
+        assert_eq!(reader.lookup("c1", 12).await, DirectoryAnswer::Unknown);
+        assert!(
+            reader.heads.lock().unwrap().is_empty(),
+            "a head that names a missing run is not kept"
+        );
+
+        // A head that does not decode.
+        put_segment(&inner, &head_key(PREFIX, partition), b"{").await;
+        assert_eq!(reader.lookup("c1", 13).await, DirectoryAnswer::Unknown);
+        // A head of another format.
+        let head = Head {
+            v: 99,
+            ..Head::default()
+        };
+        put_segment(&inner, &head_key(PREFIX, partition), &encode_json(&head)).await;
+        assert_eq!(reader.lookup("c1", 14).await, DirectoryAnswer::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_run_that_is_shorter_than_its_head_says_is_unknown() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("c1"));
+        write_head(&inner, partition, &["c1"], "l0").await;
+        let mut head = read_head(inner.as_ref(), PREFIX, partition)
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        head.l0.as_mut().unwrap().count = 5_000;
+        put_segment(&inner, &head_key(PREFIX, partition), &encode_json(&head)).await;
+        let reader = directory_over(&inner);
+        reader.refresh(10).await.unwrap();
+        assert_eq!(reader.lookup("c1", 11).await, DirectoryAnswer::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_run_count_no_object_can_have_is_unknown_not_a_panic() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("c1"));
+        write_head(&inner, partition, &["c1"], "l0").await;
+        let mut head = read_head(inner.as_ref(), PREFIX, partition)
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        head.l0.as_mut().unwrap().count = u64::MAX - 3;
+        put_segment(&inner, &head_key(PREFIX, partition), &encode_json(&head)).await;
+        let reader = directory_over(&inner);
+        reader.refresh(10).await.unwrap();
+        assert_eq!(reader.lookup("c1", 11).await, DirectoryAnswer::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_rebuilt_head_replaces_the_cached_one_even_at_a_lower_rev() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("old"));
+        write_head(&inner, partition, &["old"], "l2").await;
+        let mut head = read_head(inner.as_ref(), PREFIX, partition)
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        head.rev = 5;
+        put_segment(&inner, &head_key(PREFIX, partition), &encode_json(&head)).await;
+        let reader = directory_over(&inner);
+        reader.refresh(10).await.unwrap();
+        let other = (0..)
+            .map(|index| format!("cell-{index}"))
+            .find(|cell| partition_of(fingerprint(cell)) == partition && cell != "old")
+            .unwrap();
+        assert_eq!(reader.lookup("old", 11).await, DirectoryAnswer::Exists);
+
+        // The partition is rebuilt: a new run, and a rev that starts over.
+        let key = run_key(partition, "rec", "gen2", 2);
+        let run = write_run(
+            inner.as_ref(),
+            PREFIX,
+            &key,
+            &[Record {
+                fp: fingerprint(&other),
+                kind: Kind::Born,
+            }],
+        )
+        .await
+        .unwrap();
+        let rebuilt = Head {
+            rev: 1,
+            l2: Some(run),
+            ..Head::default()
+        };
+        put_segment(&inner, &head_key(PREFIX, partition), &encode_json(&rebuilt)).await;
+        let later = 11 + HEAD_TTL_MS + 1;
+        reader.refresh(later).await.unwrap();
+        assert_eq!(
+            reader.lookup(&other, later + 1).await,
+            DirectoryAnswer::Exists
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_tail_cannot_rule_a_cell_out_but_a_cached_head_does_not_extend_it() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("old"));
+        write_head(&inner, partition, &["old"], "l2").await;
+        let reader = directory_over(&inner);
+        reader.refresh(10).await.unwrap();
+        let other = (0..)
+            .map(|index| format!("cell-{index}"))
+            .find(|cell| partition_of(fingerprint(cell)) == partition)
+            .unwrap();
+        assert_eq!(reader.lookup(&other, 11).await, DirectoryAnswer::New);
+        // The head is cached, and the tail is old.
+        assert_eq!(
+            reader.lookup(&other, 10 + MAX_VIEW_AGE_MS + 1).await,
+            DirectoryAnswer::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_head_is_reused_until_it_expires() {
+        use crate::cell_directory_runs::testing::Counting;
+        let counting = Arc::new(Counting::default());
+        let partition = partition_of(fingerprint("old"));
+        write_head(&counting.inner, partition, &["old"], "l2").await;
+        let reader = CellDirectory::new(counting.clone(), PREFIX.to_owned());
+        reader.refresh(10).await.unwrap();
+        counting.reset();
+
+        // One head read and one ranged read per tier that exists.
+        assert_eq!(reader.lookup("old", 11).await, DirectoryAnswer::Exists);
+        assert_eq!(
+            counting
+                .whole_gets
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            counting
+                .ranged_gets
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        counting.reset();
+        assert_eq!(reader.lookup("old", 12).await, DirectoryAnswer::Exists);
+        assert_eq!(
+            counting
+                .whole_gets
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        // Past the head's age it is read again; the tail is kept fresh.
+        reader.refresh(10 + HEAD_TTL_MS).await.unwrap();
+        counting.reset();
+        assert_eq!(
+            reader.lookup("old", 12 + HEAD_TTL_MS).await,
+            DirectoryAnswer::Exists
+        );
+        assert_eq!(
+            counting
+                .whole_gets
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 }

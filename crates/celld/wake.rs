@@ -288,8 +288,8 @@ struct WakerRoleLease {
     expires_ms: i64,
 }
 
-async fn same_node_still_holds_waker(bucket: &Bucket, node: &str) -> bool {
-    let Ok(Some((bytes, _))) = bucket.get("wake/waker.json").await else {
+async fn same_node_still_holds(bucket: &Bucket, key: &str, node: &str) -> bool {
+    let Ok(Some((bytes, _))) = bucket.get(key).await else {
         return false;
     };
     let Ok(lease) = serde_json::from_slice::<WakerRoleLease>(&bytes) else {
@@ -302,10 +302,23 @@ async fn same_node_still_holds_waker(bucket: &Bucket, node: &str) -> bool {
 /// Correctness never depends on it — concurrent wakers race activation CAS
 /// harmlessly — so a caller skips the tick when another node holds the role.
 pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i64) -> bool {
-    const KEY: &str = "wake/waker.json";
+    try_hold_lease(bucket, WAKER_KEY, node, now_ms, ttl_ms).await
+}
+
+const WAKER_KEY: &str = "wake/waker.json";
+
+/// The advisory lease at `key`, with the same holder-and-expiry body as the
+/// waker role, so that work only some nodes do can elect its own holder.
+pub(crate) async fn try_hold_lease(
+    bucket: &Bucket,
+    key: &str,
+    node: &str,
+    now_ms: i64,
+    ttl_ms: i64,
+) -> bool {
     let body =
         |expires: i64| format!("{{\"node\":{node:?},\"expires_ms\":{expires}}}").into_bytes();
-    let token = match bucket.get(KEY).await {
+    let token = match bucket.get(key).await {
         // absent (or unreadable): claim if absent
         Ok(None) | Err(_) => None,
         Ok(Some((bytes, etag))) => {
@@ -319,15 +332,70 @@ pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i6
         }
     };
     match bucket
-        .put_cas(KEY, body(now_ms + ttl_ms), token.as_deref())
+        .put_cas(key, body(now_ms + ttl_ms), token.as_deref())
         .await
     {
         Ok(Some(_)) => true,
         // The cleanup loop and the due-scan loop renew the same node's role.
         // A clean CAS conflict can be their overlap, so check the winner
         // before cancelling a GC pass and repeating its fleet-wide LIST.
-        Ok(None) => same_node_still_holds_waker(bucket, node).await,
+        Ok(None) => same_node_still_holds(bucket, key, node).await,
         Err(_) => false,
+    }
+}
+
+/// Run `work` while this node holds the advisory waker role, renewing it every
+/// third of its lifetime, which is three ticks. `None` means the role is
+/// another node's, or was lost mid-pass; the dropped `work` cancels its
+/// remaining I/O. `pass` names the work in the log of a lost renewal.
+pub(crate) async fn while_holding_waker<F: std::future::Future>(
+    bucket: &Bucket,
+    node: &str,
+    tick_ms: u64,
+    pass: &str,
+    work: F,
+) -> Option<F::Output> {
+    while_holding_lease(bucket, WAKER_KEY, node, tick_ms, pass, work).await
+}
+
+/// [`while_holding_waker`] for the lease at `key`.
+pub(crate) async fn while_holding_lease<F: std::future::Future>(
+    bucket: &Bucket,
+    key: &str,
+    node: &str,
+    tick_ms: u64,
+    pass: &str,
+    work: F,
+) -> Option<F::Output> {
+    let ttl_ms = tick_ms.saturating_mul(3).min(i64::MAX as u64);
+    let hold = || async {
+        try_hold_lease(
+            bucket,
+            key,
+            node,
+            crate::ownership_store::now_ms() as i64,
+            ttl_ms as i64,
+        )
+        .await
+    };
+    if !hold().await {
+        return None;
+    }
+    let mut renewal = crate::asyncrt::interval(Duration::from_millis((ttl_ms / 3).max(1)));
+    renewal.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
+    renewal.tick().await;
+    tokio::pin!(work);
+    loop {
+        crate::asyncrt::select_biased! {
+            "a due waker-lease renewal wins a tie with completion of the pass";
+            _ = renewal.tick() => {
+                if !hold().await {
+                    warn!(key, "lease renewal failed; cancelling {pass}");
+                    return None;
+                }
+            },
+            output = &mut work => return Some(output),
+        }
     }
 }
 
@@ -643,5 +711,28 @@ impl Collector {
         }
         self.cursor = page.page_token;
         Ok(refresh)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leases_at_different_keys_have_separate_holders() {
+        crate::asyncrt::install_test_host_runtime().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let bucket = Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+            let now = crate::ownership_store::now_ms() as i64;
+            assert!(try_hold_waker(&bucket, "node-a", now, 60_000).await);
+            assert!(!try_hold_waker(&bucket, "node-b", now, 60_000).await);
+            // The compactor's lease is another object: node-b holds it while
+            // node-a holds the waker role, and node-a cannot take it from node-b.
+            let key = crate::cell_directory_compactor::LEASE_KEY;
+            assert!(try_hold_lease(&bucket, key, "node-b", now, 60_000).await);
+            assert!(!try_hold_lease(&bucket, key, "node-a", now, 60_000).await);
+            assert!(try_hold_lease(&bucket, key, "node-b", now + 1, 60_000).await);
+            assert!(try_hold_waker(&bucket, "node-a", now + 1, 60_000).await);
+        });
     }
 }

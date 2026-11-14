@@ -1299,6 +1299,7 @@ impl LtxRepl {
         region: String,
         credentials: Option<StorageCredentials>,
         node: &str,
+        lease: crate::bucket::Bucket,
     ) -> anyhow::Result<Self> {
         let compaction = compaction_config_from_env()?;
         // Everything downstream of the store is backend-agnostic already,
@@ -1323,13 +1324,16 @@ impl LtxRepl {
         // shadows the claim listing: until it replaces that LIST, its
         // segment writes are pure added cost.
         let (store, directory) = if crate::env_vars::flag("CELLD_CELL_DIRECTORY_SHADOW", false)? {
-            let directory = Arc::new(crate::cell_directory::CellDirectory::new());
+            let directory = Arc::new(crate::cell_directory::CellDirectory::new(
+                store.clone(),
+                prefix.clone(),
+            ));
             let batch_window = Duration::from_millis(crate::env_vars::with_default(
                 "CELLD_CELL_DIRECTORY_BATCH_MS",
                 0,
             )?);
             let store: Arc<dyn ObjectStore> =
-                Arc::new(crate::cell_directory::RegisteringStore::new(
+                Arc::new(crate::cell_directory_registrar::RegisteringStore::new(
                     store,
                     directory.clone(),
                     prefix.clone(),
@@ -1362,7 +1366,16 @@ impl LtxRepl {
             DEFAULT_DURABILITY_TIMEOUT_SECS,
         )?
         .saturating_mul(1_000);
-        Ok(Self::assemble(
+        let compactor = match directory {
+            Some(_) => Some((
+                store.clone(),
+                prefix.clone(),
+                node.to_owned(),
+                crate::env_vars::positive::<u64>("CELLD_WAKER_TICK_MS")?.unwrap_or(60_000),
+            )),
+            None => None,
+        };
+        let replicator = Self::assemble(
             watch,
             store,
             timestamp_metadata_key,
@@ -1377,7 +1390,24 @@ impl LtxRepl {
             durability_timeout_ms,
             LtxConfig::from_env(),
             directory,
-        ))
+        );
+        if let Some((store, prefix, node, tick_ms)) = compactor {
+            let stop = replicator.stop.clone();
+            let generation = crate::machine::random_process_generation();
+            replicator.tasks.spawn_owned(
+                "cell_directory_compactor",
+                crate::cell_directory_compactor::run_compactor(
+                    store,
+                    prefix,
+                    lease,
+                    node,
+                    generation,
+                    crate::cell_directory_compactor::Schedule::new(tick_ms),
+                    stop,
+                ),
+            );
+        }
+        Ok(replicator)
     }
 
     /// The one constructor body for every field and every background loop.
@@ -1439,9 +1469,9 @@ impl LtxRepl {
             bundle_loop(cells.clone(), registration.clone(), stop.clone(), flush_ms),
         );
         if let Some(directory) = cell_directory.clone() {
-            let (store, prefix, stop) = (store.clone(), prefix.clone(), stop.clone());
+            let stop = stop.clone();
             tasks.spawn_owned("cell_directory", async move {
-                directory.run_refresh(store, prefix, stop).await
+                directory.run_refresh(stop).await
             });
         }
         let compaction_queue =

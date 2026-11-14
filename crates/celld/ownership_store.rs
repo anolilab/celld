@@ -585,14 +585,15 @@ impl BucketOwnership {
     }
 
     /// What the fleet directory says about `cell`, or `None` on a node without
-    /// one. The claim guard compares it with the listing and decides by the
-    /// listing alone.
-    pub(crate) fn directory_answer(
+    /// one. A lookup that the tail does not settle reads the cell's partition,
+    /// at most four requests. The claim guard compares the answer with the
+    /// listing and decides by the listing alone.
+    pub(crate) async fn directory_answer(
         &self,
         cell: &str,
     ) -> Option<celld_logic::cell_directory::DirectoryAnswer> {
         let directory = self.cell_directory.as_ref()?;
-        Some(directory.answer(cell, crate::asyncrt::mono_ms()))
+        Some(directory.lookup(cell, crate::asyncrt::mono_ms()).await)
     }
 
     /// Whether this node found the record of `cell` lost less than
