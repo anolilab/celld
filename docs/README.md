@@ -244,6 +244,15 @@ Wrangler configuration key stops the deploy. See
 A node verifies the SHA-256 digest of each module before it builds a
 deployment.
 
+`celld deploy --sourcemap PATH` writes the entry's source map to `PATH`, for
+an error tracker or a stack-trace decoder. The map is not part of the
+deployment: the deployed module and its version are the same with or without
+the flag. Its `sources` are relative to the project directory. With
+`no_bundle: true`, the map is `<main>.map`, the file the entry's own build
+wrote beside it; celld refuses it when it is missing, a symbolic link, not a
+regular file, outside the project, or over 64 MiB. A Python Worker has no map
+to write.
+
 A running node does not restart for a new deployment. Each node reads
 `deploy/current.json` every `CELLD_DEPLOY_POLL_S` seconds (default 30) and
 adopts a new deployment in place. `POST /reload` on the internal listener

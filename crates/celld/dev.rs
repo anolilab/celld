@@ -584,6 +584,7 @@ async fn deploy_project(config: &Path, store: &Store, logs: bool) -> anyhow::Res
         json: false,
         vars: read_dev_vars(config)?,
         local_images: true,
+        sourcemap: None,
     })?;
     if logs {
         built.report();

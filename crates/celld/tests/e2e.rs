@@ -5,6 +5,7 @@ mod e2e {
     pub mod body_clone;
     pub mod d1_batch;
     pub mod d1_export;
+    pub mod deploy_sourcemap;
     pub mod do_alarms;
     pub mod do_gates;
     pub mod do_ids;
