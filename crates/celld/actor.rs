@@ -233,9 +233,20 @@ impl Ownership {
         {
             return Ok(record);
         }
-        // The listing decides. A directory that calls the cell new while LTX
-        // exists is the gap that must stay empty before the directory may
-        // replace the listing.
+        // A claim writes the record before any LTX, and celld never deletes
+        // the record, so LTX proves that a record existed before the listing.
+        // A first claim on another node can still write it after the first
+        // read. Only a read after the listing that finds no record proves a
+        // loss; without it, this node fails a request that it can forward and
+        // reports a record that exists.
+        if let Some(record) = self.read_owner(cell).await? {
+            return Ok(Some(record));
+        }
+        // The listing decides. A directory that calls a cell new whose record
+        // is lost beside its LTX is the gap that must stay empty before the
+        // directory may replace the listing. Compared only here, because a
+        // first claim racing on another node also finds LTX after a missing
+        // record, and the re-read above settles that case.
         if let Some(answer) = directory {
             if celld_logic::cell_directory::contradicts_listing(answer, true) {
                 tracing::warn!(
@@ -245,15 +256,6 @@ impl Ownership {
                     "the cell directory called a cell new while its LTX exists"
                 );
             }
-        }
-        // A claim writes the record before any LTX, and celld never deletes
-        // the record, so LTX proves that a record existed before the listing.
-        // A first claim on another node can still write it after the first
-        // read. Only a read after the listing that finds no record proves a
-        // loss; without it, this node fails a request that it can forward and
-        // reports a record that exists.
-        if let Some(record) = self.read_owner(cell).await? {
-            return Ok(Some(record));
         }
         // A missing record tells the core that the cell was never owned, so
         // the core claims epoch one as a fresh cell and the activation

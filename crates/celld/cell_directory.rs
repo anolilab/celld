@@ -13,6 +13,7 @@
 //! only logs when the directory would have decided differently. Segments are
 //! not compacted yet, so every refresh lists the whole `fleet/born/` prefix.
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use bytes::Bytes;
 use celld_logic::cell_directory::{directory_answer, view_is_fresh, DirectoryAnswer};
@@ -160,8 +161,12 @@ impl CellDirectory {
                 .collect()
         };
         for location in unseen {
-            let body = store.get(&location).await?.bytes().await?;
-            let cells = decode_segment(&body)?;
+            let read = async { Ok::<_, anyhow::Error>(store.get(&location).await?.bytes().await?) };
+            let body = read
+                .await
+                .with_context(|| format!("read cell directory segment {location}"))?;
+            let cells = decode_segment(&body)
+                .with_context(|| format!("decode cell directory segment {location}"))?;
             let mut state = self.state.lock().unwrap();
             state.cells.extend(cells);
             state.seen.insert(location.to_string());
@@ -340,9 +345,12 @@ impl RegisteringStore {
     }
 }
 
+/// The inner store's name, unchanged: the paged reader picks its native S3
+/// path by that name (`blocking_range_reader`), and the wrapper only adds
+/// work in front of writes.
 impl fmt::Display for RegisteringStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "RegisteringStore({})", self.inner)
+        fmt::Display::fmt(&self.inner, formatter)
     }
 }
 
@@ -556,6 +564,14 @@ mod tests {
             .unwrap();
         assert_eq!(directory.answer("c1", 0), DirectoryAnswer::Exists);
         assert_eq!(directory.answer("c2", 0), DirectoryAnswer::Unknown);
+    }
+
+    #[test]
+    fn the_wrapper_keeps_the_inner_store_name() {
+        // The paged reader recognises native S3 by this name.
+        let inner = Arc::new(InMemory::new());
+        let store = store_over(&inner, &Arc::new(CellDirectory::new()));
+        assert_eq!(store.to_string(), inner.to_string());
     }
 
     #[tokio::test]
