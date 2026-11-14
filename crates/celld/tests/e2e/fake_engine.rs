@@ -102,6 +102,8 @@ struct State {
     create_reply_delay: Duration,
     /// Hold the next `containers/{x}/exec`, before it names a container.
     exec_delay: Option<Duration>,
+    /// Hold the next inspect of an application container, before it names one.
+    inspect_delay: Option<Duration>,
     /// Answer 409 to the next removal of an app container, which the daemon
     /// does while another removal of it is in progress.
     delete_conflict: bool,
@@ -314,6 +316,12 @@ esac
         state.containers.get(id).map(|c| c.labels.clone())
     }
 
+    /// Hold the next inspect of an application container for `delay`, as a
+    /// slow daemon does, before it names the container.
+    pub fn delay_next_inspect(&self, delay: Duration) {
+        self.state.lock().unwrap().inspect_delay = Some(delay);
+    }
+
     /// Hold the next `containers/{x}/exec` for `delay` before it resolves the
     /// container it names, as a daemon that is slow to take the request does.
     pub fn delay_next_exec_create(&self, delay: Duration) {
@@ -442,6 +450,15 @@ async fn serve(stream: tokio::net::UnixStream, state: Arc<Mutex<State>>) {
         && request.path.ends_with("/exec")
     {
         let delay = state.lock().unwrap().exec_delay.take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
+    if request.method == "GET"
+        && request.path.starts_with("/containers/id-celld")
+        && request.path.ends_with("/json")
+    {
+        let delay = state.lock().unwrap().inspect_delay.take();
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
