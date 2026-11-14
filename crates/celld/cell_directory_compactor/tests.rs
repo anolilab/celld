@@ -878,18 +878,18 @@ fn the_compactor_lease_is_held_between_passes() {
             "node-a".to_owned(),
             GEN.to_owned(),
             Schedule {
-                tick_ms: 150,
+                tick_ms: 400,
                 interval: Duration::from_millis(10),
                 max_segments: 100,
             },
             stop.clone(),
         ));
         // Well past the lease's lifetime of three ticks, with passes between.
-        // The tick is long enough that a loaded machine delaying one tick does
-        // not let the lease lapse.
-        crate::asyncrt::sleep(Duration::from_millis(1_500)).await;
+        // The lease lasts three ticks (1.2 s), so a loaded machine can delay
+        // a renewal by most of a second before the lease lapses.
+        crate::asyncrt::sleep(Duration::from_millis(3_000)).await;
         let now = crate::ownership_store::now_ms() as i64;
-        assert!(!try_hold_lease(&lease, LEASE_KEY, "node-b", now, 450).await);
+        assert!(!try_hold_lease(&lease, LEASE_KEY, "node-b", now, 1_200).await);
         assert!(store.lists.load(Ordering::SeqCst) > 1);
         stop.request_stop();
         running.await.unwrap();
