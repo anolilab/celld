@@ -13,8 +13,8 @@ use serde_json::Value;
 use super::harness::{wait_until, Server};
 
 /// The directory on, and a tick short enough that the compactor's first pass
-/// follows a start by a second. Its next pass is ten minutes away, so a pass
-/// that folds a registration is the first pass of the next start.
+/// follows a start by a second. Its next pass is a minute away, so a pass that
+/// folds a registration is the first pass of the next start.
 const DIRECTORY: &[(&str, &str)] = &[
     ("CELLD_CELL_DIRECTORY_SHADOW", "1"),
     ("CELLD_WAKER_TICK_MS", "1000"),
@@ -93,7 +93,11 @@ async fn lost_record_beside_ltx_is_refused_not_reclaimed() {
     assert_eq!(records, 0, "the refused claim wrote a record");
     // Other cells are unaffected.
     assert_eq!(server.get_text("/agent/new").await, "ok");
-    // The directory never called a cell new while its LTX existed.
+    // The directory never called a cell new while its LTX existed. The
+    // compactor's first pass is a tick away, so no marker is published during
+    // this test and every lookup after the restart answers `unknown`; a restart
+    // inside the blind window may legitimately read `new`, so the tick is not
+    // shortened to make this assertion stronger.
     assert!(
         !server.log_text().contains("cell_directory_mismatch"),
         "the directory disagreed with the listing"
@@ -106,7 +110,7 @@ fn folded(project: &Path) -> bool {
     let store = store(project);
     let ledger: Option<Vec<u8>> = store
         .query_row(
-            "SELECT body FROM objects WHERE key LIKE '%fleet/dir/ledger'",
+            "SELECT body FROM objects WHERE key LIKE '%fleet/dir/k256/ledger'",
             [],
             |row| row.get(0),
         )

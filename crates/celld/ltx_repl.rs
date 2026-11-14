@@ -1321,6 +1321,13 @@ impl LtxRepl {
                 Arc::new(crate::local_store::LocalStore::open(&bucket)?)
             }
         };
+        // Saturating: an absurd seconds value must clamp, not wrap through
+        // `as_millis() as u64` into a short deadline.
+        let durability_timeout_ms = crate::env_vars::positive_or(
+            "CELLD_LTX_DURABILITY_TIMEOUT_SECS",
+            DEFAULT_DURABILITY_TIMEOUT_SECS,
+        )?
+        .saturating_mul(1_000);
         // Every per-cell LTX write goes through this store, so wrapping it
         // here puts a durable directory entry in front of the first artifact
         // of each cell. The reader needs no registration, so it holds the
@@ -1332,20 +1339,20 @@ impl LtxRepl {
                 store.clone(),
                 prefix.clone(),
             ));
-            let batch_window = Duration::from_millis(crate::env_vars::with_default(
-                "CELLD_CELL_DIRECTORY_BATCH_MS",
-                0,
-            )?);
-            let store: Arc<dyn ObjectStore> =
-                Arc::new(crate::cell_directory_registrar::RegisteringStore::new(
-                    store,
-                    directory.clone(),
-                    prefix.clone(),
-                    node.to_owned(),
-                    crate::machine::random_process_generation(),
-                    batch_window,
-                ));
-            (store, Some(directory))
+            let batch_ms = crate::env_vars::with_default("CELLD_CELL_DIRECTORY_BATCH_MS", 0)?;
+            crate::cell_directory::check_batch_window(batch_ms, durability_timeout_ms)?;
+            let batch_window = Duration::from_millis(batch_ms);
+            let registering = crate::cell_directory_registrar::RegisteringStore::new(
+                store,
+                directory.clone(),
+                prefix.clone(),
+                node.to_owned(),
+                crate::machine::random_process_generation(),
+                batch_window,
+            );
+            let registrar = registering.registrar();
+            let store: Arc<dyn ObjectStore> = Arc::new(registering);
+            (store, Some((directory, registrar)))
         } else {
             (store, None)
         };
@@ -1363,13 +1370,10 @@ impl LtxRepl {
         // upload per cell per interval; it is simultaneously the bucket lag
         // budget. 0 disables pacing.
         let flush_ms = crate::env_vars::with_default("CELLD_LOG_FLUSH_MS", 2000)? as u64;
-        // Saturating: an absurd seconds value must clamp, not wrap through
-        // `as_millis() as u64` into a short deadline.
-        let durability_timeout_ms = crate::env_vars::positive_or(
-            "CELLD_LTX_DURABILITY_TIMEOUT_SECS",
-            DEFAULT_DURABILITY_TIMEOUT_SECS,
-        )?
-        .saturating_mul(1_000);
+        let (directory, registrar) = match directory {
+            Some((directory, registrar)) => (Some(directory), Some(registrar)),
+            None => (None, None),
+        };
         let compactor = match directory {
             Some(_) => Some((
                 store.clone(),
@@ -1395,6 +1399,14 @@ impl LtxRepl {
             LtxConfig::from_env(),
             directory,
         );
+        if let Some(registrar) = registrar {
+            let stop = replicator.stop.clone();
+            replicator
+                .tasks
+                .spawn_owned("cell_directory_flush", async move {
+                    registrar.run_flusher(stop).await
+                });
+        }
         if let Some((store, prefix, node, tick_ms)) = compactor {
             let stop = replicator.stop.clone();
             let generation = crate::machine::random_process_generation();
@@ -1472,12 +1484,6 @@ impl LtxRepl {
             "ltx_bundle",
             bundle_loop(cells.clone(), registration.clone(), stop.clone(), flush_ms),
         );
-        if let Some(directory) = cell_directory.clone() {
-            let stop = stop.clone();
-            tasks.spawn_owned("cell_directory", async move {
-                directory.run_refresh(stop).await
-            });
-        }
         let compaction_queue =
             compaction.map(|config| start_compaction_loop(config, tasks.clone()));
         Self {

@@ -1,7 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The format of the cell directory's segments: their keys, the cells they
-//! record, and the fingerprints those cells have in the tail and in runs.
+//! record, and the fingerprints those cells have in segments and in runs.
 
 use anyhow::Context as _;
 use bytes::Bytes;
@@ -15,7 +15,7 @@ fn digest(cell: &str) -> [u8; 32] {
     Sha256::digest(cell.as_bytes()).into()
 }
 
-/// The 64-bit fingerprint a cell has in runs and in the tail: the first eight
+/// The 64-bit fingerprint a cell has in runs and in the compactor: the first eight
 /// bytes of the SHA-256 of its id. Two cells collide with probability about
 /// `n^2 / 2^65`, 3e-10 per cell at five billion cells.
 pub(crate) fn fingerprint(cell: &str) -> u64 {

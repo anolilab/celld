@@ -167,7 +167,7 @@ named for the first key in its body (`(batch) fleet/born/…`), so the compactor
 deletions are counted with the keys they remove, and each billed batch once; a
 batch that removes several kinds of key is named for its first. The proxy reads a batch-delete body up to 2 MiB (a store sends at most 1,000 keys); a larger body is refused with a 413 and not counted. `setup_requests`
 holds the directory's traffic from before the window, where the first
-compaction pass bootstraps the 4096 partition heads when the settle outlasts the
+compaction pass bootstraps the 256 partition heads when the settle outlasts the
 compactor's first tick (one minute). `compaction_passes` counts the passes that
 read their ledger inside the window. `env` records the cell directory variables
 each scenario ran with: its own value where it sets one, else the bench
@@ -192,19 +192,22 @@ reports mostly `unknown` shows a directory that could not have replaced the
 listing.
 
 The compactor's first pass runs a minute after the nodes start and the next
-ones ten minutes apart. With the settle past the first pass, a window of about
-1,300 s holds two more, so raise the settle and the minimum wait:
+ones a minute after the previous pass ends. The directory answers `new` only
+while the compactor's freshness marker is within three minutes, so raise the
+settle past the first pass, and let the window hold a few more:
 
 ```sh
-CELLD_BENCH_FILTER=fleet_evict CELLD_BENCH_SETTLE_S=120 BENCH_MIN_WAIT_S=1250 \
+CELLD_BENCH_FILTER=fleet_evict CELLD_BENCH_SETTLE_S=120 BENCH_MIN_WAIT_S=250 \
 CELLD_CELL_DIRECTORY_SHADOW=1 CELLD_CELL_DIRECTORY_BATCH_MS=2000 \
 CELLD_BENCH_S3_ENDPOINT=http://127.0.0.1:9000 CELLD_BENCH_BUCKET=s3://bench \
   cargo bench -p celld --bench storage_requests --profile lab
 ```
 
-Keep the batch window under `CELLD_LTX_DURABILITY_TIMEOUT_SECS` (default 10 s):
-with a 10 s window and the default deadline a bench run acknowledged its writes
-and no LTX reached the bucket.
+The node refuses a batch window of half of `CELLD_LTX_DURABILITY_TIMEOUT_SECS`
+(default 10 s) or more, so a 10 s window needs a deadline of at least 21 s: set
+`CELLD_LTX_DURABILITY_TIMEOUT_SECS=60` for it. A first write for a cell queued at
+its claim waits for the flush, up to one and a half windows, so the window adds
+that to the first request of every new agent under `CELLD_DURABILITY=bucket`.
 
 ### Classifying keys
 

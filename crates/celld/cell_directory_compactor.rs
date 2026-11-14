@@ -1,7 +1,8 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Compaction of the cell directory: folds the segments under `fleet/born/`
-//! into the partitioned runs under `fleet/dir/`.
+//! into the partitioned runs under `fleet/dir/k256/`. It is the only reader of
+//! segments.
 //!
 //! One pass lists the segments, reads those not yet folded, buckets their
 //! entries by partition, and rewrites each touched partition: the delta tier
@@ -11,36 +12,44 @@
 //! never forces it. Run objects are create-only, and a run a head stops naming
 //! is deleted only after a grace period.
 //!
+//! Every pass whose heads are durable ends by publishing the freshness marker
+//! (see `cell_directory`): the time, and the age of the oldest segment not
+//! folded. A segment that became durable after the listing began is not in it,
+//! so the age is never less than the pass's own duration. A segment this pass
+//! deferred, skipped or held back counts as unfolded, and its age comes from the
+//! compactor's own clock alone: the ledger remembers, for each such segment, the
+//! time before which it cannot have been durable, which is when the listing that
+//! first showed it began, or the listing before that. The store's modification
+//! time is never compared with this clock.
+//!
 //! Segments are deleted last and latest. The ledger records the exact key of
 //! every segment a pass read and folded, and it is written only after all of
 //! the touched heads are durable. A segment the ledger names is deleted once
-//! the grace has passed since then, which outlasts any head a reader holds, so
-//! a reader that no longer lists the segment holds a head that contains it. No
-//! sequence number stands in for a segment: a write that lands after a later
-//! one of its stream is a segment the ledger does not name, and the next pass
-//! folds it.
+//! the grace has passed since then. No sequence number stands in for a
+//! segment: a write that lands after a later one of its stream is a segment the
+//! ledger does not name, and the next pass folds it.
 //!
 //! A pass reads at most [`MAX_SEGMENTS_PER_PASS`] unfolded segments, and a
 //! segment it cannot read is left alone: not folded, not named by the ledger,
-//! so it is never deleted and stays in every reader's tail. The same holds for
-//! a segment that touches a partition the pass could not merge; the others are
-//! folded. A head that is missing after the first pass, or names a run that is
-//! gone, is rebuilt from the runs the partition still has, and the sweep never
-//! deletes a run of a partition whose head it cannot read. The segments of
-//! different streams have no order beyond durability: where a birth and a
-//! tombstone of one cell meet in a pass, the birth wins, which errs toward
-//! `Exists`, the answer that costs only a listing. No production path writes a
-//! tombstone yet.
+//! so it is never deleted and keeps the marker's age from advancing past it.
+//! The same holds for a segment that touches a partition the pass could not
+//! merge; the others are folded. A head that is missing after the first pass,
+//! or names a run that is gone, is rebuilt from the runs the partition still
+//! has, and the sweep never deletes a run of a partition whose head it cannot
+//! read. The segments of different streams have no order beyond durability:
+//! where a birth and a tombstone of one cell meet in a pass, the birth wins,
+//! which errs toward `Exists`, the answer that costs only a listing. No
+//! production path writes a tombstone yet.
 
-use crate::cell_directory::{HEAD_TTL_MS, SEGMENT_READS};
+use crate::cell_directory::{BLIND_WINDOW_MS, CLOCK_SKEW_MS};
 use crate::cell_directory_runs::{
-    encode_json, head_key, ledger_key, put_if, read_head, read_ledger, read_run, run_key,
-    stream_name, write_run, Cas, Head, Ledger, Retired, RunRef, Versioned,
+    encode_json, head_key, ledger_key, publish_marker, put_if, read_head, read_ledger, read_run,
+    run_key, runs_root, stream_name, write_run, Cas, Head, Ledger, Retired, RunRef, Versioned,
 };
 use crate::cell_directory_segments::{fingerprint, parse_segment_key, read_segment};
 use celld_logic::cell_directory::{
-    decode_run, merge_records, partition_of, plan_merge, supersedes, Kind, MergePlan, Op, Record,
-    PARTITIONS,
+    decode_run, merge_records, oldest_unfolded_age_ms, partition_of, plan_merge, supersedes, Kind,
+    MergePlan, Op, Record, PARTITIONS,
 };
 use futures_util::StreamExt as _;
 use object_store::path::Path;
@@ -49,14 +58,22 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
-/// How often the elected node compacts.
-pub(crate) const COMPACT_INTERVAL: Duration = Duration::from_secs(600);
+/// How often the elected node compacts, counted from the end of one pass to the
+/// start of the next. It is the compaction interval P: the blind window is
+/// three of them.
+pub(crate) const COMPACT_INTERVAL: Duration = Duration::from_secs(60);
+const _: () = assert!(BLIND_WINDOW_MS >= 3 * COMPACT_INTERVAL.as_millis() as u64);
+
+/// Segment reads a pass keeps in flight.
+pub(crate) const SEGMENT_READS: usize = 16;
 
 /// How long a merged segment or a retired run outlives the head that replaced
-/// it. A reader holds a head for [`HEAD_TTL_MS`], and its view of the segments
-/// was read no later than that before it used the head.
+/// it. A reader uses a head only while its marker is within the blind window,
+/// and read it after the marker, so a run it names is no older than the window
+/// when the retirement that follows starts this grace; one request may still be
+/// in flight at the end of it.
 pub(crate) const DELETE_GRACE_MS: u64 = 300_000;
-const _: () = assert!(DELETE_GRACE_MS >= 2 * HEAD_TTL_MS);
+const _: () = assert!(DELETE_GRACE_MS >= BLIND_WINDOW_MS + REQUEST_DEADLINE_MS);
 
 /// The longest a compactor lease lives: three ticks of the longest tick. A
 /// compactor that lost it may still have a request in flight.
@@ -82,8 +99,9 @@ const PARTITION_CONCURRENCY: usize = 8;
 const MAX_SEGMENTS_PER_PASS: usize = 20_000;
 
 /// Partitions beside the touched ones whose retired runs a pass sweeps, so a
-/// partition that is never touched again still loses its old runs.
-const SWEEP_PARTITIONS: u32 = 64;
+/// partition that is never touched again still loses its old runs. A full
+/// cycle takes 32 passes.
+const SWEEP_PARTITIONS: u32 = 8;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct PassReport {
@@ -98,6 +116,8 @@ pub(crate) struct PassReport {
     pub partitions_failed: usize,
     pub segments_deleted: usize,
     pub runs_deleted: usize,
+    /// The age the pass's marker recorded; `None` when no marker was published.
+    pub marker_age_ms: Option<u64>,
 }
 
 struct Listed {
@@ -213,6 +233,21 @@ pub(crate) async fn compact_pass_capped(
     let mut by_partition: BTreeMap<u16, Vec<(u64, Op)>> = BTreeMap::new();
     let mut read_keys: Vec<(String, Vec<u16>)> = Vec::new();
     unfolded.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+    // The earliest each could have become durable, on this clock: the listing
+    // that first showed it, or the one before that if the ledger remembers none.
+    // A first-ever pass knows nothing, so it counts from zero.
+    let unfolded_since: Vec<(String, u64)> = unfolded
+        .iter()
+        .map(|item| {
+            let since = ledger
+                .unfolded_since
+                .get(&item.key)
+                .copied()
+                .or(ledger.listing_began_ms)
+                .unwrap_or(0);
+            (item.key.clone(), since)
+        })
+        .collect();
     report.segments_deferred = unfolded.len().saturating_sub(max_segments);
     unfolded.truncate(max_segments);
     let mut reads = futures_util::stream::iter(unfolded)
@@ -223,7 +258,7 @@ pub(crate) async fn compact_pass_capped(
             Ok(read) => read,
             Err((key, error)) => {
                 // Not folded and not named by the ledger, so it is neither
-                // deleted nor missing from a reader's tail.
+                // deleted, and it keeps the marker's age from moving past it.
                 tracing::warn!(%error, %key, "cell directory segment skipped");
                 report.segments_skipped += 1;
                 continue;
@@ -322,12 +357,25 @@ pub(crate) async fn compact_pass_capped(
         // runs from here.
         let durable_ms = clock();
         let changed = !folded.is_empty();
+        let folded: HashSet<String> = folded.into_iter().collect();
+        let still_unfolded: BTreeMap<String, u64> = unfolded_since
+            .into_iter()
+            .filter(|(key, _)| !folded.contains(key))
+            .collect();
+        let oldest_unfolded_ms = still_unfolded.values().copied().min();
         for key in folded {
             ledger.segments.insert(key, durable_ms);
         }
         let before = ledger.segments.len();
         ledger.segments.retain(|key, _| present.contains(key));
-        if changed || ledger.segments.len() != before || ledger_version.is_none() {
+        let remembered_changed = ledger.unfolded_since != still_unfolded;
+        if remembered_changed
+            || changed
+            || ledger.segments.len() != before
+            || ledger_version.is_none()
+        {
+            ledger.unfolded_since = still_unfolded;
+            ledger.listing_began_ms = Some(now_ms);
             match put_if(
                 store,
                 &ledger_key(prefix),
@@ -342,6 +390,23 @@ pub(crate) async fn compact_pass_capped(
                 }
                 Err(error) => tracing::warn!(%error, "cell directory ledger write failed"),
             }
+        }
+        // The heads are durable, and a segment the ledger failed to name is
+        // folded all the same, so the marker may claim it.
+        let published_ms = clock();
+        // Another compactor's clock made some of these times, so a segment
+        // still unfolded is counted older by the skew allowance.
+        let skew_ms = if oldest_unfolded_ms.is_some() {
+            CLOCK_SKEW_MS
+        } else {
+            0
+        };
+        let age_ms = oldest_unfolded_age_ms(published_ms, now_ms, oldest_unfolded_ms)
+            .saturating_add(skew_ms);
+        match publish_marker(store, prefix, published_ms, age_ms).await {
+            Ok(Some(_)) => report.marker_age_ms = Some(age_ms),
+            Ok(None) => tracing::debug!("another compactor published first; its marker stands"),
+            Err(error) => tracing::warn!(%error, "cell directory marker write failed"),
         }
     }
 
@@ -456,7 +521,7 @@ impl Pass<'_> {
         partition: u16,
         current: Option<(UpdateVersion, u64)>,
     ) -> anyhow::Result<()> {
-        let root = self.path(&format!("fleet/dir/{partition:03x}/run"));
+        let root = Path::from(runs_root(self.prefix, partition));
         let mut listing = self.store.list(Some(&root));
         let mut union: BTreeMap<u64, Kind> = BTreeMap::new();
         while let Some(meta) = listing.next().await {
@@ -706,7 +771,7 @@ impl Pass<'_> {
     /// and that a head committed since is named by the head read after it.
     async fn sweep_partition(&self, partition: u16) -> usize {
         let swept = async {
-            let root = self.path(&format!("fleet/dir/{partition:03x}/run"));
+            let root = Path::from(runs_root(self.prefix, partition));
             let mut listing = self.store.list(Some(&root));
             let mut old_runs = Vec::new();
             while let Some(meta) = listing.next().await {
@@ -815,6 +880,7 @@ pub(crate) async fn run_compactor(
                     _ = crate::asyncrt::sleep(wait) => {}
                 }
                 number += 1;
+                let started_ms = crate::asyncrt::mono_ms();
                 crate::asyncrt::select_biased! {
                     "a stop request ends a pass in flight, so shutdown never waits on one";
                     _ = stop.stopped() => return,
@@ -834,6 +900,7 @@ pub(crate) async fn run_compactor(
                             };
                             tracing::info!(
                                 event = "cell_directory_compaction",
+                                elapsed_ms = crate::asyncrt::mono_ms().saturating_sub(started_ms),
                                 ?report,
                                 "cell directory compaction pass finished"
                             )
@@ -871,3 +938,7 @@ pub(crate) async fn run_compactor(
 #[cfg(test)]
 #[path = "cell_directory_compactor/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "cell_directory_compactor/load.rs"]
+mod load;

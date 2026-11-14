@@ -1,17 +1,21 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! The compacted tiers of the cell directory: partition heads, run objects and
-//! the compactor's ledger, under `fleet/dir/`.
+//! The compacted tiers of the cell directory: partition heads, run objects, the
+//! compactor's ledger and its freshness marker, under `fleet/dir/k<K>/`.
 //!
 //! A partition is the top bits of a cell's fingerprint (see
 //! `celld_logic::cell_directory`). Its head names the current run of each tier
 //! and the highest segment read per writer stream. Runs are create-only and
 //! never rewritten; only a head is replaced, by a conditional write.
+//!
+//! The root names the partition count, so a layout with another count is a
+//! different set of keys: an old head, run or ledger is never read as the new
+//! layout, and is left where it is.
 
 use anyhow::Context as _;
 use bytes::Bytes;
 use celld_logic::cell_directory::{
-    byte_range, decode_records, decode_run, probe_window, window_for, Record, TierProbe,
+    byte_range, decode_records, decode_run, probe_window, window_for, Record, TierProbe, PARTITIONS,
 };
 use object_store::path::Path;
 use object_store::{
@@ -22,19 +26,39 @@ use std::collections::BTreeMap;
 
 /// The version of the head and ledger bodies. A reader that finds another
 /// answers `Unknown` rather than guess at the layout.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
+
+const _: () = assert!(PARTITIONS <= 256, "a partition is two hex digits in a key");
+
+/// Below the fleet prefix: everything the compacted layout of this partition
+/// count holds.
+fn root() -> String {
+    format!("fleet/dir/k{PARTITIONS}")
+}
 
 pub(crate) fn head_key(prefix: &str, partition: u16) -> String {
-    format!("{prefix}fleet/dir/{partition:03x}/head")
+    format!("{prefix}{}/{partition:02x}/head", root())
 }
 
 pub(crate) fn ledger_key(prefix: &str) -> String {
-    format!("{prefix}fleet/dir/ledger")
+    format!("{prefix}{}/ledger", root())
+}
+
+pub(crate) fn marker_key(prefix: &str) -> String {
+    format!("{prefix}{}/fresh", root())
+}
+
+/// A partition's run objects, as a listing prefix.
+pub(crate) fn runs_root(prefix: &str, partition: u16) -> String {
+    format!("{prefix}{}/{partition:02x}/run", root())
 }
 
 /// A run's key below the fleet prefix, which is what a head stores.
 pub(crate) fn run_key(partition: u16, tier: &str, generation: &str, pass: u64) -> String {
-    format!("fleet/dir/{partition:03x}/run/{tier}-{generation}-{pass:08}")
+    format!(
+        "{}/{partition:02x}/run/{tier}-{generation}-{pass:08}",
+        root()
+    )
 }
 
 /// A writer stream, `<node>/<generation>`.
@@ -109,10 +133,17 @@ impl Head {
 /// folded into the heads it touched, and when the last of those heads became
 /// durable. A segment is named only after it was read; a key below another's
 /// sequence number says nothing about it.
+///
+/// It also carries what the freshness marker's age is measured from, on the
+/// compactor's own clock: for each segment listed and not folded, a time before
+/// which it cannot have become durable, and when the listing that wrote the
+/// ledger began. A segment that listing did not show became durable after it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Ledger {
     pub v: u32,
     pub segments: BTreeMap<String, u64>,
+    pub unfolded_since: BTreeMap<String, u64>,
+    pub listing_began_ms: Option<u64>,
 }
 
 impl Default for Ledger {
@@ -120,6 +151,35 @@ impl Default for Ledger {
         Self {
             v: FORMAT,
             segments: BTreeMap::new(),
+            unfolded_since: BTreeMap::new(),
+            listing_began_ms: None,
+        }
+    }
+}
+
+/// What the compactor says about how far its folding reaches, published after
+/// every pass whose heads are durable. Every segment that became durable more
+/// than `oldest_unfolded_age_ms` before `published_ms` is folded into the heads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Marker {
+    pub v: u32,
+    /// One more than the marker this one replaced, by a conditional write, so
+    /// markers are ordered whatever clock each compactor's `published_ms` is
+    /// read from. A reader compares it for identity, to tell whether a head it
+    /// holds was read after this marker.
+    pub generation: u64,
+    /// The compactor's wall clock when it published.
+    pub published_ms: u64,
+    pub oldest_unfolded_age_ms: u64,
+}
+
+impl Marker {
+    pub(crate) fn new(generation: u64, published_ms: u64, oldest_unfolded_age_ms: u64) -> Self {
+        Self {
+            v: FORMAT,
+            generation,
+            published_ms,
+            oldest_unfolded_age_ms,
         }
     }
 }
@@ -179,6 +239,72 @@ pub(crate) async fn read_ledger(
         );
     }
     Ok(ledger)
+}
+
+pub(crate) async fn read_marker(
+    store: &dyn ObjectStore,
+    prefix: &str,
+) -> anyhow::Result<Option<Marker>> {
+    let key = marker_key(prefix);
+    let marker = read_versioned::<Marker>(store, &key).await?;
+    if let Some(marker) = &marker {
+        anyhow::ensure!(
+            marker.value.v == FORMAT,
+            "{key} has format {}",
+            marker.value.v
+        );
+    }
+    Ok(marker.map(|marker| marker.value))
+}
+
+/// Publish the next marker by a conditional write on the one it replaces, so
+/// its generation follows the last by one. `None` when another compactor
+/// published first: its marker stands, and ours would only be older. A marker
+/// that does not decode counts as generation zero, so it is replaced instead of
+/// blocking every later pass.
+pub(crate) async fn publish_marker(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    published_ms: u64,
+    oldest_unfolded_age_ms: u64,
+) -> anyhow::Result<Option<Marker>> {
+    let key = marker_key(prefix);
+    let (generation, version) = match store.get(&Path::from(key.as_str())).await {
+        Ok(result) => {
+            let version = UpdateVersion {
+                e_tag: result.meta.e_tag.clone(),
+                version: result.meta.version.clone(),
+            };
+            let body = result
+                .bytes()
+                .await
+                .with_context(|| format!("read body of {key}"))?;
+            let current = serde_json::from_slice::<Marker>(&body)
+                .ok()
+                .filter(|marker| marker.v == FORMAT);
+            (current.map_or(0, |marker| marker.generation), Some(version))
+        }
+        Err(object_store::Error::NotFound { .. }) => (0, None),
+        Err(error) => return Err(error).with_context(|| format!("read {key}")),
+    };
+    let marker = Marker::new(generation + 1, published_ms, oldest_unfolded_age_ms);
+    match put_if(store, &key, encode_json(&marker), version).await? {
+        Cas::Applied => Ok(Some(marker)),
+        Cas::Lost => Ok(None),
+    }
+}
+
+/// Write `marker` as it is, which a test does to stand in for a compactor.
+#[cfg(test)]
+pub(crate) async fn write_marker(store: &dyn ObjectStore, prefix: &str, marker: &Marker) {
+    store
+        .put_opts(
+            &Path::from(marker_key(prefix).as_str()),
+            PutPayload::from_bytes(Bytes::from(encode_json(marker))),
+            PutOptions::default(),
+        )
+        .await
+        .expect("write a marker");
 }
 
 /// How a conditional write ended.
@@ -333,6 +459,11 @@ pub(crate) mod testing {
         pub whole_gets: AtomicUsize,
         pub lists: AtomicUsize,
         pub puts: AtomicUsize,
+        /// Requests of any kind that name something under `fleet/born/`.
+        pub born_requests: AtomicUsize,
+        /// Segment writes wait for a permit, when set. A permit is consumed by
+        /// the write that takes it.
+        pub segment_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
         /// Refuse the next conditional write of a head, as a lost race does.
         pub refuse_head_update: AtomicBool,
         /// Apply the next conditional write of a head and then refuse it, as a
@@ -376,6 +507,12 @@ pub(crate) mod testing {
             Ok(())
         }
 
+        fn note_born(&self, path: &str) {
+            if path.contains("fleet/born") {
+                self.born_requests.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
         pub(crate) fn reset(&self) {
             for counter in [&self.ranged_gets, &self.whole_gets, &self.lists, &self.puts] {
                 counter.store(0, Ordering::SeqCst);
@@ -412,6 +549,11 @@ pub(crate) mod testing {
         ) -> object_store::Result<PutResult> {
             self.begin()?;
             self.puts.fetch_add(1, Ordering::SeqCst);
+            self.note_born(location.as_ref());
+            let gate = self.segment_gate.lock().unwrap().clone();
+            if let Some(gate) = gate.filter(|_| location.as_ref().contains("fleet/born")) {
+                gate.acquire().await.expect("the gate stays open").forget();
+            }
             if self.dropping_puts.load(Ordering::SeqCst) {
                 return Ok(PutResult {
                     e_tag: None,
@@ -483,6 +625,7 @@ pub(crate) mod testing {
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
             self.begin()?;
+            self.note_born(location.as_ref());
             let swap = {
                 let mut pending = self.swap_on_first_get.lock().unwrap();
                 match pending.as_ref() {
@@ -543,6 +686,9 @@ pub(crate) mod testing {
             prefix: Option<&Path>,
         ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
             self.lists.fetch_add(1, Ordering::SeqCst);
+            if let Some(prefix) = prefix {
+                self.note_born(prefix.as_ref());
+            }
             if let Err(error) = self.begin() {
                 return failed_listing(error);
             }
