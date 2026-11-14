@@ -1848,7 +1848,9 @@ impl ContainerEngine {
         signal: u32,
     ) -> anyhow::Result<()> {
         let id = cell.container_id(run).ok_or_else(|| {
-            anyhow!("signal container failed: the container of this run was not created")
+            anyhow!(
+                "signal container failed: the container of this run was never created or has ended"
+            )
         })?;
         self.docker
             .expect(
