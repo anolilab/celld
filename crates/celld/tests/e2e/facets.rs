@@ -23,3 +23,21 @@ async fn facet_data_survives_a_restart() {
     let third = count(&server.get_text("/").await);
     assert_eq!(third, second + 1);
 }
+
+#[tokio::test]
+async fn a_deleted_facet_starts_over_with_the_cell_directory_on() {
+    let server = Server::start("facets", &[("CELLD_CELL_DIRECTORY_SHADOW", "1")]).await;
+    let first = count(&server.get_text("/").await);
+    assert_eq!(count(&server.get_text("/").await), first + 1);
+
+    assert_eq!(server.get_text("/reset").await, "reset");
+
+    // Deleting a facet runs through the directory's deletion path, and the
+    // recreated facet starts empty. A facet is not a registered cell, so the
+    // deletion has no tombstone to write.
+    assert_eq!(count(&server.get_text("/").await), first);
+    assert!(
+        !server.log_text().contains("cell_directory_mismatch"),
+        "the directory disagreed with the listing"
+    );
+}

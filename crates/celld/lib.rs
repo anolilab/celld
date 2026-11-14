@@ -18,6 +18,8 @@ pub mod asyncrt;
 pub mod bucket;
 pub mod cell_cli;
 pub mod cell_directory;
+pub(crate) mod cell_directory_compactor;
+pub(crate) mod cell_directory_runs;
 pub mod cell_dispatch;
 mod cell_host;
 pub mod cell_runtime;

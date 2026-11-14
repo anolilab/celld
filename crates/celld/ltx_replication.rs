@@ -37,6 +37,7 @@ impl Replication {
         credentials: Option<StorageCredentials>,
         node: &str,
     ) -> anyhow::Result<Self> {
+        let lease = bucket.clone();
         Ok(Self {
             ltx: Arc::new(LtxRepl::start(
                 watch,
@@ -47,6 +48,7 @@ impl Replication {
                 region,
                 credentials,
                 node,
+                lease,
             )?),
         })
     }

@@ -223,9 +223,11 @@ impl Ownership {
         if record.is_some() {
             return Ok(record);
         }
-        // Asked before the listing, so a registration that lands during the
-        // listing cannot make the directory look wrong.
-        let directory = bucket.directory_answer(cell);
+        // Asked, and answered, before the listing starts, so a registration
+        // that lands during the listing cannot make the directory look wrong.
+        // Only a cell without a record needs it, so it is not raced with the
+        // record read, which a cell that has one would pay for in vain.
+        let directory = bucket.directory_answer(cell).await;
         if !bucket
             .ltx_exists(cell)
             .await
