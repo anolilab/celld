@@ -124,3 +124,135 @@ The `$/mo @10K` column prices the per-agent requests at S3 Standard rates for
 10,000 agents alive at once, each living one turn interval per turn (60 s by
 default: six turns, one every 10 s). `$/node-mo`
 prices one node's shared requests under the same load.
+
+### Classifying keys
+
+The split between "per agent" and "shared" depends on how a store lays out its
+keys, so the classifier is a setting. A key is matched after the run's bucket
+and prefix are stripped.
+
+| Variable                    | Default | Meaning                                                              |
+| --------------------------- | ------- | -------------------------------------------------------------------- |
+| `BENCH_PER_AGENT_REGEX`     | `^cells/` | A key matching this regex belongs to one agent.                    |
+| `BENCH_PER_AGENT_PREFIXES`  | unset   | Comma-separated key prefixes that belong to one agent. Added to the regex. |
+| `BENCH_BACKGROUND_REGEX`    | unset   | Shared keys that see steady traffic with no load, such as leases and heartbeats. |
+
+Setting either per-agent variable replaces the `cells/` default. Without one,
+the celld layout applies. A key that matches no per-agent pattern is shared and
+is reported per node-hour. The tally groups keys by shape: long hex ids and
+UUIDs print as `*`, other numbers as `#`.
+
+A layout that has no per-agent keys, where objects of every agent share
+prefixes, cannot split the load by key. Count it as a total instead: the
+report also gives every class A and class B request of the run, and, when an
+idle window was measured (`BENCH_IDLE_S` in `agent_requests`), the same totals
+minus the idle request rate times the run length.
+
+### Ending a run
+
+A run has finished when its traffic to the store has stopped. Some systems write
+to the bucket long after the request that caused it, so the rule is a minimum
+wait after the last write followed by a quiet window:
+
+| Variable                 | Default | Meaning                                                           |
+| ------------------------ | ------- | ----------------------------------------------------------------- |
+| `BENCH_MIN_WAIT_S`       | `25`    | Wait at least this long after the last write.                     |
+| `BENCH_QUIET_S`          | `10`    | Then wait until no watched request has arrived for this long.     |
+| `BENCH_QUIET_SCOPE`      | `agent` | Which requests count as traffic: `agent`, `foreground` (all but background) or `all`. |
+| `BENCH_QUIET_TIMEOUT_S`  | `300`   | Fail the run if the traffic has not stopped this long after the minimum wait. |
+
+The defaults are what `storage_requests` always used. For a system that tiers to
+the bucket on a timer, set `BENCH_MIN_WAIT_S` above that timer plus its jitter,
+and scope the quiet check to `all` or `foreground` when no key identifies an
+agent. A count taken before the flush is too low, so the run fails instead of
+reporting it when traffic is still arriving at the timeout.
+
+## Any server: requests, latency and memory
+
+Three more targets measure a server that you start yourself, so they need no
+knowledge of it beyond a base URL. The server has to serve the
+`bench-agents` fixture (`crates/celld/tests/fixtures/bench-agents`): a Durable
+Object per `/agent/<name>`, where every request appends one row. Only that
+route is used. All settings are environment variables; each target's header
+comment lists them.
+
+```sh
+cargo bench -p celld --profile lab --no-run \
+  --bench bucket_proxy --bench agent_requests --bench runtime_latency
+```
+
+These targets need a running server (and `bucket_proxy` never exits), so name
+them with `--bench`; a bare `cargo bench -p celld` would also start them. The
+nightly workflow runs only `e2e`. `BENCH_IDLE_S` means a different thing in two
+of them: in `runtime_latency` it is how long agents idle before the wake
+request, in `agent_requests` it is the length of the no-load window that
+measures the steady request rate.
+
+### Latency, throughput and memory: `runtime_latency`
+
+```sh
+BENCH_BASE_URL=http://127.0.0.1:8787 BENCH_PIDS=12345 BENCH_IDLE_S=15 \
+  cargo bench -p celld --bench runtime_latency --profile lab
+```
+
+| Phase        | What it measures                                                                  |
+| ------------ | --------------------------------------------------------------------------------- |
+| `memory`     | Resident set of the process ids in `BENCH_PIDS` (and their children) at zero agents, after one, and after `BENCH_MEM_AGENTS` (500) live agents. The slope is KiB per live agent; the idle figure shows what is kept after eviction. |
+| `cold`       | First request to each of `BENCH_COLD_AGENTS` (100) agents that have never been seen. |
+| `warm`       | `BENCH_WARM_REQUESTS` (1000) sequential requests to one agent, after 20 warm-up requests. |
+| `wake`       | `BENCH_WAKE_AGENTS` (50) agents are created, idle for `BENCH_IDLE_S` (15 s), and requested again. |
+| `throughput` | `BENCH_CONCURRENCY` (32) connections for `BENCH_SECONDS` (10) after a 2 s warm-up, once on one agent and once over `BENCH_THROUGHPUT_AGENTS` (256). |
+
+`BENCH_PHASES` picks phases (default all). Latency is from send to the last
+body byte and is reported as nearest-rank p50, p95 and p99. Set
+`BENCH_IDLE_S` above the server's idle eviction time. If it is shorter, the
+`wake` phase measures a warm request, and the report cannot tell. What a wake
+does depends on what the server keeps: a process that reopens a local file and
+one that restores from a bucket do different work. Say which one a number is.
+
+Memory needs a server that has served no agent yet, so run it first, as the
+default order does. Pass every process that holds agents in `BENCH_PIDS`
+(a host process and its workers, for example); child processes of a listed pid
+are added. The total includes the runtime and the code, so read the per-agent
+slope, not the absolute figure.
+
+### Requests per agent: `bucket_proxy` and `agent_requests`
+
+`bucket_proxy` is the counting proxy of `storage_requests` as its own process.
+Start it in front of the store, point the server's bucket endpoint at it, and
+run `agent_requests` against the server:
+
+```sh
+BENCH_PROXY_UPSTREAM=127.0.0.1:9000 BENCH_PROXY_ROOT=mybucket \
+  cargo bench -p celld --bench bucket_proxy --profile lab &
+BENCH_BASE_URL=http://127.0.0.1:8787 BENCH_PROXY_URL=http://127.0.0.1:19100 \
+BENCH_MIN_WAIT_S=70 BENCH_QUIET_S=30 BENCH_QUIET_SCOPE=all \
+  cargo bench -p celld --bench agent_requests --profile lab
+```
+
+`BENCH_PROXY_ROOT` is the bucket name plus any key prefix that every key of the
+run starts with. `agent_requests` takes the agent count, turns and turn gap of
+`storage_requests` (`BENCH_AGENTS` 200, `BENCH_TURNS` 6, `BENCH_TURN_MS`
+10000, `BENCH_SPREAD_S` 60) and the classifier and end rule above. With
+`BENCH_IDLE_S` it first watches the proxy with no load for that long and
+reports the idle request rate. The proxy speaks plain HTTP and path-style S3, so
+the server must be allowed to use an `http://` endpoint. It answers
+`GET /.proxy/tally` with the counts as JSON and `POST /.proxy/reset`.
+
+The proxy opens a new connection to the store for every request. That is fine
+at the rates of a request-count run, but at throughput rates it exhausts the
+host's ephemeral ports and the server sees store errors. Point a server at the
+store directly for `runtime_latency`, and through the proxy only for counting.
+
+Some systems keep a steady rate of store requests with no load at all
+(heartbeats, leases, polling), so a quiet window over every request never ends.
+Two ways to handle it: name the steady keys in `BENCH_BACKGROUND_REGEX` and use
+`BENCH_QUIET_SCOPE=foreground`, or watch only the key class that the load
+causes (`BENCH_PER_AGENT_REGEX` with `BENCH_QUIET_SCOPE=agent`). Where neither
+is possible, set `BENCH_QUIET_S=1` so `BENCH_MIN_WAIT_S` alone ends the run,
+and take the steady rate from an idle window (`BENCH_IDLE_S`). Say which rule a
+number was taken with.
+
+A bucket-backed system keeps its state in the bucket, so before trusting a
+count, check that one agent restores from the bucket alone: remove the
+server's local state, restart it, and request an agent that it had.

@@ -25,6 +25,21 @@ name = "storage_requests"
 path = "benches/storage_requests.rs"
 harness = false
 
+[[bench]]
+name = "bucket_proxy"
+path = "benches/bucket_proxy.rs"
+harness = false
+
+[[bench]]
+name = "agent_requests"
+path = "benches/agent_requests.rs"
+harness = false
+
+[[bench]]
+name = "runtime_latency"
+path = "benches/runtime_latency.rs"
+harness = false
+
 [lints.clippy]
 disallowed_macros = "forbid"
 
