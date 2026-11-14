@@ -199,7 +199,7 @@ BENCH_BASE_URL=http://127.0.0.1:8787 BENCH_PIDS=12345 BENCH_IDLE_S=15 \
 | ------------ | --------------------------------------------------------------------------------- |
 | `memory`     | Resident set of the process ids in `BENCH_PIDS` (and their children, each process counted once) at zero agents, after one, and after `BENCH_MEM_AGENTS` (500) live agents. The slope is KiB per live agent; the idle figure shows what is kept after eviction. A listed process that is not running fails the phase. |
 | `cold`       | First request to each of `BENCH_COLD_AGENTS` (100) agents that have never been seen. |
-| `warm`       | `BENCH_WARM_REQUESTS` (1000) sequential requests to one agent, after 20 warm-up requests. |
+| `warm`       | `BENCH_WARM_REQUESTS` (1000) sequential requests to one agent, after 20 warm-up requests. At least one warm-up request must succeed, or the phase fails: otherwise a measured request could create the agent. |
 | `wake`       | `BENCH_WAKE_AGENTS` (50) agents are created, idle for `BENCH_IDLE_S` (15 s), and requested again. |
 | `throughput` | `BENCH_CONCURRENCY` (32) connections for `BENCH_SECONDS` (10) after a 2 s warm-up, once on one agent and once over `BENCH_THROUGHPUT_AGENTS` (256). |
 
@@ -247,7 +247,15 @@ the server must be allowed to use an `http://` endpoint. It answers
 `GET /.proxy/tally` with the counts as JSON and `POST /.proxy/reset`, to
 callers on a loopback address only: the relay may listen on a public address
 for a server on another host, but the tally cannot be read or cleared from
-there, so run `agent_requests` on the proxy's host.
+there, so run `agent_requests` on the proxy's host. `agent_requests` says so when
+the proxy answers 403.
+
+The tally only grows. If it is reset during a run (`POST /.proxy/reset`), the run
+fails with "the tally was reset during the run" rather than reporting counts
+from a partial tally; a reset that leaves every count at or above its earlier
+value cannot be told from traffic. A read of the tally times out after 10 s,
+and the end rule cuts off a read that is still waiting at its deadline
+(`BENCH_QUIET_TIMEOUT_S`), so a stalled proxy ends the run with an error.
 
 The proxy opens a new connection to the store for every request. That is fine
 at the rates of a request-count run, but at throughput rates it exhausts the

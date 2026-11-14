@@ -172,6 +172,8 @@ pub struct EndRule {
     /// A run still making requests this long after `min_wait` fails, rather
     /// than reporting a partial count.
     pub timeout: Duration,
+    /// How often the tally is read while waiting for quiet.
+    pub poll: Duration,
 }
 
 impl EndRule {
@@ -181,6 +183,7 @@ impl EndRule {
             quiet: Duration::from_secs(10),
             scope: Scope::Agent,
             timeout: Duration::from_secs(300),
+            poll: Duration::from_secs(1),
         }
     }
 
@@ -194,6 +197,7 @@ impl EndRule {
             min_wait: secs("BENCH_MIN_WAIT_S", default.min_wait),
             quiet: secs("BENCH_QUIET_S", default.quiet),
             timeout: secs("BENCH_QUIET_TIMEOUT_S", default.timeout),
+            poll: default.poll,
             scope: match env_text("BENCH_QUIET_SCOPE").as_deref() {
                 None | Some("agent") => Scope::Agent,
                 Some("foreground") => Scope::Foreground,
@@ -218,24 +222,36 @@ impl EndRule {
     }
 
     /// Waits `min_wait` after `last_write`, then until the watched traffic has
-    /// been still for `quiet`.
-    pub async fn wait(&self, source: &TallySource, last_write: Instant) {
+    /// been still for `quiet`. Fails when the traffic has not stopped by the
+    /// deadline, or the tally cannot be read: a read that stalls is cut off at
+    /// the deadline, so the run ends with an error instead of hanging.
+    pub async fn wait(&self, source: &TallySource, last_write: Instant) -> Result<(), String> {
         tokio::time::sleep_until((last_write + self.min_wait).into()).await;
         let deadline = Instant::now() + self.timeout;
-        let (mut last, mut since) = (self.watched(&source.take().await), Instant::now());
+        let read = || async {
+            match tokio::time::timeout_at(deadline.into(), source.take()).await {
+                Ok(tally) => tally.map(|tally| self.watched(&tally)),
+                Err(_) => Err(format!(
+                    "reading the tally was still waiting {:?} after the minimum wait",
+                    self.timeout
+                )),
+            }
+        };
+        let (mut last, mut since) = (read().await?, Instant::now());
         while since.elapsed() < self.quiet {
-            assert!(
-                Instant::now() < deadline,
-                "{:?} requests still arriving {:?} after the minimum wait",
-                self.scope,
-                self.timeout
-            );
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let now = self.watched(&source.take().await);
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "{:?} requests still arriving {:?} after the minimum wait",
+                    self.scope, self.timeout
+                ));
+            }
+            tokio::time::sleep(self.poll).await;
+            let now = read().await?;
             if now != last {
                 (last, since) = (now, Instant::now());
             }
         }
+        Ok(())
     }
 }
 
@@ -248,26 +264,47 @@ pub enum TallySource {
     },
 }
 
+/// The longest a read of a standalone proxy's tally may take.
+const TALLY_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl TallySource {
     pub fn remote(proxy_url: &str) -> TallySource {
+        TallySource::remote_with_timeout(proxy_url, TALLY_TIMEOUT)
+    }
+
+    pub fn remote_with_timeout(proxy_url: &str, timeout: Duration) -> TallySource {
         TallySource::Remote {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .expect("build http client"),
             url: format!("{}{CONTROL}tally", proxy_url.trim_end_matches('/')),
         }
     }
 
-    pub async fn take(&self) -> Tally {
+    pub async fn take(&self) -> Result<Tally, String> {
         match self {
-            TallySource::Local(tally) => tally.lock().unwrap().clone(),
+            TallySource::Local(tally) => Ok(tally.lock().unwrap().clone()),
             TallySource::Remote { client, url } => {
-                let body: Value = client
+                let response = client
                     .get(url)
                     .send()
                     .await
-                    .expect("reach the counting proxy")
+                    .map_err(|e| format!("could not reach the counting proxy at {url}: {e}"))?;
+                let status = response.status();
+                if status == reqwest::StatusCode::FORBIDDEN {
+                    return Err(format!(
+                        "the counting proxy at {url} answered 403: its control routes answer \
+                         loopback callers only, so run this on the proxy's host"
+                    ));
+                }
+                if !status.is_success() {
+                    return Err(format!("the counting proxy at {url} answered {status}"));
+                }
+                let body: Value = response
                     .json()
                     .await
-                    .expect("read the proxy tally");
+                    .map_err(|e| format!("the counting proxy at {url} sent no JSON tally: {e}"))?;
                 parse_tally(&body)
             }
         }
@@ -282,25 +319,50 @@ fn tally_json(tally: &Tally) -> Value {
     })
 }
 
-fn parse_tally(body: &Value) -> Tally {
+fn parse_tally(body: &Value) -> Result<Tally, String> {
+    let rows = body["requests"]
+        .as_array()
+        .ok_or("the proxy tally has no `requests` rows")?;
     let mut tally = Tally::new();
-    for row in body["requests"].as_array().expect("tally rows") {
-        let text = |name: &str| row[name].as_str().expect("tally field").to_owned();
+    for row in rows {
+        let text = |name: &str| {
+            row[name]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("a tally row has no `{name}`"))
+        };
+        let count = row["count"].as_u64().ok_or("a tally row has no `count`")?;
         tally.insert(
-            (text("kind"), text("key"), Part::parse(&text("part"))),
-            row["count"].as_u64().expect("tally count"),
+            (text("kind")?, text("key")?, Part::parse(&text("part")?)),
+            count,
         );
     }
-    tally
+    Ok(tally)
 }
 
-/// The requests made between two tallies.
-pub fn diff(after: &Tally, before: &Tally) -> Tally {
-    after
+/// The requests made between two tallies. A tally only grows, so a key that
+/// is gone from `after`, or a count that went down, means the proxy's tally
+/// was reset between the two: there is no valid difference, and it is an
+/// error rather than a wrapped count.
+pub fn diff(after: &Tally, before: &Tally) -> Result<Tally, String> {
+    for (key, was) in before {
+        match after.get(key) {
+            Some(now) if now >= was => {}
+            _ => {
+                return Err(format!(
+                    "the tally was reset during the run: {} {} went from {was} to {}",
+                    key.0,
+                    key.1,
+                    after.get(key).copied().unwrap_or(0)
+                ))
+            }
+        }
+    }
+    Ok(after
         .iter()
         .map(|(key, n)| (key.clone(), n - before.get(key).copied().unwrap_or(0)))
         .filter(|(_, n)| *n > 0)
-        .collect()
+        .collect())
 }
 
 /// A plain-HTTP relay to the store that tallies every request by kind and key
@@ -831,6 +893,18 @@ pub fn window_position(at: Duration, warmup: Duration, window: Duration) -> Wind
     } else {
         WindowPosition::Over
     }
+}
+
+/// Whether warm-up requests have established an agent: at least one of the
+/// `sent` must have succeeded. Without that, the first measured request may
+/// create the agent and its latency would be reported as warm.
+pub fn require_warmup(succeeded: usize, sent: usize) -> Result<(), String> {
+    if succeeded == 0 {
+        return Err(format!(
+            "none of {sent} warm-up requests succeeded, so the agent may not exist yet"
+        ));
+    }
+    Ok(())
 }
 
 /// The measurement phases of `runtime_latency`.

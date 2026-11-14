@@ -226,9 +226,13 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
         settings.spread,
     )
     .await;
-    settings.end.wait(&proxy.source(), Instant::now()).await;
+    settings
+        .end
+        .wait(&proxy.source(), Instant::now())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     let elapsed = started.elapsed();
-    let load = diff(&proxy.take(), &base);
+    let load = diff(&proxy.take(), &base).unwrap_or_else(|e| panic!("{e}"));
     drop(nodes);
     ScenarioResult {
         name: scenario.name,

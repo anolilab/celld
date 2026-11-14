@@ -43,8 +43,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 use support::{
-    base_urls, env_text, git, memory_slope, out, parse_phases, percentile_us, positive, rss_kib,
-    run_id, target_dir, window_position, WindowPosition,
+    base_urls, env_text, git, memory_slope, out, parse_phases, percentile_us, positive,
+    require_warmup, rss_kib, run_id, target_dir, window_position, WindowPosition,
 };
 use tokio::sync::Semaphore;
 
@@ -165,8 +165,7 @@ fn main() {
             record("cold", Outcome::from_samples("cold", &samples));
         }
         if settings.runs("warm") {
-            let samples = warm(&settings, &client).await;
-            record("warm", Outcome::from_samples("warm", &samples));
+            record("warm", warm(&settings, &client).await);
         }
         if settings.runs("wake") {
             record("wake", wake(&settings, &client).await);
@@ -364,10 +363,15 @@ async fn cold(settings: &Settings, client: &reqwest::Client) -> Samples {
     samples
 }
 
-async fn warm(settings: &Settings, client: &reqwest::Client) -> Samples {
+async fn warm(settings: &Settings, client: &reqwest::Client) -> Outcome {
+    const WARMUP: usize = 20;
     let url = settings.url(&format!("{}-warm", settings.run), 0);
-    for _ in 0..20 {
-        timed(client, &url).await;
+    let mut succeeded = 0;
+    for _ in 0..WARMUP {
+        succeeded += usize::from(timed(client, &url).await.is_some());
+    }
+    if let Err(reason) = require_warmup(succeeded, WARMUP) {
+        return Outcome::invalid(json!({ "warmup_succeeded": succeeded }), reason);
     }
     let mut samples = Samples::default();
     for _ in 0..settings.warm_requests {
@@ -376,7 +380,7 @@ async fn warm(settings: &Settings, client: &reqwest::Client) -> Samples {
             None => samples.errors += 1,
         }
     }
-    samples
+    Outcome::from_samples("warm", &samples)
 }
 
 async fn wake(settings: &Settings, client: &reqwest::Client) -> Outcome {

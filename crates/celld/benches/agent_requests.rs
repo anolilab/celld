@@ -57,32 +57,34 @@ fn main() {
         .build()
         .expect("build http client");
 
-    let (errors, report) = runtime.block_on(async {
-        let idle = match idle_window {
-            Some(window) => {
-                let before = source.take().await;
-                tokio::time::sleep(window).await;
-                Some((diff(&source.take().await, &before), window))
-            }
-            None => None,
-        };
-        let base = source.take().await;
-        let started = Instant::now();
-        let errors = run_turns(&client, &bases, &run, agents, turns, turn, spread).await;
-        end.wait(&source, Instant::now()).await;
-        let elapsed = started.elapsed();
-        let load = diff(&source.take().await, &base);
-        (
-            errors,
-            Report {
-                nodes,
-                agents,
-                load,
-                elapsed,
-                idle,
-            },
-        )
-    });
+    let (errors, report) = runtime
+        .block_on(async {
+            let idle = match idle_window {
+                Some(window) => {
+                    let before = source.take().await?;
+                    tokio::time::sleep(window).await;
+                    Some((diff(&source.take().await?, &before)?, window))
+                }
+                None => None,
+            };
+            let base = source.take().await?;
+            let started = Instant::now();
+            let errors = run_turns(&client, &bases, &run, agents, turns, turn, spread).await;
+            end.wait(&source, Instant::now()).await?;
+            let elapsed = started.elapsed();
+            let load = diff(&source.take().await?, &base)?;
+            Ok::<_, String>((
+                errors,
+                Report {
+                    nodes,
+                    agents,
+                    load,
+                    elapsed,
+                    idle,
+                },
+            ))
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
 
     out(&report.table(errors));
     let lifetime = turn * turns as u32;
