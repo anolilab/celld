@@ -866,6 +866,10 @@ struct Cell {
     /// what a successor restore will actually see, which is what
     /// `note_undrained_tail` compares against (#473).
     percell_txid: AtomicU64,
+    /// The level-0 file the newest per-cell upload wrote, as `(min, max)`. An
+    /// eviction's confirm asks the bucket for exactly this file with one HEAD
+    /// when the position it closed is this file's end.
+    last_percell_file: Mutex<Option<(u64, u64)>>,
     /// Set while a sync for this cell is in flight, so the loop never runs two
     /// at once for one cell (they would serialize on the mutex and waste work).
     syncing: AtomicBool,
@@ -2157,12 +2161,44 @@ impl LtxRepl {
         Ok(Some(EpochChain::build(clients).await?))
     }
 
-    /// Does the bucket hold any LTX for this cell at this epoch? The fail-closed
-    /// eviction gate: never delete the last local copy of state the bucket
-    /// cannot restore.
-    pub async fn epoch_replicated(&self, cell: &str, epoch: u64) -> bool {
+    /// Does the bucket hold this cell's transaction `txid` at this epoch? The
+    /// fail-closed eviction gate: never delete the last local copy of state the
+    /// bucket cannot restore.
+    ///
+    /// The question names a transaction because an epoch can hold several
+    /// closed images. A cell resumed at its own epoch is evicted again at a
+    /// later position, and the first eviction's snapshot is still in the
+    /// bucket: asking whether any object exists would let the second eviction
+    /// pass on it while its own snapshot is missing.
+    ///
+    /// `newest` is the level-0 file the caller last wrote, which answers with
+    /// one HEAD when `txid` is its end.
+    async fn epoch_covers(
+        &self,
+        cell: &str,
+        epoch: u64,
+        txid: u64,
+        newest: Option<(u64, u64)>,
+    ) -> bool {
         let client = self.client_for(cell, epoch);
-        matches!(client.has_any_object().await, Ok(true))
+        let newest = newest.map(|(min, max)| (TXID(min), TXID(max)));
+        matches!(client.covers_txid(TXID(txid), newest).await, Ok(true))
+    }
+
+    /// Whether the bucket holds the position this closed cell's per-cell
+    /// watermark stands at, asking for the newest file the node wrote first.
+    /// Fails with the refusal an eviction returns.
+    async fn confirm_closed(&self, cell: &str, epoch: u64, handle: &Cell) -> anyhow::Result<()> {
+        let position = percell_coverage(handle);
+        let newest =
+            (*handle.last_percell_file.lock().unwrap()).filter(|(_, max)| *max == position);
+        if self.epoch_covers(cell, epoch, position, newest).await {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "no replica objects through txid {position} for {cell} epoch {epoch}; \
+             refusing to evict state the bucket cannot restore"
+        ))
     }
 
     pub async fn activate(
@@ -2174,7 +2210,34 @@ impl LtxRepl {
 
     /// `activate`, where `allow_paged` false always clones: a facet's
     /// database is opened by a plain connection that has no fault-in VFS.
+    ///
+    /// A restore plans against one listing of the epoch's objects. An owner
+    /// that evicts the cell meanwhile publishes a newer snapshot and deletes
+    /// the older one once its grace has passed, so a restore that outlives the
+    /// grace finds its planned object gone. It plans again once from a fresh
+    /// listing, which holds the newer snapshot. A paged cell that faults a
+    /// page from a deleted object after it serves cannot, and the grace is
+    /// the bound on that.
     pub(crate) async fn activate_with(
+        &self,
+        options: ActivationOptions<'_>,
+        allow_paged: bool,
+    ) -> anyhow::Result<ActivationResult> {
+        match self.activate_once(options.clone(), allow_paged).await {
+            Err(error) if planned_object_vanished(&error) => {
+                info!(
+                    cell = options.cell,
+                    epoch = options.epoch,
+                    error = %format!("{error:#}"),
+                    "a planned restore object was replaced; planning again"
+                );
+                self.activate_once(options, allow_paged).await
+            }
+            result => result,
+        }
+    }
+
+    async fn activate_once(
         &self,
         options: ActivationOptions<'_>,
         allow_paged: bool,
@@ -2218,16 +2281,17 @@ impl LtxRepl {
         // epoch's baseline. Eviction removes the LTX metadata, so reopening
         // that SQLite image starts a new writer generation at TXID 1. Pairing
         // it with the same remote epoch would mix that new lineage with the
-        // old tail (#158). A clean process reload is the separate
-        // `resume_local` path: it retains both the live database and its LTX
-        // metadata, so it can safely continue the existing epoch.
+        // old tail (#158). `resume_local` is the separate path that continues
+        // the existing epoch: a clean process reload retains the live database
+        // and its LTX metadata, and an eviction that kept the cell dormant
+        // here retains a `.evicted` copy with the same metadata.
         // `.evicted` is the current name; `.hibernated` is what releases
         // before 2026-08-05 wrote. Accept both, so an upgrade reuses the
         // snapshots already on disk instead of restoring every cell from the
         // bucket. Writes always use the new name, so the old one dies out.
         let legacy = |path: &PathBuf| path.with_extension("hibernated");
         let previous = celld_logic::restore::previous_epoch_reusable(epoch, took_over)
-            .then(|| self.db_path(cell, epoch - 1).with_extension("evicted"));
+            .then(|| evicted_path(&self.db_path(cell, epoch - 1)));
         let is_file = |path: &PathBuf| {
             self.ltx_host
                 .metadata(path)
@@ -2240,9 +2304,37 @@ impl LtxRepl {
                 Some(legacy(&path)).filter(is_file)
             }
         };
+        // The next epoch takes the base alone and clears the files beside it,
+        // so a base whose write-ahead log still holds pages is not one: those
+        // pages are in the bucket's snapshot, and the bucket restore has them.
         let local_snapshot = (!fresh && !resume_local)
             .then(|| previous.and_then(first_present))
-            .flatten();
+            .flatten()
+            .filter(|_| {
+                let pending = self.wal_holds_pages(&self.db_path(cell, epoch.saturating_sub(1)));
+                if pending {
+                    warn!(
+                        cell,
+                        epoch,
+                        "the previous epoch's write-ahead log holds pages; restoring instead"
+                    );
+                }
+                !pending
+            })
+            // A lineage that cannot be cleared stays with the base, which the
+            // cache still tracks; the bucket restore needs neither.
+            .filter(|_| match self.forget_lineage(cell, epoch - 1) {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(
+                        cell,
+                        epoch,
+                        error = %format!("{error:#}"),
+                        "clearing the previous epoch's lineage failed; restoring instead"
+                    );
+                    false
+                }
+            });
 
         // Sample before a restore can replace the path. A non-certified live
         // database can contain rows which a crash or self-fence staged but did
@@ -2255,12 +2347,9 @@ impl LtxRepl {
         // A paged activation continues its chain from the cut: (last txid of
         // the chain, page count at the cut).
         let mut continuation: Option<(TXID, u32)> = None;
+        let mut resume = None;
         if resume_local {
-            anyhow::ensure!(
-                is_file(&dst),
-                "clean reload database is missing: {}",
-                dst.display()
-            );
+            resume = Some(self.prepare_resume(cell, epoch, &dst)?);
             info!(cell, epoch, "resumed clean local replica");
         } else if let Some(snapshot) = local_snapshot {
             self.ltx_host.rename(&snapshot, &dst)?;
@@ -2325,9 +2414,13 @@ impl LtxRepl {
                     && self.paged_fleet.load(Ordering::Relaxed)
                 {
                     let plan_started = asyncrt::mono_ms();
-                    let plan = replica::calc_restore_plan(&chain, TXID(0))
-                        .await
-                        .map_err(|error| anyhow!("paged plan {cell} e{from}: {error}"))?;
+                    let plan =
+                        replica::calc_restore_plan(&chain, TXID(0))
+                            .await
+                            .map_err(|error| {
+                                anyhow::Error::new(error)
+                                    .context(format!("paged plan {cell} e{from}"))
+                            })?;
                     let plan_us = asyncrt::mono_ms()
                         .saturating_sub(plan_started)
                         .saturating_mul(1_000);
@@ -2350,7 +2443,9 @@ impl LtxRepl {
                     let map_started = asyncrt::mono_ms();
                     let map = celld_ltx::paged::build_page_map(&chain, &plan)
                         .await
-                        .map_err(|error| anyhow!("paged map {cell} e{from}: {error}"))?;
+                        .map_err(|error| {
+                            anyhow::Error::new(error).context(format!("paged map {cell} e{from}"))
+                        })?;
                     let map_us = asyncrt::mono_ms()
                         .saturating_sub(map_started)
                         .saturating_mul(1_000);
@@ -2417,7 +2512,9 @@ impl LtxRepl {
                         self.restore_slots.clone(),
                     )
                     .await
-                    .map_err(|error| anyhow!("restore {cell} e{from}: {error}"))?;
+                    .map_err(|error| {
+                        anyhow::Error::new(error).context(format!("restore {cell} e{from}"))
+                    })?;
                     let levels = stats
                         .plan
                         .by_level
@@ -2540,6 +2637,25 @@ impl LtxRepl {
                     complete: AtomicBool::new(false),
                 })
             });
+        // A reopened epoch holds a snapshot at some position, and under a
+        // fleet proof the rows at or below it are in no per-cell L0 file, so
+        // its compaction continues from the next transaction. The eviction
+        // recorded the position beside the database. One that cannot be read,
+        // or that lies above the database, is not guessed: the handle does
+        // not compact.
+        let position = seed.map_or(0, |pos| pos.txid.0);
+        let resume_cut = match resume.as_ref().map(|plan| plan.cut) {
+            None => Some(0),
+            Some(ResumeCut::At(cut)) if cut <= position => Some(cut),
+            Some(_) => {
+                warn!(
+                    cell,
+                    epoch, "the snapshot position of a reopened epoch is unknown; no compaction"
+                );
+                None
+            }
+        };
+        let compaction_queue = self.compaction_queue.as_ref().zip(resume_cut);
         let handle = Arc::new(Cell {
             snapshot_declined: AtomicBool::new(false),
             paged_vfs: paged_vfs_name.clone(),
@@ -2562,9 +2678,10 @@ impl LtxRepl {
             // The restore read the per-cell prefix, so the seed IS the
             // per-cell coverage at open.
             percell_txid: AtomicU64::new(seed.map_or(0, |pos| pos.txid.0)),
+            last_percell_file: Mutex::new(None),
             syncing: AtomicBool::new(false),
             ready: Notify::new(),
-            compaction: self.compaction_queue.as_ref().map(|queue| {
+            compaction: compaction_queue.map(|(queue, resume_cut)| {
                 let fetcher = Arc::new(SinkFetcher {
                     registration: self.registration.clone(),
                     cell: cell.to_string(),
@@ -2585,11 +2702,11 @@ impl LtxRepl {
                     local_path: Db::meta_path_for_path(&dst),
                     host: self.ltx_host.clone(),
                     queue: queue.clone(),
-                    base_txid: continuation.map_or(1, |(txid, _)| txid.0),
+                    base_txid: continuation.map_or(resume_cut + 1, |(txid, _)| txid.0),
                     min_txids: self.compaction_min_txids,
                     min_bytes: self.compaction_min_bytes,
                     pending_bytes: AtomicU64::new(0),
-                    compacted_txid: AtomicU64::new(0),
+                    compacted_txid: AtomicU64::new(resume_cut),
                     retry_after_ms: AtomicU64::new(0),
                     failures: AtomicU64::new(0),
                     queued: AtomicBool::new(false),
@@ -2622,6 +2739,9 @@ impl LtxRepl {
             } else {
                 cells.insert((cell.to_string(), epoch), handle.clone());
                 registration.keep();
+                if let Some(resume) = &mut resume {
+                    resume.keep();
+                }
                 (true, false)
             }
         };
@@ -2848,11 +2968,16 @@ impl LtxRepl {
     /// The fleet proof therefore keeps the window this closes for the bucket
     /// proof. Moving the handoff snapshot forward would not close it: the
     /// snapshot is a full image at one txid, `evict` publishes it as the
-    /// successor's authoritative restore artifact, and a cell that keeps
-    /// serving can commit past it. A cancelled eviction would then leave an
-    /// image in the bucket that a later restore reads as complete. The cost
-    /// of the remaining window is revocability and not durability, because
-    /// `evict` still refuses to give up state the bucket cannot restore.
+    /// successor's restore artifact, and a cell that keeps serving can commit
+    /// past it, with those rows in node bundles and not under the per-cell
+    /// prefix. A restore reads the highest snapshot of an epoch and the
+    /// per-cell files above it, so it would stop short of them until a
+    /// recovery gathers the bundles, which every takeover and restart does
+    /// first. That is a second mechanism, so the snapshot is published only
+    /// when the stop is past revoking. The cost of the remaining window is
+    /// revocability and not durability, because `evict` still refuses to give
+    /// up state the bucket cannot restore, and its confirm names the position
+    /// it closed, not merely an object of the epoch.
     /// Closing it needs the core to accept a request during `Phase::Cleaning`,
     /// which is an open decision (#818). Do not read the scoping as a claim
     /// that the fleet path needs no gate.
@@ -2867,14 +2992,17 @@ impl LtxRepl {
         revocable: bool,
     ) -> anyhow::Result<()> {
         let proof = self.handoff_wait(cell, epoch).await?;
-        if revocable
-            && matches!(proof, celld_logic::ProofSource::Bucket)
-            && !self.epoch_replicated(cell, epoch).await
-        {
-            return Err(anyhow!(
-                "no replica objects for {cell} epoch {epoch}; refusing to \
-                 evict state the bucket cannot restore"
-            ));
+        if revocable && matches!(proof, celld_logic::ProofSource::Bucket) {
+            // The per-cell watermark, not `durable_txid`: a bundle flush
+            // credits that one without writing anything under this prefix.
+            let handle = self
+                .cells
+                .lock()
+                .unwrap()
+                .get(&(cell.to_string(), epoch))
+                .cloned()
+                .ok_or_else(|| anyhow!("ltx cell not resident: {cell} epoch {epoch}"))?;
+            self.confirm_closed(cell, epoch, &handle).await?;
         }
         Ok(())
     }
@@ -2972,7 +3100,7 @@ impl LtxRepl {
         // handoff snapshot that eviction publishes. The durable L0 chain and
         // this certified local base cover both a later node and this node's
         // successor activation.
-        self.remove_local(cell, epoch, true);
+        self.remove_local(cell, epoch, Retained::Base);
         Ok(())
     }
 
@@ -3110,24 +3238,40 @@ impl LtxRepl {
     ///   loaded node. Abandoning here costs nothing.
     /// - Before `publish_handoff_snapshot`, the snapshot exists only in this
     ///   process. Abandoning here throws away one local capture.
-    /// - After that PUT there is no way back. The snapshot is a full image at
-    ///   one txid, and `restore_plan` takes the highest snapshot at or below
-    ///   its target and then extends it only with the per-cell files above it.
-    ///   A resumed cell commits past that txid, and under a fleet proof those
-    ///   rows go to node bundles and not to the per-cell prefix, so a restore
-    ///   would read the image as a complete database that stops short of an
-    ///   acknowledged write. The rows are recoverable while the node-log
-    ///   session stays open, but that is a second mechanism and not a proof,
-    ///   so this pass does not rely on it.
+    /// - After that PUT there is no way back, and nothing about the snapshot
+    ///   needs one. The snapshot is a full image at one txid, and
+    ///   `restore_plan` takes the highest snapshot at or below its target and
+    ///   extends it only with the per-cell files above it. A cell that goes on
+    ///   past that txid, resumed at its own epoch, commits rows that a fleet
+    ///   proof sends to node bundles and not to the per-cell prefix, so the
+    ///   image alone stops short of an acknowledged write. Three rules keep
+    ///   that image from being read as complete:
+    ///   - The confirm names a transaction. `epoch_covers` asks for an object
+    ///     that holds the position this pass closed, so a later eviction of
+    ///     the same epoch passes only on its own snapshot and never on the
+    ///     previous one.
+    ///   - A restore reads the highest snapshot an epoch holds and the files
+    ///     above it, so the newer image wins.
+    ///   - A restore that follows a crash gathers the node-log bundles before
+    ///     it lists anything, as every takeover, restart and release
+    ///     already does.
     ///
-    /// The PUT and the visibility LIST therefore stay unrevocable in both
-    /// postures. A request that arrives during those two round trips still
-    /// waits for the cell to start again at a new epoch.
+    ///   The PUT and the visibility LIST stay unrevocable regardless: the
+    ///   runtime and its database are already closed by then, and undoing
+    ///   that costs more than the wake that raced the eviction.
+    ///
+    /// A request that arrives during those two round trips therefore waits
+    /// for the cell to start again, at its own epoch when the stop kept the
+    /// database and at a new epoch otherwise.
+    ///
+    /// `retained` says what stays on this node: [`Retained::Resumable`] keeps
+    /// the database and its LTX metadata for a wake at this same epoch, which
+    /// `activate` reopens.
     pub async fn evict(
         &self,
         cell: &str,
         epoch: u64,
-        preserve_local: bool,
+        retained: Retained,
         abandon: Option<&crate::replication::EvictionAbandon>,
     ) -> anyhow::Result<EvictionRestoreArtifact> {
         // The runtime is closed before this pass, so the snapshot is the
@@ -3159,13 +3303,30 @@ impl LtxRepl {
         }
         let deadline = barrier_started_mono_ms.saturating_add(self.durability_timeout_ms);
         let mut artifact = None;
+        let mut snapshot_end = None;
         if let Some(snapshot) = snapshot {
             let published = asyncrt::timeout_at(
                 deadline,
                 self.publish_handoff_snapshot(cell, epoch, &snapshot),
             )
             .await;
-            if matches!(published, Ok(Ok(()))) && self.epoch_replicated(cell, epoch).await {
+            // The snapshot itself must be visible: a handoff that took it has
+            // told the successor to restore that image, and the transaction
+            // alone would pass on an L0 object that holds it. One HEAD of the
+            // key just written decides; only a HEAD that cannot decide falls
+            // back to listing the level.
+            let visible = if matches!(published, Ok(Ok(()))) {
+                let client = self.client_for(cell, epoch);
+                match client.has_full_snapshot(snapshot.max_txid).await {
+                    Ok(visible) => visible,
+                    Err(_) => client.full_snapshots().await.is_ok_and(|files| {
+                        files.iter().any(|file| file.max_txid >= snapshot.max_txid)
+                    }),
+                }
+            } else {
+                false
+            };
+            if visible {
                 // The snapshot is a per-cell object through its txid, so it
                 // covers every fleet-acked row of this closed database. No
                 // later sync or bundle flush credits a removed handle, so
@@ -3177,6 +3338,7 @@ impl LtxRepl {
                 // `durable_txid` to choose which rows to upload.
                 credit_percell_upload(&handle, snapshot.max_txid.0);
                 artifact = Some(EvictionRestoreArtifact::Snapshot);
+                snapshot_end = Some(snapshot.max_txid.0);
             } else {
                 handle.snapshot_declined.store(true, Ordering::Relaxed);
                 warn!(
@@ -3200,11 +3362,7 @@ impl LtxRepl {
                 {
                     return Err(anyhow!("final durability failed for {cell} epoch {epoch}"));
                 }
-                if !self.epoch_replicated(cell, epoch).await {
-                    return Err(anyhow!(
-                        "no replica objects for {cell} epoch {epoch}; refusing to evict state the bucket cannot restore"
-                    ));
-                }
+                self.confirm_closed(cell, epoch, &handle).await?;
                 EvictionRestoreArtifact::L0Chain
             }
         };
@@ -3217,6 +3375,25 @@ impl LtxRepl {
             "final durability barrier passed"
         );
 
+        // A reopened handle compacts from the snapshot, so the record of its
+        // end goes beside the database. A record that cannot be written leaves
+        // only a base: a cut is never guessed.
+        let retained = match snapshot_end {
+            Some(end) if retained == Retained::Resumable => {
+                match self.record_cut(cell, epoch, end) {
+                    Ok(()) => retained,
+                    Err(error) => {
+                        warn!(cell, epoch, %error, "record the snapshot position failed; keeping a base only");
+                        Retained::Base
+                    }
+                }
+            }
+            _ => retained,
+        };
+        if let Some(end) = snapshot_end {
+            self.prune_superseded_snapshots(cell, epoch, end);
+        }
+
         // Keep the local Db until one authoritative restore artifact is
         // remotely visible. A failed snapshot and failed L0 fallback retain
         // the handle, so the actor cannot release ownership. Every such
@@ -3226,7 +3403,7 @@ impl LtxRepl {
         if let Some(pause) = compaction_pause {
             pause.handed_off();
         }
-        self.remove_local(cell, epoch, preserve_local);
+        self.remove_local(cell, epoch, retained);
         Ok(artifact)
     }
 
@@ -3320,7 +3497,7 @@ impl LtxRepl {
     /// Its fleet-acked rows are still acknowledged writes, so it keeps them
     /// uncredited behind an undrained tail until a successor fold uploads them.
     pub(crate) fn discard(&self, cell: &str, epoch: u64) {
-        self.remove_local(cell, epoch, false);
+        self.remove_local(cell, epoch, Retained::Nothing);
     }
 
     /// Remove the handle of a stream that `ctx.facets.delete()` destroys.
@@ -3343,7 +3520,7 @@ impl LtxRepl {
         let Some(handle) = removed.clone() else {
             return;
         };
-        match self.close_removed(cell, epoch, removed, false) {
+        match self.close_removed(cell, epoch, removed, Retained::Nothing) {
             Some(staged) => {
                 handle.durable_txid.fetch_max(staged, Ordering::SeqCst);
             }
@@ -3356,9 +3533,9 @@ impl LtxRepl {
         }
     }
 
-    fn remove_local(&self, cell: &str, epoch: u64, preserve_local: bool) {
+    fn remove_local(&self, cell: &str, epoch: u64, retained: Retained) {
         let removed = self.remove_active_and_record_tail(cell, epoch);
-        self.close_removed(cell, epoch, removed, preserve_local);
+        self.close_removed(cell, epoch, removed, retained);
     }
 
     /// Close a handle that has left the active map, and return the position
@@ -3368,7 +3545,7 @@ impl LtxRepl {
         cell: &str,
         epoch: u64,
         removed: Option<CellHandle>,
-        preserve_local: bool,
+        retained: Retained,
     ) -> Option<u64> {
         if let Some(handle) = &removed {
             self.note_covered(cell, epoch, percell_coverage(handle));
@@ -3378,7 +3555,11 @@ impl LtxRepl {
         // the activation. The io methods hold their own Arcs, so open files
         // outliving the unregistration stay safe.
         let paged_vfs = removed.as_ref().and_then(|handle| handle.paged_vfs.clone());
-        let preserve_local = preserve_local && paged_vfs.is_none();
+        let retained = if paged_vfs.is_none() {
+            retained
+        } else {
+            Retained::Nothing
+        };
         if let Some(hydration) = removed
             .as_ref()
             .and_then(|handle| handle.hydration.as_ref())
@@ -3390,7 +3571,7 @@ impl LtxRepl {
         if let Some(name) = paged_vfs {
             let _ = celld_ltx::paged_vfs::unregister_paged_vfs(&name);
         }
-        self.finish_remove_local(cell, epoch, preserve_local, close_result);
+        self.finish_remove_local(cell, epoch, retained, close_result);
         staged
     }
 
@@ -3441,56 +3622,30 @@ impl LtxRepl {
         }
     }
 
-    fn finish_remove_local(
-        &self,
-        cell: &str,
-        epoch: u64,
-        preserve_local: bool,
-        close_result: anyhow::Result<()>,
-    ) {
-        let preserve_local = match close_result {
-            Ok(()) => preserve_local,
-            Err(error) => {
-                warn!(
-                    cell,
-                    epoch,
-                    %error,
-                    "close managed replica failed; discarding local snapshot"
-                );
-                // A failed close cannot qualify the live database as a
-                // reusable baseline. An orderly eviction already published
-                // its final snapshot, and every other caller requested no
-                // local reuse, so force any next epoch through remote restore.
-                false
-            }
+    /// Delete the snapshots of an epoch that a newer one has replaced, when
+    /// epoch GC is on, by its grace. An epoch that is reopened after each
+    /// eviction otherwise gains a full image per eviction that nothing removes
+    /// while the epoch lives.
+    ///
+    /// The cleanup runs on its own task, detached: it is best effort, so it
+    /// must not delay the stop that is closing the cell, and a bucket that
+    /// stalls its delete costs only the bytes until the next eviction.
+    fn prune_superseded_snapshots(&self, cell: &str, epoch: u64, confirmed: u64) {
+        let Some(grace_ms) = self.epoch_gc_grace_ms else {
+            return;
         };
-        let db = self.db_path(cell, epoch);
-        if preserve_local {
-            let preserved = db.with_extension("evicted");
-            if let Err(error) = self.ltx_host.rename(&db, &preserved) {
-                warn!(cell, epoch, %error, "preserve local snapshot failed");
-            } else {
-                if let Err(error) = self
-                    .preserved
-                    .lock()
-                    .expect("preserved cache poisoned")
-                    .insert(preserved)
-                {
-                    warn!(cell, epoch, %error, "index preserved local snapshot failed");
-                }
-            }
+        if self.stop.is_stopped() {
+            return;
         }
-        // Clear the WAL/meta siblings and the live db regardless: a reactivation
-        // restores or reuses the `.hibernated` copy.
-        for suffix in ["-wal", "-shm"] {
-            let mut sibling = db.clone().into_os_string();
-            sibling.push(suffix);
-            let _ = self.ltx_host.remove_file(&PathBuf::from(sibling));
-        }
-        let _ = self.ltx_host.remove_dir_all(&Db::meta_path_for_path(&db));
-        if !preserve_local {
-            let _ = self.ltx_host.remove_file(&db);
-        }
+        let client = self.client_for(cell, epoch);
+        asyncrt::spawn(prune_snapshots(
+            client,
+            cell.to_string(),
+            epoch,
+            confirmed,
+            grace_ms,
+        ))
+        .detach();
     }
 
     /// Capture one full snapshot after the runtime closes.
@@ -3737,7 +3892,7 @@ impl LtxRepl {
         // Discard it after the proof, so the successor pages the complete
         // position in again from the bucket.
         if self.paged_vfs_name(cell, epoch).is_some() {
-            self.remove_local(cell, epoch, false);
+            self.remove_local(cell, epoch, Retained::Nothing);
             return Ok(());
         }
         let removed = self
@@ -3824,7 +3979,7 @@ impl LtxRepl {
             if let Some(parent) = db.parent() {
                 self.ltx_host.remove_dir_all(parent)?;
                 let mut preserved = self.preserved.lock().expect("preserved cache poisoned");
-                preserved.forget(&db.with_extension("evicted"));
+                preserved.forget(&evicted_path(&db));
                 preserved.forget(&db.with_extension("hibernated"));
             }
         }
@@ -3942,6 +4097,9 @@ async fn sync_cell(handle: CellHandle) -> Option<bool> {
             handle.ready.notify_waiters();
             return Some(false);
         }
+    }
+    if let Some((min_txid, max_txid, _)) = uploads.last() {
+        *handle.last_percell_file.lock().unwrap() = Some((*min_txid, *max_txid));
     }
     if let Some(last) = last {
         // Advance the replica's uploaded watermark; `syncing` serializes
@@ -5183,12 +5341,82 @@ fn node_config(
     }
 }
 
+/// Delete the snapshots of an epoch that a newer one has replaced, as far as
+/// `superseded_snapshots` allows. A failure only costs the bytes until the next
+/// eviction.
+async fn prune_snapshots(
+    client: ObjectStoreClient,
+    cell: String,
+    epoch: u64,
+    confirmed: u64,
+    grace_ms: u64,
+) {
+    let listed = match client.full_snapshots().await {
+        Ok(listed) => listed,
+        Err(error) => {
+            warn!(%cell, epoch, %error, "list the superseded snapshots failed; they stay until the next eviction");
+            return;
+        }
+    };
+    let now_ms = asyncrt::wall_ms().max(0) as u64;
+    let snapshots: Vec<_> = listed
+        .iter()
+        .map(|file| celld_logic::epoch_gc::ListedSnapshot {
+            end: file.max_txid.0,
+            // A file with no upload time is taken to be new.
+            uploaded_ms: file
+                .created_at
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(now_ms, |age| age.as_millis() as u64),
+        })
+        .collect();
+    let ends = celld_logic::epoch_gc::superseded_snapshots(&snapshots, confirmed, now_ms, grace_ms);
+    if ends.is_empty() {
+        return;
+    }
+    let victims: Vec<celld_ltx::FileInfo> = listed
+        .iter()
+        .filter(|file| ends.contains(&file.max_txid.0))
+        .cloned()
+        .collect();
+    match client.delete_ltx_files(&victims).await {
+        Ok(()) => info!(
+            event = "superseded_snapshots_deleted",
+            %cell,
+            epoch,
+            deleted = victims.len(),
+            "deleted the snapshots that a newer one replaced"
+        ),
+        Err(error) => warn!(
+            %cell,
+            epoch,
+            %error,
+            "delete the superseded snapshots failed; they stay until the next eviction"
+        ),
+    }
+}
+
+/// Whether an activation failed on an object of its plan that is no longer
+/// in the bucket.
+fn planned_object_vanished(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| match cause.downcast_ref::<celld_ltx::Error>() {
+            Some(celld_ltx::Error::LTXMissing | celld_ltx::Error::TxNotAvailable) => true,
+            Some(celld_ltx::Error::Io(error)) => error.kind() == std::io::ErrorKind::NotFound,
+            _ => false,
+        })
+}
+
 fn production_ltx_host() -> LtxHost {
     execution_domain_ltx_host()
 }
 
 fn execution_domain_ltx_host() -> LtxHost {
-    let filesystem = asyncrt::fs();
+    ltx_host_over(asyncrt::fs())
+}
+
+fn ltx_host_over(filesystem: Arc<dyn celld_ltx::FileSystem>) -> LtxHost {
     let age_filesystem = filesystem.clone();
     let read_filesystem = filesystem.clone();
     LtxHost::new(
@@ -5263,3 +5491,11 @@ impl Drop for LtxRepl {
         self.shutdown_local_fallback();
     }
 }
+
+mod retained;
+pub use retained::Retained;
+use retained::{evicted_path, ResumeCut};
+pub(crate) use retained::{live_path, remove_lineage};
+
+#[cfg(test)]
+mod tests;

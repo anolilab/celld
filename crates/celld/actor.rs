@@ -1233,6 +1233,18 @@ where
     CompletedEffect::plain(Event::RuntimeStopped { op })
 }
 
+/// A wake that reopens an eviction's kept database and finds it gone is an
+/// expected outcome: a paged cell and a root that opened a facet keep none, and
+/// the cache can drop the rest. The core claims the next epoch instead, so it
+/// is no restore failure to print. The core marks such a resume itself, so a
+/// failed clean-reload resume, which it does fail, is never taken for one.
+fn expected_resume_fallback(spec: &celld_logic::RestoreSpec, error: &anyhow::Error) -> bool {
+    spec.resume == Some(celld_logic::ResumeFrom::Eviction)
+        && error
+            .downcast_ref::<crate::replication::RetainedUnavailable>()
+            .is_some()
+}
+
 fn mono_elapsed_us(started_mono_ms: u64) -> u64 {
     crate::asyncrt::mono_ms()
         .saturating_sub(started_mono_ms)
@@ -1903,6 +1915,9 @@ pub struct Actor {
     peer_http: reqwest::Client,
     peer_auth: Arc<PeerAuth>,
     operation_deadline_ms: u64,
+    /// Whether an eviction that keeps the cell on this node also keeps what a
+    /// wake at the same epoch reopens: `Config::resume_dormant_local`.
+    resume_dormant_local: bool,
     /// The abandon signal of every eviction stop now in flight, by its op.
     ///
     /// Only a bounded eviction has an entry, because only a bounded eviction
@@ -2348,6 +2363,7 @@ impl Actor {
         };
         let ttl_ms = crate::env_vars::positive_or("CELLD_TTL_MS", 10_000)?;
         let operation_deadline_ms = operation_deadline_ms()?;
+        let resume_dormant_local = crate::env_vars::flag("CELLD_RESUME_DORMANT_LOCAL", false)?;
         let lease_spec = NodeLeaseSpec {
             // Startup has already resolved the environment and CLI settings
             // into this validated internal address. Reading the environment
@@ -2388,7 +2404,7 @@ impl Actor {
                     )?,
                     idle_evict_ms: crate::env_vars::positive::<u64>("CELLD_IDLE_EVICT_S")?
                         .map(|seconds| seconds.saturating_mul(1_000)),
-                    resume_dormant_local: false,
+                    resume_dormant_local,
                     pressure: pressure_config_from_environment()?,
                     max_outbound_websockets: crate::env_vars::positive_or(
                         "CELLD_MAX_OUTBOUND_WEBSOCKETS",
@@ -2409,6 +2425,7 @@ impl Actor {
             peer_http,
             peer_auth,
             operation_deadline_ms,
+            resume_dormant_local,
             eviction_abandons: BTreeMap::new(),
             handoff_directory: Arc::new(Mutex::new(HandoffDirectory::default())),
             host,
@@ -3536,7 +3553,17 @@ impl Actor {
                     out.spawn_detached(async move {
                         let started = crate::asyncrt::mono_ms();
                         let result = runtime.restore_cell(&cell, &spec).await.map_err(|error| {
-                            eprintln!("celld restore failed for {cell}: {error:#}");
+                            if expected_resume_fallback(&spec, &error) {
+                                tracing::info!(
+                                    event = "dormant_resume_unavailable",
+                                    %cell,
+                                    epoch = spec.epoch,
+                                    reason = %error,
+                                    "the kept database could not be reopened at its epoch"
+                                );
+                            } else {
+                                eprintln!("celld restore failed for {cell}: {error:#}");
+                            }
                             Failure::Definite
                         });
                         CompletedEffect::timed(
@@ -3865,7 +3892,11 @@ impl Actor {
                     });
                     let stop_mode = match cause {
                         StopCause::Evict { rebalance } => crate::runtime::StopMode::Evict {
-                            preserve_local: !rebalance,
+                            retained: match (rebalance, self.resume_dormant_local) {
+                                (true, _) => crate::ltx_repl::Retained::Nothing,
+                                (false, false) => crate::ltx_repl::Retained::Base,
+                                (false, true) => crate::ltx_repl::Retained::Resumable,
+                            },
                             abandon,
                         },
                         StopCause::Cleanup => crate::runtime::StopMode::Rebase,
@@ -4262,3 +4293,7 @@ fn apply_core_event(state: &mut ActorState, event: Event) -> Vec<Effect> {
 #[cfg(test)]
 #[path = "actor/operator_token_tests.rs"]
 mod operator_token_tests;
+
+#[cfg(test)]
+#[path = "actor/resume_fallback_tests.rs"]
+mod resume_fallback_tests;

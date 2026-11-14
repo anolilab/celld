@@ -16,6 +16,8 @@ pub(crate) struct Shell {
     owners: BTreeMap<CellId, Epoch>,
     /// Restores of these cells fail, as when the replica cannot be read.
     pub failing_restores: BTreeSet<CellId>,
+    /// Cells whose same-epoch resume fails while every other restore works.
+    pub failing_resumes: BTreeSet<CellId>,
     next_request: RequestId,
     /// The monotonic and wall clock, in milliseconds, advanced per event.
     pub now: u64,
@@ -34,6 +36,7 @@ impl Shell {
             inbox: Vec::new(),
             owners: BTreeMap::new(),
             failing_restores: BTreeSet::new(),
+            failing_resumes: BTreeSet::new(),
             next_request: 1,
             now: 1_000_000,
         }
@@ -42,11 +45,23 @@ impl Shell {
     /// A shell whose node holds a live lease, and so has begun confirming
     /// the cells on its disk: the `ReadLocalCells` effect waits in the inbox.
     pub(crate) fn leased(config: Config) -> Self {
+        Self::leased_after(config, None)
+    }
+
+    /// A node that replaces the process `generation` left a lease behind for,
+    /// as a clean reload does: it adopts the cells on disk without reading
+    /// their records, and `ReadLocalCells` waits in the inbox.
+    pub(crate) fn reloaded(config: Config) -> Self {
+        Self::leased_after(config, Some("previous"))
+    }
+
+    fn leased_after(config: Config, predecessor: Option<&str>) -> Self {
         let mut shell = Self {
             state: State::new("node", config),
             inbox: Vec::new(),
             owners: BTreeMap::new(),
             failing_restores: BTreeSet::new(),
+            failing_resumes: BTreeSet::new(),
             next_request: 1,
             now: 1_000_000,
         };
@@ -58,7 +73,7 @@ impl Shell {
                 addr: "node:8081".into(),
                 peer_protocol: 1,
                 generation: "g".into(),
-                resume_generation: None,
+                resume_generation: predecessor.map(str::to_owned),
                 ttl_ms: 30_000,
             },
         });
@@ -70,7 +85,15 @@ impl Shell {
             op,
             now_ms: now,
             now_mono_ms: now,
-            result: Ok(None),
+            result: Ok(predecessor.map(|generation| NodeLeaseRecord {
+                node: "node".into(),
+                addr: "node:8081".into(),
+                expires_ms: now + 30_000,
+                peer_protocol: 1,
+                generation: generation.into(),
+                log_state: None,
+                etag: "previous-etag".into(),
+            })),
         });
         let op = shell.expect("a lease write", |effect| match effect {
             Effect::CasNodeLease { op, .. } => Some(*op),
@@ -169,9 +192,11 @@ impl Shell {
                         result: Ok(CasOutcome::Applied),
                     }
                 }
-                Effect::Restore { op, cell, .. } => Event::RestoreCompleted {
+                Effect::Restore { op, cell, spec } => Event::RestoreCompleted {
                     op,
-                    result: if self.failing_restores.contains(&cell) {
+                    result: if self.failing_restores.contains(&cell)
+                        || (spec.resume.is_some() && self.failing_resumes.contains(&cell))
+                    {
                         Err(Failure::Definite)
                     } else {
                         Ok(RestoreOutcome {

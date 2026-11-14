@@ -1364,15 +1364,16 @@ impl RuntimeManager {
     ) -> anyhow::Result<()> {
         // No facet opens once the stop begins; the facet loop below stops
         // the streams this answers again, with any that opened before.
-        self.facets.stopping(cell, epoch);
+        let facet_streams = self.facets.stopping(cell, epoch);
         if let Some(engine) = crate::container::engine_if_ready() {
             // Only an idle eviction keeps the cell on this node, so only it
             // keeps the container: the next activation here reconnects.
             let release = match &mode {
-                StopMode::Evict {
-                    preserve_local: true,
-                    ..
-                } => crate::container::Release::Keep,
+                StopMode::Evict { retained, .. }
+                    if *retained != crate::ltx_repl::Retained::Nothing =>
+                {
+                    crate::container::Release::Keep
+                }
                 _ => crate::container::Release::Destroy,
             };
             engine.release(cell, release).await;
@@ -1446,11 +1447,23 @@ impl RuntimeManager {
                 // runtime itself has already stopped. An abandoned one is not:
                 // it returns `EvictionAbandoned`, and the caller ends the stop
                 // instead of trying again.
-                StopMode::Evict {
-                    preserve_local,
-                    abandon,
-                } => replication
-                    .evict(cell, epoch, *preserve_local, abandon.as_deref())
+                StopMode::Evict { retained, abandon } => replication
+                    .evict(
+                        cell,
+                        epoch,
+                        // A facet keeps no database past its stop, and its
+                        // epoch already holds the objects it published, so a
+                        // facet that opened at the epoch the root resumes at
+                        // could be restored into neither. The root's wake
+                        // claims the next epoch instead.
+                        match retained {
+                            crate::ltx_repl::Retained::Resumable if !facet_streams.is_empty() => {
+                                crate::ltx_repl::Retained::Base
+                            }
+                            retained => *retained,
+                        },
+                        abandon.as_deref(),
+                    )
                     .await
                     .map(|_| ()),
                 StopMode::Rebase => replication.release(cell, epoch).await,
@@ -1476,7 +1489,7 @@ impl RuntimeManager {
                     // next activation's baseline. The root is gone by now, so
                     // the eviction is not abandoned.
                     StopMode::Evict { .. } => replication
-                        .evict(&facet, epoch, false, None)
+                        .evict(&facet, epoch, crate::ltx_repl::Retained::Nothing, None)
                         .await
                         .map(|_| ()),
                     StopMode::Rebase => replication.release(&facet, epoch).await,

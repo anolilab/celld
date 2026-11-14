@@ -96,3 +96,42 @@ pub fn plan(
 pub fn retired(epoch: Epoch, recorded: Option<Epoch>) -> bool {
     recorded.is_some_and(|mark| epoch < mark)
 }
+
+/// One full snapshot of an epoch: the transaction it ends at and when it was
+/// uploaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListedSnapshot {
+    pub end: u64,
+    pub uploaded_ms: u64,
+}
+
+/// The snapshots of an epoch an owner may delete once the one ending at
+/// `confirmed` is listed, as the ends of the files to delete.
+///
+/// An epoch that its owner reopens after each eviction gains a full snapshot
+/// per eviction, and a restore reads only the newest one at or below its
+/// target. A snapshot is deleted only when a later one exists and the later
+/// one has been listed for at least `grace_ms`: a restore that planned
+/// against the older file did so before its successor existed, so it ends
+/// within the grace. The age of the victim itself says nothing, since an
+/// hour-old snapshot can have been superseded a second ago. The newest
+/// snapshot, and every snapshot at or above the confirmed one, stay, and a
+/// listing that does not hold the confirmed snapshot decides nothing.
+pub fn superseded_snapshots(
+    listed: &[ListedSnapshot],
+    confirmed: u64,
+    now_ms: u64,
+    grace_ms: u64,
+) -> Vec<u64> {
+    let mut ordered = listed.to_vec();
+    ordered.sort_by_key(|snapshot| snapshot.end);
+    if !ordered.iter().any(|snapshot| snapshot.end == confirmed) {
+        return Vec::new();
+    }
+    ordered
+        .windows(2)
+        .filter(|pair| pair[0].end < confirmed)
+        .filter(|pair| now_ms.saturating_sub(pair[1].uploaded_ms) >= grace_ms)
+        .map(|pair| pair[0].end)
+        .collect()
+}

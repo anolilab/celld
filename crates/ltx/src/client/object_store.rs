@@ -571,6 +571,10 @@ impl std::fmt::Debug for ObjectStoreClient {
     }
 }
 
+/// How many transactions below the one asked for [`ObjectStoreClient::covers_txid`]
+/// looks for a file that starts there before it walks the epoch.
+const COVERS_WINDOW: u64 = 1024;
+
 impl ObjectStoreClient {
     /// Create a client from config (no I/O; the store is built on first use).
     pub fn new(config: ObjectStoreConfig) -> Self {
@@ -708,6 +712,81 @@ impl ObjectStoreClient {
             .transpose()
             .map(|object| object.is_some())
             .map_err(map_os_error)
+    }
+
+    /// Whether some object under the replica epoch prefix holds `txid`: a
+    /// file at any level whose range contains it. Transaction zero asks only
+    /// for an object. `newest` names a level-0 file the caller wrote, which is
+    /// checked first.
+    pub async fn covers_txid(&self, txid: TXID, newest: Option<(TXID, TXID)>) -> Result<bool> {
+        if txid == TXID(0) {
+            return self.has_any_object().await;
+        }
+        let store = self.store().await?;
+        if let Some((min_txid, max_txid)) = newest.filter(|(min, max)| *min <= txid && txid <= *max)
+        {
+            let key = ObjPath::from(self.ltx_key(0, min_txid, max_txid));
+            match store.head(&key).await {
+                Ok(_) => return Ok(true),
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Err(map_os_error(error)),
+            }
+        }
+        let seek = TXID(txid.0.saturating_sub(COVERS_WINDOW - 1).max(1));
+        for level in 0..=1 {
+            let near = self
+                .ltx_files_bounded(level, seek, COVERS_WINDOW as usize)
+                .await?;
+            if near
+                .iter()
+                .any(|file| file.min_txid <= txid && txid <= file.max_txid)
+            {
+                return Ok(true);
+            }
+        }
+        let snapshots = self
+            .ltx_files(crate::compaction_level::SNAPSHOT_LEVEL, TXID(0))
+            .await?;
+        if snapshots
+            .iter()
+            .any(|file| file.min_txid <= txid && txid <= file.max_txid)
+        {
+            return Ok(true);
+        }
+        let prefix = ObjPath::from(self.root_prefix());
+        let mut listed = store.list(Some(&prefix));
+        while let Some(meta) = listed.try_next().await.map_err(map_os_error)? {
+            let name = meta.location.filename().unwrap_or("");
+            if let Ok((min_txid, max_txid)) = ltx::parse_filename(name) {
+                if min_txid <= txid && txid <= max_txid {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether the epoch holds the full snapshot that ends at `txid`, by one
+    /// HEAD of its key.
+    pub async fn has_full_snapshot(&self, txid: TXID) -> Result<bool> {
+        let store = self.store().await?;
+        let key =
+            ObjPath::from(self.ltx_key(crate::compaction_level::SNAPSHOT_LEVEL, TXID(1), txid));
+        match store.head(&key).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(map_os_error(error)),
+        }
+    }
+
+    /// The epoch's full snapshots, oldest first: the objects at the snapshot
+    /// level that start at transaction 1.
+    pub async fn full_snapshots(&self) -> Result<Vec<FileInfo>> {
+        let mut files = self
+            .ltx_files(crate::compaction_level::SNAPSHOT_LEVEL, TXID(0))
+            .await?;
+        files.retain(|file| file.min_txid == TXID(1));
+        Ok(files)
     }
 
     /// Build the S3 key for an LTX file: `{path}/{level:04x}/{min}-{max}.ltx`.

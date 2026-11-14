@@ -74,7 +74,7 @@ impl Replication {
             epoch: spec.epoch,
             fresh: spec.fresh,
             took_over: spec.took_over,
-            resume_local: spec.resume_local,
+            resume_local: spec.resume.is_some(),
             prior: spec.prior.clone(),
         };
         let activated = self.ltx.activate_with(options, allow_paged).await?;
@@ -152,11 +152,11 @@ impl Replication {
         &self,
         cell: &str,
         epoch: u64,
-        preserve_local: bool,
+        retained: crate::ltx_repl::Retained,
         abandon: Option<&crate::replication::EvictionAbandon>,
     ) -> anyhow::Result<()> {
         self.ltx
-            .evict(cell, epoch, preserve_local, abandon)
+            .evict(cell, epoch, retained, abandon)
             .await
             .map(|_| ())
     }

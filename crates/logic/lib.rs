@@ -76,6 +76,18 @@ enum WhenFull {
     HoldResidents,
 }
 
+/// Why a local epoch remains authoritative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeFrom {
+    /// The node-level lease handoff of a clean reload proved it.
+    Handoff,
+    /// An eviction kept the database on this node. If the host cannot reopen
+    /// it, the core claims the next epoch in the same wake instead of failing
+    /// the cell's requests, and the adapter reports that fallback as the
+    /// expected outcome it is.
+    Eviction,
+}
+
 /// Facts already decided by ownership resolution that select a safe restore
 /// source. The effect adapter must not rediscover or guess these.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,11 +103,9 @@ pub struct RestoreSpec {
     /// Ownership was seized from a different node (or a released record), so
     /// a previous local eviction cache is not authoritative.
     pub took_over: bool,
-    /// This exact local epoch remains authoritative, either because the
-    /// node-level lease handoff proved it or because an idle eviction kept the
-    /// live database in this process. The adapter must not consult the remote
-    /// replica.
-    pub resume_local: bool,
+    /// Set when this exact local epoch remains authoritative, and says why.
+    /// The adapter restores nothing from the remote replica.
+    pub resume: Option<ResumeFrom>,
     /// The owner the takeover displaced — the node named by the record
     /// version the acquire consumed — for the node-log takeover interlock.
     /// `None` when the record was released or absent, which the release
@@ -629,6 +639,14 @@ impl Default for Cell {
             last_used_request: 0,
             local_request_count: 0,
         }
+    }
+}
+
+impl Cell {
+    /// Nothing demands the cell any more: no request, alarm, startup resume or
+    /// confirmation waits on its activation.
+    fn awaits_nothing(&self) -> bool {
+        self.requests.is_empty() && !self.alarm_wake && !self.resume_demand && !self.confirming
     }
 }
 
@@ -2032,11 +2050,7 @@ impl State {
                 self.cells.insert(id, cell);
                 continue;
             };
-            if cell.requests.is_empty()
-                && !cell.alarm_wake
-                && !cell.resume_demand
-                && !cell.confirming
-            {
+            if cell.awaits_nothing() {
                 set_phase(
                     &mut self.occupied,
                     &mut cell,
@@ -2093,7 +2107,7 @@ impl State {
                     epoch: local.epoch,
                     fresh: false,
                     took_over: false,
-                    resume_local: true,
+                    resume: Some(ResumeFrom::Handoff),
                     prior: None,
                 }),
                 effects,
@@ -2264,7 +2278,7 @@ impl State {
                 return;
             }
         }
-        if cell.requests.is_empty() && !cell.alarm_wake && !cell.resume_demand && !cell.confirming {
+        if cell.awaits_nothing() {
             set_phase(
                 &mut self.occupied,
                 cell,
@@ -4209,7 +4223,7 @@ impl State {
                     took_over: reconciling_claim
                         .as_ref()
                         .is_some_and(|claim| claim.takeover),
-                    resume_local: false,
+                    resume: None,
                     // The ambiguous acquire applied after all, so the prior
                     // owner it displaced is the one the claim carried — the
                     // takeover interlock must see it exactly as if the CAS
@@ -4785,7 +4799,7 @@ impl State {
                     epoch: claim.epoch,
                     fresh: matches!(claim.guard, CasGuard::Absent),
                     took_over: claim.takeover,
-                    resume_local: false,
+                    resume: None,
                     prior: claim.prior.clone(),
                 };
                 self.record_acquisition(&spec);
@@ -4897,8 +4911,26 @@ impl State {
             unreachable!()
         };
         let epoch = spec.epoch;
+        let after_eviction = spec.resume == Some(ResumeFrom::Eviction);
         let mut resume_failed = false;
         match result {
+            Err(_) if after_eviction => {
+                // The host could not reopen the database this process kept
+                // (a paged cell leaves no reusable file, and the cache can
+                // drop one), so the wake goes through the ownership record
+                // like any other. The caller never learns that the shortcut
+                // was tried.
+                cell.resumable = false;
+                // Nobody left to wake the cell for (the caller left or the
+                // alarm was cancelled while the reopen ran): claiming an epoch
+                // would hold a record for nothing, so it stays dormant, as a
+                // queued wake does when its demand goes (`pump_activations`).
+                if cell.awaits_nothing() {
+                    set_phase(&mut self.occupied, &mut cell, Phase::Dormant { epoch });
+                } else {
+                    self.begin_cold_route(&id, &mut cell, ColdStart::ReadOwner, effects);
+                }
+            }
             Ok(outcome) => {
                 cell.restore_failed = false;
                 if outcome.restored {
@@ -7286,7 +7318,7 @@ fn resume_in_place(epoch: Epoch) -> ColdStart {
         epoch,
         fresh: false,
         took_over: false,
-        resume_local: true,
+        resume: Some(ResumeFrom::Eviction),
         prior: None,
     })
 }
@@ -7354,6 +7386,8 @@ mod dead_owner_tests;
 mod dormant_resume_tests;
 #[cfg(test)]
 mod drain_tests;
+#[cfg(test)]
+mod epoch_gc_tests;
 #[cfg(test)]
 mod failed_restore_tests;
 #[cfg(test)]

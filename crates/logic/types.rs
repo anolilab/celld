@@ -162,13 +162,16 @@ pub struct Config {
     /// needs the room.
     pub idle_evict_ms: Option<u64>,
     /// Every eviction stop with `StopCause::Evict { rebalance: false }` keeps
-    /// the cell's live database and its LTX metadata in this process, so a
-    /// wake on this node resumes at the same epoch with neither an owner read
-    /// nor an epoch claim. That covers idle evictions and the room and
-    /// pressure evictions that keep ownership (`OwnershipOnEvict::Sticky`),
-    /// keyed on the same flag as the stop's `preserve_local`. Only a host that
-    /// retains them for every such stop may enable it: a cell whose metadata
-    /// is gone must still claim the next epoch (#158).
+    /// the cell's database and its LTX metadata on this node, so a wake on this
+    /// node resumes at the same epoch with neither an owner read nor an epoch
+    /// claim. That covers idle evictions and the room and pressure evictions
+    /// that keep ownership (`OwnershipOnEvict::Sticky`). The actor maps
+    /// `rebalance` and this option onto `Retained::Resumable` in
+    /// `StopMode::Evict`. The host keeps files and no open handle, so a room
+    /// eviction pins neither a descriptor nor page cache. A host that cannot
+    /// reopen what it kept fails the restore, and the core claims the next
+    /// epoch in the same wake: a cell whose metadata is gone must not
+    /// continue its epoch (#158).
     pub resume_dormant_local: bool,
     /// Ceilings and low watermarks for load shedding.
     ///

@@ -618,12 +618,12 @@ pub type AlarmObserver = Arc<dyn Fn(String, celld_logic::wake::AlarmSnapshot, bo
 pub(crate) enum StopMode {
     /// Prove the final position, then optionally retain a local base.
     ///
-    /// `abandon` travels with `preserve_local` because an eviction that could
-    /// be abandoned and an eviction that keeps a local base are the same
+    /// `abandon` travels with `retained` because an eviction that could be
+    /// abandoned and an eviction that keeps a local base are the same
     /// eviction: the one a live node can change its mind about. A drain and a
     /// fence carry neither.
     Evict {
-        preserve_local: bool,
+        retained: crate::ltx_repl::Retained,
         abandon: Option<Arc<crate::replication::EvictionAbandon>>,
     },
     /// Prove the final position and retain it for the successor epoch.
