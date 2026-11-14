@@ -91,8 +91,10 @@ pub struct RestoreSpec {
     /// Ownership was seized from a different node (or a released record), so
     /// a previous local eviction cache is not authoritative.
     pub took_over: bool,
-    /// The node-level lease handoff proved that this exact local epoch remains
-    /// authoritative. The adapter must not consult the remote replica.
+    /// This exact local epoch remains authoritative, either because the
+    /// node-level lease handoff proved it or because an idle eviction kept the
+    /// live database in this process. The adapter must not consult the remote
+    /// replica.
     pub resume_local: bool,
     /// The owner the takeover displaced — the node named by the record
     /// version the acquire consumed — for the node-log takeover interlock.
@@ -420,6 +422,12 @@ struct Cell {
     restore_failed: bool,
     /// Whether the eviction now under way hands this cell to the fleet.
     evict_rebalance: bool,
+    /// This process still holds the live database and LTX metadata of the
+    /// dormant epoch, so a wake resumes it without touching the ownership
+    /// record. Set by an idle eviction that kept ownership; any phase other
+    /// than `Dormant`, and every issued release, ends it, and a failed release
+    /// never brings it back because the write may still have committed.
+    resumable: bool,
     /// The epoch this node holds the record at, kept across the transient
     /// wake phases. A dormant cell that waits for an activation permit still
     /// routes every request here, and a fleet-wide wake wave otherwise hides
@@ -603,6 +611,7 @@ impl Default for Cell {
             releasing: None,
             restore_failed: false,
             evict_rebalance: false,
+            resumable: false,
             held_epoch: None,
             handoff: false,
             alarm: None,
@@ -1314,6 +1323,14 @@ impl State {
         }
 
         for (id, cell) in &self.cells {
+            if cell.resumable
+                && !(matches!(cell.phase, Phase::Dormant { .. }) && cell.releasing.is_none())
+            {
+                return Err(format!(
+                    "resumable cell {id:?} is not dormant and unreleased in {:?}",
+                    cell.phase
+                ));
+            }
             let in_pipeline = match cell.phase {
                 Phase::Dormant { .. } => cell.releasing.is_some(),
                 Phase::Adopting { .. } => true,
@@ -1929,6 +1946,21 @@ impl State {
                 Self::record_local_request(cell, request, self.now_mono_ms);
             }
             self.complete_request(id, request, result.clone(), effects);
+        }
+    }
+
+    /// How a dormant cell wakes: through the ownership record, or, when this
+    /// process kept its database, at the epoch it already holds.
+    fn dormant_wake(&self, cell: &Cell) -> ColdStart {
+        match cell.phase {
+            Phase::Dormant { epoch } if cell.resumable => ColdStart::Restore(RestoreSpec {
+                epoch,
+                fresh: false,
+                took_over: false,
+                resume_local: true,
+                prior: None,
+            }),
+            _ => ColdStart::ReadOwner,
         }
     }
 
@@ -3315,12 +3347,14 @@ impl State {
             }
             Phase::Dormant { .. } => {
                 cell.alarm_wake = true;
-                // Every activation takes a fresh epoch. The LTX metadata does
-                // not survive an eviction, so a same-epoch wake would restart
-                // at TXID 1 inside a populated prefix and mix two writer
-                // lineages (CelldWriterGeneration.tla, #158). The CAS also
-                // settles the older resume-vs-release race deterministically.
-                self.admit_or_queue_activation(id, &mut cell, ColdStart::ReadOwner, effects);
+                // Every activation takes a fresh epoch unless this process
+                // kept the database. The LTX metadata does not survive an
+                // eviction, so a same-epoch wake would restart at TXID 1
+                // inside a populated prefix and mix two writer lineages
+                // (CelldWriterGeneration.tla, #158). The CAS also settles the
+                // older resume-vs-release race deterministically.
+                let start = self.dormant_wake(&cell);
+                self.admit_or_queue_activation(id, &mut cell, start, effects);
                 effects.push(Effect::ScheduleTimer {
                     timer: Timer::CellAlarm {
                         cell: id.to_string(),
@@ -3797,15 +3831,12 @@ impl State {
                         );
                     }
                     Phase::Dormant { .. } if !self.hands_off(&cell) => {
-                        // A wake always claims a fresh epoch. The preserved
-                        // snapshot remains reusable as the previous epoch's
-                        // baseline after the claim succeeds.
-                        self.admit_or_queue_activation(
-                            &id,
-                            &mut cell,
-                            ColdStart::ReadOwner,
-                            effects,
-                        );
+                        // A wake claims a fresh epoch unless this process kept
+                        // the database. The preserved snapshot remains
+                        // reusable as the previous epoch's baseline after the
+                        // claim succeeds.
+                        let start = self.dormant_wake(&cell);
+                        self.admit_or_queue_activation(&id, &mut cell, start, effects);
                     }
                     _ => {}
                 }
@@ -3869,7 +3900,8 @@ impl State {
         cell.alarm_wake = true;
         match cell.phase {
             Phase::Inactive | Phase::Remote { .. } | Phase::Dormant { .. } => {
-                self.admit_or_queue_activation(&id, &mut cell, ColdStart::ReadOwner, effects);
+                let start = self.dormant_wake(&cell);
+                self.admit_or_queue_activation(&id, &mut cell, start, effects);
             }
             _ => {}
         }
@@ -5236,6 +5268,10 @@ impl State {
                 if cell.requests.is_empty() || (self.draining && rebalance) =>
             {
                 set_phase(&mut self.occupied, &mut cell, Phase::Dormant { epoch });
+                cell.resumable = self.config.resume_dormant_local
+                    && !rebalance
+                    && !self.draining
+                    && cell.releasing.is_none();
                 self.eviction_permits.remove(&id);
                 // The record still names this node, which is the whole cost of
                 // stopping here: every later request for the cell routes to a
@@ -5690,6 +5726,9 @@ impl State {
     fn release_all(&mut self, effects: &mut Vec<Effect>) {
         if !self.draining {
             self.drain_handoff_ceiling = self.config.max_releases.max(self.handoffs_in_flight());
+            for cell in self.cells.values_mut() {
+                cell.resumable = false;
+            }
         }
         self.draining = true;
         self.pump_release(effects);
@@ -5776,6 +5815,7 @@ impl State {
             }
             let op = self.cell_op(&id);
             let cell = self.cells.get_mut(&id).expect("dormant Queue listed above");
+            cell.resumable = false;
             cell.releasing = Some(op);
             self.releasing_cells.insert(id.clone());
             effects.push(Effect::ReleaseOwner {
@@ -5881,6 +5921,7 @@ impl State {
         let op = self.cell_op(id);
         let handoff = !self.draining;
         let cell = self.cells.get_mut(id).expect("dormant cell listed above");
+        cell.resumable = false;
         cell.releasing = Some(op);
         cell.handoff = handoff;
         self.releasing_cells.insert(id.to_string());
@@ -5975,6 +6016,11 @@ impl State {
             }
             None => false,
         }
+    }
+
+    #[cfg(test)]
+    fn resumable(&self, id: &str) -> bool {
+        self.cells.get(id).is_some_and(|cell| cell.resumable)
     }
 
     fn begin_eviction(
@@ -7180,6 +7226,11 @@ fn set_phase(occupied: &mut usize, cell: &mut Cell, phase: Phase) {
     if !matches!(&phase, Phase::Resident { .. }) {
         cell.quiescing = false;
     }
+    // The retained database is only promised to a cell that stays dormant. A
+    // wake, a fence, a reset or a lost record ends the promise.
+    if !matches!(&phase, Phase::Dormant { .. }) {
+        cell.resumable = false;
+    }
     // Ownership follows the confirmed phases and survives the transient
     // wake phases between them; a phase that names another owner, no owner,
     // or a released record ends it.
@@ -7276,6 +7327,8 @@ mod absent_log_tests;
 mod alarm_tests;
 #[cfg(test)]
 mod dead_owner_tests;
+#[cfg(test)]
+mod dormant_resume_tests;
 #[cfg(test)]
 mod drain_tests;
 #[cfg(test)]
