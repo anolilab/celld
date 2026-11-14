@@ -120,9 +120,11 @@ pub fn window_for(count: u64, fp: u64) -> RecordWindow {
     }
 }
 
-/// The bytes of a run that hold `window`.
-pub fn byte_range(window: RecordWindow) -> Range<u64> {
-    RUN_HEADER_LEN + window.first * RECORD_LEN..RUN_HEADER_LEN + window.end * RECORD_LEN
+/// The bytes of a run that hold `window`, or `None` when they do not fit in a
+/// `u64`, as a record count that no object can have.
+pub fn byte_range(window: RecordWindow) -> Option<Range<u64>> {
+    let at = |index: u64| index.checked_mul(RECORD_LEN)?.checked_add(RUN_HEADER_LEN);
+    Some(at(window.first)?..at(window.end)?)
 }
 
 /// What one run says about one fingerprint.
@@ -574,7 +576,7 @@ mod tests {
         assert_eq!(at(0).first, 0);
         assert_eq!(at(100 - 1).end, count);
         assert_eq!(
-            byte_range(middle),
+            byte_range(middle).unwrap(),
             RUN_HEADER_LEN + middle.first * RECORD_LEN..RUN_HEADER_LEN + middle.end * RECORD_LEN
         );
     }
@@ -604,7 +606,8 @@ mod tests {
         let window = window_for(count, fp_in_partition(1, 2));
         let width = window.end - window.first;
         assert!(width >= 2 * 4 * 1_095, "{width}");
-        assert!(byte_range(window).end - byte_range(window).start < 128 * 1024);
+        let range = byte_range(window).unwrap();
+        assert!(range.end - range.start < 128 * 1024);
         // Eight standard deviations of the worst case cover.
         let sigma = (count as f64).sqrt() / 2.0;
         assert!((width as f64) / 2.0 > 8.0 * sigma - 1.0);

@@ -1402,7 +1402,7 @@ impl LtxRepl {
                     lease,
                     node,
                     generation,
-                    (tick_ms, crate::cell_directory_compactor::COMPACT_INTERVAL),
+                    crate::cell_directory_compactor::Schedule::new(tick_ms),
                     stop,
                 ),
             );

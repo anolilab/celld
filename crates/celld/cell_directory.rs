@@ -258,14 +258,9 @@ impl CellDirectory {
                 return None;
             }
         };
-        let mut heads = self.heads.lock().unwrap();
-        // Two reads that raced keep the newer head.
-        if let Some(cached) = heads.get(&partition) {
-            if cached.head.rev > head.rev {
-                return Some(cached.head.clone());
-            }
-        }
-        heads.insert(
+        // A read is the head as of now, whatever its `rev`: a rebuilt head
+        // starts over, and the cache must not outlive it.
+        self.heads.lock().unwrap().insert(
             partition,
             CachedHead {
                 head: head.clone(),
@@ -615,6 +610,70 @@ mod tests {
         let reader = directory_over(&inner);
         reader.refresh(10).await.unwrap();
         assert_eq!(reader.lookup("c1", 11).await, DirectoryAnswer::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_run_count_no_object_can_have_is_unknown_not_a_panic() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("c1"));
+        write_head(&inner, partition, &["c1"], "l0").await;
+        let mut head = read_head(inner.as_ref(), PREFIX, partition)
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        head.l0.as_mut().unwrap().count = u64::MAX - 3;
+        put_segment(&inner, &head_key(PREFIX, partition), &encode_json(&head)).await;
+        let reader = directory_over(&inner);
+        reader.refresh(10).await.unwrap();
+        assert_eq!(reader.lookup("c1", 11).await, DirectoryAnswer::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_rebuilt_head_replaces_the_cached_one_even_at_a_lower_rev() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("old"));
+        write_head(&inner, partition, &["old"], "l2").await;
+        let mut head = read_head(inner.as_ref(), PREFIX, partition)
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        head.rev = 5;
+        put_segment(&inner, &head_key(PREFIX, partition), &encode_json(&head)).await;
+        let reader = directory_over(&inner);
+        reader.refresh(10).await.unwrap();
+        let other = (0..)
+            .map(|index| format!("cell-{index}"))
+            .find(|cell| partition_of(fingerprint(cell)) == partition && cell != "old")
+            .unwrap();
+        assert_eq!(reader.lookup("old", 11).await, DirectoryAnswer::Exists);
+
+        // The partition is rebuilt: a new run, and a rev that starts over.
+        let key = run_key(partition, "rec", "gen2", 2);
+        let run = write_run(
+            inner.as_ref(),
+            PREFIX,
+            &key,
+            &[Record {
+                fp: fingerprint(&other),
+                kind: Kind::Born,
+            }],
+        )
+        .await
+        .unwrap();
+        let rebuilt = Head {
+            rev: 1,
+            l2: Some(run),
+            ..Head::default()
+        };
+        put_segment(&inner, &head_key(PREFIX, partition), &encode_json(&rebuilt)).await;
+        let later = 11 + HEAD_TTL_MS + 1;
+        reader.refresh(later).await.unwrap();
+        assert_eq!(
+            reader.lookup(&other, later + 1).await,
+            DirectoryAnswer::Exists
+        );
     }
 
     #[tokio::test]

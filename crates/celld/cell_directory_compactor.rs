@@ -91,6 +91,8 @@ pub(crate) struct PassReport {
     pub segments_folded: usize,
     /// Segments left for a later pass because they could not be read.
     pub segments_skipped: usize,
+    /// Segments left for the next pass because this one hit its cap.
+    pub segments_deferred: usize,
     pub partitions_merged: usize,
     pub partitions_lost: usize,
     pub partitions_failed: usize,
@@ -139,6 +141,7 @@ struct Pass<'a> {
 
 /// One compaction pass. `generation` and `number` make this pass's run keys
 /// unique, `clock` is wall-clock time.
+#[cfg(test)]
 pub(crate) async fn compact_pass(
     store: &dyn ObjectStore,
     prefix: &str,
@@ -157,7 +160,7 @@ pub(crate) async fn compact_pass(
     .await
 }
 
-async fn compact_pass_capped(
+pub(crate) async fn compact_pass_capped(
     store: &dyn ObjectStore,
     prefix: &str,
     generation: &str,
@@ -210,6 +213,7 @@ async fn compact_pass_capped(
     let mut by_partition: BTreeMap<u16, Vec<(u64, Op)>> = BTreeMap::new();
     let mut read_keys: Vec<(String, Vec<u16>)> = Vec::new();
     unfolded.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+    report.segments_deferred = unfolded.len().saturating_sub(max_segments);
     unfolded.truncate(max_segments);
     let mut reads = futures_util::stream::iter(unfolded)
         .map(|item| read_unfolded(store, item))
@@ -762,47 +766,80 @@ impl Pass<'_> {
 /// takes that, and only a node that runs the directory compacts.
 pub(crate) const LEASE_KEY: &str = "fleet/dir/compactor-lease";
 
-/// Compact every `interval`, asking for the lease every `tick_ms`, on the node that holds the compactor lease, until
-/// `stop` ends the loop. The lease is held across the whole loop, so no other
-/// node's timer finds it free between passes; a node without it asks again
-/// every tick. It only spares the other nodes the work: the conditional writes
-/// keep two compactors from corrupting each other.
+/// When the compactor runs.
+pub(crate) struct Schedule {
+    /// How often a node asks for the lease, and how soon a pass follows one
+    /// that left segments behind.
+    pub tick_ms: u64,
+    /// The pause between passes once the backlog is drained.
+    pub interval: Duration,
+    /// Segments one pass folds.
+    pub max_segments: usize,
+}
+
+impl Schedule {
+    pub(crate) fn new(tick_ms: u64) -> Self {
+        Self {
+            tick_ms,
+            interval: COMPACT_INTERVAL,
+            max_segments: MAX_SEGMENTS_PER_PASS,
+        }
+    }
+}
+
+/// Compact on the node that holds the compactor lease, until `stop` ends the
+/// loop. The lease is held across the whole loop, so no other node's timer
+/// finds it free between passes; a node without it asks again every tick. A
+/// pass that hit its cap is followed after one tick, and a drained backlog
+/// after the interval. It only spares the other nodes the work: the
+/// conditional writes keep two compactors from corrupting each other.
 pub(crate) async fn run_compactor(
     store: std::sync::Arc<dyn ObjectStore>,
     prefix: String,
     lease: crate::bucket::Bucket,
     node: String,
     generation: String,
-    (tick_ms, interval): (u64, Duration),
+    schedule: Schedule,
     stop: crate::ltx_repl::StopToken,
 ) {
-    let tick_ms = tick_ms.min(LEASE_TTL_MAX_MS / 3);
+    let tick_ms = schedule.tick_ms.min(LEASE_TTL_MAX_MS / 3);
+    let tick = Duration::from_millis(tick_ms);
     let mut number = 0_u64;
     loop {
         let compacting = async {
+            let mut wait = tick;
             loop {
                 crate::asyncrt::select_biased! {
                     "a stop request wins a tie with the timer, so shutdown never waits a period";
                     _ = stop.stopped() => return,
-                    _ = crate::asyncrt::sleep(interval) => {}
+                    _ = crate::asyncrt::sleep(wait) => {}
                 }
                 number += 1;
                 crate::asyncrt::select_biased! {
                     "a stop request ends a pass in flight, so shutdown never waits on one";
                     _ = stop.stopped() => return,
-                    outcome = compact_pass(
+                    outcome = compact_pass_capped(
                         store.as_ref(),
                         &prefix,
                         &generation,
                         number,
                         &crate::ownership_store::now_ms,
+                        schedule.max_segments,
                     ) => match outcome {
-                        Ok(report) => tracing::info!(
-                            event = "cell_directory_compaction",
-                            ?report,
-                            "cell directory compaction pass finished"
-                        ),
+                        Ok(report) => {
+                            wait = if report.segments_deferred > 0 {
+                                tick
+                            } else {
+                                schedule.interval
+                            };
+                            tracing::info!(
+                                event = "cell_directory_compaction",
+                                ?report,
+                                "cell directory compaction pass finished"
+                            )
+                        }
                         Err(error) => {
+                            wait = schedule.interval;
                             tracing::warn!(%error, "cell directory compaction pass failed")
                         }
                     }

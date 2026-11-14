@@ -58,8 +58,8 @@ pub(crate) struct Retired {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Head {
     pub v: u32,
-    /// One more than the head it replaced, so a reader keeps the newer of two
-    /// reads that raced.
+    /// One more than the head it replaced, or 1 for a rebuilt head. It is not
+    /// ordered across a rebuild, so no reader compares it.
     pub rev: u64,
     pub merged_at_ms: u64,
     pub l0: Option<RunRef>,
@@ -242,7 +242,10 @@ pub(crate) async fn probe_run(
     }
     let window = window_for(run.count, fp);
     let path = Path::from(format!("{prefix}{}", run.key));
-    let Ok(bytes) = store.get_range(&path, byte_range(window)).await else {
+    let Some(range) = byte_range(window) else {
+        return TierProbe::Unknown;
+    };
+    let Ok(bytes) = store.get_range(&path, range).await else {
         return TierProbe::Unknown;
     };
     match decode_records(&bytes) {

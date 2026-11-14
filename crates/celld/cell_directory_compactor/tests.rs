@@ -877,7 +877,11 @@ fn the_compactor_lease_is_held_between_passes() {
             lease.clone(),
             "node-a".to_owned(),
             GEN.to_owned(),
-            (30, Duration::from_millis(10)),
+            Schedule {
+                tick_ms: 30,
+                interval: Duration::from_millis(10),
+                max_segments: 100,
+            },
             stop.clone(),
         ));
         // Well past the lease's lifetime of three ticks, with passes between.
@@ -885,6 +889,43 @@ fn the_compactor_lease_is_held_between_passes() {
         let now = crate::ownership_store::now_ms() as i64;
         assert!(!try_hold_lease(&lease, LEASE_KEY, "node-b", now, 90).await);
         assert!(store.lists.load(Ordering::SeqCst) > 1);
+        stop.request_stop();
+        running.await.unwrap();
+    });
+}
+
+#[test]
+fn a_backlog_is_worked_off_a_tick_at_a_time_not_an_interval() {
+    use crate::bucket::Bucket;
+    crate::asyncrt::install_test_host_runtime().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+        let store = Arc::new(Counting::default());
+        for seq in 0..5 {
+            put_segment(
+                &store,
+                &format!("node-b/g9/{seq:08}"),
+                format!("c{seq}\n").as_bytes(),
+            )
+            .await;
+        }
+        let stop = crate::ltx_repl::StopToken::new();
+        let running = crate::asyncrt::spawn(run_compactor(
+            store.clone(),
+            PREFIX.to_owned(),
+            lease,
+            "node-a".to_owned(),
+            GEN.to_owned(),
+            Schedule {
+                tick_ms: 30,
+                interval: Duration::from_secs(3_600),
+                max_segments: 2,
+            },
+            stop.clone(),
+        ));
+        crate::asyncrt::sleep(Duration::from_millis(900)).await;
+        let ledger = read_ledger(store.as_ref(), PREFIX).await.unwrap().unwrap();
+        assert_eq!(ledger.value.segments.len(), 5);
         stop.request_stop();
         running.await.unwrap();
     });
