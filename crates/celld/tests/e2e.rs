@@ -20,6 +20,7 @@ mod e2e {
     pub mod operator_branches;
     pub mod operator_token;
     pub mod ownership;
+    pub mod rpc_streams;
     pub mod runtime_pool;
     pub mod sockets;
     pub mod version;
