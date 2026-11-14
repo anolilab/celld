@@ -5341,8 +5341,13 @@ __celld.__makeIncomingRequest = (
   url, method,
   streamId === undefined ? body : new CelldHttpBodyStream(streamId),
   headersJson, undefined, true);
+// Requests the host authenticated as the fleet operator's. The host says so
+// as a typed argument of the dispatch, never as a header or a property of the
+// request, so nothing a Worker sends can put a request in this set.
+const __operatorRequests = new WeakSet();
 const __dispatchTo = __celld.__dispatchTo = async (
   scope, url, method, body, headersJson, requestId = null, bodyStreamId = null,
+  operatorIngress = false,
 ) => {
   // A routed body that must not be collected crosses as a host stream id; the
   // handler here reads it in parts. A held body arrives as its bytes.
@@ -5358,15 +5363,18 @@ const __dispatchTo = __celld.__dispatchTo = async (
   try {
     const dispatch = (async () => {
       const inst = await _readyInstance(scope);
-      return await __ctxRun(undefined, () => inst.fetch(
-        __makeRequest(
+      return await __ctxRun(undefined, () => {
+        const incoming = __makeRequest(
           url,
           method,
           body,
           headersJson,
           requestController.signal,
           true,
-        )));
+        );
+        if (operatorIngress === true) __operatorRequests.add(incoming);
+        return inst.fetch(incoming);
+      });
     })();
     // The caller's abandonment reaches the target through
     // __do_call_cancel/__abortIncomingRequest, which aborts the fresh incoming
@@ -5397,6 +5405,9 @@ const __dispatchTo = __celld.__dispatchTo = async (
   }
 };
 const __rpcTargetMethod = async (scope, method) => {
+  const allowed = __runtimeRpcMethods.get(scope.split(":")[0]);
+  if (allowed !== undefined && !allowed.has(method))
+    throw new TypeError(method + " is not a function");
   const inst = await _readyInstance(scope);
   if (!inst.__celldState._rpcOk)
     throw new TypeError(
@@ -6000,10 +6011,14 @@ const __cell = __celld.__cell = {
 // than make every user set a flag. It is not the application's export, so it
 // stays out of ctx.exports.
 const __runtimeClasses = new Set();
-const __runtimeClass = (name, cls) => {
+// The methods a stub may call over RPC on a runtime class that names them.
+// A class without an entry keeps every method callable.
+const __runtimeRpcMethods = new Map();
+const __runtimeClass = (name, cls, rpcMethods) => {
   __cell.classes[name] = cls;
   __cell.doExports[name] = true;
   __runtimeClasses.add(name);
+  if (rpcMethods !== undefined) __runtimeRpcMethods.set(name, new Set(rpcMethods));
 };
 // ---- KV ------------------------------------------------------------------
 // The namespace cell and the binding's client are `services/kv.js`, which the
@@ -7655,15 +7670,35 @@ class __D1DatabaseCell {
   // HMAC over names that sit in the project's config, so the scope itself
   // is no secret.
   async fetch(request) {
+    // Set by the host for the signed operator route alone. The branches that
+    // change the schema history or read every row of the database are the
+    // operator's, and a Worker holding a stub reaches this method too.
+    const operator = __operatorRequests.has(request);
     let body;
     try {
       body = await request.json();
     } catch {
       return Response.json({ error: "D1_ERROR: invalid request body" }, { status: 400 });
     }
+    if (body === null || typeof body !== "object") {
+      return Response.json({ error: "D1_ERROR: invalid request body" }, { status: 400 });
+    }
+    const operatorOnly = body.export !== undefined || body.migrate !== undefined ||
+      (body.exec !== undefined && !!body.exec.rows);
+    if (operatorOnly && !operator) {
+      return Response.json(
+        { error: "D1_ERROR: this request is for the operator, through `celld d1`" },
+        { status: 403 },
+      );
+    }
     try {
       let result;
-      if (body.migrate !== undefined) {
+      if (body.export !== undefined) {
+        // SQL text, not a JSON envelope: it can be tens of megabytes.
+        return new Response(this.__d1Export(body.export), {
+          headers: { "content-type": "application/sql; charset=utf-8" },
+        });
+      } else if (body.migrate !== undefined) {
         result = this.__d1Migrate(
           String(body.migrate.name),
           String(body.migrate.sql),
@@ -7710,6 +7745,16 @@ class __D1DatabaseCell {
     });
     return { count: result.count, duration: result.duration };
   }
+  __d1Export(options) {
+    return __d1_export(
+      this.ctx.storage.sql._scope,
+      JSON.stringify({
+        tables: Array.isArray(options.tables) ? options.tables.map(String) : [],
+        schema: options.schema !== false,
+        data: options.data !== false,
+      }),
+    );
+  }
   // Apply one migration and record it. The engine runs the file, the
   // bookkeeping insert (the name is a bound parameter, so a file name never
   // reaches SQL text) and the BEGIN IMMEDIATE .. COMMIT bracket in one
@@ -7726,7 +7771,13 @@ class __D1DatabaseCell {
   }
 }
 
-__runtimeClass("__D1Database", __D1DatabaseCell);
+// A stub reaches a database over RPC only through the methods the binding
+// calls; the operator's requests arrive by `fetch`, not by RPC.
+__runtimeClass("__D1Database", __D1DatabaseCell, [
+  "__d1Query",
+  "__d1Batch",
+  "__d1Exec",
+]);
 
 // Validate and encode bind values once, at the public boundary, exactly as
 // upstream does (workerd d1-api.ts). Byte-shaped values become byte arrays --

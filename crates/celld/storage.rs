@@ -668,7 +668,7 @@ fn without_sql_authorizer<T>(
 /// Install sqlite-vec on one cell connection. Other SQLite users in the
 /// process do not need the module and must not inherit it through a global
 /// `sqlite3_auto_extension` hook.
-fn register_vec0_extension(connection: &Connection) -> anyhow::Result<()> {
+pub(crate) fn register_vec0_extension(connection: &Connection) -> anyhow::Result<()> {
     type ExtensionInit = unsafe extern "C" fn(
         *mut rusqlite::ffi::sqlite3,
         *mut *mut std::os::raw::c_char,
@@ -795,7 +795,10 @@ fn finish_open(
         let database = c.handle();
         for (category, limit) in [
             (rusqlite::ffi::SQLITE_LIMIT_LENGTH, 2_200_000),
-            (rusqlite::ffi::SQLITE_LIMIT_SQL_LENGTH, 100_000),
+            (
+                rusqlite::ffi::SQLITE_LIMIT_SQL_LENGTH,
+                crate::d1_export::STATEMENT_MAX_BYTES as i32,
+            ),
             (rusqlite::ffi::SQLITE_LIMIT_COLUMN, 100),
             (rusqlite::ffi::SQLITE_LIMIT_EXPR_DEPTH, 100),
             (rusqlite::ffi::SQLITE_LIMIT_COMPOUND_SELECT, 5),
@@ -2715,6 +2718,8 @@ unsafe fn d1_run_prepared(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum D1TransactionOperation {
     Begin,
+    /// A deferred transaction: a read snapshot that takes no write lock.
+    BeginRead,
     Commit,
     Rollback,
 }
@@ -2723,6 +2728,7 @@ impl D1TransactionOperation {
     fn sql(self) -> &'static str {
         match self {
             Self::Begin => "BEGIN IMMEDIATE",
+            Self::BeginRead => "BEGIN",
             Self::Commit => "COMMIT",
             Self::Rollback => "ROLLBACK",
         }
@@ -3048,6 +3054,62 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
             .unwrap_or_else(|| Err(d1_error(format!("no db for {scope}"))))
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct D1ExportRequest {
+    #[serde(default)]
+    tables: Vec<String>,
+    schema: bool,
+    data: bool,
+}
+
+/// The whole database, or the named tables, as SQL: `celld d1 export`.
+///
+/// One read transaction covers the schema and the data, so the dump is one
+/// snapshot. It takes no write lock, and the transaction is rolled back
+/// whatever the dump does.
+pub fn d1_export_json(scope: &str, request: &str) -> Result<String, D1Failure> {
+    let request: D1ExportRequest = serde_json::from_str(request)
+        .map_err(|error| d1_error(format!("invalid D1 export request: {error}")))?;
+    let options = crate::d1_export::ExportOptions {
+        tables: request.tables,
+        schema: request.schema,
+        data: request.data,
+    };
+    require_sql_healthy(scope).map_err(d1_error)?;
+    with_mut(scope, |connection| {
+        if !connection.is_autocommit() {
+            return Err(d1_error(
+                "an export cannot start inside an open transaction",
+            ));
+        }
+        d1_transaction_control(
+            scope,
+            connection,
+            D1TransactionOperation::BeginRead,
+            d1_error,
+        )?;
+        let dumped = as_user_sql(|| {
+            crate::d1_export::export(
+                connection,
+                &options,
+                crate::d1_export::EXPORT_MAX_BYTES,
+                |_| {},
+            )
+        });
+        if !connection.is_autocommit() {
+            d1_transaction_control(
+                scope,
+                connection,
+                D1TransactionOperation::Rollback,
+                d1_error,
+            )?;
+        }
+        dumped.map_err(d1_error)
+    })
+    .unwrap_or_else(|| Err(d1_error(format!("no db for {scope}"))))
 }
 
 fn d1_plain_identifier(name: &str) -> bool {

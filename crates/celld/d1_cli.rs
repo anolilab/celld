@@ -207,6 +207,27 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             };
             note!("Executed {count} statement(s) in {took}");
         }
+        Action::Export {
+            tables,
+            schema,
+            data,
+            output,
+        } => {
+            let sql = database.export(&tables, schema, data).await?;
+            match output {
+                Some(path) => {
+                    std::fs::write(&path, &sql)
+                        .with_context(|| format!("write {}", path.display()))?;
+                    note!("Exported {} bytes to {}", sql.len(), path.display());
+                }
+                // stdout carries the SQL and nothing else, so it can be piped
+                // into `celld d1 execute --file -` or a file.
+                None => {
+                    drop(out);
+                    return Output::new(Format::Text).bytes(sql.as_bytes());
+                }
+            }
+        }
         Action::Batch => {
             let statements = batch.expect("a batch action reads its statements first");
             let count = statements.len();
@@ -264,6 +285,16 @@ impl Reachable {
         // exec(): the operator asked to see the result, not only the count.
         self.call(serde_json::json!({ "exec": { "sql": source, "rows": true } }))
             .await
+    }
+
+    /// The database as SQL, from one snapshot. The cell answers with the
+    /// text itself, and only the operator route may ask: the dump holds every
+    /// row.
+    async fn export(&self, tables: &[String], schema: bool, data: bool) -> anyhow::Result<String> {
+        self.call_text(serde_json::json!({
+            "export": { "tables": tables, "schema": schema, "data": data },
+        }))
+        .await
     }
 
     /// `batch(statements)` as a Worker runs it: one transaction, so a failing
@@ -503,6 +534,13 @@ enum Action {
     },
     /// `execute --batch`: a JSON array of statements on stdin.
     Batch,
+    /// A consistent SQL dump of one snapshot.
+    Export {
+        tables: Vec<String>,
+        schema: bool,
+        data: bool,
+        output: Option<PathBuf>,
+    },
     MigrationsList,
     MigrationsApply,
 }
@@ -522,9 +560,14 @@ impl Command {
         let Some(first) = arguments.next() else {
             return Ok(None);
         };
+        let mut exporting = false;
         let action = match first.as_str() {
             "--help" | "-h" | "help" => return Ok(None),
             "execute" => None,
+            "export" => {
+                exporting = true;
+                None
+            }
             // An option in the subcommand slot means the subcommand is
             // missing, not that the option names one. Reporting `--bucket` as
             // an unknown subcommand would send an operator looking for a
@@ -551,6 +594,10 @@ impl Command {
         let mut json = false;
         let mut batch = false;
         let mut unsafe_public_advertise = false;
+        let mut tables: Vec<String> = Vec::new();
+        let mut no_schema = false;
+        let mut no_data = false;
+        let mut output = None;
         while let Some(argument) = arguments.next() {
             let mut value = |flag: &str| {
                 arguments
@@ -562,6 +609,10 @@ impl Command {
                 "--file" => file = Some(PathBuf::from(value("--file")?)),
                 "--json" => json = true,
                 "--batch" => batch = true,
+                "--table" => tables.push(value("--table")?),
+                "--no-schema" => no_schema = true,
+                "--no-data" => no_data = true,
+                "--output" => output = Some(PathBuf::from(value("--output")?)),
                 "--unsafe-public-advertise" => unsafe_public_advertise = true,
                 "--help" | "-h" => return Ok(None),
                 other => {
@@ -578,7 +629,27 @@ impl Command {
                 }
             }
         }
+        if !exporting && (!tables.is_empty() || no_schema || no_data || output.is_some()) {
+            bail!("--table, --no-schema, --no-data and --output belong to `celld d1 export`");
+        }
         let action = match action {
+            None if exporting => {
+                if sql.is_some() || file.is_some() || batch || json {
+                    bail!(
+                        "`celld d1 export` prints SQL, and takes no --command, --file, \
+                         --batch or --json"
+                    );
+                }
+                if no_schema && no_data {
+                    bail!("--no-schema and --no-data together leave nothing to export");
+                }
+                Action::Export {
+                    tables,
+                    schema: !no_schema,
+                    data: !no_data,
+                    output,
+                }
+            }
             Some(action) => {
                 // Accepting the flag and ignoring it would tell an operator
                 // their SQL ran when nothing read it.
@@ -635,6 +706,8 @@ pub fn print_help() {
 USAGE:
   celld d1 execute DATABASE (--command SQL | --file PATH) [PROJECT] --bucket NAME
   celld d1 execute DATABASE --batch --json [PROJECT] --bucket NAME < statements.json
+  celld d1 export DATABASE [--table NAME]... [--no-schema] [--no-data]
+                  [--output PATH] [PROJECT] --bucket NAME
   celld d1 migrations apply DATABASE [PROJECT] --bucket NAME
   celld d1 migrations list  DATABASE [PROJECT] --bucket NAME
 
@@ -667,6 +740,18 @@ rolls the whole batch back. Each element is a SQL string, or an object
 It prints one JSON array on stdout with one result per statement, shaped like
 `batch()`'s: `{{success, meta, results}}`, with `results` as row objects.
 
+`export` prints the database as SQL that replays into an empty database, with
+`celld d1 execute DATABASE --file dump.sql`. The schema and the data come from
+one snapshot, so a write that lands during the export is in none of it. It
+carries tables, indexes, triggers, views and each AUTOINCREMENT counter, and
+it leaves out generated columns (SQLite computes them again) and the shadow
+tables of `fts5` and `vec0` tables (it replays those through the table, or
+rebuilds an external-content `fts5` index). TEXT with a NUL byte, and bytes
+that are not UTF-8, keep every byte. Only the node operator can ask for it. It
+refuses a result over 32 MiB, and a row whose INSERT would pass the
+100,000-byte statement limit a replay runs under; name the tables to export a
+database in parts.
+
 OPTIONS:
   --command SQL       SQL to run; several statements are permitted
   --file PATH         Read the SQL from a file instead
@@ -674,6 +759,11 @@ OPTIONS:
                       transactional batch; requires --json and takes neither
                       --command nor --file
   --json              Print one JSON object per row instead of a table
+  --table NAME        With `export`: only this table, with its indexes and
+                      triggers; repeat for more. Views need a whole export
+  --no-schema         With `export`: the rows only
+  --no-data           With `export`: the schema only
+  --output PATH       With `export`: write the SQL to a file, not to stdout
 {FLEET_HELP}
   --unsafe-public-advertise
                       Permit a node whose advertised address is a public IP
@@ -721,6 +811,56 @@ mod tests {
         }
         let message = refusal(&["migrations", "apply", "ledger", "--batch", "--json"]);
         assert!(message.contains("execute"), "{message}");
+    }
+
+    #[test]
+    fn export_collects_its_filters() {
+        let command = parse(&[
+            "export",
+            "ledger",
+            "--table",
+            "a",
+            "--table",
+            "b",
+            "--no-data",
+            "--output",
+            "x.sql",
+            "--bucket",
+            "b",
+        ])
+        .unwrap()
+        .unwrap();
+        let Action::Export {
+            tables,
+            schema,
+            data,
+            output,
+        } = command.action
+        else {
+            panic!("export parses to an export");
+        };
+        assert_eq!(tables, ["a", "b"]);
+        assert!(schema && !data);
+        assert_eq!(output, Some(PathBuf::from("x.sql")));
+    }
+
+    #[test]
+    fn export_refuses_what_it_would_ignore() {
+        let message = refusal(&["export", "ledger", "--no-schema", "--no-data"]);
+        assert!(message.contains("nothing to export"), "{message}");
+        for extra in [["--command", "select 1"], ["--file", "x.sql"]] {
+            let message = refusal(&["export", "ledger", extra[0], extra[1]]);
+            assert!(message.contains("prints SQL"), "{message}");
+        }
+        assert!(refusal(&["export", "ledger", "--json"]).contains("prints SQL"));
+        assert!(refusal(&["export", "ledger", "--batch"]).contains("prints SQL"));
+        // The filters mean nothing to the other subcommands.
+        for arguments in [
+            vec!["execute", "ledger", "--command", "select 1", "--table", "a"],
+            vec!["migrations", "apply", "ledger", "--no-data"],
+        ] {
+            assert!(refusal(&arguments).contains("belong to `celld d1 export`"));
+        }
     }
 
     #[test]

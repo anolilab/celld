@@ -3,6 +3,7 @@
 mod e2e {
     pub mod alarms;
     pub mod d1_batch;
+    pub mod d1_export;
     pub mod do_alarms;
     pub mod do_gates;
     pub mod do_ids;

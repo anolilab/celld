@@ -119,6 +119,54 @@ impl Reachable {
     /// refused, and re-sending a migration that in fact ran would apply it
     /// twice.
     pub(crate) async fn call(&self, body: Value) -> anyhow::Result<Value> {
+        let (status, text, refused) = self.exchange(body).await?;
+        let value: Value = serde_json::from_str(&text)
+            .with_context(|| format!("decode the reply ({status}): {text}"))?;
+        if let Some(error) = value.get("error").and_then(Value::as_str) {
+            bail!("{error}{}", report(&refused));
+        }
+        if !status.is_success() {
+            bail!(
+                "the {} refused the request ({status}): {text}{}",
+                self.subject.noun,
+                report(&refused)
+            );
+        }
+        value
+            .get("result")
+            .cloned()
+            .ok_or_else(|| anyhow!("the reply carried no result: {text}{}", report(&refused)))
+    }
+
+    /// Like [`Self::call`] for a request whose answer is text and not JSON,
+    /// such as a SQL dump. A refusal is still a JSON `{"error": ...}`.
+    pub(crate) async fn call_text(&self, body: Value) -> anyhow::Result<String> {
+        let (status, text, refused) = self.exchange(body).await?;
+        if status.is_success() {
+            return Ok(text);
+        }
+        let message = serde_json::from_str::<Value>(&text).ok().and_then(|value| {
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        match message {
+            Some(error) => bail!("{error}{}", report(&refused)),
+            None => bail!(
+                "the {} refused the request ({status}): {text}{}",
+                self.subject.noun,
+                report(&refused)
+            ),
+        }
+    }
+
+    /// Send one signed request to the first entrance that takes it, and
+    /// return the status and body of its answer.
+    async fn exchange(
+        &self,
+        body: Value,
+    ) -> anyhow::Result<(reqwest::StatusCode, String, Vec<String>)> {
         // Signed per entrance, because the signature binds the node it is
         // addressed to: a signature for one node is not replayable at another.
         let payload = serde_json::to_vec(&body).context("encode the request")?;
@@ -171,22 +219,7 @@ impl Reachable {
                 refused.push(format!("{url}: the node's dispatcher is unavailable"));
                 continue;
             }
-            let value: Value = serde_json::from_str(&text)
-                .with_context(|| format!("decode the reply ({status}): {text}"))?;
-            if let Some(error) = value.get("error").and_then(Value::as_str) {
-                bail!("{error}{}", report(&refused));
-            }
-            if !status.is_success() {
-                bail!(
-                    "the {} refused the request ({status}): {text}{}",
-                    self.subject.noun,
-                    report(&refused)
-                );
-            }
-            return value
-                .get("result")
-                .cloned()
-                .ok_or_else(|| anyhow!("the reply carried no result: {text}{}", report(&refused)));
+            return Ok((status, text, refused));
         }
         bail!("no node in the fleet answered{}", report(&refused))
     }

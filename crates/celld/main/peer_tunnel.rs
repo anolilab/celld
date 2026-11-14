@@ -45,11 +45,21 @@ pub(crate) const SCOPE_HEADER: &str = "x-cells-scope";
 pub(crate) const NAME_HEADER: &str = "x-cells-do-name";
 pub(crate) const REQUEST_ID_HEADER: &str = "x-cells-request-id";
 pub(crate) const HANDOFF_HEADER: &str = "x-cells-capacity-handoff";
+/// Marks a call the sending node authenticated as the fleet operator's. A
+/// peer that did not set it cannot have it: the sender strips an application
+/// header of this name, and the receiver strips it before the handler sees it.
+pub(crate) const OPERATOR_HEADER: &str = "x-cells-operator-ingress";
 
 /// The inner headers node A owns. A overwrites them on the way in and B
 /// strips them on the way out, so an application header with a reserved name
 /// is dropped rather than obeyed.
-const CONTROL_HEADERS: [&str; 4] = [SCOPE_HEADER, NAME_HEADER, REQUEST_ID_HEADER, HANDOFF_HEADER];
+const CONTROL_HEADERS: [&str; 5] = [
+    SCOPE_HEADER,
+    NAME_HEADER,
+    REQUEST_ID_HEADER,
+    HANDOFF_HEADER,
+    OPERATOR_HEADER,
+];
 
 enum TunnelKind {
     Do,
@@ -63,6 +73,7 @@ pub(crate) struct TunnelControl {
     pub(crate) name: Option<String>,
     pub(crate) request_id: Option<celld::js::RequestId>,
     pub(crate) capacity_handoff: bool,
+    pub(crate) operator_ingress: bool,
 }
 
 pub(crate) fn is_tunnel_request(request: &Request<Incoming>) -> bool {
@@ -182,6 +193,7 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                     .and_then(|value| value.to_str().ok())
                     .and_then(celld::js::parse_request_id),
                 capacity_handoff: inner.headers().get(HANDOFF_HEADER).is_some(),
+                operator_ingress: inner.headers().get(OPERATOR_HEADER).is_some(),
             };
             // A tunneled upgrade is the client's own handshake, so the
             // owner answers it directly: fastwebsockets computes the 101
@@ -240,6 +252,7 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                 headers,
                 request_id: control.request_id,
                 capacity_handoff: control.capacity_handoff,
+                operator_ingress: control.operator_ingress,
             };
             let outcome = dispatch_forwarded_fetch(app.clone(), control.scope, fetch, body).await;
             let (target, worker_headers) = match outcome {
@@ -422,6 +435,9 @@ fn inner_request(
     }
     if control.capacity_handoff {
         inner = inner.header(HANDOFF_HEADER, "1");
+    }
+    if control.operator_ingress {
+        inner = inner.header(OPERATOR_HEADER, "1");
     }
     Ok(inner.body(body)?)
 }
@@ -772,4 +788,61 @@ pub(crate) fn response_stream(body: PooledResponseBody) -> HttpChunkStream {
             .map_ok(|data: Bytes| data.to_vec())
             .map_err(|error| error.to_string()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn control(operator_ingress: bool) -> TunnelControl {
+        TunnelControl {
+            scope: "Cell:0".to_string(),
+            name: None,
+            request_id: None,
+            capacity_handoff: false,
+            operator_ingress,
+        }
+    }
+
+    /// The mark rides a header between nodes, so a header a Worker sets with
+    /// the same name must never reach the other node as the mark.
+    #[test]
+    fn an_application_header_cannot_carry_the_operator_mark() {
+        let forged = vec![
+            (OPERATOR_HEADER.to_string(), "1".to_string()),
+            ("X-Cells-Operator-Ingress".to_string(), "1".to_string()),
+        ];
+        let request = inner_request(
+            &control(false),
+            "http://cell/",
+            "POST",
+            &forged,
+            full_body(Bytes::new()),
+        )
+        .unwrap();
+        assert!(request.headers().get(OPERATOR_HEADER).is_none());
+    }
+
+    #[test]
+    fn the_mark_is_sent_only_when_the_sender_set_it() {
+        let marked = inner_request(
+            &control(true),
+            "http://cell/",
+            "POST",
+            &[],
+            full_body(Bytes::new()),
+        )
+        .unwrap();
+        assert!(marked.headers().get(OPERATOR_HEADER).is_some());
+        let plain = inner_request(
+            &control(false),
+            "http://cell/",
+            "POST",
+            &[],
+            full_body(Bytes::new()),
+        )
+        .unwrap();
+        assert!(plain.headers().get(OPERATOR_HEADER).is_none());
+        assert!(CONTROL_HEADERS.contains(&OPERATOR_HEADER));
+    }
 }

@@ -89,6 +89,8 @@ pub struct CallPayload {
     pub method: String,
     pub body: RequestBody,
     pub headers: Vec<(String, String)>,
+    /// The call was authenticated as the fleet operator's by the host.
+    pub operator_ingress: bool,
 }
 
 /// The state of a fetch-style call that outlives one dispatch attempt.
@@ -136,6 +138,7 @@ pub fn split_do_call(
         reply,
         order,
         parent,
+        operator_ingress,
     } = call;
     (
         CallContext {
@@ -153,6 +156,7 @@ pub fn split_do_call(
             method,
             body,
             headers,
+            operator_ingress,
         },
         reply,
     )
@@ -265,6 +269,7 @@ pub async fn dispatch_call_attempt(
                 method,
                 body,
                 headers,
+                operator_ingress,
             } = payload;
             dispatch_local_fetch(
                 app,
@@ -279,6 +284,7 @@ pub async fn dispatch_call_attempt(
                     request_id: call.request_id,
                     order: call.order.take(),
                     parent: call.parent,
+                    operator_ingress,
                 },
                 call.cancel.take(),
                 &mut call.body_guard,
