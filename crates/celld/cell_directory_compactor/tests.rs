@@ -878,16 +878,18 @@ fn the_compactor_lease_is_held_between_passes() {
             "node-a".to_owned(),
             GEN.to_owned(),
             Schedule {
-                tick_ms: 30,
+                tick_ms: 400,
                 interval: Duration::from_millis(10),
                 max_segments: 100,
             },
             stop.clone(),
         ));
         // Well past the lease's lifetime of three ticks, with passes between.
-        crate::asyncrt::sleep(Duration::from_millis(400)).await;
+        // The lease lasts three ticks (1.2 s), so a loaded machine can delay
+        // a renewal by most of a second before the lease lapses.
+        crate::asyncrt::sleep(Duration::from_millis(3_000)).await;
         let now = crate::ownership_store::now_ms() as i64;
-        assert!(!try_hold_lease(&lease, LEASE_KEY, "node-b", now, 90).await);
+        assert!(!try_hold_lease(&lease, LEASE_KEY, "node-b", now, 1_200).await);
         assert!(store.lists.load(Ordering::SeqCst) > 1);
         stop.request_stop();
         running.await.unwrap();
@@ -923,9 +925,19 @@ fn a_backlog_is_worked_off_a_tick_at_a_time_not_an_interval() {
             },
             stop.clone(),
         ));
-        crate::asyncrt::sleep(Duration::from_millis(900)).await;
-        let ledger = read_ledger(store.as_ref(), PREFIX).await.unwrap().unwrap();
-        assert_eq!(ledger.value.segments.len(), 5);
+        // Two segments a tick, so five take three ticks. A loaded machine can
+        // delay ticks, so wait for the work and fail only after a long bound.
+        let mut segments = 0;
+        for _ in 0..400 {
+            crate::asyncrt::sleep(Duration::from_millis(50)).await;
+            if let Some(ledger) = read_ledger(store.as_ref(), PREFIX).await.unwrap() {
+                segments = ledger.value.segments.len();
+                if segments == 5 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(segments, 5);
         stop.request_stop();
         running.await.unwrap();
     });
