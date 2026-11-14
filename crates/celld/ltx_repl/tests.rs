@@ -257,6 +257,14 @@ async fn put_empty(rig: &Rig, epoch: u64, level: i32, min: u64, max: u64) {
         .expect("put");
 }
 
+/// Wait for the rows written so far to reach the bucket's per-cell layout.
+async fn synced(rig: &Rig) {
+    assert!(matches!(
+        rig.ltx.sync_wait(CELL, 1, Duration::from_secs(10)).await,
+        SyncWait::Durable
+    ));
+}
+
 fn live(rig: &Rig, epoch: u64) -> PathBuf {
     rig.ltx.db_path(CELL, epoch)
 }
@@ -432,10 +440,7 @@ fn a_crash_after_a_wake_restores_the_new_rows_and_not_the_retained_base() {
             .await
             .expect("resume");
         write(&resumed.path, "INSERT INTO t VALUES (2);");
-        assert!(matches!(
-            rig.ltx.sync_wait(CELL, 1, Duration::from_secs(10)).await,
-            SyncWait::Durable
-        ));
+        synced(&rig).await;
 
         // The process is gone without a second eviction. The wake renamed the
         // retained base, so the next epoch finds none to reuse and restores the
@@ -674,15 +679,25 @@ async fn level(rig: &Rig, epoch: u64, level: i32) -> Vec<(u64, u64)> {
         .collect()
 }
 
-async fn round(rig: &Rig, epoch: u64) -> CompactionOutcome {
-    compact_cell(
+/// One round on the resident handle. A queued round of the same handle can
+/// have folded the rows already, so the caller checks the level and not
+/// whether this round was the one that advanced it.
+async fn round(rig: &Rig, epoch: u64) {
+    let outcome = compact_cell(
         resident(rig, epoch),
         asyncrt::mono_ms(),
         "test",
         false,
         None,
     )
-    .await
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            CompactionOutcome::Advanced | CompactionOutcome::Current
+        ),
+        "the round {outcome:?}"
+    );
 }
 
 #[test]
@@ -704,12 +719,9 @@ fn a_reopened_handle_compacts_from_the_snapshot_when_no_l0_holds_the_rows_below_
             .await
             .expect("resume");
         write(&resumed.path, "INSERT INTO t VALUES (2);");
-        assert!(matches!(
-            rig.ltx.sync_wait(CELL, 1, Duration::from_secs(10)).await,
-            SyncWait::Durable
-        ));
+        synced(&rig).await;
 
-        assert_eq!(round(&rig, 1).await, CompactionOutcome::Advanced);
+        round(&rig, 1).await;
         assert_eq!(level(&rig, 1, 1).await, [(2, 2)]);
         assert_eq!(resident(&rig, 1).compaction.as_ref().unwrap().base_txid, 2);
     });
@@ -720,11 +732,8 @@ fn a_reopened_handle_leaves_the_level_files_below_its_snapshot_alone() {
     run(async {
         let rig = rig_with(Some(EVERY_ROW));
         first_lifetime(&rig).await;
-        assert!(matches!(
-            rig.ltx.sync_wait(CELL, 1, Duration::from_secs(10)).await,
-            SyncWait::Durable
-        ));
-        assert_eq!(round(&rig, 1).await, CompactionOutcome::Advanced);
+        synced(&rig).await;
+        round(&rig, 1).await;
         write(&live(&rig, 1), "INSERT INTO t VALUES (2);");
         // The second row is only in the snapshot, above the level's end.
         rig.ltx
@@ -739,12 +748,9 @@ fn a_reopened_handle_leaves_the_level_files_below_its_snapshot_alone() {
             .await
             .expect("resume");
         write(&resumed.path, "INSERT INTO t VALUES (3);");
-        assert!(matches!(
-            rig.ltx.sync_wait(CELL, 1, Duration::from_secs(10)).await,
-            SyncWait::Durable
-        ));
+        synced(&rig).await;
 
-        assert_eq!(round(&rig, 1).await, CompactionOutcome::Advanced);
+        round(&rig, 1).await;
         assert_eq!(level(&rig, 1, 1).await, [(1, 1), (3, 3)]);
     });
 }
@@ -773,13 +779,13 @@ fn a_clean_reload_of_a_resumed_cell_keeps_compacting_from_the_snapshot() {
             .await
             .expect("reopen");
         write(&live(&rig, 1), "INSERT INTO t VALUES (3);");
-        assert!(matches!(
-            rig.ltx.sync_wait(CELL, 1, Duration::from_secs(10)).await,
-            SyncWait::Durable
-        ));
+        synced(&rig).await;
 
-        assert_eq!(round(&rig, 1).await, CompactionOutcome::Advanced);
+        round(&rig, 1).await;
         assert_eq!(resident(&rig, 1).compaction.as_ref().unwrap().base_txid, 2);
+        let folded = level(&rig, 1, 1).await;
+        assert_eq!(folded.first().map(|file| file.0), Some(2));
+        assert_eq!(folded.last().map(|file| file.1), Some(3));
     });
 }
 
