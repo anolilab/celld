@@ -4376,6 +4376,7 @@ mod sweep_tests {
             cells: Mutex::new(HashMap::new()),
             networks: tokio::sync::Mutex::new(None),
             fenced: tokio::sync::Mutex::new(false),
+            removals: Arc::new(Removals::new(Duration::from_secs(1))),
         });
         let spec = Arc::new(ContainerSpec {
             class_name: "Runner".to_string(),
