@@ -70,12 +70,6 @@ impl Server {
         self.boot
     }
 
-    /// What the node and its supervisor have logged so far.
-    #[allow(dead_code)]
-    pub fn log_text(&self) -> String {
-        fs::read_to_string(&self.log).unwrap_or_default()
-    }
-
     /// The project directory the server was started on, a private copy of the
     /// fixture. Its local state is under `.celld/dev`.
     pub fn project_dir(&self) -> &Path {
