@@ -671,7 +671,7 @@ async fn a_run_no_head_names_is_deleted_once_it_is_older_than_the_grace() {
     }
     assert!(has_orphan(runs().await));
 
-    let later = written + DELETE_GRACE_MS + 1;
+    let later = written + ORPHAN_GRACE_MS + 1;
     let mut deleted = 0;
     for number in 0..rotation {
         deleted += pass(&store, 2 + rotation + number, later)
@@ -685,7 +685,7 @@ async fn a_run_no_head_names_is_deleted_once_it_is_older_than_the_grace() {
 }
 
 #[tokio::test]
-async fn a_head_that_went_missing_is_not_recreated_and_holds_the_ledger_back() {
+async fn a_head_that_went_missing_is_rebuilt_from_its_runs() {
     let store = Arc::new(Counting::default());
     let a = node(&store, "node-a", "gen1");
     let cells = cells_in_partition(partition_of(fingerprint("seed")), 2);
@@ -699,18 +699,127 @@ async fn a_head_that_went_missing_is_not_recreated_and_holds_the_ledger_back() {
         .unwrap();
     a.write_ltx(&cells[1]).await;
     let report = pass(&store, 2, 2_000).await;
-    assert_eq!(report.partitions_failed, 1, "{report:?}");
-    assert!(read_head(store.as_ref(), PREFIX, partition)
+    assert_eq!(report.partitions_failed, 0, "{report:?}");
+    pass(&store, 3, 2_000 + 10 * DELETE_GRACE_MS).await;
+    assert!(segments(&store).await.is_empty());
+    let reader = a.fresh_reader(10).await;
+    for cell in &cells {
+        assert_eq!(reader.lookup(cell, 11).await, DirectoryAnswer::Exists);
+    }
+}
+
+#[tokio::test]
+async fn a_head_that_names_a_missing_run_is_rebuilt() {
+    let store = Arc::new(Counting::default());
+    let a = node(&store, "node-a", "gen1");
+    let cells = cells_in_partition(partition_of(fingerprint("seed")), 3);
+    a.write_ltx(&cells[0]).await;
+    pass(&store, 1, 1_000).await;
+    a.write_ltx(&cells[1]).await;
+    pass(&store, 2, 2_000).await;
+    let partition = partition_of(fingerprint(&cells[0]));
+    // The delta tier's run goes, as a sweep that raced a stalled pass does it.
+    let head = read_head(store.as_ref(), PREFIX, partition)
         .await
         .unwrap()
-        .is_none());
-    // Nothing the pass read is deleted, however late: the new segment is
-    // still in the tail, and the lost head stays doubt.
-    pass(&store, 3, 2_000 + 10 * DELETE_GRACE_MS).await;
-    assert_eq!(segments(&store).await.len(), 1);
+        .unwrap()
+        .value;
+    let named = head.l0.unwrap().key;
+    store
+        .inner
+        .delete(&Path::from(format!("{PREFIX}{named}")))
+        .await
+        .unwrap();
+    // The retired run of the pass before still holds the first cell.
+    a.write_ltx(&cells[2]).await;
+    let report = pass(&store, 3, 3_000).await;
+    assert_eq!(report.partitions_failed, 0, "{report:?}");
+    pass(&store, 4, 3_000 + 10 * DELETE_GRACE_MS).await;
     let reader = a.fresh_reader(10).await;
-    assert_eq!(reader.lookup(&cells[1], 11).await, DirectoryAnswer::Exists);
-    assert_eq!(reader.lookup(&cells[0], 11).await, DirectoryAnswer::Unknown);
+    for cell in [&cells[0], &cells[2]] {
+        assert_eq!(reader.lookup(cell, 11).await, DirectoryAnswer::Exists);
+    }
+}
+
+#[tokio::test]
+async fn one_failed_partition_holds_back_only_the_segments_that_touch_it() {
+    let store = Arc::new(Counting::default());
+    let a = node(&store, "node-a", "gen1");
+    let first = cells_in_partition(partition_of(fingerprint("seed")), 1).remove(0);
+    let broken = partition_of(fingerprint(&first));
+    let other = (0..)
+        .map(|index| format!("other-{index}"))
+        .find(|cell| partition_of(fingerprint(cell)) != broken)
+        .unwrap();
+    put_segment(&store, "node-b/g9/00000000", b"seed\n").await;
+    pass(&store, 1, 1_000).await;
+    // The head of one partition cannot be read.
+    store
+        .inner
+        .put(
+            &Path::from(head_key(PREFIX, broken)),
+            PutPayload::from_static(b"{"),
+        )
+        .await
+        .unwrap();
+    put_segment(
+        &store,
+        "node-b/g9/00000001",
+        format!("{first}\n").as_bytes(),
+    )
+    .await;
+    put_segment(
+        &store,
+        "node-b/g9/00000002",
+        format!("{other}\n").as_bytes(),
+    )
+    .await;
+    let report = pass(&store, 2, 2_000).await;
+    assert_eq!(report.partitions_failed, 1, "{report:?}");
+    pass(&store, 3, 2_000 + 10 * DELETE_GRACE_MS).await;
+    assert_eq!(
+        segments(&store).await,
+        vec!["fleet-a/fleet/born/node-b/g9/00000001".to_owned()]
+    );
+    let reader = a.fresh_reader(10).await;
+    assert_eq!(reader.lookup(&other, 11).await, DirectoryAnswer::Exists);
+}
+
+#[tokio::test]
+async fn the_sweep_never_deletes_the_runs_of_a_partition_it_cannot_read_a_head_for() {
+    let store = Arc::new(Counting::default());
+    let a = node(&store, "node-a", "gen1");
+    a.write_ltx("c1").await;
+    pass(&store, 1, 1_000).await;
+    let partition = partition_of(fingerprint("c1"));
+    let run = run_key(partition, "l0", "old-gen", 9);
+    write_run(
+        store.as_ref(),
+        PREFIX,
+        &run,
+        &[Record {
+            fp: fingerprint("c1"),
+            kind: Kind::Born,
+        }],
+    )
+    .await
+    .unwrap();
+    store
+        .inner
+        .put(
+            &Path::from(head_key(PREFIX, partition)),
+            PutPayload::from_static(b"{"),
+        )
+        .await
+        .unwrap();
+    let rotation = u64::from(PARTITIONS / SWEEP_PARTITIONS);
+    let later = crate::ownership_store::now_ms() + ORPHAN_GRACE_MS + 1;
+    for number in 0..rotation {
+        let report = pass(&store, 2 + number, later).await;
+        assert_eq!(report.runs_deleted, 0);
+    }
+    let remaining = keys(&store, "fleet-a/fleet/dir").await;
+    assert!(remaining.contains(&format!("{PREFIX}{run}")));
 }
 
 #[tokio::test]
