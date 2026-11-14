@@ -415,6 +415,42 @@ pub struct BucketOwnership {
     /// The fleet directory of cells with LTX, when this node writes LTX. It
     /// only shadows the lost-record listing; see [`Self::directory_answer`].
     cell_directory: Option<Arc<crate::cell_directory::CellDirectory>>,
+    directory_answers: DirectoryAnswers,
+}
+
+/// How often the fleet directory answered a claim guard, by its answer and by
+/// whether the listing beside it found LTX. `New` with LTX found counts a
+/// cell whose first claim raced on another node as well as a lost record; the
+/// guard's re-read of the record tells them apart after the count.
+#[derive(Debug, Default)]
+pub(crate) struct DirectoryAnswers {
+    counts: [[AtomicU64; 2]; 3],
+}
+
+impl DirectoryAnswers {
+    fn record(&self, answer: celld_logic::cell_directory::DirectoryAnswer, ltx_found: bool) {
+        use celld_logic::cell_directory::DirectoryAnswer;
+        let row = match answer {
+            DirectoryAnswer::New => 0,
+            DirectoryAnswer::Exists => 1,
+            DirectoryAnswer::Unknown => 2,
+        };
+        self.counts[row][usize::from(ltx_found)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let pair = |row: &[AtomicU64; 2]| {
+            serde_json::json!({
+                "no_ltx": row[0].load(Ordering::Relaxed),
+                "ltx": row[1].load(Ordering::Relaxed),
+            })
+        };
+        serde_json::json!({
+            "new": pair(&self.counts[0]),
+            "exists": pair(&self.counts[1]),
+            "unknown": pair(&self.counts[2]),
+        })
+    }
 }
 
 /// What this node currently looks like, for peers deciding where to place a
@@ -512,6 +548,7 @@ impl BucketOwnership {
             applied: tokio::sync::watch::channel((String::new(), 0)).0,
             lost_records: std::sync::Mutex::default(),
             cell_directory: None,
+            directory_answers: DirectoryAnswers::default(),
         }
     }
 
@@ -594,6 +631,22 @@ impl BucketOwnership {
     ) -> Option<celld_logic::cell_directory::DirectoryAnswer> {
         let directory = self.cell_directory.as_ref()?;
         Some(directory.lookup(cell, crate::asyncrt::mono_ms()).await)
+    }
+
+    /// Count one answer of the directory beside the listing of the same claim.
+    pub(crate) fn record_directory_answer(
+        &self,
+        answer: celld_logic::cell_directory::DirectoryAnswer,
+        ltx_found: bool,
+    ) {
+        self.directory_answers.record(answer, ltx_found);
+    }
+
+    /// The answers counted so far, or `None` on a node without a directory.
+    pub(crate) fn directory_answers(&self) -> Option<serde_json::Value> {
+        self.cell_directory
+            .is_some()
+            .then(|| self.directory_answers.to_json())
     }
 
     /// Whether this node found the record of `cell` lost less than

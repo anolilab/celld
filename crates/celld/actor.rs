@@ -231,7 +231,11 @@ impl Ownership {
         // for in vain.
         let (directory, listed) =
             futures_util::join!(bucket.directory_answer(cell), bucket.ltx_exists(cell));
-        if !listed.map_err(ownership_read_failed)? {
+        let listed = listed.map_err(ownership_read_failed)?;
+        if let Some(answer) = directory {
+            bucket.record_directory_answer(answer, listed);
+        }
+        if !listed {
             return Ok(record);
         }
         // A claim writes the record before any LTX, and celld never deletes
@@ -4118,7 +4122,7 @@ impl Actor {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"ownership\":{:?},\"owned_cells\":{},\"occupied\":{},\"quiescing\":{},\"evicting\":{},\"releasing\":{},\"adopting\":{},\"restoring\":{},\"activating\":{},\"activation_waiting\":{},\"capacity_waiting\":{},\"phases\":{{{}}},\"handed_off\":{},\"handoff_failed\":{},\"rebalanced\":{},\"rebalance_failed\":{},\"remote_route_refreshes\":{},\"shedding\":{},\"rss_bytes\":{},\"in_use_bytes\":{},\"allocator\":{},\"libc_malloc\":{},\"cgroup_working_set_bytes\":{},\"cgroup_current_bytes\":{},\"node_load\":{},\"residents\":[{}],\"published\":[{}],\"publishes\":{},\"stops\":{}}}",
+            "{{\"ownership\":{:?},\"owned_cells\":{},\"occupied\":{},\"quiescing\":{},\"evicting\":{},\"releasing\":{},\"adopting\":{},\"restoring\":{},\"activating\":{},\"activation_waiting\":{},\"capacity_waiting\":{},\"phases\":{{{}}},\"handed_off\":{},\"handoff_failed\":{},\"rebalanced\":{},\"rebalance_failed\":{},\"remote_route_refreshes\":{},\"shedding\":{},\"rss_bytes\":{},\"in_use_bytes\":{},\"allocator\":{},\"libc_malloc\":{},\"cgroup_working_set_bytes\":{},\"cgroup_current_bytes\":{},\"node_load\":{},\"cell_directory_answers\":{},\"residents\":[{}],\"published\":[{}],\"publishes\":{},\"stops\":{}}}",
             self.ownership.name(),
             self.state.owned_cells(),
             self.state.occupied(),
@@ -4154,6 +4158,12 @@ impl Actor {
                 .cgroup_current_bytes
                 .map_or_else(|| "null".to_string(), |bytes| bytes.to_string()),
             node_load.unwrap_or_else(|| "null".to_string()),
+            match &self.ownership {
+                Ownership::Bucket(bucket) => bucket
+                    .directory_answers()
+                    .map_or_else(|| "null".to_string(), |answers| answers.to_string()),
+                Ownership::Memory(_) => "null".to_string(),
+            },
             residents,
             published,
             self.publishes,
