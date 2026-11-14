@@ -714,21 +714,10 @@ impl ObjectStoreClient {
             .map_err(map_os_error)
     }
 
-    /// Whether some object under the replica epoch prefix holds `txid`: a file
-    /// at any level whose range contains it. An epoch can hold several full
-    /// snapshots, and a later eviction publishes its own, so "any object" says
-    /// nothing about the transactions the newest closed database holds.
-    ///
-    /// Transaction zero asks only for an object. Otherwise the answer comes
-    /// from the cheapest listing that can give it, and only a refusal, or a
-    /// transaction inside a file longer than [`COVERS_WINDOW`], walks the
-    /// epoch's listing until its first match:
-    ///
-    /// 1. `newest`, the level-0 file the caller last wrote, is one HEAD when
-    ///    its range holds `txid`.
-    /// 2. The first level-0 and level-1 files that start within the window
-    ///    below `txid`, one bounded listing each.
-    /// 3. The snapshot level, which holds few objects.
+    /// Whether some object under the replica epoch prefix holds `txid`: a
+    /// file at any level whose range contains it. Transaction zero asks only
+    /// for an object. `newest` names a level-0 file the caller wrote, which is
+    /// checked first.
     pub async fn covers_txid(&self, txid: TXID, newest: Option<(TXID, TXID)>) -> Result<bool> {
         if txid == TXID(0) {
             return self.has_any_object().await;

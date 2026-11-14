@@ -4295,40 +4295,5 @@ fn apply_core_event(state: &mut ActorState, event: Event) -> Vec<Effect> {
 mod operator_token_tests;
 
 #[cfg(test)]
-mod resume_fallback_tests {
-    use super::*;
-    use celld_logic::ResumeFrom::{Eviction, Handoff};
-
-    fn spec(resume: celld_logic::ResumeFrom) -> celld_logic::RestoreSpec {
-        celld_logic::RestoreSpec {
-            epoch: 1,
-            fresh: false,
-            took_over: false,
-            resume: Some(resume),
-            prior: None,
-        }
-    }
-
-    fn gone() -> anyhow::Error {
-        anyhow::Error::new(crate::replication::RetainedUnavailable {
-            cell: "a".into(),
-            epoch: 1,
-            missing: "database",
-        })
-    }
-
-    #[test]
-    fn only_a_missing_kept_database_after_an_eviction_is_expected() {
-        assert!(expected_resume_fallback(&spec(Eviction), &gone()));
-        assert!(expected_resume_fallback(
-            &spec(Eviction),
-            &gone().context("restore a")
-        ));
-        // A clean reload's resume has no fallback: the core fails its cell.
-        assert!(!expected_resume_fallback(&spec(Handoff), &gone()));
-        assert!(!expected_resume_fallback(
-            &spec(Eviction),
-            &anyhow::anyhow!("read replica: connection reset")
-        ));
-    }
-}
+#[path = "actor/resume_fallback_tests.rs"]
+mod resume_fallback_tests;

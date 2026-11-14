@@ -117,8 +117,7 @@ impl<'a, C: ReplicaClient> ReplicaCompactor<'a, C> {
             return Err(invalid("the compaction limits must be positive"));
         }
 
-        let mut destination = self.client.ltx_files(destination_level, TXID(0)).await?;
-        destination.retain(|file| file.min_txid >= self.base);
+        let destination = self.files_from_base(destination_level).await?;
         self.verify_files(&destination)?;
         let previous_max = destination
             .iter()
@@ -389,9 +388,16 @@ impl<'a, C: ReplicaClient> ReplicaCompactor<'a, C> {
 
     /// Verifies that a destination level has neither gaps nor overlaps.
     pub async fn verify_level(&self, level: i32) -> Result<()> {
+        let files = self.files_from_base(level).await?;
+        self.verify_files(&files)
+    }
+
+    /// The level's files from the epoch's base on. Below it a snapshot covers
+    /// the rows, so those files are neither continued nor verified.
+    async fn files_from_base(&self, level: i32) -> Result<Vec<FileInfo>> {
         let mut files = self.client.ltx_files(level, TXID(0)).await?;
         files.retain(|file| file.min_txid >= self.base);
-        self.verify_files(&files)
+        Ok(files)
     }
 
     fn verify_files(&self, files: &[FileInfo]) -> Result<()> {
