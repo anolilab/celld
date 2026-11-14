@@ -340,14 +340,46 @@ pub(crate) mod testing {
         /// Apply the next conditional write of a head, let another compactor
         /// replace that head on top of it, and refuse the write.
         pub commit_then_advance_head_update: AtomicBool,
+        /// Every request the store was asked for, answered or not.
+        pub requests: AtomicUsize,
+        /// Listings that start after a key.
+        pub offset_lists: AtomicUsize,
+        /// How many of the next such listings fail.
+        pub failing_offset_lists: AtomicUsize,
+        /// Writes answer success and keep nothing.
+        pub dropping_puts: AtomicBool,
+        /// Every request fails, as in a bucket outage.
+        pub down: AtomicBool,
     }
 
     impl Counting {
+        /// Count a request, and refuse it while the store is down.
+        fn begin(&self) -> object_store::Result<()> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            if self.down.load(Ordering::SeqCst) {
+                return Err(refused("the bucket is down"));
+            }
+            Ok(())
+        }
+
         pub(crate) fn reset(&self) {
             for counter in [&self.ranged_gets, &self.whole_gets, &self.lists, &self.puts] {
                 counter.store(0, Ordering::SeqCst);
             }
         }
+    }
+
+    fn refused(reason: &'static str) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "counting",
+            source: reason.into(),
+        }
+    }
+
+    fn failed_listing(
+        error: object_store::Error,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        futures_util::stream::once(async { Err(error) }).boxed()
     }
 
     impl fmt::Display for Counting {
@@ -364,7 +396,15 @@ pub(crate) mod testing {
             payload: PutPayload,
             options: PutOptions,
         ) -> object_store::Result<PutResult> {
+            self.begin()?;
             self.puts.fetch_add(1, Ordering::SeqCst);
+            if self.dropping_puts.load(Ordering::SeqCst) {
+                return Ok(PutResult {
+                    e_tag: None,
+                    version: None,
+                    extensions: Default::default(),
+                });
+            }
             if matches!(options.mode, PutMode::Update(_))
                 && location.as_ref().ends_with("/head")
                 && self.refuse_head_update.swap(false, Ordering::SeqCst)
@@ -419,6 +459,7 @@ pub(crate) mod testing {
             location: &Path,
             options: PutMultipartOptions,
         ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.begin()?;
             self.inner.put_multipart_opts(location, options).await
         }
 
@@ -427,6 +468,7 @@ pub(crate) mod testing {
             location: &Path,
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
+            self.begin()?;
             let counter = match (&options.range, options.head) {
                 (_, true) => None,
                 (Some(GetRange::Bounded(_) | GetRange::Offset(_) | GetRange::Suffix(_)), _) => {
@@ -460,6 +502,7 @@ pub(crate) mod testing {
             &self,
             locations: BoxStream<'static, object_store::Result<Path>>,
         ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
             self.inner.delete_stream(locations)
         }
 
@@ -468,6 +511,9 @@ pub(crate) mod testing {
             prefix: Option<&Path>,
         ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
             self.lists.fetch_add(1, Ordering::SeqCst);
+            if let Err(error) = self.begin() {
+                return failed_listing(error);
+            }
             self.inner.list(prefix)
         }
 
@@ -476,6 +522,19 @@ pub(crate) mod testing {
             prefix: Option<&Path>,
             offset: &Path,
         ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.offset_lists.fetch_add(1, Ordering::SeqCst);
+            if let Err(error) = self.begin() {
+                return failed_listing(error);
+            }
+            let failing = self
+                .failing_offset_lists
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok();
+            if failing {
+                return failed_listing(refused("the listing failed"));
+            }
             self.inner.list_with_offset(prefix, offset)
         }
 
@@ -483,6 +542,7 @@ pub(crate) mod testing {
             &self,
             prefix: Option<&Path>,
         ) -> object_store::Result<ListResult> {
+            self.begin()?;
             self.inner.list_with_delimiter(prefix).await
         }
 
@@ -492,6 +552,7 @@ pub(crate) mod testing {
             to: &Path,
             options: CopyOptions,
         ) -> object_store::Result<()> {
+            self.begin()?;
             self.inner.copy_opts(from, to, options).await
         }
 
@@ -501,6 +562,7 @@ pub(crate) mod testing {
             to: &Path,
             options: RenameOptions,
         ) -> object_store::Result<()> {
+            self.begin()?;
             self.inner.rename_opts(from, to, options).await
         }
     }
