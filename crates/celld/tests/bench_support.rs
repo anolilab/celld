@@ -12,11 +12,15 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use http_body_util::BodyExt;
 use hyper::Method;
+use regex::Regex;
+use serde_json::{json, Value};
 use support::{
-    control_response, diff, idle_wait, memory_slope, parse_phases, require_idle_past_eviction,
-    require_resident, require_warmup, rss_of_tree, run_id, window_position, EndRule, Part, Scope,
-    Tally, TallySource, WindowPosition,
+    control_response, diff, idle_wait, memory_pids, memory_slope, parse_phases,
+    require_idle_past_eviction, require_resident, require_warmup, rss_of_tree, run_id,
+    window_position, Classifier, EndRule, MemoryPids, Part, Scope, Tally, TallySource,
+    WindowPosition,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -110,11 +114,12 @@ fn control_routes_answer_loopback_callers() {
     let tally = tally_with_a_request();
     for peer in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
         let peer: IpAddr = peer.parse().unwrap();
-        let read = control_response(&tally, &Method::GET, "/.proxy/tally", peer);
+        let read = control_response(&tally, &Value::Null, &Method::GET, "/.proxy/tally", peer);
         assert_eq!(read.status(), 200, "{peer}");
     }
     let reset = control_response(
         &tally,
+        &Value::Null,
         &Method::POST,
         "/.proxy/reset",
         "127.0.0.1".parse().unwrap(),
@@ -128,9 +133,9 @@ fn control_routes_refuse_other_callers_and_leave_the_tally_alone() {
     let tally = tally_with_a_request();
     for peer in ["10.0.0.5", "192.168.1.9", "203.0.113.7", "2001:db8::1"] {
         let peer: IpAddr = peer.parse().unwrap();
-        let reset = control_response(&tally, &Method::POST, "/.proxy/reset", peer);
+        let reset = control_response(&tally, &Value::Null, &Method::POST, "/.proxy/reset", peer);
         assert_eq!(reset.status(), 403, "{peer}");
-        let read = control_response(&tally, &Method::GET, "/.proxy/tally", peer);
+        let read = control_response(&tally, &Value::Null, &Method::GET, "/.proxy/tally", peer);
         assert_eq!(read.status(), 403, "{peer}");
     }
     assert_eq!(tally.lock().unwrap().len(), 1);
@@ -141,6 +146,7 @@ fn an_unknown_control_route_is_not_found() {
     let tally = tally_with_a_request();
     let answer = control_response(
         &tally,
+        &Value::Null,
         &Method::GET,
         "/.proxy/other",
         "127.0.0.1".parse().unwrap(),
@@ -333,4 +339,86 @@ fn the_memory_wait_outlasts_the_idle_time_and_the_eviction_time() {
     );
     assert_eq!(idle_wait(8 * SECOND, Some(10 * SECOND), slack), 15 * SECOND);
     assert_eq!(idle_wait(8 * SECOND, None, slack), 13 * SECOND);
+}
+
+fn phases(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| name.to_string()).collect()
+}
+
+#[test]
+fn memory_runs_when_process_ids_are_given() {
+    assert_eq!(memory_pids(&[], &[42]), MemoryPids::Run);
+    assert_eq!(memory_pids(&phases(&["memory"]), &[42]), MemoryPids::Run);
+}
+
+#[test]
+fn memory_is_skipped_without_process_ids_in_the_default_phases() {
+    assert_eq!(memory_pids(&[], &[]), MemoryPids::Skip);
+    assert_eq!(
+        memory_pids(&phases(&["cold", "warm"]), &[]),
+        MemoryPids::Skip
+    );
+}
+
+#[test]
+fn memory_asked_for_by_name_is_invalid_without_process_ids() {
+    let MemoryPids::Invalid(reason) = memory_pids(&phases(&["cold", "memory"]), &[]) else {
+        panic!("expected an invalid memory phase");
+    };
+    assert!(reason.contains("BENCH_PIDS"), "{reason}");
+}
+
+#[test]
+fn the_default_classifier_describes_itself_as_the_default_layout() {
+    let described = Classifier::default_layout().describe();
+    assert_eq!(described["per_agent_layout"], "default");
+    assert_eq!(described["per_agent"], json!(["^cells/"]));
+    assert_eq!(described["background"], json!([]));
+}
+
+#[test]
+fn a_custom_classifier_lists_its_patterns() {
+    let classifier = Classifier::new(
+        vec![Regex::new("^v1/do/").unwrap()],
+        vec![Regex::new("^v1/nodes/").unwrap()],
+    );
+    let described = classifier.describe();
+    assert_eq!(described["per_agent_layout"], "custom");
+    assert_eq!(described["per_agent"], json!(["^v1/do/"]));
+    assert_eq!(described["background"], json!(["^v1/nodes/"]));
+}
+
+#[test]
+fn the_end_rule_describes_every_setting_that_changes_a_count() {
+    let described = rule(10_000, 300_000).describe();
+    assert_eq!(
+        described,
+        json!({ "min_wait_s": 0, "quiet_s": 10, "scope": "All", "timeout_s": 300 })
+    );
+}
+
+#[tokio::test]
+async fn the_tally_route_reports_the_classifier() {
+    let tally = tally_with_a_request();
+    let info = Classifier::default_layout().describe();
+    let answer = control_response(
+        &tally,
+        &info,
+        &Method::GET,
+        "/.proxy/tally",
+        "127.0.0.1".parse().unwrap(),
+    );
+    let body = answer.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["classifier"], info);
+    assert_eq!(body["requests"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_remote_read_returns_the_proxys_classifier() {
+    const WITH_CLASSIFIER: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 54\r\nconnection: close\r\n\r\n{\"requests\":[],\"classifier\":{\"per_agent\":[\"^v1/do/\"]}}";
+    let url = serve(Some(WITH_CLASSIFIER)).await;
+    let (tally, classifier) = TallySource::remote(&url).fetch().await.unwrap();
+    assert!(tally.is_empty());
+    assert_eq!(classifier, json!({ "per_agent": ["^v1/do/"] }));
 }

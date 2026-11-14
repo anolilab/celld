@@ -62,6 +62,7 @@ struct Settings {
     settle: Duration,
     filter: Option<String>,
     end: EndRule,
+    classifier: Classifier,
 }
 
 struct Scenario {
@@ -115,6 +116,7 @@ fn main() {
         settle: Duration::from_secs(positive("CELLD_BENCH_SETTLE_S", 40)),
         filter: env_text("CELLD_BENCH_FILTER"),
         end: EndRule::from_env(),
+        classifier: Classifier::from_env(),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -172,7 +174,7 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
         "127.0.0.1:0",
         upstream,
         root.to_owned(),
-        Classifier::from_env(),
+        settings.classifier.clone(),
     )
     .await;
     let dir = tempfile::TempDir::new().expect("create temp dir");
@@ -342,6 +344,8 @@ fn write_json(settings: &Settings, results: &[ScenarioResult]) {
             "turn_ms": settings.turn.as_millis() as u64,
             "spread_s": settings.spread.as_secs(),
             "projected_concurrent": PROJECTED_CONCURRENT,
+            "end_rule": settings.end.describe(),
+            "classifier": settings.classifier.describe(),
         },
         "scenarios": results.iter().map(|r| {
             let mut scenario = r.report.json(lifetime);

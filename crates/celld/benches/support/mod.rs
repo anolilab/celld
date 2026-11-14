@@ -132,7 +132,30 @@ impl Classifier {
         let background = env_text("BENCH_BACKGROUND_REGEX")
             .map(|p| vec![compile("BENCH_BACKGROUND_REGEX", &p)])
             .unwrap_or_default();
+        Classifier::new(agent, background)
+    }
+
+    pub fn new(agent: Vec<Regex>, background: Vec<Regex>) -> Classifier {
         Classifier { agent, background }
+    }
+
+    /// The patterns in use, for the saved settings of a run: results taken
+    /// with different patterns do not compare.
+    pub fn describe(&self) -> Value {
+        fn patterns(regexes: &[Regex]) -> Vec<&str> {
+            regexes.iter().map(Regex::as_str).collect()
+        }
+        let default = Self::default_layout();
+        let layout = if patterns(&self.agent) == patterns(&default.agent) {
+            "default"
+        } else {
+            "custom"
+        };
+        json!({
+            "per_agent_layout": layout,
+            "per_agent": patterns(&self.agent),
+            "background": patterns(&self.background),
+        })
     }
 
     pub fn part(&self, key: &str) -> Part {
@@ -209,6 +232,16 @@ impl EndRule {
         }
     }
 
+    /// The rule in use, for the saved settings of a run.
+    pub fn describe(&self) -> Value {
+        json!({
+            "min_wait_s": self.min_wait.as_secs(),
+            "quiet_s": self.quiet.as_secs(),
+            "scope": format!("{:?}", self.scope),
+            "timeout_s": self.timeout.as_secs(),
+        })
+    }
+
     fn watched(&self, tally: &Tally) -> u64 {
         tally
             .iter()
@@ -283,8 +316,14 @@ impl TallySource {
     }
 
     pub async fn take(&self) -> Result<Tally, String> {
+        Ok(self.fetch().await?.0)
+    }
+
+    /// The tally and the classifier patterns the proxy reports it with
+    /// (`null` for a proxy in this process, whose settings the caller has).
+    pub async fn fetch(&self) -> Result<(Tally, Value), String> {
         match self {
-            TallySource::Local(tally) => Ok(tally.lock().unwrap().clone()),
+            TallySource::Local(tally) => Ok((tally.lock().unwrap().clone(), Value::Null)),
             TallySource::Remote { client, url } => {
                 let response = client
                     .get(url)
@@ -305,7 +344,7 @@ impl TallySource {
                     .json()
                     .await
                     .map_err(|e| format!("the counting proxy at {url} sent no JSON tally: {e}"))?;
-                parse_tally(&body)
+                Ok((parse_tally(&body)?, body["classifier"].clone()))
             }
         }
     }
@@ -404,8 +443,10 @@ impl Proxy {
                     root.clone(),
                     classifier.clone(),
                 );
+                let classifier_info = classifier.describe();
                 let service = service_fn(move |request: Request<Incoming>| {
                     let (tally, upstream) = (tally.clone(), upstream.clone());
+                    let classifier_info = classifier_info.clone();
                     // The keys of a batch delete are in its body.
                     let kind = kind(&request);
                     let key = relative(&key_of(&request), &root);
@@ -418,6 +459,7 @@ impl Proxy {
                         if request.uri().path().starts_with(CONTROL) {
                             return Ok(control_response(
                                 &tally,
+                                &classifier_info,
                                 request.method(),
                                 request.uri().path(),
                                 peer.ip(),
@@ -473,6 +515,7 @@ fn text_response(status: u16, body: String) -> Response<ProxyBody> {
 /// read or clear the tally.
 pub fn control_response(
     tally: &Mutex<Tally>,
+    classifier: &Value,
     method: &Method,
     path: &str,
     peer: IpAddr,
@@ -482,7 +525,9 @@ pub fn control_response(
     }
     match (method, path) {
         (&Method::GET, "/.proxy/tally") => {
-            text_response(200, tally_json(&tally.lock().unwrap()).to_string())
+            let mut body = tally_json(&tally.lock().unwrap());
+            body["classifier"] = classifier.clone();
+            text_response(200, body.to_string())
         }
         (&Method::POST, "/.proxy/reset") => {
             tally.lock().unwrap().clear();
@@ -952,6 +997,27 @@ pub fn require_warmup(succeeded: usize, sent: usize) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// What the memory phase does about `BENCH_PIDS`.
+#[derive(PartialEq, Eq, Debug)]
+pub enum MemoryPids {
+    Run,
+    Skip,
+    Invalid(String),
+}
+
+/// With process ids the memory phase runs. Without them it is skipped when
+/// the phases are the default set, and invalid when `memory` was asked for by
+/// name: a run that was meant to measure memory must not pass without a sample.
+pub fn memory_pids(phases: &[String], pids: &[u32]) -> MemoryPids {
+    if !pids.is_empty() {
+        MemoryPids::Run
+    } else if phases.iter().any(|phase| phase == "memory") {
+        MemoryPids::Invalid("BENCH_PHASES names memory, but BENCH_PIDS is not set".to_owned())
+    } else {
+        MemoryPids::Skip
+    }
 }
 
 /// The measurement phases of `runtime_latency`.

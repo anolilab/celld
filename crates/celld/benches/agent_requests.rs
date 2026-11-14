@@ -57,7 +57,7 @@ fn main() {
         .build()
         .expect("build http client");
 
-    let (errors, report) = runtime
+    let (errors, classifier, report) = runtime
         .block_on(async {
             let idle = match idle_window {
                 Some(window) => {
@@ -72,9 +72,11 @@ fn main() {
             let errors = run_turns(&client, &bases, &run, agents, turns, turn, spread).await;
             end.wait(&source, Instant::now()).await?;
             let elapsed = started.elapsed();
-            let load = diff(&source.take().await?, &base)?;
+            let (after, classifier) = source.fetch().await?;
+            let load = diff(&after, &base)?;
             Ok::<_, String>((
                 errors,
+                classifier,
                 Report {
                     nodes,
                     agents,
@@ -98,12 +100,9 @@ fn main() {
             "turn_ms": turn.as_millis() as u64,
             "spread_s": spread.as_secs(),
             "projected_concurrent": PROJECTED_CONCURRENT,
-            "end_rule": {
-                "min_wait_s": end.min_wait.as_secs(),
-                "quiet_s": end.quiet.as_secs(),
-                "scope": format!("{:?}", end.scope),
-                "timeout_s": end.timeout.as_secs(),
-            },
+            "idle_s": idle_window.map(|window| window.as_secs()),
+            "end_rule": end.describe(),
+            "classifier": classifier,
         },
         "failed_requests": errors,
         "result": report.json(lifetime),

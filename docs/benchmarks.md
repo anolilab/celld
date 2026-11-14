@@ -197,7 +197,7 @@ BENCH_BASE_URL=http://127.0.0.1:8787 BENCH_PIDS=12345 BENCH_IDLE_S=15 \
 
 | Phase        | What it measures                                                                  |
 | ------------ | --------------------------------------------------------------------------------- |
-| `memory`     | Resident set of the process ids in `BENCH_PIDS` (and their children, each process counted once) at zero agents, after one, and after `BENCH_MEM_AGENTS` (500) live agents. The slope is KiB per live agent. The "after idle wait" figure is the resident set after waiting longer than the idle time and the eviction time; it is not a measure of an evicted state, since the harness cannot see an eviction. A listed process that is not running fails the phase. |
+| `memory`     | Resident set of the process ids in `BENCH_PIDS` (and their children, each process counted once) at zero agents, after one, and after `BENCH_MEM_AGENTS` (500) live agents. The slope is KiB per live agent. The "after idle wait" figure is the resident set after waiting longer than the idle time and the eviction time; it is not a measure of an evicted state, since the harness cannot see an eviction. A listed process that is not running fails the phase. Without `BENCH_PIDS` the phase is skipped in the default set of phases, and fails when `BENCH_PHASES` names `memory`. |
 | `cold`       | First request to each of `BENCH_COLD_AGENTS` (100) agents that have never been seen. |
 | `warm`       | `BENCH_WARM_REQUESTS` (1000) sequential requests to one agent, after 20 warm-up requests. At least one warm-up request must succeed, or the phase fails: otherwise a measured request could create the agent. |
 | `wake`       | `BENCH_WAKE_AGENTS` (50) agents are created, idle for `BENCH_IDLE_S` (15 s), and requested again. With `BENCH_EVICT_S` set, `BENCH_IDLE_S` must be at least `BENCH_EVICT_S` plus `BENCH_EVICT_SLACK_S` (5 s), or the phase fails. |
@@ -244,7 +244,14 @@ run starts with. `agent_requests` takes the agent count, turns and turn gap of
 `storage_requests` (`BENCH_AGENTS` 200, `BENCH_TURNS` 6, `BENCH_TURN_MS`
 10000, `BENCH_SPREAD_S` 60) and the classifier and end rule above. With
 `BENCH_IDLE_S` it first watches the proxy with no load for that long and
-reports the idle request rate. The proxy speaks plain HTTP and path-style S3, so
+reports the idle request rate. Shared requests are reported per node-hour as all
+of them over the whole run: both the requests and the elapsed time run from just
+before the first agent request until the end rule is met, so the minimum wait and
+the quiet window are in both. Per-agent counts do not depend on the elapsed time.
+The JSON `settings` of both request-counting targets record the end rule and the
+classifier patterns; `agent_requests` records the patterns that the proxy
+reports, since the proxy classifies, so a run is comparable only with runs that
+used the same ones. The proxy speaks plain HTTP and path-style S3, so
 the server must be allowed to use an `http://` endpoint. It answers
 `GET /.proxy/tally` with the counts as JSON and `POST /.proxy/reset`, to
 callers on a loopback address only: the relay may listen on a public address

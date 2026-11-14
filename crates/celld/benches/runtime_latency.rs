@@ -48,9 +48,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 use support::{
-    base_urls, env_text, git, idle_wait, memory_slope, out, parse_phases, percentile_us, positive,
-    require_idle_past_eviction, require_resident, require_warmup, rss_kib, run_id, target_dir,
-    window_position, WindowPosition,
+    base_urls, env_text, git, idle_wait, memory_pids, memory_slope, out, parse_phases,
+    percentile_us, positive, require_idle_past_eviction, require_resident, require_warmup, rss_kib,
+    run_id, target_dir, window_position, MemoryPids, WindowPosition,
 };
 use tokio::sync::Semaphore;
 
@@ -162,10 +162,12 @@ fn main() {
         };
         // Memory first: it needs a server that has served no agent yet.
         if settings.runs("memory") {
-            if settings.pids.is_empty() {
-                out("memory: skipped, BENCH_PIDS is not set\n");
-            } else {
-                record("memory", memory(&settings, &client).await);
+            match memory_pids(&settings.phases, &settings.pids) {
+                MemoryPids::Run => record("memory", memory(&settings, &client).await),
+                MemoryPids::Skip => out("memory: skipped, BENCH_PIDS is not set\n"),
+                MemoryPids::Invalid(reason) => {
+                    record("memory", Outcome::invalid(json!({}), reason));
+                }
             }
         }
         if settings.runs("cold") {
