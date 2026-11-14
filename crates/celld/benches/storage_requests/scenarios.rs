@@ -174,7 +174,7 @@ pub fn idle_window(spread: Duration, turn: Duration, turns: usize, min_wait: Dur
 }
 
 /// The directory's key shape, with the partition count's digits masked.
-const DIRECTORY: &str = "fleet/dir/k#/";
+const DIRECTORY: &str = "fleet/dir/v#/";
 
 /// Whether a request is one of the cell directory's segments: a batch delete of
 /// them is named for them too.

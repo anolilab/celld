@@ -276,7 +276,7 @@ async fn synthetic_compaction_load() {
                         .map(|index| format!("{:064x}", sha_like(base + index)))
                         .collect();
                     let key =
-                        format!("{prefix}fleet/dir/k256/born/node-{node:03}/gen{run_id}/{seq:08}");
+                        format!("{prefix}fleet/dir/v2/born/node-{node:03}/gen{run_id}/{seq:08}");
                     store
                         .put_opts(
                             &Path::from(key.as_str()),

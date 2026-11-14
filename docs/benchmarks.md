@@ -161,9 +161,9 @@ traffic it spreads that traffic over the run's agents, so it is no projection to
 
 `cell_directory` in a scenario of the JSON breaks out what the directory sent,
 per agent and with nothing subtracted (`…_per_agent`; a scenario without agents
-reports `…_per_node_hour` instead, since it has no agents to divide by): `fleet/dir/k256/born/` (segments) and
-`fleet/dir/k256/` (heads, runs, ledger, marker, lease), class A and B. A batch delete is
-named for the first key in its body (`(batch) fleet/dir/k256/born/…`), so the compactor's
+reports `…_per_node_hour` instead, since it has no agents to divide by): `fleet/dir/v2/born/` (segments) and
+`fleet/dir/v2/` (heads, runs, ledger, marker, lease), class A and B. A batch delete is
+named for the first key in its body (`(batch) fleet/dir/v2/born/…`), so the compactor's
 deletions are counted with the keys they remove, and each billed batch once; a
 batch that removes several kinds of key is named for its first. The proxy reads a batch-delete body up to 2 MiB (a store sends at most 1,000 keys); a larger body is refused with a 413 and not counted. `setup_requests`
 holds the directory's traffic from before the window, where the first

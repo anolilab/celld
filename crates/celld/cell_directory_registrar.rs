@@ -511,7 +511,7 @@ pub(crate) mod testing {
     /// Every segment, with its born cells; tombstones are prefixed with `-`.
     pub(crate) async fn segments(inner: &InMemory) -> Vec<(String, Vec<String>)> {
         let mut found = Vec::new();
-        let mut listing = inner.list(Some(&Path::from("fleet-a/fleet/dir/k256/born")));
+        let mut listing = inner.list(Some(&Path::from("fleet-a/fleet/dir/v2/born")));
         while let Some(meta) = listing.next().await {
             let location = meta.unwrap().location;
             let body = inner.get(&location).await.unwrap().bytes().await.unwrap();
@@ -560,7 +560,7 @@ mod tests {
         assert_eq!(
             segments(&inner).await,
             [(
-                "fleet-a/fleet/dir/k256/born/node-a/gen1/00000000".to_owned(),
+                "fleet-a/fleet/dir/v2/born/node-a/gen1/00000000".to_owned(),
                 vec!["c1".to_owned()]
             )]
         );
@@ -648,7 +648,7 @@ mod tests {
         // the registration is refused.
         put_segment(
             &inner,
-            "fleet-a/fleet/dir/k256/born/node-a/gen1/00000000",
+            "fleet-a/fleet/dir/v2/born/node-a/gen1/00000000",
             b"",
         )
         .await;
@@ -681,7 +681,7 @@ mod tests {
         // The first segment's key is taken, so the first flush fails.
         put_segment(
             &inner,
-            "fleet-a/fleet/dir/k256/born/node-a/gen1/00000000",
+            "fleet-a/fleet/dir/v2/born/node-a/gen1/00000000",
             b"",
         )
         .await;
@@ -930,7 +930,7 @@ mod tests {
         // The segment key the write's flush uses is taken, so it fails.
         put_segment(
             &inner,
-            "fleet-a/fleet/dir/k256/born/node-a/gen1/00000000",
+            "fleet-a/fleet/dir/v2/born/node-a/gen1/00000000",
             b"",
         )
         .await;
@@ -978,7 +978,7 @@ mod tests {
             // The first segment's key is taken, so the first flush fails.
             put_segment(
                 &node.counting.inner,
-                "fleet-a/fleet/dir/k256/born/node-a/gen1/00000000",
+                "fleet-a/fleet/dir/v2/born/node-a/gen1/00000000",
                 b"",
             )
             .await;
@@ -1104,7 +1104,7 @@ mod tests {
         // The next sequence number is taken, so the tombstone write fails.
         put_segment(
             &inner,
-            "fleet-a/fleet/dir/k256/born/node-a/gen1/00000001",
+            "fleet-a/fleet/dir/v2/born/node-a/gen1/00000001",
             b"",
         )
         .await;

@@ -3,7 +3,7 @@
 //! The fleet directory of cells that have per-cell LTX.
 //!
 //! A node that writes LTX for a cell registers the cell in a create-only
-//! segment, `fleet/dir/k256/born/<node>/<generation>/<seq:08>`, before the cell's
+//! segment, `fleet/dir/v2/born/<node>/<generation>/<seq:08>`, before the cell's
 //! first LTX object exists. The registration is queued when the cell is first
 //! claimed and written by a background flusher every batch window; the cell's
 //! first write waits for that flush (see `cell_directory_registrar`). A segment
@@ -12,7 +12,7 @@
 //!
 //! Only the compactor (see `cell_directory_compactor`) lists and reads
 //! segments. Every pass folds them into partitioned runs of 64-bit fingerprints
-//! under `fleet/dir/k256/` and then publishes a freshness marker: a generation,
+//! under `fleet/dir/v2/` and then publishes a freshness marker: a generation,
 //! and how old its oldest unfolded segment was, as a duration. A node never reads
 //! a segment. A lookup is the node's own registrations, which it keeps in memory
 //! until a marker covers them, then the marker, the cell's partition head, and
@@ -639,6 +639,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_marker_without_this_layouts_version_is_not_read() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("old"));
+        write_head(&inner, partition, &["old"], "l2").await;
+        let other = a_cell_in(partition, "old");
+        let key = crate::cell_directory_runs::marker_key(PREFIX);
+        // No version at all; the version of the layout before this one, which
+        // had the same fields; and a later one.
+        let bodies = [
+            r#"{"generation":GEN,"published_ms":1,"oldest_unfolded_age_ms":0}"#,
+            r#"{"v":2,"generation":GEN,"published_ms":1,"oldest_unfolded_age_ms":0}"#,
+            r#"{"v":4,"generation":GEN,"published_ms":1,"oldest_unfolded_age_ms":0}"#,
+        ];
+        for body in bodies {
+            let reader = directory_over(&inner);
+            // Two reads that would each be a change, if the marker were read.
+            for generation in ["1", "2"] {
+                let body = body.replace("GEN", generation);
+                put_segment(&inner, &key, body.as_bytes()).await;
+                let at_ms = if generation == "1" {
+                    0
+                } else {
+                    MARKER_TTL_MS + 1
+                };
+                let _ = reader.lookup("probe", at_ms).await;
+            }
+            assert_eq!(
+                reader.lookup(&other, MARKER_TTL_MS + 2).await,
+                DirectoryAnswer::Unknown,
+                "{body}"
+            );
+        }
+        // The same fields with this layout's version are read.
+        let reader = directory_over(&inner);
+        observe_a_change(&inner, &reader).await;
+        assert_eq!(
+            reader.lookup(&other, MARKER_TTL_MS + 2).await,
+            DirectoryAnswer::New
+        );
+    }
+
+    #[tokio::test]
     async fn the_marker_is_read_once_per_ttl_and_its_age_is_judged_on_every_lookup() {
         let counting = Arc::new(Counting::default());
         let partition = partition_of(fingerprint("old"));
@@ -1017,12 +1059,12 @@ mod tests {
         assert_eq!(PARTITIONS, 256);
         assert_eq!(
             head_key("p/", 0xab),
-            "p/fleet/dir/k256/ab/head",
+            "p/fleet/dir/v2/ab/head",
             "a K=4096 head sat at fleet/dir/0ab/head"
         );
         assert_eq!(
             run_key(0xab, "l0", "g", 7),
-            "fleet/dir/k256/ab/run/l0-g-00000007"
+            "fleet/dir/v2/ab/run/l0-g-00000007"
         );
         assert!((0..PARTITIONS).all(|p| p <= 0xff));
         let partitions: std::collections::BTreeSet<u16> = (0..20_000)
@@ -1065,7 +1107,7 @@ mod tests {
         put_segment(
             &inner,
             &format!("{PREFIX}fleet/dir/ledger"),
-            br#"{"v":1,"segments":{"fleet-a/fleet/dir/k256/born/node-a/gen0/00000000":1}}"#,
+            br#"{"v":1,"segments":{"fleet-a/fleet/dir/v2/born/node-a/gen0/00000000":1}}"#,
         )
         .await;
         // A marker is published for the new layout, with no head for the

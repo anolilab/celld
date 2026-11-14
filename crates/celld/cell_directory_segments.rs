@@ -3,7 +3,7 @@
 //! The format of the cell directory's segments: their keys, the cells they
 //! record, and the fingerprints those cells have in segments and in runs.
 
-use crate::cell_directory_runs::root;
+use crate::cell_directory_runs::ROOT;
 use anyhow::Context as _;
 use bytes::Bytes;
 use celld_logic::cell_directory::Kind;
@@ -32,7 +32,7 @@ pub(crate) fn registration_key(cell: &str) -> u128 {
 /// Where segments live: under the directory's own root, not `fleet/born/`,
 /// which a compactor of another layout lists and deletes from.
 pub(crate) fn born_root(prefix: &str) -> String {
-    format!("{prefix}{}/born", root())
+    format!("{prefix}{ROOT}/born")
 }
 
 pub(crate) fn segment_key(prefix: &str, node: &str, generation: &str, seq: u64) -> String {
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn segment_keys_round_trip() {
         let key = segment_key("p/", "node-a", "g1", 7);
-        assert_eq!(key, "p/fleet/dir/k256/born/node-a/g1/00000007");
+        assert_eq!(key, "p/fleet/dir/v2/born/node-a/g1/00000007");
         assert_eq!(
             parse_segment_key("p/", &key),
             Some(SegmentKey {
@@ -135,7 +135,7 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_segment_key("", "fleet/dir/k256/born/a/b/g1/00000012")
+            parse_segment_key("", "fleet/dir/v2/born/a/b/g1/00000012")
                 .unwrap()
                 .node,
             "a/b"
@@ -155,12 +155,12 @@ mod tests {
             // what is nested.
             "p/fleet/born/node-a/g1/00000001",
             "p/fleet/born/k256/node-a/g1/00000001",
-            "p/fleet/dir/k256/born/snap-3",
-            "p/fleet/dir/k256/born/seeded",
-            "p/fleet/dir/k256/born/node-a/g1/7",
-            "p/fleet/dir/k256/born/node-a/g1/0000000x",
-            "p/fleet/dir/k256/born/g1/00000001",
-            "q/fleet/dir/k256/born/node-a/g1/00000001",
+            "p/fleet/dir/v2/born/snap-3",
+            "p/fleet/dir/v2/born/seeded",
+            "p/fleet/dir/v2/born/node-a/g1/7",
+            "p/fleet/dir/v2/born/node-a/g1/0000000x",
+            "p/fleet/dir/v2/born/g1/00000001",
+            "q/fleet/dir/v2/born/node-a/g1/00000001",
             "p/other/born/node-a/g1/00000001",
             // The compacted tiers live beside, not under, the segments.
             "p/fleet/dir/00a/run/l0-gen1-00000001",
@@ -187,7 +187,7 @@ mod tests {
             "p/cells/ltx/e1/x",
             "p/cells//ltx/x",
             "q/cells/agent:1/ltx/e1/x",
-            "p/fleet/dir/k256/born/n/g/00000000",
+            "p/fleet/dir/v2/born/n/g/00000000",
             // A nested stream is not a registered cell.
             "p/cells/agent:1/facets/ab/ltx/e1/x",
         ] {

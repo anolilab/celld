@@ -1,7 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Compaction of the cell directory: folds the segments under
-//! `fleet/dir/k256/born/` into the partitioned runs under `fleet/dir/k256/`. It
+//! `fleet/dir/v2/born/` into the partitioned runs under `fleet/dir/v2/`. It
 //! is the only reader of segments. Everything it lists, reads, writes and deletes
 //! is under that root, so a compactor of another layout, running beside it
 //! during a rollout, shares no lease, ledger or segment with it.
@@ -832,7 +832,7 @@ impl Pass<'_> {
 /// The lease the compactor is elected by. It is not the waker role: every node
 /// takes that, and only a node that runs the directory compacts. It is under the
 /// directory's root, so a compactor of another layout holds a lease of its own.
-pub(crate) const LEASE_KEY: &str = "fleet/dir/k256/compactor-lease";
+pub(crate) const LEASE_KEY: &str = "fleet/dir/v2/compactor-lease";
 
 /// When the compactor runs.
 pub(crate) struct Schedule {
