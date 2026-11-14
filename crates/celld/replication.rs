@@ -146,6 +146,7 @@ pub struct StorageCredentials {
     pub session_token: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct ActivationOptions<'a> {
     pub cell: &'a str,
     pub epoch: u64,
@@ -205,6 +206,9 @@ pub(crate) struct PreservedCache {
     filesystem: Arc<dyn celld_ltx::FileSystem>,
     entries: std::collections::BTreeMap<PathBuf, celld_logic::cache::CacheEntry>,
     bytes: u64,
+    /// Snapshots the cache removed whose lineage files could not all be
+    /// removed with them.
+    stranded: std::collections::BTreeSet<PathBuf>,
     /// Prunes served since the index was last rebuilt from the filesystem.
     /// `None` until the first adoption or while a failed mutation requires a
     /// rescan.
@@ -225,6 +229,7 @@ impl PreservedCache {
             filesystem,
             entries: std::collections::BTreeMap::new(),
             bytes: 0,
+            stranded: std::collections::BTreeSet::new(),
             since_resync: None,
         }
     }
@@ -268,14 +273,35 @@ impl PreservedCache {
     /// kept for a same-epoch wake has the LTX metadata and WAL files of its
     /// live name next to it; without the snapshot they describe nothing, and
     /// a wake that finds the snapshot gone claims the next epoch instead.
-    fn remove_beside(&self, snapshot: &std::path::Path) {
+    fn remove_beside(&self, snapshot: &std::path::Path) -> std::io::Result<()> {
         if snapshot.extension().is_none_or(|ext| ext != "evicted") {
-            return;
+            return Ok(());
         }
-        let _ = crate::ltx_repl::remove_lineage(
+        crate::ltx_repl::remove_lineage(
             self.filesystem.as_ref(),
             &crate::ltx_repl::live_path(snapshot),
-        );
+        )
+    }
+
+    /// Remove again the files beside a snapshot that the cache removed while
+    /// one of them stayed. Nothing else tracks them, so they wait here until
+    /// every one is gone. A snapshot that exists again, or a live database
+    /// at its name, owns them now, and they are left alone.
+    fn retry_stranded(&mut self) -> Option<std::io::Error> {
+        let mut first_error = None;
+        for snapshot in std::mem::take(&mut self.stranded) {
+            let live = crate::ltx_repl::live_path(&snapshot);
+            if self.filesystem.metadata(&snapshot).is_ok()
+                || self.filesystem.metadata(&live).is_ok()
+            {
+                continue;
+            }
+            if let Err(error) = crate::ltx_repl::remove_lineage(self.filesystem.as_ref(), &live) {
+                self.stranded.insert(snapshot);
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error
     }
 
     /// Drop a snapshot that has been consumed or deleted.
@@ -311,6 +337,9 @@ impl PreservedCache {
             }
             Some(count) => self.since_resync = Some(count + 1),
         }
+        if let Some(error) = self.retry_stranded() {
+            first_error.get_or_insert(error);
+        }
         if self.bytes <= max_bytes {
             return match first_error {
                 Some(error) => Err(error),
@@ -343,7 +372,10 @@ impl PreservedCache {
             for index in plan {
                 match self.filesystem.remove_file(&paths[index]) {
                     Ok(()) => {
-                        self.remove_beside(&paths[index]);
+                        if let Err(error) = self.remove_beside(&paths[index]) {
+                            self.stranded.insert(paths[index].clone());
+                            first_error.get_or_insert(error);
+                        }
                         self.forget(&paths[index]);
                         evicted += 1;
                     }

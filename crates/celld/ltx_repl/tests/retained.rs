@@ -277,8 +277,12 @@ struct Refusals {
     /// Creating a LTX metadata directory, which fails opening a database
     /// after its files are in place.
     meta: AtomicBool,
-    /// Writing the record of an eviction's snapshot.
+    /// Renaming the record of an eviction's snapshot into place, after it
+    /// was written.
     cut: AtomicBool,
+    /// The retained database vanishes before a rename of it, as when the
+    /// cache removes it between a wake's check and its rename.
+    vanish: AtomicBool,
 }
 
 struct RefusingFilesystem {
@@ -313,16 +317,22 @@ impl celld_ltx::FileSystem for RefusingFilesystem {
         self.inner.open(path)
     }
     fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-        let cut = path.extension().is_some_and(|ext| ext == "tmp");
-        if cut && self.refusals.cut.load(Ordering::SeqCst) {
-            return Err(std::io::Error::other("refused"));
-        }
         self.inner.write(path, bytes)
     }
     fn sync_all(&self, path: &Path) -> std::io::Result<()> {
         self.inner.sync_all(path)
     }
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        if to.extension().is_some_and(|ext| ext == "cut")
+            && self.refusals.cut.load(Ordering::SeqCst)
+        {
+            return Err(std::io::Error::other("refused"));
+        }
+        if from.extension().is_some_and(|ext| ext == "evicted")
+            && self.refusals.vanish.load(Ordering::SeqCst)
+        {
+            self.inner.remove_file(from)?;
+        }
         self.inner.rename(from, to)
     }
     fn remove_file(&self, path: &Path) -> std::io::Result<()> {
@@ -567,5 +577,91 @@ fn an_eviction_that_cannot_record_its_snapshot_keeps_only_a_base() {
         assert!(error
             .downcast_ref::<crate::replication::RetainedUnavailable>()
             .is_some());
+    });
+}
+
+#[test]
+fn a_stray_record_file_goes_with_the_lineage_the_next_epoch_clears() {
+    run(async {
+        let rig = rig();
+        first_lifetime(&rig).await;
+        rig.ltx
+            .evict(CELL, 1, Retained::Resumable, None)
+            .await
+            .expect("eviction");
+        let stray = live(&rig, 1).with_extension("cut.tmp");
+        std::fs::write(&stray, "7").expect("leave a record file behind");
+
+        rig.ltx
+            .activate(options(2, false, false))
+            .await
+            .expect("claim the next epoch");
+
+        assert!(!stray.exists());
+    });
+}
+
+#[test]
+fn a_cache_prune_between_a_wakes_check_and_its_rename_is_a_missing_database() {
+    run(async {
+        let (rig, refusals) = rig_refusing();
+        first_lifetime(&rig).await;
+        rig.ltx
+            .evict(CELL, 1, Retained::Resumable, None)
+            .await
+            .expect("eviction");
+
+        refusals.vanish.store(true, Ordering::SeqCst);
+        let error = rig
+            .ltx
+            .activate(options(1, false, true))
+            .await
+            .map(|_| ())
+            .expect_err("the database vanished");
+
+        assert!(error
+            .downcast_ref::<crate::replication::RetainedUnavailable>()
+            .is_some());
+    });
+}
+
+#[test]
+fn a_prune_that_cannot_clear_the_lineage_clears_it_on_the_next_prune() {
+    run(async {
+        let (rig, refusals) = rig_refusing();
+        first_lifetime(&rig).await;
+        rig.ltx
+            .evict(CELL, 1, Retained::Resumable, None)
+            .await
+            .expect("eviction");
+
+        refusals.removal.store(true, Ordering::SeqCst);
+        rig.ltx
+            .prune_local_cache(0)
+            .expect_err("the lineage cannot be removed");
+        // The database is gone, and nothing but the cache knows the files
+        // beside it.
+        assert!(!evicted(&rig, 1).exists() && meta(&rig, 1).is_dir());
+
+        refusals.removal.store(false, Ordering::SeqCst);
+        rig.ltx.prune_local_cache(u64::MAX).expect("prune");
+
+        assert!(!meta(&rig, 1).exists());
+    });
+}
+
+#[test]
+fn a_record_that_cannot_be_renamed_into_place_leaves_no_file_behind() {
+    run(async {
+        let (rig, refusals) = rig_refusing();
+        first_lifetime(&rig).await;
+
+        refusals.cut.store(true, Ordering::SeqCst);
+        rig.ltx
+            .record_cut(CELL, 1, 1)
+            .expect_err("the record cannot be renamed");
+
+        assert!(!live(&rig, 1).with_extension("cut.tmp").exists());
+        assert!(!live(&rig, 1).with_extension("cut").exists());
     });
 }

@@ -2210,7 +2210,34 @@ impl LtxRepl {
 
     /// `activate`, where `allow_paged` false always clones: a facet's
     /// database is opened by a plain connection that has no fault-in VFS.
+    ///
+    /// A restore plans against one listing of the epoch's objects. An owner
+    /// that evicts the cell meanwhile publishes a newer snapshot and deletes
+    /// the older one once its grace has passed, so a restore that outlives the
+    /// grace finds its planned object gone. It plans again once from a fresh
+    /// listing, which holds the newer snapshot. A paged cell that faults a
+    /// page from a deleted object after it serves cannot, and the grace is
+    /// the bound on that.
     pub(crate) async fn activate_with(
+        &self,
+        options: ActivationOptions<'_>,
+        allow_paged: bool,
+    ) -> anyhow::Result<ActivationResult> {
+        match self.activate_once(options.clone(), allow_paged).await {
+            Err(error) if planned_object_vanished(&error) => {
+                info!(
+                    cell = options.cell,
+                    epoch = options.epoch,
+                    %error,
+                    "a planned restore object was replaced; planning again"
+                );
+                self.activate_once(options, allow_paged).await
+            }
+            result => result,
+        }
+    }
+
+    async fn activate_once(
         &self,
         options: ActivationOptions<'_>,
         allow_paged: bool,
@@ -2374,9 +2401,13 @@ impl LtxRepl {
                     && self.paged_fleet.load(Ordering::Relaxed)
                 {
                     let plan_started = asyncrt::mono_ms();
-                    let plan = replica::calc_restore_plan(&chain, TXID(0))
-                        .await
-                        .map_err(|error| anyhow!("paged plan {cell} e{from}: {error}"))?;
+                    let plan =
+                        replica::calc_restore_plan(&chain, TXID(0))
+                            .await
+                            .map_err(|error| {
+                                anyhow::Error::new(error)
+                                    .context(format!("paged plan {cell} e{from}"))
+                            })?;
                     let plan_us = asyncrt::mono_ms()
                         .saturating_sub(plan_started)
                         .saturating_mul(1_000);
@@ -2399,7 +2430,9 @@ impl LtxRepl {
                     let map_started = asyncrt::mono_ms();
                     let map = celld_ltx::paged::build_page_map(&chain, &plan)
                         .await
-                        .map_err(|error| anyhow!("paged map {cell} e{from}: {error}"))?;
+                        .map_err(|error| {
+                            anyhow::Error::new(error).context(format!("paged map {cell} e{from}"))
+                        })?;
                     let map_us = asyncrt::mono_ms()
                         .saturating_sub(map_started)
                         .saturating_mul(1_000);
@@ -2466,7 +2499,9 @@ impl LtxRepl {
                         self.restore_slots.clone(),
                     )
                     .await
-                    .map_err(|error| anyhow!("restore {cell} e{from}: {error}"))?;
+                    .map_err(|error| {
+                        anyhow::Error::new(error).context(format!("restore {cell} e{from}"))
+                    })?;
                     let levels = stats
                         .plan
                         .by_level
@@ -5322,6 +5357,18 @@ fn node_config(
         part_size: 0,
         timestamp_metadata_key: TimestampMetadataKey::default(),
     }
+}
+
+/// Whether an activation failed on an object of its plan that is no longer
+/// in the bucket.
+fn planned_object_vanished(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| match cause.downcast_ref::<celld_ltx::Error>() {
+            Some(celld_ltx::Error::LTXMissing | celld_ltx::Error::TxNotAvailable) => true,
+            Some(celld_ltx::Error::Io(error)) => error.kind() == std::io::ErrorKind::NotFound,
+            _ => false,
+        })
 }
 
 fn production_ltx_host() -> LtxHost {

@@ -38,9 +38,15 @@ fn cut_path(db: &Path) -> PathBuf {
     db.with_extension("cut")
 }
 
+/// The file an eviction writes the record to before it takes its name.
+fn cut_temporary_path(db: &Path) -> PathBuf {
+    db.with_extension("cut.tmp")
+}
+
 /// Remove what a database keeps beside it: the LTX metadata that carries its
-/// writer lineage, the record of its snapshot and SQLite's sidecar files. Every removal is tried, and the
-/// first failure other than a path that was already gone is answered.
+/// writer lineage, the record of its snapshot and SQLite's sidecar files.
+/// Every removal is tried, and the first failure other than a path that was
+/// already gone is answered.
 pub(crate) fn remove_lineage(
     filesystem: &dyn celld_ltx::FileSystem,
     db: &Path,
@@ -55,6 +61,7 @@ pub(crate) fn remove_lineage(
     };
     note(filesystem.remove_dir_all(&Db::meta_path_for_path(db)));
     note(filesystem.remove_file(&cut_path(db)));
+    note(filesystem.remove_file(&cut_temporary_path(db)));
     for sidecar in Db::sidecar_paths_for_path(db) {
         note(filesystem.remove_file(&sidecar));
     }
@@ -174,7 +181,14 @@ impl LtxRepl {
         if !from_eviction {
             return Ok(ResumePlan { guard: None, cut });
         }
-        self.ltx_host.rename(&retained, dst)?;
+        // The cache can remove the database between the check and the rename.
+        self.ltx_host.rename(&retained, dst).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                unavailable("database")
+            } else {
+                error.into()
+            }
+        })?;
         self.preserved
             .lock()
             .expect("preserved cache poisoned")
@@ -208,12 +222,17 @@ impl LtxRepl {
     /// Record the end of the snapshot an eviction published, beside the
     /// database it closes.
     pub(super) fn record_cut(&self, cell: &str, epoch: u64, end: u64) -> std::io::Result<()> {
-        let path = cut_path(&self.db_path(cell, epoch));
-        let temporary = path.with_extension("cut.tmp");
+        let db = self.db_path(cell, epoch);
+        let temporary = cut_temporary_path(&db);
         let filesystem = self.ltx_host.filesystem();
-        filesystem.write(&temporary, end.to_string().as_bytes())?;
-        filesystem.sync_all(&temporary)?;
-        filesystem.rename(&temporary, &path)
+        let recorded = filesystem
+            .write(&temporary, end.to_string().as_bytes())
+            .and_then(|()| filesystem.sync_all(&temporary))
+            .and_then(|()| filesystem.rename(&temporary, &cut_path(&db)));
+        if recorded.is_err() {
+            let _ = filesystem.remove_file(&temporary);
+        }
+        recorded
     }
 
     /// Whether the write-ahead log of the database at `db` holds pages. SQLite

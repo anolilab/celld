@@ -315,6 +315,7 @@ pub(crate) mod testing {
     use futures_util::StreamExt as _;
     use object_store::memory::InMemory;
     use object_store::path::Path;
+    use object_store::ObjectStoreExt as _;
     use object_store::{
         CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
         ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
@@ -350,6 +351,17 @@ pub(crate) mod testing {
         pub dropping_puts: AtomicBool,
         /// Every request fails, as in a bucket outage.
         pub down: AtomicBool,
+        /// Changes the bucket the first time a key is read, as another node
+        /// does between a listing and the read that follows it.
+        pub swap_on_first_get: std::sync::Mutex<Option<Swap>>,
+    }
+
+    /// Objects written and deleted when `trigger` is first read.
+    #[derive(Debug)]
+    pub(crate) struct Swap {
+        pub trigger: Path,
+        pub puts: Vec<(Path, Bytes)>,
+        pub deletes: Vec<Path>,
     }
 
     impl Counting {
@@ -469,6 +481,21 @@ pub(crate) mod testing {
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
             self.begin()?;
+            let swap = {
+                let mut pending = self.swap_on_first_get.lock().unwrap();
+                match pending.as_ref() {
+                    Some(swap) if swap.trigger == *location => pending.take(),
+                    _ => None,
+                }
+            };
+            if let Some(swap) = swap {
+                for (path, bytes) in swap.puts {
+                    self.inner.put(&path, PutPayload::from_bytes(bytes)).await?;
+                }
+                for path in swap.deletes {
+                    self.inner.delete(&path).await?;
+                }
+            }
             let counter = match (&options.range, options.head) {
                 (_, true) => None,
                 (Some(GetRange::Bounded(_) | GetRange::Offset(_) | GetRange::Suffix(_)), _) => {
