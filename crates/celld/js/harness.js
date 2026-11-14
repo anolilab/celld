@@ -6035,6 +6035,8 @@ const {
     }
   },
   limits: () => __cell.kvLimits,
+  // Set by the host for the signed operator route alone; see `__operatorRequests`.
+  operator: (request) => __operatorRequests.has(request),
   // One op for the whole large-value path, following `__d1_run`.
   blob: async (_cell, request, value) => {
     const reply = await __kv_blob(JSON.stringify(request), value);
@@ -6049,7 +6051,14 @@ const {
   atob: (text) => $$atob(text, true),
 });
 
-__runtimeClass("__KvNamespace", __KvNamespaceCell);
+// What the binding's client calls over RPC; the rest of the cell is the
+// operator's, through `fetch`, or the cell's own.
+__runtimeClass("__KvNamespace", __KvNamespaceCell, [
+  "__kvGet",
+  "__kvPut",
+  "__kvDelete",
+  "__kvList",
+]);
 
 const __makeKvNamespace = __celld.__makeKvNamespace = (id, cellName) =>
   new __KvNamespace(() => __cell.makeNamespace("__KvNamespace"), cellName);
@@ -7471,6 +7480,14 @@ class __QueueCell {
   }
 
   async fetch(request) {
+    // The operator's route and the host's own settlement. A Worker holding a
+    // stub reaches `fetch` too, and these branches purge, pause, redrive and
+    // settle the queue.
+    if (!__operatorRequests.has(request)) {
+      return new Response("this request is for the operator, through `celld queue`", {
+        status: 403,
+      });
+    }
     const path = new URL(request.url).pathname;
     if (request.method !== "POST") {
       return new Response("Queue route not found", { status: 404 });
@@ -7526,7 +7543,12 @@ class __QueueCell {
   }
 }
 
-__runtimeClass("__Queue", __QueueCell);
+// What a producer and another queue's dead-letter hand-off call over RPC.
+__runtimeClass("__Queue", __QueueCell, [
+  "__queueSend",
+  "__queueMetrics",
+  "__queueDlqAcceptBatch",
+]);
 
 class Queue {
   constructor(queue, cellName, deliveryDelay) {

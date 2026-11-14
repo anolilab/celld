@@ -2525,7 +2525,10 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
             reply,
             order: None,
             parent: None,
-            operator_ingress: false,
+            // The host's own call, not a Worker's: the queue cell's `fetch`
+            // answers only calls the host marks, and a Worker holding a stub
+            // cannot settle a batch.
+            operator_ingress: true,
         },
     )
     .await;
