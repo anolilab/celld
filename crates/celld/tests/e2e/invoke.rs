@@ -57,6 +57,7 @@ async fn stage_variant(server: &Server) -> String {
         no_activate: true,
         vars: VarOverrides::None,
         local_images: true,
+        sourcemap: None,
     })
     .expect("build the variant");
     let bucket = celld::dev::open_local_bucket(&database(server)).expect("open the dev store");
