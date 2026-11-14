@@ -2353,11 +2353,16 @@ impl LtxRepl {
         // the chain, page count at the cut).
         let mut continuation: Option<(TXID, u32)> = None;
         // A retained database is evicted state: the bucket holds a snapshot
-        // at its position, and the rows at or below it can exist nowhere else
-        // once the bundles that carried them are collected. Compaction
-        // continues a level from the position it already holds, so a round on
-        // this handle would find rows above a gap and fail on every retry. The
-        // next eviction's snapshot covers what compaction would have folded.
+        // at its position, and under a fleet proof the rows at or below it are
+        // in no per-cell L0 file. A compaction round continues a level from
+        // the first transaction it holds, so on this handle it finds its first
+        // source above a gap and fails, "the compaction source does not
+        // continue the destination level", on every retry. Without rounds the
+        // handle's rows above the snapshot stay uncovered by the per-cell
+        // layout until its next eviction snapshot, which keeps the bundles
+        // that carry them. Folding from the snapshot's cut needs the
+        // compactor to accept a level that starts above transaction 1 beside
+        // older files, which it does not yet.
         let mut from_eviction = false;
         if resume_local {
             from_eviction = self.take_retained_database(cell, epoch, &dst)?;

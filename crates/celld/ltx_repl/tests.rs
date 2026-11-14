@@ -137,6 +137,10 @@ struct Rig {
 }
 
 fn rig() -> Rig {
+    rig_with(None)
+}
+
+fn rig_with(compaction: Option<CompactionConfig>) -> Rig {
     let directory = tempfile::tempdir().expect("temporary directory");
     let store = Arc::new(Forgetful::default());
     let ltx = LtxRepl::assemble(
@@ -148,7 +152,7 @@ fn rig() -> Rig {
         None,
         "us-east-1".to_string(),
         None,
-        None,
+        compaction,
         // The sync loop runs only when a test asks for a durability pass.
         3_600_000,
         production_ltx_host(),
@@ -624,5 +628,42 @@ fn the_graceful_seal_waits_for_the_snapshot_of_a_resumed_cell() {
             .await
             .expect("second eviction");
         assert!(rig.ltx.all_tails_tiered());
+    });
+}
+
+#[test]
+fn a_handle_reopened_from_a_retained_base_runs_no_compaction() {
+    run(async {
+        let rig = rig_with(Some(CompactionConfig {
+            min_txids: 1,
+            min_bytes: u64::MAX,
+            concurrency: 1,
+        }));
+        let compaction = |rig: &Rig, epoch: u64| {
+            rig.ltx
+                .cells
+                .lock()
+                .unwrap()
+                .get(&(CELL.to_string(), epoch))
+                .map(|handle| handle.compaction.is_some())
+        };
+        first_lifetime(&rig).await;
+        assert_eq!(compaction(&rig, 1), Some(true));
+        rig.ltx
+            .evict(CELL, 1, Retained::Resumable, None)
+            .await
+            .expect("first eviction");
+
+        // The rows at or below the snapshot are in no per-cell L0 file, as
+        // under a fleet proof. A round on the reopened handle would continue
+        // an empty level from transaction 1 and find its first source at 2,
+        // which fails with "the compaction source does not continue the
+        // destination level", on every retry.
+        rig.ltx
+            .activate(options(1, false, true))
+            .await
+            .expect("resume");
+
+        assert_eq!(compaction(&rig, 1), Some(false));
     });
 }

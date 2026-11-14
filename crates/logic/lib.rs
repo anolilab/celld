@@ -4897,7 +4897,8 @@ impl State {
             unreachable!()
         };
         let epoch = spec.epoch;
-        let dormant_resume = spec.resume_local && !cell.resume_demand;
+        let dormant_resume =
+            self.config.resume_dormant_local && spec.resume_local && !cell.resume_demand;
         let mut resume_failed = false;
         match result {
             Err(_) if dormant_resume => {
