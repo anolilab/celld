@@ -21,6 +21,11 @@ use tempfile::TempDir;
 const CELLD: &str = env!("CARGO_BIN_EXE_celld");
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How often the readiness probe looks, much shorter than `POLL_INTERVAL`: the
+/// time to the first response is a benchmark result, and a coarse probe adds up
+/// to its own interval to it, once for the announced port and once for the
+/// response.
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const START_ATTEMPTS: usize = 3;
 /// Path the fixtures answer without touching any state, so the readiness probe
 /// cannot change what a test counts.
@@ -259,7 +264,7 @@ impl Server {
             if Instant::now() >= deadline {
                 return Err("timed out waiting for the first response".into());
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
         }
     }
 
