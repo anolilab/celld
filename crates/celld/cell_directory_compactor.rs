@@ -20,7 +20,11 @@
 //! one of its stream is a segment the ledger does not name, and the next pass
 //! folds it.
 //!
-//! A pass that cannot read every unfolded segment folds nothing. The segments of
+//! A pass reads at most [`MAX_SEGMENTS_PER_PASS`] unfolded segments, and a
+//! segment it cannot read is left alone: not folded, not named by the ledger,
+//! so it is never deleted and stays in every reader's tail. A partition whose
+//! head is missing after the first pass is skipped and not recreated, which
+//! also holds back the ledger. The segments of
 //! different streams have no order beyond durability: where a birth and a
 //! tombstone of one cell meet in a pass, the birth wins, which errs toward
 //! `Exists`, the answer that costs only a listing. No production path writes a
@@ -55,6 +59,10 @@ const _: () = assert!(DELETE_GRACE_MS >= 2 * HEAD_TTL_MS);
 /// memory, and the base run of a partition is the largest.
 const PARTITION_CONCURRENCY: usize = 8;
 
+/// Segments one pass reads and folds. A pass holds their entries in memory, so
+/// a backlog is worked off over several passes, in key order.
+const MAX_SEGMENTS_PER_PASS: usize = 20_000;
+
 /// Partitions beside the touched ones whose retired runs a pass sweeps, so a
 /// partition that is never touched again still loses its old runs.
 const SWEEP_PARTITIONS: u32 = 64;
@@ -63,6 +71,8 @@ const SWEEP_PARTITIONS: u32 = 64;
 pub(crate) struct PassReport {
     pub segments_listed: usize,
     pub segments_folded: usize,
+    /// Segments left for a later pass because they could not be read.
+    pub segments_skipped: usize,
     pub partitions_merged: usize,
     pub partitions_lost: usize,
     pub partitions_failed: usize,
@@ -100,6 +110,9 @@ struct Pass<'a> {
     /// The clock at the start of the pass, which only ever delays a deletion.
     now_ms: u64,
     streams: &'a [String],
+    /// Whether the partitions have their heads. After that a missing head is
+    /// lost state, never an empty partition.
+    bootstrapped: bool,
     /// The highest segment read, per stream.
     read_through: &'a BTreeMap<String, u64>,
     /// Streams that have a segment in the listing.
@@ -114,6 +127,25 @@ pub(crate) async fn compact_pass(
     generation: &str,
     number: u64,
     clock: Clock<'_>,
+) -> anyhow::Result<PassReport> {
+    compact_pass_capped(
+        store,
+        prefix,
+        generation,
+        number,
+        clock,
+        MAX_SEGMENTS_PER_PASS,
+    )
+    .await
+}
+
+async fn compact_pass_capped(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    generation: &str,
+    number: u64,
+    clock: Clock<'_>,
+    max_segments: usize,
 ) -> anyhow::Result<PassReport> {
     let now_ms = clock();
     let mut report = PassReport::default();
@@ -159,12 +191,23 @@ pub(crate) async fn compact_pass(
     let mut read_through: BTreeMap<String, u64> = BTreeMap::new();
     let mut by_partition: BTreeMap<u16, Vec<(u64, Op)>> = BTreeMap::new();
     let mut read_keys: Vec<String> = Vec::new();
-    report.segments_folded = unfolded.len();
+    unfolded.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+    unfolded.truncate(max_segments);
     let mut reads = futures_util::stream::iter(unfolded)
         .map(|item| read_unfolded(store, item))
         .buffer_unordered(SEGMENT_READS);
     while let Some(read) = reads.next().await {
-        let (item, ops) = read?;
+        let (item, ops) = match read {
+            Ok(read) => read,
+            Err((key, error)) => {
+                // Not folded and not named by the ledger, so it is neither
+                // deleted nor missing from a reader's tail.
+                tracing::warn!(%error, %key, "cell directory segment skipped");
+                report.segments_skipped += 1;
+                continue;
+            }
+        };
+        report.segments_folded += 1;
         read_keys.push(item.key.clone());
         let stream = *stream_ids.entry(item.stream.clone()).or_insert_with(|| {
             streams.push(item.stream.clone());
@@ -195,6 +238,7 @@ pub(crate) async fn compact_pass(
         clock,
         now_ms,
         streams: &streams,
+        bootstrapped: ledger_version.is_some(),
         read_through: &read_through,
         live: &live,
     };
@@ -266,9 +310,11 @@ pub(crate) async fn compact_pass(
 async fn read_unfolded(
     store: &dyn ObjectStore,
     item: Listed,
-) -> anyhow::Result<(Listed, Vec<(Kind, String)>)> {
-    let ops = read_segment(store, &item.location).await?;
-    Ok((item, ops))
+) -> Result<(Listed, Vec<(Kind, String)>), (String, anyhow::Error)> {
+    match read_segment(store, &item.location).await {
+        Ok(ops) => Ok((item, ops)),
+        Err(error) => Err((item.key, error)),
+    }
 }
 
 async fn create_empty_head(
@@ -339,6 +385,11 @@ impl Pass<'_> {
     async fn try_merge(&self, partition: u16, ops: Vec<(u64, Op)>) -> anyhow::Result<Outcome> {
         let (head, version) = match read_head(self.store, self.prefix, partition).await? {
             Some(read) => (read.value, Some(read.version)),
+            None if self.bootstrapped => {
+                // Recreating it would drop every registration it held.
+                tracing::warn!(partition, "cell directory head is missing; not recreated");
+                return Ok(Outcome::Failed);
+            }
             None => (Head::default(), None),
         };
         let mut winners: HashMap<u64, Op> = HashMap::new();
@@ -574,54 +625,70 @@ impl Pass<'_> {
 /// takes that, and only a node that runs the directory compacts.
 pub(crate) const LEASE_KEY: &str = "fleet/dir/compactor-lease";
 
-/// Compact every [`COMPACT_INTERVAL`] on the node that holds the compactor
-/// lease, until `stop` ends the loop. The lease only spares the other nodes the
-/// work: the conditional writes keep two compactors from corrupting each other.
+/// Compact every `interval`, asking for the lease every `tick_ms`, on the node that holds the compactor lease, until
+/// `stop` ends the loop. The lease is held across the whole loop, so no other
+/// node's timer finds it free between passes; a node without it asks again
+/// every tick. It only spares the other nodes the work: the conditional writes
+/// keep two compactors from corrupting each other.
 pub(crate) async fn run_compactor(
     store: std::sync::Arc<dyn ObjectStore>,
     prefix: String,
     lease: crate::bucket::Bucket,
     node: String,
     generation: String,
-    tick_ms: u64,
+    (tick_ms, interval): (u64, Duration),
     stop: crate::ltx_repl::StopToken,
 ) {
     let mut number = 0_u64;
     loop {
-        crate::asyncrt::select_biased! {
-            "a stop request wins a tie with the timer, so shutdown never waits a period";
-            _ = stop.stopped() => return,
-            _ = crate::asyncrt::sleep(COMPACT_INTERVAL) => {}
-        }
-        number += 1;
-        let pass = crate::wake::while_holding_lease(
+        let compacting = async {
+            loop {
+                crate::asyncrt::select_biased! {
+                    "a stop request wins a tie with the timer, so shutdown never waits a period";
+                    _ = stop.stopped() => return,
+                    _ = crate::asyncrt::sleep(interval) => {}
+                }
+                number += 1;
+                crate::asyncrt::select_biased! {
+                    "a stop request ends a pass in flight, so shutdown never waits on one";
+                    _ = stop.stopped() => return,
+                    outcome = compact_pass(
+                        store.as_ref(),
+                        &prefix,
+                        &generation,
+                        number,
+                        &crate::ownership_store::now_ms,
+                    ) => match outcome {
+                        Ok(report) => tracing::info!(
+                            event = "cell_directory_compaction",
+                            ?report,
+                            "cell directory compaction pass finished"
+                        ),
+                        Err(error) => {
+                            tracing::warn!(%error, "cell directory compaction pass failed")
+                        }
+                    }
+                }
+            }
+        };
+        if crate::wake::while_holding_lease(
             &lease,
             LEASE_KEY,
             &node,
             tick_ms,
             "cell directory compaction",
-            compact_pass(
-                store.as_ref(),
-                &prefix,
-                &generation,
-                number,
-                &crate::ownership_store::now_ms,
-            ),
-        );
+            compacting,
+        )
+        .await
+        .is_some()
+        {
+            return;
+        }
+        tracing::debug!("another node compacts the cell directory");
         crate::asyncrt::select_biased! {
-            "a stop request ends a pass in flight, so shutdown never waits on one";
+            "a stop request wins a tie with the timer, so shutdown never waits a tick";
             _ = stop.stopped() => return,
-            outcome = pass => match outcome {
-                None => tracing::debug!("another node compacts the cell directory"),
-                Some(Ok(report)) => tracing::info!(
-                    event = "cell_directory_compaction",
-                    ?report,
-                    "cell directory compaction pass finished"
-                ),
-                Some(Err(error)) => {
-                    tracing::warn!(%error, "cell directory compaction pass failed")
-                }
-            }
+            _ = crate::asyncrt::sleep(Duration::from_millis(tick_ms)) => {}
         }
     }
 }

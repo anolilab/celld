@@ -1397,7 +1397,13 @@ impl LtxRepl {
             replicator.tasks.spawn_owned(
                 "cell_directory_compactor",
                 crate::cell_directory_compactor::run_compactor(
-                    store, prefix, lease, node, generation, tick_ms, stop,
+                    store,
+                    prefix,
+                    lease,
+                    node,
+                    generation,
+                    (tick_ms, crate::cell_directory_compactor::COMPACT_INTERVAL),
+                    stop,
                 ),
             );
         }

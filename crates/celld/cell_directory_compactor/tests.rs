@@ -10,6 +10,7 @@ use object_store::PutPayload;
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 const PREFIX: &str = "fleet-a/";
 const GEN: &str = "gen-c";
@@ -209,7 +210,7 @@ async fn a_pass_that_loses_a_head_race_skips_the_partition_and_deletes_nothing()
 }
 
 #[tokio::test]
-async fn a_segment_that_cannot_be_read_stops_the_whole_pass() {
+async fn a_segment_that_cannot_be_read_is_skipped_and_never_deleted() {
     let store = Arc::new(Counting::default());
     let a = node(&store, "node-a", "gen1");
     a.write_ltx("c1").await;
@@ -221,11 +222,19 @@ async fn a_segment_that_cannot_be_read_stops_the_whole_pass() {
         )
         .await
         .unwrap();
-    compact_pass(store.as_ref(), PREFIX, GEN, 1, &|| 1_000)
-        .await
-        .expect_err("a corrupt segment is an error");
-    assert!(keys(&store, "fleet-a/fleet/dir").await.is_empty());
-    assert_eq!(segments(&store).await.len(), 2);
+    let report = pass(&store, 1, 1_000).await;
+    assert_eq!((report.segments_folded, report.segments_skipped), (1, 1));
+    pass(&store, 2, 1_000 + DELETE_GRACE_MS).await;
+    pass(&store, 3, 1_000 + 2 * DELETE_GRACE_MS).await;
+    assert_eq!(
+        segments(&store).await,
+        vec!["fleet-a/fleet/born/node-b/g9/00000000".to_owned()]
+    );
+    let ledger = read_ledger(store.as_ref(), PREFIX).await.unwrap().unwrap();
+    assert!(!ledger
+        .value
+        .segments
+        .contains_key("fleet-a/fleet/born/node-b/g9/00000000"));
 }
 
 #[tokio::test]
@@ -673,4 +682,101 @@ async fn a_run_no_head_names_is_deleted_once_it_is_older_than_the_grace() {
     assert!(!has_orphan(runs().await));
     let reader = a.fresh_reader(10).await;
     assert_eq!(reader.lookup("c1", 11).await, DirectoryAnswer::Exists);
+}
+
+#[tokio::test]
+async fn a_head_that_went_missing_is_not_recreated_and_holds_the_ledger_back() {
+    let store = Arc::new(Counting::default());
+    let a = node(&store, "node-a", "gen1");
+    let cells = cells_in_partition(partition_of(fingerprint("seed")), 2);
+    a.write_ltx(&cells[0]).await;
+    pass(&store, 1, 1_000).await;
+    let partition = partition_of(fingerprint(&cells[0]));
+    store
+        .inner
+        .delete(&Path::from(head_key(PREFIX, partition)))
+        .await
+        .unwrap();
+    a.write_ltx(&cells[1]).await;
+    let report = pass(&store, 2, 2_000).await;
+    assert_eq!(report.partitions_failed, 1, "{report:?}");
+    assert!(read_head(store.as_ref(), PREFIX, partition)
+        .await
+        .unwrap()
+        .is_none());
+    // Nothing the pass read is deleted, however late: the new segment is
+    // still in the tail, and the lost head stays doubt.
+    pass(&store, 3, 2_000 + 10 * DELETE_GRACE_MS).await;
+    assert_eq!(segments(&store).await.len(), 1);
+    let reader = a.fresh_reader(10).await;
+    assert_eq!(reader.lookup(&cells[1], 11).await, DirectoryAnswer::Exists);
+    assert_eq!(reader.lookup(&cells[0], 11).await, DirectoryAnswer::Unknown);
+}
+
+#[tokio::test]
+async fn a_pass_folds_at_most_its_cap_of_segments_in_key_order() {
+    let store = Arc::new(Counting::default());
+    let a = node(&store, "node-a", "gen1");
+    for seq in 0..5 {
+        put_segment(
+            &store,
+            &format!("node-b/g9/{seq:08}"),
+            format!("c{seq}\n").as_bytes(),
+        )
+        .await;
+    }
+    let report = compact_pass_capped(store.as_ref(), PREFIX, GEN, 1, &|| 1_000, 2)
+        .await
+        .unwrap();
+    assert_eq!(report.segments_folded, 2);
+    let mut deleted = 0;
+    for number in 2..8 {
+        let report = compact_pass_capped(
+            store.as_ref(),
+            PREFIX,
+            GEN,
+            number,
+            &|| 1_000 + number * DELETE_GRACE_MS,
+            2,
+        )
+        .await
+        .unwrap();
+        deleted += report.segments_deleted;
+    }
+    assert_eq!(deleted, 5);
+    let reader = a.fresh_reader(10).await;
+    for seq in 0..5 {
+        assert_eq!(
+            reader.lookup(&format!("c{seq}"), 11).await,
+            DirectoryAnswer::Exists
+        );
+    }
+}
+
+#[test]
+fn the_compactor_lease_is_held_between_passes() {
+    use crate::bucket::Bucket;
+    use crate::wake::try_hold_lease;
+    crate::asyncrt::install_test_host_runtime().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+        let store = Arc::new(Counting::default());
+        let stop = crate::ltx_repl::StopToken::new();
+        let running = crate::asyncrt::spawn(run_compactor(
+            store.clone(),
+            PREFIX.to_owned(),
+            lease.clone(),
+            "node-a".to_owned(),
+            GEN.to_owned(),
+            (30, Duration::from_millis(10)),
+            stop.clone(),
+        ));
+        // Well past the lease's lifetime of three ticks, with passes between.
+        crate::asyncrt::sleep(Duration::from_millis(400)).await;
+        let now = crate::ownership_store::now_ms() as i64;
+        assert!(!try_hold_lease(&lease, LEASE_KEY, "node-b", now, 90).await);
+        assert!(store.lists.load(Ordering::SeqCst) > 1);
+        stop.request_stop();
+        running.await.unwrap();
+    });
 }
