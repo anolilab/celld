@@ -2228,7 +2228,7 @@ impl LtxRepl {
                 info!(
                     cell = options.cell,
                     epoch = options.epoch,
-                    %error,
+                    error = %format!("{error:#}"),
                     "a planned restore object was replaced; planning again"
                 );
                 self.activate_once(options, allow_paged).await
@@ -3291,27 +3291,29 @@ impl LtxRepl {
         let deadline = barrier_started_mono_ms.saturating_add(self.durability_timeout_ms);
         let mut artifact = None;
         let mut snapshot_end = None;
-        let mut snapshots_listed = Vec::new();
         if let Some(snapshot) = snapshot {
             let published = asyncrt::timeout_at(
                 deadline,
                 self.publish_handoff_snapshot(cell, epoch, &snapshot),
             )
             .await;
-            // The snapshot itself must be listed: a handoff that took it has
+            // The snapshot itself must be visible: a handoff that took it has
             // told the successor to restore that image, and the transaction
-            // alone would pass on an L0 object that holds it.
-            if matches!(published, Ok(Ok(()))) {
-                snapshots_listed = self
-                    .client_for(cell, epoch)
-                    .full_snapshots()
-                    .await
-                    .unwrap_or_default();
-            }
-            if snapshots_listed
-                .iter()
-                .any(|file| file.max_txid >= snapshot.max_txid)
-            {
+            // alone would pass on an L0 object that holds it. One HEAD of the
+            // key just written decides; only a HEAD that cannot decide falls
+            // back to listing the level.
+            let visible = if matches!(published, Ok(Ok(()))) {
+                let client = self.client_for(cell, epoch);
+                match client.has_full_snapshot(snapshot.max_txid).await {
+                    Ok(visible) => visible,
+                    Err(_) => client.full_snapshots().await.is_ok_and(|files| {
+                        files.iter().any(|file| file.max_txid >= snapshot.max_txid)
+                    }),
+                }
+            } else {
+                false
+            };
+            if visible {
                 // The snapshot is a per-cell object through its txid, so it
                 // covers every fleet-acked row of this closed database. No
                 // later sync or bundle flush credits a removed handle, so
@@ -3376,8 +3378,7 @@ impl LtxRepl {
             _ => retained,
         };
         if let Some(end) = snapshot_end {
-            self.prune_superseded_snapshots(cell, epoch, &snapshots_listed, end)
-                .await;
+            self.prune_superseded_snapshots(cell, epoch, end);
         }
 
         // Keep the local Db until one authoritative restore artifact is
@@ -3611,59 +3612,27 @@ impl LtxRepl {
     /// Delete the snapshots of an epoch that a newer one has replaced, when
     /// epoch GC is on, by its grace. An epoch that is reopened after each
     /// eviction otherwise gains a full image per eviction that nothing removes
-    /// while the epoch lives. `listed` holds the snapshots the confirm saw, and
-    /// a failure only costs the bytes until the next eviction.
-    async fn prune_superseded_snapshots(
-        &self,
-        cell: &str,
-        epoch: u64,
-        listed: &[celld_ltx::FileInfo],
-        confirmed: u64,
-    ) {
+    /// while the epoch lives.
+    ///
+    /// The cleanup runs on its own task, detached: it is best effort, so it
+    /// must not delay the stop that is closing the cell, and a bucket that
+    /// stalls its delete costs only the bytes until the next eviction.
+    fn prune_superseded_snapshots(&self, cell: &str, epoch: u64, confirmed: u64) {
         let Some(grace_ms) = self.epoch_gc_grace_ms else {
             return;
         };
-        let now_ms = asyncrt::wall_ms().max(0) as u64;
-        let snapshots: Vec<_> = listed
-            .iter()
-            .map(|file| celld_logic::epoch_gc::ListedSnapshot {
-                end: file.max_txid.0,
-                // A file with no upload time is taken to be new.
-                uploaded_ms: file
-                    .created_at
-                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(now_ms, |age| age.as_millis() as u64),
-            })
-            .collect();
-        let ends =
-            celld_logic::epoch_gc::superseded_snapshots(&snapshots, confirmed, now_ms, grace_ms);
-        if ends.is_empty() {
+        if self.stop.is_stopped() {
             return;
         }
-        let victims: Vec<celld_ltx::FileInfo> = listed
-            .iter()
-            .filter(|file| ends.contains(&file.max_txid.0))
-            .cloned()
-            .collect();
-        match self
-            .client_for(cell, epoch)
-            .delete_ltx_files(&victims)
-            .await
-        {
-            Ok(()) => info!(
-                event = "superseded_snapshots_deleted",
-                cell,
-                epoch,
-                deleted = victims.len(),
-                "deleted the snapshots that a newer one replaced"
-            ),
-            Err(error) => warn!(
-                cell,
-                epoch,
-                %error,
-                "delete the superseded snapshots failed; they stay until the next eviction"
-            ),
-        }
+        let client = self.client_for(cell, epoch);
+        asyncrt::spawn(prune_snapshots(
+            client,
+            cell.to_string(),
+            epoch,
+            confirmed,
+            grace_ms,
+        ))
+        .detach();
     }
 
     /// Capture one full snapshot after the runtime closes.
@@ -5356,6 +5325,61 @@ fn node_config(
         skip_verify: false,
         part_size: 0,
         timestamp_metadata_key: TimestampMetadataKey::default(),
+    }
+}
+
+/// Delete the snapshots of an epoch that a newer one has replaced, as far as
+/// `superseded_snapshots` allows. A failure only costs the bytes until the next
+/// eviction.
+async fn prune_snapshots(
+    client: ObjectStoreClient,
+    cell: String,
+    epoch: u64,
+    confirmed: u64,
+    grace_ms: u64,
+) {
+    let listed = match client.full_snapshots().await {
+        Ok(listed) => listed,
+        Err(error) => {
+            warn!(%cell, epoch, %error, "list the superseded snapshots failed; they stay until the next eviction");
+            return;
+        }
+    };
+    let now_ms = asyncrt::wall_ms().max(0) as u64;
+    let snapshots: Vec<_> = listed
+        .iter()
+        .map(|file| celld_logic::epoch_gc::ListedSnapshot {
+            end: file.max_txid.0,
+            // A file with no upload time is taken to be new.
+            uploaded_ms: file
+                .created_at
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(now_ms, |age| age.as_millis() as u64),
+        })
+        .collect();
+    let ends = celld_logic::epoch_gc::superseded_snapshots(&snapshots, confirmed, now_ms, grace_ms);
+    if ends.is_empty() {
+        return;
+    }
+    let victims: Vec<celld_ltx::FileInfo> = listed
+        .iter()
+        .filter(|file| ends.contains(&file.max_txid.0))
+        .cloned()
+        .collect();
+    match client.delete_ltx_files(&victims).await {
+        Ok(()) => info!(
+            event = "superseded_snapshots_deleted",
+            %cell,
+            epoch,
+            deleted = victims.len(),
+            "deleted the snapshots that a newer one replaced"
+        ),
+        Err(error) => warn!(
+            %cell,
+            epoch,
+            %error,
+            "delete the superseded snapshots failed; they stay until the next eviction"
+        ),
     }
 }
 

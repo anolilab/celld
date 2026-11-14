@@ -146,9 +146,8 @@ fn the_confirm_walks_the_epoch_for_a_file_longer_than_its_window() {
     });
 }
 
-/// Evict a cell twice at one epoch, writing a row in between, and answer the
-/// snapshot objects the bucket holds after the second eviction.
-async fn snapshots_after_two_evictions(rig: &Rig) -> Vec<(u64, u64)> {
+/// Evict a cell twice at one epoch, writing a row in between.
+async fn two_evictions(rig: &Rig) {
     first_lifetime(rig).await;
     rig.ltx
         .evict(CELL, 1, Retained::Resumable, None)
@@ -164,7 +163,42 @@ async fn snapshots_after_two_evictions(rig: &Rig) -> Vec<(u64, u64)> {
         .evict(CELL, 1, Retained::Resumable, None)
         .await
         .expect("second eviction");
+}
+
+async fn snapshots(rig: &Rig) -> Vec<(u64, u64)> {
     level(rig, 1, replica::SNAPSHOT_LEVEL).await
+}
+
+#[test]
+fn an_eviction_confirms_its_snapshot_with_one_head_and_lists_no_snapshot_level() {
+    run(async {
+        let rig = rig_with_retention(None);
+        first_lifetime(&rig).await;
+        rig.ltx
+            .evict(CELL, 1, Retained::Resumable, None)
+            .await
+            .expect("first eviction");
+        let resumed = rig
+            .ltx
+            .activate(options(1, false, true))
+            .await
+            .expect("resume");
+        write(&resumed.path, "INSERT INTO t VALUES (2);");
+        let listings = || {
+            (
+                rig.store.lists.load(Ordering::SeqCst),
+                rig.store.offset_lists.load(Ordering::SeqCst),
+            )
+        };
+        let before = listings();
+
+        rig.ltx
+            .evict(CELL, 1, Retained::Resumable, None)
+            .await
+            .expect("second eviction");
+
+        assert_eq!(listings(), before);
+    });
 }
 
 #[test]
@@ -172,7 +206,18 @@ fn an_eviction_deletes_the_snapshot_a_newer_one_replaced_once_the_grace_has_pass
     run(async {
         let rig = rig_with_retention(Some(0));
 
-        assert_eq!(snapshots_after_two_evictions(&rig).await, [(1, 2)]);
+        two_evictions(&rig).await;
+
+        // The cleanup runs on its own task, so the deletion is awaited.
+        let mut left = snapshots(&rig).await;
+        for _ in 0..300 {
+            if left == [(1, 2)] {
+                break;
+            }
+            asyncrt::sleep(Duration::from_millis(10)).await;
+            left = snapshots(&rig).await;
+        }
+        assert_eq!(left, [(1, 2)]);
 
         // The newest snapshot is the whole database.
         let restored = rig
@@ -186,11 +231,51 @@ fn an_eviction_deletes_the_snapshot_a_newer_one_replaced_once_the_grace_has_pass
 }
 
 #[test]
-fn an_eviction_keeps_a_replaced_snapshot_inside_the_grace() {
+fn an_eviction_completes_while_the_bucket_stalls_the_snapshot_cleanup() {
+    run(async {
+        let rig = rig_with_retention(Some(0));
+        first_lifetime(&rig).await;
+        rig.ltx
+            .evict(CELL, 1, Retained::Resumable, None)
+            .await
+            .expect("first eviction");
+        let resumed = rig
+            .ltx
+            .activate(options(1, false, true))
+            .await
+            .expect("resume");
+        write(&resumed.path, "INSERT INTO t VALUES (2);");
+
+        rig.store.hanging_deletes.store(true, Ordering::SeqCst);
+        asyncrt::timeout(
+            Duration::from_secs(5),
+            rig.ltx.evict(CELL, 1, Retained::Resumable, None),
+        )
+        .await
+        .expect("the eviction waited for the cleanup")
+        .expect("second eviction");
+
+        // The stop finished: the database is retained for the next wake.
+        assert!(evicted(&rig, 1).is_file());
+    });
+}
+
+#[test]
+fn a_replaced_snapshot_stays_inside_the_grace() {
     run(async {
         let rig = rig_with_retention(Some(3_600_000));
+        two_evictions(&rig).await;
 
-        assert_eq!(snapshots_after_two_evictions(&rig).await, [(1, 1), (1, 2)]);
+        prune_snapshots(
+            rig.ltx.client_for(CELL, 1),
+            CELL.to_string(),
+            1,
+            2,
+            3_600_000,
+        )
+        .await;
+
+        assert_eq!(snapshots(&rig).await, [(1, 1), (1, 2)]);
     });
 }
 
@@ -199,6 +284,8 @@ fn an_eviction_keeps_every_snapshot_while_epoch_gc_is_off() {
     run(async {
         let rig = rig_with_retention(None);
 
-        assert_eq!(snapshots_after_two_evictions(&rig).await, [(1, 1), (1, 2)]);
+        two_evictions(&rig).await;
+
+        assert_eq!(snapshots(&rig).await, [(1, 1), (1, 2)]);
     });
 }

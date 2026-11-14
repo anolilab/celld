@@ -165,8 +165,9 @@ pub struct Config {
     /// the cell's database and its LTX metadata on this node, so a wake on this
     /// node resumes at the same epoch with neither an owner read nor an epoch
     /// claim. That covers idle evictions and the room and pressure evictions
-    /// that keep ownership (`OwnershipOnEvict::Sticky`), keyed on the same flag
-    /// as the stop's `preserve_local`. The host keeps files and no open
+    /// that keep ownership (`OwnershipOnEvict::Sticky`). The actor maps
+    /// `rebalance` and this option onto `Retained::Resumable` in
+    /// `StopMode::Evict`. The host keeps files and no open
     /// handle, so a room eviction pins neither a descriptor nor page cache.
     /// A host that cannot reopen what it kept fails the restore, and the core
     /// claims the next epoch in the same wake: a cell whose metadata is gone

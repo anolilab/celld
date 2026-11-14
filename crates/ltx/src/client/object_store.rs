@@ -766,6 +766,19 @@ impl ObjectStoreClient {
         Ok(false)
     }
 
+    /// Whether the epoch holds the full snapshot that ends at `txid`, by one
+    /// HEAD of its key.
+    pub async fn has_full_snapshot(&self, txid: TXID) -> Result<bool> {
+        let store = self.store().await?;
+        let key =
+            ObjPath::from(self.ltx_key(crate::compaction_level::SNAPSHOT_LEVEL, TXID(1), txid));
+        match store.head(&key).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(map_os_error(error)),
+        }
+    }
+
     /// The epoch's full snapshots, oldest first: the objects at the snapshot
     /// level that start at transaction 1.
     pub async fn full_snapshots(&self) -> Result<Vec<FileInfo>> {

@@ -351,6 +351,8 @@ pub(crate) mod testing {
         pub dropping_puts: AtomicBool,
         /// Every request fails, as in a bucket outage.
         pub down: AtomicBool,
+        /// A delete never answers, as when the bucket stalls it.
+        pub hanging_deletes: AtomicBool,
         /// Changes the bucket the first time a key is read, as another node
         /// does between a listing and the read that follows it.
         pub swap_on_first_get: std::sync::Mutex<Option<Swap>>,
@@ -530,6 +532,9 @@ pub(crate) mod testing {
             locations: BoxStream<'static, object_store::Result<Path>>,
         ) -> BoxStream<'static, object_store::Result<Path>> {
             self.requests.fetch_add(1, Ordering::SeqCst);
+            if self.hanging_deletes.load(Ordering::SeqCst) {
+                return futures_util::stream::pending().boxed();
+            }
             self.inner.delete_stream(locations)
         }
 
