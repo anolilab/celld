@@ -10,6 +10,69 @@
 use super::*;
 pub use crate::ws_registry::*;
 
+/// Who is asking, from the running event and not from an argument the script
+/// supplies: the cell whose event runs (empty for a Worker request) and the
+/// event's own identity. A facet's event names the facet, which is also the
+/// scope its sockets register under.
+pub(super) fn ws_caller(scope: &mut v8::PinScope) -> WsCaller {
+    let context = event_context(scope);
+    let cell = current_cell_event(&context)
+        .map(|frame| frame.storage)
+        .unwrap_or_default();
+    WsCaller {
+        cell,
+        owner: context.owner_id(),
+    }
+}
+
+/// Refuse a socket id the caller does not own. Throws and returns `false`.
+fn ws_authorize(scope: &mut v8::PinScope, id: u64) -> bool {
+    let caller = ws_caller(scope);
+    if ws_registry().lock().unwrap().may_use(&caller, id) {
+        return true;
+    }
+    loader_throw(
+        scope,
+        "WebSocket belongs to another request or Durable Object",
+    );
+    false
+}
+
+/// Refuse an id the caller may not take for its own. A socket the registry
+/// knows must answer the caller; one it does not know yet must have been
+/// allocated by the caller's own event. Throws and returns `false`.
+fn ws_claim(scope: &mut v8::PinScope, id: u64) -> bool {
+    let context = event_context(scope);
+    let caller = ws_caller(scope);
+    let allocated = context.allocated_sockets.lock().unwrap().contains(&id);
+    if ws_registry()
+        .lock()
+        .unwrap()
+        .may_claim(&caller, id, allocated)
+    {
+        return true;
+    }
+    loader_throw(
+        scope,
+        "WebSocket belongs to another request or Durable Object",
+    );
+    false
+}
+
+/// Refuse a cell argument that is not the cell whose event is running. The
+/// argument crosses application JavaScript, so it names a cell only when the
+/// host agrees. Throws and returns `false`.
+fn ws_own_cell(scope: &mut v8::PinScope, cell: &str) -> bool {
+    if ws_caller(scope).cell == cell {
+        return true;
+    }
+    loader_throw(
+        scope,
+        "WebSocket operation names a cell other than the running one",
+    );
+    false
+}
+
 #[derive(Default)]
 pub(super) struct WsCapture {
     frames: WsBatch,
@@ -19,7 +82,8 @@ pub(super) struct WsCapture {
     promise: Option<v8::Global<v8::Promise>>,
 }
 
-fn prepare_worker_websocket_handoff(id: u64) {
+fn prepare_worker_websocket_handoff(id: u64, owner: u64) {
+    ws_set_owner(id, owner);
     let (inbound, receiver) = ws_pull_channel();
     ws_pull_register(id, receiver);
     ws_register_outbound(id, "", None);
@@ -29,8 +93,19 @@ fn prepare_worker_websocket_handoff(id: u64) {
     drop(replaced);
 }
 
-pub(super) fn transfer_worker_websocket_handoff(id: u64) -> Option<WorkerWebSocket> {
-    let inbound = ws_registry().lock().unwrap().worker_handoffs.remove(&id)?;
+pub(super) fn transfer_worker_websocket_handoff(
+    caller: &WsCaller,
+    id: u64,
+) -> Option<WorkerWebSocket> {
+    let shared = ws_registry();
+    let mut registry = shared.lock().unwrap();
+    // The id comes back from application JavaScript, so a response can take
+    // only a handoff its own request prepared.
+    if !registry.may_use(caller, id) {
+        return None;
+    }
+    let inbound = registry.worker_handoffs.remove(&id)?;
+    drop(registry);
     // The response now owns cleanup. Transfer the frame channel and request
     // ownership together so request retirement cannot close a returned socket.
     current_context()
@@ -251,6 +326,9 @@ pub(super) fn op_ws_send(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
+    if !ws_authorize(scope, id) {
+        return;
+    }
     let data = args.get(1).to_rust_string_lossy(scope);
     ws_emit(&event_context(scope), id, WsOut::Text(data));
 }
@@ -264,6 +342,9 @@ pub(super) fn op_ws_send_binary(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
+    if !ws_authorize(scope, id) {
+        return;
+    }
     let data = view_bytes(args.get(1)).unwrap_or_default();
     ws_emit(&event_context(scope), id, WsOut::Binary(data));
 }
@@ -277,6 +358,9 @@ pub(super) fn op_ws_close(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
+    if !ws_authorize(scope, id) {
+        return;
+    }
     let code = args.get(1).uint32_value(scope).unwrap_or(1000) as u16;
     let reason = args.get(2).to_rust_string_lossy(scope);
     ws_emit(&event_context(scope), id, WsOut::Close(code, reason));
@@ -286,7 +370,13 @@ pub(super) fn op_ws_alloc(
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    rv.set(v8::Number::new(scope, ws_next_id() as f64).into());
+    let id = ws_next_id();
+    event_context(scope)
+        .allocated_sockets
+        .lock()
+        .unwrap()
+        .insert(id);
+    rv.set(v8::Number::new(scope, id as f64).into());
 }
 
 pub(super) fn op_ws_prepare_worker_handoff(
@@ -299,7 +389,12 @@ pub(super) fn op_ws_prepare_worker_handoff(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
-    prepare_worker_websocket_handoff(id);
+    // A fresh id belongs to no one, and this call makes it the caller's. An id
+    // that is already registered keeps its owner.
+    if !ws_claim(scope, id) {
+        return;
+    }
+    prepare_worker_websocket_handoff(id, ws_caller(scope).owner);
 }
 /// The facet record of an outbound socket that `cell` opens, when the running
 /// event belongs to a Durable Object facet.
@@ -367,6 +462,10 @@ pub(super) fn op_ws_upgrade(
         .map(|n| n.value() as u64)
         .unwrap_or(0);
     let cell = args.get(1).to_rust_string_lossy(scope);
+    if !ws_own_cell(scope, &cell) || !ws_claim(scope, id) {
+        return;
+    }
+    let owner = ws_caller(scope).owner;
     let facet = match dialing_facet(scope, &cell) {
         Ok(facet) => facet,
         Err(error) => return loader_throw(scope, &error),
@@ -393,6 +492,7 @@ pub(super) fn op_ws_upgrade(
         let (pull_tx, pull_rx) = ws_pull_channel();
         ws_pull_register(id, pull_rx);
         ws_track_request_socket(id);
+        ws_set_owner(id, owner);
         pull_tx
     });
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -452,7 +552,13 @@ pub(super) fn op_ws_next(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
-    let queue = ws_pull().lock().unwrap().get(&id).cloned();
+    // A socket the caller does not own reads as one that is not registered.
+    let queue = ws_registry()
+        .lock()
+        .unwrap()
+        .may_use(&ws_caller(scope), id)
+        .then(|| ws_pull().lock().unwrap().get(&id).cloned())
+        .flatten();
     let async_id = asyncrt::enqueue_io_context(async move {
         let Some(queue) = queue else {
             return Ok(WsPull::Close(1006, "socket is not registered".into(), false).encode());
@@ -493,6 +599,10 @@ pub(super) fn op_ws_connect(
         .map(|n| n.value() as u64)
         .unwrap_or(0);
     let cell = args.get(1).to_rust_string_lossy(scope);
+    if !ws_own_cell(scope, &cell) || !ws_claim(scope, id) {
+        return;
+    }
+    let owner = ws_caller(scope).owner;
     let facet = match dialing_facet(scope, &cell) {
         Ok(facet) => facet,
         Err(error) => return loader_throw(scope, &error),
@@ -514,6 +624,7 @@ pub(super) fn op_ws_connect(
         let (pull_tx, pull_rx) = ws_pull_channel();
         ws_pull_register(id, pull_rx);
         ws_track_request_socket(id);
+        ws_set_owner(id, owner);
         pull_tx
     });
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -573,6 +684,16 @@ pub(super) fn op_ws_bind_target(
     // accounted against the isolate holding it, exactly as `op_ws_connect`
     // accounts an outbound one.
     let cell = args.get(2).to_rust_string_lossy(scope);
+    // The target is a cell's socket, which this request may bind only if the
+    // host handed it this request as a response. The JSON crosses application
+    // JavaScript, so it proves nothing by itself.
+    let owner = ws_caller(scope).owner;
+    if !ws_own_cell(scope, &cell) || !ws_claim(scope, id) {
+        return;
+    }
+    if !ws_target_granted(&target, owner) {
+        return loader_throw(scope, "WebSocket target was not handed to this request");
+    }
     // The caller end's frames reach this isolate through its pull queue, so
     // they never route by `cell`. The record still matters: a facet that
     // stops closes its sockets by it, and this end would otherwise keep the
@@ -585,6 +706,7 @@ pub(super) fn op_ws_bind_target(
     ws_pull_register(id, pull_rx);
     if cell.is_empty() {
         ws_track_request_socket(id);
+        ws_set_owner(id, owner);
     }
     // Registered here, on the JS thread, so a frame sent between this op and
     // the pipe task buffers as a pending frame instead of being dropped for
@@ -635,6 +757,13 @@ pub(super) fn op_ws_accept(
         .map(|n| n.value() as u64)
         .unwrap_or(0);
     let cell = args.get(1).to_rust_string_lossy(scope);
+    if !ws_own_cell(scope, &cell) {
+        return;
+    }
+    // A socket another cell or request holds is not this cell's to accept.
+    if !ws_claim(scope, id) {
+        return;
+    }
     // Tags are how `state.getWebSockets(tag)` finds this socket again after a
     // hibernation, so a silent default accepted the socket untagged and the
     // Worker could not address it by tag; only a bare `getWebSockets()` still
@@ -690,6 +819,9 @@ pub(super) fn op_ws_accept_regular(
         .map(|n| n.value() as u64)
         .unwrap_or(0);
     let cell = args.get(1).to_rust_string_lossy(scope);
+    if !ws_own_cell(scope, &cell) || !ws_claim(scope, id) {
+        return;
+    }
     let inserted = {
         let registry = ws_registry();
         let mut registry = registry.lock().unwrap();
@@ -720,6 +852,9 @@ pub(super) fn op_ws_list(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    if !ws_own_cell(scope, &cell) {
+        return;
+    }
     let tag = args.get(1);
     let tag = if tag.is_undefined() || tag.is_null() {
         None
@@ -757,6 +892,9 @@ pub(super) fn op_ws_attachment_set(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
+    if !ws_authorize(scope, id) {
+        return;
+    }
     let Some(attachment) = view_bytes(args.get(1)) else {
         let message = v8::String::new(scope, "__ws_attachment_set expects bytes").unwrap();
         let exception = v8::Exception::type_error(scope, message);
@@ -774,6 +912,9 @@ pub(super) fn op_ws_auto_response_set(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    if !ws_own_cell(scope, &cell) {
+        return;
+    }
     let request = args.get(1);
     if request.is_null() || request.is_undefined() {
         ws_auto_responses().lock().unwrap().remove(&cell);
@@ -792,6 +933,9 @@ pub(super) fn op_ws_auto_response_get(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    if !ws_own_cell(scope, &cell) {
+        return;
+    }
     let pair = ws_auto_responses().lock().unwrap().get(&cell).cloned();
     let json = match pair {
         Some((request, response)) => serde_json::to_string(&[request, response]).unwrap(),
@@ -809,6 +953,9 @@ pub(super) fn op_ws_auto_response_ts(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
+    if !ws_authorize(scope, id) {
+        return;
+    }
     let stamped = ws_registry()
         .lock()
         .unwrap()

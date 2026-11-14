@@ -19,6 +19,7 @@ mod e2e {
     pub mod operator_token;
     pub mod ownership;
     pub mod runtime_pool;
+    pub mod sockets;
     pub mod version;
     pub mod webcrypto;
 }

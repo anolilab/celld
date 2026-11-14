@@ -301,6 +301,38 @@ does for any generation swap. The data, the cell scopes and the operator
 commands do not change, and nothing crosses nodes, so a rolling upgrade has no
 mixed-version window for this change.
 
+## Socket ownership
+
+A WebSocket or TCP socket answers only the party that opened it:
+
+- A Durable Object's WebSocket answers that object's events. Another object,
+  facet, or Worker request that holds its id cannot send on it, close it,
+  read its attachment, list it, or accept it.
+- A Worker's own WebSocket and every TCP socket answer the request that
+  opened them. Another request in the same isolate that writes the id on a
+  socket of its own gets an error: a read or write on a TCP socket of another
+  request fails as a closed socket, and a WebSocket operation throws.
+- A Worker can bind to a Durable Object's socket, or answer an upgrade with
+  one, only when celld handed that exact socket to the request as the response
+  of its own `stub.fetch()` or service-binding call. A changed scope or tunnel
+  is a different target.
+- An id that no socket holds yet can be taken only by the event that
+  allocated it.
+
+celld takes the caller's identity from the running event, never from an id or
+scope that the script passes. This matches Cloudflare, where a Worker cannot
+use an I/O object that another request created.
+
+### Upgrading: socket ids
+
+The next release (placeholder: the version that ships this note) enforces
+these rules. A Worker that opened a socket in one request and used it from
+another now fails; before, celld allowed it, and Cloudflare does not. Open the
+socket in the request that uses it. Nothing else changes: sockets a Durable
+Object accepts, sockets a Worker returns in a `101` response, and sockets a
+Worker obtains from a `stub.fetch()` upgrade work as before. The rules apply
+inside one process, so a rolling upgrade has no mixed-version window.
+
 ## Cell ownership
 
 Each cell is a SQLite database with one writer. An ownership epoch fences each

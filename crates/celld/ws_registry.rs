@@ -468,12 +468,28 @@ pub struct FacetSocket {
     /// that opening only, never a later one at the same scope.
     pub opening: u64,
 }
+/// Who is using a socket, as the host knows it: the cell whose event is
+/// running (empty for a Worker request) and the event's own identity.
+pub(crate) struct WsCaller {
+    pub(crate) cell: String,
+    pub(crate) owner: u64,
+}
+
 #[derive(Default)]
 #[doc(hidden)]
 pub struct WsRegistry {
     pub(crate) outputs: HashMap<u64, tokio::sync::mpsc::UnboundedSender<WsOut>>,
     pub metadata: HashMap<u64, WsMeta>,
     pub(crate) worker_handoffs: HashMap<u64, WsPullSender>,
+    /// The request that owns a Worker socket (one with no cell scope), keyed
+    /// by socket id. Recorded by the host where the isolate opens the socket,
+    /// never taken from an argument the script supplies.
+    owners: HashMap<u64, u64>,
+    /// The request a cell's socket was handed to as a response target, and
+    /// the whole target it was handed, keyed by the cell end's id and tunnel.
+    /// Only that request can bind to it or return it, and only as handed: the
+    /// scope and the tunnel cross application JavaScript like the id does.
+    grants: HashMap<(u64, Option<u64>), (u64, String)>,
 }
 impl WsRegistry {
     #[doc(hidden)]
@@ -488,7 +504,43 @@ impl WsRegistry {
 
     fn unregister(&mut self, id: u64) -> Option<WsMeta> {
         self.outputs.remove(&id);
+        self.owners.remove(&id);
+        self.grants.remove(&(id, None));
         self.metadata.remove(&id)
+    }
+
+    /// Whether the caller may act on socket `id`.
+    ///
+    /// A cell's socket answers that cell's events only. A Worker's socket
+    /// answers the request that opened it. An id the registry does not know
+    /// answers anyone, because nothing can come of it: no frame is delivered
+    /// and no state changes.
+    pub(crate) fn knows(&self, id: u64) -> bool {
+        self.metadata.contains_key(&id)
+            || self.owners.contains_key(&id)
+            || self.outputs.contains_key(&id)
+    }
+
+    /// Whether the caller may take socket `id` for its own: a socket the
+    /// registry knows must already answer the caller, and one it does not know
+    /// yet is the caller's only if the caller's own event allocated it.
+    pub(crate) fn may_claim(&self, caller: &WsCaller, id: u64, allocated: bool) -> bool {
+        if self.knows(id) {
+            self.may_use(caller, id)
+        } else {
+            allocated
+        }
+    }
+
+    pub(crate) fn may_use(&self, caller: &WsCaller, id: u64) -> bool {
+        match (self.metadata.get(&id), self.owners.get(&id)) {
+            (Some(meta), _) if !meta.scope.is_empty() => meta.scope == caller.cell,
+            (_, Some(owner)) => caller.cell.is_empty() && *owner == caller.owner,
+            // A Worker-scoped entry that no request claimed has no owner to
+            // answer to, so nobody does.
+            (Some(_), None) => false,
+            (None, None) => !self.outputs.contains_key(&id),
+        }
     }
 
     #[doc(hidden)]
@@ -700,6 +752,56 @@ pub fn ws_register_outbound(id: u64, scope: &str, facet: Option<FacetSocket>) {
         increment_regular_ws(scope);
     }
 }
+/// Record the request that owns the Worker socket `id`.
+pub(crate) fn ws_set_owner(id: u64, owner: u64) {
+    ws_registry().lock().unwrap().owners.insert(id, owner);
+}
+
+/// Record that the response target `id` was handed to `owner`.
+pub(crate) fn ws_grant_target(target: &WsTarget, owner: u64) {
+    ws_registry()
+        .lock()
+        .unwrap()
+        .grants
+        .insert((target.id, target.tunnel), (owner, target.scope.clone()));
+}
+
+/// Forget what a request was handed when the request ends.
+pub(crate) fn ws_revoke_grants(owner: u64) {
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    if !registry.grants.is_empty() {
+        registry.grants.retain(|_, (granted, _)| *granted != owner);
+    }
+}
+
+/// Whether `owner` was handed exactly the response target `target`.
+pub(crate) fn ws_target_granted(target: &WsTarget, owner: u64) -> bool {
+    ws_granted(&ws_registry().lock().unwrap(), target, owner)
+}
+
+fn ws_granted(registry: &WsRegistry, target: &WsTarget, owner: u64) -> bool {
+    registry
+        .grants
+        .get(&(target.id, target.tunnel))
+        .is_some_and(|(granted, scope)| *granted == owner && *scope == target.scope)
+}
+
+/// Whether the caller may answer with `target`: a cell returning a socket it
+/// accepted itself, or a request returning one the host handed it.
+pub(crate) fn ws_may_return_target(caller: &WsCaller, target: &WsTarget) -> bool {
+    let registry = ws_registry();
+    let registry = registry.lock().unwrap();
+    let own = !caller.cell.is_empty()
+        && target.tunnel.is_none()
+        && target.scope == caller.cell
+        && registry
+            .metadata
+            .get(&target.id)
+            .is_some_and(|meta| meta.scope == caller.cell);
+    own || ws_granted(&registry, target, caller.owner)
+}
+
 pub fn ws_unregister(id: u64) {
     let meta = ws_registry().lock().unwrap().unregister(id);
     if let Some(meta) = meta.filter(|meta| !meta.hibernatable) {

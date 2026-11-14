@@ -1,0 +1,15 @@
+{
+  "name": "sockets",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "durable_objects": {
+    "bindings": [
+      { "name": "CHAT", "class_name": "Chat" },
+      { "name": "PLAIN", "class_name": "Plain" },
+      { "name": "HOST", "class_name": "Host" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Chat", "Plain", "Host"] }]
+}
