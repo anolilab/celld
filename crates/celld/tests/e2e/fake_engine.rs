@@ -104,6 +104,8 @@ struct State {
     exec_delay: Option<Duration>,
     /// Hold the next inspect of an application container, before it names one.
     inspect_delay: Option<Duration>,
+    /// Hold the next kill of an application container, before it acts.
+    kill_delay: Option<Duration>,
     /// Answer 409 to the next removal of an app container, which the daemon
     /// does while another removal of it is in progress.
     delete_conflict: bool,
@@ -342,6 +344,12 @@ esac
         self.state.lock().unwrap().inspect_delay = Some(delay);
     }
 
+    /// Hold the next kill of an application container for `delay`, as a slow
+    /// daemon does, before it takes effect.
+    pub fn delay_next_kill(&self, delay: Duration) {
+        self.state.lock().unwrap().kill_delay = Some(delay);
+    }
+
     /// Remove every application container without the node asking, as an
     /// operator or a crashed daemon does.
     pub fn vanish(&self) {
@@ -495,6 +503,15 @@ async fn serve(stream: tokio::net::UnixStream, state: Arc<Mutex<State>>) {
         && request.path.ends_with("/json")
     {
         let delay = state.lock().unwrap().inspect_delay.take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
+    if request.method == "POST"
+        && request.path.starts_with("/containers/id-celld")
+        && request.path.ends_with("/kill")
+    {
+        let delay = state.lock().unwrap().kill_delay.take();
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
