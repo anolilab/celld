@@ -176,13 +176,19 @@ pub fn idle_window(spread: Duration, turn: Duration, turns: usize, min_wait: Dur
 /// The directory's key shape, with the partition count's digits masked.
 const DIRECTORY: &str = "fleet/dir/v#/";
 
+/// Whether `rest`, a path below the directory's root, is its segments: a segment,
+/// or the bare prefix the compactor lists them by.
+fn segments(rest: &str) -> bool {
+    rest == "born" || rest.starts_with("born/")
+}
+
 /// Whether a request is one of the cell directory's segments: a batch delete of
 /// them is named for them too.
 pub fn born(shape: &str) -> bool {
     shape
         .trim_start_matches("(batch) ")
         .strip_prefix(DIRECTORY)
-        .is_some_and(|rest| rest.starts_with("born/"))
+        .is_some_and(segments)
 }
 
 /// Whether a request is one of the cell directory's heads, runs, ledger, marker
@@ -191,7 +197,7 @@ pub fn runs(shape: &str) -> bool {
     shape
         .trim_start_matches("(batch) ")
         .strip_prefix(DIRECTORY)
-        .is_some_and(|rest| !rest.starts_with("born/"))
+        .is_some_and(|rest| !segments(rest))
 }
 
 /// The cell directory's requests in `load`, by class, nothing subtracted. With

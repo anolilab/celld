@@ -155,6 +155,21 @@ fn with_agents_the_directory_requests_are_per_agent() {
 }
 
 #[test]
+fn the_compactors_listing_of_the_segments_counts_as_segments_not_runs() {
+    let mut load = Tally::new();
+    let mut add = |kind: &str, key: &str, count: u64| {
+        load.insert((kind.to_owned(), key.to_owned(), Part::Shared), count);
+    };
+    // The compactor lists the segments by their bare prefix, and each
+    // partition's runs by theirs.
+    add("LIST", "fleet/dir/v#/born", 8);
+    add("LIST", "fleet/dir/v#/#/run", 4);
+    let requests = directory_requests(&load, 4, 2.0);
+    assert_eq!(requests["segments_class_a_per_agent"], 2.0);
+    assert_eq!(requests["runs_class_a_per_agent"], 1.0);
+}
+
+#[test]
 fn without_agents_the_directory_requests_are_per_node_hour_not_per_agent() {
     let requests = directory_requests(&directory_load(), 0, 2.0);
     assert_eq!(requests["segments_class_a_per_node_hour"], 6.0);

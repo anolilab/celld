@@ -158,8 +158,11 @@ impl Own {
 #[derive(Debug, Default)]
 struct MarkerView {
     marker: Option<Marker>,
-    /// When the node last read it, for the cache.
+    /// When the node last read the marker, or found there was none.
     read_ms: Option<u64>,
+    /// When the node last tried to read it, for the cache: a read that failed
+    /// counts, and changes nothing else.
+    attempted_ms: Option<u64>,
     /// A time on the node's clock before which the marker was not published: the
     /// node's last read that still returned the marker before it. `None` for a
     /// marker the node saw first, or after a read that found none.
@@ -264,33 +267,39 @@ impl CellDirectory {
     }
 
     /// The marker with the time it is known to be no older than, from the cache
-    /// while it is younger than [`MARKER_TTL_MS`]. One that is missing or
-    /// unreadable is `None`, and cached like any other so a node without a
-    /// compactor does not read it per lookup. A read that finds a marker other
-    /// than the last dates it from the read before, and releases the own
-    /// registrations it covers.
+    /// while the last attempt is younger than [`MARKER_TTL_MS`]. One that is
+    /// missing is `None`, and cached like any other so a node without a
+    /// compactor does not read it per lookup. A read that fails leaves the
+    /// marker and its age as they were, so a bucket error does not discard what
+    /// the node knows, and the marker ages out on its own if the errors last. A
+    /// read that finds a marker other than the last dates it from the read
+    /// before, and releases the own registrations it covers.
     async fn marker(&self, now_ms: u64) -> Option<(Marker, Option<u64>)> {
         let mut view = self.marker.lock().await;
-        if !view_is_fresh(view.read_ms, now_ms, MARKER_TTL_MS) {
-            let read = match read_marker(self.store.as_ref(), &self.prefix).await {
-                Ok(read) => read,
+        if !view_is_fresh(view.attempted_ms, now_ms, MARKER_TTL_MS) {
+            view.attempted_ms = Some(now_ms);
+            match read_marker(self.store.as_ref(), &self.prefix).await {
+                Ok(read) => self.observe(&mut view, now_ms, read),
                 Err(error) => {
-                    tracing::debug!(%error, "cell directory marker unreadable");
-                    None
+                    tracing::warn!(%error, "cell directory marker unreadable; keeping the last one");
                 }
-            };
-            view.anchor_ms = match (&view.marker, &read) {
-                (Some(last), Some(read)) if same_marker(last, read) => view.anchor_ms,
-                (Some(_), Some(_)) => view.read_ms,
-                _ => None,
-            };
-            view.read_ms = Some(now_ms);
-            view.marker = read;
-            if let (Some(marker), Some(anchor_ms)) = (&view.marker, view.anchor_ms) {
-                self.release_covered(anchor_ms, marker.oldest_unfolded_age_ms);
             }
         }
         view.marker.clone().map(|marker| (marker, view.anchor_ms))
+    }
+
+    /// Take a marker read, or the finding that there is none, into the view.
+    fn observe(&self, view: &mut MarkerView, now_ms: u64, read: Option<Marker>) {
+        view.anchor_ms = match (&view.marker, &read) {
+            (Some(last), Some(read)) if same_marker(last, read) => view.anchor_ms,
+            (Some(_), Some(_)) => view.read_ms,
+            _ => None,
+        };
+        view.read_ms = Some(now_ms);
+        view.marker = read;
+        if let (Some(marker), Some(anchor_ms)) = (&view.marker, view.anchor_ms) {
+            self.release_covered(anchor_ms, marker.oldest_unfolded_age_ms);
+        }
     }
 
     fn release_covered(&self, anchor_ms: u64, oldest_unfolded_age_ms: u64) {
@@ -626,15 +635,58 @@ mod tests {
         put_segment(&inner, &key, &encode_json(&marker)).await;
         let reader = directory_over(&inner);
         assert_eq!(reader.lookup(&other, 10).await, DirectoryAnswer::Unknown);
-        // A marker that was readable and then is not has no age to count from.
+    }
+
+    #[tokio::test]
+    async fn a_failed_marker_read_keeps_the_last_marker_and_its_age() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("old"));
+        write_head(&inner, partition, &["old"], "l2").await;
+        let other = a_cell_in(partition, "old");
         let reader = directory_over(&inner);
         observe_a_change(&inner, &reader).await;
+        assert_eq!(
+            reader.lookup(&other, MARKER_TTL_MS + 2).await,
+            DirectoryAnswer::New
+        );
+
+        // The marker can not be read now. The node still knows what it read, and
+        // counts its age from the same time.
+        let key = crate::cell_directory_runs::marker_key(PREFIX);
         put_segment(&inner, &key, b"{").await;
-        let _ = reader.lookup("probe", 3 * MARKER_TTL_MS).await;
+        assert_eq!(
+            reader.lookup(&other, 3 * MARKER_TTL_MS).await,
+            DirectoryAnswer::New,
+            "a read error discarded the marker the node had"
+        );
+        // If the errors last, the marker ages out like one that stopped changing.
+        assert_eq!(
+            reader.lookup(&other, BLIND_WINDOW_MS + 1).await,
+            DirectoryAnswer::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn a_marker_that_is_gone_is_forgotten_with_its_age() {
+        let inner = Arc::new(InMemory::new());
+        let partition = partition_of(fingerprint("old"));
+        write_head(&inner, partition, &["old"], "l2").await;
+        let other = a_cell_in(partition, "old");
+        let reader = directory_over(&inner);
+        observe_a_change(&inner, &reader).await;
+
+        // Not an error: there is no marker. A later one starts over.
+        let key = crate::cell_directory_runs::marker_key(PREFIX);
+        inner.delete(&Path::from(key.as_str())).await.unwrap();
+        assert_eq!(
+            reader.lookup(&other, 3 * MARKER_TTL_MS).await,
+            DirectoryAnswer::Unknown
+        );
         publish(&inner, 3, 0).await;
         assert_eq!(
             reader.lookup(&other, 5 * MARKER_TTL_MS).await,
-            DirectoryAnswer::Unknown
+            DirectoryAnswer::Unknown,
+            "a marker seen after none is a first sight"
         );
     }
 
