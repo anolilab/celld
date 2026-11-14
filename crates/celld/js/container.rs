@@ -107,11 +107,8 @@ pub(super) fn op_container_start(
     // the start settles, the run ends as failed rather than staying pending
     // for every `exec()` and `monitor()` that waits on it.
     let opened = container::engine_if_ready()
-        .and_then(|engine| engine.cell(&cell))
-        .map(|cell| {
-            let run = cell.begin_run();
-            container::StartGuard::new(cell, run)
-        });
+        .and_then(|engine| engine.open_run(&cell))
+        .map(|(cell, run)| container::StartGuard::new(cell, run));
     let async_id = asyncrt::enqueue_io_context(async move {
         let (engine, cell) = cell_for(&cell).await?;
         let guard = opened.unwrap_or_else(|| {

@@ -55,7 +55,9 @@ celld implements this part of `ctx.container`:
   it, so a call never addresses the container by it. The node keeps the id
   that the engine gave each run's container, and `exec()`, `signal()` and
   `destroy()` act on the container of the run that was current when the object
-  called them. A `destroy()` that reaches the engine after a newer `start()`
+  called them. A `destroy()` also removes a container that an earlier run left
+  when the run it ends failed before it created its own, and rejects if that
+  removal fails. A `destroy()` that reaches the engine after a newer `start()`
   does not remove the new container, and an `exec()` for a run that ended
   rejects with an error that says so, and does not run in the newer run's
   container.

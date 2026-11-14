@@ -140,6 +140,11 @@ impl FakeEngine {
         engine
     }
 
+    /// The unix socket the fake listens on.
+    pub fn socket(&self) -> &std::path::Path {
+        &self.socket
+    }
+
     /// The environment that points a node at this engine, for its daemon
     /// socket and for the `docker` CLI `celld deploy` runs.
     pub fn env(&self) -> Vec<(String, String)> {
