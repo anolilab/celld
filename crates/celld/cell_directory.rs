@@ -22,9 +22,13 @@
 //!
 //! A lookup answers `New` only while the marker is recent, and the blind window
 //! is [`BLIND_WINDOW_MS`]: a cell whose registration became durable less than
-//! that ago, by another node, may be missing from the runs, and reads `New`.
-//! The window is counted from the durable segment, which precedes the cell's
-//! first LTX object, so it is also how long LTX can exist beside a `New`. A
+//! that ago, by another node or by an earlier process of this one, may be
+//! missing from the runs, and reads `New`. The window is counted from the
+//! durable segment, which precedes the cell's first LTX object, so it is also
+//! how long LTX can exist beside a `New`. A reader whose wall clock differs
+//! from the compactor's trusts a marker for less time, never more; the bucket's
+//! clock against the compactor's moves the age of a segment a pass left
+//! unfolded by their difference. A
 //! missing or unreadable marker, a marker older than the window, a dead
 //! compactor, or a failed read answers `Unknown`, which sends the caller to the
 //! listing.
@@ -77,18 +81,20 @@ impl Now {
     }
 }
 
-/// Refuse a batch window that a first write could not outlast. A write that
-/// waits a whole window for its segment fails its durability deadline at
-/// half of it or less once the segment PUT and a second window behind a
-/// flush in flight are counted, and a write that misses the deadline is never
-/// tiered.
+/// Refuse a batch window of half the durability budget or more. No write waits
+/// for the window any more, since a cell whose segment is not durable flushes
+/// the queue itself, but the window is the time from a claim to its durable
+/// registration and so widens the blind window, and one the durability budget
+/// could not cover points at a mistaken unit. Before registration left the write
+/// path such a window made every first write miss its deadline, so nothing was
+/// ever tiered.
 pub(crate) fn check_batch_window(batch_ms: u64, durability_timeout_ms: u64) -> anyhow::Result<()> {
     anyhow::ensure!(
         batch_ms < durability_timeout_ms / 2,
         "CELLD_CELL_DIRECTORY_BATCH_MS={batch_ms} must be below half of \
-         CELLD_LTX_DURABILITY_TIMEOUT_SECS ({durability_timeout_ms} ms): a cell's first LTX \
-         write would otherwise wait out the batch window and miss its durability deadline, \
-         and nothing would reach the bucket"
+         CELLD_LTX_DURABILITY_TIMEOUT_SECS ({durability_timeout_ms} ms): the window is how \
+         long a claim waits for its registration to be durable, and a window the durability \
+         budget cannot cover is likely a mistaken unit"
     );
     Ok(())
 }

@@ -248,7 +248,7 @@ pub(crate) async fn compact_pass_capped(
             Ok(read) => read,
             Err((key, error)) => {
                 // Not folded and not named by the ledger, so it is neither
-                // deleted nor missing from a reader's tail.
+                // deleted, and it keeps the marker's age from moving past it.
                 tracing::warn!(%error, %key, "cell directory segment skipped");
                 report.segments_skipped += 1;
                 continue;
@@ -912,3 +912,7 @@ pub(crate) async fn run_compactor(
 #[cfg(test)]
 #[path = "cell_directory_compactor/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "cell_directory_compactor/load.rs"]
+mod load;
