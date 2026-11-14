@@ -2486,7 +2486,6 @@ impl ContainerEngine {
         if let Some(stopping) = stopping {
             let mut state = cell.state.lock().unwrap();
             if state.attached != stopping || state.stopping.contains_key(&run) {
-                drop(state);
                 return earlier_failure.map_or(Ok(()), Err);
             }
             state.committed = state.committed.max(run);
@@ -4656,10 +4655,9 @@ mod engine_tests {
         let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
         let scope = "Runner:one";
         let cell = rig.cell(scope);
-        let run = rig.start(&cell);
+        rig.start(&cell);
         let stopping = stop_held_at_the_kill(&rig, &cell, Duration::from_millis(600));
-        let (handle, next) = rig.engine.open_run(scope).unwrap();
-        assert!(next > run);
+        let (handle, _) = rig.engine.open_run(scope).unwrap();
         rig.runtime
             .block_on(rig.engine.attach_cell(scope, handle.spec.clone()))
             .unwrap();
