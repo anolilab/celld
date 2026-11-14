@@ -412,10 +412,11 @@ struct Cell {
     waiting_activation: Option<ColdStart>,
     /// The in-flight release of this cell's ownership record, if any.
     releasing: Option<OpId>,
-    /// The last restore of this cell failed. Its local state may hold
-    /// acknowledged writes the bucket does not, so the record stays with this
-    /// node: a peer given the cell would restore from the bucket alone and
-    /// lose that tail. Cleared by the next restore that succeeds.
+    /// The last restore of this cell failed, or a generation swap stopped its
+    /// runtime and the restart failed. Its local state may hold acknowledged
+    /// writes the bucket does not, so the record stays with this node: a peer
+    /// given the cell would restore from the bucket alone and lose that tail.
+    /// Cleared by the next restore that succeeds.
     restore_failed: bool,
     /// Whether the eviction now under way hands this cell to the fleet.
     evict_rebalance: bool,
@@ -4961,7 +4962,12 @@ impl State {
                 });
             }
             Err(_) => {
+                // A swap's stop skipped the durability proof, and no runtime
+                // is left to prove one now, so the record stays with this node
+                // as it does after a failed restore.
+                let swapping = cell.swapping;
                 set_phase(&mut self.occupied, &mut cell, Phase::Dormant { epoch });
+                cell.restore_failed |= swapping;
                 self.finish_requests(&id, &mut cell, Err(RequestError::RuntimeFailed), effects);
                 resume_failed = cell.resume_demand;
             }
@@ -5261,20 +5267,15 @@ impl State {
                 // claim epoch+1 before reusing the preserved SQLite image.
                 self.admit_or_queue_activation(&id, &mut cell, ColdStart::ReadOwner, effects);
             }
-            // The node began leaving while the cell was between isolates.
-            // Started again it would only be one more resident for the
-            // drain to evict; dormant, the drain releases its record like
-            // any other.
-            StopCause::Swap if self.draining => {
-                set_phase(&mut self.occupied, &mut cell, Phase::Dormant { epoch });
-                self.finish_requests(&id, &mut cell, Err(RequestError::PublishFailed), effects);
-            }
             // The swap's second half: the same epoch, the same owner record,
             // the same replica, a new isolate. `Starting` without `Restore`
             // is deliberate — the database is open on disk and the LTX
             // handle never closed — and without `CasOwner`, because nothing
             // about ownership changed. Requests queued while the cell
-            // quiesced release when it publishes.
+            // quiesced release when it publishes. A node that began leaving
+            // meanwhile takes the same path: the swap skipped the durability
+            // proof, so the cell must be resident again for the drain to prove
+            // and stop it before its record is released.
             StopCause::Swap => {
                 let op = self.cell_op(&id);
                 set_phase(&mut self.occupied, &mut cell, Phase::Starting { op, epoch });
