@@ -13,6 +13,7 @@ mod e2e {
     pub mod egress;
     pub mod facets;
     pub mod harness;
+    pub mod invoke;
     pub mod isolates;
     pub mod node_crypto;
     pub mod operator_branches;

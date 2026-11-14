@@ -38,6 +38,7 @@ pub(crate) enum Action {
     Deploy(Vec<String>),
     Activate(Vec<String>),
     Discard(Vec<String>),
+    Invoke(Vec<String>),
     Dev(Vec<String>),
     Cell(Vec<String>),
     D1(Vec<String>),
@@ -77,6 +78,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             "deploy" => return Ok(Action::Deploy(arguments)),
             "activate" => return Ok(Action::Activate(arguments)),
             "discard" => return Ok(Action::Discard(arguments)),
+            "invoke" => return Ok(Action::Invoke(arguments)),
             "dev" => return Ok(Action::Dev(arguments)),
             "cell" => return Ok(Action::Cell(arguments)),
             "d1" => return Ok(Action::D1(arguments)),
@@ -274,6 +276,7 @@ USAGE:
   celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld activate SCRIPT=VERSION... [--primary SCRIPT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld discard SCRIPT=VERSION... --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  celld invoke SCRIPT=VERSION [PATH] [--header-env NAME=VAR] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld dev [PROJECT] [--host IP] [--port PORT] [--logs]
   celld cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld cell gc --dry-run [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]

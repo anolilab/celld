@@ -26,6 +26,11 @@ use crate::wake::WakeFlusher;
 /// keeping the previous one resolvable are the same instant. Held apart,
 /// the window between them resolved an in-flight call from the previous
 /// generation against the new deployment graph.
+/// Ids from here up belong to shadow generations, the short-lived ones that
+/// serve one staged request. Real generations count up from one, so the two
+/// ranges never meet, and a shadow never moves the id the next adoption takes.
+pub(crate) const SHADOW_ID_BASE: GenerationId = 1 << 62;
+
 pub(crate) struct Generations {
     pub(crate) current: Arc<Generation>,
     pub(crate) draining: Vec<Arc<Generation>>,
@@ -36,6 +41,9 @@ pub struct CellRuntime {
     /// The generations a call can resolve against. A reader takes one
     /// snapshot and never holds the lock across an await.
     pub(crate) generations: Arc<std::sync::RwLock<Generations>>,
+    /// The next shadow generation id. An atomic counter, so two requests that
+    /// build at once never share an id.
+    shadow_ids: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) data_dir: Arc<PathBuf>,
     pub(crate) replication: Option<Replication>,
     pub(crate) wake: Option<Arc<WakeFlusher>>,
@@ -62,6 +70,7 @@ impl CellRuntime {
                 current: generation,
                 draining: Vec::new(),
             })),
+            shadow_ids: Arc::new(std::sync::atomic::AtomicU64::new(SHADOW_ID_BASE)),
             data_dir: Arc::new(data_dir),
             replication,
             wake,
@@ -115,9 +124,33 @@ impl CellRuntime {
             .draining
             .iter()
             .map(|generation| generation.id)
+            .filter(|id| *id < SHADOW_ID_BASE)
             .max()
             .unwrap_or(0);
         generations.current.id.max(draining) + 1
+    }
+
+    /// An id for a shadow generation, unique for the life of the process.
+    pub fn next_shadow_generation_id(&self) -> GenerationId {
+        self.shadow_ids
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Make a shadow generation resolvable by its id, so a call from one of
+    /// its isolates reaches the graph it was built with. It is not current:
+    /// nothing new is admitted to it except through the returned handle, and
+    /// cells, ingress and the cron schedule keep using the serving generation.
+    pub fn register_shadow(&self, generation: Generation) -> ShadowGeneration {
+        let generation = Arc::new(generation);
+        self.generations
+            .write()
+            .expect("generation lock poisoned")
+            .draining
+            .push(generation.clone());
+        ShadowGeneration {
+            generations: self.generations.clone(),
+            generation: Some(generation),
+        }
     }
 
     /// The generations still draining, for `/state`. Each one holds its
@@ -307,4 +340,53 @@ pub(crate) fn require_cell_scope_name_max(name_max: usize) -> anyhow::Result<()>
         celld_logic::cell::MAX_CELL_SCOPE
     );
     Ok(())
+}
+
+/// A generation built to serve one staged request. Dropping it retires every
+/// isolate it built and removes it from the draining list once they are free,
+/// whether the request finished, failed or was cancelled.
+pub struct ShadowGeneration {
+    generations: Arc<std::sync::RwLock<Generations>>,
+    generation: Option<Arc<Generation>>,
+}
+
+impl ShadowGeneration {
+    pub fn generation(&self) -> &Arc<Generation> {
+        self.generation.as_ref().expect("released only on drop")
+    }
+}
+
+impl Drop for ShadowGeneration {
+    fn drop(&mut self) {
+        let Some(generation) = self.generation.take() else {
+            return;
+        };
+        generation.retire();
+        let generations = self.generations.clone();
+        let remove = move |generation: &Arc<Generation>| {
+            let mut generations = generations.write().expect("generation lock poisoned");
+            generations
+                .draining
+                .retain(|candidate| !Arc::ptr_eq(candidate, generation));
+        };
+        asyncrt::spawn(async move {
+            let mut wait = std::time::Duration::from_millis(50);
+            loop {
+                generation.reap_cell_pools();
+                if generation.is_drained() {
+                    remove(&generation);
+                    tracing::info!(
+                        event = "shadow_generation_freed",
+                        generation = generation.id,
+                        version = %generation.version,
+                        "staged-request generation freed"
+                    );
+                    return;
+                }
+                asyncrt::sleep(wait).await;
+                wait = (wait * 2).min(std::time::Duration::from_secs(2));
+            }
+        })
+        .detach();
+    }
 }
