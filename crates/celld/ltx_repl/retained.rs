@@ -32,8 +32,14 @@ pub(crate) fn live_path(evicted: &Path) -> PathBuf {
     evicted.with_extension("sqlite")
 }
 
+/// Where an eviction records the end of the snapshot it published, for the
+/// handle that reopens the database to compact from.
+fn cut_path(db: &Path) -> PathBuf {
+    db.with_extension("cut")
+}
+
 /// Remove what a database keeps beside it: the LTX metadata that carries its
-/// writer lineage and SQLite's sidecar files. Every removal is tried, and the
+/// writer lineage, the record of its snapshot and SQLite's sidecar files. Every removal is tried, and the
 /// first failure other than a path that was already gone is answered.
 pub(crate) fn remove_lineage(
     filesystem: &dyn celld_ltx::FileSystem,
@@ -48,10 +54,37 @@ pub(crate) fn remove_lineage(
         }
     };
     note(filesystem.remove_dir_all(&Db::meta_path_for_path(db)));
+    note(filesystem.remove_file(&cut_path(db)));
     for sidecar in Db::sidecar_paths_for_path(db) {
         note(filesystem.remove_file(&sidecar));
     }
     first_error.map_or(Ok(()), Err)
+}
+
+/// Where a reopened handle's compaction continues from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ResumeCut {
+    /// The end of the snapshot the epoch was last evicted at, or 0 for an
+    /// epoch that has none: compaction continues from the next transaction.
+    At(u64),
+    /// The record of the snapshot cannot be read. A cut is never guessed, so
+    /// the handle does not compact.
+    Unknown,
+}
+
+/// What a resume takes back from the files an eviction left.
+pub(super) struct ResumePlan<'a> {
+    guard: Option<ReturnToCache<'a>>,
+    pub(super) cut: ResumeCut,
+}
+
+impl ResumePlan<'_> {
+    /// The activation reached its handle, which owns the database now.
+    pub(super) fn keep(&mut self) {
+        if let Some(guard) = &mut self.guard {
+            guard.keep();
+        }
+    }
 }
 
 /// A retained database that a resume renamed to its live name. Unless the
@@ -83,12 +116,18 @@ impl Drop for ReturnToCache<'_> {
 }
 
 impl LtxRepl {
-    /// Put the database a same-epoch wake continues at its live path.
+    /// Prepare what a same-epoch wake continues: put its database at the live
+    /// path and read where the handle's compaction continues from.
     ///
-    /// A clean reload left it there. A dormant cell left it as `.evicted`, and
-    /// the rename is what ends that name: no epoch directory holds both, so a
-    /// crash after the first write cannot offer the pre-write image to the
-    /// next epoch as its base, which would drop every row since.
+    /// Everything here is local. The files are checked before anything else,
+    /// so a wake with nothing kept fails with [`RetainedUnavailable`] having
+    /// asked the bucket for nothing.
+    ///
+    /// A clean reload left the database at its live path. A dormant cell left
+    /// it as `.evicted`, and the rename is what ends that name: no epoch
+    /// directory holds both, so a crash after the first write cannot offer the
+    /// pre-write image to the next epoch as its base, which would drop every
+    /// row since.
     ///
     /// The LTX metadata must be there too. Opening a database without it
     /// starts a writer lineage at TXID 1 inside an epoch that already holds
@@ -96,14 +135,14 @@ impl LtxRepl {
     /// the next epoch instead.
     ///
     /// A database that was renamed goes back to `.evicted`, and into the
-    /// cache, when the activation does not reach its handle: the guard
-    /// answered holds it until then.
-    pub(super) fn take_retained_database(
+    /// cache, when the activation does not reach its handle: the plan holds it
+    /// until `keep`.
+    pub(super) fn prepare_resume(
         &self,
         cell: &str,
         epoch: u64,
         dst: &Path,
-    ) -> anyhow::Result<Option<ReturnToCache<'_>>> {
+    ) -> anyhow::Result<ResumePlan<'_>> {
         let is_file = |path: &Path| {
             self.ltx_host
                 .metadata(path)
@@ -131,21 +170,50 @@ impl LtxRepl {
         {
             return Err(unavailable("LTX metadata"));
         }
+        let cut = self.read_cut(dst);
         if !from_eviction {
-            return Ok(None);
+            return Ok(ResumePlan { guard: None, cut });
         }
         self.ltx_host.rename(&retained, dst)?;
         self.preserved
             .lock()
             .expect("preserved cache poisoned")
             .forget(&retained);
-        Ok(Some(ReturnToCache {
-            repl: self,
-            cell: cell.to_string(),
-            epoch,
-            live: dst.to_path_buf(),
-            armed: true,
-        }))
+        Ok(ResumePlan {
+            guard: Some(ReturnToCache {
+                repl: self,
+                cell: cell.to_string(),
+                epoch,
+                live: dst.to_path_buf(),
+                armed: true,
+            }),
+            cut,
+        })
+    }
+
+    /// The end of the snapshot the epoch was last evicted at. A database that
+    /// no eviction published a snapshot for has no record, and compacts from
+    /// the first transaction.
+    fn read_cut(&self, db: &Path) -> ResumeCut {
+        match self.ltx_host.filesystem().read(&cut_path(db)) {
+            Ok(bytes) => String::from_utf8(bytes)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+                .map_or(ResumeCut::Unknown, ResumeCut::At),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ResumeCut::At(0),
+            Err(_) => ResumeCut::Unknown,
+        }
+    }
+
+    /// Record the end of the snapshot an eviction published, beside the
+    /// database it closes.
+    pub(super) fn record_cut(&self, cell: &str, epoch: u64, end: u64) -> std::io::Result<()> {
+        let path = cut_path(&self.db_path(cell, epoch));
+        let temporary = path.with_extension("cut.tmp");
+        let filesystem = self.ltx_host.filesystem();
+        filesystem.write(&temporary, end.to_string().as_bytes())?;
+        filesystem.sync_all(&temporary)?;
+        filesystem.rename(&temporary, &path)
     }
 
     /// Whether the write-ahead log of the database at `db` holds pages. SQLite

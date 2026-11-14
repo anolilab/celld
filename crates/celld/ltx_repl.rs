@@ -62,10 +62,6 @@ use celld_logic::durability::{proof_deadline, ProofProgress, ProofWait};
 /// and in-flight object-store requests under high write fan-out.
 const SYNC_CONCURRENCY: usize = 64;
 
-/// How many times the snapshot listing that places a reopened handle's
-/// compaction is tried before the activation fails.
-const SNAPSHOT_CUT_ATTEMPTS: u32 = 3;
-
 /// Max LTX object downloads across every restore on this node. A hot cell can
 /// contain thousands of L0 files, so serial reads turn a takeover into minutes
 /// of terminal failures. This shared ceiling hides round-trip latency without
@@ -618,10 +614,6 @@ pub(crate) struct LtxConfig {
     /// The TRUNCATE checkpoint threshold of a non-Queue cell, 0 to disable
     /// truncation (`CELLD_LTX_TRUNCATE_PAGES`).
     pub(crate) truncate_pages: u32,
-    /// Whether an eviction keeps the database for a wake at its own epoch
-    /// (`CELLD_RESUME_DORMANT_LOCAL`). Only such an epoch can hold a snapshot
-    /// that a reopened handle compacts from.
-    pub(crate) resume_dormant_local: bool,
 }
 
 impl LtxConfig {
@@ -669,15 +661,6 @@ impl LtxConfig {
                 .ok()
                 .flatten()
                 .unwrap_or(DEFAULT_TRUNCATE_PAGES),
-            resume_dormant_local: lookup("CELLD_RESUME_DORMANT_LOCAL")
-                .and_then(|value| {
-                    crate::env_vars::parse_flag(
-                        "CELLD_RESUME_DORMANT_LOCAL",
-                        value.as_deref(),
-                        false,
-                    )
-                })
-                .unwrap_or(false),
         }
     }
 }
@@ -1242,8 +1225,6 @@ pub struct LtxRepl {
     /// Bytes per second a paged cell hydrates in the background, 0 for none
     /// (`CELLD_LTX_HYDRATE_MBPS`). A hydrated cell reads only its file.
     hydrate_bytes_per_s: u64,
-    /// `LtxConfig::resume_dormant_local`.
-    resume_dormant_local: bool,
     /// One paged cell hydrates at a time: a node with several whales pages
     /// them all and fills them in turn.
     hydrations: Arc<Semaphore>,
@@ -1525,7 +1506,6 @@ impl LtxRepl {
             paged_fleet: AtomicBool::new(false),
             paged_min_bytes: AtomicU64::new(config.paged_min_bytes),
             hydrate_bytes_per_s: config.hydrate_bytes_per_s,
-            resume_dormant_local: config.resume_dormant_local,
             hydrations: Arc::new(Semaphore::new(1)),
             preserved,
             dirty_ship,
@@ -2221,35 +2201,6 @@ impl LtxRepl {
         ))
     }
 
-    /// The end of every full snapshot an epoch holds. Rows at or below the
-    /// newest one at or below a reopened handle's position are the snapshot's,
-    /// not any per-cell level's, so the handle compacts from the next
-    /// transaction.
-    ///
-    /// A listing that keeps failing is an error and not a position: a cut
-    /// that was guessed would pin the handle's compaction to the wrong base
-    /// for as long as it lives.
-    async fn snapshot_ends(&self, cell: &str, epoch: u64) -> anyhow::Result<Vec<u64>> {
-        let client = self.client_for(cell, epoch);
-        let mut attempt = 1;
-        let files = loop {
-            match client.full_snapshots().await {
-                Ok(files) => break files,
-                Err(error) if attempt < SNAPSHOT_CUT_ATTEMPTS => {
-                    warn!(cell, epoch, attempt, %error, "listing the snapshots of a reopened epoch failed; retrying");
-                    asyncrt::sleep(Duration::from_millis(100 << attempt)).await;
-                    attempt += 1;
-                }
-                Err(error) => {
-                    return Err(anyhow!(
-                        "list the snapshots of {cell} epoch {epoch}: {error}"
-                    ))
-                }
-            }
-        };
-        Ok(files.iter().map(|file| file.max_txid.0).collect())
-    }
-
     pub async fn activate(
         &self,
         options: ActivationOptions<'_>,
@@ -2355,17 +2306,9 @@ impl LtxRepl {
         // A paged activation continues its chain from the cut: (last txid of
         // the chain, page count at the cut).
         let mut continuation: Option<(TXID, u32)> = None;
-        // Listed before the database changes name: a listing that fails then
-        // leaves the retained files where the cache and a retry find them.
-        let snapshot_ends =
-            if resume_local && self.resume_dormant_local && self.compaction_queue.is_some() {
-                self.snapshot_ends(cell, epoch).await?
-            } else {
-                Vec::new()
-            };
-        let mut taken = None;
+        let mut resume = None;
         if resume_local {
-            taken = self.take_retained_database(cell, epoch, &dst)?;
+            resume = Some(self.prepare_resume(cell, epoch, &dst)?);
             info!(cell, epoch, "resumed clean local replica");
         } else if let Some(snapshot) = local_snapshot {
             self.forget_lineage(cell, epoch - 1)?;
@@ -2648,15 +2591,22 @@ impl LtxRepl {
             });
         // A reopened epoch holds a snapshot at some position, and under a
         // fleet proof the rows at or below it are in no per-cell L0 file, so
-        // its compaction continues from the next transaction. A clean reload
-        // of such a cell finds the same snapshot.
+        // its compaction continues from the next transaction. The eviction
+        // recorded the position beside the database. One that cannot be read,
+        // or that lies above the database, is not guessed: the handle does
+        // not compact.
         let position = seed.map_or(0, |pos| pos.txid.0);
-        let resume_cut = snapshot_ends
-            .iter()
-            .copied()
-            .filter(|end| *end <= position)
-            .max()
-            .unwrap_or(0);
+        let resume_cut = match resume.as_ref().map(|plan| plan.cut) {
+            None => Some(0),
+            Some(ResumeCut::At(cut)) if cut <= position => Some(cut),
+            Some(_) => {
+                warn!(
+                    cell,
+                    epoch, "the snapshot position of a reopened epoch is unknown; no compaction"
+                );
+                None
+            }
+        };
         let handle = Arc::new(Cell {
             snapshot_declined: AtomicBool::new(false),
             paged_vfs: paged_vfs_name.clone(),
@@ -2682,41 +2632,43 @@ impl LtxRepl {
             last_percell_file: Mutex::new(None),
             syncing: AtomicBool::new(false),
             ready: Notify::new(),
-            compaction: self.compaction_queue.as_ref().map(|queue| {
-                let fetcher = Arc::new(SinkFetcher {
-                    registration: self.registration.clone(),
-                    cell: cell.to_string(),
-                    epoch,
-                    rows: tokio::sync::Mutex::new(None),
-                });
-                CellCompaction {
-                    cell: cell.to_string(),
-                    epoch,
-                    // The overlay lets compaction read bundle-resident frames
-                    // beside the per-cell objects; its output stays pure
-                    // per-cell L1s, which is the continuous drain.
-                    client: celld_ltx::BundleOverlayClient::new(
-                        client.clone(),
-                        Some(fetcher.clone()),
-                    ),
-                    fetcher,
-                    local_path: Db::meta_path_for_path(&dst),
-                    host: self.ltx_host.clone(),
-                    queue: queue.clone(),
-                    base_txid: continuation.map_or(resume_cut + 1, |(txid, _)| txid.0),
-                    min_txids: self.compaction_min_txids,
-                    min_bytes: self.compaction_min_bytes,
-                    pending_bytes: AtomicU64::new(0),
-                    compacted_txid: AtomicU64::new(resume_cut),
-                    retry_after_ms: AtomicU64::new(0),
-                    failures: AtomicU64::new(0),
-                    queued: AtomicBool::new(false),
-                    cancelled: AtomicBool::new(false),
-                    handoff_paused: AtomicBool::new(false),
-                    cancel: Notify::new(),
-                    run: tokio::sync::Mutex::new(()),
-                }
-            }),
+            compaction: self.compaction_queue.as_ref().zip(resume_cut).map(
+                |(queue, resume_cut)| {
+                    let fetcher = Arc::new(SinkFetcher {
+                        registration: self.registration.clone(),
+                        cell: cell.to_string(),
+                        epoch,
+                        rows: tokio::sync::Mutex::new(None),
+                    });
+                    CellCompaction {
+                        cell: cell.to_string(),
+                        epoch,
+                        // The overlay lets compaction read bundle-resident frames
+                        // beside the per-cell objects; its output stays pure
+                        // per-cell L1s, which is the continuous drain.
+                        client: celld_ltx::BundleOverlayClient::new(
+                            client.clone(),
+                            Some(fetcher.clone()),
+                        ),
+                        fetcher,
+                        local_path: Db::meta_path_for_path(&dst),
+                        host: self.ltx_host.clone(),
+                        queue: queue.clone(),
+                        base_txid: continuation.map_or(resume_cut + 1, |(txid, _)| txid.0),
+                        min_txids: self.compaction_min_txids,
+                        min_bytes: self.compaction_min_bytes,
+                        pending_bytes: AtomicU64::new(0),
+                        compacted_txid: AtomicU64::new(resume_cut),
+                        retry_after_ms: AtomicU64::new(0),
+                        failures: AtomicU64::new(0),
+                        queued: AtomicBool::new(false),
+                        cancelled: AtomicBool::new(false),
+                        handoff_paused: AtomicBool::new(false),
+                        cancel: Notify::new(),
+                        run: tokio::sync::Mutex::new(()),
+                    }
+                },
+            ),
         });
         // Shutdown publishes stop before it takes the close gate and this map.
         // An activation that linearizes first is in shutdown's snapshot; one
@@ -2740,8 +2692,8 @@ impl LtxRepl {
             } else {
                 cells.insert((cell.to_string(), epoch), handle.clone());
                 registration.keep();
-                if let Some(taken) = &mut taken {
-                    taken.keep();
+                if let Some(resume) = &mut resume {
+                    resume.keep();
                 }
                 (true, false)
             }
@@ -3304,6 +3256,8 @@ impl LtxRepl {
         }
         let deadline = barrier_started_mono_ms.saturating_add(self.durability_timeout_ms);
         let mut artifact = None;
+        let mut snapshot_end = None;
+        let mut snapshots_listed = Vec::new();
         if let Some(snapshot) = snapshot {
             let published = asyncrt::timeout_at(
                 deadline,
@@ -3313,13 +3267,16 @@ impl LtxRepl {
             // The snapshot itself must be listed: a handoff that took it has
             // told the successor to restore that image, and the transaction
             // alone would pass on an L0 object that holds it.
-            if matches!(published, Ok(Ok(())))
-                && matches!(
-                    self.client_for(cell, epoch)
-                        .has_snapshot_through(TXID(snapshot.max_txid.0))
-                        .await,
-                    Ok(true)
-                )
+            if matches!(published, Ok(Ok(()))) {
+                snapshots_listed = self
+                    .client_for(cell, epoch)
+                    .full_snapshots()
+                    .await
+                    .unwrap_or_default();
+            }
+            if snapshots_listed
+                .iter()
+                .any(|file| file.max_txid >= snapshot.max_txid)
             {
                 // The snapshot is a per-cell object through its txid, so it
                 // covers every fleet-acked row of this closed database. No
@@ -3332,6 +3289,7 @@ impl LtxRepl {
                 // `durable_txid` to choose which rows to upload.
                 credit_percell_upload(&handle, snapshot.max_txid.0);
                 artifact = Some(EvictionRestoreArtifact::Snapshot);
+                snapshot_end = Some(snapshot.max_txid.0);
             } else {
                 handle.snapshot_declined.store(true, Ordering::Relaxed);
                 warn!(
@@ -3367,6 +3325,26 @@ impl LtxRepl {
             elapsed_ms = asyncrt::mono_ms().saturating_sub(barrier_started_mono_ms),
             "final durability barrier passed"
         );
+
+        // A reopened handle compacts from the snapshot, so the record of its
+        // end goes beside the database. A record that cannot be written leaves
+        // only a base: a cut is never guessed.
+        let retained = match snapshot_end {
+            Some(end) if retained == Retained::Resumable => {
+                match self.record_cut(cell, epoch, end) {
+                    Ok(()) => retained,
+                    Err(error) => {
+                        warn!(cell, epoch, %error, "record the snapshot position failed; keeping a base only");
+                        Retained::Base
+                    }
+                }
+            }
+            _ => retained,
+        };
+        if let Some(end) = snapshot_end {
+            self.prune_superseded_snapshots(cell, epoch, &snapshots_listed, end)
+                .await;
+        }
 
         // Keep the local Db until one authoritative restore artifact is
         // remotely visible. A failed snapshot and failed L0 fallback retain
@@ -3593,6 +3571,64 @@ impl LtxRepl {
                     durable_txid: handle.durable_txid.clone(),
                 },
             );
+        }
+    }
+
+    /// Delete the snapshots of an epoch that a newer one has replaced, when
+    /// epoch GC is on, by its grace. An epoch that is reopened after each
+    /// eviction otherwise gains a full image per eviction that nothing removes
+    /// while the epoch lives. `listed` holds the snapshots the confirm saw, and
+    /// a failure only costs the bytes until the next eviction.
+    async fn prune_superseded_snapshots(
+        &self,
+        cell: &str,
+        epoch: u64,
+        listed: &[celld_ltx::FileInfo],
+        confirmed: u64,
+    ) {
+        let Some(grace_ms) = self.epoch_gc_grace_ms else {
+            return;
+        };
+        let now_ms = asyncrt::wall_ms().max(0) as u64;
+        let snapshots: Vec<_> = listed
+            .iter()
+            .map(|file| celld_logic::epoch_gc::ListedSnapshot {
+                end: file.max_txid.0,
+                // A file with no upload time is taken to be new.
+                uploaded_ms: file
+                    .created_at
+                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(now_ms, |age| age.as_millis() as u64),
+            })
+            .collect();
+        let ends =
+            celld_logic::epoch_gc::superseded_snapshots(&snapshots, confirmed, now_ms, grace_ms);
+        if ends.is_empty() {
+            return;
+        }
+        let victims: Vec<celld_ltx::FileInfo> = listed
+            .iter()
+            .filter(|file| ends.contains(&file.max_txid.0))
+            .cloned()
+            .collect();
+        match self
+            .client_for(cell, epoch)
+            .delete_ltx_files(&victims)
+            .await
+        {
+            Ok(()) => info!(
+                event = "superseded_snapshots_deleted",
+                cell,
+                epoch,
+                deleted = victims.len(),
+                "deleted the snapshots that a newer one replaced"
+            ),
+            Err(error) => warn!(
+                cell,
+                epoch,
+                %error,
+                "delete the superseded snapshots failed; they stay until the next eviction"
+            ),
         }
     }
 
@@ -5374,8 +5410,8 @@ impl Drop for LtxRepl {
 }
 
 mod retained;
-use retained::evicted_path;
 pub use retained::Retained;
+use retained::{evicted_path, ResumeCut};
 pub(crate) use retained::{live_path, remove_lineage};
 
 #[cfg(test)]

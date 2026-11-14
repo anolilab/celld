@@ -38,14 +38,18 @@ fn rig_with(compaction: Option<CompactionConfig>) -> Rig {
 }
 
 fn rig_on(compaction: Option<CompactionConfig>, host: LtxHost) -> Rig {
-    rig_configured(compaction, host, true)
+    rig_configured(compaction, host, None)
 }
 
-/// `resume_dormant_local` is the node's `CELLD_RESUME_DORMANT_LOCAL`.
+/// A rig whose epoch GC runs with `grace_ms`, or does not run at all.
+fn rig_with_retention(grace_ms: Option<u64>) -> Rig {
+    rig_configured(None, production_ltx_host(), grace_ms)
+}
+
 fn rig_configured(
     compaction: Option<CompactionConfig>,
     host: LtxHost,
-    resume_dormant_local: bool,
+    epoch_gc_grace_ms: Option<u64>,
 ) -> Rig {
     let directory = tempfile::tempdir().expect("temporary directory");
     let store = Arc::new(Counting::default());
@@ -63,12 +67,10 @@ fn rig_configured(
         3_600_000,
         host,
         5_000,
-        LtxConfig::from_lookup(|name| {
-            Ok(
-                (name == "CELLD_RESUME_DORMANT_LOCAL" && resume_dormant_local)
-                    .then(|| "1".to_string()),
-            )
-        }),
+        LtxConfig {
+            epoch_gc_grace_ms,
+            ..LtxConfig::from_lookup(|_| Ok(None))
+        },
         None,
     );
     Rig {

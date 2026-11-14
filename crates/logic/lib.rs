@@ -7387,6 +7387,8 @@ mod dormant_resume_tests;
 #[cfg(test)]
 mod drain_tests;
 #[cfg(test)]
+mod epoch_gc_tests;
+#[cfg(test)]
 mod failed_restore_tests;
 #[cfg(test)]
 mod fence_confirming_tests;

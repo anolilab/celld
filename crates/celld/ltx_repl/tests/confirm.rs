@@ -145,3 +145,60 @@ fn the_confirm_walks_the_epoch_for_a_file_longer_than_its_window() {
         assert_eq!(rig.store.lists.load(Ordering::SeqCst), 1);
     });
 }
+
+/// Evict a cell twice at one epoch, writing a row in between, and answer the
+/// snapshot objects the bucket holds after the second eviction.
+async fn snapshots_after_two_evictions(rig: &Rig) -> Vec<(u64, u64)> {
+    first_lifetime(rig).await;
+    rig.ltx
+        .evict(CELL, 1, Retained::Resumable, None)
+        .await
+        .expect("first eviction");
+    let resumed = rig
+        .ltx
+        .activate(options(1, false, true))
+        .await
+        .expect("resume");
+    write(&resumed.path, "INSERT INTO t VALUES (2);");
+    rig.ltx
+        .evict(CELL, 1, Retained::Resumable, None)
+        .await
+        .expect("second eviction");
+    level(rig, 1, replica::SNAPSHOT_LEVEL).await
+}
+
+#[test]
+fn an_eviction_deletes_the_snapshot_a_newer_one_replaced_once_the_grace_has_passed() {
+    run(async {
+        let rig = rig_with_retention(Some(0));
+
+        assert_eq!(snapshots_after_two_evictions(&rig).await, [(1, 2)]);
+
+        // The newest snapshot is the whole database.
+        let restored = rig
+            .ltx
+            .restore_snapshot(CELL)
+            .await
+            .expect("restore")
+            .expect("a restorable cell");
+        assert_eq!(rows(restored.path()), [1, 2]);
+    });
+}
+
+#[test]
+fn an_eviction_keeps_a_replaced_snapshot_inside_the_grace() {
+    run(async {
+        let rig = rig_with_retention(Some(3_600_000));
+
+        assert_eq!(snapshots_after_two_evictions(&rig).await, [(1, 1), (1, 2)]);
+    });
+}
+
+#[test]
+fn an_eviction_keeps_every_snapshot_while_epoch_gc_is_off() {
+    run(async {
+        let rig = rig_with_retention(None);
+
+        assert_eq!(snapshots_after_two_evictions(&rig).await, [(1, 1), (1, 2)]);
+    });
+}

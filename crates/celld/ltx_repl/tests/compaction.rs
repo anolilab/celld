@@ -93,8 +93,31 @@ fn a_clean_reload_of_a_resumed_cell_keeps_compacting_from_the_snapshot() {
     });
 }
 
+/// A reopened handle whose snapshot record says `record`, if it says anything.
+async fn base_after_reopen(record: Option<&str>) -> Option<u64> {
+    let rig = rig_with(Some(EVERY_ROW));
+    first_lifetime(&rig).await;
+    rig.ltx
+        .evict(CELL, 1, Retained::Resumable, None)
+        .await
+        .expect("eviction");
+    let cut = live(&rig, 1).with_extension("cut");
+    match record {
+        Some(text) => std::fs::write(&cut, text).expect("write the record"),
+        None => std::fs::remove_file(&cut).expect("remove the record"),
+    }
+    rig.ltx
+        .activate(options(1, false, true))
+        .await
+        .expect("resume");
+    resident(&rig, 1)
+        .compaction
+        .as_ref()
+        .map(|compaction| compaction.base_txid)
+}
+
 #[test]
-fn a_snapshot_listing_that_fails_once_is_retried_and_the_base_stays_right() {
+fn an_eviction_records_where_the_reopened_handle_compacts_from() {
     run(async {
         let rig = rig_with(Some(EVERY_ROW));
         first_lifetime(&rig).await;
@@ -103,43 +126,23 @@ fn a_snapshot_listing_that_fails_once_is_retried_and_the_base_stays_right() {
             .await
             .expect("eviction");
 
-        rig.store.failing_offset_lists.store(1, Ordering::SeqCst);
-        rig.ltx
-            .activate(options(1, false, true))
-            .await
-            .expect("resume");
-
-        assert_eq!(resident(&rig, 1).compaction.as_ref().unwrap().base_txid, 2);
+        let record = std::fs::read_to_string(live(&rig, 1).with_extension("cut")).unwrap();
+        assert_eq!(record, "1");
     });
 }
 
 #[test]
-fn a_snapshot_listing_that_keeps_failing_fails_the_resume_instead_of_guessing_a_cut() {
+fn a_reopened_epoch_without_a_record_of_a_snapshot_compacts_from_the_start() {
     run(async {
-        let rig = rig_with(Some(EVERY_ROW));
-        first_lifetime(&rig).await;
-        rig.ltx
-            .evict(CELL, 1, Retained::Resumable, None)
-            .await
-            .expect("eviction");
+        assert_eq!(base_after_reopen(None).await, Some(1));
+    });
+}
 
-        rig.store.failing_offset_lists.store(100, Ordering::SeqCst);
-        let error = rig
-            .ltx
-            .activate(options(1, false, true))
-            .await
-            .map(|_| ())
-            .expect_err("a resume whose cut cannot be established");
-        assert!(error.to_string().contains("list the snapshots"));
-        assert!(!rig.ltx.is_resident(CELL, 1));
-
-        // The files stay where the cache and a retry find them.
-        assert!(evicted(&rig, 1).is_file() && !live(&rig, 1).exists());
-        rig.store.failing_offset_lists.store(0, Ordering::SeqCst);
-        rig.ltx
-            .activate(options(1, false, true))
-            .await
-            .expect("the retry");
-        assert_eq!(resident(&rig, 1).compaction.as_ref().unwrap().base_txid, 2);
+#[test]
+fn a_record_that_cannot_be_read_or_lies_above_the_database_leaves_the_handle_uncompacted() {
+    run(async {
+        assert_eq!(base_after_reopen(Some("not a position")).await, None);
+        // The database is at 1, and the record says it was cut at 99.
+        assert_eq!(base_after_reopen(Some("99")).await, None);
     });
 }

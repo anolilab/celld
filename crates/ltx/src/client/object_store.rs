@@ -776,12 +776,6 @@ impl ObjectStoreClient {
         Ok(files)
     }
 
-    /// Whether the epoch holds a full snapshot through `txid`.
-    pub async fn has_snapshot_through(&self, txid: TXID) -> Result<bool> {
-        let snapshots = self.full_snapshots().await?;
-        Ok(snapshots.iter().any(|file| file.max_txid >= txid))
-    }
-
     /// Build the S3 key for an LTX file: `{path}/{level:04x}/{min}-{max}.ltx`.
     /// Ported from s3/replica_client.go:629, 677, 1040-1042.
     fn ltx_key(&self, level: i32, min_txid: TXID, max_txid: TXID) -> String {

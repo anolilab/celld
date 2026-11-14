@@ -269,16 +269,34 @@ fn the_graceful_seal_waits_for_the_snapshot_of_a_resumed_cell() {
     });
 }
 
-/// A filesystem that refuses to remove a directory while `refusing` is set.
-struct RefusesRemoval {
-    inner: celld_ltx::DirectFileSystem,
-    refusing: Arc<AtomicBool>,
-    /// Creating a LTX metadata directory fails while set, which fails
-    /// opening a database after its files are in place.
-    refusing_meta: Arc<AtomicBool>,
+/// What a filesystem refuses while its flag is set.
+#[derive(Default)]
+struct Refusals {
+    /// Removing a directory.
+    removal: AtomicBool,
+    /// Creating a LTX metadata directory, which fails opening a database
+    /// after its files are in place.
+    meta: AtomicBool,
+    /// Writing the record of an eviction's snapshot.
+    cut: AtomicBool,
 }
 
-impl celld_ltx::FileSystem for RefusesRemoval {
+struct RefusingFilesystem {
+    inner: celld_ltx::DirectFileSystem,
+    refusals: Arc<Refusals>,
+}
+
+/// A rig over a filesystem that refuses what `Refusals` says.
+fn rig_refusing() -> (Rig, Arc<Refusals>) {
+    let refusals = Arc::<Refusals>::default();
+    let host = ltx_host_over(Arc::new(RefusingFilesystem {
+        inner: celld_ltx::DirectFileSystem,
+        refusals: refusals.clone(),
+    }));
+    (rig_on(None, host), refusals)
+}
+
+impl celld_ltx::FileSystem for RefusingFilesystem {
     fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         self.inner.read(path)
     }
@@ -295,6 +313,10 @@ impl celld_ltx::FileSystem for RefusesRemoval {
         self.inner.open(path)
     }
     fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let cut = path.extension().is_some_and(|ext| ext == "tmp");
+        if cut && self.refusals.cut.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("refused"));
+        }
         self.inner.write(path, bytes)
     }
     fn sync_all(&self, path: &Path) -> std::io::Result<()> {
@@ -307,7 +329,7 @@ impl celld_ltx::FileSystem for RefusesRemoval {
         self.inner.remove_file(path)
     }
     fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
-        if self.refusing.load(Ordering::SeqCst) {
+        if self.refusals.removal.load(Ordering::SeqCst) {
             return Err(std::io::Error::other("refused"));
         }
         self.inner.remove_dir_all(path)
@@ -316,7 +338,7 @@ impl celld_ltx::FileSystem for RefusesRemoval {
         let meta = path
             .file_name()
             .is_some_and(|name| name.to_string_lossy().ends_with("-litestream"));
-        if meta && self.refusing_meta.load(Ordering::SeqCst) {
+        if meta && self.refusals.meta.load(Ordering::SeqCst) {
             return Err(std::io::Error::other("refused"));
         }
         self.inner.create_dir_all(path)
@@ -326,20 +348,14 @@ impl celld_ltx::FileSystem for RefusesRemoval {
 #[test]
 fn a_base_whose_lineage_cannot_be_removed_is_not_taken_and_strands_nothing() {
     run(async {
-        let refusing = Arc::new(AtomicBool::new(false));
-        let host = ltx_host_over(Arc::new(RefusesRemoval {
-            inner: celld_ltx::DirectFileSystem,
-            refusing: refusing.clone(),
-            refusing_meta: Arc::default(),
-        }));
-        let rig = rig_on(None, host);
+        let (rig, refusals) = rig_refusing();
         first_lifetime(&rig).await;
         rig.ltx
             .evict(CELL, 1, Retained::Resumable, None)
             .await
             .expect("eviction");
 
-        refusing.store(true, Ordering::SeqCst);
+        refusals.removal.store(true, Ordering::SeqCst);
         rig.ltx
             .activate(options(2, false, false))
             .await
@@ -351,7 +367,7 @@ fn a_base_whose_lineage_cannot_be_removed_is_not_taken_and_strands_nothing() {
         assert!(evicted(&rig, 1).is_file() && meta(&rig, 1).is_dir());
         assert!(!live(&rig, 2).exists());
 
-        refusing.store(false, Ordering::SeqCst);
+        refusals.removal.store(false, Ordering::SeqCst);
         let next = rig
             .ltx
             .activate(options(2, false, false))
@@ -419,48 +435,9 @@ fn a_base_whose_log_still_holds_pages_is_not_kept() {
 }
 
 #[test]
-fn a_clean_reload_lists_nothing_on_a_node_that_keeps_no_dormant_databases() {
-    run(async {
-        let rig = rig_configured(Some(EVERY_ROW), production_ltx_host(), false);
-        first_lifetime(&rig).await;
-        rig.ltx.close_for_reload(CELL, 1).await.expect("reload");
-        let before = rig.store.offset_lists.load(Ordering::SeqCst);
-
-        rig.ltx
-            .activate(options(1, false, true))
-            .await
-            .expect("reopen");
-
-        assert_eq!(rig.store.offset_lists.load(Ordering::SeqCst), before);
-        assert_eq!(resident(&rig, 1).compaction.as_ref().unwrap().base_txid, 1);
-    });
-}
-
-#[test]
-fn a_clean_reload_needs_no_bucket_on_a_node_that_keeps_no_dormant_databases() {
-    run(async {
-        let rig = rig_configured(Some(EVERY_ROW), production_ltx_host(), false);
-        first_lifetime(&rig).await;
-        rig.ltx.close_for_reload(CELL, 1).await.expect("reload");
-
-        rig.store.down.store(true, Ordering::SeqCst);
-        rig.ltx
-            .activate(options(1, false, true))
-            .await
-            .expect("a reload reads nothing remote");
-    });
-}
-
-#[test]
 fn a_failed_resume_returns_the_database_to_the_cache() {
     run(async {
-        let refusing_meta = Arc::new(AtomicBool::new(false));
-        let host = ltx_host_over(Arc::new(RefusesRemoval {
-            inner: celld_ltx::DirectFileSystem,
-            refusing: Arc::default(),
-            refusing_meta: refusing_meta.clone(),
-        }));
-        let rig = rig_on(None, host);
+        let (rig, refusals) = rig_refusing();
         first_lifetime(&rig).await;
         rig.ltx
             .evict(CELL, 1, Retained::Resumable, None)
@@ -469,17 +446,126 @@ fn a_failed_resume_returns_the_database_to_the_cache() {
         // The cache has read the disk once, so it knows only what it is told.
         rig.ltx.prune_local_cache(u64::MAX).expect("prune");
 
-        refusing_meta.store(true, Ordering::SeqCst);
+        refusals.meta.store(true, Ordering::SeqCst);
         rig.ltx
             .activate(options(1, false, true))
             .await
             .map(|_| ())
             .expect_err("a database that cannot be opened");
-        refusing_meta.store(false, Ordering::SeqCst);
+        refusals.meta.store(false, Ordering::SeqCst);
 
         // Neither a live file nor an unaccounted base is left at the epoch.
         assert!(evicted(&rig, 1).is_file() && !live(&rig, 1).exists());
         rig.ltx.prune_local_cache(0).expect("prune");
         assert!(!evicted(&rig, 1).exists() && !meta(&rig, 1).exists());
+    });
+}
+
+#[test]
+fn a_clean_reload_of_a_resumed_cell_needs_no_bucket() {
+    run(async {
+        let rig = rig_with(Some(EVERY_ROW));
+        first_lifetime(&rig).await;
+        rig.ltx
+            .evict(CELL, 1, Retained::Resumable, None)
+            .await
+            .expect("eviction");
+        let resumed = rig
+            .ltx
+            .activate(options(1, false, true))
+            .await
+            .expect("resume");
+        write(&resumed.path, "INSERT INTO t VALUES (2);");
+        rig.ltx.close_for_reload(CELL, 1).await.expect("reload");
+
+        rig.store.down.store(true, Ordering::SeqCst);
+        let before = rig.store.requests.load(Ordering::SeqCst);
+        rig.ltx
+            .activate(options(1, false, true))
+            .await
+            .expect("a reload reads nothing remote");
+
+        assert_eq!(rig.store.requests.load(Ordering::SeqCst), before);
+        assert_eq!(resident(&rig, 1).compaction.as_ref().unwrap().base_txid, 2);
+    });
+}
+
+#[test]
+fn a_wake_with_nothing_kept_falls_back_without_a_request() {
+    run(async {
+        let rig = rig_with(Some(EVERY_ROW));
+        first_lifetime(&rig).await;
+        // What a root that opened a facet keeps: a base and no lineage.
+        rig.ltx
+            .evict(CELL, 1, Retained::Base, None)
+            .await
+            .expect("eviction");
+
+        rig.store.down.store(true, Ordering::SeqCst);
+        let before = rig.store.requests.load(Ordering::SeqCst);
+        let error = rig
+            .ltx
+            .activate(options(1, false, true))
+            .await
+            .map(|_| ())
+            .expect_err("nothing to reopen");
+
+        assert!(error
+            .downcast_ref::<crate::replication::RetainedUnavailable>()
+            .is_some());
+        assert_eq!(rig.store.requests.load(Ordering::SeqCst), before);
+    });
+}
+
+#[test]
+fn a_wake_whose_database_the_cache_removed_falls_back_without_a_request() {
+    run(async {
+        let rig = rig_with(Some(EVERY_ROW));
+        first_lifetime(&rig).await;
+        rig.ltx
+            .evict(CELL, 1, Retained::Resumable, None)
+            .await
+            .expect("eviction");
+        rig.ltx.prune_local_cache(0).expect("prune");
+
+        rig.store.down.store(true, Ordering::SeqCst);
+        let before = rig.store.requests.load(Ordering::SeqCst);
+        let error = rig
+            .ltx
+            .activate(options(1, false, true))
+            .await
+            .map(|_| ())
+            .expect_err("the cache removed the database");
+
+        assert!(error
+            .downcast_ref::<crate::replication::RetainedUnavailable>()
+            .is_some());
+        assert_eq!(rig.store.requests.load(Ordering::SeqCst), before);
+    });
+}
+
+#[test]
+fn an_eviction_that_cannot_record_its_snapshot_keeps_only_a_base() {
+    run(async {
+        let (rig, refusals) = rig_refusing();
+        first_lifetime(&rig).await;
+
+        refusals.cut.store(true, Ordering::SeqCst);
+        rig.ltx
+            .evict(CELL, 1, Retained::Resumable, None)
+            .await
+            .expect("eviction");
+
+        // The next epoch can still take the base; a wake at this epoch cannot.
+        assert!(evicted(&rig, 1).is_file() && !meta(&rig, 1).exists());
+        let error = rig
+            .ltx
+            .activate(options(1, false, true))
+            .await
+            .map(|_| ())
+            .expect_err("no lineage to reopen");
+        assert!(error
+            .downcast_ref::<crate::replication::RetainedUnavailable>()
+            .is_some());
     });
 }
