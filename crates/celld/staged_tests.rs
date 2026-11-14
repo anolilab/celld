@@ -13,16 +13,7 @@ struct Fleet {
 /// The process runtime that blocking storage work runs on. It outlives every
 /// test, which each drive their own current-thread runtime.
 fn install_host_runtime() {
-    static HOST: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    HOST.get_or_init(|| {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("host runtime");
-        crate::asyncrt::set_host_handle(runtime.handle().clone());
-        runtime
-    });
+    crate::asyncrt::install_test_host_runtime();
 }
 
 fn fleet() -> Fleet {
