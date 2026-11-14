@@ -31,6 +31,9 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Segment reads a refresh keeps in flight.
+const SEGMENT_READS: usize = 16;
+
 /// How often a node lists `fleet/born/` for segments it has not read.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -56,7 +59,9 @@ fn parse_segment_key<'a>(prefix: &str, key: &'a str) -> Option<SegmentKey<'a>> {
     let (rest, seq) = rest.rsplit_once('/')?;
     let (node, generation) = rest.rsplit_once('/')?;
     // A pointer or snapshot object beside the segments is not a segment.
-    if seq.len() != 8 || !seq.bytes().all(|b| b.is_ascii_digit()) {
+    // `{seq:08}` is a minimum width: a process past 99,999,999 segments
+    // writes longer numbers.
+    if seq.len() < 8 || !seq.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     if node.is_empty() || generation.is_empty() {
@@ -160,13 +165,22 @@ impl CellDirectory {
                 })
                 .collect()
         };
-        for location in unseen {
-            let read = async { Ok::<_, anyhow::Error>(store.get(&location).await?.bytes().await?) };
-            let body = read
-                .await
-                .with_context(|| format!("read cell directory segment {location}"))?;
-            let cells = decode_segment(&body)
-                .with_context(|| format!("decode cell directory segment {location}"))?;
+        // A node that starts beside many segments reads them a batch at a
+        // time, so its first view does not take the sum of their latencies.
+        let mut reads = futures_util::stream::iter(unseen)
+            .map(|location| async move {
+                let read =
+                    async { Ok::<_, anyhow::Error>(store.get(&location).await?.bytes().await?) };
+                let body = read
+                    .await
+                    .with_context(|| format!("read cell directory segment {location}"))?;
+                let cells = decode_segment(&body)
+                    .with_context(|| format!("decode cell directory segment {location}"))?;
+                Ok::<_, anyhow::Error>((location, cells))
+            })
+            .buffer_unordered(SEGMENT_READS);
+        while let Some(read) = reads.next().await {
+            let (location, cells) = read?;
             let mut state = self.state.lock().unwrap();
             state.cells.extend(cells);
             state.seen.insert(location.to_string());
@@ -488,6 +502,11 @@ mod tests {
                 .node,
             "a/b"
         );
+        let past_width = segment_key("p/", "node-a", "g1", 100_000_000);
+        assert_eq!(
+            parse_segment_key("p/", &past_width).map(|key| key.seq),
+            Some(100_000_000)
+        );
     }
 
     #[test]
@@ -692,6 +711,30 @@ mod tests {
         let found = segments(&inner).await;
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].1.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_reads_more_segments_than_it_keeps_in_flight() {
+        let inner = Arc::new(InMemory::new());
+        let count = SEGMENT_READS * 3 + 1;
+        for seq in 0..count {
+            inner
+                .put(
+                    &Path::from(segment_key(PREFIX, "node-b", "g9", seq as u64)),
+                    PutPayload::from(format!("c{seq}\n")),
+                )
+                .await
+                .unwrap();
+        }
+        let reader = CellDirectory::new();
+        reader.refresh(inner.as_ref(), PREFIX, 10).await.unwrap();
+        for seq in 0..count {
+            assert_eq!(
+                reader.answer(&format!("c{seq}"), 11),
+                DirectoryAnswer::Exists
+            );
+        }
+        assert_eq!(reader.state.lock().unwrap().seen.len(), count);
     }
 
     #[tokio::test]
