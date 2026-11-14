@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use super::harness::{run_expecting_exit, Server};
+use super::harness::{client, run_expecting_exit, Server};
 
 const TOKEN: &str = "e2e-operator-token";
 
@@ -31,8 +31,18 @@ fn internal_routes() -> BTreeSet<String> {
         .lines()
         .find(|line| line.contains("const INTERNAL_LOG_APPEND_PATH"))
         .expect("the log append path is a constant");
+    // The log routes branch again inside their own handler.
+    let log = {
+        let start = source
+            .find("async fn internal_log(")
+            .expect("internal_log exists");
+        let end = source[start + 1..]
+            .find("\nasync fn ")
+            .map_or(source.len(), |offset| start + 1 + offset);
+        &source[start..end]
+    };
     let mut routes = BTreeSet::new();
-    for text in [handler, recovery, append] {
+    for text in [handler, recovery, append, log] {
         for (index, piece) in text.split('"').enumerate() {
             // Odd pieces are inside quotes.
             if index % 2 == 1
@@ -67,6 +77,7 @@ fn the_route_scan_finds_the_known_routes() {
         "/peer/tunnel",
         "/peer/log/seal",
         "/peer/log/append",
+        "/peer/log/stream",
         "/do/x",
         "/cell/x",
         "/evict/x",
@@ -80,7 +91,7 @@ fn the_route_scan_finds_the_known_routes() {
 #[tokio::test]
 async fn every_internal_route_requires_the_token() {
     let server = Server::start("do-ids", &[("CELLD_OPERATOR_TOKEN", TOKEN)]).await;
-    let client = reqwest::Client::new();
+    let client = client();
     let mut paths = internal_routes();
     paths.insert("/no/such/route".to_string());
     for path in &paths {
@@ -118,7 +129,7 @@ async fn every_internal_route_requires_the_token() {
 #[tokio::test]
 async fn the_token_opens_the_internal_listener() {
     let server = Server::start("do-ids", &[("CELLD_OPERATOR_TOKEN", TOKEN)]).await;
-    let client = reqwest::Client::new();
+    let client = client();
     let state = client
         .get(server.internal_url("/state").await)
         .bearer_auth(TOKEN)
@@ -138,7 +149,9 @@ async fn the_token_opens_the_internal_listener() {
 #[tokio::test]
 async fn without_a_token_the_listener_stays_open() {
     let server = Server::start("do-ids", &[]).await;
-    let state = reqwest::get(server.internal_url("/state").await)
+    let state = client()
+        .get(server.internal_url("/state").await)
+        .send()
         .await
         .unwrap();
     assert_eq!(state.status().as_u16(), 200);

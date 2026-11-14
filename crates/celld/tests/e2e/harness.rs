@@ -421,6 +421,9 @@ fn spawn(project: &Path, env: &[(String, String)], log: &Path) -> Child {
         .arg("dev")
         .arg(project)
         .args(["--no-watch", "--logs", "--port", "0"])
+        // A token in the runner's environment would gate every test node;
+        // a test that wants one passes it in `env`.
+        .env_remove("CELLD_OPERATOR_TOKEN")
         .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(log.try_clone().expect("clone log handle"))
@@ -430,7 +433,7 @@ fn spawn(project: &Path, env: &[(String, String)], log: &Path) -> Child {
         .expect("spawn celld")
 }
 
-fn client() -> reqwest::Client {
+pub fn client() -> reqwest::Client {
     // A request to a cell behind `blockConcurrencyWhile` waits for the hold,
     // so the timeout only bounds a hung server.
     reqwest::Client::builder()
