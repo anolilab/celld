@@ -56,6 +56,22 @@ pub(crate) const MAX_VIEW_AGE_MS: u64 = 3 * REFRESH_INTERVAL.as_millis() as u64;
 /// before it deletes anything is a multiple of this.
 pub(crate) const HEAD_TTL_MS: u64 = 60_000;
 
+/// Refuse a batch window that a first write could not outlast. A write that
+/// waits a whole window for its segment fails its durability deadline at
+/// half of it or less once the segment PUT and a second window behind a
+/// flush in flight are counted, and a write that misses the deadline is never
+/// tiered.
+pub(crate) fn check_batch_window(batch_ms: u64, durability_timeout_ms: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        batch_ms < durability_timeout_ms / 2,
+        "CELLD_CELL_DIRECTORY_BATCH_MS={batch_ms} must be below half of \
+         CELLD_LTX_DURABILITY_TIMEOUT_SECS ({durability_timeout_ms} ms): a cell's first LTX \
+         write would otherwise wait out the batch window and miss its durability deadline, \
+         and nothing would reach the bucket"
+    );
+    Ok(())
+}
+
 #[derive(Debug)]
 struct TailSegment {
     id: u64,
@@ -374,6 +390,18 @@ mod tests {
     use celld_logic::cell_directory::Record;
     use object_store::memory::InMemory;
     use object_store::ObjectStoreExt as _;
+
+    #[test]
+    fn a_batch_window_at_or_above_half_the_durability_budget_is_refused() {
+        assert!(check_batch_window(0, 10_000).is_ok());
+        assert!(check_batch_window(4_999, 10_000).is_ok());
+        for batch_ms in [5_000, 10_000, 60_000] {
+            let error = check_batch_window(batch_ms, 10_000).unwrap_err().to_string();
+            assert!(error.contains("CELLD_CELL_DIRECTORY_BATCH_MS"), "{error}");
+        }
+        assert!(check_batch_window(30_000, 60_000).is_err());
+        assert!(check_batch_window(29_999, 60_000).is_ok());
+    }
 
     #[tokio::test]
     async fn a_refresh_reads_more_segments_than_it_keeps_in_flight() {
