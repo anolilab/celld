@@ -2022,12 +2022,10 @@ impl ContainerEngine {
         let Ok(info) = reply.json() else {
             return false;
         };
-        let (Some(id), labels) = (
-            info.get("Id").and_then(Value::as_str),
-            info.pointer("/Config/Labels"),
-        ) else {
+        let Some(id) = info.get("Id").and_then(Value::as_str) else {
             return false;
         };
+        let labels = info.pointer("/Config/Labels");
         let label = |key: &str| labels.and_then(|labels| labels.get(key)?.as_str());
         let ours = label("celld.node") == Some(self.node.as_str())
             && label("celld.cell") == Some(cell.scope.as_str());
