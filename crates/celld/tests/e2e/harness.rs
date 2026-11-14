@@ -2,7 +2,8 @@
 //!
 //! Every test copies its fixture into a private temp directory, because
 //! `celld dev` writes `.celld/` into the project it serves, and runs the real
-//! binary on a port of its own, so tests can run in parallel.
+//! binary on an ephemeral port of its own (`--port 0`), so tests can run in
+//! parallel.
 
 // The harness drives a child process from the outside, so it is not part of the
 // execution boundary that the disallowed-methods policy protects.
@@ -10,7 +11,6 @@
 
 use std::fs;
 use std::future::Future;
-use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -183,14 +183,14 @@ impl Server {
         fs::read_to_string(&self.log).unwrap_or_default()
     }
 
-    /// Picks a free port and starts the process, retrying when the port was
-    /// taken between the reservation and the bind.
+    /// Starts the process on an ephemeral port, which it reports once it is
+    /// listening, and retries a start that did not come up.
     async fn launch(&mut self) {
         let mut last = String::new();
         for attempt in 1..=START_ATTEMPTS {
-            self.port = free_port();
+            self.port = 0;
             let spawned = Instant::now();
-            self.child = Some(spawn(&self.project, self.port, &self.env, &self.log));
+            self.child = Some(spawn(&self.project, &self.env, &self.log));
             match self.wait_ready().await {
                 Ok(()) => {
                     self.boot = spawned.elapsed();
@@ -207,17 +207,22 @@ impl Server {
 
     async fn wait_ready(&mut self) -> Result<(), String> {
         let deadline = Instant::now() + READY_TIMEOUT;
-        let url = self.url(READY_PATH);
         loop {
             let child = self.child.as_mut().expect("child is running");
             if let Some(status) = child.try_wait().expect("poll celld") {
                 return Err(format!("celld exited early: {status}"));
             }
-            if let Ok(response) = self.client.get(&url).send().await {
-                if response.status().is_success()
-                    && response.text().await.is_ok_and(|body| body == READY_BODY)
-                {
-                    return Ok(());
+            if self.port == 0 {
+                self.port = announced_port(&self.log).unwrap_or(0);
+            }
+            let url = self.url(READY_PATH);
+            if self.port != 0 {
+                if let Ok(response) = self.client.get(&url).send().await {
+                    if response.status().is_success()
+                        && response.text().await.is_ok_and(|body| body == READY_BODY)
+                    {
+                        return Ok(());
+                    }
                 }
             }
             if Instant::now() >= deadline {
@@ -311,7 +316,7 @@ pub fn run_expecting_exit(fixture: &str, env: &[(&str, &str)]) -> Exited {
     let project = dir.path().join("project");
     copy_dir(&fixture_dir(fixture), &project);
     let log_path = dir.path().join("celld.log");
-    let mut child = spawn(&project, free_port(), &owned_env(env), &log_path);
+    let mut child = spawn(&project, &owned_env(env), &log_path);
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll celld") {
@@ -391,13 +396,12 @@ fn signal_group(pgid: u32, signal: &str) {
 
 /// Starts `celld dev` on `project`, with its output going to `log`. The child
 /// leads a process group of its own, so the whole tree can be signalled.
-fn spawn(project: &Path, port: u16, env: &[(String, String)], log: &Path) -> Child {
+fn spawn(project: &Path, env: &[(String, String)], log: &Path) -> Child {
     let log = fs::File::create(log).expect("create log file");
     Command::new(CELLD)
         .arg("dev")
         .arg(project)
-        .args(["--no-watch", "--logs", "--port"])
-        .arg(port.to_string())
+        .args(["--no-watch", "--logs", "--port", "0"])
         .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(log.try_clone().expect("clone log handle"))
@@ -422,14 +426,14 @@ fn owned_env(env: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// `celld dev --port 0` is refused, so the port is reserved here and handed
-/// over after the listener is dropped.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("read local address")
-        .port()
+/// The port `celld dev` reports in the line that announces it ready, once the
+/// log has one.
+fn announced_port(log: &Path) -> Option<u16> {
+    let text = fs::read_to_string(log).ok()?;
+    let line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("ready"))?;
+    line.rsplit(':').next()?.trim().parse().ok()
 }
 
 fn fixture_dir(name: &str) -> PathBuf {

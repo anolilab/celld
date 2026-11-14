@@ -338,7 +338,7 @@ A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
 as for wrangler dev. Without one, .env and then .env.local supply them, and\n\
 an entry of these files that cannot be a binding is skipped with a warning.\n\
 The entries override the vars of the config.\n\n\
-OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT})\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
+OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port, or 0 for a free one (default: {DEFAULT_PORT})\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
 }
@@ -378,9 +378,6 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
                 port = value
                     .parse::<u16>()
                     .with_context(|| format!("invalid --port value {value:?}"))?;
-                if port == 0 {
-                    bail!("--port must be between 1 and 65535");
-                }
             }
             other if other.starts_with('-') => bail!("unknown argument for `celld dev`: {other}"),
             value if project.is_none() => project = Some(PathBuf::from(value)),
@@ -627,6 +624,9 @@ async fn run_stack(
         console,
     )
     .await?;
+    // A reload restarts the node on the address the first start resolved, so a
+    // port chosen for `--port 0` stays the one the operator was told.
+    let listener = running.listener;
 
     loop {
         match wait_for_node_event(&mut running.child, &mut signals, watcher.as_mut()).await? {
@@ -649,15 +649,8 @@ async fn run_stack(
                 }
                 console.progress("restarting the application");
                 stop_running_node(running).await;
-                running = start_node(
-                    state,
-                    options.listener,
-                    options.logs,
-                    project_hash,
-                    store,
-                    console,
-                )
-                .await?;
+                running =
+                    start_node(state, listener, options.logs, project_hash, store, console).await?;
             }
         }
     }
@@ -665,6 +658,9 @@ async fn run_stack(
 
 struct RunningNode {
     child: Child,
+    /// The address the node listens on, with the port it was given when the
+    /// request was for port 0.
+    listener: SocketAddr,
     internal: String,
     output: tokio::task::JoinHandle<()>,
 }
@@ -766,14 +762,21 @@ async fn start_node(
         .take()
         .expect("the local node was configured with piped output");
     let (internal_tx, internal_rx) = oneshot::channel();
+    let (listener_tx, listener_rx) = oneshot::channel();
     let output_console = *console;
     let output = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         let mut internal_tx = Some(internal_tx);
+        let mut listener_tx = Some(listener_tx);
         while let Ok(Some(line)) = lines.next_line().await {
             if let Some(origin) = internal_origin(&line) {
                 if let Some(sender) = internal_tx.take() {
                     let _ = sender.send(origin);
+                }
+            }
+            if let Some(address) = listener_address(&line) {
+                if let Some(sender) = listener_tx.take() {
+                    let _ = sender.send(address);
                 }
             }
             if logs || line.contains(" ERROR ") {
@@ -796,6 +799,16 @@ async fn start_node(
         }
     };
 
+    // The node prints its public address before its internal one, so by now the
+    // line has been read; the channel holds it.
+    let listener = match listener_rx.await {
+        Ok(address) => address,
+        Err(_) => {
+            stop_child(&mut child, Some(&internal)).await;
+            let _ = output.await;
+            bail!("the local node exited before it announced its listener");
+        }
+    };
     if let Err(error) = wait_for_node(&mut child, listener).await {
         stop_child(&mut child, Some(&internal)).await;
         let _ = output.await;
@@ -804,9 +817,19 @@ async fn start_node(
     console.ready(&format!("http://{listener}"));
     Ok(RunningNode {
         child,
+        listener,
         internal,
         output,
     })
+}
+
+/// The address in the line the node prints once its public listener is bound.
+fn listener_address(line: &str) -> Option<SocketAddr> {
+    line.strip_prefix("celld listening on ")?
+        .split_once(' ')?
+        .0
+        .parse()
+        .ok()
 }
 
 fn internal_origin(line: &str) -> Option<String> {
@@ -908,5 +931,47 @@ async fn stop_child(child: &mut Child, internal: Option<&str>) {
     let waited = tokio::time::timeout(Duration::from_secs(35), child.wait()).await;
     if waited.is_err() {
         let _ = child.kill().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> anyhow::Result<Option<Options>> {
+        options_from_arguments(
+            arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn port_zero_asks_for_a_free_port() {
+        let options = parse(&["--port", "0"]).unwrap().unwrap();
+        assert_eq!(options.stack.listener.port(), 0);
+    }
+
+    #[test]
+    fn a_port_out_of_range_is_refused() {
+        assert!(parse(&["--port", "65536"]).is_err());
+        assert!(parse(&["--port", "-1"]).is_err());
+    }
+
+    #[test]
+    fn the_public_address_is_read_from_the_announce_line() {
+        assert_eq!(
+            listener_address("celld listening on 127.0.0.1:55421 (ownership=dev)"),
+            Some("127.0.0.1:55421".parse().unwrap())
+        );
+        assert_eq!(
+            listener_address("celld listening on [::1]:8080 (ownership=dev)"),
+            Some("[::1]:8080".parse().unwrap())
+        );
+        assert_eq!(
+            listener_address("celld internal listening on 127.0.0.1:1 (advertise=x)"),
+            None
+        );
     }
 }
