@@ -465,6 +465,15 @@ struct CellState {
     /// the label and not the id. It is cleared when the start takes the
     /// container for its run, or the engine answers that it created none.
     starting: BTreeMap<u64, String>,
+    /// The newest run whose container a stop took, at the moment it saw the
+    /// cell unattached and under the same hold of the lock. Nothing of that
+    /// run is used from then on, whatever an earlier look at the container
+    /// says: it stays set after the removal, so a stale answer cannot undo it.
+    committed: u64,
+    /// The containers a stop is removing now, by run, until it is done with
+    /// them. They are not the cell's to remove again, and the name they hold
+    /// is not free yet.
+    stopping: BTreeMap<u64, String>,
 }
 
 impl Address {
@@ -559,21 +568,39 @@ impl CellContainer {
     /// effect runs, or the monitor would find the previous run's exit and
     /// report the new container dead on arrival.
     pub fn begin_run(&self) -> u64 {
-        self.begin_run_after(None)
+        self.begin_run_after(None, None)
             .expect("a run opens when no run is required")
     }
 
     /// Open the next run if `seen` is still the newest, or whatever the
     /// newest is when `seen` is `None`. `None` when a newer run opened.
-    fn begin_run_after(&self, seen: Option<u64>) -> Option<u64> {
+    ///
+    /// `adopting` is a container the engine still runs that the new run takes
+    /// as its own. It is taken in the same hold of the lock that opens the run,
+    /// and only if no stop has taken it: the answer that named it may be older
+    /// than the stop. `None` then too.
+    fn begin_run_after(&self, seen: Option<u64>, adopting: Option<&str>) -> Option<u64> {
         let mut state = self.state.lock().unwrap();
         if seen.is_some_and(|seen| state.run != seen) {
             return None;
+        }
+        if let Some(id) = adopting {
+            let owner = state
+                .containers
+                .iter()
+                .find_map(|(run, held)| (held == id).then_some(*run))?;
+            if owner <= state.committed {
+                return None;
+            }
         }
         state.run += 1;
         state.running = true;
         state.address = Address::None;
         let run = state.run;
+        if let Some(id) = adopting {
+            state.containers.retain(|_, held| held != id);
+            state.containers.insert(run, id.to_string());
+        }
         drop(state);
         // The exit of an earlier run stays: `monitor()` takes an exit only
         // from the run it was asked about or a later one, and a monitor that
@@ -791,14 +818,21 @@ impl CellContainer {
         (state.run, state.containers.values().next_back().cloned())
     }
 
-    /// The containers of the runs before `run`, which no call can still mean.
+    /// The containers of the runs before `run`, which no call can still mean,
+    /// except those a stop is removing: that stop answers for them.
     fn containers_before(&self, run: u64) -> Vec<(u64, String)> {
         let state = self.state.lock().unwrap();
         state
             .containers
             .range(..run)
+            .filter(|(run, _)| !state.stopping.contains_key(run))
             .map(|(run, id)| (*run, id.clone()))
             .collect()
+    }
+
+    /// Whether a stop is removing a container of this cell.
+    fn stop_in_flight(&self) -> bool {
+        !self.state.lock().unwrap().stopping.is_empty()
     }
 
     /// The engine removed the container `run` created.
@@ -813,7 +847,7 @@ impl CellContainer {
     /// running: what an exec may be sent to.
     fn running_container(&self, run: u64) -> anyhow::Result<String> {
         let state = self.state.lock().unwrap();
-        if state.run != run {
+        if state.run != run || run <= state.committed {
             return Err(anyhow!(
                 "exec() requires a running container: the container of this run ended"
             ));
@@ -885,6 +919,29 @@ impl StartGuard {
 impl Drop for StartGuard {
     fn drop(&mut self) {
         self.cell.abandon_start(self.run);
+    }
+}
+
+/// Held while a stop removes the container it took. However the stop ends,
+/// whether it failed or its future was dropped, a container still tracked is
+/// the engine's worker's from here, whatever became of the cell: the cell
+/// no longer uses it and nothing else would remove it.
+struct StopGuard<'a> {
+    cell: &'a CellContainer,
+    run: u64,
+    id: String,
+}
+
+impl Drop for StopGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.cell.state.lock().unwrap();
+        state.stopping.remove(&self.run);
+        if state.containers.get(&self.run) == Some(&self.id) {
+            state.containers.remove(&self.run);
+            self.cell
+                .removals
+                .add(&self.cell.name, Target::Id(self.id.clone()));
+        }
     }
 }
 
@@ -1799,8 +1856,8 @@ impl ContainerEngine {
         // began. A start that opens a newer run meanwhile owns the state from
         // then on, and an answer about the older container is not its own.
         let (seen, id) = cell.observe();
-        let running = match id {
-            Some(id) => self.inspect_running(&id).await?,
+        let running = match &id {
+            Some(id) => self.inspect_running(id).await?,
             None => None,
         };
         // A container this handle started and no longer tracks as running,
@@ -1809,16 +1866,25 @@ impl ContainerEngine {
         // because opening one clears it.
         let mut run = seen;
         if let (true, Some((id, _))) = (running.is_some() && !cell.running(), &running) {
-            let Some(adopted) = cell.begin_run_after(Some(seen)) else {
+            let Some(adopted) = cell.begin_run_after(Some(seen), Some(id)) else {
                 return Ok(cell);
             };
             run = adopted;
             cell.settle_start(run, Started::Ready);
-            cell.record_container(run, id.clone());
             self.watch_exit(&cell, run, id.clone());
         }
+        // A stop that took the run's container since the inspection began
+        // has ended the run, and the answer is not about anything the cell
+        // may use. Nor is it about a newer run when the container is an
+        // earlier run's, which the newest container the cell tracks can be.
         let mut state = cell.state.lock().unwrap();
-        if state.run == run {
+        let usable = id.as_ref().is_none_or(|id| {
+            state
+                .containers
+                .iter()
+                .any(|(owner, held)| held == id && *owner > state.committed)
+        });
+        if usable && state.run == run && run > state.committed {
             state.running = running.is_some();
             state.address = running.map(|(_, address)| address).unwrap_or_default();
         }
@@ -2281,10 +2347,16 @@ impl ContainerEngine {
                 Some(body.clone()),
             )
             .await?;
-        for _ in 0..20 {
-            if reply.status.as_u16() != 409 {
-                break;
-            }
+        // A stop that is removing the container of an earlier run holds the
+        // name until the engine is done with it, for as long as the engine
+        // takes: the start waits for that rather than make a second container
+        // under the name, or remove what the stop answers for.
+        let deadline = asyncrt::mono_ms() + self.docker.lifecycle_timeout().as_millis() as u64;
+        let mut tries = 0;
+        while reply.status.as_u16() == 409
+            && (tries < 20 || (cell.stop_in_flight() && asyncrt::mono_ms() < deadline))
+        {
+            tries += 1;
             cell.end_create(run);
             asyncrt::sleep(Duration::from_millis(100)).await;
             self.remove_earlier_containers(cell, run).await;
@@ -2406,13 +2478,45 @@ impl ContainerEngine {
                 Err(error) => earlier_failure = earlier_failure.or(Some(error)),
             }
         }
-        if stopping.is_some_and(|stopping| cell.state.lock().unwrap().attached != stopping) {
-            return earlier_failure.map_or(Ok(()), Err);
+        // A stop takes the run's container under the hold of the lock that
+        // shows the cell unattached, and the run ends there: a cell that
+        // attaches afterwards finds nothing of it to use.
+        let mut taken = None;
+        let mut ended_before_it_started = false;
+        if let Some(stopping) = stopping {
+            let mut state = cell.state.lock().unwrap();
+            if state.attached != stopping || state.stopping.contains_key(&run) {
+                drop(state);
+                return earlier_failure.map_or(Ok(()), Err);
+            }
+            state.committed = state.committed.max(run);
+            taken = state.containers.get(&run).cloned();
+            if let Some(id) = &taken {
+                state.stopping.insert(run, id.clone());
+            }
+            if state.run == run {
+                state.running = false;
+                state.address = Address::None;
+                ended_before_it_started = cell.settle_start(
+                    run,
+                    Started::Failed("the container was destroyed before it started".to_string()),
+                );
+            }
         }
+        if ended_before_it_started {
+            cell.publish_exit(run, Ok(DESTROYED_EXIT_CODE));
+        }
+        let _hold = taken.as_ref().map(|id| StopGuard {
+            cell,
+            run,
+            id: id.clone(),
+        });
         // A run whose container the engine has not answered the create of has
         // none to remove here: its start removes the container when it finds
         // the run ended.
-        if let Some(id) = cell.container_id(run) {
+        if let Some(id) =
+            taken.or_else(|| stopping.is_none().then(|| cell.container_id(run)).flatten())
+        {
             // Kill first so the wait task reports 137 before the removal makes
             // the container disappear under it. The removal is forced and ends
             // the container anyway, so a kill that failed need not stop it.
@@ -4220,10 +4324,11 @@ mod engine_tests {
         });
     }
 
-    // A stop whose destroy fails while an activation keeps the handle must
-    // not hand a container the live handle tracks to the worker.
+    // A stop that took the run's container and could not remove it hands the
+    // container to the worker, though an activation keeps the handle: the
+    // cell no longer uses that run, and the object asks again at no cost.
     #[test]
-    fn a_failed_stop_that_leaves_the_handle_keeps_the_runs_container() {
+    fn a_failed_stop_that_leaves_the_handle_hands_its_container_to_the_worker() {
         let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
         let cell = rig.cell("Runner:one");
         rig.start(&cell);
@@ -4242,13 +4347,14 @@ mod engine_tests {
         rig.runtime.block_on(async { stopping.await.unwrap() });
         assert!(rig.engine.cell("Runner:one").is_some());
         assert!(
-            rig.engine.removals.pending().is_empty(),
-            "the live run's container was handed to the worker"
+            cell.container_id(1).is_none(),
+            "the run kept a container the stop took"
         );
-        assert!(cell.container_id(1).is_some(), "the run lost its container");
+        rig.wait_for("the worker to remove the container", |fake| {
+            fake.live_ids().is_empty()
+        });
         // The object can ask again.
         rig.runtime.block_on(rig.engine.destroy(&cell, 1)).unwrap();
-        assert!(rig.fake.live_ids().is_empty());
     }
 
     // A container under the cell's name that nothing tracks any more must not
@@ -4460,6 +4566,188 @@ mod engine_tests {
             [own],
             "the returned run's container went"
         );
+    }
+
+    /// Start a stop of the cell that the engine holds at the kill, and wait
+    /// until it is there.
+    fn stop_held_at_the_kill(
+        rig: &Rig,
+        cell: &Arc<CellContainer>,
+        hold: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        rig.fake.delay_next_kill(hold);
+        let (engine, cell) = (rig.engine.clone(), cell.clone());
+        let stopping = rig.runtime.spawn(async move { engine.forget(&cell).await });
+        rig.wait_for("the stop to reach the engine", |fake| {
+            fake.requests().iter().any(|r| r.ends_with("/kill"))
+        });
+        stopping
+    }
+
+    // A cell that comes back while a stop is killing its container must not
+    // take that container for its own: it starts a new run.
+    #[test]
+    fn a_cell_that_returns_during_a_stop_gets_a_new_run_not_the_dying_container() {
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
+        let scope = "Runner:one";
+        let cell = rig.cell(scope);
+        let run = rig.start(&cell);
+        let dying = cell.container_id(run).unwrap();
+        let stopping = stop_held_at_the_kill(&rig, &cell, Duration::from_millis(600));
+        let spec = cell.spec.clone();
+        rig.runtime
+            .block_on(rig.engine.attach_cell(scope, spec))
+            .unwrap();
+        assert!(!cell.running(), "the cell took the container being killed");
+        assert!(cell.address(80).is_err());
+        assert_eq!(cell.current_run(), run, "the dying container was adopted");
+        let error = cell.running_container(run).unwrap_err();
+        assert!(error.to_string().contains("ended"), "{error:#}");
+        let fresh = {
+            let (handle, next) = rig.engine.open_run(scope).unwrap();
+            rig.runtime
+                .block_on(rig.engine.start(&handle, next, Rig::params(None)))
+                .unwrap();
+            next
+        };
+        rig.runtime.block_on(async { stopping.await.unwrap() });
+        let own = cell.container_id(fresh).unwrap();
+        assert_ne!(own, dying);
+        assert_eq!(rig.fake.live_ids(), [own]);
+        assert!(cell.running());
+    }
+
+    // An inspection that is held in the engine while the stop commits says
+    // the container is running when it reaches the cell. It must not make
+    // the cell running again, nor have the cell adopt the container.
+    #[test]
+    fn an_inspection_in_flight_while_a_stop_commits_cannot_revive_the_cell() {
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
+        let scope = "Runner:one";
+        let cell = rig.cell(scope);
+        let run = rig.start(&cell);
+        // The engine holds the inspection while the stop commits and is held
+        // at its kill, and answers it once the container is taken.
+        rig.fake.delay_next_inspect(Duration::from_millis(500));
+        let attaching = {
+            let (engine, spec) = (rig.engine.clone(), cell.spec.clone());
+            rig.runtime
+                .spawn(async move { engine.attach_cell(scope, spec).await })
+        };
+        rig.wait_for("the inspection to reach the engine", |fake| {
+            fake.requests()
+                .iter()
+                .any(|r| r.starts_with("GET /containers/id-celld") && r.ends_with("/json"))
+        });
+        let stopping = stop_held_at_the_kill(&rig, &cell, Duration::from_millis(1500));
+        rig.runtime
+            .block_on(async { attaching.await.unwrap().unwrap() });
+        assert!(!cell.running(), "a stale inspection revived the cell");
+        assert_eq!(cell.current_run(), run, "the dying container was adopted");
+        rig.runtime.block_on(async { stopping.await.unwrap() });
+        assert!(rig.fake.live_ids().is_empty());
+    }
+
+    // The newest container the cell tracks can be the one of an earlier run
+    // that a stop is removing, while a newer run has opened. What an attach
+    // learns of that container is not about the newer run.
+    #[test]
+    fn an_attach_does_not_give_a_newer_run_the_address_of_the_container_a_stop_took() {
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
+        let scope = "Runner:one";
+        let cell = rig.cell(scope);
+        let run = rig.start(&cell);
+        let stopping = stop_held_at_the_kill(&rig, &cell, Duration::from_millis(600));
+        let (handle, next) = rig.engine.open_run(scope).unwrap();
+        assert!(next > run);
+        rig.runtime
+            .block_on(rig.engine.attach_cell(scope, handle.spec.clone()))
+            .unwrap();
+        assert!(
+            matches!(cell.state.lock().unwrap().address, Address::None),
+            "the newer run took the address of the container being removed"
+        );
+        rig.runtime.block_on(async { stopping.await.unwrap() });
+    }
+
+    // A stop that took the container and could not remove it leaves it to the
+    // removal worker, though the cell has come back and keeps its handle.
+    #[test]
+    fn a_committed_container_that_will_not_go_is_left_to_the_worker_though_the_cell_returned() {
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
+        let scope = "Runner:one";
+        let cell = rig.cell(scope);
+        let run = rig.start(&cell);
+        rig.fake.fail_next_delete("daemon is overloaded");
+        let stopping = stop_held_at_the_kill(&rig, &cell, Duration::from_millis(300));
+        let spec = cell.spec.clone();
+        rig.runtime
+            .block_on(rig.engine.attach_cell(scope, spec))
+            .unwrap();
+        rig.runtime.block_on(async { stopping.await.unwrap() });
+        assert!(
+            rig.engine.cell(scope).is_some(),
+            "the returned cell lost its handle"
+        );
+        assert!(
+            cell.container_id(run).is_none(),
+            "the cell still holds the container it let go"
+        );
+        rig.wait_for("the worker to remove the container", |fake| {
+            fake.live_ids().is_empty()
+        });
+    }
+
+    // An exec for a run whose container a stop has taken fails from then on,
+    // though the engine has not removed the container yet.
+    #[test]
+    fn exec_on_a_run_a_stop_has_taken_says_the_run_ended() {
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
+        let cell = rig.cell("Runner:one");
+        let run = rig.start(&cell);
+        let stopping = stop_held_at_the_kill(&rig, &cell, Duration::from_millis(500));
+        let error = rig
+            .runtime
+            .block_on(rig.engine.exec(&cell, run, exec_params()))
+            .err()
+            .expect("the exec reached a container a stop had taken");
+        assert!(error.to_string().contains("ended"), "{error:#}");
+        rig.runtime.block_on(async { stopping.await.unwrap() });
+        assert!(rig.fake.exec_targets().is_empty());
+    }
+
+    // A start that follows a stop waits for the stop to finish with the
+    // container that holds the name, and never makes a second one under it.
+    #[test]
+    fn a_start_after_a_committed_stop_waits_for_the_name_and_makes_one_container() {
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
+        let scope = "Runner:one";
+        let cell = rig.cell(scope);
+        let run = rig.start(&cell);
+        let dying = cell.container_id(run).unwrap();
+        // Longer than the twenty tries a start makes at a name that is taken.
+        rig.fake.delay_next_delete(Duration::from_millis(3000));
+        let stopping = stop_held_at_the_kill(&rig, &cell, Duration::from_millis(100));
+        let spec = cell.spec.clone();
+        rig.runtime
+            .block_on(rig.engine.attach_cell(scope, spec))
+            .unwrap();
+        let (handle, next) = rig.engine.open_run(scope).unwrap();
+        rig.runtime
+            .block_on(rig.engine.start(&handle, next, Rig::params(None)))
+            .unwrap();
+        rig.runtime.block_on(async { stopping.await.unwrap() });
+        let own = cell.container_id(next).unwrap();
+        assert_ne!(own, dying);
+        assert_eq!(rig.fake.live_ids(), [own]);
+        assert!(cell.running());
+        let removals = rig
+            .fake
+            .requests()
+            .iter()
+            .filter(|r| **r == format!("DELETE /containers/{dying}"))
+            .count();
+        assert_eq!(removals, 1, "the start removed what the stop was removing");
     }
 
     // When the run's own container will not go either, the error that reaches
