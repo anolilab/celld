@@ -632,6 +632,7 @@ fn fetch_request_error(error: &reqwest::Error) -> String {
     }
 }
 
+mod scoping;
 #[doc(hidden)]
 pub mod websocket;
 use crate::host_channels::GateRefusal;
@@ -2190,6 +2191,8 @@ struct ActorRuntimeState {
     resource_limits: Option<ResourceLimits>,
     tail_reporting: bool,
     script_name: String,
+    /// What the script declared it may address; see [`scoping`].
+    declared: scoping::Declared,
     event_hooks: OnceLock<EventHooks>,
     /// See [`internals`].
     internals: OnceLock<v8::Global<v8::Object>>,
@@ -5352,6 +5355,7 @@ impl Worker {
             resource_limits: config.resource_limits,
             tail_reporting: config.tail_reporting,
             script_name: script_name.to_string(),
+            declared: scoping::Declared::of(&config),
             ..Default::default()
         });
         let loader_owner = LoaderOwner::fresh(script_name, config.generation);
@@ -5960,6 +5964,12 @@ macro_rules! ops {
                     args: v8::FunctionCallbackArguments<'s>,
                     rv: v8::ReturnValue<'s, v8::Value>,
                 ) {
+                    const CELL_ARG: Option<usize> = scoping::cell_scope_arg($name);
+                    if let Some(index) = CELL_ARG {
+                        if !scoping::own_cell_arg(scope, &args, index) {
+                            return;
+                        }
+                    }
                     let before = asyncrt::spawn_count();
                     $op(scope, args, rv);
                     if asyncrt::spawn_count() != before {
@@ -6136,6 +6146,7 @@ ops! { OP_NAMES, install_op_functions,
         "__ws_send_binary" => websocket::op_ws_send_binary,
         "__ws_close" => websocket::op_ws_close,
         "__ws_alloc" => websocket::op_ws_alloc,
+        "__cell_delegate" => scoping::op_cell_delegate,
         "__ws_prepare_worker_handoff" => websocket::op_ws_prepare_worker_handoff,
         "__ws_accept" => websocket::op_ws_accept,
         "__ws_accept_regular" => websocket::op_ws_accept_regular,
@@ -8097,6 +8108,9 @@ fn op_do_call_impl(
     cancellable: bool,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    if !scoping::may_address(scope, &cell) {
+        return;
+    }
     let name_value = args.get(1);
     let name = (!name_value.is_null_or_undefined()).then(|| name_value.to_rust_string_lossy(scope));
     let url = args.get(2).to_rust_string_lossy(scope);
@@ -8348,6 +8362,9 @@ fn op_rpc_call(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    if !scoping::may_address(scope, &cell) {
+        return;
+    }
     let name_value = args.get(1);
     let name = (!name_value.is_null_or_undefined()).then(|| name_value.to_rust_string_lossy(scope));
     let method = args.get(2).to_rust_string_lossy(scope);
@@ -10070,6 +10087,11 @@ pub struct IoContext {
     /// yet can be taken only by the event that allocated it, so a script
     /// cannot claim an id another event is about to use.
     allocated_sockets: Mutex<HashSet<u64>>,
+    /// Cells whose capability this event is calling right now: the harness
+    /// names the cell that minted the stub, from its own record of it, for the
+    /// length of the call. The cell's ops then answer this event too, because
+    /// a same-isolate stub runs the target's code inside the caller's event.
+    delegated_cells: Mutex<HashMap<String, usize>>,
     /// Input-gate holds and pending acquisitions for this event.
     ///
     /// The event owns the cell and host id together, and retirement wakes a
@@ -10313,6 +10335,7 @@ impl IoContext {
             rewriters: Mutex::new(Vec::new()),
             tcp_sockets: Mutex::new(Vec::new()),
             allocated_sockets: Mutex::new(HashSet::new()),
+            delegated_cells: Mutex::new(HashMap::new()),
             input_gates: Mutex::new(InputGateClaims::default()),
             cross_entry_gates: CrossEntryGateClaims::default(),
             body_streams: Mutex::new(HashMap::new()),
@@ -10346,6 +10369,7 @@ impl IoContext {
             rewriters: Mutex::new(Vec::new()),
             tcp_sockets: Mutex::new(Vec::new()),
             allocated_sockets: Mutex::new(HashSet::new()),
+            delegated_cells: Mutex::new(HashMap::new()),
             input_gates: Mutex::new(InputGateClaims::default()),
             cross_entry_gates: CrossEntryGateClaims::default(),
             body_streams: Mutex::new(HashMap::new()),

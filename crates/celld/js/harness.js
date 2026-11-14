@@ -4676,19 +4676,29 @@ const __stubOp = (meta, path, args) => {
           entry.section !== block.holder))
         await __gate_wait(cell);
     }
-    const reply = await __ctxRun(entry.ctx,
-      () => __rpcRun(async () => {
-        const decoded =
-          argsSc === null ? null : __rpcDesArgs(argsSc);
-        try {
-          return await __rpcWalk(entry.target, path,
-            decoded === null ? null : decoded.args, false);
-        } finally {
-          if (decoded !== null)
-            for (const handle of decoded.received)
-              __disposeStub(handle);
-        }
-      }, true));
+    // The target runs inside the caller's event, and its code acts on the
+    // cell that minted it. The host is told so for the length of the call:
+    // `entry.scope` is the harness's own record, which no script can write.
+    const delegated = entry.scope;
+    if (delegated !== undefined) __cell_delegate(delegated, true);
+    let reply;
+    try {
+      reply = await __ctxRun(entry.ctx,
+        () => __rpcRun(async () => {
+          const decoded =
+            argsSc === null ? null : __rpcDesArgs(argsSc);
+          try {
+            return await __rpcWalk(entry.target, path,
+              decoded === null ? null : decoded.args, false);
+          } finally {
+            if (decoded !== null)
+              for (const handle of decoded.received)
+                __disposeStub(handle);
+          }
+        }, true));
+    } finally {
+      if (delegated !== undefined) __cell_delegate(delegated, false);
+    }
     if (__abortedCtxs.size !== 0) {
       const aborted = __abortedCtxs.get(entry.ctx);
       if (aborted !== undefined)

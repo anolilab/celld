@@ -22,6 +22,7 @@ mod e2e {
     pub mod ownership;
     pub mod rpc_streams;
     pub mod runtime_pool;
+    pub mod scoping;
     pub mod sockets;
     pub mod version;
     pub mod webcrypto;

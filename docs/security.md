@@ -386,6 +386,42 @@ Object accepts, sockets a Worker returns in a `101` response, and sockets a
 Worker obtains from a `stub.fetch()` upgrade work as before. The rules apply
 inside one process, so a rolling upgrade has no mixed-version window.
 
+## Declared cells
+
+A scope, a namespace key and a Durable Object id are strings a script can
+write down, and the id key is derived from the namespace key, so any script can
+compute a valid id for any namespace. celld therefore does not treat them as
+proof of a right to reach a cell. Two rules come from the host:
+
+- An operation that acts on "the cell" acts on the cell whose event is
+  running: storage, SQL, alarms, a facet's parent, and containers refuse a
+  scope that names another cell, and a SQL or key-listing cursor answers only
+  the cell that opened it.
+- A call to another cell goes only to a cell the script declared: an instance
+  of one of its Durable Object classes whose id that class's own namespace
+  derived, or exactly the D1 database, KV namespace or Queue that one of its
+  bindings (or queue consumers) names. A namespace built by hand, or an id
+  built for another namespace key, reaches nothing it does not already declare.
+
+A call to a capability another cell minted (an `RpcTarget` or a function that a
+cell returned) acts on that cell for the length of the call, because a
+same-isolate stub runs the target's code inside the caller's event. The D1, KV
+and Queue cells are exempt from the declared-cell rule, as they route to other
+cells of their class by design. A workflow or cron cell is not: it runs the
+application's code.
+
+### Upgrading: declared cells
+
+The next release (placeholder: the version that ships this note) enforces
+both rules inside each node. Application code that worked only because celld
+did not check, such as a script that points `ctx.storage` at another cell's
+scope or builds a `DurableObjectNamespace` by hand for a database it has no
+binding for, now fails with an error. Stubs received over RPC or read back from
+storage keep working: celld does not change the stored encoding, so rows
+written earlier decode as before, and a stub reaches the same cell because its
+class is the receiver's own. Nothing crosses nodes, so a rolling upgrade has no
+mixed-version window for these rules.
+
 ## Cell ownership
 
 Each cell is a SQLite database with one writer. An ownership epoch fences each

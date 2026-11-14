@@ -548,6 +548,11 @@ pub(super) fn op_sql_cursor_next(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cursor = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    // A cursor id is a number any script can write down. Only the cell that
+    // opened the cursor reads from it; another reads as a cursor that ended.
+    if !scoping::own_cursor(scope, storage::sql_cursor_scope(cursor)) {
+        return throw_sql_error(scope, "SQL cursor is no longer active");
+    }
     match storage::sql_cursor_next(cursor) {
         Ok((Some(row), _)) => rv.set(sql_row_to_v8(scope, row).into()),
         Ok((None, rows_written)) => rv.set(v8::Number::new(scope, rows_written as f64).into()),
@@ -822,6 +827,10 @@ pub(super) fn op_storage_sync_list_next(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cursor = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    if !scoping::own_cursor(scope, storage::sync_list_cursor_scope(cursor)) {
+        throw_storage_error(scope, "kv.list", "sync KV cursor was invalidated");
+        return;
+    }
     match storage::sync_list_next(cursor) {
         Ok(Some((key, value))) => {
             let Some((decoded, _)) = deserialize_stored(scope, value, args.get(1)) else {
