@@ -926,6 +926,8 @@ struct Leftover {
 const REMOVAL_RETRY_FIRST: Duration = Duration::from_secs(1);
 const REMOVAL_RETRY_CAP: Duration = Duration::from_secs(60);
 const REMOVAL_ATTEMPTS: u32 = 12;
+/// How many removals the worker has in the engine at once.
+const REMOVAL_CONCURRENCY: usize = 4;
 
 fn removal_backoff(failed: u32) -> Duration {
     REMOVAL_RETRY_FIRST
@@ -1107,32 +1109,44 @@ async fn attempt_removal(docker: &Docker, removals: &Removals, entry: &Leftover)
 
 /// The retry worker: runs for the life of the engine.
 async fn run_removals(docker: Docker, removals: Arc<Removals>) {
+    use futures_util::StreamExt;
     const IDLE: Duration = Duration::from_secs(3600);
     loop {
-        for mut entry in removals.take_due(asyncrt::mono_ms()) {
-            if let Attempt::Retry(reason) = attempt_removal(&docker, &removals, &entry).await {
-                entry.attempts += 1;
-                tracing::info!(
-                    event = "container_removal_retry",
-                    target = ?entry.target,
-                    attempt = entry.attempts,
-                    reason = %reason,
-                    "the container is not removed yet"
-                );
-                if entry.attempts >= REMOVAL_ATTEMPTS {
-                    tracing::warn!(
-                        event = "container_removal_abandoned",
+        // The removals that are due run together, a few at a time: each can
+        // take the engine's whole limit, and a container whose turn is last
+        // would otherwise keep running, and keep its name, for as long as
+        // every one before it takes. Each keeps its own backoff.
+        futures_util::stream::iter(removals.take_due(asyncrt::mono_ms()))
+            .for_each_concurrent(REMOVAL_CONCURRENCY, |mut entry| {
+                let (docker, removals) = (&docker, &removals);
+                async move {
+                    let Attempt::Retry(reason) = attempt_removal(docker, removals, &entry).await
+                    else {
+                        return;
+                    };
+                    entry.attempts += 1;
+                    tracing::info!(
+                        event = "container_removal_retry",
                         target = ?entry.target,
+                        attempt = entry.attempts,
                         reason = %reason,
-                        "the container may still exist until the node restarts"
+                        "the container is not removed yet"
                     );
-                    continue;
+                    if entry.attempts >= REMOVAL_ATTEMPTS {
+                        tracing::warn!(
+                            event = "container_removal_abandoned",
+                            target = ?entry.target,
+                            reason = %reason,
+                            "the container may still exist until the node restarts"
+                        );
+                        return;
+                    }
+                    entry.due_ms =
+                        asyncrt::mono_ms() + removal_backoff(entry.attempts).as_millis() as u64;
+                    removals.put_back(entry);
                 }
-                entry.due_ms =
-                    asyncrt::mono_ms() + removal_backoff(entry.attempts).as_millis() as u64;
-                removals.put_back(entry);
-            }
-        }
+            })
+            .await;
         let now = asyncrt::mono_ms();
         let wait = removals
             .next_due(now)
@@ -4272,6 +4286,50 @@ mod engine_tests {
             tokio::time::sleep(Duration::from_millis(800)).await;
         });
         assert_eq!(rig.fake.live_ids().len(), 1);
+    }
+
+    /// Cells that each have a container the node has to remove, and have no
+    /// handle for it.
+    fn leftover_cells(rig: &Rig, count: usize) {
+        for n in 0..count {
+            let cell = rig.cell(&format!("Runner:{n}"));
+            rig.start(&cell);
+            let id = cell.container_id(1).unwrap();
+            cell.forget_container(1, &id);
+            rig.engine.removals.add(&cell.name, Target::Id(id));
+        }
+    }
+
+    // Removals that stall must not wait on one another: each can take the
+    // engine's whole limit, and a container waits for every one before it.
+    #[test]
+    fn leftover_removals_run_concurrently() {
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
+        rig.fake.delay_all_deletes(Duration::from_millis(500));
+        leftover_cells(&rig, 4);
+        rig.wait_for("the worker to remove them all", |fake| {
+            fake.live_ids().is_empty()
+        });
+        assert!(
+            rig.fake.max_concurrent_deletes() >= 2,
+            "the removals went one after another"
+        );
+    }
+
+    // And they are bounded, so a long list does not open a connection each.
+    #[test]
+    fn leftover_removals_are_bounded() {
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
+        rig.fake.delay_all_deletes(Duration::from_millis(400));
+        leftover_cells(&rig, REMOVAL_CONCURRENCY + 4);
+        rig.wait_for("the worker to remove them all", |fake| {
+            fake.live_ids().is_empty()
+        });
+        let most = rig.fake.max_concurrent_deletes();
+        assert!(
+            (2..=REMOVAL_CONCURRENCY).contains(&most),
+            "{most} removals at once"
+        );
     }
 
     #[test]

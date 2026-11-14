@@ -109,6 +109,12 @@ struct State {
     delete_conflict: bool,
     /// Hold the next removal of a container that exists, for this long.
     delete_delay: Option<Duration>,
+    /// Hold every removal of an existing application container this long.
+    delete_delay_all: Duration,
+    /// Removals of application containers the fake is holding now, and the
+    /// most it held at once.
+    deletes_in_flight: usize,
+    max_deletes_in_flight: usize,
     /// Refuse the next removal of a container that exists, leaving it as it
     /// is.
     delete_error: Option<String>,
@@ -316,6 +322,16 @@ esac
         state.containers.get(id).map(|c| c.labels.clone())
     }
 
+    /// Hold every removal of an existing application container for `delay`.
+    pub fn delay_all_deletes(&self, delay: Duration) {
+        self.state.lock().unwrap().delete_delay_all = delay;
+    }
+
+    /// The most removals of application containers the fake held at once.
+    pub fn max_concurrent_deletes(&self) -> usize {
+        self.state.lock().unwrap().max_deletes_in_flight
+    }
+
     /// Hold the next inspect of an application container for `delay`, as a
     /// slow daemon does, before it names the container.
     pub fn delay_next_inspect(&self, delay: Duration) {
@@ -479,12 +495,19 @@ async fn serve(stream: tokio::net::UnixStream, state: Arc<Mutex<State>>) {
             tokio::time::sleep(delay).await;
         }
     }
+    let mut holding_delete = false;
     if request.method == "DELETE" && request.path.starts_with("/containers/") {
         let delay = {
             let mut guard = state.lock().unwrap();
             let key = request.path.trim_start_matches("/containers/");
             match container_named(&guard, key) {
-                Some(id) if !guard.containers[&id].fence => guard.delete_delay.take(),
+                Some(id) if !guard.containers[&id].fence => {
+                    holding_delete = true;
+                    guard.deletes_in_flight += 1;
+                    guard.max_deletes_in_flight =
+                        guard.max_deletes_in_flight.max(guard.deletes_in_flight);
+                    Some(guard.delete_delay.take().unwrap_or(guard.delete_delay_all))
+                }
                 _ => None,
             }
         };
@@ -493,7 +516,11 @@ async fn serve(stream: tokio::net::UnixStream, state: Arc<Mutex<State>>) {
         }
     }
     let creating = request.method == "POST" && request.path == "/containers/create";
-    match handle(&state, &request) {
+    let action = handle(&state, &request);
+    if holding_delete {
+        state.lock().unwrap().deletes_in_flight -= 1;
+    }
+    match action {
         Action::Reply(status, body) => {
             if creating && status == 201 {
                 let delay = state.lock().unwrap().create_reply_delay;
