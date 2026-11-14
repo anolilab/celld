@@ -70,19 +70,6 @@ pub(crate) fn cell_of_ltx_key<'a>(prefix: &str, key: &'a str) -> Option<&'a str>
     (!cell.is_empty() && tail.starts_with("ltx/")).then_some(cell)
 }
 
-/// The registered cells among the keys of a deletion: the cells whose
-/// directory entry the deletion ends. A key of a nested stream names no
-/// registered cell, because registration is by the cell's own LTX tree.
-pub(crate) fn registered_cells<'a>(
-    prefix: &str,
-    keys: impl IntoIterator<Item = &'a str>,
-) -> BTreeSet<String> {
-    keys.into_iter()
-        .filter_map(|key| cell_of_ltx_key(prefix, key))
-        .map(str::to_owned)
-        .collect()
-}
-
 /// Sorted cell ids, one per line, each a tombstone when `kind` says so.
 pub(crate) fn encode_segment(kind: Kind, cells: &BTreeSet<String>) -> Bytes {
     let mut body = String::new();
@@ -195,22 +182,6 @@ mod tests {
             assert_eq!(cell_of_ltx_key("p/", key), None, "{key}");
         }
         assert_eq!(cell_of_ltx_key("", "cells/c/ltx/e1/x"), Some("c"));
-    }
-
-    #[test]
-    fn a_deletion_ends_the_entries_of_the_cells_whose_ltx_it_removes() {
-        let keys = [
-            "p/cells/c1/own.json",
-            "p/cells/c1/ltx/e1/0000/0001.ltx",
-            "p/cells/c1/ltx/e2/0000/0001.ltx",
-            "p/cells/c1/facets/ab/ltx/e1/0000/0001.ltx",
-        ];
-        assert_eq!(registered_cells("p/", keys), names(&["c1"]));
-        let nested = [
-            "p/cells/c1/facets/ab/ltx/e1/0000/0001.ltx",
-            "p/cells/c1/facets/ab/own.json",
-        ];
-        assert!(registered_cells("p/", nested).is_empty());
     }
 
     #[test]

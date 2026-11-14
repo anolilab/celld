@@ -22,10 +22,6 @@ export class Greeter extends WorkerEntrypoint {
 
 export class Supervisor extends DurableObject {
   fetch(request) {
-    if (new URL(request.url).pathname === "/reset") {
-      this.ctx.facets.delete("app");
-      return new Response("reset");
-    }
     const worker = this.env.LOADER.get("app-v1", () => ({
       compatibilityDate: "2025-01-01",
       mainModule: "app.js",

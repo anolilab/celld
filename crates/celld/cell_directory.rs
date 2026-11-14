@@ -5,11 +5,10 @@
 //! A node that writes LTX for a cell first records the cell in a create-only
 //! segment, `fleet/born/<node>/<generation>/<seq:08>`, and the LTX write waits
 //! until the segment is durable. A segment body is sorted cell ids, one per
-//! line; a line that starts with a tab is a tombstone, which the deletion of a
-//! stream writes, durably, before its first DELETE. Because a registration
-//! precedes the first artifact and only a tombstone ends it, a cell missing
-//! from a view that began after the cell's first LTX write is a cell that never
-//! had LTX, or had it deleted.
+//! line; a line that starts with a tab is a tombstone. No production path
+//! writes one yet, so no entry ends: a registration precedes the first
+//! artifact, and a cell missing from a view that began after the cell's first
+//! LTX write is a cell that never had LTX.
 //!
 //! Segments are the uncompacted tail. The compactor (see
 //! `cell_directory_compactor`) folds them into partitioned runs of 64-bit
@@ -76,8 +75,10 @@ struct TailEntry {
 /// deleted mentions.
 #[derive(Debug, Default)]
 struct Tail {
-    streams: Vec<String>,
+    /// The writer streams the index entries name, by id.
+    streams: HashMap<u32, String>,
     stream_ids: HashMap<String, u32>,
+    next_stream: u32,
     /// Segment keys in the tail, so a refresh reads only new ones.
     segments: HashMap<String, TailSegment>,
     index: HashMap<u64, TailEntry>,
@@ -100,15 +101,16 @@ impl Tail {
     /// `fp`, if the entry is one.
     fn tombstone_of(&self, fp: u64) -> Option<(String, u64)> {
         let op = self.index.get(&fp)?.op;
-        (op.kind == Kind::Tombstone).then(|| (self.streams[op.stream as usize].clone(), op.seq))
+        (op.kind == Kind::Tombstone).then(|| (self.streams[&op.stream].clone(), op.seq))
     }
 
     fn stream_id(&mut self, name: &str) -> u32 {
         if let Some(id) = self.stream_ids.get(name) {
             return *id;
         }
-        let id = self.streams.len() as u32;
-        self.streams.push(name.to_owned());
+        let id = self.next_stream;
+        self.next_stream += 1;
+        self.streams.insert(id, name.to_owned());
         self.stream_ids.insert(name.to_owned(), id);
         id
     }
@@ -127,6 +129,10 @@ impl Tail {
             self.segments
                 .retain(|_, segment| !gone.contains(&segment.id));
             self.index.retain(|_, entry| !gone.contains(&entry.segment));
+            // A writer name outlives its segments only while an entry names it.
+            let named: HashSet<u32> = self.index.values().map(|entry| entry.op.stream).collect();
+            self.streams.retain(|id, _| named.contains(id));
+            self.stream_ids.retain(|_, id| named.contains(id));
         }
     }
 
@@ -459,6 +465,25 @@ mod tests {
         assert_eq!(tail.hit(fingerprint("c2")), TailHit::Born);
         tail.drop_unlisted(3, |_| false);
         assert_eq!(tail.hit(fingerprint("c2")), TailHit::Miss);
+    }
+
+    #[test]
+    fn a_stream_with_no_segment_left_is_forgotten() {
+        let mut tail = Tail {
+            listings_begun: 1,
+            ..Tail::default()
+        };
+        let ops = |cell: &str| [(fingerprint(cell), Kind::Born)];
+        tail.apply("a".to_owned(), "n1/g1", 0, ops("c1"));
+        tail.apply("b".to_owned(), "n2/g2", 0, ops("c2"));
+        tail.drop_unlisted(2, |key| key == "b");
+        assert_eq!(tail.stream_ids.len(), 1);
+        assert_eq!(tail.streams.len(), 1);
+        assert_eq!(tail.hit(fingerprint("c2")), TailHit::Born);
+        tail.apply("c".to_owned(), "n1/g1", 1, ops("c3"));
+        assert_eq!(tail.hit(fingerprint("c3")), TailHit::Born);
+        tail.drop_unlisted(2, |_| false);
+        assert!(tail.stream_ids.is_empty() && tail.streams.is_empty());
     }
 
     #[tokio::test]

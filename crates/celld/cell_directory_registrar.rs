@@ -1,8 +1,9 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The writer side of the cell directory: registers a cell in a create-only
-//! segment before its first LTX object, and records the tombstone of a
-//! deletion. Segments are written in groups, one write at a time per node.
+//! segment before its first LTX object. Segments are written in groups, one
+//! write at a time per node. The tombstone write is kept for a deletion path
+//! that does not exist yet; only tests call it.
 
 use crate::cell_directory::CellDirectory;
 use crate::cell_directory_runs::stream_name;
@@ -159,6 +160,7 @@ impl Registrar {
     /// same id registers again. It takes the same turn as a registration
     /// flush, so its sequence number orders it against the writer's other
     /// segments.
+    #[cfg(test)]
     pub(crate) async fn tombstone(&self, cells: &BTreeSet<String>) -> object_store::Result<()> {
         if cells.is_empty() {
             return Ok(());
@@ -242,6 +244,7 @@ impl RegisteringStore {
     }
 
     /// The handle that records tombstones in the segments this store writes.
+    #[cfg(test)]
     pub(crate) fn writer(&self) -> Arc<Registrar> {
         self.registrar.clone()
     }

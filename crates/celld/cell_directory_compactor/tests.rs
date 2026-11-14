@@ -4,7 +4,7 @@ use super::*;
 use crate::cell_directory::CellDirectory;
 use crate::cell_directory_registrar::{RegisteringStore, Registrar};
 use crate::cell_directory_runs::testing::{keys, Counting};
-use crate::cell_directory_runs::{read_ledger, read_run};
+use crate::cell_directory_runs::{read_ledger, read_run, run_key, write_run};
 use celld_logic::cell_directory::{DirectoryAnswer, Kind, Record};
 use object_store::PutPayload;
 use std::collections::BTreeSet;
@@ -122,8 +122,7 @@ async fn a_tombstoned_cell_reads_as_new_until_it_registers_again() {
     let before = a.fresh_reader(10).await;
     assert_eq!(before.lookup("c1", 11).await, DirectoryAnswer::Exists);
 
-    // What `delete_streams` does for a registered cell: the tombstone
-    // first, then the objects.
+    // The tombstone of a deletion, then the objects.
     a.registrar.tombstone(&names(&["c1"])).await.unwrap();
     store
         .inner
@@ -187,10 +186,10 @@ async fn a_pass_that_loses_a_head_race_skips_the_partition_and_deletes_nothing()
         keys(&store, &format!("fleet-a/fleet/dir/{partition:03x}/run")).await,
         runs_before
     );
-    // Nothing is deleted however old the ledger is, because it did not
-    // advance past what the heads hold.
+    // Nothing is deleted however old the ledger is, because it names only
+    // what the heads hold.
     let ledger = read_ledger(store.as_ref(), PREFIX).await.unwrap().unwrap();
-    assert_eq!(ledger.value.streams["node-a/gen1"].seq, 0);
+    assert_eq!(ledger.value.segments.len(), 1);
     let stuck = pass(&store, 3, 2_000 + 10 * DELETE_GRACE_MS).await;
     assert_eq!(stuck.partitions_lost, 0);
     assert_eq!(stuck.segments_deleted, 1, "only the folded segment goes");
@@ -198,7 +197,7 @@ async fn a_pass_that_loses_a_head_race_skips_the_partition_and_deletes_nothing()
 
     // The next pass folds what the lost one did not, and not twice.
     let ledger = read_ledger(store.as_ref(), PREFIX).await.unwrap().unwrap();
-    assert_eq!(ledger.value.streams["node-a/gen1"].seq, 1);
+    assert_eq!(ledger.value.segments.len(), 2);
     let reader = a.fresh_reader(10).await;
     for cell in &cells[..2] {
         assert_eq!(
@@ -536,7 +535,11 @@ async fn the_grace_before_a_segment_goes_runs_from_when_the_heads_were_durable()
     assert_eq!(handover.segments_deleted, 0);
     assert_eq!(segments(&store).await.len(), 1);
     let ledger = read_ledger(store.as_ref(), PREFIX).await.unwrap().unwrap();
-    assert!(ledger.value.streams["node-a/gen1"].at_ms > 1_000 + DELETE_GRACE_MS);
+    assert!(ledger
+        .value
+        .segments
+        .values()
+        .all(|at_ms| *at_ms > 1_000 + DELETE_GRACE_MS));
 }
 
 #[tokio::test]
@@ -547,4 +550,127 @@ async fn an_empty_fleet_writes_its_ledger_once() {
     store.reset();
     pass(&store, 2, 2_000).await;
     assert_eq!(store.puts.load(Ordering::SeqCst), 0);
+}
+
+async fn put_segment(store: &Counting, key: &str, body: &[u8]) {
+    store
+        .inner
+        .put(
+            &Path::from(format!("fleet-a/fleet/born/{key}")),
+            PutPayload::from(body.to_vec()),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_segment_that_lands_after_a_later_one_is_folded_before_it_is_deleted() {
+    let store = Arc::new(Counting::default());
+    let a = node(&store, "node-a", "gen1");
+    // One partition, so the head the first pass writes already carries the
+    // stream's watermark when the late segment is read.
+    let cells = cells_in_partition(partition_of(fingerprint("seed")), 2);
+    put_segment(&store, "node-b/g9/00000000", b"x0\n").await;
+    put_segment(
+        &store,
+        "node-b/g9/00000002",
+        format!("{}\n", cells[0]).as_bytes(),
+    )
+    .await;
+    pass(&store, 1, 1_000).await;
+    // Sequence 1 failed to acknowledge, and its write commits late.
+    put_segment(
+        &store,
+        "node-b/g9/00000001",
+        format!("{}\n", cells[1]).as_bytes(),
+    )
+    .await;
+    pass(&store, 2, 1_000 + DELETE_GRACE_MS).await;
+    pass(&store, 3, 1_000 + 2 * DELETE_GRACE_MS).await;
+    assert!(segments(&store).await.is_empty());
+
+    let reader = a.fresh_reader(10).await;
+    for cell in &cells {
+        assert_eq!(
+            reader.lookup(cell, 11).await,
+            DirectoryAnswer::Exists,
+            "{cell}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_lost_head_race_keeps_the_runs_the_current_head_names() {
+    let store = Arc::new(Counting::default());
+    let a = node(&store, "node-a", "gen1");
+    let cells = cells_in_partition(partition_of(fingerprint("seed")), 2);
+    a.write_ltx(&cells[0]).await;
+    pass(&store, 1, 1_000).await;
+    a.write_ltx(&cells[1]).await;
+    store
+        .commit_then_advance_head_update
+        .store(true, Ordering::SeqCst);
+    let report = pass(&store, 2, 2_000).await;
+    assert_eq!(report.partitions_lost, 1, "{report:?}");
+
+    let partition = partition_of(fingerprint(&cells[0]));
+    let head = read_head(store.as_ref(), PREFIX, partition)
+        .await
+        .unwrap()
+        .unwrap()
+        .value;
+    assert_eq!(
+        read_run(store.as_ref(), PREFIX, &head.l0)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let reader = a.fresh_reader(10).await;
+    for cell in &cells {
+        assert_eq!(reader.lookup(cell, 11).await, DirectoryAnswer::Exists);
+    }
+}
+
+#[tokio::test]
+async fn a_run_no_head_names_is_deleted_once_it_is_older_than_the_grace() {
+    let store = Arc::new(Counting::default());
+    let a = node(&store, "node-a", "gen1");
+    a.write_ltx("c1").await;
+    pass(&store, 1, 1_000).await;
+    let partition = partition_of(fingerprint("c1"));
+    let orphan = run_key(partition, "l0", "dead-gen", 7);
+    write_run(
+        store.as_ref(),
+        PREFIX,
+        &orphan,
+        &[Record {
+            fp: fingerprint("c1"),
+            kind: Kind::Born,
+        }],
+    )
+    .await
+    .unwrap();
+    let runs = || keys(&store, "fleet-a/fleet/dir");
+    let has_orphan = |keys: Vec<String>| keys.contains(&format!("{PREFIX}{orphan}"));
+    let rotation = u64::from(PARTITIONS / SWEEP_PARTITIONS);
+
+    // A run an in-flight compactor just wrote is not yet an orphan.
+    let written = crate::ownership_store::now_ms();
+    for number in 0..rotation {
+        pass(&store, 2 + number, written).await;
+    }
+    assert!(has_orphan(runs().await));
+
+    let later = written + DELETE_GRACE_MS + 1;
+    let mut deleted = 0;
+    for number in 0..rotation {
+        deleted += pass(&store, 2 + rotation + number, later)
+            .await
+            .runs_deleted;
+    }
+    assert_eq!(deleted, 1);
+    assert!(!has_orphan(runs().await));
+    let reader = a.fresh_reader(10).await;
+    assert_eq!(reader.lookup("c1", 11).await, DirectoryAnswer::Exists);
 }

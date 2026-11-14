@@ -1286,8 +1286,6 @@ pub struct LtxRepl {
     /// Every cell with per-cell LTX, as far as this node has read. The store
     /// registers a cell here before its first artifact is written.
     cell_directory: Option<Arc<crate::cell_directory::CellDirectory>>,
-    /// Records the tombstone of a deletion in the directory's segments.
-    cell_directory_writer: Option<Arc<crate::cell_directory_registrar::Registrar>>,
 }
 
 impl LtxRepl {
@@ -1325,17 +1323,17 @@ impl LtxRepl {
         // wrapper too, which forwards reads. Opt-in while the directory only
         // shadows the claim listing: until it replaces that LIST, its
         // segment writes are pure added cost.
-        let (store, directory, writer) =
-            if crate::env_vars::flag("CELLD_CELL_DIRECTORY_SHADOW", false)? {
-                let directory = Arc::new(crate::cell_directory::CellDirectory::new(
-                    store.clone(),
-                    prefix.clone(),
-                ));
-                let batch_window = Duration::from_millis(crate::env_vars::with_default(
-                    "CELLD_CELL_DIRECTORY_BATCH_MS",
-                    0,
-                )?);
-                let registering = Arc::new(crate::cell_directory_registrar::RegisteringStore::new(
+        let (store, directory) = if crate::env_vars::flag("CELLD_CELL_DIRECTORY_SHADOW", false)? {
+            let directory = Arc::new(crate::cell_directory::CellDirectory::new(
+                store.clone(),
+                prefix.clone(),
+            ));
+            let batch_window = Duration::from_millis(crate::env_vars::with_default(
+                "CELLD_CELL_DIRECTORY_BATCH_MS",
+                0,
+            )?);
+            let store: Arc<dyn ObjectStore> =
+                Arc::new(crate::cell_directory_registrar::RegisteringStore::new(
                     store,
                     directory.clone(),
                     prefix.clone(),
@@ -1343,12 +1341,10 @@ impl LtxRepl {
                     crate::machine::random_process_generation(),
                     batch_window,
                 ));
-                let writer = registering.writer();
-                let store: Arc<dyn ObjectStore> = registering;
-                (store, Some(directory), Some(writer))
-            } else {
-                (store, None, None)
-            };
+            (store, Some(directory))
+        } else {
+            (store, None)
+        };
         // Azure blob metadata names must be C# identifiers, so the standard
         // Litestream key cannot carry its hyphen there. External Litestream
         // tooling reads that key, therefore an az:// replica gives up
@@ -1394,7 +1390,6 @@ impl LtxRepl {
             durability_timeout_ms,
             LtxConfig::from_env(),
             directory,
-            writer,
         );
         if let Some((store, prefix, node, tick_ms)) = compactor {
             let stop = replicator.stop.clone();
@@ -1426,7 +1421,6 @@ impl LtxRepl {
         durability_timeout_ms: u64,
         config: LtxConfig,
         cell_directory: Option<Arc<crate::cell_directory::CellDirectory>>,
-        cell_directory_writer: Option<Arc<crate::cell_directory_registrar::Registrar>>,
     ) -> Self {
         let cells: Arc<Mutex<BTreeMap<(String, u64), CellHandle>>> = Arc::default();
         let dirty = Arc::new(Notify::new());
@@ -1522,7 +1516,6 @@ impl LtxRepl {
             epoch_gc_grace_ms: config.epoch_gc_grace_ms,
             truncate_pages: Some(config.truncate_pages),
             cell_directory,
-            cell_directory_writer,
         }
     }
 
@@ -3269,16 +3262,6 @@ impl LtxRepl {
             .map_ok(|meta| meta.location)
             .try_collect()
             .await?;
-        // A registered cell is gone from the directory only if its tombstone
-        // is durable before the first object goes, so a failure here deletes
-        // nothing.
-        if let Some(writer) = &self.cell_directory_writer {
-            let registered = crate::cell_directory_segments::registered_cells(
-                &self.prefix,
-                locations.iter().map(|location| location.as_ref()),
-            );
-            writer.tombstone(&registered).await?;
-        }
         let mut deleted = self
             .store
             .delete_stream(futures_util::stream::iter(locations.into_iter().map(Ok)).boxed());

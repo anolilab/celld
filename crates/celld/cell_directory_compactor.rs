@@ -11,23 +11,25 @@
 //! never forces it. Run objects are create-only, and a run a head stops naming
 //! is deleted only after a grace period.
 //!
-//! Segments are deleted last and latest. The ledger records, per writer
-//! stream, the highest segment whose entries every touched head holds, and it
-//! is written only after all of those heads are durable. A segment the ledger
-//! covers is deleted once the grace has passed since then, which outlasts any
-//! head a reader holds, so a reader that no longer lists the segment holds a
-//! head that contains it.
+//! Segments are deleted last and latest. The ledger records the exact key of
+//! every segment a pass read and folded, and it is written only after all of
+//! the touched heads are durable. A segment the ledger names is deleted once
+//! the grace has passed since then, which outlasts any head a reader holds, so
+//! a reader that no longer lists the segment holds a head that contains it. No
+//! sequence number stands in for a segment: a write that lands after a later
+//! one of its stream is a segment the ledger does not name, and the next pass
+//! folds it.
 //!
-//! A pass that cannot read every unfolded segment folds nothing, so it never
-//! folds a stream's later segments without its earlier ones. The segments of
+//! A pass that cannot read every unfolded segment folds nothing. The segments of
 //! different streams have no order beyond durability: where a birth and a
 //! tombstone of one cell meet in a pass, the birth wins, which errs toward
-//! `Exists`, the answer that costs only a listing.
+//! `Exists`, the answer that costs only a listing. No production path writes a
+//! tombstone yet.
 
 use crate::cell_directory::{HEAD_TTL_MS, SEGMENT_READS};
 use crate::cell_directory_runs::{
     encode_json, head_key, ledger_key, put_if, read_head, read_ledger, read_run, run_key,
-    stream_name, write_run, Cas, Head, Ledger, LedgerStream, Retired, RunRef,
+    stream_name, write_run, Cas, Head, Ledger, Retired, RunRef,
 };
 use crate::cell_directory_segments::{fingerprint, parse_segment_key, read_segment};
 use celld_logic::cell_directory::{
@@ -70,6 +72,8 @@ pub(crate) struct PassReport {
 
 struct Listed {
     location: Path,
+    /// The segment's key, which the ledger names it by.
+    key: String,
     stream: String,
     seq: u64,
 }
@@ -96,7 +100,7 @@ struct Pass<'a> {
     /// The clock at the start of the pass, which only ever delays a deletion.
     now_ms: u64,
     streams: &'a [String],
-    /// The highest unfolded segment read, per stream.
+    /// The highest segment read, per stream.
     read_through: &'a BTreeMap<String, u64>,
     /// Streams that have a segment in the listing.
     live: &'a HashSet<String>,
@@ -123,6 +127,7 @@ pub(crate) async fn compact_pass(
         };
         let (stream, seq) = (stream_name(key.node, key.generation), key.seq);
         listed.push(Listed {
+            key: location.to_string(),
             location,
             stream,
             seq,
@@ -130,6 +135,7 @@ pub(crate) async fn compact_pass(
     }
     report.segments_listed = listed.len();
     let live: HashSet<String> = listed.iter().map(|item| item.stream.clone()).collect();
+    let present: HashSet<String> = listed.iter().map(|item| item.key.clone()).collect();
 
     let (mut ledger, ledger_version) = match read_ledger(store, prefix).await? {
         Some(read) => (read.value, Some(read.version)),
@@ -138,13 +144,13 @@ pub(crate) async fn compact_pass(
     let mut deletable = Vec::new();
     let mut unfolded = Vec::new();
     for item in listed {
-        match ledger.streams.get(&item.stream) {
-            Some(done) if item.seq <= done.seq => {
-                if now_ms.saturating_sub(done.at_ms) >= DELETE_GRACE_MS {
+        match ledger.segments.get(&item.key) {
+            Some(at_ms) => {
+                if now_ms.saturating_sub(*at_ms) >= DELETE_GRACE_MS {
                     deletable.push(item.location);
                 }
             }
-            _ => unfolded.push(item),
+            None => unfolded.push(item),
         }
     }
 
@@ -152,12 +158,14 @@ pub(crate) async fn compact_pass(
     let mut stream_ids: HashMap<String, u32> = HashMap::new();
     let mut read_through: BTreeMap<String, u64> = BTreeMap::new();
     let mut by_partition: BTreeMap<u16, Vec<(u64, Op)>> = BTreeMap::new();
+    let mut read_keys: Vec<String> = Vec::new();
     report.segments_folded = unfolded.len();
     let mut reads = futures_util::stream::iter(unfolded)
         .map(|item| read_unfolded(store, item))
         .buffer_unordered(SEGMENT_READS);
     while let Some(read) = reads.next().await {
         let (item, ops) = read?;
+        read_keys.push(item.key.clone());
         let stream = *stream_ids.entry(item.stream.clone()).or_insert_with(|| {
             streams.push(item.stream.clone());
             streams.len() as u32 - 1
@@ -227,18 +235,13 @@ pub(crate) async fn compact_pass(
         // Read after the heads are durable: the grace before a segment goes
         // runs from here.
         let durable_ms = clock();
-        for (stream, seq) in &read_through {
-            ledger.streams.insert(
-                stream.clone(),
-                LedgerStream {
-                    seq: *seq,
-                    at_ms: durable_ms,
-                },
-            );
+        let changed = !read_keys.is_empty();
+        for key in read_keys {
+            ledger.segments.insert(key, durable_ms);
         }
-        let before = ledger.streams.len();
-        ledger.streams.retain(|stream, _| live.contains(stream));
-        if !read_through.is_empty() || ledger.streams.len() != before || ledger_version.is_none() {
+        let before = ledger.segments.len();
+        ledger.segments.retain(|key, _| present.contains(key));
+        if changed || ledger.segments.len() != before || ledger_version.is_none() {
             match put_if(
                 store,
                 &ledger_key(prefix),
@@ -340,11 +343,15 @@ impl Pass<'_> {
         };
         let mut winners: HashMap<u64, Op> = HashMap::new();
         for (fp, op) in ops {
-            let merged = head
-                .watermarks
-                .get(&self.streams[op.stream as usize])
-                .is_some_and(|through| op.seq <= *through);
-            if merged {
+            // A birth is merged again if a pass folded it before, which
+            // changes nothing. A tombstone is not: a later birth of its
+            // stream may be in the runs, and the runs hold no sequence.
+            let fenced = op.kind == Kind::Tombstone
+                && head
+                    .watermarks
+                    .get(&self.streams[op.stream as usize])
+                    .is_some_and(|through| op.seq <= *through);
+            if fenced {
                 continue;
             }
             match winners.entry(fp) {
@@ -446,17 +453,22 @@ impl Pass<'_> {
             Cas::Applied => Ok(Outcome::Merged),
             Cas::Lost => {
                 // The store retries a write whose answer it lost, and a retry
-                // of a write that committed is refused like a lost race. Only
-                // a head that is not ours proves that nothing names the new
-                // runs. A head that cannot be read leaves them where they are.
+                // of a write that committed is refused like a lost race. A
+                // head that cannot be read leaves the new runs where they
+                // are. Of a head that is not ours, only a run it does not
+                // name is deleted: our write may have committed, and another
+                // compactor may have built on it since.
                 match read_head(self.store, self.prefix, partition).await? {
                     Some(current) if current.value == next => Ok(Outcome::Merged),
-                    _ => {
+                    Some(current) => {
                         for key in created {
-                            let _ = self.store.delete(&self.path(&key)).await;
+                            if !current.value.names(&key) {
+                                let _ = self.store.delete(&self.path(&key)).await;
+                            }
                         }
                         Ok(Outcome::Lost)
                     }
+                    None => Ok(Outcome::Lost),
                 }
             }
         }
@@ -497,21 +509,49 @@ impl Pass<'_> {
         (keep, deleted)
     }
 
-    /// Drop the due retired runs of a partition this pass did not merge.
+    /// Drop the due retired runs of a partition this pass did not merge, and
+    /// the runs that no head names and that are older than the grace: a pass
+    /// that wrote a run and then lost, or never learned the outcome of, its
+    /// head write leaves one. The listing comes first, so a run that is in it
+    /// and that a head committed since is named by the head read after it.
     async fn sweep_partition(&self, partition: u16) -> usize {
         let swept = async {
+            let root = self.path(&format!("fleet/dir/{partition:03x}/run"));
+            let mut listing = self.store.list(Some(&root));
+            let mut old_runs = Vec::new();
+            while let Some(meta) = listing.next().await {
+                let meta = meta?;
+                let age_ms = self
+                    .now_ms
+                    .saturating_sub(meta.last_modified.timestamp_millis().max(0) as u64);
+                if age_ms >= DELETE_GRACE_MS {
+                    old_runs.push(meta.location);
+                }
+            }
+            drop(listing);
             let Some(read) = read_head(self.store, self.prefix, partition).await? else {
                 return Ok(0);
             };
             let (mut head, version) = (read.value, read.version);
+            let orphans: Vec<Path> = old_runs
+                .into_iter()
+                .filter(|location| {
+                    location
+                        .as_ref()
+                        .strip_prefix(self.prefix)
+                        .is_some_and(|key| !head.names(key))
+                })
+                .collect();
+            let mut deleted = delete_all(self.store, orphans).await;
             if !head
                 .retired
                 .iter()
                 .any(|run| self.now_ms.saturating_sub(run.at_ms) >= DELETE_GRACE_MS)
             {
-                return Ok(0);
+                return Ok(deleted);
             }
-            let (keep, deleted) = self.delete_due(std::mem::take(&mut head.retired)).await;
+            let (keep, retired) = self.delete_due(std::mem::take(&mut head.retired)).await;
+            deleted += retired;
             head.retired = keep;
             head.rev += 1;
             put_if(
@@ -530,9 +570,13 @@ impl Pass<'_> {
     }
 }
 
-/// Compact every [`COMPACT_INTERVAL`] on the node that holds the waker role,
-/// until `stop` ends the loop. The role only spares the other nodes the work:
-/// the conditional writes keep two compactors from corrupting each other.
+/// The lease the compactor is elected by. It is not the waker role: every node
+/// takes that, and only a node that runs the directory compacts.
+pub(crate) const LEASE_KEY: &str = "fleet/dir/compactor-lease";
+
+/// Compact every [`COMPACT_INTERVAL`] on the node that holds the compactor
+/// lease, until `stop` ends the loop. The lease only spares the other nodes the
+/// work: the conditional writes keep two compactors from corrupting each other.
 pub(crate) async fn run_compactor(
     store: std::sync::Arc<dyn ObjectStore>,
     prefix: String,
@@ -550,8 +594,9 @@ pub(crate) async fn run_compactor(
             _ = crate::asyncrt::sleep(COMPACT_INTERVAL) => {}
         }
         number += 1;
-        let pass = crate::wake::while_holding_waker(
+        let pass = crate::wake::while_holding_lease(
             &lease,
+            LEASE_KEY,
             &node,
             tick_ms,
             "cell directory compaction",

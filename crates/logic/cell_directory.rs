@@ -3,9 +3,9 @@
 //! What the fleet directory of cells with LTX says about a cell.
 //!
 //! A node registers a cell in the directory before the first LTX object of
-//! that cell exists. Registrations are never removed except by a tombstone,
-//! which the deletion of a stream writes before its first DELETE. A cell the
-//! view holds therefore has, or had, LTX. A cell the view lacks proves nothing
+//! that cell exists. Registrations are never removed: the run format has a
+//! tombstone kind for a deletion path that does not exist yet, and nothing in
+//! production writes one. A cell the view holds therefore has, or had, LTX. A cell the view lacks proves nothing
 //! unless the view is recent enough to include every registration that
 //! preceded the question.
 //!
@@ -224,10 +224,10 @@ pub fn answer_from_tail(view_fresh: bool, tail: TailHit) -> Option<DirectoryAnsw
 }
 
 /// Whether a tombstone in the tail, segment `seq` of its stream, is newer than
-/// every tier. The head's watermark for the stream says how far the compactor
-/// folded it: a tombstone the head covers is already in the tiers, together
-/// with every later entry of the cell that the compactor folded, and a birth
-/// that was folded after it would be hidden by answering from the tombstone.
+/// every tier. The head's watermark for the stream is the highest segment of it
+/// that a merge of the head read: a tombstone at or below it was folded, or was
+/// left out because a later entry of its stream may be folded, and a birth that
+/// was folded after it would be hidden by answering from the tombstone.
 pub fn tombstone_is_newest(head_watermark: Option<u64>, seq: u64) -> bool {
     head_watermark.is_none_or(|through| seq > through)
 }

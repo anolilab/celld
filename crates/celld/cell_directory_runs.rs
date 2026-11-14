@@ -5,7 +5,7 @@
 //!
 //! A partition is the top bits of a cell's fingerprint (see
 //! `celld_logic::cell_directory`). Its head names the current run of each tier
-//! and the highest segment merged per writer stream. Runs are create-only and
+//! and the highest segment read per writer stream. Runs are create-only and
 //! never rewritten; only a head is replaced, by a conditional write.
 
 use anyhow::Context as _;
@@ -65,7 +65,10 @@ pub(crate) struct Head {
     pub l0: Option<RunRef>,
     pub l1: Option<RunRef>,
     pub l2: Option<RunRef>,
-    /// The highest segment sequence merged, per writer stream.
+    /// The highest segment sequence read, per writer stream. It fences stale
+    /// tombstones only: a tombstone at or below it is not applied, because a
+    /// later entry of its stream may be folded. It never says a segment was
+    /// folded, so a birth is merged whatever it says.
     pub watermarks: BTreeMap<String, u64>,
     /// Runs this head no longer names, deleted once readers cannot hold a head
     /// that names them.
@@ -88,32 +91,37 @@ impl Default for Head {
 }
 
 impl Head {
+    /// Whether the head holds the run at `key`, as a tier or as retired.
+    pub(crate) fn names(&self, key: &str) -> bool {
+        [&self.l0, &self.l1, &self.l2]
+            .into_iter()
+            .flatten()
+            .any(|run| run.key == key)
+            || self.retired.iter().any(|run| run.key == key)
+    }
+
     pub(crate) fn count(run: &Option<RunRef>) -> u64 {
         run.as_ref().map_or(0, |run| run.count)
     }
 }
 
-/// What the compactor has made durable: per stream, the highest segment whose
-/// entries every touched head holds, and when that became true.
+/// What the compactor has made durable: the key of every segment it read and
+/// folded into the heads it touched, and when the last of those heads became
+/// durable. A segment is named only after it was read; a key below another's
+/// sequence number says nothing about it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Ledger {
     pub v: u32,
-    pub streams: BTreeMap<String, LedgerStream>,
+    pub segments: BTreeMap<String, u64>,
 }
 
 impl Default for Ledger {
     fn default() -> Self {
         Self {
             v: FORMAT,
-            streams: BTreeMap::new(),
+            segments: BTreeMap::new(),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct LedgerStream {
-    pub seq: u64,
-    pub at_ms: u64,
 }
 
 /// An object read together with the version a conditional write replaces.
@@ -326,6 +334,9 @@ pub(crate) mod testing {
         /// Apply the next conditional write of a head and then refuse it, as a
         /// retry of a write that committed is.
         pub commit_then_refuse_head_update: AtomicBool,
+        /// Apply the next conditional write of a head, let another compactor
+        /// replace that head on top of it, and refuse the write.
+        pub commit_then_advance_head_update: AtomicBool,
     }
 
     impl Counting {
@@ -370,6 +381,31 @@ pub(crate) mod testing {
                 return Err(object_store::Error::Precondition {
                     path: location.to_string(),
                     source: "the retry of a committed write".into(),
+                });
+            }
+            if matches!(options.mode, PutMode::Update(_))
+                && location.as_ref().ends_with("/head")
+                && self
+                    .commit_then_advance_head_update
+                    .swap(false, Ordering::SeqCst)
+            {
+                self.inner.put_opts(location, payload, options).await?;
+                let body = self
+                    .inner
+                    .get_opts(location, GetOptions::default())
+                    .await?
+                    .bytes()
+                    .await?;
+                let mut head: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                head["rev"] = (head["rev"].as_u64().unwrap() + 1).into();
+                let advanced =
+                    PutPayload::from_bytes(Bytes::from(serde_json::to_vec(&head).unwrap()));
+                self.inner
+                    .put_opts(location, advanced, PutOptions::default())
+                    .await?;
+                return Err(object_store::Error::Precondition {
+                    path: location.to_string(),
+                    source: "another compactor got there first".into(),
                 });
             }
             self.inner.put_opts(location, payload, options).await
