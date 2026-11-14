@@ -283,6 +283,9 @@ struct Refusals {
     /// The retained database vanishes before a rename of it, as when the
     /// cache removes it between a wake's check and its rename.
     vanish: AtomicBool,
+    /// Every path synced, in order. Not a refusal: it shows what was made
+    /// durable.
+    synced: std::sync::Mutex<Vec<std::path::PathBuf>>,
 }
 
 struct RefusingFilesystem {
@@ -320,6 +323,11 @@ impl celld_ltx::FileSystem for RefusingFilesystem {
         self.inner.write(path, bytes)
     }
     fn sync_all(&self, path: &Path) -> std::io::Result<()> {
+        self.refusals
+            .synced
+            .lock()
+            .unwrap()
+            .push(path.to_path_buf());
         self.inner.sync_all(path)
     }
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
@@ -663,5 +671,23 @@ fn a_record_that_cannot_be_renamed_into_place_leaves_no_file_behind() {
 
         assert!(!live(&rig, 1).with_extension("cut.tmp").exists());
         assert!(!live(&rig, 1).with_extension("cut").exists());
+    });
+}
+
+#[test]
+fn a_record_is_durable_in_its_directory_once_it_is_renamed_into_place() {
+    run(async {
+        let (rig, refusals) = rig_refusing();
+        first_lifetime(&rig).await;
+        refusals.synced.lock().unwrap().clear();
+
+        rig.ltx.record_cut(CELL, 1, 1).expect("record");
+
+        let directory = live(&rig, 1).parent().unwrap().to_path_buf();
+        assert_eq!(
+            refusals.synced.lock().unwrap().last(),
+            Some(&directory),
+            "the directory holding the renamed record is synced last"
+        );
     });
 }

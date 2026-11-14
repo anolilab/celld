@@ -228,7 +228,13 @@ impl LtxRepl {
         let recorded = filesystem
             .write(&temporary, end.to_string().as_bytes())
             .and_then(|()| filesystem.sync_all(&temporary))
-            .and_then(|()| filesystem.rename(&temporary, &cut_path(&db)));
+            .and_then(|()| filesystem.rename(&temporary, &cut_path(&db)))
+            // A rename lost in a crash would leave the epoch with no record,
+            // which reads as a cut at the first transaction.
+            .and_then(|()| match db.parent() {
+                Some(directory) => filesystem.sync_all(directory),
+                None => Ok(()),
+            });
         if recorded.is_err() {
             let _ = filesystem.remove_file(&temporary);
         }
