@@ -419,3 +419,45 @@ fn a_request_during_an_idle_stop_resumes_the_epoch_in_place() {
 
     assert_resumed_in_place(&mut shell, &effects);
 }
+
+#[test]
+fn a_queued_wake_after_an_interrupted_stop_keeps_the_promise() {
+    let mut shell = Shell::new(Config {
+        max_activations: 1,
+        ..config()
+    });
+    let request = shell.request(CELL);
+    shell.finish(request);
+    shell.send(Event::Evict { cell: CELL.into() });
+    let op = shell.expect("an eviction proof", |effect| match effect {
+        Effect::EnsureDurable { op, .. } => Some(*op),
+        _ => None,
+    });
+    shell.send(Event::DurabilityChecked { op, result: Ok(()) });
+    let stop = shell.expect("an eviction stop", |effect| match effect {
+        Effect::StopRuntime { op, .. } => Some(*op),
+        _ => None,
+    });
+    let now_mono_ms = shell.tick(1);
+    shell.send(Event::RequestAt {
+        request: WAKE_REQUEST + 1,
+        cell: "b".into(),
+        now_mono_ms,
+    });
+    wake_by_request(&mut shell);
+    shell.send(Event::RuntimeStopped { op: stop });
+    assert!(matches!(
+        shell.state.phase(CELL),
+        Some(Phase::WaitingActivation)
+    ));
+
+    shell.send(Event::Cancel {
+        request: WAKE_REQUEST,
+    });
+
+    assert!(matches!(
+        shell.state.phase(CELL),
+        Some(Phase::Dormant { epoch: 1 })
+    ));
+    assert!(shell.state.resumable(CELL));
+}

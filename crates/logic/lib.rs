@@ -5298,7 +5298,8 @@ impl State {
                 // Otherwise the stop discarded the LTX metadata: re-read
                 // ownership and claim epoch+1 before reusing the preserved
                 // SQLite image.
-                let start = if self.eviction_keeps_database(rebalance, &cell) {
+                cell.resumable = self.eviction_keeps_database(rebalance, &cell);
+                let start = if cell.resumable {
                     resume_in_place(epoch)
                 } else {
                     ColdStart::ReadOwner
