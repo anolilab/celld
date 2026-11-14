@@ -562,6 +562,23 @@ impl Db {
         }
     }
 
+    /// SQLite's WAL sidecar path (`<db>-wal`) for a database file path,
+    /// without opening it.
+    pub fn wal_path_for_path(path: impl AsRef<Path>) -> PathBuf {
+        let mut sidecar = path.as_ref().as_os_str().to_owned();
+        sidecar.push("-wal");
+        PathBuf::from(sidecar)
+    }
+
+    /// SQLite's WAL and shared-memory sidecar paths (`<db>-wal`, `<db>-shm`)
+    /// for a database file path, without opening it.
+    pub fn sidecar_paths_for_path(path: impl AsRef<Path>) -> [PathBuf; 2] {
+        let path = path.as_ref();
+        let mut shm = path.as_os_str().to_owned();
+        shm.push("-shm");
+        [Self::wal_path_for_path(path), PathBuf::from(shm)]
+    }
+
     /// The database file path. Ported from `DB.Path` (db.go:275).
     pub fn path(&self) -> &Path {
         &self.path
@@ -576,9 +593,7 @@ impl Db {
     /// Path to SQLite's WAL sidecar file (`<db>-wal`).
     /// Ported from `DB.WALPath` (db.go:287-289).
     pub fn wal_path(&self) -> PathBuf {
-        let mut s = self.path.clone().into_os_string();
-        s.push("-wal");
-        PathBuf::from(s)
+        Self::wal_path_for_path(&self.path)
     }
 
     /// Root LTX directory (`<meta>/ltx`). Ported from `DB.LTXDir` (db.go:302).

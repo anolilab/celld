@@ -274,15 +274,10 @@ impl PreservedCache {
         if snapshot.extension().is_none_or(|ext| ext != "evicted") {
             return;
         }
-        let live = snapshot.with_extension("sqlite");
-        let _ = self
-            .filesystem
-            .remove_dir_all(&celld_ltx::Db::meta_path_for_path(&live));
-        for suffix in ["-wal", "-shm"] {
-            let mut sibling = live.clone().into_os_string();
-            sibling.push(suffix);
-            let _ = self.filesystem.remove_file(&PathBuf::from(sibling));
-        }
+        let _ = crate::ltx_repl::remove_lineage(
+            self.filesystem.as_ref(),
+            &crate::ltx_repl::live_path(snapshot),
+        );
     }
 
     /// Drop a snapshot that has been consumed or deleted.

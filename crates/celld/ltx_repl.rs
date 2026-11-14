@@ -791,38 +791,6 @@ struct RemoteRestoreTiming {
     paged: bool,
 }
 
-/// A retained database that a resume renamed to its live name. Unless the
-/// activation reaches its handle, it goes back to `.evicted` and into the
-/// preserved cache: the core then claims the next epoch, and nothing else
-/// counts or removes files at the epoch this node leaves.
-struct ReturnToCache<'a> {
-    repl: &'a LtxRepl,
-    retained: PathBuf,
-    live: PathBuf,
-    armed: bool,
-}
-
-impl Drop for ReturnToCache<'_> {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if let Err(error) = self.repl.ltx_host.rename(&self.live, &self.retained) {
-            warn!(path = %self.live.display(), %error, "return a failed resume's database to the cache failed");
-            return;
-        }
-        if let Err(error) = self
-            .repl
-            .preserved
-            .lock()
-            .expect("preserved cache poisoned")
-            .insert(self.retained.clone())
-        {
-            warn!(path = %self.retained.display(), %error, "index a failed resume's database failed");
-        }
-    }
-}
-
 /// A paged VFS registration that unregisters itself unless the activation
 /// reaches its handle: every failure after the registration (the managed
 /// db's open, the seed, the marker's upload, admission) otherwise leaked a
@@ -854,18 +822,6 @@ fn by_level(plan: &[celld_ltx::FileInfo]) -> String {
         .map(|(level, count)| format!("L{level}:{count}"))
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-/// What an eviction leaves of the closed database on this node.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Retained {
-    /// No local file: the next activation restores from the bucket.
-    Nothing,
-    /// The database as `.evicted`, a base for the next epoch to open.
-    Base,
-    /// A base plus the LTX metadata and WAL files of the epoch it closed at,
-    /// so a wake at that same epoch reopens it without claiming a new one.
-    Resumable,
 }
 
 struct HandoffSnapshot {
@@ -2265,106 +2221,6 @@ impl LtxRepl {
         ))
     }
 
-    /// Put the database a same-epoch wake continues at its live path.
-    ///
-    /// A clean reload left it there. A dormant cell left it as `.evicted`, and
-    /// the rename is what ends that name: no epoch directory holds both, so a
-    /// crash after the first write cannot offer the pre-write image to the
-    /// next epoch as its base, which would drop every row since.
-    ///
-    /// The LTX metadata must be there too. Opening a database without it
-    /// starts a writer lineage at TXID 1 inside an epoch that already holds
-    /// files (#158), so a missing directory fails the wake and the core claims
-    /// the next epoch instead.
-    ///
-    /// A database that was renamed goes back to `.evicted`, and into the
-    /// cache, when the activation does not reach its handle: the guard
-    /// answered holds it until then.
-    fn take_retained_database(
-        &self,
-        cell: &str,
-        epoch: u64,
-        dst: &Path,
-    ) -> anyhow::Result<Option<ReturnToCache<'_>>> {
-        let is_file = |path: &Path| {
-            self.ltx_host
-                .metadata(path)
-                .is_ok_and(|metadata| metadata.is_file)
-        };
-        // A live file with its metadata gone is what a failed rename leaves,
-        // so the metadata is checked whichever name holds the database.
-        let meta = Db::meta_path_for_path(dst);
-        let retained = dst.with_extension("evicted");
-        let unavailable = |missing| {
-            anyhow::Error::new(crate::replication::RetainedUnavailable {
-                cell: cell.to_string(),
-                epoch,
-                missing,
-            })
-        };
-        let from_eviction = !is_file(dst);
-        if from_eviction && !is_file(&retained) {
-            return Err(unavailable("database"));
-        }
-        if !self
-            .ltx_host
-            .metadata(&meta)
-            .is_ok_and(|metadata| metadata.is_dir)
-        {
-            return Err(unavailable("LTX metadata"));
-        }
-        if !from_eviction {
-            return Ok(None);
-        }
-        self.ltx_host.rename(&retained, dst)?;
-        self.preserved
-            .lock()
-            .expect("preserved cache poisoned")
-            .forget(&retained);
-        Ok(Some(ReturnToCache {
-            repl: self,
-            retained,
-            live: dst.to_path_buf(),
-            armed: true,
-        }))
-    }
-
-    /// Whether the write-ahead log of the database at `db` holds pages. SQLite
-    /// folds the log into the file and removes it when its last connection
-    /// closes, so a log that survives the close was not folded. A log that
-    /// cannot be read is taken to hold pages.
-    fn wal_holds_pages(&self, db: &Path) -> bool {
-        let mut wal = db.as_os_str().to_owned();
-        wal.push("-wal");
-        match self.ltx_host.metadata(Path::new(&wal)) {
-            Ok(metadata) => metadata.len > 0,
-            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-        }
-    }
-
-    /// Remove what a retained epoch kept beside its database, before the next
-    /// epoch takes the database as its base. Its LTX metadata describes a
-    /// lineage that epoch no longer writes.
-    ///
-    /// This runs ahead of the rename: once the database has left its name, no
-    /// inventory or cache entry reaches the files beside it, so a failure or a
-    /// crash after the rename would strand them. A failure here leaves the
-    /// base where it was, still a valid base that the activation can retry.
-    fn forget_lineage(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
-        let db = self.db_path(cell, epoch);
-        let absent_is_fine = |result: std::io::Result<()>| match result {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-            _ => Ok(()),
-        };
-        absent_is_fine(self.ltx_host.remove_dir_all(&Db::meta_path_for_path(&db)))?;
-        for suffix in ["-wal", "-shm"] {
-            let mut sibling = db.clone().into_os_string();
-            sibling.push(suffix);
-            absent_is_fine(self.ltx_host.remove_file(&PathBuf::from(sibling)))?;
-        }
-        Ok(())
-    }
-
     /// The end of every full snapshot an epoch holds. Rows at or below the
     /// newest one at or below a reopened handle's position are the snapshot's,
     /// not any per-cell level's, so the handle compacts from the next
@@ -2457,7 +2313,7 @@ impl LtxRepl {
         // bucket. Writes always use the new name, so the old one dies out.
         let legacy = |path: &PathBuf| path.with_extension("hibernated");
         let previous = celld_logic::restore::previous_epoch_reusable(epoch, took_over)
-            .then(|| self.db_path(cell, epoch - 1).with_extension("evicted"));
+            .then(|| evicted_path(&self.db_path(cell, epoch - 1)));
         let is_file = |path: &PathBuf| {
             self.ltx_host
                 .metadata(path)
@@ -2885,7 +2741,7 @@ impl LtxRepl {
                 cells.insert((cell.to_string(), epoch), handle.clone());
                 registration.keep();
                 if let Some(taken) = &mut taken {
-                    taken.armed = false;
+                    taken.keep();
                 }
                 (true, false)
             }
@@ -3740,78 +3596,6 @@ impl LtxRepl {
         }
     }
 
-    fn finish_remove_local(
-        &self,
-        cell: &str,
-        epoch: u64,
-        retained: Retained,
-        close_result: anyhow::Result<()>,
-    ) {
-        let retained = match close_result {
-            Ok(()) => retained,
-            Err(error) => {
-                warn!(
-                    cell,
-                    epoch,
-                    %error,
-                    "close managed replica failed; discarding local snapshot"
-                );
-                // A failed close cannot qualify the live database as a
-                // reusable baseline. An orderly eviction already published
-                // its final snapshot, and every other caller requested no
-                // local reuse, so force any next epoch through remote restore.
-                Retained::Nothing
-            }
-        };
-        let db = self.db_path(cell, epoch);
-        // A close that could not fold the write-ahead log leaves pages there
-        // that the database file lacks. A base is the file alone, so it would
-        // be older than the snapshot that was published; only a resumable
-        // database keeps the log with it.
-        let retained = if retained == Retained::Base && self.wal_holds_pages(&db) {
-            warn!(
-                cell,
-                epoch, "the write-ahead log still holds pages; discarding local snapshot"
-            );
-            Retained::Nothing
-        } else {
-            retained
-        };
-        let preserved = db.with_extension("evicted");
-        let mut renamed = false;
-        if retained != Retained::Nothing {
-            if let Err(error) = self.ltx_host.rename(&db, &preserved) {
-                warn!(cell, epoch, %error, "preserve local snapshot failed");
-            } else {
-                renamed = true;
-                if let Err(error) = self
-                    .preserved
-                    .lock()
-                    .expect("preserved cache poisoned")
-                    .insert(preserved)
-                {
-                    warn!(cell, epoch, %error, "index preserved local snapshot failed");
-                }
-            }
-        }
-        // A resumable database keeps what the next open of this epoch reads
-        // beside it: the LTX metadata that carries its writer lineage, and the
-        // WAL files that belong to the name it returns to. Every other base is
-        // an image for the next epoch, which starts its own lineage and
-        // would otherwise inherit a stale one (#158).
-        if !(renamed && retained == Retained::Resumable) {
-            for suffix in ["-wal", "-shm"] {
-                let mut sibling = db.clone().into_os_string();
-                sibling.push(suffix);
-                let _ = self.ltx_host.remove_file(&PathBuf::from(sibling));
-            }
-            let _ = self.ltx_host.remove_dir_all(&Db::meta_path_for_path(&db));
-        }
-        if retained == Retained::Nothing {
-            let _ = self.ltx_host.remove_file(&db);
-        }
-    }
-
     /// Capture one full snapshot after the runtime closes.
     ///
     /// A retry reuses these bytes. Recreating the image for each failed PUT
@@ -4143,7 +3927,7 @@ impl LtxRepl {
             if let Some(parent) = db.parent() {
                 self.ltx_host.remove_dir_all(parent)?;
                 let mut preserved = self.preserved.lock().expect("preserved cache poisoned");
-                preserved.forget(&db.with_extension("evicted"));
+                preserved.forget(&evicted_path(&db));
                 preserved.forget(&db.with_extension("hibernated"));
             }
         }
@@ -5588,6 +5372,11 @@ impl Drop for LtxRepl {
         self.shutdown_local_fallback();
     }
 }
+
+mod retained;
+use retained::evicted_path;
+pub use retained::Retained;
+pub(crate) use retained::{live_path, remove_lineage};
 
 #[cfg(test)]
 mod tests;
