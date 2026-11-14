@@ -2320,6 +2320,20 @@ impl LtxRepl {
                     );
                 }
                 !pending
+            })
+            // A lineage that cannot be cleared stays with the base, which the
+            // cache still tracks; the bucket restore needs neither.
+            .filter(|_| match self.forget_lineage(cell, epoch - 1) {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(
+                        cell,
+                        epoch,
+                        error = %format!("{error:#}"),
+                        "clearing the previous epoch's lineage failed; restoring instead"
+                    );
+                    false
+                }
             });
 
         // Sample before a restore can replace the path. A non-certified live
@@ -2338,7 +2352,6 @@ impl LtxRepl {
             resume = Some(self.prepare_resume(cell, epoch, &dst)?);
             info!(cell, epoch, "resumed clean local replica");
         } else if let Some(snapshot) = local_snapshot {
-            self.forget_lineage(cell, epoch - 1)?;
             self.ltx_host.rename(&snapshot, &dst)?;
             self.preserved
                 .lock()

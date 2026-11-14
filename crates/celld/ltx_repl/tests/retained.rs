@@ -364,7 +364,7 @@ impl celld_ltx::FileSystem for RefusingFilesystem {
 }
 
 #[test]
-fn a_base_whose_lineage_cannot_be_removed_is_not_taken_and_strands_nothing() {
+fn a_base_whose_lineage_cannot_be_removed_is_not_taken_and_the_cell_restores() {
     run(async {
         let (rig, refusals) = rig_refusing();
         first_lifetime(&rig).await;
@@ -374,25 +374,17 @@ fn a_base_whose_lineage_cannot_be_removed_is_not_taken_and_strands_nothing() {
             .expect("eviction");
 
         refusals.removal.store(true, Ordering::SeqCst);
-        rig.ltx
-            .activate(options(2, false, false))
-            .await
-            .map(|_| ())
-            .expect_err("a lineage that cannot be removed");
-
-        // The base stays where the inventory and the cache find it, with the
-        // files beside it, for the retry.
-        assert!(evicted(&rig, 1).is_file() && meta(&rig, 1).is_dir());
-        assert!(!live(&rig, 2).exists());
-
-        refusals.removal.store(false, Ordering::SeqCst);
         let next = rig
             .ltx
             .activate(options(2, false, false))
             .await
-            .expect("claim the next epoch");
+            .expect("the bucket restore stands in for the base");
+        refusals.removal.store(false, Ordering::SeqCst);
+
         assert_eq!(rows(&next.path), [1]);
-        assert!(!evicted(&rig, 1).exists() && !meta(&rig, 1).exists());
+        // The base stays where the inventory and the cache find it, with the
+        // files beside it, so a later prune clears them.
+        assert!(evicted(&rig, 1).is_file() && meta(&rig, 1).is_dir());
     });
 }
 
