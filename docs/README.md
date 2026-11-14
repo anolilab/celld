@@ -143,18 +143,16 @@ the Cloudflare service.
 
 ## Install
 
+Build `celld` from source; this repository does not publish release binaries
+yet:
+
 ```sh
-curl -fsSL https://celld.dev/install.sh | sh
+cargo build --release --locked -p celld
+install -m 755 target/release/celld ~/.local/bin/celld
 ```
 
-The installer downloads the `celld` binary. Replication runs inside the
-process, so a node needs no external replicator. If the installer tells
-you, add `~/.local/bin` to `PATH`. To install one exact release, set
-`CELLD_VERSION` to its tag, for example `v0.0.1`; to go back, run the
-installer again with the previous tag. Each
-[release](https://github.com/denoland/celld/releases) has a build
-attestation: verify a file with
-`gh attestation verify <asset> --repo denoland/celld`.
+Replication runs inside the process, so a node needs no external replicator.
+Add `~/.local/bin` to `PATH` if it is not there already.
 
 ## Configure object storage
 
@@ -228,7 +226,7 @@ Install `esbuild` on `PATH` if the project contains Worker code. Then run
 `celld deploy` in a Wrangler project:
 
 ```sh
-git clone https://github.com/denoland/celld
+git clone https://github.com/anolilab/celld
 cd celld/examples/counter
 celld deploy . \
   --bucket "$CELLD_BUCKET" \
