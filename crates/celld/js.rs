@@ -10812,7 +10812,7 @@ fn op_vfs_mkdir(
 ) {
     let path = args.get(0).to_rust_string_lossy(scope);
     let recursive = args.get(1).boolean_value(scope);
-    let result = current_context()
+    let result = event_context(scope)
         .vfs
         .get_or_init(|| Mutex::new(RequestVfs::default()))
         .lock()
@@ -10839,7 +10839,7 @@ fn op_vfs_stat(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let path = args.get(0).to_rust_string_lossy(scope);
-    let (kind, size) = match current_context()
+    let (kind, size) = match event_context(scope)
         .vfs
         .get_or_init(|| Mutex::new(RequestVfs::default()))
         .lock()
