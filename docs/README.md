@@ -707,6 +707,8 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | variable | purpose |
 | --- | --- |
 | `CELLD_BUCKET` | The fleet bucket, and an optional key prefix. The same as `--bucket` |
+| `CELLD_CELL_DIRECTORY_SHADOW` | `1` records every cell that has stored state in a fleet directory under `fleet/born/` and logs `cell_directory_mismatch` when it disagrees with the claim's listing. The listing still decides. Default `0`, since the directory only adds requests until it replaces the listing |
+| `CELLD_CELL_DIRECTORY_BATCH_MS` | With the directory on, how long a registration waits for more cells to share its segment write (default `0`). A cell's first stored write waits for its registration, so keep it `0` with `CELLD_DURABILITY=bucket` |
 | `S3_ENDPOINT` | The S3-compatible endpoint. The same as `--endpoint` |
 | `AWS_REGION`, `AWS_DEFAULT_REGION` | The storage region |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Explicit AWS credentials. The standard AWS credential chain is also available |

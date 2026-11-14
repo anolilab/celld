@@ -3811,13 +3811,16 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             // of today's manifest. Start it even for a stateless deployment
             // so a later deployment can introduce cells without changing the
             // durability contract underneath the node.
-            let replication = Some(Replication::start(
+            let replication = Replication::start(
                 client.clone(),
                 &data_dir,
                 settings.endpoint.clone(),
                 settings.region.clone(),
                 storage_credentials.clone(),
-            )?);
+                &node,
+            )?;
+            let cell_directory = replication.cell_directory();
+            let replication = Some(replication);
             // The same two calls a reload makes: there is no boot-only way from
             // a deployment to a serving generation.
             let generation = Generation::build(
@@ -3849,7 +3852,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     probe_public_key.clone(),
                 )
                 .with_lease_ttl_ms(lease_ttl_ms_from_environment())
-                .with_fleet_sample_ms(fleet_sample_ms),
+                .with_fleet_sample_ms(fleet_sample_ms)
+                .with_cell_directory(cell_directory),
             );
             let wake_scan = Some((client, bucket_ownership.clone()));
             let ownership = Ownership::Bucket(bucket_ownership);

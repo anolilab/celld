@@ -1283,9 +1283,13 @@ pub struct LtxRepl {
     /// because each truncate boundary emits a full image of their unbounded
     /// backlog.
     truncate_pages: Option<u32>,
+    /// Every cell with per-cell LTX, as far as this node has read. The store
+    /// registers a cell here before its first artifact is written.
+    cell_directory: Option<Arc<crate::cell_directory::CellDirectory>>,
 }
 
 impl LtxRepl {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         watch: &Path,
         backend: crate::bucket::StorageBackend,
@@ -1294,6 +1298,7 @@ impl LtxRepl {
         endpoint: Option<String>,
         region: String,
         credentials: Option<StorageCredentials>,
+        node: &str,
     ) -> anyhow::Result<Self> {
         let compaction = compaction_config_from_env()?;
         // Everything downstream of the store is backend-agnostic already,
@@ -1310,6 +1315,31 @@ impl LtxRepl {
             crate::bucket::StorageBackend::Local => {
                 Arc::new(crate::local_store::LocalStore::open(&bucket)?)
             }
+        };
+        // Every per-cell LTX write goes through this store, so wrapping it
+        // here puts a durable directory entry in front of the first artifact
+        // of each cell. The reader needs no registration, so it holds the
+        // wrapper too, which forwards reads. Opt-in while the directory only
+        // shadows the claim listing: until it replaces that LIST, its
+        // segment writes are pure added cost.
+        let (store, directory) = if crate::env_vars::flag("CELLD_CELL_DIRECTORY_SHADOW", false)? {
+            let directory = Arc::new(crate::cell_directory::CellDirectory::new());
+            let batch_window = Duration::from_millis(crate::env_vars::with_default(
+                "CELLD_CELL_DIRECTORY_BATCH_MS",
+                0,
+            )?);
+            let store: Arc<dyn ObjectStore> =
+                Arc::new(crate::cell_directory::RegisteringStore::new(
+                    store,
+                    directory.clone(),
+                    prefix.clone(),
+                    node.to_owned(),
+                    crate::machine::random_process_generation(),
+                    batch_window,
+                ));
+            (store, Some(directory))
+        } else {
+            (store, None)
         };
         // Azure blob metadata names must be C# identifiers, so the standard
         // Litestream key cannot carry its hyphen there. External Litestream
@@ -1346,6 +1376,7 @@ impl LtxRepl {
             production_ltx_host(),
             durability_timeout_ms,
             LtxConfig::from_env(),
+            directory,
         ))
     }
 
@@ -1365,6 +1396,7 @@ impl LtxRepl {
         ltx_host: LtxHost,
         durability_timeout_ms: u64,
         config: LtxConfig,
+        cell_directory: Option<Arc<crate::cell_directory::CellDirectory>>,
     ) -> Self {
         let cells: Arc<Mutex<BTreeMap<(String, u64), CellHandle>>> = Arc::default();
         let dirty = Arc::new(Notify::new());
@@ -1406,6 +1438,12 @@ impl LtxRepl {
             "ltx_bundle",
             bundle_loop(cells.clone(), registration.clone(), stop.clone(), flush_ms),
         );
+        if let Some(directory) = cell_directory.clone() {
+            let (store, prefix, stop) = (store.clone(), prefix.clone(), stop.clone());
+            tasks.spawn_owned("cell_directory", async move {
+                directory.run_refresh(store, prefix, stop).await
+            });
+        }
         let compaction_queue =
             compaction.map(|config| start_compaction_loop(config, tasks.clone()));
         Self {
@@ -1453,7 +1491,13 @@ impl LtxRepl {
             retired_marks: Mutex::new(BTreeMap::new()),
             epoch_gc_grace_ms: config.epoch_gc_grace_ms,
             truncate_pages: Some(config.truncate_pages),
+            cell_directory,
         }
+    }
+
+    /// The node's view of the fleet directory of cells with LTX.
+    pub fn cell_directory(&self) -> Option<Arc<crate::cell_directory::CellDirectory>> {
+        self.cell_directory.clone()
     }
 
     pub(crate) fn take_task_owner(&self) -> LtxTaskOwner {

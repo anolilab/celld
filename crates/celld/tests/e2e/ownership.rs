@@ -16,7 +16,7 @@ fn store(project: &Path) -> rusqlite::Connection {
 
 #[tokio::test]
 async fn lost_record_beside_ltx_is_refused_not_reclaimed() {
-    let mut server = Server::start("bench-agents", &[]).await;
+    let mut server = Server::start("bench-agents", &[("CELLD_CELL_DIRECTORY_SHADOW", "1")]).await;
     for _ in 0..3 {
         assert_eq!(server.get_text("/agent/kept").await, "ok");
     }
@@ -31,6 +31,14 @@ async fn lost_record_beside_ltx_is_refused_not_reclaimed() {
                 )
                 .expect("count LTX");
             assert!(ltx > 0, "the writes left no LTX in the store");
+            let registered: i64 = store
+                .query_row(
+                    "SELECT count(*) FROM objects WHERE key LIKE '%fleet/born/%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count directory segments");
+            assert!(registered > 0, "the LTX has no directory entry");
             let deleted = store
                 .execute("DELETE FROM objects WHERE key LIKE '%cells/%/own.json'", [])
                 .expect("delete the ownership record");
@@ -74,4 +82,9 @@ async fn lost_record_beside_ltx_is_refused_not_reclaimed() {
     assert_eq!(records, 0, "the refused claim wrote a record");
     // Other cells are unaffected.
     assert_eq!(server.get_text("/agent/new").await, "ok");
+    // The directory never called a cell new while its LTX existed.
+    assert!(
+        !server.log_text().contains("cell_directory_mismatch"),
+        "the directory disagreed with the listing"
+    );
 }

@@ -220,11 +220,16 @@ impl Ownership {
             return Err(Failure::Definite);
         }
         let record = self.read_owner(cell).await?;
-        if record.is_some()
-            || !bucket
-                .ltx_exists(cell)
-                .await
-                .map_err(ownership_read_failed)?
+        if record.is_some() {
+            return Ok(record);
+        }
+        // Asked before the listing, so a registration that lands during the
+        // listing cannot make the directory look wrong.
+        let directory = bucket.directory_answer(cell);
+        if !bucket
+            .ltx_exists(cell)
+            .await
+            .map_err(ownership_read_failed)?
         {
             return Ok(record);
         }
@@ -236,6 +241,21 @@ impl Ownership {
         // reports a record that exists.
         if let Some(record) = self.read_owner(cell).await? {
             return Ok(Some(record));
+        }
+        // The listing decides. A directory that calls a cell new whose record
+        // is lost beside its LTX is the gap that must stay empty before the
+        // directory may replace the listing. Compared only here, because a
+        // first claim racing on another node also finds LTX after a missing
+        // record, and the re-read above settles that case.
+        if let Some(answer) = directory {
+            if celld_logic::cell_directory::contradicts_listing(answer, true) {
+                tracing::warn!(
+                    event = "cell_directory_mismatch",
+                    cell,
+                    ?answer,
+                    "the cell directory called a cell new while its LTX exists"
+                );
+            }
         }
         // A missing record tells the core that the cell was never owned, so
         // the core claims epoch one as a fresh cell and the activation

@@ -231,6 +231,7 @@ pub fn validate() -> anyhow::Result<()> {
     }
 
     for name in [
+        "CELLD_CELL_DIRECTORY_SHADOW",
         "CELLD_CLOUD",
         "CELLD_LTX_COMPACTION",
         "CELLD_LTX_PAGED",
@@ -273,6 +274,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_ADMISSION_WAIT_MS",
         "CELLD_ALARM_RESIDENT_MS",
         "CELLD_ASSET_CACHE_BYTES",
+        "CELLD_CELL_DIRECTORY_BATCH_MS",
         "CELLD_DEPLOY_MAX_AGE_S",
         "CELLD_LOCAL_CACHE_MAX_BYTES",
         "CELLD_LTX_TRUNCATE_PAGES",

@@ -17,6 +17,7 @@ pub mod assets;
 pub mod asyncrt;
 pub mod bucket;
 pub mod cell_cli;
+pub mod cell_directory;
 pub mod cell_dispatch;
 mod cell_host;
 pub mod cell_runtime;
