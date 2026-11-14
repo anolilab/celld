@@ -44,6 +44,9 @@ pub struct ReplicaCompactor<'a, C> {
     /// The epoch's first txid. An epoch that continues a chain it paged in
     /// starts at its cut, not at 1, so an empty destination level continues
     /// from here rather than from the first txid that never existed here.
+    /// An epoch reopened at a snapshot's position starts there too, and the
+    /// destination files below the base are the snapshot's to cover: they are
+    /// neither continued nor verified.
     base: TXID,
     local_path: Option<PathBuf>,
     host: LtxHost,
@@ -114,7 +117,8 @@ impl<'a, C: ReplicaClient> ReplicaCompactor<'a, C> {
             return Err(invalid("the compaction limits must be positive"));
         }
 
-        let destination = self.client.ltx_files(destination_level, TXID(0)).await?;
+        let mut destination = self.client.ltx_files(destination_level, TXID(0)).await?;
+        destination.retain(|file| file.min_txid >= self.base);
         self.verify_files(&destination)?;
         let previous_max = destination
             .iter()
@@ -385,7 +389,8 @@ impl<'a, C: ReplicaClient> ReplicaCompactor<'a, C> {
 
     /// Verifies that a destination level has neither gaps nor overlaps.
     pub async fn verify_level(&self, level: i32) -> Result<()> {
-        let files = self.client.ltx_files(level, TXID(0)).await?;
+        let mut files = self.client.ltx_files(level, TXID(0)).await?;
+        files.retain(|file| file.min_txid >= self.base);
         self.verify_files(&files)
     }
 

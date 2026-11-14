@@ -1233,6 +1233,22 @@ where
     CompletedEffect::plain(Event::RuntimeStopped { op })
 }
 
+/// A same-epoch wake whose kept files are gone is an expected outcome with
+/// `CELLD_RESUME_DORMANT_LOCAL`: a paged cell and a root that opened a facet
+/// keep none, and the cache can drop the rest. The core claims the next epoch
+/// instead, so it is no restore failure to print.
+fn expected_resume_fallback(
+    dormant_resume: bool,
+    spec: &celld_logic::RestoreSpec,
+    error: &anyhow::Error,
+) -> bool {
+    dormant_resume
+        && spec.resume_local
+        && error
+            .downcast_ref::<crate::replication::RetainedUnavailable>()
+            .is_some()
+}
+
 fn mono_elapsed_us(started_mono_ms: u64) -> u64 {
     crate::asyncrt::mono_ms()
         .saturating_sub(started_mono_ms)
@@ -3534,6 +3550,7 @@ impl Actor {
                 self.route_effect_started(&cell);
                 if let Some(runtime) = self.host.clone() {
                     let timing_cell = cell.clone();
+                    let dormant_resume = self.resume_dormant_local;
                     // A restore downloads, merges, and fsyncs a whole database.
                     // The drain runs it off the core, which owns the node lease timer.
                     // Choosing `spawn_detached` over `spawn_scoped` only keeps this
@@ -3541,7 +3558,17 @@ impl Actor {
                     out.spawn_detached(async move {
                         let started = crate::asyncrt::mono_ms();
                         let result = runtime.restore_cell(&cell, &spec).await.map_err(|error| {
-                            eprintln!("celld restore failed for {cell}: {error:#}");
+                            if expected_resume_fallback(dormant_resume, &spec, &error) {
+                                tracing::info!(
+                                    event = "dormant_resume_unavailable",
+                                    %cell,
+                                    epoch = spec.epoch,
+                                    reason = %error,
+                                    "the kept database could not be reopened at its epoch"
+                                );
+                            } else {
+                                eprintln!("celld restore failed for {cell}: {error:#}");
+                            }
                             Failure::Definite
                         });
                         CompletedEffect::timed(
@@ -4268,3 +4295,43 @@ fn apply_core_event(state: &mut ActorState, event: Event) -> Vec<Effect> {
 #[cfg(test)]
 #[path = "actor/operator_token_tests.rs"]
 mod operator_token_tests;
+
+#[cfg(test)]
+mod resume_fallback_tests {
+    use super::*;
+
+    fn spec(resume_local: bool) -> celld_logic::RestoreSpec {
+        celld_logic::RestoreSpec {
+            epoch: 1,
+            fresh: false,
+            took_over: false,
+            resume_local,
+            prior: None,
+        }
+    }
+
+    fn gone() -> anyhow::Error {
+        anyhow::Error::new(crate::replication::RetainedUnavailable {
+            cell: "a".into(),
+            epoch: 1,
+            missing: "database",
+        })
+    }
+
+    #[test]
+    fn only_a_missing_kept_database_of_a_dormant_resume_is_expected() {
+        assert!(expected_resume_fallback(true, &spec(true), &gone()));
+        assert!(expected_resume_fallback(
+            true,
+            &spec(true),
+            &gone().context("restore a")
+        ));
+        assert!(!expected_resume_fallback(false, &spec(true), &gone()));
+        assert!(!expected_resume_fallback(true, &spec(false), &gone()));
+        assert!(!expected_resume_fallback(
+            true,
+            &spec(true),
+            &anyhow::anyhow!("read replica: connection reset")
+        ));
+    }
+}

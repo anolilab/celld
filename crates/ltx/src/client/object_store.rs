@@ -715,11 +715,28 @@ impl ObjectStoreClient {
     /// snapshots, and a later eviction publishes its own, so "any object" says
     /// nothing about the transactions the newest closed database holds.
     ///
-    /// Transaction zero asks only for an object. Like [`Self::has_any_object`]
-    /// the listing stops at the first match.
+    /// Transaction zero asks only for an object. Otherwise a file that starts
+    /// at `txid` in the first two levels, or a snapshot that contains it,
+    /// answers from a bounded listing. Only a transaction inside a longer file
+    /// walks the epoch's listing, until its first match.
     pub async fn covers_txid(&self, txid: TXID) -> Result<bool> {
         if txid == TXID(0) {
             return self.has_any_object().await;
+        }
+        for level in 0..=1 {
+            let first = self.ltx_files_bounded(level, txid, 1).await?;
+            if first.first().is_some_and(|file| file.min_txid == txid) {
+                return Ok(true);
+            }
+        }
+        let snapshots = self
+            .ltx_files(crate::compaction_level::SNAPSHOT_LEVEL, TXID(0))
+            .await?;
+        if snapshots
+            .iter()
+            .any(|file| file.min_txid <= txid && txid <= file.max_txid)
+        {
+            return Ok(true);
         }
         let store = self.store().await?;
         let prefix = ObjPath::from(self.root_prefix());

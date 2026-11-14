@@ -71,6 +71,28 @@ impl std::fmt::Display for EvictionAbandoned {
 
 impl std::error::Error for EvictionAbandoned {}
 
+/// A same-epoch wake found nothing to reopen: the database or its LTX metadata
+/// is gone from this node. The core answers with an epoch claim in the same
+/// wake, so the failure is an expected fallback and no cell is left unserved.
+#[derive(Debug)]
+pub struct RetainedUnavailable {
+    pub cell: String,
+    pub epoch: u64,
+    pub missing: &'static str,
+}
+
+impl std::fmt::Display for RetainedUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "no {} retained for {} epoch {}",
+            self.missing, self.cell, self.epoch
+        )
+    }
+}
+
+impl std::error::Error for RetainedUnavailable {}
+
 /// Outcome of a blocking replication wait on one cell db.
 pub enum SyncWait {
     /// The latest local commit is in the bucket.
@@ -136,7 +158,9 @@ pub struct ActivationOptions<'a> {
     /// state is authoritative.
     pub took_over: bool,
     /// Open the exact existing local epoch after a certified node-level
-    /// handoff. This path performs no remote discovery or restore.
+    /// handoff or an eviction that kept the cell dormant on this node. This
+    /// path performs no restore, and reads only the epoch's snapshot listing
+    /// to place the handle's compaction.
     pub resume_local: bool,
     /// The owner a takeover displaced, from the record version the acquire
     /// consumed. The node-log takeover interlock recovers that node's log

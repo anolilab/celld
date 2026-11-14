@@ -2213,9 +2213,7 @@ impl LtxRepl {
     /// starts a writer lineage at TXID 1 inside an epoch that already holds
     /// files (#158), so a missing directory fails the wake and the core claims
     /// the next epoch instead.
-    ///
-    /// Answers whether the database came from `.evicted`.
-    fn take_retained_database(&self, cell: &str, epoch: u64, dst: &Path) -> anyhow::Result<bool> {
+    fn take_retained_database(&self, cell: &str, epoch: u64, dst: &Path) -> anyhow::Result<()> {
         let is_file = |path: &Path| {
             self.ltx_host
                 .metadata(path)
@@ -2225,19 +2223,24 @@ impl LtxRepl {
         // so the metadata is checked whichever name holds the database.
         let meta = Db::meta_path_for_path(dst);
         let retained = dst.with_extension("evicted");
+        let unavailable = |missing| {
+            anyhow::Error::new(crate::replication::RetainedUnavailable {
+                cell: cell.to_string(),
+                epoch,
+                missing,
+            })
+        };
         let from_eviction = !is_file(dst);
-        anyhow::ensure!(
-            !from_eviction || is_file(&retained),
-            "no retained database for {cell} epoch {epoch}: {}",
-            dst.display()
-        );
-        anyhow::ensure!(
-            self.ltx_host
-                .metadata(&meta)
-                .is_ok_and(|metadata| metadata.is_dir),
-            "no LTX metadata retained for {cell} epoch {epoch}: {}",
-            meta.display()
-        );
+        if from_eviction && !is_file(&retained) {
+            return Err(unavailable("database"));
+        }
+        if !self
+            .ltx_host
+            .metadata(&meta)
+            .is_ok_and(|metadata| metadata.is_dir)
+        {
+            return Err(unavailable("LTX metadata"));
+        }
         if from_eviction {
             self.ltx_host.rename(&retained, dst)?;
             self.preserved
@@ -2245,19 +2248,54 @@ impl LtxRepl {
                 .expect("preserved cache poisoned")
                 .forget(&retained);
         }
-        Ok(from_eviction)
+        Ok(())
     }
 
-    /// Remove what a retained epoch kept beside its database, once the next
-    /// epoch has taken the database as its base. Its LTX metadata describes a
+    /// Remove what a retained epoch kept beside its database, before the next
+    /// epoch takes the database as its base. Its LTX metadata describes a
     /// lineage that epoch no longer writes.
-    fn forget_lineage(&self, cell: &str, epoch: u64) {
+    ///
+    /// This runs ahead of the rename: once the database has left its name, no
+    /// inventory or cache entry reaches the files beside it, so a failure or a
+    /// crash after the rename would strand them. A failure here leaves the
+    /// base where it was, still a valid base that the activation can retry.
+    fn forget_lineage(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
         let db = self.db_path(cell, epoch);
-        let _ = self.ltx_host.remove_dir_all(&Db::meta_path_for_path(&db));
+        let absent_is_fine = |result: std::io::Result<()>| match result {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+        absent_is_fine(self.ltx_host.remove_dir_all(&Db::meta_path_for_path(&db)))?;
         for suffix in ["-wal", "-shm"] {
             let mut sibling = db.clone().into_os_string();
             sibling.push(suffix);
-            let _ = self.ltx_host.remove_file(&PathBuf::from(sibling));
+            absent_is_fine(self.ltx_host.remove_file(&PathBuf::from(sibling)))?;
+        }
+        Ok(())
+    }
+
+    /// The position of the newest full snapshot an epoch holds at or below
+    /// `position`, or 0. Rows at or below it are the snapshot's, not any
+    /// per-cell level's, so a handle reopened there compacts from the next
+    /// transaction. A listing that fails answers 0: the handle then
+    /// compacts from the first transaction, which can fail its rounds and
+    /// cannot lose a row.
+    async fn snapshot_cut(&self, cell: &str, epoch: u64, position: u64) -> u64 {
+        match self
+            .client_for(cell, epoch)
+            .ltx_files(replica::SNAPSHOT_LEVEL, TXID(0))
+            .await
+        {
+            Ok(files) => files
+                .iter()
+                .filter(|file| file.min_txid == TXID(1) && file.max_txid.0 <= position)
+                .map(|file| file.max_txid.0)
+                .max()
+                .unwrap_or(0),
+            Err(error) => {
+                warn!(cell, epoch, %error, "could not list the snapshots of a reopened epoch");
+                0
+            }
         }
     }
 
@@ -2352,28 +2390,16 @@ impl LtxRepl {
         // A paged activation continues its chain from the cut: (last txid of
         // the chain, page count at the cut).
         let mut continuation: Option<(TXID, u32)> = None;
-        // A retained database is evicted state: the bucket holds a snapshot
-        // at its position, and under a fleet proof the rows at or below it are
-        // in no per-cell L0 file. A compaction round continues a level from
-        // the first transaction it holds, so on this handle it finds its first
-        // source above a gap and fails, "the compaction source does not
-        // continue the destination level", on every retry. Without rounds the
-        // handle's rows above the snapshot stay uncovered by the per-cell
-        // layout until its next eviction snapshot, which keeps the bundles
-        // that carry them. Folding from the snapshot's cut needs the
-        // compactor to accept a level that starts above transaction 1 beside
-        // older files, which it does not yet.
-        let mut from_eviction = false;
         if resume_local {
-            from_eviction = self.take_retained_database(cell, epoch, &dst)?;
+            self.take_retained_database(cell, epoch, &dst)?;
             info!(cell, epoch, "resumed clean local replica");
         } else if let Some(snapshot) = local_snapshot {
+            self.forget_lineage(cell, epoch - 1)?;
             self.ltx_host.rename(&snapshot, &dst)?;
             self.preserved
                 .lock()
                 .expect("preserved cache poisoned")
                 .forget(&snapshot);
-            self.forget_lineage(cell, epoch - 1);
             info!(cell, epoch, "reused local eviction snapshot");
             restored = true;
         } else if !fresh {
@@ -2646,7 +2672,17 @@ impl LtxRepl {
                     complete: AtomicBool::new(false),
                 })
             });
-        let compaction_queue = self.compaction_queue.as_ref().filter(|_| !from_eviction);
+        // A reopened epoch holds a snapshot at some position, and under a
+        // fleet proof the rows at or below it are in no per-cell L0 file, so
+        // its compaction continues from the next transaction. A clean reload
+        // of such a cell finds the same snapshot.
+        let resume_cut = match (resume_local, &self.compaction_queue) {
+            (true, Some(_)) => {
+                self.snapshot_cut(cell, epoch, seed.map_or(0, |pos| pos.txid.0))
+                    .await
+            }
+            _ => 0,
+        };
         let handle = Arc::new(Cell {
             snapshot_declined: AtomicBool::new(false),
             paged_vfs: paged_vfs_name.clone(),
@@ -2671,7 +2707,7 @@ impl LtxRepl {
             percell_txid: AtomicU64::new(seed.map_or(0, |pos| pos.txid.0)),
             syncing: AtomicBool::new(false),
             ready: Notify::new(),
-            compaction: compaction_queue.map(|queue| {
+            compaction: self.compaction_queue.as_ref().map(|queue| {
                 let fetcher = Arc::new(SinkFetcher {
                     registration: self.registration.clone(),
                     cell: cell.to_string(),
@@ -2692,11 +2728,11 @@ impl LtxRepl {
                     local_path: Db::meta_path_for_path(&dst),
                     host: self.ltx_host.clone(),
                     queue: queue.clone(),
-                    base_txid: continuation.map_or(1, |(txid, _)| txid.0),
+                    base_txid: continuation.map_or(resume_cut + 1, |(txid, _)| txid.0),
                     min_txids: self.compaction_min_txids,
                     min_bytes: self.compaction_min_bytes,
                     pending_bytes: AtomicU64::new(0),
-                    compacted_txid: AtomicU64::new(0),
+                    compacted_txid: AtomicU64::new(resume_cut),
                     retry_after_ms: AtomicU64::new(0),
                     failures: AtomicU64::new(0),
                     queued: AtomicBool::new(false),
@@ -5339,7 +5375,10 @@ fn production_ltx_host() -> LtxHost {
 }
 
 fn execution_domain_ltx_host() -> LtxHost {
-    let filesystem = asyncrt::fs();
+    ltx_host_over(asyncrt::fs())
+}
+
+fn ltx_host_over(filesystem: Arc<dyn celld_ltx::FileSystem>) -> LtxHost {
     let age_filesystem = filesystem.clone();
     let read_filesystem = filesystem.clone();
     LtxHost::new(
