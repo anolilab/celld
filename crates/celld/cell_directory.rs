@@ -242,7 +242,7 @@ impl CellDirectory {
                 BLIND_WINDOW_MS,
             )
         });
-        if presence == Presence::Absent && !(recent && !forgotten) {
+        if presence == Presence::Absent && (!recent || forgotten) {
             return DirectoryAnswer::Unknown;
         }
         answer_from_tiers(presence)
@@ -467,10 +467,10 @@ mod tests {
         .await;
     }
 
-    /// Two reads that return different markers, which is what gives a reader
-    /// an age to count from: the first at `0`, the second after the cache's
-    /// time. The generation after the last is `3`; the marker the second read
-    /// returns has no unfolded backlog. Time `0` is then the anchor.
+    /// Two reads that return different markers, the first at `0` and the second
+    /// after the cache's time, which gives the reader `0` to count the marker's
+    /// age from. Neither marker has an unfolded backlog, and the next generation
+    /// is `3`.
     async fn observe_a_change(inner: &Arc<InMemory>, reader: &CellDirectory) {
         publish(inner, 1, 0).await;
         let _ = reader.lookup("probe", 0).await;
