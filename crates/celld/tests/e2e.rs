@@ -2,6 +2,7 @@
 
 mod e2e {
     pub mod alarms;
+    pub mod body_clone;
     pub mod d1_batch;
     pub mod d1_export;
     pub mod do_alarms;
