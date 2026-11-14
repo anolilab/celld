@@ -1206,13 +1206,16 @@ impl RuntimeManager {
         let config = generation
             .cell_config(class)
             .ok_or_else(|| anyhow!("no Worker exports Durable Object class {class}"))?;
+        // Held until the cell is registered below: a start that fails first
+        // leaves the container to the idle sweep.
+        let mut attached = None;
         // The object's `running` is read synchronously, so the engine
         // answers it here, before the object exists. A container is found
         // only through the id its run recorded; one left under the cell's
         // name is not reconnected.
         if config.container_class(class) {
             let engine = crate::container::engine().await?;
-            engine.attach(&cell, class).await?;
+            attached = Some(engine.attach(&cell, class).await?);
         }
         let startup_timing = CellIsolateStartupTiming {
             started: Instant::now(),
@@ -1310,6 +1313,9 @@ impl RuntimeManager {
             // ahead of the registry entry that later reports and coverage
             // reads depend on.
             (self.alarm_observer)(cell.clone(), alarm, self.alarm_covered(&cell, alarm));
+            if let Some(attached) = attached {
+                attached.keep();
+            }
             Ok((placed_in, generation.id))
         }
     }
