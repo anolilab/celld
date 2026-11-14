@@ -1,0 +1,11 @@
+{
+  "name": "operator-branches",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "kv_namespaces": [{ "binding": "KV", "id": "kv-id" }],
+  "queues": {
+    "producers": [{ "binding": "JOBS", "queue": "jobs" }],
+    "consumers": [{ "queue": "jobs", "max_batch_size": 1, "max_batch_timeout": 1 }]
+  }
+}

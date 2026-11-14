@@ -112,6 +112,32 @@ HMAC-authenticated `/runtime/<SCOPE>` route for these classes.
 `/peer/probe` returns a signed diagnostic response. Do not call the other
 reserved peer paths directly.
 
+### Operator-only branches of KV and Queue cells
+
+The KV namespace cell and the Queue cell answer their `fetch` only to a
+request that the host marked as the operator's: the signed `/runtime/<SCOPE>`
+route, or the host's own queue settlement. A Worker that holds a stub of one of
+these cells through its binding cannot read, write or list every key, and
+cannot purge, pause, redrive or settle a queue. A stub answers only the
+methods its binding calls over RPC: `__kvGet`, `__kvPut`, `__kvDelete` and
+`__kvList` for KV, and `__queueSend`, `__queueMetrics` and
+`__queueDlqAcceptBatch` for a queue. D1 follows the same rule for its export,
+migrate and row-returning branches.
+
+#### Upgrading: operator-only branches
+
+The next release (placeholder: the version that ships this note) marks the
+host's own queue settlement, so every KV and Queue call reaches the cell with
+the mark or is refused. During a rolling upgrade, a node that has not upgraded
+sends neither the mark on a forwarded operator call nor the mark on a queue
+settlement. An upgraded owner then answers `403` to `celld kv` and `celld
+queue` commands that an older node forwarded: run them through an upgraded
+node. It also refuses the settlement that an older node made for a batch it
+delivered, so the batch's lease expires and the messages are delivered again.
+A consumer must already tolerate redelivery, and the window closes when the
+last node upgrades. Upgrade every node before you rely on `celld queue`
+against a mixed fleet.
+
 ### Read an eviction result
 
 An accepted eviction waits for the operation to finish, and a refused one

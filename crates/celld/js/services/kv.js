@@ -31,6 +31,10 @@
 //   for bytes and the parsed JSON reply otherwise.
 // - `btoa(bytes)`, `atob(text)`: base64 of bytes and back, for the operator
 //   route.
+// - `operator(request)`: whether the host authenticated the request as the
+//   fleet operator's. The cell's `fetch` is the operator route, and a Worker
+//   holding a stub reaches it too, so it answers only such a request. A host
+//   without the function refuses every `fetch`.
 function kvService(host) {
   // Run one bounded reclamation transaction. A cell supplies only its ordered
   // candidate query and its per-row transition, so KV expiry and Queue retention
@@ -672,6 +676,12 @@ function kvService(host) {
     // has no faithful string form, and `celld kv` must be able to read back
     // exactly what was written.
     async fetch(request) {
+      if (typeof host.operator !== "function" || host.operator(request) !== true) {
+        return Response.json(
+          { error: "KV_ERROR: this request is for the operator, through `celld kv`" },
+          { status: 403 },
+        );
+      }
       let body;
       try {
         body = await request.json();
