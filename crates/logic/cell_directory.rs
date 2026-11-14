@@ -9,19 +9,21 @@
 //! unless the view is recent enough to include every registration that
 //! preceded the question.
 //!
-//! The directory is two tiers. Recent registrations sit in segments that every
-//! node reads whole: the uncompacted tail. Older ones are folded into
-//! partitioned runs of 64-bit fingerprints, which a lookup reads by range. The
-//! decisions here are pure; the owner supplies the facts by I/O, and every
-//! doubt becomes [`DirectoryAnswer::Unknown`], which sends the caller to the
-//! listing.
+//! Registrations are written to segments that only the compactor reads. It
+//! folds them into partitioned runs of 64-bit fingerprints, which a lookup reads
+//! by range, and after every pass publishes a freshness marker: when it
+//! published and how old its oldest unfolded segment was. A lookup rules a cell
+//! out only while that marker is recent enough to say every registration older
+//! than the blind window is folded. The decisions here are pure; the owner
+//! supplies the facts by I/O, and every doubt becomes
+//! [`DirectoryAnswer::Unknown`], which sends the caller to the listing.
 
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::ops::Range;
 
 /// A cell's fingerprint is partitioned by its top bits.
-pub const PARTITION_BITS: u32 = 12;
+pub const PARTITION_BITS: u32 = 8;
 /// How many partitions the fingerprint space is split into.
 pub const PARTITIONS: u32 = 1 << PARTITION_BITS;
 
@@ -37,10 +39,14 @@ const WINDOW_MIN_MARGIN: u64 = 16;
 /// `sqrt(count) / 2`, so `4 * sqrt(count)` is eight of them.
 const WINDOW_SQRT_FACTOR: u64 = 4;
 
-/// Records L0 holds before the next merge goes to L1.
-pub const L0_MAX_RECORDS: u64 = 1_024;
-/// Records L1 holds at least before it is merged into L2.
-pub const L1_MIN_RECORDS: u64 = 4_096;
+/// Records L0 holds before the next merge goes to L1. At the planned rate a
+/// partition gains about 40 records per 60 s pass, so L0 absorbs about 100
+/// passes, and a pass would need 100 times that load to merge into L1 every
+/// time.
+pub const L0_MAX_RECORDS: u64 = 4_096;
+/// Records L1 holds at least before it is merged into L2: sixteen L0
+/// flushes, about a day at the planned rate.
+pub const L1_MIN_RECORDS: u64 = 65_536;
 /// L1 is merged into L2 once it passes this share (as `1 / n`) of L2.
 pub const L1_SHARE_OF_L2: u64 = 10;
 
@@ -205,36 +211,7 @@ impl From<Probe> for TierProbe {
     }
 }
 
-/// What the uncompacted tail says about a fingerprint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TailHit {
-    Born,
-    Tombstone,
-    Miss,
-}
-
-/// The answer the tail settles without reading a run, or `None` when the head
-/// or the tiers must be asked. A birth in the tail is final at any view age.
-/// Everything else needs a fresh tail, because only a fresh one holds every
-/// registration that preceded the question.
-pub fn answer_from_tail(view_fresh: bool, tail: TailHit) -> Option<DirectoryAnswer> {
-    match (tail, view_fresh) {
-        (TailHit::Born, _) => Some(DirectoryAnswer::Exists),
-        (_, false) => Some(DirectoryAnswer::Unknown),
-        (TailHit::Tombstone | TailHit::Miss, true) => None,
-    }
-}
-
-/// Whether a tombstone in the tail, segment `seq` of its stream, is newer than
-/// every tier. The head's watermark for the stream is the highest segment of it
-/// that a merge of the head read: a tombstone at or below it was folded, or was
-/// left out because a later entry of its stream may be folded, and a birth that
-/// was folded after it would be hidden by answering from the tombstone.
-pub fn tombstone_is_newest(head_watermark: Option<u64>, seq: u64) -> bool {
-    head_watermark.is_none_or(|through| seq > through)
-}
-
-/// The answer once the tiers were read, for a fresh tail that missed.
+/// The answer once the tiers were read, for a fresh marker.
 pub fn answer_from_tiers(presence: Presence) -> DirectoryAnswer {
     match presence {
         Presence::Present => DirectoryAnswer::Exists,
@@ -243,12 +220,59 @@ pub fn answer_from_tiers(presence: Presence) -> DirectoryAnswer {
     }
 }
 
-/// Whether a view whose last complete refresh began at `refreshed_at_ms` is
-/// fresh at `now_ms`. A view that never loaded is not fresh. The refresh start
-/// is the right anchor, because a registration made after the listing began
-/// can be missing from it. A cached head uses the same rule with its fetch time.
-pub fn view_is_fresh(refreshed_at_ms: Option<u64>, now_ms: u64, max_age_ms: u64) -> bool {
-    refreshed_at_ms.is_some_and(|at| now_ms.saturating_sub(at) <= max_age_ms)
+/// Whether something fetched at `fetched_at_ms` is still within `max_age_ms` at
+/// `now_ms`, on one monotonic clock. Nothing fetched is not fresh.
+pub fn view_is_fresh(fetched_at_ms: Option<u64>, now_ms: u64, max_age_ms: u64) -> bool {
+    fetched_at_ms.is_some_and(|at| now_ms.saturating_sub(at) <= max_age_ms)
+}
+
+/// Whether a freshness marker allows the answer `New` at `now_ms`, all on wall
+/// clock time. The marker says every registration whose segment was durable
+/// more than `oldest_unfolded_age_ms` before `published_ms` is folded into the
+/// heads, so a cell registered less than `now - published + oldest_unfolded_age`
+/// ago may be missing. The allowance is that much, up to `max_blind_ms`. A
+/// clock that differs from the publisher's in either direction counts as
+/// elapsed time, so skew only ever removes the allowance.
+pub fn marker_allows_new(
+    published_ms: u64,
+    oldest_unfolded_age_ms: u64,
+    now_ms: u64,
+    max_blind_ms: u64,
+) -> bool {
+    now_ms
+        .abs_diff(published_ms)
+        .saturating_add(oldest_unfolded_age_ms)
+        <= max_blind_ms
+}
+
+/// The age a freshness marker records: the oldest segment that is not folded,
+/// and never less than the pass's own duration. A segment that became durable
+/// after the pass listed the segments is not in the listing, and it is at most
+/// `published_ms - listing_began_ms` old at publication.
+pub fn oldest_unfolded_age_ms(
+    published_ms: u64,
+    listing_began_ms: u64,
+    oldest_unfolded_modified_ms: Option<u64>,
+) -> u64 {
+    let began = oldest_unfolded_modified_ms
+        .map_or(listing_began_ms, |modified| modified.min(listing_began_ms));
+    published_ms.saturating_sub(began)
+}
+
+/// Whether the registration an own-process entry made, durable at
+/// `durable_ms`, is folded according to a marker. Every segment durable before
+/// `published_ms - oldest_unfolded_age_ms` is, with `skew_ms` taken off for a
+/// clock that differs from the compactor's. An entry whose segment is not
+/// durable yet is not.
+pub fn marker_covers(
+    durable_ms: Option<u64>,
+    published_ms: u64,
+    oldest_unfolded_age_ms: u64,
+    skew_ms: u64,
+) -> bool {
+    durable_ms.is_some_and(|durable| {
+        durable.saturating_add(skew_ms) < published_ms.saturating_sub(oldest_unfolded_age_ms)
+    })
 }
 
 /// Whether the directory and the listing of the cell's LTX disagree in the one
@@ -441,41 +465,45 @@ mod tests {
     }
 
     #[test]
-    fn membership_in_the_tail_is_final_at_any_age() {
-        assert_eq!(
-            answer_from_tail(true, TailHit::Born),
-            Some(DirectoryAnswer::Exists)
-        );
-        assert_eq!(
-            answer_from_tail(false, TailHit::Born),
-            Some(DirectoryAnswer::Exists)
-        );
+    fn a_marker_allows_new_only_while_its_blind_window_holds() {
+        // Published at 1_000 with nothing unfolded older than the pass itself.
+        assert!(marker_allows_new(1_000, 0, 1_000, 180));
+        assert!(marker_allows_new(1_000, 20, 1_160, 180));
+        assert!(!marker_allows_new(1_000, 20, 1_161, 180));
+        // An unfolded backlog uses the allowance up front.
+        assert!(!marker_allows_new(1_000, 181, 1_000, 180));
+        assert!(marker_allows_new(1_000, 180, 1_000, 180));
+        // A clock behind the publisher's is elapsed time too.
+        assert!(marker_allows_new(1_000, 0, 820, 180));
+        assert!(!marker_allows_new(1_000, 0, 819, 180));
+        assert!(!marker_allows_new(u64::MAX, u64::MAX, 0, 180));
     }
 
     #[test]
-    fn absence_counts_only_in_a_fresh_view() {
-        assert_eq!(answer_from_tail(true, TailHit::Miss), None);
-        assert_eq!(
-            answer_from_tail(false, TailHit::Miss),
-            Some(DirectoryAnswer::Unknown)
-        );
-        assert_eq!(answer_from_tail(true, TailHit::Tombstone), None);
-        assert_eq!(
-            answer_from_tail(false, TailHit::Tombstone),
-            Some(DirectoryAnswer::Unknown)
-        );
+    fn the_age_of_a_marker_is_floored_at_the_pass_duration() {
+        // Nothing unfolded: a segment that landed during the pass is at most
+        // as old as the pass.
+        assert_eq!(oldest_unfolded_age_ms(1_500, 1_000, None), 500);
+        // An unfolded segment from before the pass counts from its own time.
+        assert_eq!(oldest_unfolded_age_ms(1_500, 1_000, Some(400)), 1_100);
+        // One that landed after the listing began is no older than the floor.
+        assert_eq!(oldest_unfolded_age_ms(1_500, 1_000, Some(1_200)), 500);
+        assert_eq!(oldest_unfolded_age_ms(1_000, 1_500, None), 0);
     }
 
     #[test]
-    fn a_tombstone_the_head_covers_is_in_the_tiers_already() {
-        assert!(tombstone_is_newest(None, 0));
-        assert!(tombstone_is_newest(Some(4), 5));
-        assert!(!tombstone_is_newest(Some(5), 5));
-        assert!(!tombstone_is_newest(Some(9), 5));
+    fn a_marker_covers_only_registrations_older_than_its_unfolded_backlog() {
+        assert!(marker_covers(Some(700), 1_000, 200, 50));
+        assert!(!marker_covers(Some(750), 1_000, 200, 50));
+        assert!(!marker_covers(Some(800), 1_000, 200, 0));
+        assert!(marker_covers(Some(799), 1_000, 200, 0));
+        // Not durable yet: never covered.
+        assert!(!marker_covers(None, u64::MAX, 0, 0));
+        assert!(!marker_covers(Some(1), 1_000, u64::MAX, 0));
     }
 
     #[test]
-    fn the_tiers_decide_what_the_tail_left_open() {
+    fn the_tiers_decide_the_answer() {
         assert_eq!(
             answer_from_tiers(Presence::Present),
             DirectoryAnswer::Exists
@@ -599,15 +627,15 @@ mod tests {
 
     #[test]
     fn the_margin_grows_with_the_square_root_of_the_count() {
-        // About 5B cells over 4096 partitions: the rank of a uniform
-        // fingerprint strays by up to sqrt(n) / 2 = 550 records, a fixed margin
-        // of 64 would miss it, and the window must stay one small range.
-        let count = 1_200_000;
+        // About 5B cells over 256 partitions: the rank of a uniform
+        // fingerprint strays by up to sqrt(n) / 2 = 2,200 records, a fixed
+        // margin of 64 would miss it, and the window must stay one small range.
+        let count = 19_500_000;
         let window = window_for(count, fp_in_partition(1, 2));
         let width = window.end - window.first;
-        assert!(width >= 2 * 4 * 1_095, "{width}");
+        assert!(width >= 2 * 4 * 4_415, "{width}");
         let range = byte_range(window).unwrap();
-        assert!(range.end - range.start < 128 * 1024);
+        assert!(range.end - range.start < 512 * 1024);
         // Eight standard deviations of the worst case cover.
         let sigma = (count as f64).sqrt() / 2.0;
         assert!((width as f64) / 2.0 > 8.0 * sigma - 1.0);
@@ -716,15 +744,21 @@ mod tests {
     #[test]
     fn plans_follow_the_tier_sizes() {
         assert_eq!(plan_merge(0, 0, 0, 10), MergePlan::L0);
-        assert_eq!(plan_merge(1_000, 0, 0, 24), MergePlan::L0);
-        assert_eq!(plan_merge(1_000, 0, 0, 25), MergePlan::L1);
-        assert_eq!(plan_merge(1_000, 500, 1_000_000, 100), MergePlan::L1);
+        assert_eq!(plan_merge(4_000, 0, 0, 96), MergePlan::L0);
+        assert_eq!(plan_merge(4_000, 0, 0, 97), MergePlan::L1);
+        assert_eq!(plan_merge(4_000, 500, 100_000_000, 100), MergePlan::L1);
         // L1 reaches a tenth of L2 and the floor.
-        assert_eq!(plan_merge(1_000, 99_000, 1_000_000, 100), MergePlan::L2);
-        assert_eq!(plan_merge(1_000, 90_000, 1_000_000, 100), MergePlan::L1);
+        assert_eq!(
+            plan_merge(4_000, 9_996_000, 100_000_000, 100),
+            MergePlan::L2
+        );
+        assert_eq!(
+            plan_merge(4_000, 9_000_000, 100_000_000, 100),
+            MergePlan::L1
+        );
         // A small L2 does not pull L1 in below the floor.
-        assert_eq!(plan_merge(1_000, 100, 10, 100), MergePlan::L1);
-        assert_eq!(plan_merge(1_000, 4_000, 10, 100), MergePlan::L2);
+        assert_eq!(plan_merge(4_000, 100, 10, 100), MergePlan::L1);
+        assert_eq!(plan_merge(4_000, 62_000, 10, 100), MergePlan::L2);
         assert_eq!(plan_merge(u64::MAX, u64::MAX, 0, u64::MAX), MergePlan::L2);
     }
 

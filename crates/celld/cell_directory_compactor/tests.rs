@@ -1,10 +1,12 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 use super::*;
-use crate::cell_directory::CellDirectory;
+use crate::cell_directory::{CellDirectory, Now};
 use crate::cell_directory_registrar::{RegisteringStore, Registrar};
 use crate::cell_directory_runs::testing::{keys, Counting};
-use crate::cell_directory_runs::{read_ledger, read_run, run_key, write_run};
+use crate::cell_directory_runs::{
+    read_ledger, read_marker, read_run, run_key, write_marker, write_run, Marker,
+};
 use celld_logic::cell_directory::{DirectoryAnswer, Kind, Record};
 use object_store::PutPayload;
 use std::collections::BTreeSet;
@@ -17,7 +19,6 @@ const GEN: &str = "gen-c";
 
 struct Node {
     store: Arc<Counting>,
-    directory: Arc<CellDirectory>,
     writer: RegisteringStore,
     registrar: Arc<Registrar>,
 }
@@ -34,8 +35,7 @@ fn node(store: &Arc<Counting>, name: &str, generation: &str) -> Node {
     );
     Node {
         store: store.clone(),
-        directory,
-        registrar: writer.writer(),
+        registrar: writer.registrar(),
         writer,
     }
 }
@@ -51,11 +51,21 @@ impl Node {
             .unwrap();
     }
 
-    /// What a node that just started and has read the segments answers.
-    async fn fresh_reader(&self, now_ms: u64) -> CellDirectory {
-        let reader = CellDirectory::new(self.store.clone(), PREFIX.to_owned());
-        reader.refresh(now_ms).await.unwrap();
-        reader
+    /// A node that just started: it holds none of the directory.
+    async fn fresh_reader(&self) -> CellDirectory {
+        CellDirectory::new(self.store.clone(), PREFIX.to_owned())
+    }
+}
+
+/// A moment just after the last marker a pass published, on both clocks.
+async fn after_marker(store: &Counting) -> Now {
+    let marker = read_marker(store, PREFIX)
+        .await
+        .unwrap()
+        .expect("a pass published a marker");
+    Now {
+        mono_ms: 0,
+        wall_ms: marker.published_ms + 1,
     }
 }
 
@@ -102,15 +112,18 @@ async fn a_cell_registered_then_compacted_is_found_by_range() {
     assert!(segments(&store).await.is_empty());
 
     // A node that starts now has an empty tail, so the tiers answer.
-    let reader = a.fresh_reader(10).await;
+    let reader = a.fresh_reader().await;
     for cell in ["c1", "c2", "c3"] {
         assert_eq!(
-            reader.lookup(cell, 11).await,
+            reader.lookup(cell, after_marker(&store).await).await,
             DirectoryAnswer::Exists,
             "{cell}"
         );
     }
-    assert_eq!(reader.lookup("never", 11).await, DirectoryAnswer::New);
+    assert_eq!(
+        reader.lookup("never", after_marker(&store).await).await,
+        DirectoryAnswer::New
+    );
 }
 
 #[tokio::test]
@@ -120,40 +133,47 @@ async fn a_tombstoned_cell_reads_as_new_until_it_registers_again() {
     a.write_ltx("c1").await;
     pass(&store, 1, 1_000).await;
     pass(&store, 2, 1_000 + DELETE_GRACE_MS).await;
-    let before = a.fresh_reader(10).await;
-    assert_eq!(before.lookup("c1", 11).await, DirectoryAnswer::Exists);
+    let before = a.fresh_reader().await;
+    assert_eq!(
+        before.lookup("c1", after_marker(&store).await).await,
+        DirectoryAnswer::Exists
+    );
 
-    // The tombstone of a deletion, then the objects.
+    // The tombstone of a deletion, then the objects. A reader sees it only
+    // once the compactor has folded it.
     a.registrar.tombstone(&names(&["c1"])).await.unwrap();
     store
         .inner
         .delete(&Path::from("fleet-a/cells/c1/ltx/e1/0000/0001.ltx"))
         .await
         .unwrap();
-    // Visible at once through the tail, on the deleting node and others.
-    assert_eq!(a.directory.lookup("c1", 11).await, DirectoryAnswer::Unknown);
-    a.directory.refresh(12).await.unwrap();
-    assert_eq!(a.directory.lookup("c1", 13).await, DirectoryAnswer::New);
-    let other = a.fresh_reader(14).await;
-    assert_eq!(other.lookup("c1", 15).await, DirectoryAnswer::New);
+    let unfolded = a.fresh_reader().await;
+    assert_eq!(
+        unfolded.lookup("c1", after_marker(&store).await).await,
+        DirectoryAnswer::Exists
+    );
 
-    // And once compacted, through the tiers: the tombstone overrides the
-    // older birth.
+    // Once compacted, through the tiers: the tombstone overrides the older
+    // birth.
     let t = 2 * DELETE_GRACE_MS;
     pass(&store, 3, t).await;
     pass(&store, 4, t + DELETE_GRACE_MS).await;
     assert!(segments(&store).await.is_empty());
-    let compacted = a.fresh_reader(20).await;
-    assert_eq!(compacted.lookup("c1", 21).await, DirectoryAnswer::New);
+    let compacted = a.fresh_reader().await;
+    assert_eq!(
+        compacted.lookup("c1", after_marker(&store).await).await,
+        DirectoryAnswer::New
+    );
 
     // The stream recreated under the same id registers and reads as it.
     a.write_ltx("c1").await;
-    let recreated = a.fresh_reader(22).await;
-    assert_eq!(recreated.lookup("c1", 23).await, DirectoryAnswer::Exists);
     pass(&store, 5, 4 * DELETE_GRACE_MS).await;
     pass(&store, 6, 5 * DELETE_GRACE_MS).await;
-    let after = a.fresh_reader(30).await;
-    assert_eq!(after.lookup("c1", 31).await, DirectoryAnswer::Exists);
+    let after = a.fresh_reader().await;
+    assert_eq!(
+        after.lookup("c1", after_marker(&store).await).await,
+        DirectoryAnswer::Exists
+    );
 }
 
 #[tokio::test]
@@ -171,7 +191,7 @@ async fn a_pass_that_loses_a_head_race_skips_the_partition_and_deletes_nothing()
         .value;
 
     a.write_ltx(&cells[1]).await;
-    let runs_before = keys(&store, &format!("fleet-a/fleet/dir/{partition:03x}/run")).await;
+    let runs_before = keys(&store, &runs_root(PREFIX, partition)).await;
     store.refuse_head_update.store(true, Ordering::SeqCst);
     let lost = pass(&store, 2, 2_000).await;
     assert_eq!(lost.partitions_lost, 1, "{lost:?}");
@@ -184,7 +204,7 @@ async fn a_pass_that_loses_a_head_race_skips_the_partition_and_deletes_nothing()
         .value;
     assert_eq!(head_after, head_before);
     assert_eq!(
-        keys(&store, &format!("fleet-a/fleet/dir/{partition:03x}/run")).await,
+        keys(&store, &runs_root(PREFIX, partition)).await,
         runs_before
     );
     // Nothing is deleted however old the ledger is, because it names only
@@ -199,10 +219,10 @@ async fn a_pass_that_loses_a_head_race_skips_the_partition_and_deletes_nothing()
     // The next pass folds what the lost one did not, and not twice.
     let ledger = read_ledger(store.as_ref(), PREFIX).await.unwrap().unwrap();
     assert_eq!(ledger.value.segments.len(), 2);
-    let reader = a.fresh_reader(10).await;
+    let reader = a.fresh_reader().await;
     for cell in &cells[..2] {
         assert_eq!(
-            reader.lookup(cell, 11).await,
+            reader.lookup(cell, after_marker(&store).await).await,
             DirectoryAnswer::Exists,
             "{cell}"
         );
@@ -243,16 +263,16 @@ async fn the_first_pass_gives_every_partition_a_head() {
     let a = node(&store, "node-a", "gen1");
     a.write_ltx("c1").await;
     pass(&store, 1, 1_000).await;
-    let heads = keys(&store, "fleet-a/fleet/dir")
+    let heads = keys(&store, "fleet-a/fleet/dir/k256")
         .await
         .into_iter()
         .filter(|key| key.ends_with("/head"))
         .count();
     assert_eq!(heads, PARTITIONS as usize);
-    // A second pass writes none of them again.
+    // A second pass writes none of them again, only its marker.
     store.reset();
     pass(&store, 2, 2_000).await;
-    assert_eq!(store.puts.load(Ordering::SeqCst), 0);
+    assert_eq!(store.puts.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -268,8 +288,11 @@ async fn a_missing_head_is_doubt_after_compaction_started() {
         .delete(&Path::from(head_key(PREFIX, partition)))
         .await
         .unwrap();
-    let reader = a.fresh_reader(10).await;
-    assert_eq!(reader.lookup("c1", 11).await, DirectoryAnswer::Unknown);
+    let reader = a.fresh_reader().await;
+    assert_eq!(
+        reader.lookup("c1", after_marker(&store).await).await,
+        DirectoryAnswer::Unknown
+    );
 }
 
 #[tokio::test]
@@ -278,9 +301,8 @@ async fn the_delta_tier_is_rewritten_and_old_runs_are_deleted_after_the_grace() 
     let a = node(&store, "node-a", "gen1");
     let cells = cells_in_partition(partition_of(fingerprint("seed")), 3);
     let partition = partition_of(fingerprint(&cells[0]));
-    let run_keys = |store: Arc<Counting>| async move {
-        keys(&store, &format!("fleet-a/fleet/dir/{partition:03x}/run")).await
-    };
+    let run_keys =
+        |store: Arc<Counting>| async move { keys(&store, &runs_root(PREFIX, partition)).await };
 
     a.write_ltx(&cells[0]).await;
     pass(&store, 1, 1_000).await;
@@ -335,12 +357,7 @@ async fn a_partition_nothing_touches_still_loses_its_retired_runs() {
         .unwrap()
         .value;
     assert!(head.retired.is_empty());
-    assert_eq!(
-        keys(&store, &format!("fleet-a/fleet/dir/{partition:03x}/run"))
-            .await
-            .len(),
-        1
-    );
+    assert_eq!(keys(&store, &runs_root(PREFIX, partition)).await.len(), 1);
 }
 
 #[tokio::test]
@@ -354,14 +371,17 @@ async fn a_birth_from_another_stream_outranks_a_tombstone_in_one_pass() {
     b.write_ltx("c1").await;
     pass(&store, 1, 1_000).await;
     pass(&store, 2, 1_000 + DELETE_GRACE_MS).await;
-    let reader = a.fresh_reader(10).await;
-    assert_eq!(reader.lookup("c1", 11).await, DirectoryAnswer::Exists);
+    let reader = a.fresh_reader().await;
+    assert_eq!(
+        reader.lookup("c1", after_marker(&store).await).await,
+        DirectoryAnswer::Exists
+    );
 }
 
 #[tokio::test]
 async fn a_lookup_that_finds_nothing_reads_three_ranges_and_no_run_whole() {
     let store = Arc::new(Counting::default());
-    let partition = 0x2a5_u16;
+    let partition = 0xa5_u16;
     let base = u64::from(partition) << (64 - celld_logic::cell_directory::PARTITION_BITS);
     // A uniform run of 200,000 records, a middle tier and a delta, none
     // of which holds the cell asked about.
@@ -394,17 +414,20 @@ async fn a_lookup_that_finds_nothing_reads_three_ranges_and_no_run_whole() {
     )
     .await
     .unwrap();
+    write_marker(store.as_ref(), PREFIX, &Marker::new(1_000, 0))
+        .await
+        .unwrap();
     let reader = CellDirectory::new(store.clone(), PREFIX.to_owned());
-    reader.refresh(10).await.unwrap();
     let cell = cells_in_partition(partition, 1).remove(0);
+    let now = after_marker(&store).await;
     store.reset();
 
-    assert_eq!(reader.lookup(&cell, 11).await, DirectoryAnswer::New);
+    assert_eq!(reader.lookup(&cell, now).await, DirectoryAnswer::New);
     assert_eq!(store.ranged_gets.load(Ordering::SeqCst), 3);
     assert_eq!(
         store.whole_gets.load(Ordering::SeqCst),
-        1,
-        "only the small head is read whole"
+        2,
+        "only the small marker and head are read whole"
     );
     assert_eq!(store.lists.load(Ordering::SeqCst), 0);
 }
@@ -434,9 +457,14 @@ async fn a_tombstone_in_a_newer_tier_hides_an_older_birth() {
     )
     .await
     .unwrap();
+    write_marker(store.as_ref(), PREFIX, &Marker::new(1_000, 0))
+        .await
+        .unwrap();
     let reader = CellDirectory::new(store.clone(), PREFIX.to_owned());
-    reader.refresh(10).await.unwrap();
-    assert_eq!(reader.lookup(cell, 11).await, DirectoryAnswer::New);
+    assert_eq!(
+        reader.lookup(cell, after_marker(&store).await).await,
+        DirectoryAnswer::New
+    );
 }
 
 #[tokio::test]
@@ -449,7 +477,8 @@ async fn a_delta_pass_leaves_the_base_run_in_place() {
     let partition = partition_of(fingerprint(&cells[0]));
     let fps: Vec<Record> = (0..50_u64)
         .map(|index| Record {
-            fp: (u64::from(partition) << 52) + index * 1_000,
+            fp: (u64::from(partition) << (64 - celld_logic::cell_directory::PARTITION_BITS))
+                + index * 1_000,
             kind: Kind::Born,
         })
         .collect();
@@ -500,8 +529,11 @@ async fn a_tombstone_the_head_covers_leaves_the_answer_to_the_tiers() {
         .delete(&Path::from("fleet-a/fleet/born/node-a/gen1/00000002"))
         .await
         .unwrap();
-    let reader = a.fresh_reader(10).await;
-    assert_eq!(reader.lookup("c1", 11).await, DirectoryAnswer::Exists);
+    let reader = a.fresh_reader().await;
+    assert_eq!(
+        reader.lookup("c1", after_marker(&store).await).await,
+        DirectoryAnswer::Exists
+    );
 }
 
 #[tokio::test]
@@ -518,9 +550,12 @@ async fn a_head_write_that_committed_before_the_store_refused_it_is_ours() {
     let report = pass(&store, 2, 2_000).await;
     assert_eq!((report.partitions_merged, report.partitions_lost), (1, 0));
     // The runs the head names are still there.
-    let reader = a.fresh_reader(10).await;
+    let reader = a.fresh_reader().await;
     for cell in &cells {
-        assert_eq!(reader.lookup(cell, 11).await, DirectoryAnswer::Exists);
+        assert_eq!(
+            reader.lookup(cell, after_marker(&store).await).await,
+            DirectoryAnswer::Exists
+        );
     }
     let later = pass(&store, 3, 2_000 + DELETE_GRACE_MS).await;
     assert_eq!(later.partitions_failed, 0);
@@ -558,7 +593,11 @@ async fn an_empty_fleet_writes_its_ledger_once() {
     assert!(read_ledger(store.as_ref(), PREFIX).await.unwrap().is_some());
     store.reset();
     pass(&store, 2, 2_000).await;
-    assert_eq!(store.puts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store.puts.load(Ordering::SeqCst),
+        1,
+        "only the marker is written again"
+    );
 }
 
 async fn put_segment(store: &Counting, key: &str, body: &[u8]) {
@@ -598,10 +637,10 @@ async fn a_segment_that_lands_after_a_later_one_is_folded_before_it_is_deleted()
     pass(&store, 3, 1_000 + 2 * DELETE_GRACE_MS).await;
     assert!(segments(&store).await.is_empty());
 
-    let reader = a.fresh_reader(10).await;
+    let reader = a.fresh_reader().await;
     for cell in &cells {
         assert_eq!(
-            reader.lookup(cell, 11).await,
+            reader.lookup(cell, after_marker(&store).await).await,
             DirectoryAnswer::Exists,
             "{cell}"
         );
@@ -635,9 +674,12 @@ async fn a_lost_head_race_keeps_the_runs_the_current_head_names() {
             .len(),
         2
     );
-    let reader = a.fresh_reader(10).await;
+    let reader = a.fresh_reader().await;
     for cell in &cells {
-        assert_eq!(reader.lookup(cell, 11).await, DirectoryAnswer::Exists);
+        assert_eq!(
+            reader.lookup(cell, after_marker(&store).await).await,
+            DirectoryAnswer::Exists
+        );
     }
 }
 
@@ -660,7 +702,7 @@ async fn a_run_no_head_names_is_deleted_once_it_is_older_than_the_grace() {
     )
     .await
     .unwrap();
-    let runs = || keys(&store, "fleet-a/fleet/dir");
+    let runs = || keys(&store, "fleet-a/fleet/dir/k256");
     let has_orphan = |keys: Vec<String>| keys.contains(&format!("{PREFIX}{orphan}"));
     let rotation = u64::from(PARTITIONS / SWEEP_PARTITIONS);
 
@@ -680,8 +722,11 @@ async fn a_run_no_head_names_is_deleted_once_it_is_older_than_the_grace() {
     }
     assert_eq!(deleted, 1);
     assert!(!has_orphan(runs().await));
-    let reader = a.fresh_reader(10).await;
-    assert_eq!(reader.lookup("c1", 11).await, DirectoryAnswer::Exists);
+    let reader = a.fresh_reader().await;
+    assert_eq!(
+        reader.lookup("c1", after_marker(&store).await).await,
+        DirectoryAnswer::Exists
+    );
 }
 
 #[tokio::test]
@@ -702,9 +747,12 @@ async fn a_head_that_went_missing_is_rebuilt_from_its_runs() {
     assert_eq!(report.partitions_failed, 0, "{report:?}");
     pass(&store, 3, 2_000 + 10 * DELETE_GRACE_MS).await;
     assert!(segments(&store).await.is_empty());
-    let reader = a.fresh_reader(10).await;
+    let reader = a.fresh_reader().await;
     for cell in &cells {
-        assert_eq!(reader.lookup(cell, 11).await, DirectoryAnswer::Exists);
+        assert_eq!(
+            reader.lookup(cell, after_marker(&store).await).await,
+            DirectoryAnswer::Exists
+        );
     }
 }
 
@@ -735,9 +783,12 @@ async fn a_head_that_names_a_missing_run_is_rebuilt() {
     let report = pass(&store, 3, 3_000).await;
     assert_eq!(report.partitions_failed, 0, "{report:?}");
     pass(&store, 4, 3_000 + 10 * DELETE_GRACE_MS).await;
-    let reader = a.fresh_reader(10).await;
+    let reader = a.fresh_reader().await;
     for cell in [&cells[0], &cells[2]] {
-        assert_eq!(reader.lookup(cell, 11).await, DirectoryAnswer::Exists);
+        assert_eq!(
+            reader.lookup(cell, after_marker(&store).await).await,
+            DirectoryAnswer::Exists
+        );
     }
 }
 
@@ -781,8 +832,11 @@ async fn one_failed_partition_holds_back_only_the_segments_that_touch_it() {
         segments(&store).await,
         vec!["fleet-a/fleet/born/node-b/g9/00000001".to_owned()]
     );
-    let reader = a.fresh_reader(10).await;
-    assert_eq!(reader.lookup(&other, 11).await, DirectoryAnswer::Exists);
+    let reader = a.fresh_reader().await;
+    assert_eq!(
+        reader.lookup(&other, after_marker(&store).await).await,
+        DirectoryAnswer::Exists
+    );
 }
 
 #[tokio::test]
@@ -818,7 +872,7 @@ async fn the_sweep_never_deletes_the_runs_of_a_partition_it_cannot_read_a_head_f
         let report = pass(&store, 2 + number, later).await;
         assert_eq!(report.runs_deleted, 0);
     }
-    let remaining = keys(&store, "fleet-a/fleet/dir").await;
+    let remaining = keys(&store, "fleet-a/fleet/dir/k256").await;
     assert!(remaining.contains(&format!("{PREFIX}{run}")));
 }
 
@@ -853,13 +907,134 @@ async fn a_pass_folds_at_most_its_cap_of_segments_in_key_order() {
         deleted += report.segments_deleted;
     }
     assert_eq!(deleted, 5);
-    let reader = a.fresh_reader(10).await;
+    let reader = a.fresh_reader().await;
     for seq in 0..5 {
         assert_eq!(
-            reader.lookup(&format!("c{seq}"), 11).await,
+            reader
+                .lookup(&format!("c{seq}"), after_marker(&store).await)
+                .await,
             DirectoryAnswer::Exists
         );
     }
+}
+
+async fn marker(store: &Counting) -> Marker {
+    read_marker(store, PREFIX)
+        .await
+        .unwrap()
+        .expect("a pass published a marker")
+}
+
+#[tokio::test]
+async fn a_pass_publishes_its_marker_after_the_heads_are_durable() {
+    let store = Arc::new(Counting::default());
+    let a = node(&store, "node-a", "gen1");
+    a.write_ltx("c1").await;
+    assert!(read_marker(store.as_ref(), PREFIX).await.unwrap().is_none());
+    let report = pass(&store, 1, 1_000).await;
+    // Everything was folded, so only the pass's own duration is in the age.
+    assert_eq!(marker(&store).await, Marker::new(1_000, 0));
+    assert_eq!(report.marker_age_ms, Some(0));
+    // Passes with nothing to fold still publish, or readers would age out.
+    pass(&store, 2, 2_000).await;
+    assert_eq!(marker(&store).await, Marker::new(2_000, 0));
+}
+
+#[tokio::test]
+async fn the_marker_age_is_never_less_than_the_pass_that_wrote_it() {
+    let store = Arc::new(Counting::default());
+    let a = node(&store, "node-a", "gen1");
+    a.write_ltx("c1").await;
+    // A segment that lands after the listing is not in it, and the pass may
+    // run this long before it publishes.
+    let ticks = std::sync::atomic::AtomicU64::new(0);
+    let slow = || 1_000 + ticks.fetch_add(1, Ordering::SeqCst) * 7_000;
+    compact_pass(store.as_ref(), PREFIX, GEN, 1, &slow)
+        .await
+        .unwrap();
+    let published = marker(&store).await;
+    assert!(published.published_ms >= 1_000 + 14_000);
+    assert_eq!(
+        published.oldest_unfolded_age_ms,
+        published.published_ms - 1_000
+    );
+}
+
+#[tokio::test]
+async fn the_marker_age_counts_segments_a_pass_left_unfolded() {
+    let store = Arc::new(Counting::default());
+    // The store stamps segments with the real time, so the pass runs a
+    // virtual 100 s later.
+    let written = crate::ownership_store::now_ms();
+    let later = written + 100_000;
+    put_segment(&store, "node-b/g9/00000000", b"c0\n").await;
+    put_segment(&store, "node-b/g9/00000001", b"c1\n").await;
+    put_segment(&store, "node-b/g9/00000002", &[0xff]).await;
+
+    // Capped: one deferred, one unreadable.
+    let report = compact_pass_capped(store.as_ref(), PREFIX, GEN, 1, &|| later, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.segments_folded, report.segments_deferred),
+        (2, 1),
+        "{report:?}"
+    );
+    let age = marker(&store).await.oldest_unfolded_age_ms;
+    assert!((99_000..=101_000).contains(&age), "{age}");
+
+    // The deferred one folds next; the unreadable one still holds the age back.
+    compact_pass_capped(store.as_ref(), PREFIX, GEN, 2, &|| later, 2)
+        .await
+        .unwrap();
+    let age = marker(&store).await.oldest_unfolded_age_ms;
+    assert!((99_000..=101_000).contains(&age), "{age}");
+
+    // Remove the broken segment: nothing is unfolded, and the age is the floor.
+    store
+        .inner
+        .delete(&Path::from("fleet-a/fleet/born/node-b/g9/00000002"))
+        .await
+        .unwrap();
+    compact_pass_capped(store.as_ref(), PREFIX, GEN, 3, &|| later, 2)
+        .await
+        .unwrap();
+    assert_eq!(marker(&store).await, Marker::new(later, 0));
+}
+
+#[tokio::test]
+async fn a_segment_held_back_by_a_failed_partition_keeps_the_marker_age() {
+    let store = Arc::new(Counting::default());
+    let written = crate::ownership_store::now_ms();
+    let later = written + 100_000;
+    put_segment(&store, "node-b/g9/00000000", b"seed\n").await;
+    pass(&store, 1, later).await;
+    let broken = partition_of(fingerprint("seed"));
+    store
+        .inner
+        .put(
+            &Path::from(head_key(PREFIX, broken)),
+            PutPayload::from_static(b"{"),
+        )
+        .await
+        .unwrap();
+    put_segment(&store, "node-b/g9/00000001", b"seed\n").await;
+    let report = pass(&store, 2, later).await;
+    assert_eq!(report.partitions_failed, 1, "{report:?}");
+    let age = marker(&store).await.oldest_unfolded_age_ms;
+    assert!(age >= 99_000, "{age}");
+}
+
+#[tokio::test]
+async fn a_pass_that_fails_leaves_the_marker_to_age() {
+    let store = Arc::new(Counting::default());
+    pass(&store, 1, 1_000).await;
+    store.down.store(true, Ordering::SeqCst);
+    compact_pass(store.as_ref(), PREFIX, GEN, 2, &|| 2_000)
+        .await
+        .expect_err("a pass in an outage fails");
+    store.down.store(false, Ordering::SeqCst);
+    assert_eq!(marker(&store).await, Marker::new(1_000, 0));
 }
 
 #[test]
