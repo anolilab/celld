@@ -12,11 +12,18 @@
 //!
 //! The container is bound to the cell's ownership on this node, not to its
 //! residency: an idle eviction leaves it running under an inactivity timer
-//! and the next activation of the same cell reconnects to it by name, which
+//! and the next activation of the same cell reconnects to it, which
 //! is what Cloudflare does and what the `@cloudflare/containers` class's
 //! `sleepAfter` alarm relies on. Every other stop destroys it. The
 //! container's disk is ephemeral on Cloudflare too, so a takeover that
 //! starts fresh is conformant.
+//!
+//! The name is the cell's and every run of the cell reuses it, so a name can
+//! mean the container of an earlier run, or of a later one. A call therefore
+//! never goes by the name: the cell keeps the engine's id of each run's
+//! container from the create that answered it, and a call made for a run
+//! reaches that run's container or finds nothing. The name is used to create
+//! a container and by the node's reap of what a previous process left.
 //!
 //! Images travel through the bucket. `celld deploy` saves the image the
 //! config names as a tar at `deploy/images/<id>.tar`, and a node loads it
@@ -440,6 +447,14 @@ struct CellState {
     /// Bumped per start so a wait from a previous run cannot report for
     /// this one.
     run: u64,
+    /// The engine's id of the container each run created, from the create
+    /// that answered it until the removal the engine confirmed. The name
+    /// belongs to the cell and is reused, so a run's container is addressed
+    /// by this id and by nothing else.
+    containers: BTreeMap<u64, String>,
+    /// Bumped by every `attach`, so a stop that began before an activation
+    /// came back can tell that the cell is wanted again.
+    attached: u64,
 }
 
 impl Address {
@@ -532,7 +547,17 @@ impl CellContainer {
     /// effect runs, or the monitor would find the previous run's exit and
     /// report the new container dead on arrival.
     pub fn begin_run(&self) -> u64 {
+        self.begin_run_after(None)
+            .expect("a run opens when no run is required")
+    }
+
+    /// Open the next run if `seen` is still the newest, or whatever the
+    /// newest is when `seen` is `None`. `None` when a newer run opened.
+    fn begin_run_after(&self, seen: Option<u64>) -> Option<u64> {
         let mut state = self.state.lock().unwrap();
+        if seen.is_some_and(|seen| state.run != seen) {
+            return None;
+        }
         state.run += 1;
         state.running = true;
         state.address = Address::None;
@@ -542,7 +567,7 @@ impl CellContainer {
         // from the run it was asked about or a later one, and a monitor that
         // has not polled yet must still find the end of its own run.
         self.started.send_replace((run, Started::Pending));
-        run
+        Some(run)
     }
 
     /// Settle `run`'s start, unless it already settled or a newer run
@@ -637,13 +662,20 @@ impl CellContainer {
         self.publish_exit(run, Err(reason.to_string()));
     }
 
-    /// Wait until the newest run's start has settled. `Ok` when the container
-    /// is up; an error names why it will not be.
-    async fn wait_started(&self) -> anyhow::Result<()> {
+    /// Wait until `run`'s start has settled. `Ok` when the container is up;
+    /// an error names why it will not be. The wait is for that run alone: a
+    /// start that opens meanwhile replaces the run, which ended, and the call
+    /// that waited must neither wait for the newer start nor reach it.
+    async fn wait_started(&self, run: u64) -> anyhow::Result<()> {
         let mut started = self.started.subscribe();
         loop {
-            let (_, current) = started.borrow_and_update().clone();
-            match current {
+            let (current, outcome) = started.borrow_and_update().clone();
+            if current > run {
+                return Err(anyhow!(
+                    "exec() requires a running container: the container of this run ended"
+                ));
+            }
+            match outcome {
                 Started::Ready => return Ok(()),
                 Started::Failed(reason) => {
                     return Err(anyhow!("exec() requires a running container: {reason}"))
@@ -659,6 +691,73 @@ impl CellContainer {
     /// The run `monitor()` waits on: the newest one.
     pub fn current_run(&self) -> u64 {
         self.state.lock().unwrap().run
+    }
+
+    /// Whether `run` is still the cell's newest.
+    fn is_current(&self, run: u64) -> bool {
+        self.state.lock().unwrap().run == run
+    }
+
+    /// Note the id the engine gave the container `run` created. No other
+    /// run holds it afterwards, as a container the node adopted moves to the
+    /// run that adopted it.
+    fn record_container(&self, run: u64, id: String) {
+        let mut state = self.state.lock().unwrap();
+        state.containers.retain(|_, held| *held != id);
+        state.containers.insert(run, id);
+    }
+
+    /// The id of the container `run` created, if the engine answered it.
+    fn container_id(&self, run: u64) -> Option<String> {
+        self.state.lock().unwrap().containers.get(&run).cloned()
+    }
+
+    /// The newest run, and the id of the container of the newest run that has
+    /// one, read together.
+    fn observe(&self) -> (u64, Option<String>) {
+        let state = self.state.lock().unwrap();
+        (state.run, state.containers.values().next_back().cloned())
+    }
+
+    /// The containers of the runs before `run`, which no call can still mean.
+    fn containers_before(&self, run: u64) -> Vec<(u64, String)> {
+        let state = self.state.lock().unwrap();
+        state
+            .containers
+            .range(..run)
+            .map(|(run, id)| (*run, id.clone()))
+            .collect()
+    }
+
+    /// The engine removed the container `run` created.
+    fn forget_container(&self, run: u64, id: &str) {
+        let mut state = self.state.lock().unwrap();
+        if state.containers.get(&run).is_some_and(|held| held == id) {
+            state.containers.remove(&run);
+        }
+    }
+
+    /// The id of `run`'s container, when `run` is the cell's newest and is
+    /// running: what an exec may be sent to.
+    fn running_container(&self, run: u64) -> anyhow::Result<String> {
+        let state = self.state.lock().unwrap();
+        if state.run != run {
+            return Err(anyhow!(
+                "exec() requires a running container: the container of this run ended"
+            ));
+        }
+        // The start settled before this is asked, so a run that is not running
+        // has ended.
+        if !state.running {
+            return Err(anyhow!(
+                "exec() requires a running container: the container of this run ended"
+            ));
+        }
+        state
+            .containers
+            .get(&run)
+            .cloned()
+            .ok_or_else(|| anyhow!("exec() requires a running container."))
     }
 }
 
@@ -1231,6 +1330,14 @@ impl ContainerEngine {
     /// class with a spec; the object's `running` reads the answer.
     pub async fn attach(&self, scope: &str, class: &str) -> anyhow::Result<Arc<CellContainer>> {
         let spec = spec(class).ok_or_else(|| anyhow!("class {class} has no container"))?;
+        self.attach_cell(scope, spec).await
+    }
+
+    async fn attach_cell(
+        &self,
+        scope: &str,
+        spec: Arc<ContainerSpec>,
+    ) -> anyhow::Result<Arc<CellContainer>> {
         let cell = {
             let mut cells = self.cells.lock().unwrap();
             let cell = cells.entry(scope.to_string()).or_insert_with(|| {
@@ -1244,26 +1351,54 @@ impl ContainerEngine {
                     started: watch::channel((0, Started::Ready)).0,
                 })
             });
-            // A returning cell cancels the destroy its eviction armed.
-            cell.state.lock().unwrap().sweeper = None;
+            // A returning cell cancels the destroy its eviction armed, and
+            // tells a stop that is already under way to leave the handle.
+            let mut state = cell.state.lock().unwrap();
+            state.sweeper = None;
+            state.attached += 1;
+            drop(state);
             cell.clone()
         };
-        let running = self.inspect_running(&cell).await?;
-        // A container this handle did not start, left running by an
-        // earlier owner of the name: give it a run so `monitor()` has an
-        // exit to wait for. The run opens before the address lands, because
-        // opening one clears it.
-        let adopted = running.is_some() && !cell.running();
-        if adopted {
-            let run = cell.begin_run();
+        // What the inspection says is about the newest run as it was when it
+        // began. A start that opens a newer run meanwhile owns the state from
+        // then on, and an answer about the older container is not its own.
+        let (seen, id) = cell.observe();
+        let running = match id {
+            Some(id) => self.inspect_running(&id).await?,
+            None => None,
+        };
+        // A container this handle started and no longer tracks as running,
+        // which the engine still has running: give it a run so `monitor()`
+        // has an exit to wait for. The run opens before the address lands,
+        // because opening one clears it.
+        let mut run = seen;
+        if let (true, Some((id, _))) = (running.is_some() && !cell.running(), &running) {
+            let Some(adopted) = cell.begin_run_after(Some(seen)) else {
+                return Ok(cell);
+            };
+            run = adopted;
             cell.settle_start(run, Started::Ready);
-            self.watch_exit(&cell, run, cell.name.clone());
+            cell.record_container(run, id.clone());
+            self.watch_exit(&cell, run, id.clone());
         }
         let mut state = cell.state.lock().unwrap();
-        state.running = running.is_some();
-        state.address = running.unwrap_or_default();
+        if state.run == run {
+            state.running = running.is_some();
+            state.address = running.map(|(_, address)| address).unwrap_or_default();
+        }
         drop(state);
         Ok(cell)
+    }
+
+    /// Open the next run on the cell's handle, if the cell started on this
+    /// node. The handle is looked up and the run opened under the lock that a
+    /// stop holds to remove the handle, so a run is never opened on a handle
+    /// that is being taken away.
+    pub fn open_run(&self, scope: &str) -> Option<(Arc<CellContainer>, u64)> {
+        let cells = self.cells.lock().unwrap();
+        let cell = cells.get(scope)?.clone();
+        let run = cell.begin_run();
+        Some((cell, run))
     }
 
     /// The cell's handle, if the cell started on this node.
@@ -1331,10 +1466,13 @@ impl ContainerEngine {
         Ok(())
     }
 
-    async fn inspect_running(&self, cell: &CellContainer) -> anyhow::Result<Option<Address>> {
+    /// The container with this id, if it is running: its id and where the
+    /// node dials it. The name is never looked up, because a container under
+    /// it that this handle does not know is a leftover and not the cell's.
+    async fn inspect_running(&self, id: &str) -> anyhow::Result<Option<(String, Address)>> {
         let reply = self
             .docker
-            .call("GET", &format!("/containers/{}/json", cell.name), None)
+            .call("GET", &format!("/containers/{id}/json"), None)
             .await?;
         if reply.status.as_u16() == 404 {
             return Ok(None);
@@ -1351,7 +1489,7 @@ impl ContainerEngine {
             .pointer("/State/Running")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        Ok(running.then(|| address_of(&info)))
+        Ok(running.then(|| (id.to_string(), address_of(&info))))
     }
 
     /// Start the cell's container. The object's `start()` returns before
@@ -1366,11 +1504,7 @@ impl ContainerEngine {
         run: u64,
         params: StartParams,
     ) -> anyhow::Result<()> {
-        // The id of the container this run created. Everything the run does
-        // to its container goes by id: the name is the cell's, and a newer
-        // run can hold it by the time this one fails or finishes late.
-        let mut container_id = None;
-        let started = self.create_and_start(cell, params, &mut container_id).await;
+        let started = self.create_and_start(cell, run, params).await;
         let address = match started {
             Ok(address) => address,
             Err(error) => {
@@ -1407,7 +1541,7 @@ impl ContainerEngine {
                 // create the engine never answered has no id; whatever it
                 // makes later is removed by the cell's next start, or by the
                 // node when it restarts or shuts down.
-                self.remove_container(container_id.as_deref()).await;
+                self.remove_run_container(cell, run).await;
                 return Err(error);
             }
         };
@@ -1415,31 +1549,60 @@ impl ContainerEngine {
             // `destroy()` ended this run while the container was being
             // created. The container exists now and belongs to no run, so it
             // goes, by its id: a newer run may hold the name already.
-            self.remove_container(container_id.as_deref()).await;
+            self.remove_run_container(cell, run).await;
             return Ok(());
         }
         // `finish_start` took the container for the run, so it has an id.
-        if let Some(id) = container_id {
+        if let Some(id) = cell.container_id(run) {
             self.watch_exit(cell, run, id);
         }
         Ok(())
     }
 
-    /// Remove the container with this id, if there is one. Best effort: the
-    /// run that asks has already failed or ended.
-    async fn remove_container(&self, id: Option<&str>) {
-        let Some(id) = id else {
+    /// Remove the container `run` created, by its id, if there is one. Best
+    /// effort: the run that asks has already failed or ended.
+    async fn remove_run_container(&self, cell: &CellContainer, run: u64) {
+        let Some(id) = cell.container_id(run) else {
             return;
         };
-        let _ = self
-            .docker
-            .call("DELETE", &format!("/containers/{id}?force=true"), None)
-            .await;
+        if self.remove_container(&id).await.is_ok() {
+            cell.forget_container(run, &id);
+        }
     }
 
-    /// Wait for the container `target` (its id, or the cell's name for one
-    /// adopted from an earlier owner) to end and publish the exit for `run`;
-    /// a later run's start has already replaced the state.
+    /// Remove the container with this id. Done when the engine confirms the
+    /// removal or says there is no such container, as it does for one that
+    /// already ended; also done on 409, the daemon saying another removal of
+    /// it is already in progress. An engine that did not answer, or refused,
+    /// is an error, because the container may still be running.
+    async fn remove_container(&self, id: &str) -> anyhow::Result<()> {
+        let removed = self
+            .docker
+            .call("DELETE", &format!("/containers/{id}?force=true"), None)
+            .await
+            .context("remove container")?;
+        if !removed.status.is_success() && !matches!(removed.status.as_u16(), 404 | 409) {
+            return Err(anyhow!(
+                "remove container failed with [{}] {}",
+                removed.status.as_u16(),
+                removed.message()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Remove what the runs before `run` left. Each goes by its id, so
+    /// nothing of a later run is reached.
+    async fn remove_earlier_containers(&self, cell: &CellContainer, run: u64) {
+        for (earlier, id) in cell.containers_before(run) {
+            if self.remove_container(&id).await.is_ok() {
+                cell.forget_container(earlier, &id);
+            }
+        }
+    }
+
+    /// Wait for the container with id `target` to end and publish the exit
+    /// for `run`; a later run's start has already replaced the state.
     fn watch_exit(&self, cell: &Arc<CellContainer>, run: u64, target: String) {
         let docker = self.docker.clone();
         let cell_ = cell.clone();
@@ -1476,8 +1639,8 @@ impl ContainerEngine {
     async fn create_and_start(
         &self,
         cell: &CellContainer,
+        run: u64,
         params: StartParams,
-        created: &mut Option<String>,
     ) -> anyhow::Result<Address> {
         let image = cell
             .spec
@@ -1495,16 +1658,22 @@ impl ContainerEngine {
         self.ensure_image(&image).await?;
         let (open, internal) = self.networks().await?;
         // A previous run's container may still be named: the wait task
-        // observed its exit but nothing removed it, or a restart adopted a
-        // stopped one. The name is the cell's, so it is ours to remove.
-        let _ = self
-            .docker
-            .call(
-                "DELETE",
-                &format!("/containers/{}?force=true", cell.name),
-                None,
-            )
-            .await;
+        // observed its exit but nothing removed it. It goes by its id.
+        self.remove_earlier_containers(cell, run).await;
+        // A container under the name that no run of this node knows, such as
+        // the one an abandoned create made, goes by the name, but only while
+        // this run is still the cell's: a start that was overtaken must not
+        // remove the container of the run that overtook it.
+        if cell.is_current(run) {
+            let _ = self
+                .docker
+                .call(
+                    "DELETE",
+                    &format!("/containers/{}?force=true", cell.name),
+                    None,
+                )
+                .await;
+        }
         let mut env: Vec<String> = DEFAULT_ENV.iter().map(|entry| entry.to_string()).collect();
         env.push(format!("CLOUDFLARE_DURABLE_OBJECT_ID={}", cell.scope));
         env.extend(
@@ -1611,6 +1780,10 @@ impl ContainerEngine {
                 break;
             }
             asyncrt::sleep(Duration::from_millis(100)).await;
+            self.remove_earlier_containers(cell, run).await;
+            if !cell.is_current(run) {
+                return Err(anyhow!("the start was overtaken by a newer start"));
+            }
             let _ = self
                 .docker
                 .call(
@@ -1644,7 +1817,7 @@ impl ContainerEngine {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("create container answered without an id"))?
             .to_string();
-        *created = Some(id.clone());
+        cell.record_container(run, id.clone());
         self.docker
             .expect(
                 "POST",
@@ -1688,48 +1861,59 @@ impl ContainerEngine {
     /// the removal, or says there is nothing to remove: an engine that did not
     /// answer, or refused, leaves the run as it was and the error goes to the
     /// caller, who can ask again, rather than report a container gone that
-    /// may still be running.
+    /// may still be running. The containers of earlier runs that are still
+    /// tracked go with it, and one that will not go fails the destroy too.
     pub async fn destroy(&self, cell: &Arc<CellContainer>, run: u64) -> anyhow::Result<()> {
-        // Kill first so the wait task reports 137 before the removal makes
-        // the name disappear under it. The removal is forced and ends the
-        // container anyway, so a kill that failed need not stop it.
-        let _ = self
-            .docker
-            .call(
-                "POST",
-                &format!("/containers/{}/kill?signal=SIGKILL", cell.name),
-                None,
-            )
-            .await;
-        let removed = self
-            .docker
-            .call(
-                "DELETE",
-                &format!("/containers/{}?force=true", cell.name),
-                None,
-            )
-            .await
-            .context("remove container")?;
-        // 404: there is no container of that name, which is what a start that
-        // has not created one yet, or one that already ended, looks like. 409
-        // on a forced removal is the daemon saying another removal of it is
-        // already in progress, as the create path above also meets.
-        if !removed.status.is_success() && !matches!(removed.status.as_u16(), 404 | 409) {
-            return Err(anyhow!(
-                "remove container failed with [{}] {}",
-                removed.status.as_u16(),
-                removed.message()
-            ));
+        let mut earlier_failure = None;
+        // The containers of earlier runs that nothing removed, such as one
+        // that exited while its successor failed before it created its own:
+        // `run` has no container of its own to say they are gone.
+        for (earlier, id) in cell.containers_before(run) {
+            match self.remove_container(&id).await {
+                Ok(()) => cell.forget_container(earlier, &id),
+                Err(error) => earlier_failure = earlier_failure.or(Some(error)),
+            }
         }
+        // A run whose container the engine has not answered the create of has
+        // none to remove here: its start removes the container when it finds
+        // the run ended.
+        if let Some(id) = cell.container_id(run) {
+            // Kill first so the wait task reports 137 before the removal makes
+            // the container disappear under it. The removal is forced and ends
+            // the container anyway, so a kill that failed need not stop it.
+            let _ = self
+                .docker
+                .call(
+                    "POST",
+                    &format!("/containers/{id}/kill?signal=SIGKILL"),
+                    None,
+                )
+                .await;
+            self.remove_container(&id).await?;
+            cell.forget_container(run, &id);
+        }
+        // The run is over once its own container is, whatever became of the
+        // containers of earlier runs, which are reported below.
         cell.end_run_destroyed(run);
-        Ok(())
+        earlier_failure.map_or(Ok(()), Err)
     }
 
-    pub async fn signal(&self, cell: &Arc<CellContainer>, signal: u32) -> anyhow::Result<()> {
+    /// Signal the container of `run`.
+    pub async fn signal(
+        &self,
+        cell: &Arc<CellContainer>,
+        run: u64,
+        signal: u32,
+    ) -> anyhow::Result<()> {
+        let id = cell.container_id(run).ok_or_else(|| {
+            anyhow!(
+                "signal container failed: the container of this run was never created or has ended"
+            )
+        })?;
         self.docker
             .expect(
                 "POST",
-                &format!("/containers/{}/kill?signal={signal}", cell.name),
+                &format!("/containers/{id}/kill?signal={signal}"),
                 None,
                 "signal container",
             )
@@ -1769,7 +1953,11 @@ impl ContainerEngine {
     async fn forget(&self, cell: &Arc<CellContainer>) {
         // Nobody is left to ask again, so a removal the engine did not
         // confirm is told here; the cell's next start removes the name.
-        if let Err(error) = self.destroy(cell, cell.current_run()).await {
+        let (run, attached) = {
+            let state = cell.state.lock().unwrap();
+            (state.run, state.attached)
+        };
+        if let Err(error) = self.destroy(cell, run).await {
             tracing::warn!(
                 event = "container_destroy_failed",
                 cell = %cell.scope,
@@ -1777,29 +1965,42 @@ impl ContainerEngine {
                 "the container may still exist"
             );
         }
-        for id in cell.processes.lock().unwrap().drain(..) {
-            drop_process(id);
-        }
+        // The destroy took time, and a start or an activation that came in
+        // meanwhile wants the handle and its processes. Whether it did is
+        // decided under the lock that opens a run and attaches, and removes
+        // the handle: a check made before the await would not hold.
         let mut cells = self.cells.lock().unwrap();
-        if cells
+        if !cells
             .get(&cell.scope)
             .is_some_and(|current| Arc::ptr_eq(current, cell))
         {
-            cells.remove(&cell.scope);
+            return;
         }
+        {
+            let state = cell.state.lock().unwrap();
+            if state.run != run || state.attached != attached {
+                return;
+            }
+        }
+        for id in cell.processes.lock().unwrap().drain(..) {
+            drop_process(id);
+        }
+        cells.remove(&cell.scope);
     }
 
+    /// Run a process in the container of `run`, the run that was current when
+    /// the object called `exec()`. A start still in flight is what `running`
+    /// already counts, so the exec waits for that start to settle. It never
+    /// reaches another run: the container is the one the run created, by its
+    /// id, and a run that ended, or was replaced, fails the exec.
     pub async fn exec(
         &self,
         cell: &Arc<CellContainer>,
+        run: u64,
         params: ExecParams,
     ) -> anyhow::Result<Arc<ExecProcess>> {
-        // A start still in flight is what `running` already counts, so wait
-        // for it to settle before asking whether the container is up.
-        cell.wait_started().await?;
-        if !cell.running() {
-            return Err(anyhow!("exec() requires a running container."));
-        }
+        cell.wait_started(run).await?;
+        let container = cell.running_container(run)?;
         let tty = params.pty.is_some();
         let id = next_exec_id();
         let marker = exec_marker(id);
@@ -1838,14 +2039,23 @@ impl ContainerEngine {
         }
         let created = self
             .docker
-            .expect(
-                "POST",
-                &format!("/containers/{}/exec", cell.name),
-                Some(body),
-                "create exec",
-            )
-            .await?
-            .json()?;
+            .call("POST", &format!("/containers/{container}/exec"), Some(body))
+            .await?;
+        // The engine knows no container of that id once it was removed, which
+        // is how a run that ended after the exec began looks.
+        if created.status.as_u16() == 404 {
+            return Err(anyhow!(
+                "exec() requires a running container: the container of this run ended"
+            ));
+        }
+        if !created.status.is_success() {
+            return Err(anyhow!(
+                "create exec failed with [{}] {}",
+                created.status.as_u16(),
+                created.message()
+            ));
+        }
+        let created = created.json()?;
         let exec_id = created
             .get("Id")
             .and_then(Value::as_str)
@@ -1904,7 +2114,7 @@ impl ContainerEngine {
             marker,
             user: params.user.clone(),
             exec_id,
-            container: cell.name.clone(),
+            container,
             pid,
             docker: self.docker.clone(),
             stdin: tokio::sync::Mutex::new(Some(write)),
@@ -1960,6 +2170,7 @@ pub struct ExecProcess {
     /// every capability that would let it do more.
     user: Option<String>,
     exec_id: String,
+    /// The id of the container the process runs in, which is the run's.
     container: String,
     pub pid: i64,
     docker: Docker,
@@ -2334,6 +2545,12 @@ fn container_name(node: &str, scope: &str) -> String {
     let digest = sha2::Sha256::digest(format!("{node}\n{scope}").as_bytes());
     format!("celld-{}", crate::control_plane::hex(&digest))[..30].to_string()
 }
+
+// The engine tests drive the node's engine against the fake container
+// engine of the end-to-end tests, in process.
+#[cfg(test)]
+#[path = "tests/e2e/fake_engine.rs"]
+mod fake_engine;
 
 #[cfg(test)]
 mod endpoint_tests {
@@ -2745,7 +2962,7 @@ mod run_tests {
         let waited = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(cell.wait_started());
+            .block_on(cell.wait_started(run));
         assert!(waited.is_err());
     }
 
@@ -2764,6 +2981,58 @@ mod run_tests {
         drop(old);
         assert!(cell.running());
         assert_eq!(cell.started.borrow().clone(), (newer, Started::Pending));
+    }
+
+    // An exec that waits for a run must not be answered by the next run's
+    // start, which opened while it waited.
+    #[test]
+    fn an_exec_waits_for_its_own_run_and_not_the_next() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let cell = Arc::new(cell());
+        let first = cell.begin_run();
+        cell.end_run_destroyed(first);
+        let second = cell.begin_run();
+        // The second start is pending, and the first run is over.
+        let error = rt.block_on(cell.wait_started(first)).unwrap_err();
+        assert!(error.to_string().contains("ended"), "{error}");
+        assert!(cell.finish_start(second, Address::None));
+        assert!(rt.block_on(cell.wait_started(second)).is_ok());
+        // A run's container is the one it created, and only while it is the
+        // cell's newest.
+        cell.record_container(second, "id-2".to_string());
+        assert_eq!(cell.running_container(second).unwrap(), "id-2");
+        let third = cell.begin_run();
+        let error = cell.running_container(second).unwrap_err();
+        assert!(error.to_string().contains("ended"), "{error}");
+        assert!(cell.running_container(third).is_err());
+    }
+
+    #[test]
+    fn a_container_id_belongs_to_the_run_that_created_it() {
+        let cell = cell();
+        let first = cell.begin_run();
+        cell.record_container(first, "id-1".to_string());
+        let second = cell.begin_run();
+        // A new run does not drop its predecessor's id: a late destroy of
+        // that run, and the next start's removal, need it.
+        assert_eq!(cell.container_id(first).as_deref(), Some("id-1"));
+        assert_eq!(cell.container_id(second), None);
+        cell.record_container(second, "id-2".to_string());
+        assert_eq!(
+            cell.containers_before(second),
+            [(first, "id-1".to_string())]
+        );
+        assert_eq!(cell.observe().1.as_deref(), Some("id-2"));
+        // Forgetting is by id, so a late removal of the first run cannot
+        // forget what the second recorded.
+        cell.forget_container(first, "id-2");
+        assert_eq!(cell.container_id(first).as_deref(), Some("id-1"));
+        cell.forget_container(first, "id-1");
+        assert_eq!(cell.container_id(first), None);
+        assert_eq!(cell.observe().1.as_deref(), Some("id-2"));
+        assert!(cell.containers_before(second).is_empty());
     }
 
     #[test]
@@ -2963,5 +3232,306 @@ table inet celld {
                 "{mode:?} {addrs:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod engine_tests {
+    use super::fake_engine::FakeEngine;
+    use super::*;
+
+    struct Rig {
+        runtime: tokio::runtime::Handle,
+        fake: FakeEngine,
+        engine: Arc<ContainerEngine>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn rig() -> Rig {
+        let runtime = asyncrt::install_test_host_runtime();
+        *FENCE_IMAGE.write().unwrap() = Some("celld-fence:test".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let (fake, engine) = runtime.block_on(async {
+            let fake = FakeEngine::start().await;
+            let engine = ContainerEngine::connect(
+                Docker::new(fake.socket()),
+                "test-node".to_string(),
+                None,
+                None,
+                Vec::new(),
+                dir.path().to_path_buf(),
+                FenceNodeNetns::default(),
+            )
+            .await
+            .unwrap();
+            (fake, Arc::new(engine))
+        });
+        Rig {
+            runtime,
+            fake,
+            engine,
+            _dir: dir,
+        }
+    }
+
+    impl Rig {
+        /// A handle for the cell, as `attach` makes it, or the one that is
+        /// there.
+        fn cell(&self, scope: &str) -> Arc<CellContainer> {
+            let mut cells = self.engine.cells.lock().unwrap();
+            cells
+                .entry(scope.to_string())
+                .or_insert_with(|| {
+                    Arc::new(CellContainer {
+                        scope: scope.to_string(),
+                        name: container_name(&self.engine.node, scope),
+                        spec: Arc::new(ContainerSpec {
+                            class_name: "Runner".to_string(),
+                            image: "celld-image:test".to_string(),
+                            images: BTreeMap::new(),
+                            instance_type: None,
+                            max_instances: None,
+                            runtime: None,
+                        }),
+                        state: Mutex::new(CellState::default()),
+                        processes: Mutex::new(Vec::new()),
+                        exit: watch::channel(None).0,
+                        started: watch::channel((0, Started::Ready)).0,
+                    })
+                })
+                .clone()
+        }
+
+        fn params(image: Option<&str>) -> StartParams {
+            StartParams {
+                image: image.map(str::to_string),
+                entrypoint: None,
+                env: Vec::new(),
+                enable_internet: true,
+                labels: Vec::new(),
+            }
+        }
+
+        /// Open a run on the handle and start it to the end.
+        fn start(&self, cell: &Arc<CellContainer>) -> u64 {
+            let run = cell.begin_run();
+            self.runtime
+                .block_on(self.engine.start(cell, run, Self::params(None)))
+                .unwrap();
+            run
+        }
+
+        /// Wait for `done` to hold of the fake engine, or fail.
+        fn wait_for(&self, what: &str, done: impl Fn(&FakeEngine) -> bool) {
+            self.runtime.block_on(async {
+                let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                while !done(&self.fake) {
+                    assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            });
+        }
+    }
+
+    // A stop whose destroy is still in the engine when the object starts the
+    // container again must leave the new run its handle and its processes.
+    #[test]
+    fn a_stop_that_overlaps_a_new_start_leaves_the_new_runs_handle() {
+        let rig = rig();
+        let scope = "Runner:one";
+        let cell = rig.cell(scope);
+        rig.start(&cell);
+        cell.processes.lock().unwrap().push(u64::MAX);
+        // The engine holds the removal the stop sends.
+        rig.fake.delay_next_delete(Duration::from_millis(1500));
+        let engine = rig.engine.clone();
+        let stopping = {
+            let cell = cell.clone();
+            rig.runtime.spawn(async move { engine.forget(&cell).await })
+        };
+        rig.wait_for("the stop to reach the engine", |fake| {
+            fake.requests()
+                .iter()
+                .any(|r| r.starts_with("DELETE /containers/id-celld"))
+        });
+        // The cell's object starts it again before the stop has finished.
+        let (handle, run) = rig.engine.open_run(scope).expect("the handle is there");
+        rig.runtime
+            .block_on(rig.engine.start(&handle, run, Rig::params(None)))
+            .unwrap();
+        rig.runtime.block_on(async { stopping.await.unwrap() });
+        let kept = rig
+            .engine
+            .cell(scope)
+            .expect("the stop took the new run's handle");
+        assert!(Arc::ptr_eq(&kept, &cell));
+        assert!(kept.running());
+        assert_eq!(rig.fake.live_ids().len(), 1);
+        assert_eq!(*kept.processes.lock().unwrap(), [u64::MAX]);
+        kept.processes.lock().unwrap().clear();
+    }
+
+    // The same, for an activation that comes back and cancels the sweep.
+    #[test]
+    fn a_stop_that_overlaps_an_activation_leaves_the_handle() {
+        let rig = rig();
+        let scope = "Runner:one";
+        let cell = rig.cell(scope);
+        rig.start(&cell);
+        rig.fake.delay_next_delete(Duration::from_millis(1500));
+        let engine = rig.engine.clone();
+        let stopping = {
+            let cell = cell.clone();
+            rig.runtime.spawn(async move { engine.forget(&cell).await })
+        };
+        rig.wait_for("the stop to reach the engine", |fake| {
+            fake.requests()
+                .iter()
+                .any(|r| r.starts_with("DELETE /containers/id-celld"))
+        });
+        cell.state.lock().unwrap().attached += 1;
+        rig.runtime.block_on(async { stopping.await.unwrap() });
+        assert!(rig.engine.cell(scope).is_some());
+    }
+
+    // `destroy()` of a run that failed before it created its own container
+    // must still remove the container of the run before it.
+    // An activation's inspection of the container it knew is about the run it
+    // saw. A start that opened a newer run while the engine took the answer
+    // keeps its own state.
+    #[test]
+    fn an_activation_does_not_mark_a_newer_run_stopped() {
+        let rig = rig();
+        let scope = "Runner:one";
+        let cell = rig.cell(scope);
+        rig.start(&cell);
+        rig.fake.delay_next_inspect(Duration::from_millis(1500));
+        let inspections = |fake: &FakeEngine| {
+            fake.requests()
+                .iter()
+                .filter(|r| r.starts_with("GET /containers/id-celld") && r.ends_with("/json"))
+                .count()
+        };
+        let before = inspections(&rig.fake);
+        let engine = rig.engine.clone();
+        let spec = cell.spec.clone();
+        let attaching = rig
+            .runtime
+            .spawn(async move { engine.attach_cell(scope, spec).await });
+        rig.wait_for("the inspection to reach the engine", |fake| {
+            inspections(fake) > before
+        });
+        // The container the activation is asking about goes, and the object
+        // starts another.
+        rig.runtime.block_on(rig.engine.destroy(&cell, 1)).unwrap();
+        rig.start(&cell);
+        rig.runtime
+            .block_on(async { attaching.await.unwrap().unwrap() });
+        assert!(cell.running(), "the newer run was marked stopped");
+        assert!(
+            !matches!(cell.state.lock().unwrap().address, Address::None),
+            "the newer run lost its address"
+        );
+    }
+
+    // A run that was ready and then destroyed has ended, and an exec for it
+    // says so.
+    #[test]
+    fn exec_on_a_destroyed_run_says_the_run_ended() {
+        let rig = rig();
+        let cell = rig.cell("Runner:one");
+        let run = rig.start(&cell);
+        rig.runtime
+            .block_on(rig.engine.destroy(&cell, run))
+            .unwrap();
+        let params = ExecParams {
+            cmd: vec!["hello".to_string()],
+            env: Vec::new(),
+            cwd: None,
+            user: None,
+            combined: false,
+            pty: None,
+        };
+        let error = rig
+            .runtime
+            .block_on(rig.engine.exec(&cell, run, params))
+            .err()
+            .expect("the exec of an ended run was accepted");
+        assert!(error.to_string().contains("ended"), "{error:#}");
+    }
+
+    // The run is over when its own container is, even if an earlier run's
+    // container will not go; the error still reaches the caller.
+    #[test]
+    fn destroy_ends_the_run_when_only_an_earlier_container_will_not_go() {
+        let rig = rig();
+        let cell = rig.cell("Runner:one");
+        rig.start(&cell);
+        // The second run has begun and has no container yet.
+        let second = cell.begin_run();
+        rig.fake.fail_next_delete("daemon is overloaded");
+        let error = rig
+            .runtime
+            .block_on(rig.engine.destroy(&cell, second))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("daemon is overloaded"),
+            "{error:#}"
+        );
+        assert!(!cell.running(), "the destroyed run still reads as running");
+        assert!(matches!(
+            cell.started.borrow().clone(),
+            (ended, Started::Failed(_)) if ended == second
+        ));
+        assert_eq!(rig.fake.live_ids().len(), 1);
+    }
+
+    #[test]
+    fn destroy_removes_the_container_an_earlier_run_left() {
+        let rig = rig();
+        let cell = rig.cell("Runner:one");
+        rig.start(&cell);
+        assert_eq!(rig.fake.live_ids().len(), 1);
+        // The second run fails before it asks the engine for anything.
+        let second = cell.begin_run();
+        let failed =
+            rig.runtime
+                .block_on(rig.engine.start(&cell, second, Rig::params(Some("nope"))));
+        assert!(failed.is_err());
+        assert_eq!(rig.fake.live_ids().len(), 1);
+        rig.runtime
+            .block_on(rig.engine.destroy(&cell, second))
+            .unwrap();
+        assert!(
+            rig.fake.live_ids().is_empty(),
+            "the earlier container stayed"
+        );
+    }
+
+    #[test]
+    fn destroy_reports_an_earlier_container_it_could_not_remove() {
+        let rig = rig();
+        let cell = rig.cell("Runner:one");
+        rig.start(&cell);
+        let second = cell.begin_run();
+        let _ = rig
+            .runtime
+            .block_on(rig.engine.start(&cell, second, Rig::params(Some("nope"))));
+        rig.fake.fail_next_delete("daemon is overloaded");
+        let error = rig
+            .runtime
+            .block_on(rig.engine.destroy(&cell, second))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("daemon is overloaded"),
+            "{error:#}"
+        );
+        assert_eq!(rig.fake.live_ids().len(), 1);
+        // Asked again, it removes it.
+        rig.runtime
+            .block_on(rig.engine.destroy(&cell, second))
+            .unwrap();
+        assert!(rig.fake.live_ids().is_empty());
     }
 }

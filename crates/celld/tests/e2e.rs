@@ -6,6 +6,7 @@ mod e2e {
     pub mod container_exec;
     pub mod container_fence;
     pub mod container_images;
+    pub mod container_runs;
     pub mod d1_batch;
     pub mod d1_export;
     pub mod deploy_sourcemap;

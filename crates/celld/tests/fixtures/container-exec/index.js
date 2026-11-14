@@ -73,6 +73,58 @@ export class Runner extends DurableObject {
           await new Promise((resolve) => setTimeout(resolve, 1500));
           return { failed, running: container.running };
         });
+      // The container of this run is up.
+      case "/up":
+        return run(async () => {
+          container.start();
+          await (await container.exec(["hello"])).output();
+          return { running: container.running };
+        });
+      // A destroy() of the first run that reaches the engine after the object
+      // has started a second one.
+      case "/late-destroy":
+        return run(async () => {
+          container.start();
+          await (await container.exec(["hello"])).output();
+          const destroying = attempt(() => container.destroy());
+          // The kill ends the first container, and the removal is held.
+          for (let waited = 0; container.running && waited < 2000; waited += 20) {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          container.start();
+          await (await container.exec(["hello"])).output();
+          const destroyed = await destroying;
+          return { destroyed, running: container.running };
+        });
+      // An exec issued for the first run, held by the engine while the object
+      // destroys that run and starts a second one.
+      case "/exec-through-restart":
+        return run(async () => {
+          const stale = attempt(() => container.exec(["hello"]));
+          await container.destroy();
+          container.start();
+          const fresh = await attempt(async () => (await (await container.exec(["hello"])).output()).exitCode);
+          const outcome = await stale;
+          return { stale: outcome.error ?? "ran", fresh };
+        });
+      // An exec issued while the first start is in flight, which the object
+      // destroys and replaces with a second start before the exec is answered.
+      case "/start-exec-restart":
+        return run(async () => {
+          container.start();
+          const pending = attempt(() => container.exec(["hello"]));
+          await container.destroy();
+          container.start();
+          const fresh = await attempt(async () => (await (await container.exec(["hello"])).output()).exitCode);
+          const outcome = await pending;
+          return { pending: outcome.error ?? "ran", fresh };
+        });
+      // A destroy() the engine answers with a removal already in progress.
+      case "/destroy-plain":
+        return run(async () => {
+          const destroyed = await attempt(() => container.destroy());
+          return { destroyed, running: container.running };
+        });
       // A pty exec of `size`: it prints the terminal size after one line of stdin.
       case "/pty": {
         const pty = JSON.parse(url.searchParams.get("pty") ?? "true");

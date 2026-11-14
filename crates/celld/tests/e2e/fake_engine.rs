@@ -22,6 +22,14 @@
 //! facts about a real daemon that a kill must survive: the pid that an exec
 //! inspect reports is a host pid, which names nothing inside the container,
 //! and an image may have no `kill` executable.
+//!
+//! It models container ids and name reuse as a daemon does. A container has an
+//! id of its own, a name is held by at most one container at a time (a create
+//! under a held name answers 409), and a request that names a container by an
+//! id that was removed finds nothing even when a newer container took its
+//! name. A request names a container by its name or by its id, and the name is
+//! resolved when the request is handled, so a request that was held in flight
+//! reaches whichever container holds the name by then.
 
 // The fake plays the part of a daemon outside the node, so it is not part of
 // the execution boundary the disallowed-methods policy protects.
@@ -42,6 +50,8 @@ use tokio::net::UnixListener;
 use tokio::sync::watch;
 
 struct Proc {
+    /// The id of the container the exec runs in.
+    container: String,
     pid: i64,
     cmd: Vec<String>,
     env: Vec<String>,
@@ -53,17 +63,20 @@ struct Proc {
 }
 
 struct Container {
-    /// What `containers/create` answered with: unique per container, so a
-    /// request for the id of a container that was removed finds nothing even
-    /// when a newer container took its name.
-    id: String,
+    /// The name the container was created under; at most one container holds
+    /// a name at a time.
+    name: String,
     running: bool,
     exit: watch::Sender<Option<i64>>,
     fence: bool,
+    labels: Value,
 }
 
 #[derive(Default)]
 struct State {
+    /// By id, which `containers/create` answered with: unique per container,
+    /// so a request for the id of a container that was removed finds nothing
+    /// even when a newer container took its name.
     containers: HashMap<String, Container>,
     /// Bodies of every `containers/create`, the fence's excluded, with the
     /// requested name under `_name`.
@@ -72,12 +85,28 @@ struct State {
     fence_created: Vec<Value>,
     requests: Vec<String>,
     removed: Vec<String>,
+    removed_ids: Vec<String>,
     execs: HashMap<String, Proc>,
     exec_creates: Vec<Value>,
+    /// The id of the container each `containers/{x}/exec` reached, in order;
+    /// `None` when it found none.
+    exec_targets: Vec<Option<String>>,
     kills: Vec<(String, i64)>,
+    /// The id of the container each `containers/{x}/kill` reached.
+    kill_targets: Vec<Option<String>>,
     next: i64,
     start_error: Option<String>,
     create_delay: Duration,
+    /// Answer a create this long after it took effect, so the container
+    /// exists while the node still waits for its id.
+    create_reply_delay: Duration,
+    /// Hold the next `containers/{x}/exec`, before it names a container.
+    exec_delay: Option<Duration>,
+    /// Hold the next inspect of an application container, before it names one.
+    inspect_delay: Option<Duration>,
+    /// Answer 409 to the next removal of an app container, which the daemon
+    /// does while another removal of it is in progress.
+    delete_conflict: bool,
     /// Hold the next removal of a container that exists, for this long.
     delete_delay: Option<Duration>,
     /// Refuse the next removal of a container that exists, leaving it as it
@@ -111,6 +140,11 @@ impl FakeEngine {
         let engine = FakeEngine { dir, socket, state };
         engine.write_cli();
         engine
+    }
+
+    /// The unix socket the fake listens on.
+    pub fn socket(&self) -> &std::path::Path {
+        &self.socket
     }
 
     /// The environment that points a node at this engine, for its daemon
@@ -240,12 +274,70 @@ esac
         let state = self.state.lock().unwrap();
         let mut names: Vec<String> = state
             .containers
-            .iter()
-            .filter(|(_, container)| !container.fence)
-            .map(|(name, _)| name.clone())
+            .values()
+            .filter(|container| !container.fence)
+            .map(|container| container.name.clone())
             .collect();
         names.sort();
         names
+    }
+
+    /// The ids of the application containers that exist now, oldest first.
+    pub fn live_ids(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        let mut ids: Vec<String> = state
+            .containers
+            .iter()
+            .filter(|(_, container)| !container.fence)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort_by_key(|id| id.rsplit('-').next().and_then(|n| n.parse::<i64>().ok()));
+        ids
+    }
+
+    /// The ids of the application containers the node removed.
+    pub fn removed_ids(&self) -> Vec<String> {
+        self.state.lock().unwrap().removed_ids.clone()
+    }
+
+    /// The id of the container each exec create reached, in order.
+    pub fn exec_targets(&self) -> Vec<Option<String>> {
+        self.state.lock().unwrap().exec_targets.clone()
+    }
+
+    /// The id of the container each kill reached, in order.
+    pub fn kill_targets(&self) -> Vec<Option<String>> {
+        self.state.lock().unwrap().kill_targets.clone()
+    }
+
+    /// The `Labels` of the application container with this id.
+    pub fn labels_of(&self, id: &str) -> Option<Value> {
+        let state = self.state.lock().unwrap();
+        state.containers.get(id).map(|c| c.labels.clone())
+    }
+
+    /// Hold the next inspect of an application container for `delay`, as a
+    /// slow daemon does, before it names the container.
+    pub fn delay_next_inspect(&self, delay: Duration) {
+        self.state.lock().unwrap().inspect_delay = Some(delay);
+    }
+
+    /// Hold the next `containers/{x}/exec` for `delay` before it resolves the
+    /// container it names, as a daemon that is slow to take the request does.
+    pub fn delay_next_exec_create(&self, delay: Duration) {
+        self.state.lock().unwrap().exec_delay = Some(delay);
+    }
+
+    /// Answer every `containers/create` `delay` after it took effect.
+    pub fn delay_create_reply(&self, delay: Duration) {
+        self.state.lock().unwrap().create_reply_delay = delay;
+    }
+
+    /// Answer the next removal of an application container with 409, as a
+    /// daemon does while another removal of it is in progress. The container
+    /// is left as it is.
+    pub fn conflict_next_delete(&self) {
+        self.state.lock().unwrap().delete_conflict = true;
     }
 
     /// Make every exec resize fail with `message`.
@@ -346,9 +438,28 @@ async fn serve(stream: tokio::net::UnixStream, state: Arc<Mutex<State>>) {
         .unwrap()
         .requests
         .push(format!("{} {}", request.method, request.path));
-    if request.method == "POST" && request.path == "/containers/create" {
+    let fence_create = request.body["Labels"]["celld.fence"].is_string();
+    if request.method == "POST" && request.path == "/containers/create" && !fence_create {
         let delay = state.lock().unwrap().create_delay;
         if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+    if request.method == "POST"
+        && request.path.starts_with("/containers/")
+        && request.path.ends_with("/exec")
+    {
+        let delay = state.lock().unwrap().exec_delay.take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
+    if request.method == "GET"
+        && request.path.starts_with("/containers/id-celld")
+        && request.path.ends_with("/json")
+    {
+        let delay = state.lock().unwrap().inspect_delay.take();
+        if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
     }
@@ -357,7 +468,7 @@ async fn serve(stream: tokio::net::UnixStream, state: Arc<Mutex<State>>) {
             let mut guard = state.lock().unwrap();
             let key = request.path.trim_start_matches("/containers/");
             match container_named(&guard, key) {
-                Some(name) if !guard.containers[&name].fence => guard.delete_delay.take(),
+                Some(id) if !guard.containers[&id].fence => guard.delete_delay.take(),
                 _ => None,
             }
         };
@@ -365,8 +476,17 @@ async fn serve(stream: tokio::net::UnixStream, state: Arc<Mutex<State>>) {
             tokio::time::sleep(delay).await;
         }
     }
+    let creating = request.method == "POST" && request.path == "/containers/create";
     match handle(&state, &request) {
-        Action::Reply(status, body) => reply(&mut write, status, body).await,
+        Action::Reply(status, body) => {
+            if creating && status == 201 {
+                let delay = state.lock().unwrap().create_reply_delay;
+                if !delay.is_zero() && !fence_create {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            reply(&mut write, status, body).await
+        }
         Action::Wait(mut exit) => {
             let code = loop {
                 if let Some(code) = *exit.borrow_and_update() {
@@ -393,13 +513,16 @@ async fn serve(stream: tokio::net::UnixStream, state: Arc<Mutex<State>>) {
     }
 }
 
-/// The name of the container `key` names, which is its name or its id.
+/// The id of the container `key` names, which is its id or its name.
 fn container_named(guard: &State, key: &str) -> Option<String> {
+    if guard.containers.contains_key(key) {
+        return Some(key.to_string());
+    }
     guard
         .containers
         .iter()
-        .find(|(name, container)| name.as_str() == key || container.id == key)
-        .map(|(name, _)| name.clone())
+        .find(|(_, container)| container.name == key)
+        .map(|(id, _)| id.clone())
 }
 
 fn handle(state: &Arc<Mutex<State>>, request: &Request) -> Action {
@@ -411,27 +534,85 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request) -> Action {
         ("GET", ["networks", _]) => gone("no such network"),
         ("POST", ["networks", "create"]) => Action::Reply(201, json!({"Id": "net"})),
         ("DELETE", ["networks", _]) => Action::Reply(204, Value::Null),
-        ("GET", ["containers", "json"]) => Action::Reply(200, json!([])),
+        ("GET", ["containers", "json"]) => {
+            // The label filters the node asks for, as the daemon applies them.
+            let labels: Vec<String> = request
+                .query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("filters="))
+                .map(|encoded| {
+                    percent_encoding::percent_decode_str(encoded)
+                        .decode_utf8_lossy()
+                        .into_owned()
+                })
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|filters| {
+                    filters["label"].as_array().map(|labels| {
+                        labels
+                            .iter()
+                            .filter_map(|label| label.as_str().map(str::to_string))
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+            let matches = |container: &Container| {
+                labels.iter().all(|wanted| match wanted.split_once('=') {
+                    Some((key, value)) => container.labels[key].as_str() == Some(value),
+                    None => !container.labels[wanted.as_str()].is_null(),
+                })
+            };
+            let mut list: Vec<(&String, &Container)> = guard
+                .containers
+                .iter()
+                .filter(|(_, container)| matches(container))
+                .collect();
+            list.sort_by_key(|(id, _)| id.to_string());
+            Action::Reply(
+                200,
+                Value::Array(
+                    list.into_iter()
+                        .map(|(id, container)| {
+                            json!({
+                                "Id": id,
+                                "Names": [format!("/{}", container.name)],
+                                "Labels": container.labels,
+                                "State": if container.running { "running" } else { "created" },
+                            })
+                        })
+                        .collect(),
+                ),
+            )
+        }
         ("POST", ["containers", "create"]) => {
             let name = request
                 .query
                 .strip_prefix("name=")
                 .unwrap_or("fence")
                 .to_string();
+            if guard.containers.values().any(|c| c.name == name) {
+                return Action::Reply(
+                    409,
+                    message(&format!(
+                        "Conflict. The container name \"/{name}\" is already in use"
+                    )),
+                );
+            }
             let fence = request.body["Labels"]["celld.fence"].is_string();
             guard.next += 1;
             let id = format!("id-{name}-{}", guard.next);
             guard.containers.insert(
-                name.clone(),
+                id.clone(),
                 Container {
-                    id: id.clone(),
+                    name: name.clone(),
                     running: false,
                     exit: watch::channel(None).0,
                     fence,
+                    labels: request.body["Labels"].clone(),
                 },
             );
             let mut body = request.body.clone();
             body["_name"] = json!(name);
+            body["_id"] = json!(id);
             if fence {
                 guard.fence_created.push(body);
             } else {
@@ -439,16 +620,15 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request) -> Action {
             }
             Action::Reply(201, json!({ "Id": id }))
         }
-        ("POST", ["containers", name, "start"]) => {
-            let name = container_named(&guard, name).unwrap_or_default();
-            let name = name.as_str();
+        ("POST", ["containers", key, "start"]) => {
+            let id = container_named(&guard, key).unwrap_or_default();
             // The fence's start is the node's, not the test's.
-            if !guard.containers.get(name).is_some_and(|c| c.fence) {
+            if !guard.containers.get(&id).is_some_and(|c| c.fence) {
                 if let Some(error) = guard.start_error.take() {
                     return Action::Reply(500, message(&error));
                 }
             }
-            match guard.containers.get_mut(name) {
+            match guard.containers.get_mut(&id) {
                 Some(container) => {
                     container.running = true;
                     Action::Reply(204, Value::Null)
@@ -456,10 +636,10 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request) -> Action {
                 None => gone("No such container"),
             }
         }
-        ("GET", ["containers", name, "json"]) => {
+        ("GET", ["containers", key, "json"]) => {
             match guard
                 .containers
-                .get(container_named(&guard, name).unwrap_or_default().as_str())
+                .get(container_named(&guard, key).unwrap_or_default().as_str())
             {
                 Some(container) => Action::Reply(
                     200,
@@ -474,45 +654,56 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request) -> Action {
                 None => gone("No such container"),
             }
         }
-        ("POST", ["containers", name, "wait"]) => {
+        ("POST", ["containers", key, "wait"]) => {
             match guard
                 .containers
-                .get(container_named(&guard, name).unwrap_or_default().as_str())
+                .get(container_named(&guard, key).unwrap_or_default().as_str())
             {
                 Some(container) if container.fence => Action::Reply(200, json!({"StatusCode": 0})),
                 Some(container) => Action::Wait(container.exit.subscribe()),
                 None => gone("No such container"),
             }
         }
-        ("POST", ["containers", name, "kill"]) => {
-            end_container(
-                &guard,
-                container_named(&guard, name).unwrap_or_default().as_str(),
-            );
-            Action::Reply(204, Value::Null)
+        ("POST", ["containers", key, "kill"]) => {
+            let id = container_named(&guard, key);
+            guard.kill_targets.push(id.clone());
+            match id {
+                Some(id) => {
+                    end_container(&guard, &id);
+                    Action::Reply(204, Value::Null)
+                }
+                None => gone("No such container"),
+            }
         }
-        ("DELETE", ["containers", name]) => {
-            let name = container_named(&guard, name).unwrap_or_default();
-            let name = name.as_str();
-            if guard.containers.get(name).is_some_and(|c| !c.fence) {
+        ("DELETE", ["containers", key]) => {
+            let id = container_named(&guard, key).unwrap_or_default();
+            if guard.containers.get(&id).is_some_and(|c| !c.fence) {
                 if let Some(error) = guard.delete_error.take() {
                     return Action::Reply(500, message(&error));
                 }
+                if std::mem::take(&mut guard.delete_conflict) {
+                    return Action::Reply(
+                        409,
+                        message("removal of the container is already in progress"),
+                    );
+                }
             }
-            let existed = end_container(&guard, name);
+            let existed = end_container(&guard, &id);
             if existed {
-                guard.containers.remove(name);
-                guard.removed.push(name.to_string());
+                if let Some(container) = guard.containers.remove(&id) {
+                    guard.removed.push(container.name);
+                    guard.removed_ids.push(id);
+                }
             }
             Action::Reply(if existed { 204 } else { 404 }, Value::Null)
         }
         ("GET", ["containers", _, "logs"]) => Action::Reply(200, json!(null)),
-        ("POST", ["containers", name, "exec"]) => {
-            let name = container_named(&guard, name).unwrap_or_default();
-            let name = name.as_str();
-            if !guard.containers.get(name).is_some_and(|c| c.running) {
-                return gone(&format!("No such container: {name}"));
-            }
+        ("POST", ["containers", key, "exec"]) => {
+            let container = container_named(&guard, key);
+            guard.exec_targets.push(container.clone());
+            let Some(container) = container.filter(|id| guard.containers[id].running) else {
+                return gone(&format!("No such container: {key}"));
+            };
             guard.next += 1;
             let id = format!("exec-{}", guard.next);
             let words = |key: &str| -> Vec<String> {
@@ -532,6 +723,7 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request) -> Action {
             guard.execs.insert(
                 id.clone(),
                 Proc {
+                    container,
                     pid,
                     cmd: words("Cmd"),
                     env: words("Env"),
@@ -604,12 +796,12 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request) -> Action {
 }
 
 /// Make the container exit as a kill or a removal does. Whether it existed.
-fn end_container(guard: &State, name: &str) -> bool {
-    let Some(container) = guard.containers.get(name) else {
+fn end_container(guard: &State, id: &str) -> bool {
+    let Some(container) = guard.containers.get(id) else {
         return false;
     };
     container.exit.send_replace(Some(137));
-    for proc in guard.execs.values() {
+    for proc in guard.execs.values().filter(|proc| proc.container == id) {
         proc.signal.send_replace(Some(9));
     }
     true
@@ -618,7 +810,11 @@ fn end_container(guard: &State, name: &str) -> bool {
 /// A detached exec: the kills. The fake plays what the daemon would do with
 /// the command; it does not run a shell.
 fn run_detached(guard: &mut State, id: &str) {
-    let Some(cmd) = guard.execs.get(id).map(|proc| proc.cmd.clone()) else {
+    let Some((cmd, container)) = guard
+        .execs
+        .get(id)
+        .map(|proc| (proc.cmd.clone(), proc.container.clone()))
+    else {
         return;
     };
     let script = cmd.join(" ");
@@ -642,7 +838,12 @@ fn run_detached(guard: &mut State, id: &str) {
             signal_of(&script),
         ) {
             guard.kills.push((marker.clone(), signal));
-            for proc in guard.execs.values() {
+            // The scan reads the `/proc` of the container it runs in.
+            for proc in guard
+                .execs
+                .values()
+                .filter(|proc| proc.container == container)
+            {
                 if proc.env.contains(&marker) {
                     proc.signal.send_replace(Some(signal));
                 }
