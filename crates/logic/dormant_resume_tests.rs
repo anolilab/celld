@@ -67,7 +67,7 @@ fn assert_resumed_in_place(shell: &mut Shell, effects: &[Effect]) {
     );
     let spec = resume_restore(effects).expect("a restore effect");
     assert_eq!(spec.epoch, 1);
-    assert!(spec.resume_local && spec.after_eviction);
+    assert_eq!(spec.resume, Some(ResumeFrom::Eviction));
     assert!(!spec.fresh && !spec.took_over && spec.prior.is_none());
     shell.settle();
     assert!(matches!(
@@ -535,7 +535,7 @@ fn a_clean_reload_resume_that_fails_is_a_restore_failure_not_a_fallback() {
             _ => None,
         })
         .expect("a restore of the cell the reload left");
-    assert!(spec.resume_local && !spec.after_eviction);
+    assert_eq!(spec.resume, Some(ResumeFrom::Handoff));
     shell.settle();
 
     // The core fails the cell and keeps it dormant, with no claim.

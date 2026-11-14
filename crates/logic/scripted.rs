@@ -195,7 +195,7 @@ impl Shell {
                 Effect::Restore { op, cell, spec } => Event::RestoreCompleted {
                     op,
                     result: if self.failing_restores.contains(&cell)
-                        || (spec.resume_local && self.failing_resumes.contains(&cell))
+                        || (spec.resume.is_some() && self.failing_resumes.contains(&cell))
                     {
                         Err(Failure::Definite)
                     } else {

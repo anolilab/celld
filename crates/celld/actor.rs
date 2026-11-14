@@ -1239,7 +1239,7 @@ where
 /// is no restore failure to print. The core marks such a resume itself, so a
 /// failed clean-reload resume, which it does fail, is never taken for one.
 fn expected_resume_fallback(spec: &celld_logic::RestoreSpec, error: &anyhow::Error) -> bool {
-    spec.after_eviction
+    spec.resume == Some(celld_logic::ResumeFrom::Eviction)
         && error
             .downcast_ref::<crate::replication::RetainedUnavailable>()
             .is_some()
@@ -4294,14 +4294,14 @@ mod operator_token_tests;
 #[cfg(test)]
 mod resume_fallback_tests {
     use super::*;
+    use celld_logic::ResumeFrom::{Eviction, Handoff};
 
-    fn spec(after_eviction: bool) -> celld_logic::RestoreSpec {
+    fn spec(resume: celld_logic::ResumeFrom) -> celld_logic::RestoreSpec {
         celld_logic::RestoreSpec {
             epoch: 1,
             fresh: false,
             took_over: false,
-            resume_local: true,
-            after_eviction,
+            resume: Some(resume),
             prior: None,
         }
     }
@@ -4316,15 +4316,15 @@ mod resume_fallback_tests {
 
     #[test]
     fn only_a_missing_kept_database_after_an_eviction_is_expected() {
-        assert!(expected_resume_fallback(&spec(true), &gone()));
+        assert!(expected_resume_fallback(&spec(Eviction), &gone()));
         assert!(expected_resume_fallback(
-            &spec(true),
+            &spec(Eviction),
             &gone().context("restore a")
         ));
         // A clean reload's resume has no fallback: the core fails its cell.
-        assert!(!expected_resume_fallback(&spec(false), &gone()));
+        assert!(!expected_resume_fallback(&spec(Handoff), &gone()));
         assert!(!expected_resume_fallback(
-            &spec(true),
+            &spec(Eviction),
             &anyhow::anyhow!("read replica: connection reset")
         ));
     }

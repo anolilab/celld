@@ -74,7 +74,7 @@ impl Replication {
             epoch: spec.epoch,
             fresh: spec.fresh,
             took_over: spec.took_over,
-            resume_local: spec.resume_local,
+            resume_local: spec.resume.is_some(),
             prior: spec.prior.clone(),
         };
         let activated = self.ltx.activate_with(options, allow_paged).await?;
