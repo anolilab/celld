@@ -442,8 +442,11 @@ struct CellState {
     /// the published loopback ports elsewhere.
     address: Address,
     inactivity: Option<Duration>,
-    /// The pending destroy after an idle eviction. Dropping it cancels.
-    sweeper: Option<asyncrt::TaskHandle<()>>,
+    /// Names the pending destroy after an idle eviction. An eviction arms a
+    /// new one and an activation cancels it by bumping this, and the sweep
+    /// does nothing when it wakes to find that its number is not the current
+    /// one. A task handle cannot do this: dropping one does not stop the task.
+    sweep: u64,
     /// Bumped per start so a wait from a previous run cannot report for
     /// this one.
     run: u64,
@@ -1354,7 +1357,7 @@ impl ContainerEngine {
             // A returning cell cancels the destroy its eviction armed, and
             // tells a stop that is already under way to leave the handle.
             let mut state = cell.state.lock().unwrap();
-            state.sweeper = None;
+            state.sweep += 1;
             state.attached += 1;
             drop(state);
             cell.clone()
@@ -1932,19 +1935,19 @@ impl ContainerEngine {
         };
         match release {
             Release::Keep => {
-                let window = cell
-                    .state
-                    .lock()
-                    .unwrap()
-                    .inactivity
-                    .unwrap_or(DEFAULT_INACTIVITY);
+                let (window, armed) = {
+                    let mut state = cell.state.lock().unwrap();
+                    state.sweep += 1;
+                    (state.inactivity.unwrap_or(DEFAULT_INACTIVITY), state.sweep)
+                };
                 let engine = self.clone();
-                let cell_ = cell.clone();
-                let sweeper = asyncrt::spawn(async move {
+                asyncrt::spawn(async move {
                     asyncrt::sleep(window).await;
-                    engine.forget(&cell_).await;
-                });
-                cell.state.lock().unwrap().sweeper = Some(sweeper);
+                    if cell.state.lock().unwrap().sweep == armed {
+                        engine.forget(&cell).await;
+                    }
+                })
+                .detach();
             }
             Release::Destroy => self.forget(&cell).await,
         }
@@ -3533,5 +3536,97 @@ mod engine_tests {
             .block_on(rig.engine.destroy(&cell, second))
             .unwrap();
         assert!(rig.fake.live_ids().is_empty());
+    }
+}
+
+// The engine's idle sweep, against a daemon that only counts who calls it.
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod sweep_tests {
+    use super::*;
+
+    #[test]
+    fn a_cell_that_returns_inside_the_window_keeps_its_container() {
+        let runtime = asyncrt::install_test_host_runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("engine.sock");
+        let calls = Arc::new(AtomicU64::new(0));
+        {
+            let _guard = runtime.enter();
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let calls = calls.clone();
+                    tokio::spawn(async move {
+                        // The method is the first four bytes, which a
+                        // fragmented request may not deliver in one read.
+                        let mut buffer = [0u8; 4096];
+                        let mut read = 0;
+                        while read < 4 {
+                            match stream.read(&mut buffer[read..]).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(count) => read += count,
+                            }
+                        }
+                        // An inspect is an activation's own; any other call
+                        // is the engine being told to act on a container.
+                        if !buffer[..read].starts_with(b"GET ") {
+                            calls.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 404 X\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                            )
+                            .await;
+                    });
+                }
+            });
+        }
+        let engine = Arc::new(ContainerEngine {
+            runtime: None,
+            dns: Vec::new(),
+            resolv_conf: None,
+            docker: Docker::new(&socket),
+            node: "test-node".to_string(),
+            bucket: None,
+            fence_netns: FenceNodeNetns::default(),
+            images: Mutex::new(HashMap::new()),
+            cells: Mutex::new(HashMap::new()),
+            networks: tokio::sync::Mutex::new(None),
+            fenced: tokio::sync::Mutex::new(false),
+        });
+        let spec = Arc::new(ContainerSpec {
+            class_name: "Runner".to_string(),
+            image: "celld-image:test".to_string(),
+            images: BTreeMap::new(),
+            instance_type: None,
+            max_instances: None,
+            runtime: None,
+        });
+        let scope = "Runner:one";
+        runtime.block_on(async {
+            let cell = engine.attach_cell(scope, spec.clone()).await.unwrap();
+            // The run has a container, so a sweep that reached destruction
+            // would send the engine a kill and a removal for it.
+            let run = cell.begin_run();
+            cell.record_container(run, "container-one".to_string());
+            cell.set_inactivity(Duration::from_millis(300));
+            // An idle eviction keeps the container under its window...
+            engine.release(scope, Release::Keep).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // ...and the object comes back inside it.
+            engine.attach_cell(scope, spec).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        });
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "the sweep went to the engine after the cell returned"
+        );
+        assert!(
+            engine.cell(scope).is_some(),
+            "the sweep took the returned cell's handle"
+        );
     }
 }
