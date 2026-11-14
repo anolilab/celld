@@ -2646,6 +2646,7 @@ impl LtxRepl {
                     complete: AtomicBool::new(false),
                 })
             });
+        let compaction_queue = self.compaction_queue.as_ref().filter(|_| !from_eviction);
         let handle = Arc::new(Cell {
             snapshot_declined: AtomicBool::new(false),
             paged_vfs: paged_vfs_name.clone(),
@@ -2670,45 +2671,41 @@ impl LtxRepl {
             percell_txid: AtomicU64::new(seed.map_or(0, |pos| pos.txid.0)),
             syncing: AtomicBool::new(false),
             ready: Notify::new(),
-            compaction: self
-                .compaction_queue
-                .as_ref()
-                .filter(|_| !from_eviction)
-                .map(|queue| {
-                    let fetcher = Arc::new(SinkFetcher {
-                        registration: self.registration.clone(),
-                        cell: cell.to_string(),
-                        epoch,
-                        rows: tokio::sync::Mutex::new(None),
-                    });
-                    CellCompaction {
-                        cell: cell.to_string(),
-                        epoch,
-                        // The overlay lets compaction read bundle-resident frames
-                        // beside the per-cell objects; its output stays pure
-                        // per-cell L1s, which is the continuous drain.
-                        client: celld_ltx::BundleOverlayClient::new(
-                            client.clone(),
-                            Some(fetcher.clone()),
-                        ),
-                        fetcher,
-                        local_path: Db::meta_path_for_path(&dst),
-                        host: self.ltx_host.clone(),
-                        queue: queue.clone(),
-                        base_txid: continuation.map_or(1, |(txid, _)| txid.0),
-                        min_txids: self.compaction_min_txids,
-                        min_bytes: self.compaction_min_bytes,
-                        pending_bytes: AtomicU64::new(0),
-                        compacted_txid: AtomicU64::new(0),
-                        retry_after_ms: AtomicU64::new(0),
-                        failures: AtomicU64::new(0),
-                        queued: AtomicBool::new(false),
-                        cancelled: AtomicBool::new(false),
-                        handoff_paused: AtomicBool::new(false),
-                        cancel: Notify::new(),
-                        run: tokio::sync::Mutex::new(()),
-                    }
-                }),
+            compaction: compaction_queue.map(|queue| {
+                let fetcher = Arc::new(SinkFetcher {
+                    registration: self.registration.clone(),
+                    cell: cell.to_string(),
+                    epoch,
+                    rows: tokio::sync::Mutex::new(None),
+                });
+                CellCompaction {
+                    cell: cell.to_string(),
+                    epoch,
+                    // The overlay lets compaction read bundle-resident frames
+                    // beside the per-cell objects; its output stays pure
+                    // per-cell L1s, which is the continuous drain.
+                    client: celld_ltx::BundleOverlayClient::new(
+                        client.clone(),
+                        Some(fetcher.clone()),
+                    ),
+                    fetcher,
+                    local_path: Db::meta_path_for_path(&dst),
+                    host: self.ltx_host.clone(),
+                    queue: queue.clone(),
+                    base_txid: continuation.map_or(1, |(txid, _)| txid.0),
+                    min_txids: self.compaction_min_txids,
+                    min_bytes: self.compaction_min_bytes,
+                    pending_bytes: AtomicU64::new(0),
+                    compacted_txid: AtomicU64::new(0),
+                    retry_after_ms: AtomicU64::new(0),
+                    failures: AtomicU64::new(0),
+                    queued: AtomicBool::new(false),
+                    cancelled: AtomicBool::new(false),
+                    handoff_paused: AtomicBool::new(false),
+                    cancel: Notify::new(),
+                    run: tokio::sync::Mutex::new(()),
+                }
+            }),
         });
         // Shutdown publishes stop before it takes the close gate and this map.
         // An activation that linearizes first is in shutdown's snapshot; one
