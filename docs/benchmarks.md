@@ -197,21 +197,28 @@ BENCH_BASE_URL=http://127.0.0.1:8787 BENCH_PIDS=12345 BENCH_IDLE_S=15 \
 
 | Phase        | What it measures                                                                  |
 | ------------ | --------------------------------------------------------------------------------- |
-| `memory`     | Resident set of the process ids in `BENCH_PIDS` (and their children) at zero agents, after one, and after `BENCH_MEM_AGENTS` (500) live agents. The slope is KiB per live agent; the idle figure shows what is kept after eviction. |
+| `memory`     | Resident set of the process ids in `BENCH_PIDS` (and their children, each process counted once) at zero agents, after one, and after `BENCH_MEM_AGENTS` (500) live agents. The slope is KiB per live agent; the idle figure shows what is kept after eviction. A listed process that is not running fails the phase. |
 | `cold`       | First request to each of `BENCH_COLD_AGENTS` (100) agents that have never been seen. |
 | `warm`       | `BENCH_WARM_REQUESTS` (1000) sequential requests to one agent, after 20 warm-up requests. |
 | `wake`       | `BENCH_WAKE_AGENTS` (50) agents are created, idle for `BENCH_IDLE_S` (15 s), and requested again. |
 | `throughput` | `BENCH_CONCURRENCY` (32) connections for `BENCH_SECONDS` (10) after a 2 s warm-up, once on one agent and once over `BENCH_THROUGHPUT_AGENTS` (256). |
 
-`BENCH_PHASES` picks phases (default all). Latency is from send to the last
-body byte and is reported as nearest-rank p50, p95 and p99. Set
+`BENCH_PHASES` picks phases (default all); an unknown name is an error. Latency is from send to the last
+body byte and is reported as nearest-rank p50, p95 and p99. A throughput
+request counts when it finishes inside the measured window, and a phase whose
+agents could not all be created is not measured. Set
 `BENCH_IDLE_S` above the server's idle eviction time. If it is shorter, the
 `wake` phase measures a warm request, and the report cannot tell. What a wake
 does depends on what the server keeps: a process that reopens a local file and
 one that restores from a bucket do different work. Say which one a number is.
 
 Memory needs a server that has served no agent yet, so run it first, as the
-default order does. Pass every process that holds agents in `BENCH_PIDS`
+default order does. Creating the agents must take less than the server's idle
+eviction time, or early agents are gone before the sample and the slope would
+be too small; set `BENCH_EVICT_S` to that time (without it, `BENCH_IDLE_S` is
+used as the limit). A run that takes longer reports no slope: lower
+`BENCH_MEM_AGENTS`. With `BENCH_EVICT_S` set, `wake` also checks that
+`BENCH_IDLE_S` is above it. Pass every process that holds agents in `BENCH_PIDS`
 (a host process and its workers, for example); child processes of a listed pid
 are added. The total includes the runtime and the code, so read the per-agent
 slope, not the absolute figure.
@@ -237,7 +244,10 @@ run starts with. `agent_requests` takes the agent count, turns and turn gap of
 `BENCH_IDLE_S` it first watches the proxy with no load for that long and
 reports the idle request rate. The proxy speaks plain HTTP and path-style S3, so
 the server must be allowed to use an `http://` endpoint. It answers
-`GET /.proxy/tally` with the counts as JSON and `POST /.proxy/reset`.
+`GET /.proxy/tally` with the counts as JSON and `POST /.proxy/reset`, to
+callers on a loopback address only: the relay may listen on a public address
+for a server on another host, but the tally cannot be read or cleared from
+there, so run `agent_requests` on the proxy's host.
 
 The proxy opens a new connection to the store for every request. That is fine
 at the rates of a request-count run, but at throughput rates it exhausts the

@@ -26,12 +26,12 @@
 
 mod support;
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use support::{
-    base_urls, diff, env_text, git, out, positive, run_turns, target_dir, Class, EndRule, Report,
-    TallySource, PROJECTED_CONCURRENT,
+    base_urls, diff, env_text, git, out, positive, run_id, run_turns, target_dir, Class, EndRule,
+    Report, TallySource, PROJECTED_CONCURRENT,
 };
 
 fn main() {
@@ -46,12 +46,7 @@ fn main() {
     let idle_window =
         env_text("BENCH_IDLE_S").map(|_| Duration::from_secs(positive("BENCH_IDLE_S", 1)));
     let end = EndRule::from_env();
-    let run = format!(
-        "req-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs())
-    );
+    let run = run_id("req");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

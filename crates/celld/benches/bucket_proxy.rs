@@ -13,7 +13,9 @@
 //! bucket name and key prefix that every key of the run starts with; it is
 //! stripped before classifying), and the classifier settings of
 //! `docs/benchmarks.md`. `GET /.proxy/tally` returns the tally as JSON and
-//! `POST /.proxy/reset` clears it. The proxy runs until it is killed.
+//! `POST /.proxy/reset` clears it; both answer callers on a loopback address
+//! only, even when `BENCH_PROXY_LISTEN` is a public address. The proxy runs
+//! until it is killed.
 
 // The load generator drives other processes from the outside, so it is not
 // part of the execution boundary that the disallowed-methods policy protects.

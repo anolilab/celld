@@ -8,14 +8,15 @@
 // Each target uses a different part of this module.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
@@ -307,7 +308,10 @@ pub fn diff(after: &Tally, before: &Tally) -> Tally {
 /// for the proxy's address still verifies upstream.
 ///
 /// `GET /.proxy/tally` returns the tally as JSON and `POST /.proxy/reset`
-/// clears it, so a proxy in another process can be read.
+/// clears it, so a proxy in another process can be read. Those routes answer
+/// callers on a loopback address only, whatever address the proxy listens on:
+/// the relay can be reachable from another host, the tally and its reset
+/// cannot.
 pub struct Proxy {
     pub url: String,
     tally: Arc<Mutex<Tally>>,
@@ -331,7 +335,7 @@ impl Proxy {
         let tally = Arc::new(Mutex::new(Tally::new()));
         let shared = tally.clone();
         let accept = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok((stream, peer)) = listener.accept().await {
                 let (tally, upstream, root, classifier) = (
                     shared.clone(),
                     upstream.clone(),
@@ -350,7 +354,12 @@ impl Proxy {
                     };
                     async move {
                         if request.uri().path().starts_with(CONTROL) {
-                            return Ok(control(&tally, &request));
+                            return Ok(control_response(
+                                &tally,
+                                request.method(),
+                                request.uri().path(),
+                                peer.ip(),
+                            ));
                         }
                         let response = forward(upstream, request).await?;
                         // Counted only once the store answered: a request
@@ -398,8 +407,18 @@ fn text_response(status: u16, body: String) -> Response<ProxyBody> {
         .expect("build a response")
 }
 
-fn control(tally: &Mutex<Tally>, request: &Request<Incoming>) -> Response<ProxyBody> {
-    match (request.method(), request.uri().path()) {
+/// The answer to a request for a control route. Only a loopback `peer` may
+/// read or clear the tally.
+pub fn control_response(
+    tally: &Mutex<Tally>,
+    method: &Method,
+    path: &str,
+    peer: IpAddr,
+) -> Response<ProxyBody> {
+    if !peer.to_canonical().is_loopback() {
+        return text_response(403, "{}".to_owned());
+    }
+    match (method, path) {
         (&Method::GET, "/.proxy/tally") => {
             text_response(200, tally_json(&tally.lock().unwrap()).to_string())
         }
@@ -715,11 +734,16 @@ pub fn percentile_us(sorted: &[u64], p: f64) -> u64 {
 }
 
 /// The summed resident set, in KiB, of `roots` and every process below them.
-pub fn rss_kib(roots: &[u32]) -> u64 {
+/// Fails if `ps` does, or if a listed process is not running: a stale pid must
+/// not read as zero memory.
+pub fn rss_kib(roots: &[u32]) -> Result<u64, String> {
     let output = Command::new("ps")
         .args(["-A", "-o", "pid=,ppid=,rss="])
         .output()
-        .expect("run ps");
+        .map_err(|e| format!("could not run ps: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("ps failed: {}", output.status));
+    }
     let rows: Vec<(u32, u32, u64)> = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
@@ -731,23 +755,115 @@ pub fn rss_kib(roots: &[u32]) -> u64 {
             ))
         })
         .collect();
-    let mut live: Vec<u32> = roots.to_vec();
+    rss_of_tree(&rows, roots)
+}
+
+/// The resident set of `roots` and their descendants in `rows` of
+/// `(pid, parent pid, rss)`. Each process counts once, so a root that is also
+/// the descendant of another root is not added twice.
+pub fn rss_of_tree(rows: &[(u32, u32, u64)], roots: &[u32]) -> Result<u64, String> {
+    if let Some(missing) = roots
+        .iter()
+        .find(|root| !rows.iter().any(|(pid, _, _)| pid == *root))
+    {
+        return Err(format!("process {missing} is not running"));
+    }
+    let mut seen = HashSet::new();
+    let mut pending = roots.to_vec();
     let mut total = 0;
-    let mut i = 0;
-    while i < live.len() {
-        let pid = live[i];
+    while let Some(pid) = pending.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
         total += rows
             .iter()
-            .find(|(p, _, _)| *p == pid)
-            .map_or(0, |(_, _, rss)| *rss);
-        live.extend(
+            .filter(|(p, _, _)| *p == pid)
+            .map(|(_, _, rss)| *rss)
+            .sum::<u64>();
+        pending.extend(
             rows.iter()
                 .filter(|(_, ppid, _)| *ppid == pid)
                 .map(|(p, _, _)| *p),
         );
-        i += 1;
     }
-    total
+    Ok(total)
+}
+
+/// Memory per live agent, in KiB, from the resident set with one agent and
+/// with `created` more. `creation` is how long creating them took and `limit`
+/// the longest an agent stays resident when idle: past it, early agents may
+/// be gone before the sample, so there is no slope to report.
+pub fn memory_slope(
+    one: u64,
+    live: u64,
+    created: usize,
+    creation: Duration,
+    limit: Duration,
+) -> Result<f64, String> {
+    if created == 0 {
+        return Err("no agent was created, so there is nothing to divide by".to_owned());
+    }
+    if creation >= limit {
+        return Err(format!(
+            "creating the agents took {:.1} s, not under the {:.1} s they stay resident when idle; \
+             lower BENCH_MEM_AGENTS",
+            creation.as_secs_f64(),
+            limit.as_secs_f64()
+        ));
+    }
+    Ok(live.saturating_sub(one) as f64 / created as f64)
+}
+
+/// Where a request that finished `at` after the load started falls against a
+/// `warmup` followed by a measured `window`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WindowPosition {
+    Warmup,
+    Measured,
+    Over,
+}
+
+pub fn window_position(at: Duration, warmup: Duration, window: Duration) -> WindowPosition {
+    if at < warmup {
+        WindowPosition::Warmup
+    } else if at < warmup + window {
+        WindowPosition::Measured
+    } else {
+        WindowPosition::Over
+    }
+}
+
+/// The measurement phases of `runtime_latency`.
+pub const PHASES: [&str; 5] = ["memory", "cold", "warm", "wake", "throughput"];
+
+/// The phase names in a comma-separated list; an empty list means all. An
+/// unknown name is an error, not a skipped phase.
+pub fn parse_phases(list: &str) -> Result<Vec<String>, String> {
+    let names: Vec<String> = list
+        .split(',')
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .collect();
+    match names.iter().find(|name| !PHASES.contains(&name.as_str())) {
+        Some(unknown) => Err(format!(
+            "BENCH_PHASES names {unknown:?}, which is not one of {PHASES:?}"
+        )),
+        None => Ok(names),
+    }
+}
+
+/// A name for this run that no other run shares: agents named from it are
+/// new to the server even when two runs start in the same second.
+pub fn run_id(prefix: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!(
+        "{prefix}-{nanos:x}-{:x}-{:x}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 pub fn env_text(name: &str) -> Option<String> {

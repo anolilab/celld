@@ -12,7 +12,10 @@
 //!
 //! - `memory`: the resident set of `BENCH_PIDS` (and their child processes) at
 //!   zero agents, after one, and after `BENCH_MEM_AGENTS` live agents; the
-//!   slope is the memory per live agent.
+//!   slope is the memory per live agent. Every listed process must be running.
+//!   Creating the agents must take less than the server's idle eviction time
+//!   (`BENCH_EVICT_S`, else `BENCH_IDLE_S`), or no slope is reported, since
+//!   early agents may be gone before the sample.
 //! - `cold`: the first request to each of `BENCH_COLD_AGENTS` new agents.
 //! - `warm`: `BENCH_WARM_REQUESTS` requests to one agent after a warm-up.
 //! - `wake`: `BENCH_WAKE_AGENTS` agents are created, left idle for
@@ -24,8 +27,10 @@
 //! Latency is from send to the last body byte, as nearest-rank p50/p95/p99.
 //! `BENCH_BASE_URL` may list several nodes, comma-separated; requests go
 //! round-robin. `BENCH_LABEL` is free text copied into the JSON, and
-//! `BENCH_OUT` is the JSON file. The run exits non-zero if a phase fails every
-//! request.
+//! `BENCH_OUT` is the JSON file. A phase that cannot be measured, or that
+//! fails every request, is recorded in the JSON with its reason, and the run
+//! exits non-zero after writing it. `BENCH_EVICT_S` is the server's idle
+//! eviction time, when known; `wake` then needs `BENCH_IDLE_S` above it.
 
 // The load generator drives other processes from the outside, so it is not
 // part of the execution boundary that the disallowed-methods policy protects.
@@ -34,10 +39,13 @@
 mod support;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
-use support::{base_urls, env_text, git, out, percentile_us, positive, rss_kib, target_dir};
+use serde_json::{json, Map, Value};
+use support::{
+    base_urls, env_text, git, memory_slope, out, parse_phases, percentile_us, positive, rss_kib,
+    run_id, target_dir, window_position, WindowPosition,
+};
 use tokio::sync::Semaphore;
 
 struct Settings {
@@ -48,6 +56,7 @@ struct Settings {
     warm_requests: usize,
     wake_agents: usize,
     idle: Duration,
+    evict: Option<Duration>,
     concurrency: usize,
     seconds: u64,
     throughput_agents: usize,
@@ -65,6 +74,41 @@ impl Settings {
     }
 }
 
+/// What a phase measured, and why it could not, if it could not.
+struct Outcome {
+    stats: Value,
+    failure: Option<String>,
+}
+
+impl Outcome {
+    fn measured(stats: Value) -> Outcome {
+        Outcome {
+            stats,
+            failure: None,
+        }
+    }
+
+    fn invalid(mut stats: Value, reason: String) -> Outcome {
+        stats["failure"] = json!(reason);
+        Outcome {
+            stats,
+            failure: Some(reason),
+        }
+    }
+
+    /// The outcome of a phase made of timed requests: a failure if none
+    /// succeeded.
+    fn from_samples(name: &str, samples: &Samples) -> Outcome {
+        out(&samples.line(name));
+        let stats = samples.json();
+        if samples.ok.is_empty() {
+            Outcome::invalid(stats, "no request succeeded".to_owned())
+        } else {
+            Outcome::measured(stats)
+        }
+    }
+}
+
 fn main() {
     let settings = Settings {
         bases: base_urls("BENCH_BASE_URL"),
@@ -76,22 +120,18 @@ fn main() {
             })
             .unwrap_or_default(),
         phases: env_text("BENCH_PHASES")
-            .map(|list| list.split(',').map(|p| p.trim().to_owned()).collect())
+            .map(|list| parse_phases(&list).unwrap_or_else(|e| panic!("{e}")))
             .unwrap_or_default(),
         cold_agents: positive("BENCH_COLD_AGENTS", 100),
         warm_requests: positive("BENCH_WARM_REQUESTS", 1000),
         wake_agents: positive("BENCH_WAKE_AGENTS", 50),
         idle: Duration::from_secs(positive("BENCH_IDLE_S", 15)),
+        evict: env_text("BENCH_EVICT_S").map(|_| Duration::from_secs(positive("BENCH_EVICT_S", 1))),
         concurrency: positive("BENCH_CONCURRENCY", 32),
         seconds: positive("BENCH_SECONDS", 10),
         throughput_agents: positive("BENCH_THROUGHPUT_AGENTS", 256),
         mem_agents: positive("BENCH_MEM_AGENTS", 500),
-        run: format!(
-            "lat-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs())
-        ),
+        run: run_id("lat"),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -103,46 +143,44 @@ fn main() {
         .build()
         .expect("build http client");
 
-    let mut results = serde_json::Map::new();
+    let mut results = Map::new();
     let mut failed = Vec::new();
     runtime.block_on(async {
+        let mut record = |name: &str, outcome: Outcome| {
+            if let Some(reason) = outcome.failure {
+                failed.push(format!("{name}: {reason}"));
+            }
+            results.insert(name.to_owned(), outcome.stats);
+        };
         // Memory first: it needs a server that has served no agent yet.
         if settings.runs("memory") {
             if settings.pids.is_empty() {
                 out("memory: skipped, BENCH_PIDS is not set\n");
             } else {
-                results.insert("memory".into(), memory(&settings, &client).await);
+                record("memory", memory(&settings, &client).await);
             }
         }
         if settings.runs("cold") {
             let samples = cold(&settings, &client).await;
-            record("cold", samples, &mut results, &mut failed);
+            record("cold", Outcome::from_samples("cold", &samples));
         }
         if settings.runs("warm") {
             let samples = warm(&settings, &client).await;
-            record("warm", samples, &mut results, &mut failed);
+            record("warm", Outcome::from_samples("warm", &samples));
         }
         if settings.runs("wake") {
-            let samples = wake(&settings, &client).await;
-            record("wake", samples, &mut results, &mut failed);
+            record("wake", wake(&settings, &client).await);
         }
         if settings.runs("throughput") {
             for (name, agents) in [
                 ("single_agent", 1),
                 ("many_agents", settings.throughput_agents),
             ] {
-                let (samples, window) = throughput(&settings, &client, name, agents).await;
                 let key = format!("throughput_{name}");
-                let mut stats = samples.json();
-                stats["rps"] = json!(samples.ok.len() as f64 / window);
-                stats["window_s"] = json!(window);
-                stats["concurrency"] = json!(settings.concurrency);
-                stats["agents"] = json!(agents);
-                out(&samples.line(&key));
-                if samples.ok.is_empty() {
-                    failed.push(key.clone());
-                }
-                results.insert(key, stats);
+                record(
+                    &key,
+                    throughput(&settings, &client, &key, name, agents).await,
+                );
             }
         }
     });
@@ -157,12 +195,14 @@ fn main() {
             "warm_requests": settings.warm_requests,
             "wake_agents": settings.wake_agents,
             "idle_s": settings.idle.as_secs(),
+            "evict_s": settings.evict.map(|d| d.as_secs()),
             "concurrency": settings.concurrency,
             "seconds": settings.seconds,
             "throughput_agents": settings.throughput_agents,
             "mem_agents": settings.mem_agents,
         },
         "results": results,
+        "failures": failed,
     });
     let path = env_text("BENCH_OUT")
         .map(std::path::PathBuf::from)
@@ -176,20 +216,7 @@ fn main() {
     )
     .expect("write results");
     out(&format!("results written to {}\n", path.display()));
-    assert!(failed.is_empty(), "no request succeeded in: {failed:?}");
-}
-
-fn record(
-    name: &str,
-    samples: Samples,
-    results: &mut serde_json::Map<String, Value>,
-    failed: &mut Vec<String>,
-) {
-    out(&samples.line(name));
-    if samples.ok.is_empty() {
-        failed.push(name.to_owned());
-    }
-    results.insert(name.to_owned(), samples.json());
+    assert!(failed.is_empty(), "phases that failed: {failed:?}");
 }
 
 /// The latencies of the requests that succeeded, and how many did not.
@@ -271,47 +298,58 @@ async fn create(client: &reqwest::Client, urls: Vec<String>, concurrency: usize)
     samples
 }
 
-async fn memory(settings: &Settings, client: &reqwest::Client) -> Value {
-    let at_start = rss_kib(&settings.pids);
+async fn memory(settings: &Settings, client: &reqwest::Client) -> Outcome {
+    let mut stats = Map::new();
+    match measure_memory(settings, client, &mut stats).await {
+        Ok(()) => Outcome::measured(Value::Object(stats)),
+        Err(reason) => Outcome::invalid(Value::Object(stats), reason),
+    }
+}
+
+/// Fills `stats` as it goes, so a failure keeps what was read before it.
+async fn measure_memory(
+    settings: &Settings,
+    client: &reqwest::Client,
+    stats: &mut Map<String, Value>,
+) -> Result<(), String> {
+    let at_start = rss_kib(&settings.pids)?;
+    stats.insert("rss_kib_start".into(), json!(at_start));
     let probe = create(
         client,
         vec![settings.url(&format!("{}-mem-probe", settings.run), 0)],
         1,
     )
     .await;
-    assert!(!probe.ok.is_empty(), "the memory probe request failed");
-    let one = rss_kib(&settings.pids);
+    if probe.ok.is_empty() {
+        return Err("the memory probe request failed".to_owned());
+    }
+    let one = rss_kib(&settings.pids)?;
+    stats.insert("rss_kib_one_agent".into(), json!(one));
     let urls = (0..settings.mem_agents)
         .map(|i| settings.url(&format!("{}-mem-{i}", settings.run), i))
         .collect();
     let started = Instant::now();
     let created = create(client, urls, settings.concurrency).await;
     let creation = started.elapsed();
-    let live = rss_kib(&settings.pids);
+    let live = rss_kib(&settings.pids)?;
     let n = created.ok.len();
-    let delta_per_agent = if n > 0 {
-        live.saturating_sub(one) as f64 / n as f64
-    } else {
-        0.0
-    };
+    stats.insert("rss_kib_live".into(), json!(live));
+    stats.insert("agents_created".into(), json!(n));
+    stats.insert("agents_failed".into(), json!(created.errors));
+    stats.insert("creation_s".into(), json!(creation.as_secs_f64()));
+    let limit = settings.evict.unwrap_or(settings.idle);
+    let per_agent = memory_slope(one, live, n, creation, limit)?;
+    stats.insert("kib_per_agent".into(), json!(per_agent));
     // After the agents are evicted, what the server keeps.
     tokio::time::sleep(settings.idle + Duration::from_secs(3)).await;
-    let after_idle = rss_kib(&settings.pids);
+    let after_idle = rss_kib(&settings.pids)?;
+    stats.insert("rss_kib_after_idle".into(), json!(after_idle));
     out(&format!(
         "memory: start {at_start} KiB, 1 agent {one} KiB, {n} agents {live} KiB \
-         ({delta_per_agent:.1} KiB per agent, created in {:.1} s), after idle {after_idle} KiB\n",
+         ({per_agent:.1} KiB per agent, created in {:.1} s), after idle {after_idle} KiB\n",
         creation.as_secs_f64()
     ));
-    json!({
-        "rss_kib_start": at_start,
-        "rss_kib_one_agent": one,
-        "rss_kib_live": live,
-        "rss_kib_after_idle": after_idle,
-        "agents_created": n,
-        "agents_failed": created.errors,
-        "creation_s": creation.as_secs_f64(),
-        "kib_per_agent": delta_per_agent,
-    })
+    Ok(())
 }
 
 async fn cold(settings: &Settings, client: &reqwest::Client) -> Samples {
@@ -341,16 +379,23 @@ async fn warm(settings: &Settings, client: &reqwest::Client) -> Samples {
     samples
 }
 
-async fn wake(settings: &Settings, client: &reqwest::Client) -> Samples {
+async fn wake(settings: &Settings, client: &reqwest::Client) -> Outcome {
+    if settings.evict.is_some_and(|evict| settings.idle <= evict) {
+        return Outcome::invalid(
+            json!({}),
+            "BENCH_IDLE_S must be above BENCH_EVICT_S, or the agents are not evicted".to_owned(),
+        );
+    }
     let urls: Vec<String> = (0..settings.wake_agents)
         .map(|i| settings.url(&format!("{}-wake-{i}", settings.run), i))
         .collect();
     let created = create(client, urls.clone(), 8).await;
-    assert!(
-        created.errors == 0,
-        "{} wake agents could not be created",
-        created.errors
-    );
+    if created.errors > 0 {
+        return Outcome::invalid(
+            json!({ "agents_failed": created.errors }),
+            format!("{} wake agents could not be created", created.errors),
+        );
+    }
     tokio::time::sleep(settings.idle).await;
     let mut samples = Samples::default();
     for url in &urls {
@@ -359,24 +404,34 @@ async fn wake(settings: &Settings, client: &reqwest::Client) -> Samples {
             None => samples.errors += 1,
         }
     }
-    samples
+    Outcome::from_samples("wake", &samples)
 }
 
 /// `BENCH_CONCURRENCY` workers for `BENCH_SECONDS`, after a 2 s warm-up, over
 /// `agents` objects that each have been requested once before the clock
-/// starts. Returns the samples and the measured window in seconds.
+/// starts. A request counts when it finishes inside the measured window, so
+/// the rate divides by the window it was counted in. If an agent cannot be
+/// created the phase is not measured: its first request would land in the
+/// window as cold work.
 async fn throughput(
     settings: &Settings,
     client: &reqwest::Client,
+    key: &str,
     name: &str,
     agents: usize,
-) -> (Samples, f64) {
+) -> Outcome {
     let urls: Arc<Vec<String>> = Arc::new(
         (0..agents)
             .map(|i| settings.url(&format!("{}-{name}-{i}", settings.run), i))
             .collect(),
     );
-    create(client, urls.to_vec(), settings.concurrency).await;
+    let created = create(client, urls.to_vec(), settings.concurrency).await;
+    if created.errors > 0 {
+        return Outcome::invalid(
+            json!({ "agents_failed": created.errors, "agents": agents }),
+            format!("{} of {agents} agents could not be created", created.errors),
+        );
+    }
     let warmup = Duration::from_secs(2);
     let window = Duration::from_secs(settings.seconds);
     let started = Instant::now();
@@ -386,16 +441,16 @@ async fn throughput(
         tasks.push(tokio::spawn(async move {
             let mut samples = Samples::default();
             let mut i = worker;
-            while started.elapsed() < warmup + window {
-                let counted = started.elapsed() >= warmup;
+            loop {
                 let result = timed(&client, &urls[i % urls.len()]).await;
                 i += 1;
-                if !counted {
-                    continue;
-                }
-                match result {
-                    Some(us) => samples.ok.push(us),
-                    None => samples.errors += 1,
+                match window_position(started.elapsed(), warmup, window) {
+                    WindowPosition::Warmup => {}
+                    WindowPosition::Measured => match result {
+                        Some(us) => samples.ok.push(us),
+                        None => samples.errors += 1,
+                    },
+                    WindowPosition::Over => break,
                 }
             }
             samples
@@ -407,5 +462,10 @@ async fn throughput(
         all.ok.extend(samples.ok);
         all.errors += samples.errors;
     }
-    (all, window.as_secs_f64())
+    let mut outcome = Outcome::from_samples(key, &all);
+    outcome.stats["rps"] = json!(all.ok.len() as f64 / window.as_secs_f64());
+    outcome.stats["window_s"] = json!(window.as_secs_f64());
+    outcome.stats["concurrency"] = json!(settings.concurrency);
+    outcome.stats["agents"] = json!(agents);
+    outcome
 }
