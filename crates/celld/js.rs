@@ -6598,12 +6598,13 @@ fn op_svc_call_impl(
         headers,
         reply: tx,
     };
+    let ws_owner = websocket::ws_caller(scope).owner;
     let stream_service = http_stream_service();
     let id = asyncrt::enqueue(async move {
         let mut cancel_guard = cancel_guard;
         gated_channel_send(gate, &SVC_CALL_TX, request, "no service binding channel").await?;
         let result = match rx.await {
-            Ok(Ok(response)) => encode_http_response(response, true, &stream_service),
+            Ok(Ok(response)) => encode_granted_response(ws_owner, response, &stream_service),
             Ok(Err(error)) => Err(format!("{error}")),
             Err(error) => Err(format!("service dropped: {error}")),
         };
@@ -7880,6 +7881,7 @@ fn op_facet_fetch(
     };
     let host = FacetHost::of(loader);
     let trace = current_trace_context(scope);
+    let ws_owner = websocket::ws_caller(scope).owner;
     let stream_service = http_stream_service();
     let async_id = asyncrt::enqueue(async move {
         let facet = prepare_facet(
@@ -7927,7 +7929,7 @@ fn op_facet_fetch(
                 };
                 facet.gate_response(socket).await?;
                 facet.attach_websocket(&response);
-                encode_http_response(response, true, &stream_service)
+                encode_granted_response(ws_owner, response, &stream_service)
             }
             Ok(Err(error)) => Err(format!("{error}")),
             Err(_) => match driving.await {
@@ -8164,11 +8166,12 @@ fn op_do_call_impl(
         parent: current_trace_context(scope),
         operator_ingress: false,
     };
+    let ws_owner = websocket::ws_caller(scope).owner;
     let stream_service = http_stream_service();
     let id = asyncrt::enqueue(async move {
         gated_channel_send(gate, &DO_CALL_TX, request, "no proxy channel").await?;
         let result = match rx.await {
-            Ok(Ok(response)) => encode_http_response(response, true, &stream_service),
+            Ok(Ok(response)) => encode_granted_response(ws_owner, response, &stream_service),
             Ok(Err(e)) => Err(format!("{e}")),
             Err(e) => Err(format!("proxy dropped: {e}")),
         };
@@ -8476,12 +8479,13 @@ fn op_fetch(
             headers,
             reply: tx,
         };
+        let ws_owner = websocket::ws_caller(scope).owner;
         let stream_service = http_stream_service();
         let id = asyncrt::enqueue(async move {
             let mut cancel_guard = cancel_guard;
             gated_channel_send(gate, &SVC_CALL_TX, request, "no service binding channel").await?;
             let result = match rx.await {
-                Ok(Ok(response)) => encode_http_response(response, true, &stream_service),
+                Ok(Ok(response)) => encode_granted_response(ws_owner, response, &stream_service),
                 Ok(Err(error)) => Err(format!("{error}")),
                 Err(error) => Err(format!("globalOutbound Fetcher dropped: {error}")),
             };
@@ -9328,6 +9332,20 @@ fn op_do_id(
     );
 }
 
+/// Encode a response for the request `owner`. A cell's WebSocket the response
+/// carries is recorded as handed to that request, and only that request can
+/// bind to it or return it.
+fn encode_granted_response(
+    owner: u64,
+    response: HttpResponse,
+    stream_service: &Arc<crate::http_streams::HttpStreamService>,
+) -> Result<String, String> {
+    if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
+        ws_grant_target(target, owner);
+    }
+    encode_http_response(response, true, stream_service)
+}
+
 fn view_bytes(value: v8::Local<v8::Value>) -> Option<Vec<u8>> {
     let view = v8::Local::<v8::ArrayBufferView>::try_from(value).ok()?;
     let mut bytes = vec![0_u8; view.byte_length()];
@@ -10048,6 +10066,10 @@ pub struct IoContext {
     /// its event: retirement drops the registry entries, which closes
     /// the connections.
     tcp_sockets: Mutex<Vec<u64>>,
+    /// WebSocket ids this event allocated. An id the registry does not know
+    /// yet can be taken only by the event that allocated it, so a script
+    /// cannot claim an id another event is about to use.
+    allocated_sockets: Mutex<HashSet<u64>>,
     /// Input-gate holds and pending acquisitions for this event.
     ///
     /// The event owns the cell and host id together, and retirement wakes a
@@ -10177,6 +10199,14 @@ impl IoContext {
         self.continuation.as_ref().map(|(id, _)| *id)
     }
 
+    /// The identity that owns the sockets and response targets this event
+    /// opens. A context V8 never captures has no continuation id and answers
+    /// with its address, which no id from the process-wide counter can equal.
+    fn owner_id(&self) -> u64 {
+        self.continuation_id()
+            .unwrap_or(self as *const Self as usize as u64)
+    }
+
     fn cpu_limit_ms(&self) -> Option<u32> {
         self.cpu_limit_nanos
             .and_then(|limit| u32::try_from(limit / 1_000_000).ok())
@@ -10282,6 +10312,7 @@ impl IoContext {
             sockets: Mutex::new(Vec::new()),
             rewriters: Mutex::new(Vec::new()),
             tcp_sockets: Mutex::new(Vec::new()),
+            allocated_sockets: Mutex::new(HashSet::new()),
             input_gates: Mutex::new(InputGateClaims::default()),
             cross_entry_gates: CrossEntryGateClaims::default(),
             body_streams: Mutex::new(HashMap::new()),
@@ -10314,6 +10345,7 @@ impl IoContext {
             sockets: Mutex::new(Vec::new()),
             rewriters: Mutex::new(Vec::new()),
             tcp_sockets: Mutex::new(Vec::new()),
+            allocated_sockets: Mutex::new(HashSet::new()),
             input_gates: Mutex::new(InputGateClaims::default()),
             cross_entry_gates: CrossEntryGateClaims::default(),
             body_streams: Mutex::new(HashMap::new()),
@@ -10642,6 +10674,7 @@ impl Drop for IoContext {
         // final host-side invariant for an earlier exit: no request context
         // can leave a process-wide input gate active after it is gone.
         let _ = abandon_context_input_gates(self);
+        ws_revoke_grants(self.owner_id());
         self.close_sockets();
         let mut claims = self
             .body_streams
@@ -11629,7 +11662,16 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
         .get(scope, wk.into())
         .map(|v| v.to_rust_string_lossy(scope))
         .unwrap_or_else(|| "null".into());
-    let ws = serde_json::from_str(&ws_json).ok();
+    let ws: Option<WsTarget> = serde_json::from_str(&ws_json).ok();
+    // A target names a cell's socket, and this JSON is whatever the response
+    // object carried, so only the request the host handed the target to can
+    // return it.
+    let caller = websocket::ws_caller(scope);
+    if let Some(target) = &ws {
+        if !ws_may_return_target(&caller, target) {
+            return Err(anyhow!("WebSocket target was not handed to this request"));
+        }
+    }
     let worker_id = out
         .get(scope, worker_wk.into())
         .and_then(|value| value.integer_value(scope))
@@ -11639,7 +11681,7 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
         None
     } else {
         Some(
-            websocket::transfer_worker_websocket_handoff(worker_id)
+            websocket::transfer_worker_websocket_handoff(&caller, worker_id)
                 .ok_or_else(|| anyhow!("Worker WebSocket {worker_id} has no frame handoff"))?,
         )
     };
