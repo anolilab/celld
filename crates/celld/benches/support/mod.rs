@@ -1091,7 +1091,7 @@ pub fn parse_base_urls(list: &str) -> Result<Vec<String>, String> {
     Ok(urls)
 }
 
-/// The variables that set the proxy's classifier. `lookup` reads one.
+/// The variables that set the proxy's classifier.
 const CLASSIFIER_VARIABLES: [&str; 3] = [
     "BENCH_PER_AGENT_REGEX",
     "BENCH_PER_AGENT_PREFIXES",
