@@ -47,7 +47,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use scenarios::{effective_env, plan, sum_answers, Scenario, BASELINE, SCENARIOS};
+use scenarios::{
+    born, directory_requests, effective_env, idle_window, plan, runs, sum_answers, Scenario,
+    BASELINE, SCENARIOS,
+};
 use serde_json::{json, Value};
 use support::{
     class_of, diff, env_text, free_port, git, out, positive, run_turns, target_dir, Class,
@@ -125,21 +128,6 @@ struct ScenarioResult {
     setup: Tally,
     /// The answers the directory gave the claim guard, from every node.
     answers: Value,
-}
-
-/// Whether a request is one of the directory's segments: a batch delete of
-/// them is named for them too.
-fn born(shape: &str) -> bool {
-    shape
-        .trim_start_matches("(batch) ")
-        .starts_with("fleet/born/")
-}
-
-/// Whether a request is one of the directory's heads, runs, ledger or lease.
-fn runs(shape: &str) -> bool {
-    shape
-        .trim_start_matches("(batch) ")
-        .starts_with("fleet/dir/")
 }
 
 /// The compactor reads its ledger once per pass and nothing else reads it.
@@ -258,7 +246,7 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
     let bases: Vec<String> = nodes.iter().map(|n| n.public.clone()).collect();
     let agents = if scenario.agents { settings.agents } else { 0 };
     let errors = if scenario.agents {
-        run_turns(
+        let errors = run_turns(
             &client,
             &bases,
             run,
@@ -267,16 +255,25 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
             settings.turn,
             settings.spread,
         )
-        .await
+        .await;
+        settings
+            .end
+            .wait(&proxy.source(), Instant::now())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        errors
     } else {
-        tokio::time::sleep(settings.spread + settings.turn * (settings.turns as u32 - 1)).await;
+        // The shared traffic of an idle fleet (leases, heartbeats) never goes
+        // quiet, so it ends at its fixed window, not by the end rule.
+        let window = idle_window(
+            settings.spread,
+            settings.turn,
+            settings.turns,
+            settings.end.min_wait,
+        );
+        tokio::time::sleep(window).await;
         0
     };
-    settings
-        .end
-        .wait(&proxy.source(), Instant::now())
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
     let elapsed = started.elapsed();
     let load = diff(&proxy.take(), &base).unwrap_or_else(|e| panic!("{e}"));
     let answers = directory_answers(&client, &nodes).await;
@@ -426,16 +423,15 @@ fn write_json(settings: &Settings, results: &[ScenarioResult]) {
             scenario["failed_requests"] = json!(r.errors);
             scenario["env"] = r.env.clone();
             scenario["compaction_passes"] = json!(r.passes());
-            scenario["cell_directory"] = json!({
-                "segments_class_a_per_agent": r.per_agent_where(Class::A, born),
-                "segments_class_b_per_agent": r.per_agent_where(Class::B, born),
-                "runs_class_a_per_agent": r.per_agent_where(Class::A, runs),
-                "runs_class_b_per_agent": r.per_agent_where(Class::B, runs),
-                "setup_requests": r.setup.iter().map(|((kind, shape, _), n)| json!({
-                    "kind": kind, "key": shape, "count": n,
-                })).collect::<Vec<Value>>(),
-                "answers": r.answers,
-            });
+            let mut directory =
+                directory_requests(&r.report.load, r.report.agents, r.report.node_hours());
+            directory["setup_requests"] = r
+                .setup
+                .iter()
+                .map(|((kind, shape, _), n)| json!({ "kind": kind, "key": shape, "count": n }))
+                .collect();
+            directory["answers"] = r.answers.clone();
+            scenario["cell_directory"] = directory;
             scenario
         }).collect::<Vec<Value>>(),
     });

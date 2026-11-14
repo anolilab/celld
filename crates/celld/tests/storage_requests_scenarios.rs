@@ -2,11 +2,23 @@
 //! it. The bench target has no test harness of its own, so this file includes
 //! their module.
 
+// The support module is the bench load generator's, so it is not part of the
+// execution boundary that the disallowed-methods policy protects.
+#![allow(clippy::disallowed_methods)]
+
 #[path = "../benches/storage_requests/scenarios.rs"]
 mod scenarios;
+#[path = "../benches/support/mod.rs"]
+mod support;
 
-use scenarios::{effective_env, plan, sum_answers, Scenario, BASELINE, SCENARIOS};
+use std::time::Duration;
+
+use scenarios::{
+    directory_requests, effective_env, idle_window, plan, sum_answers, Scenario, BASELINE,
+    SCENARIOS,
+};
 use serde_json::{json, Value};
+use support::{Part, Tally};
 
 fn names(filter: Option<&str>) -> Vec<&'static str> {
     plan(&SCENARIOS, filter).iter().map(|s| s.name).collect()
@@ -104,4 +116,53 @@ fn a_fleet_of_unreadable_nodes_is_reported_rather_than_hidden() {
     let total = sum_answers(&[None, None]);
     assert_eq!(total["nodes_counted"], 0);
     assert_eq!(total["nodes_unreadable"], 2);
+}
+
+#[test]
+fn an_idle_window_is_the_agents_window_and_the_minimum_wait() {
+    let window = idle_window(
+        Duration::from_secs(60),
+        Duration::from_secs(10),
+        6,
+        Duration::from_secs(25),
+    );
+    assert_eq!(window, Duration::from_secs(60 + 50 + 25));
+}
+
+fn directory_load() -> Tally {
+    let mut load = Tally::new();
+    let mut add = |kind: &str, key: &str, count: u64| {
+        load.insert((kind.to_owned(), key.to_owned(), Part::Shared), count);
+    };
+    add("PUT", "fleet/born/node-#/*/#", 10);
+    add("GET", "fleet/born/node-#/*/#", 20);
+    add("BATCH_DELETE", "(batch) fleet/born/node-#/*/#", 2);
+    add("PUT", "fleet/dir/#/run/rec-*-#", 6);
+    add("GET", "fleet/dir/#/head", 40);
+    add("PUT", "nodes/node-#.json", 999);
+    load
+}
+
+#[test]
+fn with_agents_the_directory_requests_are_per_agent() {
+    let requests = directory_requests(&directory_load(), 4, 2.0);
+    assert_eq!(requests["segments_class_a_per_agent"], 3.0);
+    assert_eq!(requests["segments_class_b_per_agent"], 5.0);
+    assert_eq!(requests["runs_class_a_per_agent"], 1.5);
+    assert_eq!(requests["runs_class_b_per_agent"], 10.0);
+    assert!(requests.get("segments_class_a_per_node_hour").is_none());
+}
+
+#[test]
+fn without_agents_the_directory_requests_are_per_node_hour_not_per_agent() {
+    let requests = directory_requests(&directory_load(), 0, 2.0);
+    assert_eq!(requests["segments_class_a_per_node_hour"], 6.0);
+    assert_eq!(requests["segments_class_b_per_node_hour"], 10.0);
+    assert_eq!(requests["runs_class_a_per_node_hour"], 3.0);
+    assert_eq!(requests["runs_class_b_per_node_hour"], 20.0);
+    assert!(requests
+        .as_object()
+        .unwrap()
+        .keys()
+        .all(|key| !key.ends_with("per_agent")));
 }

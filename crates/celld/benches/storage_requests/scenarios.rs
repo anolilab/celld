@@ -6,7 +6,11 @@
 // Each user of this module needs a different part of it.
 #![allow(dead_code)]
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
+
+use crate::support::{class_of, Class, Tally};
 
 /// Longer than the default gap between turns, so an agent is evicted once,
 /// after its last turn, not between turns.
@@ -161,4 +165,52 @@ pub fn sum_answers(states: &[Option<Value>]) -> Value {
         "exists": pair("exists"),
         "unknown": pair("unknown"),
     })
+}
+
+/// How long a scenario without agents runs: the window agents take to start and
+/// make their turns, then the end rule's minimum wait.
+pub fn idle_window(spread: Duration, turn: Duration, turns: usize, min_wait: Duration) -> Duration {
+    spread + turn * (turns as u32 - 1) + min_wait
+}
+
+/// Whether a request is one of the cell directory's segments: a batch delete of
+/// them is named for them too.
+pub fn born(shape: &str) -> bool {
+    shape
+        .trim_start_matches("(batch) ")
+        .starts_with("fleet/born/")
+}
+
+/// Whether a request is one of the cell directory's heads, runs, ledger or
+/// lease.
+pub fn runs(shape: &str) -> bool {
+    shape
+        .trim_start_matches("(batch) ")
+        .starts_with("fleet/dir/")
+}
+
+/// The cell directory's requests in `load`, by class, nothing subtracted. With
+/// agents they are per agent; a window without agents has none to divide by, so
+/// they are per node-hour instead, under names that say so.
+pub fn directory_requests(load: &Tally, agents: usize, node_hours: f64) -> Value {
+    let (divisor, unit) = if agents > 0 {
+        (agents as f64, "per_agent")
+    } else {
+        (node_hours, "per_node_hour")
+    };
+    let mut fields = serde_json::Map::new();
+    for (part, keep) in [("segments", born as fn(&str) -> bool), ("runs", runs)] {
+        for (class, label) in [(Class::A, "a"), (Class::B, "b")] {
+            let count: u64 = load
+                .iter()
+                .filter(|((kind, shape, _), _)| class_of(kind) == class && keep(shape))
+                .map(|(_, n)| n)
+                .sum();
+            fields.insert(
+                format!("{part}_class_{label}_{unit}"),
+                json!(count as f64 / divisor),
+            );
+        }
+    }
+    fields.into()
 }

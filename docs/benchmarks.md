@@ -120,7 +120,9 @@ Scenarios:
 - `bucket`, `bucket_evict`: one node with `CELLD_DURABILITY=bucket`, where each
   write is proven by an upload.
 - `fleet_evict_idle`: the nodes of `fleet_evict` with no agents and
-  `CELLD_CELL_DIRECTORY_SHADOW=0`, waiting as long as a run with agents does.
+  `CELLD_CELL_DIRECTORY_SHADOW=0`, waiting as long as a run with agents does, and ending at that fixed window
+  rather than by the quiet rule, since an idle fleet's lease traffic never goes
+  quiet.
   Its rates are what a fleet costs with nothing to do. It runs first, and a
   scenario with agents and the same node count runs it before itself even when
   `CELLD_BENCH_FILTER` does not name it. A scenario with another node count
@@ -158,7 +160,8 @@ traffic it spreads that traffic over the run's agents, so it is no projection to
 10,000 agents. Project the per-agent and the per-node-hour parts separately.
 
 `cell_directory` in a scenario of the JSON breaks out what the directory sent,
-per agent and with nothing subtracted: `fleet/born/` (segments) and
+per agent and with nothing subtracted (`…_per_agent`; a scenario without agents
+reports `…_per_node_hour` instead, since it has no agents to divide by): `fleet/born/` (segments) and
 `fleet/dir/` (heads, runs, ledger, lease), class A and B. A batch delete is
 named for the first key in its body (`(batch) fleet/born/…`), so the compactor's
 deletions are counted with the keys they remove, and each billed batch once; a
