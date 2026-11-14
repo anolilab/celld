@@ -9,9 +9,12 @@ Workflows, Cron Triggers, and static assets, deployed from the
 server with its own SQLite database. celld stores the long-term state in
 your S3-compatible, Google Cloud Storage, or Azure Blob Storage bucket.
 It needs no serving control plane or consensus service.
-An inactive cell costs almost nothing. Learn more at
-[celld.dev](https://celld.dev) or read the
-[documentation](https://celld.dev/docs).
+An inactive cell costs almost nothing. Read the [documentation](docs/README.md).
+
+This repository is a standalone continuation of the open-source celld project
+that Deno Land Inc. started, under the same Apache-2.0 licence. It is
+maintained by Anolilab, and it develops on its own schedule. See
+[NOTICE](NOTICE) for the copyright and attribution notices.
 
 ## How it works
 
@@ -64,33 +67,27 @@ lists each gap in the services above.
 
 ## Install
 
-The installer downloads the `celld` binary (provenance is verifiable with
-`gh attestation verify`):
+This repository does not publish release binaries or container images yet. Build
+`celld` from source with the Rust toolchain pinned in
+[`rust-toolchain.toml`](rust-toolchain.toml):
 
 ```sh
-curl -fsSL https://celld.dev/install.sh | sh
+cargo build --release --locked -p celld
+install -m 755 target/release/celld ~/.local/bin/celld
 ```
 
-Put `~/.local/bin` on your `PATH` if the installer asks you to.
+Put `~/.local/bin` on your `PATH` if it is not there already.
 
 Worker projects deployed with `celld deploy` need
 [esbuild](https://esbuild.github.io) on `PATH`; asset-only projects do not.
 
-The installer keeps each release under `~/.local/lib/celld/releases` and points
-one symlink at the current one. To remove celld, delete the symlink and the
-releases:
-
-```sh
-rm `which celld` && rm -rf ~/.local/lib/celld
-```
-
 ## Container
 
-The release image contains the `celld` binary and is published for Linux
-x86-64 and ARM64:
+The [`Dockerfile`](Dockerfile) builds an image that contains the `celld` binary:
 
 ```sh
-docker run --rm ghcr.io/denoland/celld --version
+docker build -t celld .
+docker run --rm celld --version
 ```
 
 Persist the runtime's local state and pass the standard AWS credential
@@ -104,7 +101,7 @@ docker run --rm --network host \
   -e AWS_SESSION_TOKEN \
   -e CELLD_WATCH=/var/lib/celld/state \
   -v celld-state:/var/lib/celld \
-  ghcr.io/denoland/celld \
+  celld \
   --bucket s3://my-cells-bucket \
   --endpoint https://ACCOUNT.r2.cloudflarestorage.com \
   --region auto \
@@ -382,19 +379,13 @@ is not necessary.
 
 ## Contributions
 
-Pull requests are disabled. Coding agents make it too easy to send a large,
-low-context change that costs maintainers more time than it saves. Thoughtful
-contributions are welcome; please understand the code, keep the patch focused,
-and respect the review time you are asking for.
+Pull requests are welcome. Keep a change focused, say what defect or behaviour
+it addresses, and add a test that fails without it. CI runs formatting, clippy,
+the unit and end-to-end tests, and the builds on every pull request; see
+[testing](docs/testing.md) for how to run them locally.
 
-Send a `git format-patch` attachment to [ry@deno.com](mailto:ry@deno.com).
-
-Contributor License Agreement: By emailing a patch, you certify that you have
-the right to submit it and assign to Deno Land Inc. all rights in the patch
-that you can assign. Where a right cannot be assigned, you grant Deno Land
-Inc. a perpetual, irrevocable, worldwide, royalty-free, transferable,
-sublicensable license to use, modify, combine, relicense, redistribute, or
-publish the patch, in whole or in part, with or without attribution.
+Unless you state otherwise, a contribution that you submit is licensed under
+the Apache License 2.0, as section 5 of the licence provides.
 
 ## License
 

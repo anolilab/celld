@@ -112,7 +112,7 @@ lease renewal that races a takeover, an alarm against a partially restored
 cell. These windows are too narrow and too rare to wait for.
 
 The coordination protocol is therefore a
-[pure decision core](https://github.com/denoland/celld/tree/main/crates/logic)
+[pure decision core](https://github.com/anolilab/celld/tree/main/crates/logic)
 with no I/O. The clock, the randomness, and the object store are interfaces
 that a simulator drives. The simulated store injects latency, compare-and-swap
 races, and lost responses. The clocks drift, and a node can crash at each
@@ -271,4 +271,4 @@ capacity to measure this limit.
 
 Report a schedule that breaks a guarantee, an untested fault, or a measurement
 that you cannot reproduce in the
-[issue tracker](https://github.com/denoland/celld/issues).
+[issue tracker](https://github.com/anolilab/celld/issues).
