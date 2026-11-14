@@ -1056,10 +1056,7 @@ async fn a_marker_or_ledger_of_the_layout_before_it_reaches_neither_a_reader_nor
 
 #[test]
 fn the_lease_is_under_the_directorys_own_root() {
-    assert_eq!(
-        LEASE_KEY,
-        format!("{}/compactor-lease", crate::cell_directory_runs::ROOT)
-    );
+    assert_eq!(LEASE_KEY, format!("{ROOT}/compactor-lease"));
 }
 
 async fn marker(store: &Counting) -> Marker {
