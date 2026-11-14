@@ -214,3 +214,19 @@ pub fn directory_requests(load: &Tally, agents: usize, node_hours: f64) -> Value
     }
     fields.into()
 }
+
+/// A node's `/state`, or `None` when it cannot be read: the node does not
+/// answer, answers with an error status (a refused request carries a JSON body
+/// too), or sends no JSON.
+pub async fn read_state(client: &reqwest::Client, url: &str) -> Option<Value> {
+    client
+        .get(url)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()
+}

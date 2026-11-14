@@ -165,7 +165,7 @@ reports `…_per_node_hour` instead, since it has no agents to divide by): `flee
 `fleet/dir/` (heads, runs, ledger, lease), class A and B. A batch delete is
 named for the first key in its body (`(batch) fleet/born/…`), so the compactor's
 deletions are counted with the keys they remove, and each billed batch once; a
-batch that removes several kinds of key is named for its first. `setup_requests`
+batch that removes several kinds of key is named for its first. The proxy reads a batch-delete body up to 2 MiB (a store sends at most 1,000 keys); a larger body is refused with a 413 and not counted. `setup_requests`
 holds the directory's traffic from before the window, where the first
 compaction pass bootstraps the 4096 partition heads when the settle outlasts the
 compactor's first tick (one minute). `compaction_passes` counts the passes that
@@ -175,7 +175,9 @@ process's.
 
 `answers` is the directory's answers beside the claim listing, summed over the
 nodes, with `nodes_counted` and `nodes_unreadable` so that a node whose `/state`
-could not be read is visible. A run with an unreadable node is not a complete
+could not be read is visible: one that does not answer, answers with an error
+status (a node with `CELLD_OPERATOR_TOKEN` set refuses the read with a 401), or
+sends no JSON. A run with an unreadable node is not a complete
 count.
 
 | Directory answer | LTX not found | LTX found |

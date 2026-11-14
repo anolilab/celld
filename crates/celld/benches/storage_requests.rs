@@ -48,8 +48,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use scenarios::{
-    born, directory_requests, effective_env, idle_window, plan, runs, sum_answers, Scenario,
-    BASELINE, SCENARIOS,
+    born, directory_requests, effective_env, idle_window, plan, read_state, runs, sum_answers,
+    Scenario, BASELINE, SCENARIOS,
 };
 use serde_json::{json, Value};
 use support::{
@@ -304,15 +304,7 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
 async fn directory_answers(client: &reqwest::Client, nodes: &[Node]) -> Value {
     let mut states = Vec::new();
     for node in nodes {
-        let state = async {
-            client
-                .get(format!("{}/state", node.internal))
-                .send()
-                .await?
-                .json::<Value>()
-                .await
-        };
-        states.push(state.await.ok());
+        states.push(read_state(client, &format!("{}/state", node.internal)).await);
     }
     sum_answers(&states)
 }

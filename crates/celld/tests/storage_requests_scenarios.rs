@@ -14,11 +14,12 @@ mod support;
 use std::time::Duration;
 
 use scenarios::{
-    directory_requests, effective_env, idle_window, plan, sum_answers, Scenario, BASELINE,
-    SCENARIOS,
+    directory_requests, effective_env, idle_window, plan, read_state, sum_answers, Scenario,
+    BASELINE, SCENARIOS,
 };
 use serde_json::{json, Value};
 use support::{Part, Tally};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn names(filter: Option<&str>) -> Vec<&'static str> {
     plan(&SCENARIOS, filter).iter().map(|s| s.name).collect()
@@ -165,4 +166,44 @@ fn without_agents_the_directory_requests_are_per_node_hour_not_per_agent() {
         .unwrap()
         .keys()
         .all(|key| !key.ends_with("per_agent")));
+}
+
+/// A node that answers one request with `status` and `body`, and its address.
+async fn node_answering(status: &'static str, body: &'static str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).await.unwrap();
+        let reply = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(reply.as_bytes()).await.unwrap();
+    });
+    format!("http://{address}/state")
+}
+
+#[tokio::test]
+async fn a_state_that_answers_ok_is_read() {
+    let url = node_answering("200 OK", r#"{"cell_directory_answers":null}"#).await;
+    let state = read_state(&reqwest::Client::new(), &url).await;
+    assert_eq!(state, Some(json!({ "cell_directory_answers": null })));
+}
+
+#[tokio::test]
+async fn a_refused_state_read_is_unreadable_not_a_node_without_a_directory() {
+    let url = node_answering("401 Unauthorized", r#"{"error":"operator token required"}"#).await;
+    assert_eq!(read_state(&reqwest::Client::new(), &url).await, None);
+    let total = sum_answers(&[None, None]);
+    assert_eq!(total["nodes_unreadable"], 2);
+}
+
+#[tokio::test]
+async fn a_node_that_does_not_answer_is_unreadable() {
+    assert_eq!(
+        read_state(&reqwest::Client::new(), "http://127.0.0.1:1/state").await,
+        None
+    );
 }

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
@@ -35,6 +35,11 @@ pub const CLASS_B_PRICE: f64 = 0.0004 / 1000.0;
 /// The projection: this many agents alive at once, all month.
 pub const PROJECTED_CONCURRENT: f64 = 10_000.0;
 pub const MONTH_SECONDS: f64 = 730.0 * 3600.0;
+
+/// The largest batch-delete body the proxy reads. A batch holds at most 1,000
+/// keys, so this is far more than a store sends; a larger one is refused rather
+/// than held in memory by a proxy that may listen on a public address.
+pub const MAX_BATCH_BODY: usize = 2 * 1024 * 1024;
 
 /// Requests to this path prefix on the proxy are answered by the proxy itself.
 pub const CONTROL: &str = "/.proxy/";
@@ -470,7 +475,13 @@ impl Proxy {
                         }
                         let (response, shape) = if batch {
                             let (parts, body) = request.into_parts();
-                            let bytes = body.collect().await?.to_bytes();
+                            let bytes = match Limited::new(body, MAX_BATCH_BODY).collect().await {
+                                Ok(collected) => collected.to_bytes(),
+                                Err(error) if error.is::<LengthLimitError>() => {
+                                    return Ok(text_response(413, "{}".to_owned()));
+                                }
+                                Err(error) => return Err(error),
+                            };
                             let shape = batch_shape(&bytes, &root);
                             let request = Request::from_parts(parts, Full::new(bytes));
                             (forward(upstream, request).await?, shape)
