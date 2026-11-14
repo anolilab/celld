@@ -331,6 +331,48 @@ pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i6
     }
 }
 
+/// Run `work` while this node holds the advisory waker role, renewing it every
+/// third of its lifetime, which is three ticks. `None` means the role is
+/// another node's, or was lost mid-pass; the dropped `work` cancels its
+/// remaining I/O. `pass` names the work in the log of a lost renewal.
+pub(crate) async fn while_holding_waker<F: std::future::Future>(
+    bucket: &Bucket,
+    node: &str,
+    tick_ms: u64,
+    pass: &str,
+    work: F,
+) -> Option<F::Output> {
+    let ttl_ms = tick_ms.saturating_mul(3).min(i64::MAX as u64);
+    let hold = || async {
+        try_hold_waker(
+            bucket,
+            node,
+            crate::ownership_store::now_ms() as i64,
+            ttl_ms as i64,
+        )
+        .await
+    };
+    if !hold().await {
+        return None;
+    }
+    let mut renewal = crate::asyncrt::interval(Duration::from_millis((ttl_ms / 3).max(1)));
+    renewal.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
+    renewal.tick().await;
+    tokio::pin!(work);
+    loop {
+        crate::asyncrt::select_biased! {
+            "a due waker-lease renewal wins a tie with completion of the pass";
+            _ = renewal.tick() => {
+                if !hold().await {
+                    warn!("waker lease renewal failed; cancelling {pass}");
+                    return None;
+                }
+            },
+            output = &mut work => return Some(output),
+        }
+    }
+}
+
 /// Per-node publication and retirement caches. Durable inventory belongs to
 /// LIST; an error or cancellation leaves no reservation for a later task.
 #[derive(Default)]

@@ -223,16 +223,15 @@ impl Ownership {
         if record.is_some() {
             return Ok(record);
         }
-        // Asked, and answered, before the listing starts, so a registration
-        // that lands during the listing cannot make the directory look wrong.
-        // Only a cell without a record needs it, so it is not raced with the
-        // record read, which a cell that has one would pay for in vain.
-        let directory = bucket.directory_answer(cell).await;
-        if !bucket
-            .ltx_exists(cell)
-            .await
-            .map_err(ownership_read_failed)?
-        {
+        // Asked beside the listing, so a new cell's first claim waits for
+        // neither in turn. A registration is durable before its cell's first
+        // LTX, so a lookup that reads after the listing can only add `Exists`,
+        // never a false `New`. Only a cell without a record needs it, so it is
+        // not raced with the record read, which a cell that has one would pay
+        // for in vain.
+        let (directory, listed) =
+            futures_util::join!(bucket.directory_answer(cell), bucket.ltx_exists(cell));
+        if !listed.map_err(ownership_read_failed)? {
             return Ok(record);
         }
         // A claim writes the record before any LTX, and celld never deletes

@@ -12,7 +12,6 @@ use futures_util::stream::{self, StreamExt as _};
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
 use tracing::{info, warn};
 
 const MARKER_GC_CONCURRENCY: usize = 64;
@@ -97,41 +96,14 @@ impl DeadNodeGc {
         node: &str,
         tick_ms: u64,
     ) -> Option<BTreeSet<String>> {
-        let lease_ttl_ms = tick_ms.saturating_mul(3).min(i64::MAX as u64);
-        if !crate::wake::try_hold_waker(
+        crate::wake::while_holding_waker(
             bucket,
             node,
-            crate::ownership_store::now_ms() as i64,
-            lease_ttl_ms as i64,
+            tick_ms,
+            "dead-node GC",
+            self.run_pass(bucket, tick_ms),
         )
         .await
-        {
-            return None;
-        }
-
-        let renew_ms = (lease_ttl_ms / 3).max(1);
-        let mut renewal = crate::asyncrt::interval(Duration::from_millis(renew_ms));
-        renewal.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
-        renewal.tick().await;
-        let pass = self.run_pass(bucket, tick_ms);
-        tokio::pin!(pass);
-        loop {
-            crate::asyncrt::select_biased! {
-                "a due waker-lease renewal wins a tie with completion of the GC pass";
-                _ = renewal.tick() => {
-                    if !crate::wake::try_hold_waker(
-                        bucket,
-                        node,
-                        crate::ownership_store::now_ms() as i64,
-                        lease_ttl_ms as i64,
-                    ).await {
-                        warn!("waker lease renewal failed; cancelling dead-node GC");
-                        return None;
-                    }
-                },
-                live = &mut pass => return Some(live),
-            }
-        }
     }
 
     /// One GC pass. Returns the live node sessions the pass observed.
