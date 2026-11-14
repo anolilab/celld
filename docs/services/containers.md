@@ -274,7 +274,9 @@ out or its event ended before the engine's answer arrived. The node keeps the
 removal, by the container's id when it has one, and otherwise by a label that
 the create carried for that one `start()`, so no other container can match it.
 It tries again in the background, after 1 second and then after twice the
-previous wait up to 60 seconds, and gives up after 12 failed tries. The next
+previous wait up to 60 seconds, and goes on once a minute until the engine
+removes it, a few removals at a time. After 12 failed tries it logs
+`container_removal_stuck`. The next
 `start()` of the same object finishes it first, and a `start()` that still finds
 the name held by a container of the same object that nothing accounts for
 removes that container by its id. The node's reap at startup and shutdown

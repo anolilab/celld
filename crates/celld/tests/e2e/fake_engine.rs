@@ -117,7 +117,7 @@ struct State {
     max_deletes_in_flight: usize,
     /// Refuse the next removal of a container that exists, leaving it as it
     /// is.
-    delete_error: Option<String>,
+    delete_errors: std::collections::VecDeque<String>,
     resize_error: Option<String>,
     resizes: Vec<(String, u64, u64)>,
 }
@@ -272,7 +272,11 @@ esac
     /// Make the next removal of an existing container fail with `message`,
     /// as a daemon that is overloaded or cannot reach the runtime does.
     pub fn fail_next_delete(&self, message: &str) {
-        self.state.lock().unwrap().delete_error = Some(message.to_string());
+        self.state
+            .lock()
+            .unwrap()
+            .delete_errors
+            .push_back(message.to_string());
     }
 
     /// The names of the application containers that exist now.
@@ -723,7 +727,7 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request) -> Action {
         ("DELETE", ["containers", key]) => {
             let id = container_named(&guard, key).unwrap_or_default();
             if guard.containers.get(&id).is_some_and(|c| !c.fence) {
-                if let Some(error) = guard.delete_error.take() {
+                if let Some(error) = guard.delete_errors.pop_front() {
                     return Action::Reply(500, message(&error));
                 }
                 if std::mem::take(&mut guard.delete_conflict) {
