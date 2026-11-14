@@ -660,6 +660,8 @@ fn handle(state: &Arc<Mutex<State>>, request: &Request) -> Action {
                 Some(container) => Action::Reply(
                     200,
                     json!({
+                        "Id": container_named(&guard, key).unwrap_or_default(),
+                        "Config": { "Labels": container.labels },
                         "State": { "Running": container.running },
                         "NetworkSettings": {
                             "Networks": { "celld": { "IPAddress": "172.30.0.2" } },

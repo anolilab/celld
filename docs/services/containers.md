@@ -275,8 +275,10 @@ removal, by the container's id when it has one, and otherwise by a label that
 the create carried for that one `start()`, so no other container can match it.
 It tries again in the background, after 1 second and then after twice the
 previous wait up to 60 seconds, and gives up after 12 failed tries. The next
-`start()` of the same object finishes it first, and the node's reap at startup
-and shutdown removes every container of the node. A retry by label looks
+`start()` of the same object finishes it first, and a `start()` that still finds
+the name held by a container of the same object that nothing accounts for
+removes that container by its id. The node's reap at startup and shutdown
+removes every container of the node. A retry by label looks
 again until twice the limit of a create has passed, because the engine may not
 have handled the create yet; it never removes a container of a later
 `start()`.
