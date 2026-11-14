@@ -70,6 +70,30 @@ impl Drop for Waiter<'_> {
     }
 }
 
+/// The cells a flush has taken from the queue, returned to it unless the
+/// segment write committed. It takes the queue lock when it drops, so a flush
+/// never holds that lock across the write it guards.
+struct Taken<'a> {
+    registrar: &'a Registrar,
+    cells: Option<BTreeSet<String>>,
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        let Some(cells) = self.cells.take() else {
+            return;
+        };
+        let mut pending = self.registrar.pending.lock().unwrap();
+        let returned: Vec<String> = cells
+            .into_iter()
+            .filter(|cell| !pending.registered.contains(&registration_key(cell)))
+            .collect();
+        pending.waiting.extend(returned);
+        drop(pending);
+        self.registrar.queued.notify_one();
+    }
+}
+
 /// Registers cells in segments before their first LTX write.
 ///
 /// A cell is queued when it is first claimed and a background flusher writes
@@ -126,10 +150,11 @@ impl Registrar {
         self.queued.notify_one();
     }
 
-    /// Write the queue as one segment. The caller holds the turn. A failed
-    /// write returns every cell to the queue, so the next flush carries them in
-    /// one segment instead of one each while the store is failing; an entry for
-    /// a write that landed anyway only says "exists", the safe answer.
+    /// Write the queue as one segment. The caller holds the turn. A write that
+    /// fails, or a flush that is cancelled while it waits, returns every cell
+    /// to the queue, so the next flush carries them in one segment instead of
+    /// one each while the store is failing; an entry for a write that landed
+    /// anyway only says "exists", the safe answer.
     async fn flush(&self) -> object_store::Result<()> {
         let (batch, seq) = {
             let mut pending = self.pending.lock().unwrap();
@@ -143,28 +168,26 @@ impl Registrar {
             (std::mem::take(&mut pending.waiting), seq)
         };
         let key = segment_key(&self.prefix, &self.node, &self.generation, seq);
-        let written = self
-            .store
+        let payload = PutPayload::from_bytes(encode_segment(Kind::Born, &batch));
+        let mut taken = Taken {
+            registrar: self,
+            cells: Some(batch),
+        };
+        self.store
             .put_opts(
                 &Path::from(key.as_str()),
-                PutPayload::from_bytes(encode_segment(Kind::Born, &batch)),
+                payload,
                 PutOptions::from(PutMode::Create),
             )
-            .await;
-        let mut pending = self.pending.lock().unwrap();
-        if let Err(error) = written {
-            let returned: Vec<String> = batch
-                .into_iter()
-                .filter(|cell| !pending.registered.contains(&registration_key(cell)))
-                .collect();
-            pending.waiting.extend(returned);
-            return Err(error);
+            .await?;
+        let batch = taken.cells.take().expect("held until the write commits");
+        {
+            let mut pending = self.pending.lock().unwrap();
+            for cell in &batch {
+                pending.registered.insert(registration_key(cell));
+                pending.claimed.remove(cell);
+            }
         }
-        for cell in &batch {
-            pending.registered.insert(registration_key(cell));
-            pending.claimed.remove(cell);
-        }
-        drop(pending);
         self.directory
             .own_durable(&batch, crate::ownership_store::now_ms());
         self.flushed.notify_waiters();
@@ -859,6 +882,37 @@ mod tests {
             );
             let found = segments(&node.counting.inner).await;
             assert_eq!(found.len(), 1, "{found:?}");
+            node.finish().await;
+        });
+    }
+
+    #[test]
+    fn a_cancelled_first_write_leaves_the_other_queued_cells_for_the_next_flush() {
+        crate::asyncrt::install_test_host_runtime().block_on(async {
+            let node = gated(Duration::from_secs(30));
+            node.directory.register_at_claim("c1");
+            // A write for a cell nobody queued takes the turn and flushes both,
+            // and the segment write waits at the closed gate.
+            let path = Path::from("fleet-a/cells/c9/ltx/e1/0000/0001.ltx");
+            let mut write = Box::pin(node.store.put(&path, PutPayload::from_static(b"x")));
+            assert!(write.as_mut().now_or_never().is_none());
+            drop(write);
+
+            let registrar = node.store.registrar();
+            {
+                let pending = registrar.pending.lock().unwrap();
+                assert!(
+                    pending.waiting.contains("c1"),
+                    "the cancelled flush took a queued cell with it"
+                );
+                assert!(!pending.waiting.contains("c9"), "{:?}", pending.waiting);
+            }
+            node.gate.add_permits(1);
+            {
+                let _turn = registrar.flushing.lock().await;
+                registrar.flush().await.unwrap();
+            }
+            assert!(registrar.is_registered("c1"));
             node.finish().await;
         });
     }
