@@ -42,6 +42,9 @@ fn a_listing_without_the_confirmed_snapshot_decides_nothing() {
 
     assert!(superseded_snapshots(&listed, 12, 10_000, GRACE).is_empty());
     assert!(superseded_snapshots(&[], 12, 10_000, GRACE).is_empty());
+    // A newer file in the listing does not stand in for the confirmed one.
+    let gapped = [snapshot(5, 0), snapshot(12, 0)];
+    assert!(superseded_snapshots(&gapped, 9, 10_000, GRACE).is_empty());
 }
 
 #[test]

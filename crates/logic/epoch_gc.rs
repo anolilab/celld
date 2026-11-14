@@ -125,7 +125,7 @@ pub fn superseded_snapshots(
 ) -> Vec<u64> {
     let mut ordered = listed.to_vec();
     ordered.sort_by_key(|snapshot| snapshot.end);
-    if ordered.last().is_none_or(|newest| newest.end < confirmed) {
+    if !ordered.iter().any(|snapshot| snapshot.end == confirmed) {
         return Vec::new();
     }
     ordered
