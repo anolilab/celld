@@ -225,10 +225,12 @@ impl Ownership {
         }
         // Asked beside the listing, so a new cell's first claim waits for
         // neither in turn. A registration is durable before its cell's first
-        // LTX, so a lookup that reads after the listing can only add `Exists`,
-        // never a false `New`. Only a cell without a record needs it, so it is
-        // not raced with the record read, which a cell that has one would pay
-        // for in vain.
+        // LTX, but the directory sees another node's registration only once the
+        // compactor has folded it, so `New` can miss a cell registered less than
+        // the blind window ago (`BLIND_WINDOW_MS`). The listing decides, and
+        // the answer is only compared with it. Only a cell without a record
+        // needs it, so it is not raced with the record read, which a cell that
+        // has one would pay for in vain.
         let (directory, listed) =
             futures_util::join!(bucket.directory_answer(cell), bucket.ltx_exists(cell));
         if !listed.map_err(ownership_read_failed)? {
@@ -247,7 +249,9 @@ impl Ownership {
         // is lost beside its LTX is the gap that must stay empty before the
         // directory may replace the listing. Compared only here, because a
         // first claim racing on another node also finds LTX after a missing
-        // record, and the re-read above settles that case.
+        // record, and the re-read above settles that case. A cell that another
+        // node registered inside the blind window also reads `New`, so a
+        // mismatch is a gap only when the cell is older than that.
         if let Some(answer) = directory {
             if celld_logic::cell_directory::contradicts_listing(answer, true) {
                 tracing::warn!(

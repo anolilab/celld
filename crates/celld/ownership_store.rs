@@ -585,15 +585,20 @@ impl BucketOwnership {
     }
 
     /// What the fleet directory says about `cell`, or `None` on a node without
-    /// one. A lookup that the tail does not settle reads the cell's partition,
-    /// at most four requests. The claim guard compares the answer with the
-    /// listing and decides by the listing alone.
+    /// one. A lookup this node's own registrations do not settle reads the
+    /// freshness marker, which is cached, and the cell's partition, at most
+    /// four more requests. The claim guard compares the answer with the listing
+    /// and decides by the listing alone.
     pub(crate) async fn directory_answer(
         &self,
         cell: &str,
     ) -> Option<celld_logic::cell_directory::DirectoryAnswer> {
         let directory = self.cell_directory.as_ref()?;
-        Some(directory.lookup(cell, crate::asyncrt::mono_ms()).await)
+        Some(
+            directory
+                .lookup(cell, crate::cell_directory::Now::current())
+                .await,
+        )
     }
 
     /// Whether this node found the record of `cell` lost less than
@@ -957,7 +962,19 @@ impl BucketOwnership {
             CasGuard::Match(etag) => Some(etag.as_str()),
         };
         match self.bucket.put_cas(&key, body, etag).await? {
-            Some(_) => Ok(CasOutcome::Applied),
+            Some(_) => {
+                // A create-only write is the cell's first claim, at epoch one:
+                // the record exists, and LTX can follow. Queueing the
+                // registration now lets the cell's first LTX write find its
+                // segment already written. A claim whose answer was lost, or
+                // that reaches LTX another way, registers when it writes.
+                if matches!(guard, CasGuard::Absent) {
+                    if let Some(directory) = &self.cell_directory {
+                        directory.register_at_claim(cell);
+                    }
+                }
+                Ok(CasOutcome::Applied)
+            }
             None => Ok(CasOutcome::Rejected),
         }
     }
