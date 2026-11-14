@@ -3559,10 +3559,16 @@ mod sweep_tests {
                 while let Ok((mut stream, _)) = listener.accept().await {
                     let calls = calls.clone();
                     tokio::spawn(async move {
+                        // The method is the first four bytes, which a
+                        // fragmented request may not deliver in one read.
                         let mut buffer = [0u8; 4096];
-                        let Ok(read) = stream.read(&mut buffer).await else {
-                            return;
-                        };
+                        let mut read = 0;
+                        while read < 4 {
+                            match stream.read(&mut buffer[read..]).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(count) => read += count,
+                            }
+                        }
                         // An inspect is an activation's own; any other call
                         // is the engine being told to act on a container.
                         if !buffer[..read].starts_with(b"GET ") {
