@@ -36,6 +36,69 @@ impl Shell {
         }
     }
 
+    /// A shell whose node holds a live lease, and so has begun confirming
+    /// the cells on its disk: the `ReadLocalCells` effect waits in the inbox.
+    pub(crate) fn leased(config: Config) -> Self {
+        let mut shell = Self {
+            state: State::new("node", config),
+            inbox: Vec::new(),
+            owners: BTreeMap::new(),
+            next_request: 1,
+            now: 1_000_000,
+        };
+        let now = shell.now;
+        shell.send(Event::StartNodeLease {
+            now_ms: now,
+            now_mono_ms: now,
+            spec: NodeLeaseSpec {
+                addr: "node:8081".into(),
+                peer_protocol: 1,
+                generation: "g".into(),
+                resume_generation: None,
+                ttl_ms: 30_000,
+            },
+        });
+        let op = shell.expect("a self lease read", |effect| match effect {
+            Effect::ReadSelfNodeLease { op } => Some(*op),
+            _ => None,
+        });
+        shell.send(Event::SelfNodeLeaseRead {
+            op,
+            now_ms: now,
+            now_mono_ms: now,
+            result: Ok(None),
+        });
+        let op = shell.expect("a lease write", |effect| match effect {
+            Effect::CasNodeLease { op, .. } => Some(*op),
+            _ => None,
+        });
+        shell.send(Event::NodeLeaseCasCompleted {
+            op,
+            now_mono_ms: now,
+            result: Ok(LeaseCasOutcome::Applied { etag: "e".into() }),
+            stamped_log_state: None,
+        });
+        assert!(shell.state.node_authoritative());
+        shell
+    }
+
+    /// Report the cells found on disk after the lease, as live local epochs.
+    pub(crate) fn local_cells(&mut self, cells: &[(&str, Epoch)]) {
+        self.expect("a local inventory read", |effect| {
+            matches!(effect, Effect::ReadLocalCells).then_some(())
+        });
+        self.send(Event::LocalCellsRead {
+            result: Ok(cells
+                .iter()
+                .map(|(id, epoch)| LocalCell {
+                    id: (*id).into(),
+                    epoch: *epoch,
+                    live: true,
+                })
+                .collect()),
+        });
+    }
+
     pub(crate) fn send(&mut self, event: Event) -> Vec<Effect> {
         let effects = on_event(&mut self.state, event);
         self.inbox.extend(effects.iter().cloned());

@@ -6628,6 +6628,10 @@ impl State {
         self.capacity_waiters.clear();
         self.quiescing_cells.clear();
         self.adopting_cells.clear();
+        // A fenced node reads no more owner records, so a confirmation still
+        // under way can never finish. Settle it here with the cells' phases.
+        self.confirming = false;
+        self.confirming_cells.clear();
         self.active_requests.clear();
         self.active_cells.clear();
         self.admitted_gates.clear();
@@ -6704,6 +6708,7 @@ impl State {
             set_phase(&mut self.occupied, &mut cell, Phase::Fenced);
             cell.waiting_for = None;
             cell.waiting_activation = None;
+            cell.confirming = false;
             cell.alarm = None;
             cell.alarm_wake = false;
             cell.websockets.clear();
@@ -7165,6 +7170,8 @@ fn runtime_epoch(phase: &Phase) -> Option<Epoch> {
 mod alarm_tests;
 #[cfg(test)]
 mod dead_owner_tests;
+#[cfg(test)]
+mod fence_confirming_tests;
 #[cfg(test)]
 mod scripted;
 #[cfg(test)]
