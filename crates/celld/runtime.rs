@@ -1369,10 +1369,11 @@ impl RuntimeManager {
             // Only an idle eviction keeps the cell on this node, so only it
             // keeps the container: the next activation here reconnects.
             let release = match &mode {
-                StopMode::Evict {
-                    preserve_local: true,
-                    ..
-                } => crate::container::Release::Keep,
+                StopMode::Evict { retained, .. }
+                    if *retained != crate::ltx_repl::Retained::Nothing =>
+                {
+                    crate::container::Release::Keep
+                }
                 _ => crate::container::Release::Destroy,
             };
             engine.release(cell, release).await;
@@ -1446,11 +1447,7 @@ impl RuntimeManager {
                 // runtime itself has already stopped. An abandoned one is not:
                 // it returns `EvictionAbandoned`, and the caller ends the stop
                 // instead of trying again.
-                StopMode::Evict {
-                    preserve_local,
-                    resumable,
-                    abandon,
-                } => replication
+                StopMode::Evict { retained, abandon } => replication
                     .evict(
                         cell,
                         epoch,
@@ -1459,10 +1456,12 @@ impl RuntimeManager {
                         // facet that opened at the epoch the root resumes at
                         // could be restored into neither. The root's wake
                         // claims the next epoch instead.
-                        crate::ltx_repl::Retained::of_stop(
-                            *preserve_local,
-                            *resumable && facet_streams.is_empty(),
-                        ),
+                        match retained {
+                            crate::ltx_repl::Retained::Resumable if !facet_streams.is_empty() => {
+                                crate::ltx_repl::Retained::Base
+                            }
+                            retained => *retained,
+                        },
                         abandon.as_deref(),
                     )
                     .await

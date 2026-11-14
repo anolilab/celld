@@ -3892,8 +3892,11 @@ impl Actor {
                     });
                     let stop_mode = match cause {
                         StopCause::Evict { rebalance } => crate::runtime::StopMode::Evict {
-                            preserve_local: !rebalance,
-                            resumable: self.resume_dormant_local && !rebalance,
+                            retained: match (rebalance, self.resume_dormant_local) {
+                                (true, _) => crate::ltx_repl::Retained::Nothing,
+                                (false, false) => crate::ltx_repl::Retained::Base,
+                                (false, true) => crate::ltx_repl::Retained::Resumable,
+                            },
                             abandon,
                         },
                         StopCause::Cleanup => crate::runtime::StopMode::Rebase,

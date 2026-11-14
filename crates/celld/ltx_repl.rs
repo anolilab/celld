@@ -868,16 +868,6 @@ pub enum Retained {
     Resumable,
 }
 
-impl Retained {
-    pub fn of_stop(preserve_local: bool, resumable: bool) -> Self {
-        match (preserve_local, resumable) {
-            (false, _) => Self::Nothing,
-            (true, false) => Self::Base,
-            (true, true) => Self::Resumable,
-        }
-    }
-}
-
 struct HandoffSnapshot {
     max_txid: TXID,
     data: Vec<u8>,
