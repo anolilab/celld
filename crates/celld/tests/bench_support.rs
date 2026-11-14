@@ -17,10 +17,10 @@ use hyper::Method;
 use regex::Regex;
 use serde_json::{json, Value};
 use support::{
-    control_response, diff, idle_wait, memory_pids, memory_slope, parse_base_urls, parse_phases,
-    reject_classifier_variables, require_idle_past_eviction, require_resident, require_warmup,
-    rss_of_tree, run_id, window_position, Classifier, EndRule, MemoryPids, Part, Scope, Tally,
-    TallySource, WindowPosition,
+    batch_shape, control_response, diff, idle_wait, memory_pids, memory_slope, parse_base_urls,
+    parse_phases, reject_classifier_variables, require_idle_past_eviction, require_resident,
+    require_warmup, rss_of_tree, run_id, window_position, Classifier, EndRule, MemoryPids, Part,
+    Proxy, Report, Scope, Tally, TallySource, WindowPosition, MAX_BATCH_BODY,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -463,4 +463,174 @@ fn every_classifier_variable_is_refused() {
 #[test]
 fn no_classifier_variable_is_fine() {
     assert_eq!(reject_classifier_variables(|_| None), Ok(()));
+}
+
+#[test]
+fn a_batch_delete_is_named_for_the_first_key_it_removes() {
+    let body = b"<Delete><Object><Key>run-1/scn/fleet/born/node-0/0123456789abcdef0/00000003</Key>\
+        </Object><Object><Key>run-1/scn/cells/c/own.json</Key></Object></Delete>";
+    assert_eq!(
+        batch_shape(body, "bench/run-1/scn"),
+        "(batch) fleet/born/node-#/*/#"
+    );
+}
+
+#[test]
+fn a_batch_delete_without_a_readable_key_keeps_its_plain_name() {
+    assert_eq!(batch_shape(b"", "bench/run-1/scn"), "(batch)");
+    assert_eq!(
+        batch_shape(b"<Delete></Delete>", "bench/run-1/scn"),
+        "(batch)"
+    );
+}
+
+#[test]
+fn a_batch_delete_key_is_read_with_its_xml_escapes_undone() {
+    let body = b"<Delete><Object><Key>run-1/scn/a&amp;b/00000001</Key></Object></Delete>";
+    assert_eq!(batch_shape(body, "bench/run-1/scn"), "(batch) a&b/#");
+}
+
+/// An upstream that answers one request with an empty 200 and returns the
+/// bytes it received.
+async fn upstream_that_records() -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let received = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 65536];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            bytes.extend_from_slice(&chunk[..read]);
+            let text = String::from_utf8_lossy(&bytes).to_lowercase();
+            let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                continue;
+            };
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .map_or(0, |n| n.trim().parse::<usize>().unwrap());
+            if body.len() >= length {
+                break;
+            }
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        bytes
+    });
+    (address, received)
+}
+
+#[tokio::test]
+async fn the_proxy_tallies_a_batch_delete_by_its_keys_and_relays_the_body_whole() {
+    let (upstream, received) = upstream_that_records().await;
+    let proxy = Proxy::start(
+        "127.0.0.1:0",
+        upstream,
+        "bench/run-1/scn".to_owned(),
+        Classifier::default_layout(),
+    )
+    .await;
+    let body = "<Delete><Object><Key>run-1/scn/fleet/born/node-0/0123456789abcdef0/00000003\
+                </Key></Object></Delete>";
+    let response = reqwest::Client::new()
+        .post(format!("{}/bench?delete", proxy.url))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let relayed = String::from_utf8(received.await.unwrap()).unwrap();
+    assert!(
+        relayed.ends_with(body),
+        "the store did not get the body: {relayed}"
+    );
+    let tally = proxy.take();
+    let counted: Vec<_> = tally.iter().collect();
+    assert_eq!(
+        counted,
+        [(
+            &(
+                "BATCH_DELETE".to_owned(),
+                "(batch) fleet/born/node-#/*/#".to_owned(),
+                Part::Shared
+            ),
+            &1
+        )]
+    );
+}
+
+#[test]
+fn a_window_with_no_agents_reports_zero_per_agent_not_a_number() {
+    let mut load = Tally::new();
+    load.insert(
+        ("PUT".to_owned(), "nodes/node-#".to_owned(), Part::Shared),
+        40,
+    );
+    let report = Report {
+        nodes: 2,
+        agents: 0,
+        load,
+        elapsed: Duration::from_secs(60),
+        idle: None,
+    };
+    assert_eq!(report.per_agent(support::Class::A), 0.0);
+    assert!(report.monthly(Duration::from_secs(60)).is_finite());
+    assert!(!report.table(0).contains("NaN"));
+    let json = report.json(Duration::from_secs(60));
+    assert_eq!(json["class_a_per_1000"], 0.0);
+    assert!(json["monthly_usd"].is_number());
+}
+
+/// A batch-delete body of exactly `length` bytes.
+fn batch_body(length: usize) -> String {
+    let head = "<Delete><Object><Key>run-1/scn/fleet/born/node-0/0123456789abcdef0/00000003</Key></Object>";
+    let tail = "</Delete>";
+    format!(
+        "{head}{}{tail}",
+        " ".repeat(length - head.len() - tail.len())
+    )
+}
+
+async fn batch_delete(proxy: &Proxy, body: String) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}/bench?delete", proxy.url))
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_proxy_relays_a_batch_delete_body_of_the_largest_size() {
+    let (upstream, received) = upstream_that_records().await;
+    let proxy = Proxy::start(
+        "127.0.0.1:0",
+        upstream,
+        "bench/run-1/scn".to_owned(),
+        Classifier::default_layout(),
+    )
+    .await;
+    let response = batch_delete(&proxy, batch_body(MAX_BATCH_BODY)).await;
+    assert!(response.status().is_success());
+    let relayed = received.await.unwrap();
+    assert!(relayed.len() > MAX_BATCH_BODY);
+    assert_eq!(proxy.take().values().sum::<u64>(), 1);
+}
+
+#[tokio::test]
+async fn the_proxy_refuses_a_batch_delete_body_over_the_limit_and_counts_nothing() {
+    // No upstream listens here: a refused request must not reach one.
+    let proxy = Proxy::start(
+        "127.0.0.1:0",
+        "127.0.0.1:1".to_owned(),
+        "bench/run-1/scn".to_owned(),
+        Classifier::default_layout(),
+    )
+    .await;
+    let response = batch_delete(&proxy, batch_body(MAX_BATCH_BODY + 1)).await;
+    assert_eq!(response.status(), 413);
+    assert!(proxy.take().is_empty());
 }

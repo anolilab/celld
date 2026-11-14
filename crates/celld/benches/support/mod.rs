@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
@@ -35,6 +35,11 @@ pub const CLASS_B_PRICE: f64 = 0.0004 / 1000.0;
 /// The projection: this many agents alive at once, all month.
 pub const PROJECTED_CONCURRENT: f64 = 10_000.0;
 pub const MONTH_SECONDS: f64 = 730.0 * 3600.0;
+
+/// The largest batch-delete body the proxy reads. A batch holds at most 1,000
+/// keys, so this is far more than a store sends; a larger one is refused rather
+/// than held in memory by a proxy that may listen on a public address.
+pub const MAX_BATCH_BODY: usize = 2 * 1024 * 1024;
 
 /// Requests to this path prefix on the proxy are answered by the proxy itself.
 pub const CONTROL: &str = "/.proxy/";
@@ -446,12 +451,14 @@ impl Proxy {
                 );
                 let classifier_info = classifier_info.clone();
                 let service = service_fn(move |request: Request<Incoming>| {
-                    let (tally, upstream) = (tally.clone(), upstream.clone());
+                    let (tally, upstream, root) = (tally.clone(), upstream.clone(), root.clone());
                     let classifier_info = classifier_info.clone();
-                    // The keys of a batch delete are in its body.
                     let kind = kind(&request);
+                    let batch = kind == "BATCH_DELETE";
                     let key = relative(&key_of(&request), &root);
-                    let (part, shape) = if kind == "BATCH_DELETE" {
+                    // The keys of a batch delete are in its body, which is read
+                    // once the request is being served.
+                    let (part, shape) = if batch {
                         (Part::Shared, "(batch)".to_owned())
                     } else {
                         (classifier.part(&key), shape(&key))
@@ -466,7 +473,21 @@ impl Proxy {
                                 peer.ip(),
                             ));
                         }
-                        let response = forward(upstream, request).await?;
+                        let (response, shape) = if batch {
+                            let (parts, body) = request.into_parts();
+                            let bytes = match Limited::new(body, MAX_BATCH_BODY).collect().await {
+                                Ok(collected) => collected.to_bytes(),
+                                Err(error) if error.is::<LengthLimitError>() => {
+                                    return Ok(text_response(413, "{}".to_owned()));
+                                }
+                                Err(error) => return Err(error),
+                            };
+                            let shape = batch_shape(&bytes, &root);
+                            let request = Request::from_parts(parts, Full::new(bytes));
+                            (forward(upstream, request).await?, shape)
+                        } else {
+                            (forward(upstream, request).await?, shape)
+                        };
                         // Counted only once the store answered: a request
                         // that never reached it is not billed.
                         *tally
@@ -538,10 +559,11 @@ pub fn control_response(
     }
 }
 
-async fn forward(
-    upstream: String,
-    request: Request<Incoming>,
-) -> Result<Response<ProxyBody>, BoxError> {
+async fn forward<B>(upstream: String, request: Request<B>) -> Result<Response<ProxyBody>, BoxError>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<BoxError>,
+{
     let stream = TcpStream::connect(upstream).await?;
     let (mut sender, connection) =
         hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
@@ -566,6 +588,30 @@ fn kind(request: &Request<Incoming>) -> &'static str {
         Method::DELETE => "DELETE",
         _ => "OTHER",
     }
+}
+
+/// The name a batch delete is tallied under: `(batch)` and the shape of the
+/// first key in its body, so a batch that removes one kind of object can be
+/// told from another. A batch of several kinds is named for its first key.
+/// `root` is the path of the run in a path-style request, bucket first; the
+/// keys in the body start below the bucket.
+pub fn batch_shape(body: &[u8], root: &str) -> String {
+    let text = String::from_utf8_lossy(body);
+    let Some(key) = text
+        .split_once("<Key>")
+        .and_then(|(_, rest)| rest.split_once("</Key>"))
+        .map(|(key, _)| key)
+    else {
+        return "(batch)".to_owned();
+    };
+    let key = key
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&");
+    let below_bucket = root.split_once('/').map_or("", |(_, rest)| rest);
+    format!("(batch) {}", shape(&relative(&key, below_bucket)))
 }
 
 /// The object a request names: its path, or for a LIST the bucket and the
@@ -664,8 +710,14 @@ impl Report {
             .sum()
     }
 
+    /// The divisor of every per-agent figure: a window with no agents, such as
+    /// an idle fleet, has none, and reports zero rather than a not-a-number.
+    pub fn agent_count(&self) -> f64 {
+        self.agents.max(1) as f64
+    }
+
     pub fn per_agent(&self, class: Class) -> f64 {
-        self.count(class, true) as f64 / self.agents as f64
+        self.count(class, true) as f64 / self.agent_count()
     }
 
     pub fn node_hours(&self) -> f64 {
@@ -697,7 +749,7 @@ impl Report {
     pub fn net_per_agent(&self, class: Class) -> Option<f64> {
         let rate = self.idle_rate(class)?;
         let net = self.total(class) as f64 - rate * self.elapsed.as_secs_f64();
-        Some(net.max(0.0) / self.agents as f64)
+        Some(net.max(0.0) / self.agent_count())
     }
 
     /// Dollars per month of the per-agent requests for `PROJECTED_CONCURRENT`
@@ -733,7 +785,7 @@ impl Report {
         );
         for ((kind, shape, _), count) in self.load.iter().filter(|((_, _, p), _)| *p == Part::Agent)
         {
-            let per_1000 = *count as f64 * 1000.0 / self.agents as f64;
+            let per_1000 = *count as f64 * 1000.0 / self.agent_count();
             text += &format!("    {kind:<6} {per_1000:>8.0}  {shape}\n");
         }
         text += &format!(
