@@ -13,8 +13,8 @@ use serde_json::Value;
 use super::harness::{wait_until, Server};
 
 /// The directory on, and a tick short enough that the compactor's first pass
-/// follows a start by a second. Its next pass is ten minutes away, so a pass
-/// that folds a registration is the first pass of the next start.
+/// follows a start by a second. Its next pass is a minute away, so a pass that
+/// folds a registration is the first pass of the next start.
 const DIRECTORY: &[(&str, &str)] = &[
     ("CELLD_CELL_DIRECTORY_SHADOW", "1"),
     ("CELLD_WAKER_TICK_MS", "1000"),
@@ -110,7 +110,7 @@ fn folded(project: &Path) -> bool {
     let store = store(project);
     let ledger: Option<Vec<u8>> = store
         .query_row(
-            "SELECT body FROM objects WHERE key LIKE '%fleet/dir/ledger'",
+            "SELECT body FROM objects WHERE key LIKE '%fleet/dir/k256/ledger'",
             [],
             |row| row.get(0),
         )
