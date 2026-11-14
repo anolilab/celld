@@ -280,6 +280,27 @@ secret. A holder of the bucket credentials controls the fleet. Give each
 credential access to one fleet bucket only, and rotate it after a suspected
 disclosure.
 
+## Runtime cells
+
+A D1 database, a KV namespace and a Queue are cells of classes that celld
+supplies, and they hold the data of every script that binds them. They run in
+isolates of their own, loaded with the engine's code and none of a
+deployment's: no bundle, binding, variable or module. A script's globals,
+prototypes and hooks therefore never run in the heap that handles another
+script's rows, keys or messages. Workflow and cron cells stay with their script,
+because they run its code.
+
+### Upgrading: runtime cells
+
+The next release (placeholder: the version that ships this note) starts these
+isolates the first time a node activates a D1, KV or Queue cell, so a node that
+uses them holds at least one more isolate than before, and its resident-memory
+use rises by that isolate's heap. A node that uses none of them starts none.
+A cell that is resident when a node upgrades moves to the new isolates as it
+does for any generation swap. The data, the cell scopes and the operator
+commands do not change, and nothing crosses nodes, so a rolling upgrade has no
+mixed-version window for this change.
+
 ## Cell ownership
 
 Each cell is a SQLite database with one writer. An ownership epoch fences each
