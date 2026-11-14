@@ -46,6 +46,7 @@ use celld_logic::cell_directory::{
 use object_store::ObjectStore;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
 /// How far behind the directory is allowed to be and still rule a cell out:
 /// three compaction intervals. A healthy marker is at most one interval and a
@@ -87,17 +88,26 @@ impl Now {
     }
 }
 
-/// Refuse a batch window of half the durability budget or more. A first write
-/// for a cell queued at its claim waits for the flush, up to one and a half
-/// windows, and then writes its own segment, so a window of half the budget or
-/// more can leave no time for the upload itself and nothing would be tiered.
+/// The longest a first write waits for the background flush of a cell queued at
+/// its claim before it flushes itself: one and a half windows, the window the
+/// flusher lets cells gather and the time its write then takes.
+pub(crate) fn first_write_wait(batch_window: Duration) -> Duration {
+    batch_window.saturating_mul(3) / 2
+}
+
+/// Refuse a batch window whose longest first-write wait would use three
+/// quarters of the durability budget or more, which is a window of half the
+/// budget or more. The write must still make its own segment upload inside the
+/// budget, and one that misses it is never tiered.
 pub(crate) fn check_batch_window(batch_ms: u64, durability_timeout_ms: u64) -> anyhow::Result<()> {
+    let wait = first_write_wait(Duration::from_millis(batch_ms));
     anyhow::ensure!(
-        batch_ms < durability_timeout_ms / 2,
+        wait < Duration::from_millis(durability_timeout_ms) / 4 * 3,
         "CELLD_CELL_DIRECTORY_BATCH_MS={batch_ms} must be below half of \
          CELLD_LTX_DURABILITY_TIMEOUT_SECS ({durability_timeout_ms} ms): a cell's first LTX \
-         write waits for its registration, and one that waits that long misses its durability \
-         deadline, so nothing would reach the bucket"
+         write waits up to 1.5 times the window for its registration, {} ms here, and then \
+         needs the rest of the deadline for its own upload, so nothing would reach the bucket",
+        wait.as_millis()
     );
     Ok(())
 }
@@ -383,6 +393,22 @@ mod tests {
     use object_store::path::Path;
     use object_store::ObjectStoreExt as _;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn the_longest_first_write_wait_leaves_a_quarter_of_the_budget_for_the_upload() {
+        for budget_ms in [2_000_u64, 10_000, 21_000, 60_000] {
+            let longest = (0..budget_ms)
+                .rev()
+                .find(|batch_ms| check_batch_window(*batch_ms, budget_ms).is_ok())
+                .expect("a window is accepted");
+            let wait = first_write_wait(Duration::from_millis(longest));
+            assert!(
+                wait <= Duration::from_millis(budget_ms) / 4 * 3,
+                "{budget_ms}: a window of {longest} ms waits {wait:?}"
+            );
+            assert!(check_batch_window(longest + 1, budget_ms).is_err());
+        }
+    }
 
     #[test]
     fn a_batch_window_at_or_above_half_the_durability_budget_is_refused() {

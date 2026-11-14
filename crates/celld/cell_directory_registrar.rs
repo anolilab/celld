@@ -197,7 +197,7 @@ impl Registrar {
     /// Wait for the flusher to make `cell` durable, for as long as it should
     /// take. A flusher that is stopped or failing leaves the cell to the caller.
     async fn await_background_flush(&self, cell: &str) {
-        let bound = self.batch_window.saturating_mul(3) / 2;
+        let bound = crate::cell_directory::first_write_wait(self.batch_window);
         let durable = async {
             loop {
                 let flushed = self.flushed.notified();
