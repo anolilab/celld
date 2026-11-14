@@ -297,13 +297,27 @@ impl Registrar {
             (std::mem::take(&mut pending.waiting), seq)
         };
         let key = segment_key(&self.prefix, &self.node, &self.generation, seq);
-        self.store
+        let written = self
+            .store
             .put_opts(
                 &Path::from(key.as_str()),
                 PutPayload::from_bytes(encode_segment(&batch)),
                 PutOptions::from(PutMode::Create),
             )
-            .await?;
+            .await;
+        if let Err(error) = written {
+            // The other cells of the batch go back to the queue, so the next
+            // flusher writes them in one segment instead of one each while
+            // the store is failing. An extra entry for a write that was
+            // cancelled meanwhile only says "exists", the safe answer.
+            let mut pending = self.pending.lock().unwrap();
+            let returned: Vec<String> = batch
+                .into_iter()
+                .filter(|other| other != cell && !pending.registered.contains(other))
+                .collect();
+            pending.waiting.extend(returned);
+            return Err(error);
+        }
         self.pending
             .lock()
             .unwrap()
@@ -682,6 +696,39 @@ mod tests {
             .unwrap();
         inner.head(&ltx).await.unwrap();
         assert_eq!(directory.answer("c1", 0), DirectoryAnswer::Exists);
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_hands_its_other_cells_to_one_segment() {
+        let inner = Arc::new(InMemory::new());
+        let store = Arc::new(store_over(&inner, &Arc::new(CellDirectory::new())));
+        // The first segment's key is taken, so the first flush fails.
+        inner
+            .put(
+                &Path::from("fleet-a/fleet/born/node-a/gen1/00000000"),
+                PutPayload::from_static(b""),
+            )
+            .await
+            .unwrap();
+        let in_flight = store.registrar.flushing.lock().await;
+        let mut writes = Box::pin(futures_util::future::join_all((0..4).map(|index| {
+            let store = store.clone();
+            async move {
+                store
+                    .put(
+                        &Path::from(format!("fleet-a/cells/c{index}/ltx/e1/0000/0001.ltx")),
+                        PutPayload::from_static(b"x"),
+                    )
+                    .await
+            }
+        })));
+        assert!(writes.as_mut().now_or_never().is_none());
+        drop(in_flight);
+        let failed = writes.await.iter().filter(|result| result.is_err()).count();
+        assert_eq!(failed, 1, "only the flusher whose segment failed fails");
+        let found = segments(&inner).await;
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[1].1.len(), 3, "{found:?}");
     }
 
     #[tokio::test]
