@@ -277,7 +277,7 @@ async fn a_signal_outlives_the_event_that_sent_it() {
                 .requests()
                 .iter()
                 .any(|request| {
-                    request.starts_with("POST /containers/celld-") && request.ends_with("/kill")
+                    request.starts_with("POST /containers/id-celld-") && request.ends_with("/kill")
                 })
                 .then_some(())
         },

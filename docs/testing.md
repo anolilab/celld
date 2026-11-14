@@ -28,7 +28,10 @@ every pull request:
 - **Container tests** (`crates/celld/tests/e2e/`): fixture Workers with a
   `containers` class run against a fake container engine
   (`tests/e2e/fake_engine.rs`), which speaks the part of the Docker Engine API
-  that celld uses over a unix socket and runs `exec()` processes in memory.
+  that celld uses over a unix socket and runs `exec()` processes in memory. It
+  models container ids and the reuse of a name, as a daemon does: a request
+  for the id of a removed container finds nothing even when a newer container
+  holds its name, so a test can tell a call that reached the wrong run.
   They need no daemon, no image and no privileged fence container, and they
   cover the `ctx.container` surface and the engine calls behind it, not the
   kernel boundary.

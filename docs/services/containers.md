@@ -51,6 +51,14 @@ celld implements this part of `ctx.container`:
   If the engine never answers a create, the node cannot know whether a
   container will appear later: such a container is removed by the next
   `start()` of the object, or when the node restarts or shuts down.
+  The name of the container belongs to the object and every `start()` reuses
+  it, so a call never addresses the container by it. The node keeps the id
+  that the engine gave each run's container, and `exec()`, `signal()` and
+  `destroy()` act on the container of the run that was current when the object
+  called them. A `destroy()` that reaches the engine after a newer `start()`
+  does not remove the new container, and an `exec()` for a run that ended
+  rejects with an error that says so, and does not run in the newer run's
+  container.
 - `setInactivityTimeout()` sets the idle window.
 
 On Linux, `getTcpPort(port)` reaches every port through the bridge address of
