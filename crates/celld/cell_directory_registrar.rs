@@ -766,12 +766,12 @@ mod tests {
             let node = gated(Duration::from_secs(30));
             // Queued at its claim, and the flusher is asleep for the window.
             node.directory.register_at_claim("c1");
-            // Never claimed here: a restore, a takeover, a recovery upload.
             node.gate.add_permits(2);
             assert!(
                 node.ltx_within("c1", Duration::from_secs(5)).await,
                 "a queued cell's write waited for the window"
             );
+            // Never claimed here, as after a restore, a takeover or a recovery upload.
             assert!(
                 node.ltx_within("c2", Duration::from_secs(5)).await,
                 "a cell nobody queued waited for the window"
