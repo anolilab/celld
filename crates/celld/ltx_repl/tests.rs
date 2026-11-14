@@ -17,6 +17,7 @@ use celld_ltx::object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
 };
 use futures_util::stream::BoxStream;
+use futures_util::StreamExt as _;
 use std::ops::Range;
 
 const CELL: &str = "cell";
@@ -34,6 +35,10 @@ struct Forgetful {
     dropping: AtomicBool,
     /// Whole-prefix listings, the walk that a bounded listing avoids.
     lists: std::sync::atomic::AtomicUsize,
+    /// Listings that start after a key, which a bounded check uses.
+    windows: std::sync::atomic::AtomicUsize,
+    /// How many of the next such listings fail.
+    failing_windows: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Display for Forgetful {
@@ -104,6 +109,22 @@ impl ObjectStore for Forgetful {
         prefix: Option<&ObjPath>,
         offset: &ObjPath,
     ) -> BoxStream<'static, celld_ltx::object_store::Result<ObjectMeta>> {
+        self.windows.fetch_add(1, Ordering::SeqCst);
+        let failing = self
+            .failing_windows
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        if failing {
+            return futures_util::stream::once(async {
+                Err(celld_ltx::object_store::Error::Generic {
+                    store: "forgetful",
+                    source: "the listing failed".into(),
+                })
+            })
+            .boxed();
+        }
         self.inner.list_with_offset(prefix, offset)
     }
 
@@ -298,15 +319,15 @@ fn covers_txid_tells_one_snapshot_from_the_next() {
         let client = rig.ltx.client_for(CELL, 1);
 
         assert!(client.has_any_object().await.unwrap());
-        assert!(client.covers_txid(TXID(5)).await.unwrap());
-        assert!(client.covers_txid(TXID(1)).await.unwrap());
-        assert!(!client.covers_txid(TXID(6)).await.unwrap());
+        assert!(client.covers_txid(TXID(5), None).await.unwrap());
+        assert!(client.covers_txid(TXID(1), None).await.unwrap());
+        assert!(!client.covers_txid(TXID(6), None).await.unwrap());
 
         put_empty(&rig, 1, 0, 6, 6).await;
-        assert!(client.covers_txid(TXID(6)).await.unwrap());
-        assert!(!client.covers_txid(TXID(7)).await.unwrap());
-        assert!(rig.ltx.epoch_covers(CELL, 1, 6).await);
-        assert!(!rig.ltx.epoch_covers(CELL, 1, 7).await);
+        assert!(client.covers_txid(TXID(6), None).await.unwrap());
+        assert!(!client.covers_txid(TXID(7), None).await.unwrap());
+        assert!(rig.ltx.epoch_covers(CELL, 1, 6, None).await);
+        assert!(!rig.ltx.epoch_covers(CELL, 1, 7, None).await);
     });
 }
 
@@ -352,7 +373,7 @@ fn a_second_eviction_at_one_epoch_does_not_confirm_on_the_first_snapshot() {
             .evict(CELL, 1, Retained::Resumable, None)
             .await
             .expect("first eviction");
-        assert!(rig.ltx.epoch_covers(CELL, 1, 1).await);
+        assert!(rig.ltx.epoch_covers(CELL, 1, 1, None).await);
 
         let resumed = rig
             .ltx
@@ -366,7 +387,7 @@ fn a_second_eviction_at_one_epoch_does_not_confirm_on_the_first_snapshot() {
         // The first snapshot still satisfies the question that asks for any
         // object, and it holds none of the new rows.
         assert!(rig.ltx.client_for(CELL, 1).has_any_object().await.unwrap());
-        assert!(!rig.ltx.epoch_covers(CELL, 1, second).await);
+        assert!(!rig.ltx.epoch_covers(CELL, 1, second, None).await);
 
         // The store answers the second snapshot and the L0 rows and keeps
         // neither, so only the first lifetime's objects are listed.
@@ -383,7 +404,7 @@ fn a_second_eviction_at_one_epoch_does_not_confirm_on_the_first_snapshot() {
         // still be restarted in place.
         assert!(rig.ltx.is_resident(CELL, 1));
         assert!(live(&rig, 1).is_file());
-        assert!(!rig.ltx.epoch_covers(CELL, 1, second).await);
+        assert!(!rig.ltx.epoch_covers(CELL, 1, second, None).await);
     });
 }
 
@@ -873,22 +894,152 @@ fn a_base_whose_lineage_cannot_be_removed_is_not_taken_and_strands_nothing() {
 }
 
 #[test]
-fn the_confirm_stops_at_a_file_that_starts_at_the_position() {
+fn the_confirm_finds_a_file_that_holds_the_position_without_listing_the_epoch() {
     run(async {
         let rig = rig();
         for txid in 1..=50 {
             put_empty(&rig, 1, 0, txid, txid).await;
         }
-        put_empty(&rig, 1, 0, 60, 70).await;
-        let covers = |txid| rig.ltx.epoch_covers(CELL, 1, txid);
+        // A fold of a longer tail: the position is the end of the newest file.
+        put_empty(&rig, 1, 0, 60, 90).await;
+        let covers = |txid, newest| rig.ltx.epoch_covers(CELL, 1, txid, newest);
+        let windows = || rig.store.windows.load(Ordering::SeqCst);
+        let lists = || rig.store.lists.load(Ordering::SeqCst);
 
-        assert!(covers(50).await);
-        assert!(covers(1).await);
-        assert_eq!(rig.store.lists.load(Ordering::SeqCst), 0);
+        // The file the caller last wrote is one HEAD.
+        assert!(covers(90, Some((60, 90))).await);
+        assert_eq!((windows(), lists()), (0, 0));
 
-        // A transaction inside a longer file walks the listing.
-        assert!(covers(65).await);
+        // Without it, a bounded listing past the transaction below the window
+        // finds the file whose range holds the position.
+        assert!(covers(90, None).await);
+        assert_eq!(lists(), 0);
+        assert!(windows() > 0);
+
+        // A hint the bucket does not hold falls through to the same listing.
+        assert!(covers(90, Some((61, 90))).await);
+        assert_eq!(lists(), 0);
+
+        // Only a refusal walks the epoch.
+        assert!(!covers(200, None).await);
+        assert_eq!(lists(), 1);
+    });
+}
+
+#[test]
+fn the_confirm_walks_the_epoch_for_a_file_longer_than_its_window() {
+    run(async {
+        let rig = rig();
+        put_empty(&rig, 1, 0, 1, 5_000).await;
+
+        assert!(rig.ltx.epoch_covers(CELL, 1, 4_000, None).await);
+
         assert_eq!(rig.store.lists.load(Ordering::SeqCst), 1);
-        assert!(!covers(200).await);
+    });
+}
+
+/// A connection that outlives the eviction's close, so SQLite does not fold
+/// the write-ahead log into the database file and the log keeps the row.
+fn commit_behind_the_close(path: &Path) -> rusqlite::Connection {
+    let held = rusqlite::Connection::open(path).expect("open the cell database");
+    held.execute_batch("INSERT INTO t VALUES (2);")
+        .expect("write");
+    held
+}
+
+#[test]
+fn a_resumable_base_with_pages_in_its_log_is_not_reused_by_the_next_epoch() {
+    run(async {
+        let rig = rig();
+        let path = first_lifetime(&rig).await;
+        let _held = commit_behind_the_close(&path);
+        rig.ltx
+            .evict(CELL, 1, Retained::Resumable, None)
+            .await
+            .expect("eviction");
+        assert!(evicted(&rig, 1).is_file());
+        assert!(rig.ltx.wal_holds_pages(&live(&rig, 1)));
+
+        // The base alone is older than the snapshot the eviction published.
+        let next = rig
+            .ltx
+            .activate(options(2, false, false))
+            .await
+            .expect("claim the next epoch");
+
+        assert!(next.restored);
+        assert_eq!(rows(&next.path), [1, 2]);
+    });
+}
+
+#[test]
+fn a_base_whose_log_still_holds_pages_is_not_kept() {
+    run(async {
+        let rig = rig();
+        let path = first_lifetime(&rig).await;
+        let _held = commit_behind_the_close(&path);
+
+        rig.ltx
+            .evict(CELL, 1, Retained::Base, None)
+            .await
+            .expect("eviction");
+        assert!(!evicted(&rig, 1).exists());
+
+        let next = rig
+            .ltx
+            .activate(options(2, false, false))
+            .await
+            .expect("claim the next epoch");
+        assert_eq!(rows(&next.path), [1, 2]);
+    });
+}
+
+#[test]
+fn a_snapshot_listing_that_fails_once_is_retried_and_the_base_stays_right() {
+    run(async {
+        let rig = rig_with(Some(EVERY_ROW));
+        first_lifetime(&rig).await;
+        rig.ltx
+            .evict(CELL, 1, Retained::Resumable, None)
+            .await
+            .expect("eviction");
+
+        rig.store.failing_windows.store(1, Ordering::SeqCst);
+        rig.ltx
+            .activate(options(1, false, true))
+            .await
+            .expect("resume");
+
+        assert_eq!(resident(&rig, 1).compaction.as_ref().unwrap().base_txid, 2);
+    });
+}
+
+#[test]
+fn a_snapshot_listing_that_keeps_failing_fails_the_resume_instead_of_guessing_a_cut() {
+    run(async {
+        let rig = rig_with(Some(EVERY_ROW));
+        first_lifetime(&rig).await;
+        rig.ltx
+            .evict(CELL, 1, Retained::Resumable, None)
+            .await
+            .expect("eviction");
+
+        rig.store.failing_windows.store(100, Ordering::SeqCst);
+        let error = rig
+            .ltx
+            .activate(options(1, false, true))
+            .await
+            .map(|_| ())
+            .expect_err("a resume whose cut cannot be established");
+        assert!(error.to_string().contains("list the snapshots"));
+        assert!(!rig.ltx.is_resident(CELL, 1));
+
+        // The files stay where a retry finds them.
+        rig.store.failing_windows.store(0, Ordering::SeqCst);
+        rig.ltx
+            .activate(options(1, false, true))
+            .await
+            .expect("the retry");
+        assert_eq!(resident(&rig, 1).compaction.as_ref().unwrap().base_txid, 2);
     });
 }

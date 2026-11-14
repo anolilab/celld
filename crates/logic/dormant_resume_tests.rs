@@ -67,7 +67,7 @@ fn assert_resumed_in_place(shell: &mut Shell, effects: &[Effect]) {
     );
     let spec = resume_restore(effects).expect("a restore effect");
     assert_eq!(spec.epoch, 1);
-    assert!(spec.resume_local);
+    assert!(spec.resume_local && spec.after_eviction);
     assert!(!spec.fresh && !spec.took_over && spec.prior.is_none());
     shell.settle();
     assert!(matches!(
@@ -519,4 +519,70 @@ fn a_resumed_cell_reaches_a_release_only_through_a_new_proof_and_stop() {
         .iter()
         .any(|effect| matches!(effect, Effect::ReleaseOwner { epoch: 1, .. })));
     assert!(!shell.state.resumable(CELL));
+}
+
+#[test]
+fn a_clean_reload_resume_that_fails_is_a_restore_failure_not_a_fallback() {
+    let mut shell = Shell::reloaded(config());
+    shell.failing_resumes.insert(CELL.into());
+    shell.local_cells(&[(CELL, 1)]);
+
+    let spec = shell
+        .inbox
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Restore { spec, .. } => Some(spec.clone()),
+            _ => None,
+        })
+        .expect("a restore of the cell the reload left");
+    assert!(spec.resume_local && !spec.after_eviction);
+    shell.settle();
+
+    // The core fails the cell and keeps it dormant, with no claim.
+    assert!(matches!(
+        shell.state.phase(CELL),
+        Some(Phase::Dormant { epoch: 1 })
+    ));
+    assert!(!shell.state.resumable(CELL));
+    assert!(shell
+        .inbox
+        .iter()
+        .all(|effect| !matches!(effect, Effect::ReadOwner { .. } | Effect::CasOwner { .. })));
+}
+
+#[test]
+fn a_failed_resume_with_nobody_waiting_leaves_the_cell_dormant_and_claims_nothing() {
+    let mut shell = dormant(config());
+    shell.failing_resumes.insert(CELL.into());
+    let effects = wake_by_request(&mut shell);
+    let op = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Restore { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("the resume");
+    shell.send(Event::Cancel {
+        request: WAKE_REQUEST,
+    });
+
+    let effects = shell.send(Event::RestoreCompleted {
+        op,
+        result: Err(Failure::Definite),
+    });
+
+    assert!(
+        !touches_ownership(&effects),
+        "the cell claimed: {effects:?}"
+    );
+    assert!(matches!(
+        shell.state.phase(CELL),
+        Some(Phase::Dormant { epoch: 1 })
+    ));
+    assert!(!shell.state.resumable(CELL));
+    assert_eq!(shell.state.activating(), 0);
+
+    // The next wake reads the record, as the kept files are not trusted.
+    let effects = wake_by_request(&mut shell);
+    assert_claims_next_epoch(&mut shell, &effects);
 }

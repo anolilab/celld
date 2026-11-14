@@ -62,6 +62,10 @@ use celld_logic::durability::{proof_deadline, ProofProgress, ProofWait};
 /// and in-flight object-store requests under high write fan-out.
 const SYNC_CONCURRENCY: usize = 64;
 
+/// How many times the snapshot listing that places a reopened handle's
+/// compaction is tried before the activation fails.
+const SNAPSHOT_CUT_ATTEMPTS: u32 = 3;
+
 /// Max LTX object downloads across every restore on this node. A hot cell can
 /// contain thousands of L0 files, so serial reads turn a takeover into minutes
 /// of terminal failures. This shared ceiling hides round-trip latency without
@@ -888,6 +892,10 @@ struct Cell {
     /// what a successor restore will actually see, which is what
     /// `note_undrained_tail` compares against (#473).
     percell_txid: AtomicU64,
+    /// The level-0 file the newest per-cell upload wrote, as `(min, max)`. An
+    /// eviction's confirm asks the bucket for exactly this file with one HEAD
+    /// when the position it closed is this file's end.
+    last_percell_file: Mutex<Option<(u64, u64)>>,
     /// Set while a sync for this cell is in flight, so the loop never runs two
     /// at once for one cell (they would serialize on the mutex and waste work).
     syncing: AtomicBool,
@@ -932,6 +940,14 @@ fn percell_coverage(handle: &Cell) -> u64 {
             compaction.compacted_txid.load(Ordering::SeqCst)
         }),
     )
+}
+
+/// The position an eviction's confirm asks the bucket for, and the file the
+/// newest upload wrote when that file ends there.
+fn confirm_position(handle: &Cell) -> (u64, Option<(u64, u64)>) {
+    let position = percell_coverage(handle);
+    let newest = (*handle.last_percell_file.lock().unwrap()).filter(|(_, max)| *max == position);
+    (position, newest)
 }
 
 /// Credit an upload that the per-cell prefix holds through `txid`. A per-cell
@@ -2188,9 +2204,19 @@ impl LtxRepl {
     /// later position, and the first eviction's snapshot is still in the
     /// bucket: asking whether any object exists would let the second eviction
     /// pass on it while its own snapshot is missing.
-    pub async fn epoch_covers(&self, cell: &str, epoch: u64, txid: u64) -> bool {
+    ///
+    /// `newest` is the level-0 file the caller last wrote, which answers with
+    /// one HEAD when `txid` is its end.
+    pub async fn epoch_covers(
+        &self,
+        cell: &str,
+        epoch: u64,
+        txid: u64,
+        newest: Option<(u64, u64)>,
+    ) -> bool {
         let client = self.client_for(cell, epoch);
-        matches!(client.covers_txid(TXID(txid)).await, Ok(true))
+        let newest = newest.map(|(min, max)| (TXID(min), TXID(max)));
+        matches!(client.covers_txid(TXID(txid), newest).await, Ok(true))
     }
 
     /// Whether the full snapshot this pass just published is listed. The
@@ -2251,6 +2277,19 @@ impl LtxRepl {
         Ok(())
     }
 
+    /// Whether the write-ahead log of the database at `db` holds pages. SQLite
+    /// folds the log into the file and removes it when its last connection
+    /// closes, so a log that survives the close was not folded. A log that
+    /// cannot be read is taken to hold pages.
+    fn wal_holds_pages(&self, db: &Path) -> bool {
+        let mut wal = db.as_os_str().to_owned();
+        wal.push("-wal");
+        match self.ltx_host.metadata(Path::new(&wal)) {
+            Ok(metadata) => metadata.len > 0,
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
+    }
+
     /// Remove what a retained epoch kept beside its database, before the next
     /// epoch takes the database as its base. Its LTX metadata describes a
     /// lineage that epoch no longer writes.
@@ -2275,28 +2314,37 @@ impl LtxRepl {
     }
 
     /// The position of the newest full snapshot an epoch holds at or below
-    /// `position`, or 0. Rows at or below it are the snapshot's, not any
-    /// per-cell level's, so a handle reopened there compacts from the next
-    /// transaction. A listing that fails answers 0: the handle then
-    /// compacts from the first transaction, which can fail its rounds and
-    /// cannot lose a row.
-    async fn snapshot_cut(&self, cell: &str, epoch: u64, position: u64) -> u64 {
-        match self
-            .client_for(cell, epoch)
-            .ltx_files(replica::SNAPSHOT_LEVEL, TXID(0))
-            .await
-        {
-            Ok(files) => files
-                .iter()
-                .filter(|file| file.min_txid == TXID(1) && file.max_txid.0 <= position)
-                .map(|file| file.max_txid.0)
-                .max()
-                .unwrap_or(0),
-            Err(error) => {
-                warn!(cell, epoch, %error, "could not list the snapshots of a reopened epoch");
-                0
+    /// `position`, or 0 when it holds none. Rows at or below it are the
+    /// snapshot's, not any per-cell level's, so a handle reopened there
+    /// compacts from the next transaction.
+    ///
+    /// A listing that keeps failing is an error and not a position: a cut
+    /// that was guessed would pin the handle's compaction to the wrong base
+    /// for as long as it lives.
+    async fn snapshot_cut(&self, cell: &str, epoch: u64, position: u64) -> anyhow::Result<u64> {
+        let client = self.client_for(cell, epoch);
+        let mut attempt = 1;
+        let files = loop {
+            match client.ltx_files(replica::SNAPSHOT_LEVEL, TXID(0)).await {
+                Ok(files) => break files,
+                Err(error) if attempt < SNAPSHOT_CUT_ATTEMPTS => {
+                    warn!(cell, epoch, attempt, %error, "listing the snapshots of a reopened epoch failed; retrying");
+                    asyncrt::sleep(Duration::from_millis(100 << attempt)).await;
+                    attempt += 1;
+                }
+                Err(error) => {
+                    return Err(anyhow!(
+                        "list the snapshots of {cell} epoch {epoch}: {error}"
+                    ))
+                }
             }
-        }
+        };
+        Ok(files
+            .iter()
+            .filter(|file| file.min_txid == TXID(1) && file.max_txid.0 <= position)
+            .map(|file| file.max_txid.0)
+            .max()
+            .unwrap_or(0))
     }
 
     pub async fn activate(
@@ -2375,9 +2423,23 @@ impl LtxRepl {
                 Some(legacy(&path)).filter(is_file)
             }
         };
+        // The next epoch takes the base alone and clears the files beside it,
+        // so a base whose write-ahead log still holds pages is not one: those
+        // pages are in the bucket's snapshot, and the bucket restore has them.
         let local_snapshot = (!fresh && !resume_local)
             .then(|| previous.and_then(first_present))
-            .flatten();
+            .flatten()
+            .filter(|_| {
+                let pending = self.wal_holds_pages(&self.db_path(cell, epoch.saturating_sub(1)));
+                if pending {
+                    warn!(
+                        cell,
+                        epoch,
+                        "the previous epoch's write-ahead log holds pages; restoring instead"
+                    );
+                }
+                !pending
+            });
 
         // Sample before a restore can replace the path. A non-certified live
         // database can contain rows which a crash or self-fence staged but did
@@ -2679,7 +2741,7 @@ impl LtxRepl {
         let resume_cut = match (resume_local, &self.compaction_queue) {
             (true, Some(_)) => {
                 self.snapshot_cut(cell, epoch, seed.map_or(0, |pos| pos.txid.0))
-                    .await
+                    .await?
             }
             _ => 0,
         };
@@ -2705,6 +2767,7 @@ impl LtxRepl {
             // The restore read the per-cell prefix, so the seed IS the
             // per-cell coverage at open.
             percell_txid: AtomicU64::new(seed.map_or(0, |pos| pos.txid.0)),
+            last_percell_file: Mutex::new(None),
             syncing: AtomicBool::new(false),
             ready: Notify::new(),
             compaction: self.compaction_queue.as_ref().map(|queue| {
@@ -3018,13 +3081,13 @@ impl LtxRepl {
         if revocable && matches!(proof, celld_logic::ProofSource::Bucket) {
             // The per-cell watermark, not `durable_txid`: a bundle flush
             // credits that one without writing anything under this prefix.
-            let position = self
+            let (position, newest) = self
                 .cells
                 .lock()
                 .unwrap()
                 .get(&(cell.to_string(), epoch))
-                .map_or(0, |handle| percell_coverage(handle));
-            if !self.epoch_covers(cell, epoch, position).await {
+                .map_or((0, None), |handle| confirm_position(handle));
+            if !self.epoch_covers(cell, epoch, position, newest).await {
                 return Err(anyhow!(
                     "no replica objects through txid {position} for {cell} epoch {epoch}; \
                      refusing to evict state the bucket cannot restore"
@@ -3375,8 +3438,8 @@ impl LtxRepl {
                 {
                     return Err(anyhow!("final durability failed for {cell} epoch {epoch}"));
                 }
-                let position = percell_coverage(&handle);
-                if !self.epoch_covers(cell, epoch, position).await {
+                let (position, newest) = confirm_position(&handle);
+                if !self.epoch_covers(cell, epoch, position, newest).await {
                     return Err(anyhow!(
                         "no replica objects through txid {position} for {cell} epoch {epoch}; refusing to evict state the bucket cannot restore"
                     ));
@@ -3645,6 +3708,19 @@ impl LtxRepl {
             }
         };
         let db = self.db_path(cell, epoch);
+        // A close that could not fold the write-ahead log leaves pages there
+        // that the database file lacks. A base is the file alone, so it would
+        // be older than the snapshot that was published; only a resumable
+        // database keeps the log with it.
+        let retained = if retained == Retained::Base && self.wal_holds_pages(&db) {
+            warn!(
+                cell,
+                epoch, "the write-ahead log still holds pages; discarding local snapshot"
+            );
+            Retained::Nothing
+        } else {
+            retained
+        };
         let preserved = db.with_extension("evicted");
         let mut renamed = false;
         if retained != Retained::Nothing {
@@ -4129,6 +4205,9 @@ async fn sync_cell(handle: CellHandle) -> Option<bool> {
             handle.ready.notify_waiters();
             return Some(false);
         }
+    }
+    if let Some((min_txid, max_txid, _)) = uploads.last() {
+        *handle.last_percell_file.lock().unwrap() = Some((*min_txid, *max_txid));
     }
     if let Some(last) = last {
         // Advance the replica's uploaded watermark; `syncing` serializes

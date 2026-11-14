@@ -571,6 +571,10 @@ impl std::fmt::Debug for ObjectStoreClient {
     }
 }
 
+/// How many transactions below the one asked for [`ObjectStoreClient::covers_txid`]
+/// looks for a file that starts there before it walks the epoch.
+const COVERS_WINDOW: u64 = 1024;
+
 impl ObjectStoreClient {
     /// Create a client from config (no I/O; the store is built on first use).
     pub fn new(config: ObjectStoreConfig) -> Self {
@@ -715,17 +719,39 @@ impl ObjectStoreClient {
     /// snapshots, and a later eviction publishes its own, so "any object" says
     /// nothing about the transactions the newest closed database holds.
     ///
-    /// Transaction zero asks only for an object. Otherwise a file that starts
-    /// at `txid` in the first two levels, or a snapshot that contains it,
-    /// answers from a bounded listing. Only a transaction inside a longer file
-    /// walks the epoch's listing, until its first match.
-    pub async fn covers_txid(&self, txid: TXID) -> Result<bool> {
+    /// Transaction zero asks only for an object. Otherwise the answer comes
+    /// from the cheapest listing that can give it, and only a refusal, or a
+    /// transaction inside a file longer than [`COVERS_WINDOW`], walks the
+    /// epoch's listing until its first match:
+    ///
+    /// 1. `newest`, the level-0 file the caller last wrote, is one HEAD when
+    ///    its range holds `txid`.
+    /// 2. The first level-0 and level-1 files that start within the window
+    ///    below `txid`, one bounded listing each.
+    /// 3. The snapshot level, which holds few objects.
+    pub async fn covers_txid(&self, txid: TXID, newest: Option<(TXID, TXID)>) -> Result<bool> {
         if txid == TXID(0) {
             return self.has_any_object().await;
         }
+        let store = self.store().await?;
+        if let Some((min_txid, max_txid)) = newest.filter(|(min, max)| *min <= txid && txid <= *max)
+        {
+            let key = ObjPath::from(self.ltx_key(0, min_txid, max_txid));
+            match store.head(&key).await {
+                Ok(_) => return Ok(true),
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Err(map_os_error(error)),
+            }
+        }
+        let seek = TXID(txid.0.saturating_sub(COVERS_WINDOW - 1).max(1));
         for level in 0..=1 {
-            let first = self.ltx_files_bounded(level, txid, 1).await?;
-            if first.first().is_some_and(|file| file.min_txid == txid) {
+            let near = self
+                .ltx_files_bounded(level, seek, COVERS_WINDOW as usize)
+                .await?;
+            if near
+                .iter()
+                .any(|file| file.min_txid <= txid && txid <= file.max_txid)
+            {
                 return Ok(true);
             }
         }
@@ -738,7 +764,6 @@ impl ObjectStoreClient {
         {
             return Ok(true);
         }
-        let store = self.store().await?;
         let prefix = ObjPath::from(self.root_prefix());
         let mut listed = store.list(Some(&prefix));
         while let Some(meta) = listed.try_next().await.map_err(map_os_error)? {

@@ -45,6 +45,17 @@ impl Shell {
     /// A shell whose node holds a live lease, and so has begun confirming
     /// the cells on its disk: the `ReadLocalCells` effect waits in the inbox.
     pub(crate) fn leased(config: Config) -> Self {
+        Self::leased_after(config, None)
+    }
+
+    /// A node that replaces the process `generation` left a lease behind for,
+    /// as a clean reload does: it adopts the cells on disk without reading
+    /// their records, and `ReadLocalCells` waits in the inbox.
+    pub(crate) fn reloaded(config: Config) -> Self {
+        Self::leased_after(config, Some("previous"))
+    }
+
+    fn leased_after(config: Config, predecessor: Option<&str>) -> Self {
         let mut shell = Self {
             state: State::new("node", config),
             inbox: Vec::new(),
@@ -62,7 +73,7 @@ impl Shell {
                 addr: "node:8081".into(),
                 peer_protocol: 1,
                 generation: "g".into(),
-                resume_generation: None,
+                resume_generation: predecessor.map(str::to_owned),
                 ttl_ms: 30_000,
             },
         });
@@ -74,7 +85,15 @@ impl Shell {
             op,
             now_ms: now,
             now_mono_ms: now,
-            result: Ok(None),
+            result: Ok(predecessor.map(|generation| NodeLeaseRecord {
+                node: "node".into(),
+                addr: "node:8081".into(),
+                expires_ms: now + 30_000,
+                peer_protocol: 1,
+                generation: generation.into(),
+                log_state: None,
+                etag: "previous-etag".into(),
+            })),
         });
         let op = shell.expect("a lease write", |effect| match effect {
             Effect::CasNodeLease { op, .. } => Some(*op),

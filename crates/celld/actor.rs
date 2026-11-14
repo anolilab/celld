@@ -1233,17 +1233,13 @@ where
     CompletedEffect::plain(Event::RuntimeStopped { op })
 }
 
-/// A same-epoch wake whose kept files are gone is an expected outcome with
-/// `CELLD_RESUME_DORMANT_LOCAL`: a paged cell and a root that opened a facet
-/// keep none, and the cache can drop the rest. The core claims the next epoch
-/// instead, so it is no restore failure to print.
-fn expected_resume_fallback(
-    dormant_resume: bool,
-    spec: &celld_logic::RestoreSpec,
-    error: &anyhow::Error,
-) -> bool {
-    dormant_resume
-        && spec.resume_local
+/// A wake that reopens an eviction's kept database and finds it gone is an
+/// expected outcome: a paged cell and a root that opened a facet keep none, and
+/// the cache can drop the rest. The core claims the next epoch instead, so it
+/// is no restore failure to print. The core marks such a resume itself, so a
+/// failed clean-reload resume, which it does fail, is never taken for one.
+fn expected_resume_fallback(spec: &celld_logic::RestoreSpec, error: &anyhow::Error) -> bool {
+    spec.after_eviction
         && error
             .downcast_ref::<crate::replication::RetainedUnavailable>()
             .is_some()
@@ -3550,7 +3546,6 @@ impl Actor {
                 self.route_effect_started(&cell);
                 if let Some(runtime) = self.host.clone() {
                     let timing_cell = cell.clone();
-                    let dormant_resume = self.resume_dormant_local;
                     // A restore downloads, merges, and fsyncs a whole database.
                     // The drain runs it off the core, which owns the node lease timer.
                     // Choosing `spawn_detached` over `spawn_scoped` only keeps this
@@ -3558,7 +3553,7 @@ impl Actor {
                     out.spawn_detached(async move {
                         let started = crate::asyncrt::mono_ms();
                         let result = runtime.restore_cell(&cell, &spec).await.map_err(|error| {
-                            if expected_resume_fallback(dormant_resume, &spec, &error) {
+                            if expected_resume_fallback(&spec, &error) {
                                 tracing::info!(
                                     event = "dormant_resume_unavailable",
                                     %cell,
@@ -4300,12 +4295,13 @@ mod operator_token_tests;
 mod resume_fallback_tests {
     use super::*;
 
-    fn spec(resume_local: bool) -> celld_logic::RestoreSpec {
+    fn spec(after_eviction: bool) -> celld_logic::RestoreSpec {
         celld_logic::RestoreSpec {
             epoch: 1,
             fresh: false,
             took_over: false,
-            resume_local,
+            resume_local: true,
+            after_eviction,
             prior: None,
         }
     }
@@ -4319,17 +4315,15 @@ mod resume_fallback_tests {
     }
 
     #[test]
-    fn only_a_missing_kept_database_of_a_dormant_resume_is_expected() {
-        assert!(expected_resume_fallback(true, &spec(true), &gone()));
+    fn only_a_missing_kept_database_after_an_eviction_is_expected() {
+        assert!(expected_resume_fallback(&spec(true), &gone()));
         assert!(expected_resume_fallback(
-            true,
             &spec(true),
             &gone().context("restore a")
         ));
-        assert!(!expected_resume_fallback(false, &spec(true), &gone()));
-        assert!(!expected_resume_fallback(true, &spec(false), &gone()));
+        // A clean reload's resume has no fallback: the core fails its cell.
+        assert!(!expected_resume_fallback(&spec(false), &gone()));
         assert!(!expected_resume_fallback(
-            true,
             &spec(true),
             &anyhow::anyhow!("read replica: connection reset")
         ));
