@@ -30,12 +30,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use support::{
-    base_urls, diff, env_text, git, out, positive, run_id, run_turns, target_dir, Class, EndRule,
-    Report, TallySource, PROJECTED_CONCURRENT,
+    base_urls, diff, env_text, git, out, positive, reject_classifier_variables, run_id, run_turns,
+    target_dir, Class, EndRule, Report, TallySource, PROJECTED_CONCURRENT,
 };
 
 fn main() {
     let bases = base_urls("BENCH_BASE_URL");
+    reject_classifier_variables(env_text).unwrap_or_else(|e| panic!("{e}"));
     let proxy_url = env_text("BENCH_PROXY_URL")
         .expect("BENCH_PROXY_URL must name the counting proxy (see bucket_proxy)");
     let nodes = positive("BENCH_NODES", bases.len());

@@ -435,6 +435,7 @@ impl Proxy {
         let url = format!("http://{}", listener.local_addr().expect("address"));
         let tally = Arc::new(Mutex::new(Tally::new()));
         let shared = tally.clone();
+        let classifier_info = classifier.describe();
         let accept = tokio::spawn(async move {
             while let Ok((stream, peer)) = listener.accept().await {
                 let (tally, upstream, root, classifier) = (
@@ -443,7 +444,7 @@ impl Proxy {
                     root.clone(),
                     classifier.clone(),
                 );
-                let classifier_info = classifier.describe();
+                let classifier_info = classifier_info.clone();
                 let service = service_fn(move |request: Request<Incoming>| {
                     let (tally, upstream) = (tally.clone(), upstream.clone());
                     let classifier_info = classifier_info.clone();
@@ -1073,11 +1074,46 @@ pub fn positive<T: std::str::FromStr + Default + PartialOrd>(name: &str, default
 /// The base URLs in `name`, comma-separated, without a trailing slash.
 pub fn base_urls(name: &str) -> Vec<String> {
     let value = env_text(name).unwrap_or_else(|| panic!("{name} must name the server's base URL"));
-    value
+    parse_base_urls(&value).unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// The base URLs in a comma-separated list. A list with no URL in it, such as
+/// `,,`, is an error: there would be no server to measure.
+pub fn parse_base_urls(list: &str) -> Result<Vec<String>, String> {
+    let urls: Vec<String> = list
         .split(',')
         .map(|u| u.trim().trim_end_matches('/').to_owned())
         .filter(|u| !u.is_empty())
-        .collect()
+        .collect();
+    if urls.is_empty() {
+        return Err(format!("{list:?} names no server"));
+    }
+    Ok(urls)
+}
+
+/// The variables that set the proxy's classifier. `lookup` reads one.
+const CLASSIFIER_VARIABLES: [&str; 3] = [
+    "BENCH_PER_AGENT_REGEX",
+    "BENCH_PER_AGENT_PREFIXES",
+    "BENCH_BACKGROUND_REGEX",
+];
+
+/// A target that reads its tally from a standalone proxy cannot classify: the
+/// proxy does. A classifier variable in its own environment would be ignored
+/// while looking as if it applied, so it is an error.
+pub fn reject_classifier_variables(lookup: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+    let set: Vec<&str> = CLASSIFIER_VARIABLES
+        .into_iter()
+        .filter(|name| lookup(name).is_some())
+        .collect();
+    if set.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} set here has no effect: the classifier belongs to the counting proxy, so set it on \
+         bucket_proxy",
+        set.join(", ")
+    ))
 }
 
 /// The disallowed-macros policy forbids `println!`, so write to stdout directly.

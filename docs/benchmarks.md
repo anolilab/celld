@@ -128,8 +128,10 @@ prices one node's shared requests under the same load.
 ### Classifying keys
 
 The split between "per agent" and "shared" depends on how a store lays out its
-keys, so the classifier is a setting. A key is matched after the run's bucket
-and prefix are stripped.
+keys, so the classifier is a setting. It belongs to the process that counts the
+requests: `bucket_proxy`, or `storage_requests` that runs its own. Set these
+variables there, not on `agent_requests`, which refuses them. A key is matched
+after the run's bucket and prefix are stripped.
 
 | Variable                    | Default | Meaning                                                              |
 | --------------------------- | ------- | -------------------------------------------------------------------- |
@@ -242,7 +244,8 @@ BENCH_MIN_WAIT_S=70 BENCH_QUIET_S=30 BENCH_QUIET_SCOPE=all \
 `BENCH_PROXY_ROOT` is the bucket name plus any key prefix that every key of the
 run starts with. `agent_requests` takes the agent count, turns and turn gap of
 `storage_requests` (`BENCH_AGENTS` 200, `BENCH_TURNS` 6, `BENCH_TURN_MS`
-10000, `BENCH_SPREAD_S` 60) and the classifier and end rule above. With
+10000, `BENCH_SPREAD_S` 60) and the end rule above; the classifier is the
+proxy's. With
 `BENCH_IDLE_S` it first watches the proxy with no load for that long and
 reports the idle request rate. Shared requests are reported per node-hour as all
 of them over the whole run: both the requests and the elapsed time run from just

@@ -17,10 +17,10 @@ use hyper::Method;
 use regex::Regex;
 use serde_json::{json, Value};
 use support::{
-    control_response, diff, idle_wait, memory_pids, memory_slope, parse_phases,
-    require_idle_past_eviction, require_resident, require_warmup, rss_of_tree, run_id,
-    window_position, Classifier, EndRule, MemoryPids, Part, Scope, Tally, TallySource,
-    WindowPosition,
+    control_response, diff, idle_wait, memory_pids, memory_slope, parse_base_urls, parse_phases,
+    reject_classifier_variables, require_idle_past_eviction, require_resident, require_warmup,
+    rss_of_tree, run_id, window_position, Classifier, EndRule, MemoryPids, Part, Scope, Tally,
+    TallySource, WindowPosition,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -421,4 +421,46 @@ async fn a_remote_read_returns_the_proxys_classifier() {
     let (tally, classifier) = TallySource::remote(&url).fetch().await.unwrap();
     assert!(tally.is_empty());
     assert_eq!(classifier, json!({ "per_agent": ["^v1/do/"] }));
+}
+
+#[test]
+fn base_urls_are_trimmed_and_listed() {
+    assert_eq!(
+        parse_base_urls(" http://a:1/ , http://b:2 "),
+        Ok(vec!["http://a:1".to_owned(), "http://b:2".to_owned()])
+    );
+}
+
+#[test]
+fn a_list_with_no_server_in_it_is_an_error() {
+    for list in [",,", " , ", ",", " "] {
+        let error = parse_base_urls(list).unwrap_err();
+        assert!(error.contains("names no server"), "{list:?}: {error}");
+    }
+}
+
+#[test]
+fn classifier_variables_are_refused_where_the_proxy_classifies() {
+    let set = |name: &str| (name == "BENCH_BACKGROUND_REGEX").then(|| "^x".to_owned());
+    let error = reject_classifier_variables(set).unwrap_err();
+    assert!(error.contains("BENCH_BACKGROUND_REGEX"), "{error}");
+    assert!(error.contains("bucket_proxy"), "{error}");
+    assert!(!error.contains("BENCH_PER_AGENT_REGEX"), "{error}");
+}
+
+#[test]
+fn every_classifier_variable_is_refused() {
+    for name in [
+        "BENCH_PER_AGENT_REGEX",
+        "BENCH_PER_AGENT_PREFIXES",
+        "BENCH_BACKGROUND_REGEX",
+    ] {
+        let only = |asked: &str| (asked == name).then(|| "x".to_owned());
+        assert!(reject_classifier_variables(only).is_err(), "{name}");
+    }
+}
+
+#[test]
+fn no_classifier_variable_is_fine() {
+    assert_eq!(reject_classifier_variables(|_| None), Ok(()));
 }
