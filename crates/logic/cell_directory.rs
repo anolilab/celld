@@ -226,23 +226,19 @@ pub fn view_is_fresh(fetched_at_ms: Option<u64>, now_ms: u64, max_age_ms: u64) -
     fetched_at_ms.is_some_and(|at| now_ms.saturating_sub(at) <= max_age_ms)
 }
 
-/// Whether a freshness marker allows the answer `New` at `now_ms`, all on wall
-/// clock time. The marker says every registration whose segment was durable
-/// more than `oldest_unfolded_age_ms` before `published_ms` is folded into the
-/// heads, so a cell registered less than `now - published + oldest_unfolded_age`
-/// ago may be missing. The allowance is that much, up to `max_blind_ms`. A
-/// clock that differs from the publisher's in either direction counts as
-/// elapsed time, so skew only ever removes the allowance.
+/// Whether a freshness marker allows the answer `New`. `observed_for_ms` is how
+/// long ago, on the reader's own clock, the marker is known to have been
+/// published at the latest: a reader never compares its clock with the
+/// compactor's. The marker says every registration whose segment became
+/// durable more than `oldest_unfolded_age_ms` before it was published is folded
+/// into the heads, so a cell registered less than that plus the time since may
+/// be missing. The allowance is `max_blind_ms` of it.
 pub fn marker_allows_new(
-    published_ms: u64,
+    observed_for_ms: u64,
     oldest_unfolded_age_ms: u64,
-    now_ms: u64,
     max_blind_ms: u64,
 ) -> bool {
-    now_ms
-        .abs_diff(published_ms)
-        .saturating_add(oldest_unfolded_age_ms)
-        <= max_blind_ms
+    observed_for_ms.saturating_add(oldest_unfolded_age_ms) <= max_blind_ms
 }
 
 /// The age a freshness marker records: the oldest segment that is not folded,
@@ -259,20 +255,18 @@ pub fn oldest_unfolded_age_ms(
     published_ms.saturating_sub(began)
 }
 
-/// Whether the registration an own-process entry made, durable at
-/// `durable_ms`, is folded according to a marker. Every segment durable before
-/// `published_ms - oldest_unfolded_age_ms` is, with `skew_ms` taken off for a
-/// clock that differs from the compactor's. An entry whose segment is not
-/// durable yet is not.
-pub fn marker_covers(
+/// Whether the registration an own-process entry made, durable at `durable_ms`,
+/// is folded according to a marker, all on the reader's clock. The marker was
+/// published no earlier than `anchor_ms`, and every segment that became durable
+/// before `oldest_unfolded_age_ms` earlier than it was published is folded, so
+/// the entry is once `anchor_ms - oldest_unfolded_age_ms` is past `durable_ms`.
+/// An entry whose segment is not durable yet is not.
+pub fn registration_covered(
     durable_ms: Option<u64>,
-    published_ms: u64,
+    anchor_ms: u64,
     oldest_unfolded_age_ms: u64,
-    skew_ms: u64,
 ) -> bool {
-    durable_ms.is_some_and(|durable| {
-        durable.saturating_add(skew_ms) < published_ms.saturating_sub(oldest_unfolded_age_ms)
-    })
+    durable_ms.is_some_and(|durable| anchor_ms.saturating_sub(oldest_unfolded_age_ms) > durable)
 }
 
 /// Whether the directory and the listing of the cell's LTX disagree in the one
@@ -466,17 +460,13 @@ mod tests {
 
     #[test]
     fn a_marker_allows_new_only_while_its_blind_window_holds() {
-        // Published at 1_000 with nothing unfolded older than the pass itself.
-        assert!(marker_allows_new(1_000, 0, 1_000, 180));
-        assert!(marker_allows_new(1_000, 20, 1_160, 180));
-        assert!(!marker_allows_new(1_000, 20, 1_161, 180));
+        assert!(marker_allows_new(0, 0, 180));
+        assert!(marker_allows_new(160, 20, 180));
+        assert!(!marker_allows_new(161, 20, 180));
         // An unfolded backlog uses the allowance up front.
-        assert!(!marker_allows_new(1_000, 181, 1_000, 180));
-        assert!(marker_allows_new(1_000, 180, 1_000, 180));
-        // A clock behind the publisher's is elapsed time too.
-        assert!(marker_allows_new(1_000, 0, 820, 180));
-        assert!(!marker_allows_new(1_000, 0, 819, 180));
-        assert!(!marker_allows_new(u64::MAX, u64::MAX, 0, 180));
+        assert!(!marker_allows_new(0, 181, 180));
+        assert!(marker_allows_new(0, 180, 180));
+        assert!(!marker_allows_new(u64::MAX, u64::MAX, 180));
     }
 
     #[test]
@@ -493,13 +483,13 @@ mod tests {
 
     #[test]
     fn a_marker_covers_only_registrations_older_than_its_unfolded_backlog() {
-        assert!(marker_covers(Some(700), 1_000, 200, 50));
-        assert!(!marker_covers(Some(750), 1_000, 200, 50));
-        assert!(!marker_covers(Some(800), 1_000, 200, 0));
-        assert!(marker_covers(Some(799), 1_000, 200, 0));
+        // Published no earlier than 1_000, with nothing older than 200 unfolded.
+        assert!(registration_covered(Some(700), 1_000, 200));
+        assert!(!registration_covered(Some(800), 1_000, 200));
+        assert!(registration_covered(Some(799), 1_000, 200));
         // Not durable yet: never covered.
-        assert!(!marker_covers(None, u64::MAX, 0, 0));
-        assert!(!marker_covers(Some(1), 1_000, u64::MAX, 0));
+        assert!(!registration_covered(None, u64::MAX, 0));
+        assert!(!registration_covered(Some(1), 1_000, u64::MAX));
     }
 
     #[test]

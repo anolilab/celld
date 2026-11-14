@@ -192,12 +192,14 @@ reports mostly `unknown` shows a directory that could not have replaced the
 listing.
 
 The compactor's first pass runs a minute after the nodes start and the next
-ones a minute after the previous pass ends. The directory answers `new` only
-while the compactor's freshness marker is within three minutes, so raise the
-settle past the first pass, and let the window hold a few more:
+ones a minute after the previous pass ends. A node answers `new` only after it
+has seen the compactor's freshness marker change, which takes two passes from
+its first lookup, and only while the marker is within three minutes, so lookups
+before that answer `unknown`. Raise the settle past the first two passes, and
+let the window hold a few more:
 
 ```sh
-CELLD_BENCH_FILTER=fleet_evict CELLD_BENCH_SETTLE_S=120 BENCH_MIN_WAIT_S=250 \
+CELLD_BENCH_FILTER=fleet_evict CELLD_BENCH_SETTLE_S=150 BENCH_MIN_WAIT_S=250 \
 CELLD_CELL_DIRECTORY_SHADOW=1 CELLD_CELL_DIRECTORY_BATCH_MS=2000 \
 CELLD_BENCH_S3_ENDPOINT=http://127.0.0.1:9000 CELLD_BENCH_BUCKET=s3://bench \
   cargo bench -p celld --bench storage_requests --profile lab

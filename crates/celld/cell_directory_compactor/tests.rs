@@ -1,7 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 use super::*;
-use crate::cell_directory::{CellDirectory, Now, BLIND_WINDOW_MS, CLOCK_SKEW_MS};
+use crate::cell_directory::{CellDirectory, BLIND_WINDOW_MS, CLOCK_SKEW_MS, MARKER_TTL_MS};
 use crate::cell_directory_registrar::{RegisteringStore, Registrar};
 use crate::cell_directory_runs::testing::{keys, Counting};
 use crate::cell_directory_runs::{
@@ -18,12 +18,12 @@ const PREFIX: &str = "fleet-a/";
 const GEN: &str = "gen-c";
 
 struct Node {
-    store: Arc<Counting>,
     writer: RegisteringStore,
     registrar: Arc<Registrar>,
 }
 
 fn node(store: &Arc<Counting>, name: &str, generation: &str) -> Node {
+    crate::asyncrt::install_test_host_runtime();
     let directory = Arc::new(CellDirectory::new(store.clone(), PREFIX.to_owned()));
     let writer = RegisteringStore::new(
         store.clone(),
@@ -34,7 +34,6 @@ fn node(store: &Arc<Counting>, name: &str, generation: &str) -> Node {
         Duration::ZERO,
     );
     Node {
-        store: store.clone(),
         registrar: writer.registrar(),
         writer,
     }
@@ -50,23 +49,31 @@ impl Node {
             .await
             .unwrap();
     }
-
-    /// A node that just started: it holds none of the directory.
-    async fn fresh_reader(&self) -> CellDirectory {
-        CellDirectory::new(self.store.clone(), PREFIX.to_owned())
-    }
 }
 
-/// A moment just after the last marker a pass published, on both clocks.
-async fn after_marker(store: &Counting) -> Now {
-    let marker = read_marker(store, PREFIX)
-        .await
-        .unwrap()
-        .expect("a pass published a marker");
-    Now {
-        mono_ms: 0,
-        wall_ms: marker.published_ms + 1,
-    }
+/// What a reader that has seen the directory change answers: it reads the
+/// marker, the compactor publishes the next generation of it, with what the last
+/// pass claimed, and the reader reads again, which dates that marker.
+async fn ask(store: &Arc<Counting>, cell: &str) -> DirectoryAnswer {
+    observing(store).await.lookup(cell, MARKER_TTL_MS + 2).await
+}
+
+/// A reader that has seen the marker change, so the time it read the first one
+/// is the age it counts from.
+async fn observing(store: &Arc<Counting>) -> CellDirectory {
+    let reader = CellDirectory::new(store.clone(), PREFIX.to_owned());
+    let _ = reader.lookup("probe", 0).await;
+    let last = marker(store).await;
+    publish_marker(
+        store.as_ref(),
+        PREFIX,
+        last.published_ms,
+        last.oldest_unfolded_age_ms,
+    )
+    .await
+    .unwrap();
+    let _ = reader.lookup("probe", MARKER_TTL_MS + 1).await;
+    reader
 }
 
 fn cells_in_partition(partition: u16, count: usize) -> Vec<String> {
@@ -112,18 +119,10 @@ async fn a_cell_registered_then_compacted_is_found_by_range() {
     assert!(segments(&store).await.is_empty());
 
     // A node that starts now holds nothing of its own, so the tiers answer.
-    let reader = a.fresh_reader().await;
     for cell in ["c1", "c2", "c3"] {
-        assert_eq!(
-            reader.lookup(cell, after_marker(&store).await).await,
-            DirectoryAnswer::Exists,
-            "{cell}"
-        );
+        assert_eq!(ask(&store, cell).await, DirectoryAnswer::Exists, "{cell}");
     }
-    assert_eq!(
-        reader.lookup("never", after_marker(&store).await).await,
-        DirectoryAnswer::New
-    );
+    assert_eq!(ask(&store, "never").await, DirectoryAnswer::New);
 }
 
 #[tokio::test]
@@ -133,11 +132,7 @@ async fn a_tombstoned_cell_reads_as_new_until_it_registers_again() {
     a.write_ltx("c1").await;
     pass(&store, 1, 1_000).await;
     pass(&store, 2, 1_000 + DELETE_GRACE_MS).await;
-    let before = a.fresh_reader().await;
-    assert_eq!(
-        before.lookup("c1", after_marker(&store).await).await,
-        DirectoryAnswer::Exists
-    );
+    assert_eq!(ask(&store, "c1").await, DirectoryAnswer::Exists);
 
     // The tombstone of a deletion, then the objects. A reader sees it only
     // once the compactor has folded it.
@@ -147,11 +142,7 @@ async fn a_tombstoned_cell_reads_as_new_until_it_registers_again() {
         .delete(&Path::from("fleet-a/cells/c1/ltx/e1/0000/0001.ltx"))
         .await
         .unwrap();
-    let unfolded = a.fresh_reader().await;
-    assert_eq!(
-        unfolded.lookup("c1", after_marker(&store).await).await,
-        DirectoryAnswer::Exists
-    );
+    assert_eq!(ask(&store, "c1").await, DirectoryAnswer::Exists);
 
     // Once compacted, through the tiers: the tombstone overrides the older
     // birth.
@@ -159,21 +150,13 @@ async fn a_tombstoned_cell_reads_as_new_until_it_registers_again() {
     pass(&store, 3, t).await;
     pass(&store, 4, t + DELETE_GRACE_MS).await;
     assert!(segments(&store).await.is_empty());
-    let compacted = a.fresh_reader().await;
-    assert_eq!(
-        compacted.lookup("c1", after_marker(&store).await).await,
-        DirectoryAnswer::New
-    );
+    assert_eq!(ask(&store, "c1").await, DirectoryAnswer::New);
 
     // The stream recreated under the same id registers and reads as it.
     a.write_ltx("c1").await;
     pass(&store, 5, 4 * DELETE_GRACE_MS).await;
     pass(&store, 6, 5 * DELETE_GRACE_MS).await;
-    let after = a.fresh_reader().await;
-    assert_eq!(
-        after.lookup("c1", after_marker(&store).await).await,
-        DirectoryAnswer::Exists
-    );
+    assert_eq!(ask(&store, "c1").await, DirectoryAnswer::Exists);
 }
 
 #[tokio::test]
@@ -219,13 +202,8 @@ async fn a_pass_that_loses_a_head_race_skips_the_partition_and_deletes_nothing()
     // The next pass folds what the lost one did not, and not twice.
     let ledger = read_ledger(store.as_ref(), PREFIX).await.unwrap().unwrap();
     assert_eq!(ledger.value.segments.len(), 2);
-    let reader = a.fresh_reader().await;
     for cell in &cells[..2] {
-        assert_eq!(
-            reader.lookup(cell, after_marker(&store).await).await,
-            DirectoryAnswer::Exists,
-            "{cell}"
-        );
+        assert_eq!(ask(&store, cell).await, DirectoryAnswer::Exists, "{cell}");
     }
 }
 
@@ -288,11 +266,7 @@ async fn a_missing_head_is_doubt_after_compaction_started() {
         .delete(&Path::from(head_key(PREFIX, partition)))
         .await
         .unwrap();
-    let reader = a.fresh_reader().await;
-    assert_eq!(
-        reader.lookup("c1", after_marker(&store).await).await,
-        DirectoryAnswer::Unknown
-    );
+    assert_eq!(ask(&store, "c1").await, DirectoryAnswer::Unknown);
 }
 
 #[tokio::test]
@@ -371,11 +345,7 @@ async fn a_birth_from_another_stream_outranks_a_tombstone_in_one_pass() {
     b.write_ltx("c1").await;
     pass(&store, 1, 1_000).await;
     pass(&store, 2, 1_000 + DELETE_GRACE_MS).await;
-    let reader = a.fresh_reader().await;
-    assert_eq!(
-        reader.lookup("c1", after_marker(&store).await).await,
-        DirectoryAnswer::Exists
-    );
+    assert_eq!(ask(&store, "c1").await, DirectoryAnswer::Exists);
 }
 
 #[tokio::test]
@@ -415,17 +385,19 @@ async fn a_lookup_that_finds_nothing_reads_three_ranges_and_no_run_whole() {
     .await
     .unwrap();
     write_marker(store.as_ref(), PREFIX, &Marker::new(1, 1_000, 0)).await;
-    let reader = CellDirectory::new(store.clone(), PREFIX.to_owned());
     let cell = cells_in_partition(partition, 1).remove(0);
-    let now = after_marker(&store).await;
+    let reader = observing(&store).await;
     store.reset();
 
-    assert_eq!(reader.lookup(&cell, now).await, DirectoryAnswer::New);
+    assert_eq!(
+        reader.lookup(&cell, MARKER_TTL_MS + 2).await,
+        DirectoryAnswer::New
+    );
     assert_eq!(store.ranged_gets.load(Ordering::SeqCst), 3);
     assert_eq!(
         store.whole_gets.load(Ordering::SeqCst),
-        2,
-        "only the small marker and head are read whole"
+        1,
+        "only the small head is read whole, the marker is cached"
     );
     assert_eq!(store.lists.load(Ordering::SeqCst), 0);
 }
@@ -456,11 +428,7 @@ async fn a_tombstone_in_a_newer_tier_hides_an_older_birth() {
     .await
     .unwrap();
     write_marker(store.as_ref(), PREFIX, &Marker::new(1, 1_000, 0)).await;
-    let reader = CellDirectory::new(store.clone(), PREFIX.to_owned());
-    assert_eq!(
-        reader.lookup(cell, after_marker(&store).await).await,
-        DirectoryAnswer::New
-    );
+    assert_eq!(ask(&store, cell).await, DirectoryAnswer::New);
 }
 
 #[tokio::test]
@@ -529,11 +497,7 @@ async fn a_tombstone_the_head_covers_leaves_the_answer_to_the_tiers() {
         ))
         .await
         .unwrap();
-    let reader = a.fresh_reader().await;
-    assert_eq!(
-        reader.lookup("c1", after_marker(&store).await).await,
-        DirectoryAnswer::Exists
-    );
+    assert_eq!(ask(&store, "c1").await, DirectoryAnswer::Exists);
 }
 
 #[tokio::test]
@@ -550,12 +514,8 @@ async fn a_head_write_that_committed_before_the_store_refused_it_is_ours() {
     let report = pass(&store, 2, 2_000).await;
     assert_eq!((report.partitions_merged, report.partitions_lost), (1, 0));
     // The runs the head names are still there.
-    let reader = a.fresh_reader().await;
     for cell in &cells {
-        assert_eq!(
-            reader.lookup(cell, after_marker(&store).await).await,
-            DirectoryAnswer::Exists
-        );
+        assert_eq!(ask(&store, cell).await, DirectoryAnswer::Exists);
     }
     let later = pass(&store, 3, 2_000 + DELETE_GRACE_MS).await;
     assert_eq!(later.partitions_failed, 0);
@@ -614,7 +574,6 @@ async fn put_segment(store: &Counting, key: &str, body: &[u8]) {
 #[tokio::test]
 async fn a_segment_that_lands_after_a_later_one_is_folded_before_it_is_deleted() {
     let store = Arc::new(Counting::default());
-    let a = node(&store, "node-a", "gen1");
     // One partition, so the head the first pass writes already carries the
     // stream's watermark when the late segment is read.
     let cells = cells_in_partition(partition_of(fingerprint("seed")), 2);
@@ -637,13 +596,8 @@ async fn a_segment_that_lands_after_a_later_one_is_folded_before_it_is_deleted()
     pass(&store, 3, 1_000 + 2 * DELETE_GRACE_MS).await;
     assert!(segments(&store).await.is_empty());
 
-    let reader = a.fresh_reader().await;
     for cell in &cells {
-        assert_eq!(
-            reader.lookup(cell, after_marker(&store).await).await,
-            DirectoryAnswer::Exists,
-            "{cell}"
-        );
+        assert_eq!(ask(&store, cell).await, DirectoryAnswer::Exists, "{cell}");
     }
 }
 
@@ -674,12 +628,8 @@ async fn a_lost_head_race_keeps_the_runs_the_current_head_names() {
             .len(),
         2
     );
-    let reader = a.fresh_reader().await;
     for cell in &cells {
-        assert_eq!(
-            reader.lookup(cell, after_marker(&store).await).await,
-            DirectoryAnswer::Exists
-        );
+        assert_eq!(ask(&store, cell).await, DirectoryAnswer::Exists);
     }
 }
 
@@ -722,11 +672,7 @@ async fn a_run_no_head_names_is_deleted_once_it_is_older_than_the_grace() {
     }
     assert_eq!(deleted, 1);
     assert!(!has_orphan(runs().await));
-    let reader = a.fresh_reader().await;
-    assert_eq!(
-        reader.lookup("c1", after_marker(&store).await).await,
-        DirectoryAnswer::Exists
-    );
+    assert_eq!(ask(&store, "c1").await, DirectoryAnswer::Exists);
 }
 
 #[tokio::test]
@@ -747,12 +693,8 @@ async fn a_head_that_went_missing_is_rebuilt_from_its_runs() {
     assert_eq!(report.partitions_failed, 0, "{report:?}");
     pass(&store, 3, 2_000 + 10 * DELETE_GRACE_MS).await;
     assert!(segments(&store).await.is_empty());
-    let reader = a.fresh_reader().await;
     for cell in &cells {
-        assert_eq!(
-            reader.lookup(cell, after_marker(&store).await).await,
-            DirectoryAnswer::Exists
-        );
+        assert_eq!(ask(&store, cell).await, DirectoryAnswer::Exists);
     }
 }
 
@@ -783,19 +725,14 @@ async fn a_head_that_names_a_missing_run_is_rebuilt() {
     let report = pass(&store, 3, 3_000).await;
     assert_eq!(report.partitions_failed, 0, "{report:?}");
     pass(&store, 4, 3_000 + 10 * DELETE_GRACE_MS).await;
-    let reader = a.fresh_reader().await;
     for cell in [&cells[0], &cells[2]] {
-        assert_eq!(
-            reader.lookup(cell, after_marker(&store).await).await,
-            DirectoryAnswer::Exists
-        );
+        assert_eq!(ask(&store, cell).await, DirectoryAnswer::Exists);
     }
 }
 
 #[tokio::test]
 async fn one_failed_partition_holds_back_only_the_segments_that_touch_it() {
     let store = Arc::new(Counting::default());
-    let a = node(&store, "node-a", "gen1");
     let first = cells_in_partition(partition_of(fingerprint("seed")), 1).remove(0);
     let broken = partition_of(fingerprint(&first));
     let other = (0..)
@@ -833,22 +770,13 @@ async fn one_failed_partition_holds_back_only_the_segments_that_touch_it() {
         vec!["fleet-a/fleet/dir/k256/born/node-b/g9/00000001".to_owned()]
     );
     // The segment that could not be folded is by now older than the blind
-    // window, so the marker no longer vouches for anything; the other cell is
-    // in its partition's runs all the same.
-    let reader = a.fresh_reader().await;
+    // window, so the marker no longer rules any cell out. The cell the runs
+    // hold is `Exists` all the same.
+    assert_eq!(ask(&store, &other).await, DirectoryAnswer::Exists);
     assert_eq!(
-        reader.lookup(&other, after_marker(&store).await).await,
+        ask(&store, "registered-nowhere").await,
         DirectoryAnswer::Unknown
     );
-    let head = read_head(store.as_ref(), PREFIX, partition_of(fingerprint(&other)))
-        .await
-        .unwrap()
-        .unwrap()
-        .value;
-    let records = read_run(store.as_ref(), PREFIX, &head.l0).await.unwrap();
-    assert!(records
-        .iter()
-        .any(|record| record.fp == fingerprint(&other)));
 }
 
 #[tokio::test]
@@ -891,7 +819,6 @@ async fn the_sweep_never_deletes_the_runs_of_a_partition_it_cannot_read_a_head_f
 #[tokio::test]
 async fn a_pass_folds_at_most_its_cap_of_segments_in_key_order() {
     let store = Arc::new(Counting::default());
-    let a = node(&store, "node-a", "gen1");
     for seq in 0..5 {
         put_segment(
             &store,
@@ -919,12 +846,9 @@ async fn a_pass_folds_at_most_its_cap_of_segments_in_key_order() {
         deleted += report.segments_deleted;
     }
     assert_eq!(deleted, 5);
-    let reader = a.fresh_reader().await;
     for seq in 0..5 {
         assert_eq!(
-            reader
-                .lookup(&format!("c{seq}"), after_marker(&store).await)
-                .await,
+            ask(&store, &format!("c{seq}")).await,
             DirectoryAnswer::Exists
         );
     }
@@ -972,14 +896,9 @@ async fn a_compactor_ignores_what_the_4096_partition_layout_left() {
 
     let report = pass(&store, 1, 1_000).await;
     assert_eq!(report.segments_folded, 1, "the old ledger must not hide it");
-    let reader = CellDirectory::new(store.clone(), PREFIX.to_owned());
-    let now = after_marker(&store).await;
+    assert_eq!(ask(&store, "seen-by-old").await, DirectoryAnswer::Exists);
     assert_eq!(
-        reader.lookup("seen-by-old", now).await,
-        DirectoryAnswer::Exists
-    );
-    assert_eq!(
-        reader.lookup("only-in-old-runs", now).await,
+        ask(&store, "only-in-old-runs").await,
         DirectoryAnswer::New,
         "a run of the old layout was read as a K=256 run"
     );
@@ -1020,15 +939,10 @@ async fn the_compactor_neither_folds_nor_deletes_segments_of_the_layout_before_i
         let kept = store.inner.get(&Path::from(key)).await.unwrap();
         assert_eq!(&kept.bytes().await.unwrap()[..], body.as_bytes(), "{key}");
     }
-    let reader = a.fresh_reader().await;
-    let now = after_marker(&store).await;
-    assert_eq!(
-        reader.lookup("new-cell", now).await,
-        DirectoryAnswer::Exists
-    );
+    assert_eq!(ask(&store, "new-cell").await, DirectoryAnswer::Exists);
     for cell in ["old-cell", "nested-cell"] {
         assert_eq!(
-            reader.lookup(cell, now).await,
+            ask(&store, cell).await,
             DirectoryAnswer::New,
             "{cell}: a segment of the previous layout was folded"
         );
@@ -1156,19 +1070,7 @@ async fn an_old_unfolded_segment_is_not_hidden_by_a_store_clock_that_runs_ahead(
         3 * 400_000 + CLOCK_SKEW_MS,
         "the age ran from the store's time, which is later than every pass"
     );
-    let reader = CellDirectory::new(store.clone(), PREFIX.to_owned());
-    assert_eq!(
-        reader
-            .lookup(
-                "anything",
-                Now {
-                    mono_ms: 0,
-                    wall_ms: published.published_ms
-                }
-            )
-            .await,
-        DirectoryAnswer::Unknown
-    );
+    assert_eq!(ask(&store, "anything").await, DirectoryAnswer::Unknown);
 }
 
 #[tokio::test]

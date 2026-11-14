@@ -189,7 +189,7 @@ impl Registrar {
             }
         }
         self.directory
-            .own_durable(&batch, crate::ownership_store::now_ms());
+            .own_durable(&batch, crate::asyncrt::mono_ms());
         self.flushed.notify_waiters();
         Ok(())
     }
@@ -474,14 +474,6 @@ pub(crate) mod testing {
 
     pub(crate) const PREFIX: &str = "fleet-a/";
 
-    /// Both clocks at `ms`.
-    pub(crate) fn at(ms: u64) -> crate::cell_directory::Now {
-        crate::cell_directory::Now {
-            mono_ms: ms,
-            wall_ms: ms,
-        }
-    }
-
     pub(crate) fn names(cells: &[&str]) -> BTreeSet<String> {
         cells.iter().map(|cell| (*cell).to_owned()).collect()
     }
@@ -494,6 +486,8 @@ pub(crate) mod testing {
         inner: &Arc<InMemory>,
         directory: &Arc<CellDirectory>,
     ) -> RegisteringStore {
+        // A flush stamps its cells with the node's monotonic clock.
+        crate::asyncrt::install_test_host_runtime();
         RegisteringStore::new(
             inner.clone(),
             directory.clone(),
@@ -574,11 +568,8 @@ mod tests {
             .head(&Path::from("fleet-a/cells/c1/ltx/e1/0000/0001.ltx"))
             .await
             .unwrap();
-        assert_eq!(directory.lookup("c1", at(0)).await, DirectoryAnswer::Exists);
-        assert_eq!(
-            directory.lookup("c2", at(0)).await,
-            DirectoryAnswer::Unknown
-        );
+        assert_eq!(directory.lookup("c1", 0).await, DirectoryAnswer::Exists);
+        assert_eq!(directory.lookup("c2", 0).await, DirectoryAnswer::Unknown);
     }
 
     #[test]
@@ -669,7 +660,7 @@ mod tests {
             .expect_err("the LTX write must fail with its registration");
         assert!(inner.head(&ltx).await.is_err(), "LTX exists unregistered");
         assert_eq!(
-            directory.lookup("c1", at(0)).await,
+            directory.lookup("c1", 0).await,
             DirectoryAnswer::Unknown,
             "a registration that failed is not vouched for"
         );
@@ -680,7 +671,7 @@ mod tests {
             .await
             .unwrap();
         inner.head(&ltx).await.unwrap();
-        assert_eq!(directory.lookup("c1", at(0)).await, DirectoryAnswer::Exists);
+        assert_eq!(directory.lookup("c1", 0).await, DirectoryAnswer::Exists);
     }
 
     #[tokio::test]
@@ -973,7 +964,7 @@ mod tests {
             // Queued cells answer Exists at once, and a second claim is a no-op.
             node.directory.register_at_claim("c1");
             assert_eq!(
-                node.directory.lookup("c2", at(0)).await,
+                node.directory.lookup("c2", 0).await,
                 DirectoryAnswer::Exists
             );
             node.finish().await;
@@ -1087,7 +1078,7 @@ mod tests {
         let store = store_over(&inner, &directory);
 
         ltx_put(&store, "c1").await;
-        assert_eq!(directory.lookup("c1", at(0)).await, DirectoryAnswer::Exists);
+        assert_eq!(directory.lookup("c1", 0).await, DirectoryAnswer::Exists);
 
         store.registrar().tombstone(&names(&["c1"])).await.unwrap();
         assert_eq!(
@@ -1096,15 +1087,12 @@ mod tests {
             "the tombstone is a segment"
         );
         // This node no longer vouches for the cell; the tiers decide.
-        assert_eq!(
-            directory.lookup("c1", at(1)).await,
-            DirectoryAnswer::Unknown
-        );
+        assert_eq!(directory.lookup("c1", 1).await, DirectoryAnswer::Unknown);
 
         // The recreated stream registers again, in a later segment.
         ltx_put(&store, "c1").await;
         assert_eq!(segments(&inner).await.len(), 3);
-        assert_eq!(directory.lookup("c1", at(2)).await, DirectoryAnswer::Exists);
+        assert_eq!(directory.lookup("c1", 2).await, DirectoryAnswer::Exists);
     }
 
     #[tokio::test]
@@ -1125,7 +1113,7 @@ mod tests {
             .tombstone(&names(&["c1"]))
             .await
             .expect_err("a tombstone that is not durable must fail the deletion");
-        assert_eq!(directory.lookup("c1", at(0)).await, DirectoryAnswer::Exists);
+        assert_eq!(directory.lookup("c1", 0).await, DirectoryAnswer::Exists);
         // The cell registers again with its next write, which outranks a
         // tombstone that may have landed anyway.
         ltx_put(&store, "c1").await;
