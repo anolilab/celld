@@ -582,6 +582,7 @@ impl Generation {
         let mut cell_configs: HashMap<String, Arc<WorkerConfig>> = HashMap::new();
         let mut service_pools = HashMap::new();
         let mut assets = HashMap::new();
+        let mut primary_config: Option<Arc<WorkerConfig>> = None;
         // Primary first: shared reserved classes retain the first script's
         // config. Only this script owns ingress and the node's cron schedule;
         // bindings and runtime construction follow the same path for all scripts.
@@ -615,6 +616,9 @@ impl Generation {
                     .with_containers(containers)
                     .with_generation(id),
             );
+            if is_primary {
+                primary_config = Some(config.clone());
+            }
             let pool = crate::runtime::StatelessRuntime::start(
                 config.clone(),
                 node.clone(),
@@ -638,6 +642,27 @@ impl Generation {
             // the primary script's scheduled handler with that script's bindings.
             if !config.crons.is_empty() {
                 cell_configs.insert(celld_logic::cron::RESERVED_CLASS.to_string(), config);
+            }
+        }
+        // The shared reserved classes hold the data of every script that binds
+        // them, and run only the engine's own code. They used to run in the
+        // first script's isolates, so that script's globals, prototypes and
+        // modules sat in the heap of another script's database. They get
+        // isolates of their own, loaded with no tenant bundle.
+        let shared_classes: Vec<String> = cell_configs
+            .keys()
+            .filter(|class| crate::deploy::is_shared_reserved_class(class))
+            .cloned()
+            .collect();
+        if let Some(primary_config) = primary_config.filter(|_| !shared_classes.is_empty()) {
+            let runtime = Arc::new(WorkerConfig::for_runtime_cells(
+                &primary_config,
+                shared_classes.clone(),
+                queue_catalog.clone(),
+                id,
+            ));
+            for class in shared_classes {
+                cell_configs.insert(class, runtime.clone());
             }
         }
         let stateless = service_pools[&primary_script].clone();

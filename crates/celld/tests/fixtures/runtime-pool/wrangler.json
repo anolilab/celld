@@ -1,0 +1,16 @@
+{
+  "name": "runtime-pool",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "d1_databases": [
+    { "binding": "DB", "database_name": "pool", "database_id": "pool-id" }
+  ],
+  "kv_namespaces": [{ "binding": "KV", "id": "pool-kv" }],
+  "queues": {
+    "producers": [{ "binding": "JOBS", "queue": "pool-jobs" }],
+    "consumers": [{ "queue": "pool-jobs", "max_batch_size": 1, "max_batch_timeout": 1 }]
+  },
+  "durable_objects": { "bindings": [{ "name": "SPY", "class_name": "Spy" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Spy"] }]
+}

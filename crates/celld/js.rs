@@ -1534,6 +1534,16 @@ impl Engine {
 /// path name the same file.
 const ENTRY_MODULE_NAME: &str = "worker.js";
 
+/// The script name of the isolates that host the shared runtime cells. A
+/// deployed script name is lowercase letters, digits and hyphens, so no script
+/// can take it.
+pub(crate) const RUNTIME_CELL_SCRIPT: &str = "__runtime";
+
+/// The whole module of the runtime-cell isolates. The cells are classes the
+/// harness registers; the module only has to load.
+const RUNTIME_CELL_ENTRY: &str =
+    "export default { fetch() { return new Response(null, { status: 404 }); } };";
+
 /// One queue's push consumer after the owning script has been resolved.
 #[derive(Clone)]
 pub struct QueueConsumerRegistration {
@@ -1782,6 +1792,40 @@ impl WorkerConfig {
             main_imports,
             module_imports,
         }
+    }
+
+    /// The configuration of the isolates that host the shared runtime cells
+    /// (D1, KV and Queue): the engine's own classes and nothing of a tenant.
+    ///
+    /// It has no bundle, no binding, no variable and no module, so no tenant
+    /// code, global or secret is in the heap that serves another script's
+    /// database. It takes the primary script's compatibility settings and node,
+    /// and the deployment's queue catalog, because those are what a queue
+    /// broker reads.
+    pub(crate) fn for_runtime_cells(
+        primary: &WorkerConfig,
+        classes: Vec<String>,
+        queue_catalog: Vec<QueueConsumerRegistration>,
+        generation: crate::generation::GenerationId,
+    ) -> Self {
+        Self::new(WorkerConfigOptions {
+            src: RUNTIME_CELL_ENTRY.to_string(),
+            script_name: RUNTIME_CELL_SCRIPT.to_string(),
+            do_classes: classes,
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            d1_bindings: Vec::new(),
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
+            vars: Vec::new(),
+            node: primary.node.clone(),
+            modules: Vec::new(),
+            compat: primary.compat,
+        })
+        .with_queue_consumers(queue_catalog)
+        .with_generation(generation)
     }
 
     pub fn with_containers(mut self, containers: Vec<crate::container::ContainerSpec>) -> Self {
