@@ -195,6 +195,25 @@ pub fn set_host_handle(handle: tokio::runtime::Handle) {
     );
 }
 
+/// Bind the process runtime for a test binary, once. Tests that touch the
+/// local store share it, because `set_host_handle` runs exactly once per
+/// process and a second caller would panic.
+#[cfg(test)]
+pub(crate) fn install_test_host_runtime() -> tokio::runtime::Handle {
+    static HOST: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    HOST.get_or_init(|| {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("host runtime");
+        set_host_handle(runtime.handle().clone());
+        runtime
+    })
+    .handle()
+    .clone()
+}
+
 /// Return the Tokio handle for the V8 arm.
 pub fn op_handle() -> tokio::runtime::Handle {
     current_domain().owner.handle.clone()

@@ -6900,13 +6900,7 @@ mod seal_absent_log_tests {
     /// The local store runs on the process's execution domain, which a test
     /// binary has to bind once.
     fn run<T>(future: impl std::future::Future<Output = T>) -> T {
-        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-        let runtime = RUNTIME.get_or_init(|| {
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            crate::asyncrt::set_host_handle(runtime.handle().clone());
-            runtime
-        });
-        runtime.block_on(future)
+        crate::asyncrt::install_test_host_runtime().block_on(future)
     }
 
     async fn lease_in(bucket: &Bucket, expires_ms: u64) -> String {
