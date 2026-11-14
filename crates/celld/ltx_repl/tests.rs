@@ -43,13 +43,17 @@ struct Forgetful {
     down: AtomicBool,
 }
 
+fn refused(reason: &'static str) -> celld_ltx::object_store::Error {
+    celld_ltx::object_store::Error::Generic {
+        store: "forgetful",
+        source: reason.into(),
+    }
+}
+
 impl Forgetful {
     fn outage(&self) -> celld_ltx::object_store::Result<()> {
         if self.down.load(Ordering::SeqCst) {
-            return Err(celld_ltx::object_store::Error::Generic {
-                store: "forgetful",
-                source: "the bucket is down".into(),
-            });
+            return Err(refused("the bucket is down"));
         }
         Ok(())
     }
@@ -117,14 +121,8 @@ impl ObjectStore for Forgetful {
         prefix: Option<&ObjPath>,
     ) -> BoxStream<'static, celld_ltx::object_store::Result<ObjectMeta>> {
         self.lists.fetch_add(1, Ordering::SeqCst);
-        if self.outage().is_err() {
-            return futures_util::stream::once(async {
-                Err(celld_ltx::object_store::Error::Generic {
-                    store: "forgetful",
-                    source: "the bucket is down".into(),
-                })
-            })
-            .boxed();
+        if let Err(error) = self.outage() {
+            return futures_util::stream::once(async { Err(error) }).boxed();
         }
         self.inner.list(prefix)
     }
@@ -140,16 +138,13 @@ impl ObjectStore for Forgetful {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 left.checked_sub(1)
             })
-            .is_ok()
-            || self.outage().is_err();
+            .is_ok();
+        if let Err(error) = self.outage() {
+            return futures_util::stream::once(async { Err(error) }).boxed();
+        }
         if failing {
-            return futures_util::stream::once(async {
-                Err(celld_ltx::object_store::Error::Generic {
-                    store: "forgetful",
-                    source: "the listing failed".into(),
-                })
-            })
-            .boxed();
+            return futures_util::stream::once(async { Err(refused("the listing failed")) })
+                .boxed();
         }
         self.inner.list_with_offset(prefix, offset)
     }
