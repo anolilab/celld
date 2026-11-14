@@ -1321,6 +1321,13 @@ impl LtxRepl {
                 Arc::new(crate::local_store::LocalStore::open(&bucket)?)
             }
         };
+        // Saturating: an absurd seconds value must clamp, not wrap through
+        // `as_millis() as u64` into a short deadline.
+        let durability_timeout_ms = crate::env_vars::positive_or(
+            "CELLD_LTX_DURABILITY_TIMEOUT_SECS",
+            DEFAULT_DURABILITY_TIMEOUT_SECS,
+        )?
+        .saturating_mul(1_000);
         // Every per-cell LTX write goes through this store, so wrapping it
         // here puts a durable directory entry in front of the first artifact
         // of each cell. The reader needs no registration, so it holds the
@@ -1332,10 +1339,9 @@ impl LtxRepl {
                 store.clone(),
                 prefix.clone(),
             ));
-            let batch_window = Duration::from_millis(crate::env_vars::with_default(
-                "CELLD_CELL_DIRECTORY_BATCH_MS",
-                0,
-            )?);
+            let batch_ms = crate::env_vars::with_default("CELLD_CELL_DIRECTORY_BATCH_MS", 0)?;
+            crate::cell_directory::check_batch_window(batch_ms, durability_timeout_ms)?;
+            let batch_window = Duration::from_millis(batch_ms);
             let store: Arc<dyn ObjectStore> =
                 Arc::new(crate::cell_directory_registrar::RegisteringStore::new(
                     store,
@@ -1363,13 +1369,6 @@ impl LtxRepl {
         // upload per cell per interval; it is simultaneously the bucket lag
         // budget. 0 disables pacing.
         let flush_ms = crate::env_vars::with_default("CELLD_LOG_FLUSH_MS", 2000)? as u64;
-        // Saturating: an absurd seconds value must clamp, not wrap through
-        // `as_millis() as u64` into a short deadline.
-        let durability_timeout_ms = crate::env_vars::positive_or(
-            "CELLD_LTX_DURABILITY_TIMEOUT_SECS",
-            DEFAULT_DURABILITY_TIMEOUT_SECS,
-        )?
-        .saturating_mul(1_000);
         let compactor = match directory {
             Some(_) => Some((
                 store.clone(),
