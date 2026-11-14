@@ -325,13 +325,26 @@ impl LtxRepl {
         } else {
             retained
         };
-        let renamed = retained != Retained::Nothing && self.preserve_as_evicted(cell, epoch, &db);
         // A resumable database keeps what the next open of this epoch reads
         // beside it: the LTX metadata that carries its writer lineage, and the
         // WAL files that belong to the name it returns to. Every other base is
         // an image for the next epoch, which starts its own lineage and
-        // would otherwise inherit a stale one (#158).
-        if !(renamed && retained == Retained::Resumable) {
+        // would otherwise inherit a stale one (#158). A base whose lineage
+        // survives would also pass for resumable at this epoch, so it is kept
+        // only once its lineage is gone.
+        let retained = if retained == Retained::Base
+            && remove_lineage(self.ltx_host.filesystem().as_ref(), &db).is_err()
+        {
+            warn!(
+                cell,
+                epoch, "removing the lineage beside a base failed; discarding local snapshot"
+            );
+            Retained::Nothing
+        } else {
+            retained
+        };
+        let renamed = retained != Retained::Nothing && self.preserve_as_evicted(cell, epoch, &db);
+        if retained != Retained::Base && !(renamed && retained == Retained::Resumable) {
             let _ = remove_lineage(self.ltx_host.filesystem().as_ref(), &db);
         }
         if retained == Retained::Nothing {

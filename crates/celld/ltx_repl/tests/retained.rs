@@ -691,3 +691,31 @@ fn a_record_is_durable_in_its_directory_once_it_is_renamed_into_place() {
         );
     });
 }
+
+#[test]
+fn a_base_whose_lineage_cannot_be_removed_is_not_kept() {
+    run(async {
+        let (rig, refusals) = rig_refusing();
+        first_lifetime(&rig).await;
+
+        refusals.removal.store(true, Ordering::SeqCst);
+        rig.ltx
+            .evict(CELL, 1, Retained::Base, None)
+            .await
+            .expect("eviction");
+        refusals.removal.store(false, Ordering::SeqCst);
+
+        // The metadata survived, so a kept base would pass for resumable.
+        assert!(meta(&rig, 1).is_dir());
+        assert!(!evicted(&rig, 1).exists());
+        let error = rig
+            .ltx
+            .activate(options(1, false, true))
+            .await
+            .map(|_| ())
+            .expect_err("no resume at the old epoch");
+        assert!(error
+            .downcast_ref::<crate::replication::RetainedUnavailable>()
+            .is_some());
+    });
+}
