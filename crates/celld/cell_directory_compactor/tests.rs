@@ -111,7 +111,7 @@ async fn a_cell_registered_then_compacted_is_found_by_range() {
     assert_eq!(late.segments_deleted, 3);
     assert!(segments(&store).await.is_empty());
 
-    // A node that starts now has an empty tail, so the tiers answer.
+    // A node that starts now holds nothing of its own, so the tiers answer.
     let reader = a.fresh_reader().await;
     for cell in ["c1", "c2", "c3"] {
         assert_eq!(
@@ -915,6 +915,66 @@ async fn a_pass_folds_at_most_its_cap_of_segments_in_key_order() {
                 .await,
             DirectoryAnswer::Exists
         );
+    }
+}
+
+#[tokio::test]
+async fn a_compactor_ignores_what_the_4096_partition_layout_left() {
+    let store = Arc::new(Counting::default());
+    // A segment the old compactor's ledger says it folded, that is still there,
+    // and the head, run and ledger it wrote.
+    put_segment(&store, "node-b/g9/00000000", b"seen-by-old\n").await;
+    let old_partition = partition_of(fingerprint("seen-by-old"));
+    let old_run = format!("fleet-a/fleet/dir/{old_partition:03x}/run/l0-old-00000001");
+    let old_head = format!("fleet-a/fleet/dir/{old_partition:03x}/head");
+    let old_ledger = "fleet-a/fleet/dir/ledger";
+    let bodies: [(&str, Vec<u8>); 3] = [
+        (
+            old_run.as_str(),
+            celld_logic::cell_directory::encode_run(&[Record {
+                fp: fingerprint("only-in-old-runs"),
+                kind: Kind::Born,
+            }]),
+        ),
+        (
+            old_head.as_str(),
+            serde_json::json!({
+                "v": 1, "rev": 9, "merged_at_ms": 5, "l0": {"key": old_run, "count": 1},
+                "l1": null, "l2": null, "watermarks": {}, "retired": []
+            })
+            .to_string()
+            .into_bytes(),
+        ),
+        (
+            old_ledger,
+            br#"{"v":1,"segments":{"fleet-a/fleet/born/node-b/g9/00000000":1}}"#.to_vec(),
+        ),
+    ];
+    for (key, body) in &bodies {
+        store
+            .inner
+            .put(&Path::from(*key), PutPayload::from(body.clone()))
+            .await
+            .unwrap();
+    }
+
+    let report = pass(&store, 1, 1_000).await;
+    assert_eq!(report.segments_folded, 1, "the old ledger must not hide it");
+    let reader = CellDirectory::new(store.clone(), PREFIX.to_owned());
+    let now = after_marker(&store).await;
+    assert_eq!(
+        reader.lookup("seen-by-old", now).await,
+        DirectoryAnswer::Exists
+    );
+    assert_eq!(
+        reader.lookup("only-in-old-runs", now).await,
+        DirectoryAnswer::New,
+        "a run of the old layout was read as a K=256 run"
+    );
+    // The old keys are left exactly as they were.
+    for (key, body) in &bodies {
+        let kept = store.inner.get(&Path::from(*key)).await.unwrap();
+        assert_eq!(&kept.bytes().await.unwrap()[..], &body[..], "{key}");
     }
 }
 
