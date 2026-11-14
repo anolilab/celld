@@ -1047,8 +1047,7 @@ enum Attempt {
 async fn attempt_removal(docker: &Docker, removals: &Removals, entry: &Leftover) -> Attempt {
     match &entry.target {
         Target::Id(id) => match remove_by_id(docker, id).await {
-            Ok(Removal::Gone) => Attempt::Done,
-            Ok(Removal::InProgress) => Attempt::Retry("the removal is in progress".to_string()),
+            Ok(()) => Attempt::Done,
             Err(error) => Attempt::Retry(format!("{error:#}")),
         },
         Target::Label(token) => {
@@ -1058,12 +1057,8 @@ async fn attempt_removal(docker: &Docker, removals: &Removals, entry: &Leftover)
             };
             let mut open = None;
             for id in &ids {
-                match remove_by_id(docker, id).await {
-                    Ok(Removal::Gone) => {}
-                    Ok(Removal::InProgress) => {
-                        open = Some("the removal is in progress".to_string())
-                    }
-                    Err(error) => open = Some(format!("{error:#}")),
+                if let Err(error) = remove_by_id(docker, id).await {
+                    open = Some(format!("{error:#}"));
                 }
             }
             if let Some(reason) = open {
@@ -1114,22 +1109,16 @@ async fn run_removals(docker: Docker, removals: Arc<Removals>) {
     }
 }
 
-/// How the engine answered a removal.
-enum Removal {
-    /// Removed, or there is no such container.
-    Gone,
-    /// The daemon says another removal of it is already in progress.
-    InProgress,
-}
-
-async fn remove_by_id(docker: &Docker, id: &str) -> anyhow::Result<Removal> {
+/// Remove the container with this id. Done when the engine removed it, says
+/// there is no such container (404), or says another removal of it is already
+/// in progress (409), which is the daemon doing what was asked.
+async fn remove_by_id(docker: &Docker, id: &str) -> anyhow::Result<()> {
     let removed = docker
         .call("DELETE", &format!("/containers/{id}?force=true"), None)
         .await
         .context("remove container")?;
     match removed.status.as_u16() {
-        200..=299 | 404 => Ok(Removal::Gone),
-        409 => Ok(Removal::InProgress),
+        200..=299 | 404 | 409 => Ok(()),
         status => Err(anyhow!(
             "remove container failed with [{status}] {}",
             removed.message()
@@ -1458,7 +1447,7 @@ impl ContainerEngine {
     /// worker.
     async fn reap(&self) -> anyhow::Result<()> {
         for id in ids_by_label(&self.docker, &format!("celld.node={}", self.node)).await? {
-            if !matches!(remove_by_id(&self.docker, &id).await, Ok(Removal::Gone)) {
+            if remove_by_id(&self.docker, &id).await.is_err() {
                 self.removals.add("", Target::Id(id));
             }
         }
@@ -1948,20 +1937,14 @@ impl ContainerEngine {
     /// id. One the engine does not confirm gone stays on the engine's list, to
     /// be tried again in the background and by the cell's next start.
     async fn remove_or_note(&self, cell: &CellContainer, run: u64, id: &str) {
-        match remove_by_id(&self.docker, id).await {
-            Ok(Removal::Gone) => {}
-            other => {
-                tracing::warn!(
-                    event = "container_destroy_failed",
-                    cell = %cell.scope,
-                    error = %other.err().map_or_else(
-                        || "the removal is in progress".to_string(),
-                        |error| format!("{error:#}"),
-                    ),
-                    "the container may still exist; the node will try to remove it again"
-                );
-                cell.removals.add(&cell.name, Target::Id(id.to_string()));
-            }
+        if let Err(error) = remove_by_id(&self.docker, id).await {
+            tracing::warn!(
+                event = "container_removal_failed",
+                cell = %cell.scope,
+                error = %format!("{error:#}"),
+                "the container may still exist; the node will try to remove it again"
+            );
+            cell.removals.add(&cell.name, Target::Id(id.to_string()));
         }
         cell.forget_container(run, id);
     }
@@ -1982,7 +1965,7 @@ impl ContainerEngine {
         };
         let target = Target::Id(id.clone());
         cell.removals.add(&cell.name, target.clone());
-        if matches!(remove_by_id(&self.docker, &id).await, Ok(Removal::Gone)) {
+        if remove_by_id(&self.docker, &id).await.is_ok() {
             // The one container the label could find is gone.
             cell.removals.clear(&cell.name, &target);
             cell.removals.clear(&cell.name, &label);
@@ -2041,7 +2024,15 @@ impl ContainerEngine {
             container = %id,
             "a container nothing tracked held the cell's name"
         );
-        matches!(remove_by_id(&self.docker, id).await, Ok(Removal::Gone))
+        // Noted before the removal is asked for, so that a refusal, or this
+        // start being dropped meanwhile, leaves it to the worker.
+        let target = Target::Id(id.to_string());
+        cell.removals.add(&cell.name, target.clone());
+        if remove_by_id(&self.docker, id).await.is_ok() {
+            cell.removals.clear(&cell.name, &target);
+            return true;
+        }
+        false
     }
 
     /// Wait for the container with id `target` to end and publish the exit
@@ -4159,6 +4150,32 @@ mod engine_tests {
             cell.container_id(2).as_deref(),
             live.first().map(String::as_str)
         );
+    }
+
+    // The orphan the start found goes to the worker when the engine refuses to
+    // remove it, and the start still fails on the name.
+    #[test]
+    fn a_refused_orphan_removal_is_left_to_the_worker() {
+        let rig = rig(SHORT_CREATE);
+        let cell = rig.cell("Runner:one");
+        start_with_unanswered_create(&rig, &cell);
+        rig.engine.removals.entries.lock().unwrap().clear();
+        let orphan = rig.fake.live_ids();
+        assert_eq!(orphan.len(), 1);
+        rig.fake.fail_next_delete("daemon is overloaded");
+        let second = cell.begin_run();
+        let started = rig
+            .runtime
+            .block_on(rig.engine.start(&cell, second, Rig::params(None)));
+        assert!(started.is_err(), "the name was free");
+        assert_eq!(
+            rig.engine.removals.pending(),
+            [Target::Id(orphan[0].clone())],
+            "the refused removal was not kept"
+        );
+        rig.wait_for("the worker to remove the orphan", |fake| {
+            fake.live_ids().is_empty()
+        });
     }
 
     #[test]
