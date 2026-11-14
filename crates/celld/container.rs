@@ -3601,7 +3601,10 @@ mod sweep_tests {
         let scope = "Runner:one";
         runtime.block_on(async {
             let cell = engine.attach_cell(scope, spec.clone()).await.unwrap();
-            cell.begin_run();
+            // The run has a container, so a sweep that reached destruction
+            // would send the engine a kill and a removal for it.
+            let run = cell.begin_run();
+            cell.record_container(run, "container-one".to_string());
             cell.set_inactivity(Duration::from_millis(300));
             // An idle eviction keeps the container under its window...
             engine.release(scope, Release::Keep).await;
