@@ -84,7 +84,7 @@ async fn pass(store: &Arc<Counting>, number: u64, now_ms: u64) -> PassReport {
 }
 
 async fn segments(store: &Counting) -> Vec<String> {
-    keys(store, "fleet-a/fleet/born").await
+    keys(store, "fleet-a/fleet/dir/k256/born").await
 }
 
 fn names(cells: &[&str]) -> BTreeSet<String> {
@@ -237,7 +237,7 @@ async fn a_segment_that_cannot_be_read_is_skipped_and_never_deleted() {
     store
         .inner
         .put(
-            &Path::from("fleet-a/fleet/born/node-b/g9/00000000"),
+            &Path::from("fleet-a/fleet/dir/k256/born/node-b/g9/00000000"),
             PutPayload::from_static(&[0xff]),
         )
         .await
@@ -248,13 +248,13 @@ async fn a_segment_that_cannot_be_read_is_skipped_and_never_deleted() {
     pass(&store, 3, 1_000 + 2 * DELETE_GRACE_MS).await;
     assert_eq!(
         segments(&store).await,
-        vec!["fleet-a/fleet/born/node-b/g9/00000000".to_owned()]
+        vec!["fleet-a/fleet/dir/k256/born/node-b/g9/00000000".to_owned()]
     );
     let ledger = read_ledger(store.as_ref(), PREFIX).await.unwrap().unwrap();
     assert!(!ledger
         .value
         .segments
-        .contains_key("fleet-a/fleet/born/node-b/g9/00000000"));
+        .contains_key("fleet-a/fleet/dir/k256/born/node-b/g9/00000000"));
 }
 
 #[tokio::test]
@@ -517,12 +517,16 @@ async fn a_tombstone_the_head_covers_leaves_the_answer_to_the_tiers() {
     // Only the tombstone's segment is left, as when a delete half failed.
     store
         .inner
-        .delete(&Path::from("fleet-a/fleet/born/node-a/gen1/00000000"))
+        .delete(&Path::from(
+            "fleet-a/fleet/dir/k256/born/node-a/gen1/00000000",
+        ))
         .await
         .unwrap();
     store
         .inner
-        .delete(&Path::from("fleet-a/fleet/born/node-a/gen1/00000002"))
+        .delete(&Path::from(
+            "fleet-a/fleet/dir/k256/born/node-a/gen1/00000002",
+        ))
         .await
         .unwrap();
     let reader = a.fresh_reader().await;
@@ -600,7 +604,7 @@ async fn put_segment(store: &Counting, key: &str, body: &[u8]) {
     store
         .inner
         .put(
-            &Path::from(format!("fleet-a/fleet/born/{key}")),
+            &Path::from(format!("fleet-a/fleet/dir/k256/born/{key}")),
             PutPayload::from(body.to_vec()),
         )
         .await
@@ -826,7 +830,7 @@ async fn one_failed_partition_holds_back_only_the_segments_that_touch_it() {
     pass(&store, 3, 2_000 + 10 * DELETE_GRACE_MS).await;
     assert_eq!(
         segments(&store).await,
-        vec!["fleet-a/fleet/born/node-b/g9/00000001".to_owned()]
+        vec!["fleet-a/fleet/dir/k256/born/node-b/g9/00000001".to_owned()]
     );
     // The segment that could not be folded is by now older than the blind
     // window, so the marker no longer vouches for anything; the other cell is
@@ -955,7 +959,7 @@ async fn a_compactor_ignores_what_the_4096_partition_layout_left() {
         ),
         (
             old_ledger,
-            br#"{"v":1,"segments":{"fleet-a/fleet/born/node-b/g9/00000000":1}}"#.to_vec(),
+            br#"{"v":1,"segments":{"fleet-a/fleet/dir/k256/born/node-b/g9/00000000":1}}"#.to_vec(),
         ),
     ];
     for (key, body) in &bodies {
@@ -984,6 +988,63 @@ async fn a_compactor_ignores_what_the_4096_partition_layout_left() {
         let kept = store.inner.get(&Path::from(*key)).await.unwrap();
         assert_eq!(&kept.bytes().await.unwrap()[..], &body[..], "{key}");
     }
+}
+
+#[tokio::test]
+async fn the_compactor_neither_folds_nor_deletes_segments_of_the_layout_before_it() {
+    let store = Arc::new(Counting::default());
+    let a = node(&store, "node-a", "gen1");
+    // What nodes and a compactor of the previous layout keep: their segments
+    // under `fleet/born/`, with a nested name that a recursive listing of it
+    // reads as a node.
+    let before = [
+        ("fleet-a/fleet/born/node-b/g9/00000000", "old-cell\n"),
+        (
+            "fleet-a/fleet/born/k256/node-b/g9/00000000",
+            "nested-cell\n",
+        ),
+    ];
+    for (key, body) in before {
+        store
+            .inner
+            .put(&Path::from(key), PutPayload::from(body.as_bytes().to_vec()))
+            .await
+            .unwrap();
+    }
+    a.write_ltx("new-cell").await;
+
+    pass(&store, 1, 1_000).await;
+    pass(&store, 2, 1_000 + 10 * DELETE_GRACE_MS).await;
+    pass(&store, 3, 1_000 + 20 * DELETE_GRACE_MS).await;
+    for (key, body) in before {
+        let kept = store.inner.get(&Path::from(key)).await.unwrap();
+        assert_eq!(&kept.bytes().await.unwrap()[..], body.as_bytes(), "{key}");
+    }
+    let reader = a.fresh_reader().await;
+    let now = after_marker(&store).await;
+    assert_eq!(
+        reader.lookup("new-cell", now).await,
+        DirectoryAnswer::Exists
+    );
+    for cell in ["old-cell", "nested-cell"] {
+        assert_eq!(
+            reader.lookup(cell, now).await,
+            DirectoryAnswer::New,
+            "{cell}: a segment of the previous layout was folded"
+        );
+    }
+    assert!(
+        segments(&store).await.is_empty(),
+        "this layout's own segments are deleted once folded"
+    );
+}
+
+#[test]
+fn the_lease_is_under_the_directorys_own_root() {
+    assert_eq!(
+        LEASE_KEY,
+        format!("{}/compactor-lease", crate::cell_directory_runs::root())
+    );
 }
 
 async fn marker(store: &Counting) -> Marker {
@@ -1066,7 +1127,9 @@ async fn the_marker_age_counts_segments_a_pass_left_unfolded() {
     // Remove the broken segment: nothing is unfolded, and the age is the floor.
     store
         .inner
-        .delete(&Path::from("fleet-a/fleet/born/node-b/g9/00000002"))
+        .delete(&Path::from(
+            "fleet-a/fleet/dir/k256/born/node-b/g9/00000002",
+        ))
         .await
         .unwrap();
     compact_pass_capped(store.as_ref(), PREFIX, GEN, 4, &|| 181_000, 2)

@@ -1,8 +1,10 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! Compaction of the cell directory: folds the segments under `fleet/born/`
-//! into the partitioned runs under `fleet/dir/k256/`. It is the only reader of
-//! segments.
+//! Compaction of the cell directory: folds the segments under
+//! `fleet/dir/k256/born/` into the partitioned runs under `fleet/dir/k256/`. It
+//! is the only reader of segments. Everything it lists, reads, writes and deletes
+//! is under that root, so a compactor of another layout, running beside it
+//! during a rollout, shares no lease, ledger or segment with it.
 //!
 //! One pass lists the segments, reads those not yet folded, buckets their
 //! entries by partition, and rewrites each touched partition: the delta tier
@@ -46,7 +48,7 @@ use crate::cell_directory_runs::{
     encode_json, head_key, ledger_key, publish_marker, put_if, read_head, read_ledger, read_run,
     run_key, runs_root, stream_name, write_run, Cas, Head, Ledger, Retired, RunRef, Versioned,
 };
-use crate::cell_directory_segments::{fingerprint, parse_segment_key, read_segment};
+use crate::cell_directory_segments::{born_root, fingerprint, parse_segment_key, read_segment};
 use celld_logic::cell_directory::{
     decode_run, merge_records, oldest_unfolded_age_ms, partition_of, plan_merge, supersedes, Kind,
     MergePlan, Op, Record, PARTITIONS,
@@ -190,7 +192,7 @@ pub(crate) async fn compact_pass_capped(
 ) -> anyhow::Result<PassReport> {
     let now_ms = clock();
     let mut report = PassReport::default();
-    let root = Path::from(format!("{prefix}fleet/born"));
+    let root = Path::from(born_root(prefix));
     let mut listing = store.list(Some(&root));
     let mut listed = Vec::new();
     while let Some(meta) = listing.next().await {
@@ -828,8 +830,9 @@ impl Pass<'_> {
 }
 
 /// The lease the compactor is elected by. It is not the waker role: every node
-/// takes that, and only a node that runs the directory compacts.
-pub(crate) const LEASE_KEY: &str = "fleet/dir/compactor-lease";
+/// takes that, and only a node that runs the directory compacts. It is under the
+/// directory's root, so a compactor of another layout holds a lease of its own.
+pub(crate) const LEASE_KEY: &str = "fleet/dir/k256/compactor-lease";
 
 /// When the compactor runs.
 pub(crate) struct Schedule {

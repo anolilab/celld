@@ -3,7 +3,7 @@
 //! The fleet directory of cells that have per-cell LTX.
 //!
 //! A node that writes LTX for a cell registers the cell in a create-only
-//! segment, `fleet/born/<node>/<generation>/<seq:08>`, before the cell's first
+//! segment, `fleet/dir/k256/born/<node>/<generation>/<seq:08>`, before the cell's first
 //! LTX object exists. The registration is queued when the cell is first claimed
 //! and written by a background flusher every batch window, so a first write
 //! waits only when its segment is not durable yet (see
@@ -811,7 +811,7 @@ mod tests {
         assert_eq!(
             counting.born_requests.load(Ordering::SeqCst),
             0,
-            "a lookup touched fleet/born/"
+            "a lookup touched the segments"
         );
     }
 
@@ -1054,7 +1054,7 @@ mod tests {
         put_segment(
             &inner,
             &format!("{PREFIX}fleet/dir/ledger"),
-            br#"{"v":1,"segments":{"fleet-a/fleet/born/node-a/gen0/00000000":1}}"#,
+            br#"{"v":1,"segments":{"fleet-a/fleet/dir/k256/born/node-a/gen0/00000000":1}}"#,
         )
         .await;
         // A marker is published for the new layout, with no head for the

@@ -135,11 +135,11 @@ fn directory_load() -> Tally {
     let mut add = |kind: &str, key: &str, count: u64| {
         load.insert((kind.to_owned(), key.to_owned(), Part::Shared), count);
     };
-    add("PUT", "fleet/born/node-#/*/#", 10);
-    add("GET", "fleet/born/node-#/*/#", 20);
-    add("BATCH_DELETE", "(batch) fleet/born/node-#/*/#", 2);
-    add("PUT", "fleet/dir/#/run/rec-*-#", 6);
-    add("GET", "fleet/dir/#/head", 40);
+    add("PUT", "fleet/dir/k#/born/node-#/*/#", 10);
+    add("GET", "fleet/dir/k#/born/node-#/*/#", 20);
+    add("BATCH_DELETE", "(batch) fleet/dir/k#/born/node-#/*/#", 2);
+    add("PUT", "fleet/dir/k#/#/run/rec-*-#", 6);
+    add("GET", "fleet/dir/k#/#/head", 40);
     add("PUT", "nodes/node-#.json", 999);
     load
 }

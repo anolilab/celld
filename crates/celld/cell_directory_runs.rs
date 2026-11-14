@@ -30,9 +30,11 @@ const FORMAT: u32 = 2;
 
 const _: () = assert!(PARTITIONS <= 256, "a partition is two hex digits in a key");
 
-/// Below the fleet prefix: everything the compacted layout of this partition
-/// count holds.
-fn root() -> String {
+/// Below the fleet prefix: everything the directory of this partition count
+/// holds, its segments and its lease as well as its heads, runs, ledger and
+/// marker. Another layout's keys are never listed, read, written or deleted
+/// from here, nor these from there.
+pub(crate) fn root() -> String {
     format!("fleet/dir/k{PARTITIONS}")
 }
 
@@ -459,7 +461,7 @@ pub(crate) mod testing {
         pub whole_gets: AtomicUsize,
         pub lists: AtomicUsize,
         pub puts: AtomicUsize,
-        /// Requests of any kind that name something under `fleet/born/`.
+        /// Requests of any kind that name a directory segment.
         pub born_requests: AtomicUsize,
         /// Segment writes wait for a permit, when set. A permit is consumed by
         /// the write that takes it.
@@ -508,7 +510,7 @@ pub(crate) mod testing {
         }
 
         fn note_born(&self, path: &str) {
-            if path.contains("fleet/born") {
+            if path.ends_with("/born") || path.contains("/born/") {
                 self.born_requests.fetch_add(1, Ordering::SeqCst);
             }
         }
@@ -551,7 +553,7 @@ pub(crate) mod testing {
             self.puts.fetch_add(1, Ordering::SeqCst);
             self.note_born(location.as_ref());
             let gate = self.segment_gate.lock().unwrap().clone();
-            if let Some(gate) = gate.filter(|_| location.as_ref().contains("fleet/born")) {
+            if let Some(gate) = gate.filter(|_| location.as_ref().contains("/born/")) {
                 gate.acquire().await.expect("the gate stays open").forget();
             }
             if self.dropping_puts.load(Ordering::SeqCst) {

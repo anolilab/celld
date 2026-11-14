@@ -517,7 +517,7 @@ pub(crate) mod testing {
     /// Every segment, with its born cells; tombstones are prefixed with `-`.
     pub(crate) async fn segments(inner: &InMemory) -> Vec<(String, Vec<String>)> {
         let mut found = Vec::new();
-        let mut listing = inner.list(Some(&Path::from("fleet-a/fleet/born")));
+        let mut listing = inner.list(Some(&Path::from("fleet-a/fleet/dir/k256/born")));
         while let Some(meta) = listing.next().await {
             let location = meta.unwrap().location;
             let body = inner.get(&location).await.unwrap().bytes().await.unwrap();
@@ -566,7 +566,7 @@ mod tests {
         assert_eq!(
             segments(&inner).await,
             [(
-                "fleet-a/fleet/born/node-a/gen1/00000000".to_owned(),
+                "fleet-a/fleet/dir/k256/born/node-a/gen1/00000000".to_owned(),
                 vec!["c1".to_owned()]
             )]
         );
@@ -655,7 +655,12 @@ mod tests {
         let store = store_over(&inner, &directory);
         // The create-only key of the first segment is taken, so the write of
         // the registration is refused.
-        put_segment(&inner, "fleet-a/fleet/born/node-a/gen1/00000000", b"").await;
+        put_segment(
+            &inner,
+            "fleet-a/fleet/dir/k256/born/node-a/gen1/00000000",
+            b"",
+        )
+        .await;
 
         let ltx = Path::from("fleet-a/cells/c1/ltx/e1/0000/0001.ltx");
         store
@@ -683,7 +688,12 @@ mod tests {
         let inner = Arc::new(InMemory::new());
         let store = Arc::new(store_over(&inner, &directory_over(&inner)));
         // The first segment's key is taken, so the first flush fails.
-        put_segment(&inner, "fleet-a/fleet/born/node-a/gen1/00000000", b"").await;
+        put_segment(
+            &inner,
+            "fleet-a/fleet/dir/k256/born/node-a/gen1/00000000",
+            b"",
+        )
+        .await;
         let in_flight = store.registrar.flushing.lock().await;
         let mut writes = Box::pin(futures_util::future::join_all((0..4).map(|index| {
             let store = store.clone();
@@ -927,7 +937,12 @@ mod tests {
         // A flush in flight holds the cell, so it is out of the queue.
         registrar.pending.lock().unwrap().waiting.clear();
         // The segment key the write's flush uses is taken, so it fails.
-        put_segment(&inner, "fleet-a/fleet/born/node-a/gen1/00000000", b"").await;
+        put_segment(
+            &inner,
+            "fleet-a/fleet/dir/k256/born/node-a/gen1/00000000",
+            b"",
+        )
+        .await;
         let ltx = Path::from("fleet-a/cells/c1/ltx/e1/0000/0001.ltx");
         store
             .put(&ltx, PutPayload::from_static(b"x"))
@@ -972,7 +987,7 @@ mod tests {
             // The first segment's key is taken, so the first flush fails.
             put_segment(
                 &node.counting.inner,
-                "fleet-a/fleet/born/node-a/gen1/00000000",
+                "fleet-a/fleet/dir/k256/born/node-a/gen1/00000000",
                 b"",
             )
             .await;
@@ -1099,7 +1114,12 @@ mod tests {
         let store = store_over(&inner, &directory);
         ltx_put(&store, "c1").await;
         // The next sequence number is taken, so the tombstone write fails.
-        put_segment(&inner, "fleet-a/fleet/born/node-a/gen1/00000001", b"").await;
+        put_segment(
+            &inner,
+            "fleet-a/fleet/dir/k256/born/node-a/gen1/00000001",
+            b"",
+        )
+        .await;
         store
             .registrar()
             .tombstone(&names(&["c1"]))
