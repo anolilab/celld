@@ -833,6 +833,38 @@ impl CellContainer {
     }
 }
 
+/// What `ContainerEngine::attach` answers: the activation's claim on the
+/// cell's container until the cell is registered. See `attach`.
+#[must_use = "an activation that drops this without keep() leaves its container to the idle sweep"]
+pub struct Attached {
+    engine: Arc<ContainerEngine>,
+    scope: String,
+    kept: bool,
+}
+
+impl Attached {
+    /// The cell is registered: its object owns the container from here, and a
+    /// stop releases it.
+    pub fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        let Some(cell) = self.engine.cell(&self.scope) else {
+            return;
+        };
+        // A cell with no container has nothing to sweep.
+        if cell.observe().1.is_some() {
+            self.engine.arm_sweep(cell);
+        }
+    }
+}
+
 /// Held by whatever drives the start of a run. If it is dropped before the
 /// start settled, the run ends as failed; see `CellContainer::abandon_start`.
 pub struct StartGuard {
@@ -1692,9 +1724,29 @@ impl ContainerEngine {
     /// The cell's container handle, adopting a container a previous
     /// activation on this node left running. Called at cell start for a
     /// class with a spec; the object's `running` reads the answer.
-    pub async fn attach(&self, scope: &str, class: &str) -> anyhow::Result<Arc<CellContainer>> {
+    ///
+    /// The activation holds the answer until the cell is registered and calls
+    /// `keep()`. One that is dropped first, because the start failed or was
+    /// cancelled, leaves the container to an idle sweep, as an eviction does:
+    /// the attach cancelled the sweep the last eviction armed, and nothing
+    /// else would arm another for a container that has no owner.
+    pub async fn attach(self: &Arc<Self>, scope: &str, class: &str) -> anyhow::Result<Attached> {
         let spec = spec(class).ok_or_else(|| anyhow!("class {class} has no container"))?;
-        self.attach_cell(scope, spec).await
+        self.attach_with(scope, spec).await
+    }
+
+    async fn attach_with(
+        self: &Arc<Self>,
+        scope: &str,
+        spec: Arc<ContainerSpec>,
+    ) -> anyhow::Result<Attached> {
+        let attached = Attached {
+            engine: self.clone(),
+            scope: scope.to_string(),
+            kept: false,
+        };
+        self.attach_cell(scope, spec).await?;
+        Ok(attached)
     }
 
     async fn attach_cell(
@@ -2377,23 +2429,27 @@ impl ContainerEngine {
             return;
         };
         match release {
-            Release::Keep => {
-                let (window, armed) = {
-                    let mut state = cell.state.lock().unwrap();
-                    state.sweep += 1;
-                    (state.inactivity.unwrap_or(DEFAULT_INACTIVITY), state.sweep)
-                };
-                let engine = self.clone();
-                asyncrt::spawn(async move {
-                    asyncrt::sleep(window).await;
-                    if cell.state.lock().unwrap().sweep == armed {
-                        engine.forget(&cell).await;
-                    }
-                })
-                .detach();
-            }
+            Release::Keep => self.arm_sweep(cell),
             Release::Destroy => self.forget(&cell).await,
         }
+    }
+
+    /// Destroy the cell's container when its inactivity window ends, unless
+    /// the cell is attached again first.
+    fn arm_sweep(self: &Arc<Self>, cell: Arc<CellContainer>) {
+        let (window, armed) = {
+            let mut state = cell.state.lock().unwrap();
+            state.sweep += 1;
+            (state.inactivity.unwrap_or(DEFAULT_INACTIVITY), state.sweep)
+        };
+        let engine = self.clone();
+        asyncrt::spawn(async move {
+            asyncrt::sleep(window).await;
+            if cell.state.lock().unwrap().sweep == armed {
+                engine.forget(&cell).await;
+            }
+        })
+        .detach();
     }
 
     async fn forget(&self, cell: &Arc<CellContainer>) {
@@ -4176,6 +4232,46 @@ mod engine_tests {
         rig.wait_for("the worker to remove the orphan", |fake| {
             fake.live_ids().is_empty()
         });
+    }
+
+    // A cell that came back inside its window and then failed to start has no
+    // owner for its container, and nothing may leave it past its window.
+    #[test]
+    fn a_container_of_a_cell_whose_start_failed_is_removed_after_its_window() {
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
+        let scope = "Runner:one";
+        let cell = rig.cell(scope);
+        rig.start(&cell);
+        cell.set_inactivity(Duration::from_millis(300));
+        let spec = cell.spec.clone();
+        rig.runtime.block_on(async {
+            // An idle eviction keeps the container under its window, and the
+            // object comes back inside it, and its start fails.
+            rig.engine.release(scope, Release::Keep).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(rig.engine.attach_with(scope, spec).await.unwrap());
+        });
+        rig.wait_for("the container to go after its window", |fake| {
+            fake.live_ids().is_empty()
+        });
+    }
+
+    // One whose start went on is the activation's now, and no sweep is armed.
+    #[test]
+    fn a_container_of_a_cell_whose_start_went_on_stays() {
+        let rig = rig(crate::docker::LIFECYCLE_TIMEOUT);
+        let scope = "Runner:one";
+        let cell = rig.cell(scope);
+        rig.start(&cell);
+        cell.set_inactivity(Duration::from_millis(300));
+        let spec = cell.spec.clone();
+        rig.runtime.block_on(async {
+            rig.engine.release(scope, Release::Keep).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            rig.engine.attach_with(scope, spec).await.unwrap().keep();
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        });
+        assert_eq!(rig.fake.live_ids().len(), 1);
     }
 
     #[test]
