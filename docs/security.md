@@ -40,7 +40,8 @@ path, so an operator request cannot become an application request.
 The internal listener has three request groups, and all three require the
 trusted private network:
 
-- Most operator routes have no request authentication.
+- Most operator routes have no request authentication, unless you set
+  [`CELLD_OPERATOR_TOKEN`](#require-an-operator-token), which gates every route.
 - `/peer/tunnel` opens a tunnel for cell fetch, RPC, and WebSocket calls. The
   establishment request carries the fleet HMAC, a clock limit, and replay
   protection. The calls inside the tunnel are plain, unsigned HTTP.
@@ -51,10 +52,51 @@ Every path to a runtime class therefore demands the fleet secret. The HMAC
 does not authenticate tunnel bytes after establishment and does not encrypt
 traffic, so it does not replace the private network.
 
+## Require an operator token
+
+Set `CELLD_OPERATOR_TOKEN` on every node to require
+`Authorization: Bearer <token>` on every request to the internal listener.
+The check runs before routing, so each route answers 401 without the token:
+the operator routes, the peer routes, the `/runtime/<SCOPE>` route, and a
+path celld does not serve. No route is exempt. Use the public health endpoint,
+`/.well-known/celld/health`, for probes. The public listener does not check
+the token. Peer routes still verify the fleet HMAC after the token.
+
+```sh
+export CELLD_OPERATOR_TOKEN="$(openssl rand -hex 32)"
+celld --bucket s3://my-bucket ...
+curl -H "Authorization: Bearer $CELLD_OPERATOR_TOKEN" http://127.0.0.1:8081/state
+```
+
+The value must be printable ASCII with no whitespace. celld refuses to start
+on an empty value, on surrounding whitespace, and on any other unusable
+value, so a mistake does not leave the listener open. Unset the variable to
+leave the listener without a token, as before. celld compares the token in
+constant time.
+
+Every in-tree client reads the same variable and sends the token: peer
+forwarding, handoff, abort, the log tier, the signed probe, `celld diagnose`,
+`celld d1`, `celld kv`, `celld queue` and the `celld dev` shutdown request. Set
+the same value on every node and in the environment of every operator command.
+During a rolling change, nodes with different values answer 401 to each other,
+so set the value on all nodes in one step, or stop the fleet first. A node on
+a release that predates this variable never sends the token, so it gets 401
+from a node that has it set.
+
+celld removes the `Authorization` header from an accepted internal request
+before it reaches a handler. A caller of `/do/<ID>` therefore cannot pass its
+own `Authorization` header to the Durable Object while the token is set.
+
+The token authenticates the caller of the internal listener. It does not
+encrypt traffic, so keep the listener on a trusted private network. A Worker
+that calls the internal port with `fetch()` gets a 401 on every route, unless
+it holds the token.
+
 ## Use the internal operator API
 
 The operator API is an alpha interface. A release can change its paths or
-response formats. These routes do not authenticate the caller:
+response formats. Without `CELLD_OPERATOR_TOKEN`, these routes do not
+authenticate the caller:
 
 - `/state` reports node state.
 - `/cell/<SCOPE>` resolves or activates a cell.

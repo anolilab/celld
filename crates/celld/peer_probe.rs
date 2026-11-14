@@ -325,4 +325,28 @@ mod tests {
             .respond("node-a", ADVERTISE, &"AB".repeat(32))
             .is_err());
     }
+
+    #[tokio::test]
+    async fn the_probe_carries_the_operator_token() {
+        let stub = crate::test_stub::Recorder::start().await;
+        let token =
+            crate::operator_token::OperatorToken::parse(std::ffi::OsStr::new("tok-5")).unwrap();
+        let auth = crate::peer_auth::PeerAuth::new([2; 32], "diagnostic")
+            .unwrap()
+            .with_operator_token(Some(token));
+        let node: crate::ownership_store::NodeLeaseWire =
+            serde_json::from_value(serde_json::json!({
+                "node": "node-a",
+                "expires_ms": 0,
+                "addr": stub.addr(),
+                "probe_public_key": PUBLIC_KEY,
+                "peer_protocol": crate::peer_auth::PROTOCOL_VERSION,
+            }))
+            .unwrap();
+        assert!(probe(&reqwest::Client::new(), &node, &auth).await.is_err());
+        assert_eq!(
+            stub.authorizations(),
+            vec![Some("Bearer tok-5".to_string())]
+        );
+    }
 }

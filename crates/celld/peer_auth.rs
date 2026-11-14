@@ -4,6 +4,7 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use crate::bucket::Bucket;
+use crate::operator_token::OperatorToken;
 use anyhow::{anyhow, Context};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
@@ -60,6 +61,10 @@ struct CanonicalRequest<'a> {
 pub struct PeerAuth {
     key: [u8; 32],
     source: String,
+    /// `CELLD_OPERATOR_TOKEN`, read once. Every request this signs carries it
+    /// as a bearer credential, and the internal listener checks it on every
+    /// request when it is set.
+    operator_token: Option<OperatorToken>,
     replay: Mutex<ReplayCache>,
 }
 
@@ -102,6 +107,7 @@ impl PeerAuth {
         Ok(Self {
             key,
             source,
+            operator_token: OperatorToken::from_env()?,
             replay: Mutex::new(ReplayCache {
                 entries: HashMap::new(),
                 checks: 0,
@@ -111,6 +117,18 @@ impl PeerAuth {
 
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// Replace the operator token read from the environment.
+    #[must_use]
+    pub fn with_operator_token(mut self, token: Option<OperatorToken>) -> Self {
+        self.operator_token = token;
+        self
+    }
+
+    /// The token the internal listener of this node requires, when set.
+    pub fn operator_token(&self) -> Option<&OperatorToken> {
+        self.operator_token.as_ref()
     }
 
     pub fn sign(
@@ -158,6 +176,9 @@ impl PeerAuth {
         };
         let signature = self.signature(&canonical);
         let mut headers = axum::http::HeaderMap::new();
+        if let Some(token) = &self.operator_token {
+            headers.insert(axum::http::header::AUTHORIZATION, token.bearer());
+        }
         for (name, value) in [
             (RESPONSE_VERSION_HEADER, PROTOCOL_VERSION_TEXT.to_string()),
             (HEADER_SOURCE, self.source.clone()),
@@ -528,5 +549,35 @@ mod tests {
         // above came from the clock check.
         let fresh = resign(now_ms().unwrap());
         verify(&auth, &fresh, b"payload").expect("a fresh timestamp verifies");
+    }
+}
+
+#[cfg(test)]
+mod operator_token_tests {
+    use super::*;
+
+    fn token(value: &str) -> OperatorToken {
+        OperatorToken::parse(std::ffi::OsStr::new(value)).unwrap()
+    }
+
+    #[test]
+    fn signed_headers_carry_the_operator_token() {
+        let auth = PeerAuth::new([1; 32], "node-a")
+            .unwrap()
+            .with_operator_token(Some(token("tok")));
+        let headers = auth.signed_headers("GET", "/state", b"", "node-b").unwrap();
+        let value = headers.get(axum::http::header::AUTHORIZATION).unwrap();
+        assert_eq!(value, "Bearer tok");
+        assert!(value.is_sensitive());
+        assert!(auth.operator_token().unwrap().authorizes(&headers));
+    }
+
+    #[test]
+    fn signed_headers_omit_it_when_unset() {
+        let auth = PeerAuth::new([1; 32], "node-a")
+            .unwrap()
+            .with_operator_token(None);
+        let headers = auth.signed_headers("GET", "/state", b"", "node-b").unwrap();
+        assert!(!headers.contains_key(axum::http::header::AUTHORIZATION));
     }
 }

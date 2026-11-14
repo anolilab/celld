@@ -348,6 +348,10 @@ ENVIRONMENT:
   CELLD_ASSET_CACHE_BYTES         Asset cache limit
 
 TUNING:
+  CELLD_OPERATOR_TOKEN            Bearer token every internal-listener request
+                                  must send; the celld commands that call it
+                                  send it too. Same value on every node
+                                  (default: unset, no token)
   CELLD_TTL_MS                    Node lease lifetime (default: 10000)
   CELLD_OPERATION_DEADLINE_MS     Non-restore operation deadline (default: 15000)
   CELLD_SHUTDOWN_TOTAL_MS         Complete process stop bound (default: {shutdown_total_ms})

@@ -6841,3 +6841,7 @@ impl NodeLogManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "node_log/operator_token_tests.rs"]
+mod operator_token_tests;
