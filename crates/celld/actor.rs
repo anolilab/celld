@@ -2387,6 +2387,7 @@ impl Actor {
                     )?,
                     idle_evict_ms: crate::env_vars::positive::<u64>("CELLD_IDLE_EVICT_S")?
                         .map(|seconds| seconds.saturating_mul(1_000)),
+                    resume_dormant_local: false,
                     pressure: pressure_config_from_environment()?,
                     max_outbound_websockets: crate::env_vars::positive_or(
                         "CELLD_MAX_OUTBOUND_WEBSOCKETS",

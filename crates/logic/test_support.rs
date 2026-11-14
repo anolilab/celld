@@ -20,6 +20,7 @@ pub(crate) fn config() -> Config {
         owner_log_recovery_attempts: 3,
         alarm_resident_ms: 0,
         idle_evict_ms: None,
+        resume_dormant_local: false,
         pressure: pressure::PressureConfig::default(),
     }
 }
