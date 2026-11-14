@@ -48,8 +48,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use scenarios::{
-    born, directory_requests, effective_env, idle_window, plan, read_state, runs, sum_answers,
-    Scenario, BASELINE, SCENARIOS,
+    born, bundle_sample, directory_requests, effective_env, idle_window, is_baseline,
+    per_agent_requests, plan, read_state, retention_json, runs, sum_answers, sum_storage,
+    BundleSample, Scenario, SCENARIOS,
 };
 use serde_json::{json, Value};
 use support::{
@@ -113,7 +114,7 @@ fn main() {
 fn idle_of(results: &[ScenarioResult], nodes: usize) -> Option<(Tally, Duration)> {
     results
         .iter()
-        .find(|r| r.name == BASELINE && r.report.nodes == nodes)
+        .find(|r| is_baseline(r.name) && r.report.nodes == nodes)
         .map(|r| (r.report.load.clone(), r.report.elapsed))
 }
 
@@ -128,6 +129,10 @@ struct ScenarioResult {
     setup: Tally,
     /// The answers the directory gave the claim guard, from every node.
     answers: Value,
+    /// The nodes' storage counters, summed, with the shares they give.
+    storage: Value,
+    /// The retained node-log bundles the nodes reported while the run went on.
+    retention: Value,
 }
 
 /// The compactor reads its ledger once per pass and nothing else reads it. The
@@ -174,6 +179,8 @@ impl ScenarioResult {
         if !self.answers.is_null() {
             text += &format!("  cell directory answers: {}\n", self.answers);
         }
+        text += &format!("  storage counters: {}\n", self.storage);
+        text += &format!("  retained bundles: {}\n", self.retention);
         text
     }
 }
@@ -244,6 +251,7 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
 
     let started = Instant::now();
     let base = proxy.take();
+    let sampler = sample_retention(&client, &nodes);
     let bases: Vec<String> = nodes.iter().map(|n| n.public.clone()).collect();
     let agents = if scenario.agents { settings.agents } else { 0 };
     let errors = if scenario.agents {
@@ -277,7 +285,8 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
     };
     let elapsed = started.elapsed();
     let load = diff(&proxy.take(), &base).unwrap_or_else(|e| panic!("{e}"));
-    let answers = directory_answers(&client, &nodes).await;
+    let retention = sampler.finish();
+    let states = read_states(&client, &nodes).await;
     drop(nodes);
     ScenarioResult {
         name: scenario.name,
@@ -294,20 +303,63 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
             .into_iter()
             .filter(|((_, shape, _), _)| born(shape) || runs(shape))
             .collect(),
-        answers,
+        answers: sum_answers(&states),
+        storage: sum_storage(&states, agents),
+        retention,
     }
 }
 
-/// What the nodes counted of the cell directory's answers beside the claim
-/// listing. `Null` when every node answered `/state` and none runs a directory;
-/// otherwise the totals say how many nodes they cover, so a node that could
-/// not be read never passes as a complete count.
-async fn directory_answers(client: &reqwest::Client, nodes: &[Node]) -> Value {
+/// Every node's `/state`, `None` for one that cannot be read. What a node
+/// counted of the cell directory's answers is `Null` when every node answered
+/// and none runs a directory; otherwise the totals say how many nodes they
+/// cover, so a node that could not be read never passes as a complete count.
+async fn read_states(client: &reqwest::Client, nodes: &[Node]) -> Vec<Option<Value>> {
     let mut states = Vec::new();
     for node in nodes {
         states.push(read_state(client, &format!("{}/state", node.internal)).await);
     }
-    sum_answers(&states)
+    states
+}
+
+/// How often the retained bundles of the nodes are read while a run goes on.
+const RETENTION_SAMPLE: Duration = Duration::from_secs(2);
+
+/// Reads every node's retained bundles every `RETENTION_SAMPLE` until
+/// `finish`.
+struct RetentionSampler {
+    task: tokio::task::JoinHandle<()>,
+    samples: std::sync::Arc<std::sync::Mutex<Vec<BundleSample>>>,
+}
+
+impl RetentionSampler {
+    fn finish(self) -> Value {
+        self.task.abort();
+        retention_json(&self.samples.lock().unwrap())
+    }
+}
+
+fn sample_retention(client: &reqwest::Client, nodes: &[Node]) -> RetentionSampler {
+    let samples = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let urls: Vec<String> = nodes
+        .iter()
+        .map(|node| format!("{}/state", node.internal))
+        .collect();
+    let (client, shared) = (client.clone(), samples.clone());
+    let task = tokio::spawn(async move {
+        loop {
+            for url in &urls {
+                if let Some(sample) = read_state(&client, url)
+                    .await
+                    .as_ref()
+                    .and_then(bundle_sample)
+                {
+                    shared.lock().unwrap().push(sample);
+                }
+            }
+            tokio::time::sleep(RETENTION_SAMPLE).await;
+        }
+    });
+    RetentionSampler { task, samples }
 }
 
 /// One `celld` fleet node in its own process group, stopped on drop.
@@ -425,6 +477,9 @@ fn write_json(settings: &Settings, results: &[ScenarioResult]) {
                 .collect();
             directory["answers"] = r.answers.clone();
             scenario["cell_directory"] = directory;
+            scenario["per_agent_requests"] = per_agent_requests(&r.report.load, r.report.agents);
+            scenario["storage_counters"] = r.storage.clone();
+            scenario["retained_bundles"] = r.retention.clone();
             scenario
         }).collect::<Vec<Value>>(),
     });

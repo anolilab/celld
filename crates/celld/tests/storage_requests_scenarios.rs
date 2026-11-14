@@ -14,8 +14,9 @@ mod support;
 use std::time::Duration;
 
 use scenarios::{
-    directory_requests, effective_env, idle_window, plan, read_state, sum_answers, Scenario,
-    BASELINE, SCENARIOS,
+    bundle_sample, directory_requests, effective_env, idle_window, per_agent_requests, plan,
+    read_state, retention_json, sum_answers, sum_storage, BundleSample, Scenario, BASELINE,
+    SCENARIOS,
 };
 use serde_json::{json, Value};
 use support::{Part, Tally};
@@ -48,8 +49,26 @@ fn a_filter_that_leaves_out_the_baseline_still_runs_it_before_the_scenario() {
 }
 
 #[test]
-fn a_filter_that_names_the_baseline_runs_it_once() {
-    assert_eq!(names(Some("fleet_evict")), [BASELINE, "fleet_evict"]);
+fn a_filter_that_names_the_baseline_runs_it_once_for_each_node_count() {
+    assert_eq!(
+        names(Some("fleet_evict")),
+        [
+            BASELINE,
+            "fleet_evict",
+            "fleet_evict_idle_4n",
+            "fleet_evict_4n"
+        ]
+    );
+}
+
+#[test]
+fn a_four_node_scenario_is_priced_against_the_four_node_baseline() {
+    assert_eq!(
+        names(Some("fleet_evict_4n")),
+        ["fleet_evict_idle_4n", "fleet_evict_4n"]
+    );
+    assert_eq!(scenario("fleet_evict_idle_4n").nodes, 4);
+    assert_eq!(scenario("fleet_evict_4n").nodes, 4);
 }
 
 #[test]
@@ -221,4 +240,141 @@ async fn a_node_that_does_not_answer_is_unreadable() {
         read_state(&reqwest::Client::new(), "http://127.0.0.1:1/state").await,
         None
     );
+}
+
+fn counters(minted: u64, claims: u64, first: u64, evictions: [u64; 5]) -> Option<Value> {
+    let [snapshot, paged, over_budget, publish_failed, empty] = evictions;
+    Some(json!({
+        "storage_counters": {
+            "ids_minted": minted,
+            "claims": claims,
+            "first_claims": first,
+            "evictions": {
+                "snapshot": snapshot,
+                "paged": paged,
+                "over_budget": over_budget,
+                "publish_failed": publish_failed,
+                "empty": empty,
+            },
+        }
+    }))
+}
+
+#[test]
+fn storage_counters_are_summed_over_the_nodes_into_shares() {
+    let total = sum_storage(
+        &[
+            counters(0, 100, 100, [90, 4, 3, 2, 1]),
+            counters(0, 100, 100, [90, 4, 3, 2, 1]),
+        ],
+        200,
+    );
+    assert_eq!(total["first_claims"], 200);
+    assert_eq!(total["claims"], 200);
+    assert_eq!(total["first_claim_share_of_claims"], 1.0);
+    assert_eq!(total["minted_share_of_first_claims"], 0.0);
+    assert_eq!(total["evictions"]["total"], 200);
+    assert_eq!(total["evicted_share"], 1.0);
+    assert_eq!(total["evictions_exceed_agents"], false);
+    assert_eq!(total["snapshot_share_of_evictions"], 0.9);
+    assert_eq!(total["nodes_counted"], 2);
+    assert_eq!(total["nodes_unreadable"], 0);
+}
+
+#[test]
+fn a_failed_publish_is_packable_and_a_paged_or_oversized_cell_is_not() {
+    let total = sum_storage(&[counters(0, 10, 10, [6, 1, 1, 2, 0])], 10);
+    assert_eq!(total["packable_share"], 0.8);
+}
+
+#[test]
+fn more_evictions_than_agents_is_flagged() {
+    let total = sum_storage(&[counters(0, 3, 3, [5, 0, 0, 0, 0])], 3);
+    assert_eq!(total["evictions_exceed_agents"], true);
+}
+
+#[test]
+fn a_share_with_nothing_to_divide_by_is_null_not_zero() {
+    let total = sum_storage(&[counters(0, 0, 0, [0; 5])], 0);
+    assert_eq!(total["first_claim_share_of_claims"], Value::Null);
+    assert_eq!(total["minted_share_of_first_claims"], Value::Null);
+    assert_eq!(total["evicted_share"], Value::Null);
+    assert_eq!(total["packable_share"], Value::Null);
+}
+
+#[test]
+fn a_node_without_counters_is_unreadable_not_zero() {
+    let total = sum_storage(&[counters(0, 4, 4, [0; 5]), None, Some(json!({}))], 4);
+    assert_eq!(total["nodes_counted"], 1);
+    assert_eq!(total["nodes_unreadable"], 2);
+}
+
+#[test]
+fn minted_ids_are_a_share_of_first_claims() {
+    let total = sum_storage(&[counters(25, 100, 100, [0; 5])], 100);
+    assert_eq!(total["minted_share_of_first_claims"], 0.25);
+}
+
+fn sampled(count: u64, oldest_age_ms: Option<u64>) -> BundleSample {
+    BundleSample {
+        count,
+        oldest_age_ms,
+    }
+}
+
+#[test]
+fn a_state_without_a_node_log_has_no_bundle_sample() {
+    let state = json!({ "storage_counters": { "retained_bundles": null } });
+    assert_eq!(bundle_sample(&state), None);
+    let state = json!({
+        "storage_counters": { "retained_bundles": { "count": 3, "oldest_age_ms": 4200 } }
+    });
+    assert_eq!(bundle_sample(&state), Some(sampled(3, Some(4200))));
+    let state = json!({
+        "storage_counters": { "retained_bundles": { "count": 0, "oldest_age_ms": null } }
+    });
+    assert_eq!(bundle_sample(&state), Some(sampled(0, None)));
+}
+
+#[test]
+fn retention_reports_the_ages_of_the_samples_that_have_a_bundle() {
+    let samples: Vec<BundleSample> = (1..=100)
+        .map(|n| sampled(n, Some(n * 1000)))
+        .chain([sampled(0, None)])
+        .collect();
+    let retention = retention_json(&samples);
+    assert_eq!(retention["samples"], 101);
+    assert_eq!(retention["samples_without_bundles"], 1);
+    assert_eq!(retention["oldest_age_s_p50"], 50.0);
+    assert_eq!(retention["oldest_age_s_p99"], 99.0);
+    assert_eq!(retention["oldest_age_s_max"], 100.0);
+    assert_eq!(retention["count_max"], 100);
+}
+
+#[test]
+fn retention_without_samples_has_no_ages() {
+    let retention = retention_json(&[]);
+    assert_eq!(retention["samples"], 0);
+    assert_eq!(retention["oldest_age_s_p50"], Value::Null);
+    assert_eq!(retention["oldest_age_s_max"], Value::Null);
+}
+
+#[test]
+fn per_agent_requests_list_only_the_agents_keys_by_class() {
+    let mut load = Tally::new();
+    let mut add = |kind: &str, key: &str, part: Part, count: u64| {
+        load.insert((kind.to_owned(), key.to_owned(), part), count);
+    };
+    add("PUT", "cells/*/own.json", Part::Agent, 200);
+    add("GET", "cells/*/own.json", Part::Agent, 100);
+    add("PUT", "nodes/node-#.json", Part::Background, 999);
+    let requests = per_agent_requests(&load, 100);
+    let rows = requests.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let get = rows.iter().find(|row| row["kind"] == "GET").unwrap();
+    assert_eq!(get["class"], "B");
+    assert_eq!(get["per_agent"], 1.0);
+    let put = rows.iter().find(|row| row["kind"] == "PUT").unwrap();
+    assert_eq!(put["class"], "A");
+    assert_eq!(put["per_agent"], 2.0);
 }

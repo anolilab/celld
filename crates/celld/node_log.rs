@@ -308,6 +308,8 @@ const BUNDLE_ROW_INDEX_CAPACITY: usize = 512;
 const BUNDLE_GC_EXAMINED_PER_TICK: usize = 512;
 
 struct IndexedBundle {
+    /// When this node wrote the bundle, on the monotonic clock.
+    written_mono_ms: u64,
     cells: BTreeSet<String>,
     rows: Option<Vec<celld_ltx::bundle::BundleRow>>,
 }
@@ -345,6 +347,7 @@ impl BundleIndex {
         let previous = self.bundles.insert(
             key.clone(),
             IndexedBundle {
+                written_mono_ms: mono_ms(),
                 cells,
                 rows: Some(rows),
             },
@@ -371,6 +374,20 @@ impl BundleIndex {
 
     fn rows(&self, key: &str) -> Option<Vec<celld_ltx::bundle::BundleRow>> {
         self.bundles.get(key).and_then(|bundle| bundle.rows.clone())
+    }
+
+    /// How many bundles this node still holds, and how long ago it wrote the
+    /// oldest of them.
+    fn retained(&self, now_mono_ms: u64) -> (usize, Option<u64>) {
+        let oldest = self
+            .bundles
+            .values()
+            .map(|bundle| bundle.written_mono_ms)
+            .min();
+        (
+            self.bundles.len(),
+            oldest.map(|written| now_mono_ms.saturating_sub(written)),
+        )
     }
 
     fn bundles_for(&self, cell: &str) -> Vec<(String, Option<Vec<celld_ltx::bundle::BundleRow>>)> {
@@ -6648,6 +6665,12 @@ impl NodeLogManager {
                 false
             }
         }
+    }
+
+    /// The bundles of this session that bundle GC has not deleted, and the age
+    /// of the oldest in milliseconds.
+    pub(crate) fn retained_bundles(&self) -> (usize, Option<u64>) {
+        self.bundle_index.lock().unwrap().retained(mono_ms())
     }
 
     pub(crate) fn bundle_active(&self) -> bool {

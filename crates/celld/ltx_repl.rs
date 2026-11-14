@@ -56,6 +56,7 @@ use crate::replication::RestoredSnapshot;
 use crate::replication::StorageCredentials;
 use crate::replication::SyncWait;
 use crate::replication::{EvictionAbandon, EvictionRestoreArtifact};
+use crate::storage_counters::EvictionOutcome;
 use celld_logic::durability::{proof_deadline, ProofProgress, ProofWait};
 
 /// Max cells uploading concurrently across the node. Caps blocking-pool threads
@@ -827,6 +828,9 @@ struct Cell {
     /// this epoch proves durability through the L0 chain instead of building
     /// and timing out on the same snapshot again.
     snapshot_declined: AtomicBool,
+    /// The reason for `snapshot_declined` that is the image's size, as opposed
+    /// to a snapshot that failed to publish. Only the eviction counters read it.
+    snapshot_over_budget: AtomicBool,
     /// The paged VFS registered for this activation (paged restore only). The
     /// local db is then a sparse cache of the cut: every reader of the file
     /// must go through this VFS, the file is not a reusable eviction baseline,
@@ -2664,6 +2668,7 @@ impl LtxRepl {
         let compaction_queue = self.compaction_queue.as_ref().zip(resume_cut);
         let handle = Arc::new(Cell {
             snapshot_declined: AtomicBool::new(false),
+            snapshot_over_budget: AtomicBool::new(false),
             paged_vfs: paged_vfs_name.clone(),
             hydration: hydration.clone(),
             replica: Mutex::new(Some(replica)),
@@ -3380,6 +3385,23 @@ impl LtxRepl {
             elapsed_ms = asyncrt::mono_ms().saturating_sub(barrier_started_mono_ms),
             "final durability barrier passed"
         );
+        crate::storage_counters::evicted(match artifact {
+            EvictionRestoreArtifact::Snapshot => EvictionOutcome::Snapshot,
+            EvictionRestoreArtifact::L0Chain if handle.paged_vfs.is_some() => {
+                EvictionOutcome::Paged
+            }
+            EvictionRestoreArtifact::L0Chain
+                if handle.snapshot_over_budget.load(Ordering::Relaxed) =>
+            {
+                EvictionOutcome::OverBudget
+            }
+            EvictionRestoreArtifact::L0Chain
+                if handle.snapshot_declined.load(Ordering::Relaxed) =>
+            {
+                EvictionOutcome::PublishFailed
+            }
+            EvictionRestoreArtifact::L0Chain => EvictionOutcome::Empty,
+        });
 
         // A reopened handle compacts from the snapshot, so the record of its
         // end goes beside the database. A record that cannot be written leaves
@@ -3719,6 +3741,9 @@ impl LtxRepl {
                 Err(_) if data.len() >= budget => {
                     snapshot_handle
                         .snapshot_declined
+                        .store(true, Ordering::Relaxed);
+                    snapshot_handle
+                        .snapshot_over_budget
                         .store(true, Ordering::Relaxed);
                     return Ok(None);
                 }
