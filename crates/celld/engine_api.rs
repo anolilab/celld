@@ -621,9 +621,11 @@ pub(crate) enum StopMode {
     /// `abandon` travels with `preserve_local` because an eviction that could
     /// be abandoned and an eviction that keeps a local base are the same
     /// eviction: the one a live node can change its mind about. A drain and a
-    /// fence carry neither.
+    /// fence carry neither. `resumable` asks the base to keep what a wake at
+    /// the same epoch reopens it with.
     Evict {
         preserve_local: bool,
+        resumable: bool,
         abandon: Option<Arc<crate::replication::EvictionAbandon>>,
     },
     /// Prove the final position and retain it for the successor epoch.

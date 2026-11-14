@@ -241,6 +241,25 @@ impl PreservedCache {
         Ok(())
     }
 
+    /// Remove what a retained snapshot kept beside it. A snapshot that was
+    /// kept for a same-epoch wake has the LTX metadata and WAL files of its
+    /// live name next to it; without the snapshot they describe nothing, and
+    /// a wake that finds the snapshot gone claims the next epoch instead.
+    fn remove_beside(&self, snapshot: &std::path::Path) {
+        if snapshot.extension().is_none_or(|ext| ext != "evicted") {
+            return;
+        }
+        let live = snapshot.with_extension("sqlite");
+        let _ = self
+            .filesystem
+            .remove_dir_all(&celld_ltx::Db::meta_path_for_path(&live));
+        for suffix in ["-wal", "-shm"] {
+            let mut sibling = live.clone().into_os_string();
+            sibling.push(suffix);
+            let _ = self.filesystem.remove_file(&PathBuf::from(sibling));
+        }
+    }
+
     /// Drop a snapshot that has been consumed or deleted.
     pub(crate) fn forget(&mut self, path: &std::path::Path) {
         if let Some(entry) = self.entries.remove(path) {
@@ -306,10 +325,12 @@ impl PreservedCache {
             for index in plan {
                 match self.filesystem.remove_file(&paths[index]) {
                     Ok(()) => {
+                        self.remove_beside(&paths[index]);
                         self.forget(&paths[index]);
                         evicted += 1;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        self.remove_beside(&paths[index]);
                         self.forget(&paths[index]);
                         evicted += 1;
                     }

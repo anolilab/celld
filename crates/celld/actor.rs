@@ -1903,6 +1903,9 @@ pub struct Actor {
     peer_http: reqwest::Client,
     peer_auth: Arc<PeerAuth>,
     operation_deadline_ms: u64,
+    /// Whether an eviction that keeps the cell on this node also keeps what a
+    /// wake at the same epoch reopens: `Config::resume_dormant_local`.
+    resume_dormant_local: bool,
     /// The abandon signal of every eviction stop now in flight, by its op.
     ///
     /// Only a bounded eviction has an entry, because only a bounded eviction
@@ -2348,6 +2351,7 @@ impl Actor {
         };
         let ttl_ms = crate::env_vars::positive_or("CELLD_TTL_MS", 10_000)?;
         let operation_deadline_ms = operation_deadline_ms()?;
+        let resume_dormant_local = crate::env_vars::flag("CELLD_RESUME_DORMANT_LOCAL", false)?;
         let lease_spec = NodeLeaseSpec {
             // Startup has already resolved the environment and CLI settings
             // into this validated internal address. Reading the environment
@@ -2388,7 +2392,7 @@ impl Actor {
                     )?,
                     idle_evict_ms: crate::env_vars::positive::<u64>("CELLD_IDLE_EVICT_S")?
                         .map(|seconds| seconds.saturating_mul(1_000)),
-                    resume_dormant_local: false,
+                    resume_dormant_local,
                     pressure: pressure_config_from_environment()?,
                     max_outbound_websockets: crate::env_vars::positive_or(
                         "CELLD_MAX_OUTBOUND_WEBSOCKETS",
@@ -2409,6 +2413,7 @@ impl Actor {
             peer_http,
             peer_auth,
             operation_deadline_ms,
+            resume_dormant_local,
             eviction_abandons: BTreeMap::new(),
             handoff_directory: Arc::new(Mutex::new(HandoffDirectory::default())),
             host,
@@ -3866,6 +3871,7 @@ impl Actor {
                     let stop_mode = match cause {
                         StopCause::Evict { rebalance } => crate::runtime::StopMode::Evict {
                             preserve_local: !rebalance,
+                            resumable: self.resume_dormant_local && !rebalance,
                             abandon,
                         },
                         StopCause::Cleanup => crate::runtime::StopMode::Rebase,

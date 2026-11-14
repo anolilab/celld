@@ -710,6 +710,31 @@ impl ObjectStoreClient {
             .map_err(map_os_error)
     }
 
+    /// Whether some object under the replica epoch prefix holds `txid`: a file
+    /// at any level whose range contains it. An epoch can hold several full
+    /// snapshots, and a later eviction publishes its own, so "any object" says
+    /// nothing about the transactions the newest closed database holds.
+    ///
+    /// Transaction zero asks only for an object. Like [`Self::has_any_object`]
+    /// the listing stops at the first match.
+    pub async fn covers_txid(&self, txid: TXID) -> Result<bool> {
+        if txid == TXID(0) {
+            return self.has_any_object().await;
+        }
+        let store = self.store().await?;
+        let prefix = ObjPath::from(self.root_prefix());
+        let mut listed = store.list(Some(&prefix));
+        while let Some(meta) = listed.try_next().await.map_err(map_os_error)? {
+            let name = meta.location.filename().unwrap_or("");
+            if let Ok((min_txid, max_txid)) = ltx::parse_filename(name) {
+                if min_txid <= txid && txid <= max_txid {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Build the S3 key for an LTX file: `{path}/{level:04x}/{min}-{max}.ltx`.
     /// Ported from s3/replica_client.go:629, 677, 1040-1042.
     fn ltx_key(&self, level: i32, min_txid: TXID, max_txid: TXID) -> String {

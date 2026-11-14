@@ -4897,8 +4897,18 @@ impl State {
             unreachable!()
         };
         let epoch = spec.epoch;
+        let dormant_resume = spec.resume_local && !cell.resume_demand;
         let mut resume_failed = false;
         match result {
+            Err(_) if dormant_resume => {
+                // The host could not reopen the database this process kept
+                // (a paged cell leaves no reusable file, and the cache can
+                // drop one), so the wake goes through the ownership record
+                // like any other. The caller never learns that the shortcut
+                // was tried.
+                cell.resumable = false;
+                self.begin_cold_route(&id, &mut cell, ColdStart::ReadOwner, effects);
+            }
             Ok(outcome) => {
                 cell.restore_failed = false;
                 if outcome.restored {

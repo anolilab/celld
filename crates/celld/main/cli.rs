@@ -367,6 +367,8 @@ TUNING:
   CELLD_PLACEMENT_WEIGHT          Relative ownership share (default: the
                                   CPU count)
   CELLD_IDLE_EVICT_S              Idle-cell eviction age (disabled unless set)
+  CELLD_RESUME_DORMANT_LOCAL      `1`: wake an evicted cell at its own epoch from
+                                  the database kept on disk (default: 0)
   CELLD_EGRESS                    `public` refuses Worker fetch(), connect() and
                                   WebSocket dials to non-public addresses
                                   (default: open)

@@ -16,6 +16,8 @@ pub(crate) struct Shell {
     owners: BTreeMap<CellId, Epoch>,
     /// Restores of these cells fail, as when the replica cannot be read.
     pub failing_restores: BTreeSet<CellId>,
+    /// Cells whose same-epoch resume fails while every other restore works.
+    pub failing_resumes: BTreeSet<CellId>,
     next_request: RequestId,
     /// The monotonic and wall clock, in milliseconds, advanced per event.
     pub now: u64,
@@ -34,6 +36,7 @@ impl Shell {
             inbox: Vec::new(),
             owners: BTreeMap::new(),
             failing_restores: BTreeSet::new(),
+            failing_resumes: BTreeSet::new(),
             next_request: 1,
             now: 1_000_000,
         }
@@ -47,6 +50,7 @@ impl Shell {
             inbox: Vec::new(),
             owners: BTreeMap::new(),
             failing_restores: BTreeSet::new(),
+            failing_resumes: BTreeSet::new(),
             next_request: 1,
             now: 1_000_000,
         };
@@ -169,9 +173,11 @@ impl Shell {
                         result: Ok(CasOutcome::Applied),
                     }
                 }
-                Effect::Restore { op, cell, .. } => Event::RestoreCompleted {
+                Effect::Restore { op, cell, spec } => Event::RestoreCompleted {
                     op,
-                    result: if self.failing_restores.contains(&cell) {
+                    result: if self.failing_restores.contains(&cell)
+                        || (spec.resume_local && self.failing_resumes.contains(&cell))
+                    {
                         Err(Failure::Definite)
                     } else {
                         Ok(RestoreOutcome {

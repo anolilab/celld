@@ -1448,9 +1448,15 @@ impl RuntimeManager {
                 // instead of trying again.
                 StopMode::Evict {
                     preserve_local,
+                    resumable,
                     abandon,
                 } => replication
-                    .evict(cell, epoch, *preserve_local, abandon.as_deref())
+                    .evict(
+                        cell,
+                        epoch,
+                        crate::ltx_repl::Retained::of_stop(*preserve_local, *resumable),
+                        abandon.as_deref(),
+                    )
                     .await
                     .map(|_| ()),
                 StopMode::Rebase => replication.release(cell, epoch).await,
@@ -1470,13 +1476,22 @@ impl RuntimeManager {
                     return Ok(());
                 }
                 match mode {
-                    // A facet keeps no local file past an eviction: its handler
-                    // writes through a connection of its own, which can outlive
-                    // the root's stop, and a preserved file would become the
-                    // next activation's baseline. The root is gone by now, so
-                    // the eviction is not abandoned.
-                    StopMode::Evict { .. } => replication
-                        .evict(&facet, epoch, false, None)
+                    // A facet keeps no local file past an eviction that gives
+                    // the cell away: its handler writes through a connection of
+                    // its own, which can outlive the root's stop, and a
+                    // preserved file would become the next activation's
+                    // baseline. One that keeps the root dormant here retains
+                    // it for the root's own wake, which reopens the facet at
+                    // the same epoch and has no remote image to restore
+                    // instead. The root is gone by now, so the eviction is not
+                    // abandoned.
+                    StopMode::Evict { resumable, .. } => replication
+                        .evict(
+                            &facet,
+                            epoch,
+                            crate::ltx_repl::Retained::of_stop(*resumable, *resumable),
+                            None,
+                        )
                         .await
                         .map(|_| ()),
                     StopMode::Rebase => replication.release(&facet, epoch).await,

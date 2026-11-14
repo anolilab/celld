@@ -152,11 +152,11 @@ impl Replication {
         &self,
         cell: &str,
         epoch: u64,
-        preserve_local: bool,
+        retained: crate::ltx_repl::Retained,
         abandon: Option<&crate::replication::EvictionAbandon>,
     ) -> anyhow::Result<()> {
         self.ltx
-            .evict(cell, epoch, preserve_local, abandon)
+            .evict(cell, epoch, retained, abandon)
             .await
             .map(|_| ())
     }

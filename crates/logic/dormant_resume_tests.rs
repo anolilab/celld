@@ -461,3 +461,19 @@ fn a_queued_wake_after_an_interrupted_stop_keeps_the_promise() {
     ));
     assert!(shell.state.resumable(CELL));
 }
+
+#[test]
+fn a_resume_the_host_cannot_open_claims_the_next_epoch_in_the_same_wake() {
+    let mut shell = dormant(config());
+    shell.failing_resumes.insert(CELL.into());
+
+    let effects = wake_by_request(&mut shell);
+    assert_eq!(resume_restore(&effects).map(|spec| spec.epoch), Some(1));
+    shell.settle();
+
+    assert!(matches!(
+        shell.state.phase(CELL),
+        Some(Phase::Resident { epoch: 2 })
+    ));
+    assert!(!shell.state.resumable(CELL));
+}
