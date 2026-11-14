@@ -197,18 +197,21 @@ BENCH_BASE_URL=http://127.0.0.1:8787 BENCH_PIDS=12345 BENCH_IDLE_S=15 \
 
 | Phase        | What it measures                                                                  |
 | ------------ | --------------------------------------------------------------------------------- |
-| `memory`     | Resident set of the process ids in `BENCH_PIDS` (and their children, each process counted once) at zero agents, after one, and after `BENCH_MEM_AGENTS` (500) live agents. The slope is KiB per live agent; the idle figure shows what is kept after eviction. A listed process that is not running fails the phase. |
+| `memory`     | Resident set of the process ids in `BENCH_PIDS` (and their children, each process counted once) at zero agents, after one, and after `BENCH_MEM_AGENTS` (500) live agents. The slope is KiB per live agent. The "after idle wait" figure is the resident set after waiting longer than the idle time and the eviction time; it is not a measure of an evicted state, since the harness cannot see an eviction. A listed process that is not running fails the phase. |
 | `cold`       | First request to each of `BENCH_COLD_AGENTS` (100) agents that have never been seen. |
 | `warm`       | `BENCH_WARM_REQUESTS` (1000) sequential requests to one agent, after 20 warm-up requests. At least one warm-up request must succeed, or the phase fails: otherwise a measured request could create the agent. |
-| `wake`       | `BENCH_WAKE_AGENTS` (50) agents are created, idle for `BENCH_IDLE_S` (15 s), and requested again. |
-| `throughput` | `BENCH_CONCURRENCY` (32) connections for `BENCH_SECONDS` (10) after a 2 s warm-up, once on one agent and once over `BENCH_THROUGHPUT_AGENTS` (256). |
+| `wake`       | `BENCH_WAKE_AGENTS` (50) agents are created, idle for `BENCH_IDLE_S` (15 s), and requested again. With `BENCH_EVICT_S` set, `BENCH_IDLE_S` must be at least `BENCH_EVICT_S` plus `BENCH_EVICT_SLACK_S` (5 s), or the phase fails. |
+| `throughput` | `BENCH_CONCURRENCY` (32) connections for `BENCH_SECONDS` (10) after a 2 s warm-up, once on one agent and once over `BENCH_THROUGHPUT_AGENTS` (256). Not measured when creating the agents and the warm-up take as long as the eviction time (`BENCH_EVICT_S`, else `BENCH_IDLE_S`): some agents may be gone. |
 
 `BENCH_PHASES` picks phases (default all); an unknown name is an error. Latency is from send to the last
 body byte and is reported as nearest-rank p50, p95 and p99. A throughput
 request counts when it finishes inside the measured window, and a phase whose
 agents could not all be created is not measured. Set
-`BENCH_IDLE_S` above the server's idle eviction time. If it is shorter, the
-`wake` phase measures a warm request, and the report cannot tell. What a wake
+`BENCH_IDLE_S` above the server's idle eviction time. The harness is generic and
+cannot see whether a server evicted an agent: it can only check these settings
+against each other. If the idle time is shorter than the eviction time, `wake`
+measures a warm request and nothing in the report says so, so a wake sample
+close to the warm latency means the agent was not evicted. What a wake
 does depends on what the server keeps: a process that reopens a local file and
 one that restores from a bucket do different work. Say which one a number is.
 
@@ -217,8 +220,7 @@ default order does. Creating the agents must take less than the server's idle
 eviction time, or early agents are gone before the sample and the slope would
 be too small; set `BENCH_EVICT_S` to that time (without it, `BENCH_IDLE_S` is
 used as the limit). A run that takes longer reports no slope: lower
-`BENCH_MEM_AGENTS`. With `BENCH_EVICT_S` set, `wake` also checks that
-`BENCH_IDLE_S` is above it. Pass every process that holds agents in `BENCH_PIDS`
+`BENCH_MEM_AGENTS`. Pass every process that holds agents in `BENCH_PIDS`
 (a host process and its workers, for example); child processes of a listed pid
 are added. The total includes the runtime and the code, so read the per-agent
 slope, not the absolute figure.

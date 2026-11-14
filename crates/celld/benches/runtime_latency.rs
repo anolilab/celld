@@ -20,9 +20,14 @@
 //! - `warm`: `BENCH_WARM_REQUESTS` requests to one agent after a warm-up.
 //! - `wake`: `BENCH_WAKE_AGENTS` agents are created, left idle for
 //!   `BENCH_IDLE_S`, then requested again. Set `BENCH_IDLE_S` above the
-//!   server's idle eviction time, or this measures a warm request.
+//!   server's idle eviction time, or this measures a warm request. With
+//!   `BENCH_EVICT_S` set, `BENCH_IDLE_S` must be at least `BENCH_EVICT_S` plus
+//!   `BENCH_EVICT_SLACK_S` (5 s). The harness cannot see an eviction happen:
+//!   a wake sample close to the warm latency means the agent was not evicted.
 //! - `throughput`: `BENCH_CONCURRENCY` connections for `BENCH_SECONDS`, once
-//!   on a single agent and once spread over `BENCH_THROUGHPUT_AGENTS`.
+//!   on a single agent and once spread over `BENCH_THROUGHPUT_AGENTS`. Not
+//!   measured when creating the agents and the 2 s warm-up take as long as
+//!   the eviction time (`BENCH_EVICT_S`, else `BENCH_IDLE_S`).
 //!
 //! Latency is from send to the last body byte, as nearest-rank p50/p95/p99.
 //! `BENCH_BASE_URL` may list several nodes, comma-separated; requests go
@@ -30,7 +35,7 @@
 //! `BENCH_OUT` is the JSON file. A phase that cannot be measured, or that
 //! fails every request, is recorded in the JSON with its reason, and the run
 //! exits non-zero after writing it. `BENCH_EVICT_S` is the server's idle
-//! eviction time, when known; `wake` then needs `BENCH_IDLE_S` above it.
+//! eviction time, when known.
 
 // The load generator drives other processes from the outside, so it is not
 // part of the execution boundary that the disallowed-methods policy protects.
@@ -43,8 +48,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 use support::{
-    base_urls, env_text, git, memory_slope, out, parse_phases, percentile_us, positive,
-    require_warmup, rss_kib, run_id, target_dir, window_position, WindowPosition,
+    base_urls, env_text, git, idle_wait, memory_slope, out, parse_phases, percentile_us, positive,
+    require_idle_past_eviction, require_resident, require_warmup, rss_kib, run_id, target_dir,
+    window_position, WindowPosition,
 };
 use tokio::sync::Semaphore;
 
@@ -57,6 +63,7 @@ struct Settings {
     wake_agents: usize,
     idle: Duration,
     evict: Option<Duration>,
+    slack: Duration,
     concurrency: usize,
     seconds: u64,
     throughput_agents: usize,
@@ -127,6 +134,7 @@ fn main() {
         wake_agents: positive("BENCH_WAKE_AGENTS", 50),
         idle: Duration::from_secs(positive("BENCH_IDLE_S", 15)),
         evict: env_text("BENCH_EVICT_S").map(|_| Duration::from_secs(positive("BENCH_EVICT_S", 1))),
+        slack: Duration::from_secs(positive("BENCH_EVICT_SLACK_S", 5)),
         concurrency: positive("BENCH_CONCURRENCY", 32),
         seconds: positive("BENCH_SECONDS", 10),
         throughput_agents: positive("BENCH_THROUGHPUT_AGENTS", 256),
@@ -195,6 +203,7 @@ fn main() {
             "wake_agents": settings.wake_agents,
             "idle_s": settings.idle.as_secs(),
             "evict_s": settings.evict.map(|d| d.as_secs()),
+            "evict_slack_s": settings.slack.as_secs(),
             "concurrency": settings.concurrency,
             "seconds": settings.seconds,
             "throughput_agents": settings.throughput_agents,
@@ -339,13 +348,14 @@ async fn measure_memory(
     let limit = settings.evict.unwrap_or(settings.idle);
     let per_agent = memory_slope(one, live, n, creation, limit)?;
     stats.insert("kib_per_agent".into(), json!(per_agent));
-    // After the agents are evicted, what the server keeps.
-    tokio::time::sleep(settings.idle + Duration::from_secs(3)).await;
-    let after_idle = rss_kib(&settings.pids)?;
-    stats.insert("rss_kib_after_idle".into(), json!(after_idle));
+    // What the server holds after an idle wait. The harness cannot see an
+    // eviction, so this is not a measure of an evicted state.
+    tokio::time::sleep(idle_wait(settings.idle, settings.evict, settings.slack)).await;
+    let after_idle_wait = rss_kib(&settings.pids)?;
+    stats.insert("rss_kib_after_idle_wait".into(), json!(after_idle_wait));
     out(&format!(
         "memory: start {at_start} KiB, 1 agent {one} KiB, {n} agents {live} KiB \
-         ({per_agent:.1} KiB per agent, created in {:.1} s), after idle {after_idle} KiB\n",
+         ({per_agent:.1} KiB per agent, created in {:.1} s), after idle wait {after_idle_wait} KiB\n",
         creation.as_secs_f64()
     ));
     Ok(())
@@ -384,11 +394,8 @@ async fn warm(settings: &Settings, client: &reqwest::Client) -> Outcome {
 }
 
 async fn wake(settings: &Settings, client: &reqwest::Client) -> Outcome {
-    if settings.evict.is_some_and(|evict| settings.idle <= evict) {
-        return Outcome::invalid(
-            json!({}),
-            "BENCH_IDLE_S must be above BENCH_EVICT_S, or the agents are not evicted".to_owned(),
-        );
+    if let Err(reason) = require_idle_past_eviction(settings.idle, settings.evict, settings.slack) {
+        return Outcome::invalid(json!({}), reason);
     }
     let urls: Vec<String> = (0..settings.wake_agents)
         .map(|i| settings.url(&format!("{}-wake-{i}", settings.run), i))
@@ -416,7 +423,8 @@ async fn wake(settings: &Settings, client: &reqwest::Client) -> Outcome {
 /// starts. A request counts when it finishes inside the measured window, so
 /// the rate divides by the window it was counted in. If an agent cannot be
 /// created the phase is not measured: its first request would land in the
-/// window as cold work.
+/// window as cold work. Nor is it when creating the agents and the warm-up
+/// take as long as the server keeps an idle one, since some may be gone.
 async fn throughput(
     settings: &Settings,
     client: &reqwest::Client,
@@ -429,7 +437,9 @@ async fn throughput(
             .map(|i| settings.url(&format!("{}-{name}-{i}", settings.run), i))
             .collect(),
     );
+    let creating = Instant::now();
     let created = create(client, urls.to_vec(), settings.concurrency).await;
+    let creation = creating.elapsed();
     if created.errors > 0 {
         return Outcome::invalid(
             json!({ "agents_failed": created.errors, "agents": agents }),
@@ -437,6 +447,13 @@ async fn throughput(
         );
     }
     let warmup = Duration::from_secs(2);
+    let limit = settings.evict.unwrap_or(settings.idle);
+    if let Err(reason) = require_resident(creation, warmup, limit) {
+        return Outcome::invalid(
+            json!({ "agents": agents, "creation_s": creation.as_secs_f64() }),
+            reason,
+        );
+    }
     let window = Duration::from_secs(settings.seconds);
     let started = Instant::now();
     let mut tasks = Vec::new();
@@ -471,5 +488,6 @@ async fn throughput(
     outcome.stats["window_s"] = json!(window.as_secs_f64());
     outcome.stats["concurrency"] = json!(settings.concurrency);
     outcome.stats["agents"] = json!(agents);
+    outcome.stats["creation_s"] = json!(creation.as_secs_f64());
     outcome
 }

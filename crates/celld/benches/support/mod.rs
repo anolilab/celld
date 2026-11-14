@@ -895,6 +895,53 @@ pub fn window_position(at: Duration, warmup: Duration, window: Duration) -> Wind
     }
 }
 
+/// Whether agents idle for `idle` are past the server's idle eviction time
+/// `evict` by at least `slack`. The harness cannot see an eviction happen, so
+/// this only checks the settings: with no `evict` it cannot check anything.
+pub fn require_idle_past_eviction(
+    idle: Duration,
+    evict: Option<Duration>,
+    slack: Duration,
+) -> Result<(), String> {
+    match evict {
+        Some(evict) if idle < evict + slack => Err(format!(
+            "BENCH_IDLE_S is {} s, under BENCH_EVICT_S {} s plus BENCH_EVICT_SLACK_S {} s, \
+             so the agents may not be evicted",
+            idle.as_secs(),
+            evict.as_secs(),
+            slack.as_secs()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Whether agents created over `creation`, then left through a `warmup`
+/// before their first request in a measured window, are all still resident:
+/// the span must stay under `limit`, the longest an idle agent is kept.
+pub fn require_resident(
+    creation: Duration,
+    warmup: Duration,
+    limit: Duration,
+) -> Result<(), String> {
+    if creation + warmup >= limit {
+        return Err(format!(
+            "creating the agents took {:.1} s and the warm-up {:.1} s, not under the {:.1} s they \
+             stay resident when idle, so some may have been evicted before they were measured",
+            creation.as_secs_f64(),
+            warmup.as_secs_f64(),
+            limit.as_secs_f64()
+        ));
+    }
+    Ok(())
+}
+
+/// How long to wait before the memory sample that follows an idle period:
+/// longer than the idle time of the wake phase and than the eviction time,
+/// by `slack`.
+pub fn idle_wait(idle: Duration, evict: Option<Duration>, slack: Duration) -> Duration {
+    idle.max(evict.unwrap_or_default()) + slack
+}
+
 /// Whether warm-up requests have established an agent: at least one of the
 /// `sent` must have succeeded. Without that, the first measured request may
 /// create the agent and its latency would be reported as warm.

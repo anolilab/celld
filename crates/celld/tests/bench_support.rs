@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 
 use hyper::Method;
 use support::{
-    control_response, diff, memory_slope, parse_phases, require_warmup, rss_of_tree, run_id,
-    window_position, EndRule, Part, Scope, Tally, TallySource, WindowPosition,
+    control_response, diff, idle_wait, memory_slope, parse_phases, require_idle_past_eviction,
+    require_resident, require_warmup, rss_of_tree, run_id, window_position, EndRule, Part, Scope,
+    Tally, TallySource, WindowPosition,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -290,4 +291,47 @@ async fn the_end_rule_cuts_off_a_read_that_outlasts_its_deadline() {
         .unwrap_err();
     assert!(started.elapsed() < Duration::from_secs(5), "{error}");
     assert!(error.contains("still waiting"), "{error}");
+}
+
+#[test]
+fn an_idle_period_must_clear_the_eviction_time_by_the_slack() {
+    let (evict, slack) = (Some(10 * SECOND), 5 * SECOND);
+    assert_eq!(
+        require_idle_past_eviction(15 * SECOND, evict, slack),
+        Ok(())
+    );
+    assert_eq!(
+        require_idle_past_eviction(20 * SECOND, evict, slack),
+        Ok(())
+    );
+    let error = require_idle_past_eviction(14 * SECOND, evict, slack).unwrap_err();
+    assert!(error.contains("BENCH_EVICT_S"), "{error}");
+    assert!(error.contains("BENCH_EVICT_SLACK_S"), "{error}");
+}
+
+#[test]
+fn an_unknown_eviction_time_cannot_be_checked() {
+    assert_eq!(require_idle_past_eviction(SECOND, None, 5 * SECOND), Ok(()));
+}
+
+#[test]
+fn agents_must_be_created_and_warmed_before_the_eviction_time() {
+    let warmup = 2 * SECOND;
+    assert_eq!(require_resident(2 * SECOND, warmup, 10 * SECOND), Ok(()));
+    let error = require_resident(8 * SECOND, warmup, 10 * SECOND).unwrap_err();
+    assert!(error.contains("evicted"), "{error}");
+    // Right at the limit, the first agent may already be gone.
+    assert!(require_resident(8 * SECOND, warmup, 10 * SECOND).is_err());
+    assert!(require_resident(7 * SECOND, warmup, 10 * SECOND).is_ok());
+}
+
+#[test]
+fn the_memory_wait_outlasts_the_idle_time_and_the_eviction_time() {
+    let slack = 5 * SECOND;
+    assert_eq!(
+        idle_wait(12 * SECOND, Some(10 * SECOND), slack),
+        17 * SECOND
+    );
+    assert_eq!(idle_wait(8 * SECOND, Some(10 * SECOND), slack), 15 * SECOND);
+    assert_eq!(idle_wait(8 * SECOND, None, slack), 13 * SECOND);
 }
