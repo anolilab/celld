@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::support::{class_of, Class, Tally};
+use crate::support::{class_of, percentile_us, Class, Part, Tally};
 
 /// Longer than the default gap between turns, so an agent is evicted once,
 /// after its last turn, not between turns.
@@ -27,8 +27,14 @@ pub struct Scenario {
 
 /// The nodes of `fleet_evict` with no agents and the cell directory forced
 /// off: the traffic of a fleet that only waits, which the all-in column of a
-/// scenario with as many nodes subtracts.
+/// scenario with as many nodes subtracts. A baseline of another node count
+/// carries a suffix.
 pub const BASELINE: &str = "fleet_evict_idle";
+
+/// Whether `name` is a baseline.
+pub fn is_baseline(name: &str) -> bool {
+    name.starts_with(BASELINE)
+}
 
 /// The variables that decide whether and how the cell directory runs, which a
 /// scenario's `env` can override.
@@ -38,7 +44,7 @@ pub const RECORDED_ENV: [&str; 3] = [
     "CELLD_LTX_DURABILITY_TIMEOUT_SECS",
 ];
 
-pub const SCENARIOS: [Scenario; 7] = [
+pub const SCENARIOS: [Scenario; 9] = [
     Scenario {
         name: BASELINE,
         nodes: 2,
@@ -80,6 +86,23 @@ pub const SCENARIOS: [Scenario; 7] = [
         agents: true,
     },
     Scenario {
+        // `fleet_evict_idle` and `fleet_evict` on four nodes, for how the idle
+        // floor grows with the node count.
+        name: "fleet_evict_idle_4n",
+        nodes: 4,
+        env: &[
+            ("CELLD_IDLE_EVICT_S", IDLE_EVICT_S),
+            ("CELLD_CELL_DIRECTORY_SHADOW", "0"),
+        ],
+        agents: false,
+    },
+    Scenario {
+        name: "fleet_evict_4n",
+        nodes: 4,
+        env: &[("CELLD_IDLE_EVICT_S", IDLE_EVICT_S)],
+        agents: true,
+    },
+    Scenario {
         name: "bucket",
         nodes: 1,
         env: &[("CELLD_DURABILITY", "bucket")],
@@ -101,14 +124,16 @@ pub const SCENARIOS: [Scenario; 7] = [
 /// runs first even when the filter does not name it. A scenario with no
 /// baseline of its node count is not priced all-in.
 pub fn plan<'a>(scenarios: &'a [Scenario], filter: Option<&str>) -> Vec<&'a Scenario> {
-    let baseline = scenarios.iter().find(|s| s.name == BASELINE);
     let mut chosen: Vec<&Scenario> = Vec::new();
     for scenario in scenarios
         .iter()
         .filter(|s| filter.is_none_or(|f| s.name.contains(f)))
     {
+        let baseline = scenarios
+            .iter()
+            .find(|b| is_baseline(b.name) && b.nodes == scenario.nodes);
         for next in baseline
-            .filter(|b| scenario.agents && b.nodes == scenario.nodes)
+            .filter(|_| scenario.agents)
             .into_iter()
             .chain([scenario])
         {
@@ -165,6 +190,133 @@ pub fn sum_answers(states: &[Option<Value>]) -> Value {
         "exists": pair("exists"),
         "unknown": pair("unknown"),
     })
+}
+
+/// The sum of the `storage_counters` of `states`, one per node, with the shares
+/// they give. `None` is a node whose state could not be read, and a node that
+/// reports no counters counts as unreadable too, so a total never passes as
+/// complete when a node is missing from it.
+///
+/// `agents` is the number of agents the run started, the divisor of the
+/// evicted share. That share is the share of agents ever evicted only while no
+/// cell is evicted twice, which `evictions_exceed_agents` says it is not.
+pub fn sum_storage(states: &[Option<Value>], agents: usize) -> Value {
+    let counters: Vec<&Value> = states
+        .iter()
+        .map(|state| state.as_ref().map(|state| &state["storage_counters"]))
+        .filter_map(|counters| counters.filter(|counters| !counters.is_null()))
+        .collect();
+    let total = |path: &[&str]| -> u64 {
+        counters
+            .iter()
+            .map(|counters| {
+                path.iter()
+                    .fold(*counters, |value, key| &value[*key])
+                    .as_u64()
+                    .unwrap_or(0)
+            })
+            .sum()
+    };
+    let (minted, claims, first) = (
+        total(&["ids_minted"]),
+        total(&["claims"]),
+        total(&["first_claims"]),
+    );
+    let snapshot = total(&["evictions", "snapshot"]);
+    let paged = total(&["evictions", "paged"]);
+    let over_budget = total(&["evictions", "over_budget"]);
+    let publish_failed = total(&["evictions", "publish_failed"]);
+    let empty = total(&["evictions", "empty"]);
+    let evicted = snapshot + paged + over_budget + publish_failed + empty;
+    // A snapshot that failed to publish is a cell a pack could have taken.
+    let packable = snapshot + publish_failed;
+    json!({
+        "nodes_counted": counters.len(),
+        "nodes_unreadable": states.len() - counters.len(),
+        "ids_minted": minted,
+        "claims": claims,
+        "first_claims": first,
+        "first_claim_share_of_claims": share(first, claims),
+        "minted_share_of_first_claims": share(minted, first),
+        "evictions": {
+            "total": evicted,
+            "snapshot": snapshot,
+            "paged": paged,
+            "over_budget": over_budget,
+            "publish_failed": publish_failed,
+            "empty": empty,
+        },
+        "evicted_share": share(evicted, agents as u64),
+        "evictions_exceed_agents": evicted > agents as u64,
+        "snapshot_share_of_evictions": share(snapshot, evicted),
+        "packable_share": share(packable, packable + paged + over_budget),
+    })
+}
+
+fn share(part: u64, whole: u64) -> Option<f64> {
+    (whole > 0).then(|| part as f64 / whole as f64)
+}
+
+/// One node's retained node-log bundles at one instant: how many, and the age
+/// of the oldest in milliseconds when there is one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BundleSample {
+    pub count: u64,
+    pub oldest_age_ms: Option<u64>,
+}
+
+/// The sample in a node's `/state`, or `None` when it has none to report.
+pub fn bundle_sample(state: &Value) -> Option<BundleSample> {
+    let retained = &state["storage_counters"]["retained_bundles"];
+    Some(BundleSample {
+        count: retained["count"].as_u64()?,
+        oldest_age_ms: retained["oldest_age_ms"].as_u64(),
+    })
+}
+
+/// The retained bundles over a run, from samples of every node taken while it
+/// went on. The ages are the oldest bundle of a node at each sample, so a
+/// sample from a node with no bundle has none and is counted apart, as is a
+/// read of a node that gave no sample.
+pub fn retention_json(samples: &[BundleSample], unreadable: usize) -> Value {
+    let mut counts: Vec<u64> = samples.iter().map(|s| s.count).collect();
+    counts.sort_unstable();
+    let mut ages: Vec<u64> = samples.iter().filter_map(|s| s.oldest_age_ms).collect();
+    ages.sort_unstable();
+    let seconds = |ms: u64| ms as f64 / 1000.0;
+    json!({
+        "samples": samples.len(),
+        "samples_without_bundles": samples.len() - ages.len(),
+        "samples_unreadable": unreadable,
+        "count_p50": percentile_us(&counts, 50.0),
+        "count_p99": percentile_us(&counts, 99.0),
+        "count_max": counts.last().copied().unwrap_or(0),
+        "oldest_age_s_p50": (!ages.is_empty()).then(|| seconds(percentile_us(&ages, 50.0))),
+        "oldest_age_s_p99": (!ages.is_empty()).then(|| seconds(percentile_us(&ages, 99.0))),
+        "oldest_age_s_max": ages.last().map(|age| seconds(*age)),
+    })
+}
+
+/// The requests that belong to one agent, per agent, by request: what a new
+/// agent costs and where it goes.
+pub fn per_agent_requests(load: &Tally, agents: usize) -> Value {
+    let agents = agents.max(1) as f64;
+    load.iter()
+        .filter(|((_, _, part), _)| *part == Part::Agent)
+        .map(|((kind, key, _), n)| {
+            json!({
+                "kind": kind,
+                "key": key,
+                "class": match class_of(kind) {
+                    Class::A => "A",
+                    Class::B => "B",
+                    Class::Free => "free",
+                },
+                "per_agent": *n as f64 / agents,
+            })
+        })
+        .collect::<Vec<_>>()
+        .into()
 }
 
 /// How long a scenario without agents runs: the window agents take to start and

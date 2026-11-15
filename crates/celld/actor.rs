@@ -341,6 +341,7 @@ impl Ownership {
         match self {
             Self::Memory(memory) => {
                 let mut memory = memory.lock().await;
+                let first = matches!(guard, CasGuard::Absent);
                 let allowed = match guard {
                     CasGuard::Absent => !memory.owners.contains_key(cell),
                     CasGuard::Match(expected) => memory
@@ -349,6 +350,7 @@ impl Ownership {
                         .is_some_and(|owner| owner.etag == expected),
                 };
                 if allowed {
+                    crate::storage_counters::claim_applied(first);
                     let etag = format!("e{}", memory.next_etag);
                     memory.next_etag += 1;
                     let node = memory.node.clone();
@@ -4157,7 +4159,7 @@ impl Actor {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"ownership\":{:?},\"owned_cells\":{},\"occupied\":{},\"quiescing\":{},\"evicting\":{},\"releasing\":{},\"adopting\":{},\"restoring\":{},\"activating\":{},\"activation_waiting\":{},\"capacity_waiting\":{},\"phases\":{{{}}},\"handed_off\":{},\"handoff_failed\":{},\"rebalanced\":{},\"rebalance_failed\":{},\"remote_route_refreshes\":{},\"shedding\":{},\"rss_bytes\":{},\"in_use_bytes\":{},\"allocator\":{},\"libc_malloc\":{},\"cgroup_working_set_bytes\":{},\"cgroup_current_bytes\":{},\"node_load\":{},\"cell_directory_answers\":{},\"residents\":[{}],\"published\":[{}],\"publishes\":{},\"stops\":{}}}",
+            "{{\"ownership\":{:?},\"owned_cells\":{},\"occupied\":{},\"quiescing\":{},\"evicting\":{},\"releasing\":{},\"adopting\":{},\"restoring\":{},\"activating\":{},\"activation_waiting\":{},\"capacity_waiting\":{},\"phases\":{{{}}},\"handed_off\":{},\"handoff_failed\":{},\"rebalanced\":{},\"rebalance_failed\":{},\"remote_route_refreshes\":{},\"shedding\":{},\"rss_bytes\":{},\"in_use_bytes\":{},\"allocator\":{},\"libc_malloc\":{},\"cgroup_working_set_bytes\":{},\"cgroup_current_bytes\":{},\"node_load\":{},\"cell_directory_answers\":{},\"storage_counters\":{},\"residents\":[{}],\"published\":[{}],\"publishes\":{},\"stops\":{}}}",
             self.ownership.name(),
             self.state.owned_cells(),
             self.state.occupied(),
@@ -4199,11 +4201,30 @@ impl Actor {
                     .map_or_else(|| "null".to_string(), |answers| answers.to_string()),
                 Ownership::Memory(_) => "null".to_string(),
             },
+            self.storage_counters_json(),
             residents,
             published,
             self.publishes,
             self.stops
         )
+    }
+
+    /// The process's storage counters, with the node log's retained bundles.
+    fn storage_counters_json(&self) -> String {
+        let mut counters = crate::storage_counters::to_json();
+        let retained = self
+            .node_log
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|log| log.retained_bundles());
+        counters["retained_bundles"] = match retained {
+            Some((count, oldest_age_ms)) => {
+                serde_json::json!({ "count": count, "oldest_age_ms": oldest_age_ms })
+            }
+            None => serde_json::Value::Null,
+        };
+        counters.to_string()
     }
 
     fn begin_route_if_cold(&mut self, cell: &str) {

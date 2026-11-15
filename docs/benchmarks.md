@@ -130,6 +130,10 @@ Scenarios:
   column.
 - `directory_idle`: the same idle fleet with the cell directory on. Its rates
   beyond `fleet_evict_idle` are the directory's fixed cost per node-hour.
+- `fleet_evict_idle_4n`, `fleet_evict_4n`: `fleet_evict_idle` and `fleet_evict`
+  on four nodes. The idle fleet's rate per node-hour is what shows whether the
+  idle floor grows with the node count; `CELLD_BENCH_FILTER=fleet_evict` runs
+  all four.
 
 The `$/mo @10K` column prices the per-agent requests at S3 Standard rates for
 10,000 agents alive at once, each living one turn interval per turn (60 s by
@@ -210,6 +214,49 @@ The node refuses a batch window of half of `CELLD_LTX_DURABILITY_TIMEOUT_SECS`
 `CELLD_LTX_DURABILITY_TIMEOUT_SECS=60` for it. A first write for a cell queued at
 its claim waits for the flush, up to one and a half windows, so the window adds
 that to the first request of every new agent under `CELLD_DURABILITY=bucket`.
+
+### Per-agent requests, evictions and retained bundles
+
+Each scenario of the JSON also carries:
+
+- `per_agent_requests`: every request kind and key shape under an agent's own
+  keys, with its price class and its count per agent. Their sums by class,
+  times 1000, are `class_a_per_1000` and `class_b_per_1000`; `free` entries are
+  in neither.
+- `storage_counters`: what the nodes counted, summed over them, with
+  `nodes_counted` and `nodes_unreadable` as for `answers`. The same counters are
+  under `storage_counters` in the node's `/state`, per process, from the start
+  of the process, and nothing reads them to decide anything.
+  - `ids_minted`: ids drawn by `newUniqueId`, as opposed to derived from a name.
+    The `bench-agents` fixture names its agents, so this is 0 there, and
+    `minted_share_of_first_claims` (`ids_minted` over `first_claims`) says nothing
+    about a fleet that mints. It is a figure for a deployment, from the sum over
+    its nodes.
+  - `claims` and `first_claims`: claims of a cell's record that the store
+    accepted, and those among them that were the create-only write of epoch one.
+    `first_claim_share_of_claims` is their ratio.
+  - `evictions`: evictions that passed their durability barrier, by how the
+    restore artifact came about. `snapshot` published one full snapshot. `paged`
+    and `over_budget` are cells for which none is attempted, a paged cell and a
+    cell whose image is over the snapshot budget. `publish_failed` is a
+    snapshot that was attempted and not confirmed, on this pass or an earlier one
+    of the same cell. `empty` is a cell that never committed a write.
+  - `evicted_share` is `evictions.total` over the agents. It is the share of
+    agents ever evicted only while no cell is evicted twice and the nodes hold
+    no cell but the agents: `evictions_exceed_agents` is true when that cannot
+    hold, and facets are evicted through the same path. `packable_share` is
+    `(snapshot + publish_failed) / (snapshot + publish_failed + paged +
+    over_budget)`: the evictions that wrote one full snapshot per cell, or tried
+    to, over those that did not. `empty` evictions have nothing to pack and are
+    left out.
+- `retained_bundles`: the node-log bundles each node still holds, read from
+  every node's `/state` every two seconds while the run goes on. A node holds
+  a bundle from its write until bundle GC deletes it. `count_*` are over the
+  samples of the nodes, one per node and tick; `oldest_age_s_*` are the age of
+  a node's oldest bundle at each sample, over the samples where it has one
+  (`samples_without_bundles` counts the others). `samples_unreadable` counts
+  the reads of a node that gave no sample, so the percentiles cover only the
+  rest. Percentiles are nearest-rank.
 
 ### Classifying keys
 

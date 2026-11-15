@@ -76,6 +76,7 @@ pub mod runtime;
 pub mod staged;
 pub mod startup;
 pub mod storage;
+pub(crate) mod storage_counters;
 pub mod telemetry;
 pub mod wake;
 pub mod wake_entry;
