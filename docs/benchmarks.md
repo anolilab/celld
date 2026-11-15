@@ -220,8 +220,9 @@ that to the first request of every new agent under `CELLD_DURABILITY=bucket`.
 Each scenario of the JSON also carries:
 
 - `per_agent_requests`: every request kind and key shape under an agent's own
-  keys, with its price class and its count per agent. Their sums by class are
-  `class_a_per_1000` and `class_b_per_1000`.
+  keys, with its price class and its count per agent. Their sums by class,
+  times 1000, are `class_a_per_1000` and `class_b_per_1000`; `free` entries are
+  in neither.
 - `storage_counters`: what the nodes counted, summed over them, with
   `nodes_counted` and `nodes_unreadable` as for `answers`. The same counters are
   under `storage_counters` in the node's `/state`, per process, from the start
@@ -253,7 +254,9 @@ Each scenario of the JSON also carries:
   a bundle from its write until bundle GC deletes it. `count_*` are over the
   samples of the nodes, one per node and tick; `oldest_age_s_*` are the age of
   a node's oldest bundle at each sample, over the samples where it has one
-  (`samples_without_bundles` counts the others). Percentiles are nearest-rank.
+  (`samples_without_bundles` counts the others). `samples_unreadable` counts
+  the reads of a node that gave no sample, so the percentiles cover only the
+  rest. Percentiles are nearest-rank.
 
 ### Classifying keys
 

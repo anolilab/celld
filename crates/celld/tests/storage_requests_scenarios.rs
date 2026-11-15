@@ -342,9 +342,10 @@ fn retention_reports_the_ages_of_the_samples_that_have_a_bundle() {
         .map(|n| sampled(n, Some(n * 1000)))
         .chain([sampled(0, None)])
         .collect();
-    let retention = retention_json(&samples);
+    let retention = retention_json(&samples, 2);
     assert_eq!(retention["samples"], 101);
     assert_eq!(retention["samples_without_bundles"], 1);
+    assert_eq!(retention["samples_unreadable"], 2);
     assert_eq!(retention["oldest_age_s_p50"], 50.0);
     assert_eq!(retention["oldest_age_s_p99"], 99.0);
     assert_eq!(retention["oldest_age_s_max"], 100.0);
@@ -353,7 +354,7 @@ fn retention_reports_the_ages_of_the_samples_that_have_a_bundle() {
 
 #[test]
 fn retention_without_samples_has_no_ages() {
-    let retention = retention_json(&[]);
+    let retention = retention_json(&[], 0);
     assert_eq!(retention["samples"], 0);
     assert_eq!(retention["oldest_age_s_p50"], Value::Null);
     assert_eq!(retention["oldest_age_s_max"], Value::Null);

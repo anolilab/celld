@@ -328,18 +328,19 @@ const RETENTION_SAMPLE: Duration = Duration::from_secs(2);
 /// `finish`.
 struct RetentionSampler {
     task: tokio::task::JoinHandle<()>,
-    samples: std::sync::Arc<std::sync::Mutex<Vec<BundleSample>>>,
+    samples: std::sync::Arc<std::sync::Mutex<(Vec<BundleSample>, usize)>>,
 }
 
 impl RetentionSampler {
     fn finish(self) -> Value {
         self.task.abort();
-        retention_json(&self.samples.lock().unwrap())
+        let (samples, unreadable) = &*self.samples.lock().unwrap();
+        retention_json(samples, *unreadable)
     }
 }
 
 fn sample_retention(client: &reqwest::Client, nodes: &[Node]) -> RetentionSampler {
-    let samples = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let samples = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), 0)));
     let urls: Vec<String> = nodes
         .iter()
         .map(|node| format!("{}/state", node.internal))
@@ -348,12 +349,14 @@ fn sample_retention(client: &reqwest::Client, nodes: &[Node]) -> RetentionSample
     let task = tokio::spawn(async move {
         loop {
             for url in &urls {
-                if let Some(sample) = read_state(&client, url)
+                let sample = read_state(&client, url)
                     .await
                     .as_ref()
-                    .and_then(bundle_sample)
-                {
-                    shared.lock().unwrap().push(sample);
+                    .and_then(bundle_sample);
+                let (samples, unreadable) = &mut *shared.lock().unwrap();
+                match sample {
+                    Some(sample) => samples.push(sample),
+                    None => *unreadable += 1,
                 }
             }
             tokio::time::sleep(RETENTION_SAMPLE).await;

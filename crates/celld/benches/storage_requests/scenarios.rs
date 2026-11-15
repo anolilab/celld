@@ -276,8 +276,9 @@ pub fn bundle_sample(state: &Value) -> Option<BundleSample> {
 
 /// The retained bundles over a run, from samples of every node taken while it
 /// went on. The ages are the oldest bundle of a node at each sample, so a
-/// sample from a node with no bundle has none and is counted apart.
-pub fn retention_json(samples: &[BundleSample]) -> Value {
+/// sample from a node with no bundle has none and is counted apart, as is a
+/// read of a node that gave no sample.
+pub fn retention_json(samples: &[BundleSample], unreadable: usize) -> Value {
     let mut counts: Vec<u64> = samples.iter().map(|s| s.count).collect();
     counts.sort_unstable();
     let mut ages: Vec<u64> = samples.iter().filter_map(|s| s.oldest_age_ms).collect();
@@ -286,6 +287,7 @@ pub fn retention_json(samples: &[BundleSample]) -> Value {
     json!({
         "samples": samples.len(),
         "samples_without_bundles": samples.len() - ages.len(),
+        "samples_unreadable": unreadable,
         "count_p50": percentile_us(&counts, 50.0),
         "count_p99": percentile_us(&counts, 99.0),
         "count_max": counts.last().copied().unwrap_or(0),

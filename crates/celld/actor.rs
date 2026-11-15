@@ -341,6 +341,7 @@ impl Ownership {
         match self {
             Self::Memory(memory) => {
                 let mut memory = memory.lock().await;
+                let first = matches!(guard, CasGuard::Absent);
                 let allowed = match guard {
                     CasGuard::Absent => !memory.owners.contains_key(cell),
                     CasGuard::Match(expected) => memory
@@ -349,6 +350,7 @@ impl Ownership {
                         .is_some_and(|owner| owner.etag == expected),
                 };
                 if allowed {
+                    crate::storage_counters::claim_applied(first);
                     let etag = format!("e{}", memory.next_etag);
                     memory.next_etag += 1;
                     let node = memory.node.clone();
