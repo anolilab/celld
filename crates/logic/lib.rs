@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub mod alarm;
+pub mod born;
 pub mod cache;
 pub mod cell;
 pub mod cell_directory;
@@ -6265,8 +6266,18 @@ impl State {
     /// emptiest isolate is the single candidate every sample, and idle
     /// eviction stalls while cold cells sit in fuller isolates.
     fn shed_candidate_where(&self, keep: impl Fn(&Cell) -> bool) -> Option<CellId> {
+        self.shed_candidate_among(keep, |_| true)
+    }
+
+    /// [`Self::shed_candidate_where`], also asking `eligible` of the cell's id.
+    fn shed_candidate_among(
+        &self,
+        keep: impl Fn(&Cell) -> bool,
+        eligible: impl Fn(&CellId) -> bool,
+    ) -> Option<CellId> {
         let evictable = |id: &CellId, cell: &Cell| {
             self.is_hibernatable(id)
+                && eligible(id)
                 && keep(cell)
                 && cell
                     .alarm
@@ -6339,12 +6350,18 @@ impl State {
             // A refused eviction waits out another idle period. Retrying it
             // on every sample stops and restarts a cell whose proof cannot
             // complete for as long as that lasts.
-            let Some(candidate) = self.shed_candidate_where(|cell| {
-                now_mono_ms.saturating_sub(cell.last_used_mono_ms) >= idle_ms
-                    && cell
-                        .eviction_refused_mono_ms
-                        .is_none_or(|refused| now_mono_ms.saturating_sub(refused) >= idle_ms)
-            }) else {
+            // A birth registry partition is never idle-evicted: it is hot by
+            // construction and a lookup waits on its owner. Pressure shedding
+            // still takes it, so this exempts only the ordinary question.
+            let Some(candidate) = self.shed_candidate_among(
+                |cell| {
+                    now_mono_ms.saturating_sub(cell.last_used_mono_ms) >= idle_ms
+                        && cell
+                            .eviction_refused_mono_ms
+                            .is_none_or(|refused| now_mono_ms.saturating_sub(refused) >= idle_ms)
+                },
+                |id| !born::is_registry_scope(id),
+            ) else {
                 return;
             };
             // Idle eviction is a local residency decision, not a handoff.

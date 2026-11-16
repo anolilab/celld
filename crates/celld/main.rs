@@ -2586,6 +2586,92 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
     }
 }
 
+/// The birth registry spike's measuring route on the internal listener, which
+/// exists only when `CELLD_BORN_SPIKE=1`. It drives the client in
+/// `BucketOwnership`, so a bench measures the path a claim would take.
+///
+/// `GET  /__born/lookup?scope=S` answers `{"answer", "us"}`.
+/// `POST /__born/register` takes `{"scopes": [...]}`.
+/// `POST /__born/raw?p=N` sends the body to partition N's cell, for the aging tool.
+async fn internal_born(request: Request<Incoming>, path: String) -> HttpReply {
+    let Some(ownership) = celld::born::ownership() else {
+        return response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{\"error\":\"no ownership\"}",
+        );
+    };
+    let query: std::collections::HashMap<String, String> = request
+        .uri()
+        .query()
+        .map(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let started = std::time::Instant::now();
+    match path.as_str() {
+        "/__born/lookup" => {
+            let Some(scope) = query.get("scope") else {
+                return response(StatusCode::BAD_REQUEST, "{\"error\":\"scope\"}");
+            };
+            let answer = ownership.born_lookup(scope).await;
+            let name = match answer {
+                celld::born::Answer::Exists => "exists",
+                celld::born::Answer::New => "new",
+                celld::born::Answer::Unknown => "unknown",
+            };
+            response(
+                StatusCode::OK,
+                format!(
+                    "{{\"answer\":\"{name}\",\"us\":{}}}",
+                    started.elapsed().as_micros()
+                ),
+            )
+        }
+        "/__born/register" | "/__born/raw" => {
+            let body = match collect_limited_body(request.into_body(), MAX_PEER_PROTOCOL_BODY_BYTES)
+                .await
+            {
+                Ok(body) => body,
+                Err(error) => return body_read_error("born", error),
+            };
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+                return response(StatusCode::BAD_REQUEST, "{\"error\":\"json\"}");
+            };
+            if path == "/__born/register" {
+                let scopes: Vec<&str> = value
+                    .get("scopes")
+                    .and_then(|scopes| scopes.as_array())
+                    .map(|scopes| scopes.iter().filter_map(|scope| scope.as_str()).collect())
+                    .unwrap_or_default();
+                let ok = ownership.born_register(&scopes).await;
+                return response(
+                    StatusCode::OK,
+                    format!("{{\"ok\":{ok},\"us\":{}}}", started.elapsed().as_micros()),
+                );
+            }
+            let Some(partition) = query.get("p").and_then(|p| p.parse::<u32>().ok()) else {
+                return response(StatusCode::BAD_REQUEST, "{\"error\":\"p\"}");
+            };
+            match celld::born::call(celld::engine_api::born_cell_scope(partition), value).await {
+                Ok(result) => response(
+                    StatusCode::OK,
+                    format!(
+                        "{{\"result\":{result},\"us\":{}}}",
+                        started.elapsed().as_micros()
+                    ),
+                ),
+                Err(error) => response(
+                    StatusCode::BAD_GATEWAY,
+                    serde_json::json!({ "error": format!("{error:#}") }).to_string(),
+                ),
+            }
+        }
+        _ => response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}"),
+    }
+}
+
 async fn internal_probe(request: Request<Incoming>, app: AppHandle) -> HttpReply {
     let (parts, body) = request.into_parts();
     let body = match collect_limited_body(body, MAX_PEER_CONTROL_BODY_BYTES).await {
@@ -2916,6 +3002,9 @@ async fn handle_internal(
         "/peer/handoff" => internal_handoff(request, app).await,
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),
+        _ if path.starts_with("/__born/") && celld::born::enabled() => {
+            internal_born(request, path.clone()).await
+        }
         "/reload" if request.method() != hyper::Method::POST => {
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
@@ -4210,6 +4299,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         Ownership::Bucket(ownership) => Some(ownership.clone()),
         Ownership::Memory(_) => None,
     };
+    if celld::born::enabled() {
+        if let Some(ownership) = &ready_ownership {
+            celld::born::install(ownership.clone());
+        }
+    }
     let fleet_bucket = ready_ownership
         .as_ref()
         .map(|ownership| ownership.bucket_client());

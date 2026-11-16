@@ -6293,6 +6293,102 @@ __runtimeClass("__KvNamespace", __KvNamespaceCell, [
 const __makeKvNamespace = __celld.__makeKvNamespace = (id, cellName) =>
   new __KvNamespace(() => __cell.makeNamespace("__KvNamespace"), cellName);
 
+// ---- Birth registry (spike) ----------------------------------------------
+// One partition of the registry of cell scopes that have ever existed. The row
+// key is the 128-bit hash of the scope, as 32 hex digits on the wire. A
+// registration is idempotent and never removed, so a lookup answer of "exists"
+// is final and "new" is exact for as long as this cell is its only writer.
+// The base table is a stub for the shared-pack phase: a forward-only pointer.
+const __BORN_HEX = /^[0-9a-f]{32}$/;
+class __BornCell {
+  constructor(ctx) {
+    this.ctx = ctx;
+    this._sql = null;
+  }
+  _db() {
+    if (this._sql === null) {
+      const sql = this.ctx.storage.sql;
+      sql.exec("CREATE TABLE IF NOT EXISTS born (h BLOB PRIMARY KEY) WITHOUT ROWID");
+      sql.exec(
+        "CREATE TABLE IF NOT EXISTS born_base (h BLOB PRIMARY KEY, txid INTEGER NOT NULL, base TEXT NOT NULL) WITHOUT ROWID");
+      this._sql = sql;
+    }
+    return this._sql;
+  }
+  async fetch(request) {
+    if (!__operatorRequests.has(request)) {
+      return Response.json({ error: "the birth registry answers only the fleet" }, { status: 403 });
+    }
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return Response.json({ error: "invalid request body" }, { status: 400 });
+    }
+    const hashes = (list) => {
+      if (!Array.isArray(list) || list.some((h) => typeof h !== "string" || !__BORN_HEX.test(h))) {
+        throw new Error("a hash is 32 lowercase hex digits");
+      }
+      return list;
+    };
+    try {
+      const sql = this._db();
+      switch (body.op) {
+        case "lookup": {
+          const [h] = hashes([body.h]);
+          const row = sql.exec("SELECT 1 AS x FROM born WHERE h = unhex(?)", h).toArray();
+          return Response.json({ result: { exists: row.length > 0, node: __cell.node } });
+        }
+        case "register": {
+          const list = hashes(body.hs);
+          this.ctx.storage.transactionSync(() => {
+            for (const h of list) sql.exec("INSERT OR IGNORE INTO born (h) VALUES (unhex(?))", h);
+          });
+          return Response.json({ result: { registered: list.length, node: __cell.node } });
+        }
+        case "set_base": {
+          const [h] = hashes([body.h]);
+          this.ctx.storage.transactionSync(() => {
+            sql.exec(
+              `INSERT INTO born_base (h, txid, base) VALUES (unhex(?), ?, ?)
+               ON CONFLICT (h) DO UPDATE SET txid = excluded.txid, base = excluded.base
+               WHERE excluded.txid > born_base.txid`,
+              h, body.txid, body.base);
+          });
+          return Response.json({ result: {} });
+        }
+        case "get_base": {
+          const [h] = hashes([body.h]);
+          const row = sql.exec("SELECT txid, base FROM born_base WHERE h = unhex(?)", h).toArray();
+          return Response.json({ result: row.length ? { txid: row[0].txid, base: row[0].base } : null });
+        }
+        // The aging tool's op: `rows` random hashes in one transaction, which
+        // is what a window of births is to the cell.
+        case "bulk": {
+          const rows = Number(body.rows);
+          if (!Number.isInteger(rows) || rows < 0 || rows > 5_000_000) throw new Error("rows out of range");
+          this.ctx.storage.transactionSync(() => {
+            sql.exec(
+              `WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < ?)
+               INSERT OR IGNORE INTO born (h) SELECT randomblob(16) FROM c`,
+              rows);
+          });
+          return Response.json({ result: { node: __cell.node } });
+        }
+        case "count": {
+          const row = sql.exec("SELECT count(*) AS n FROM born").toArray();
+          return Response.json({ result: { count: row[0].n, node: __cell.node } });
+        }
+        default:
+          return Response.json({ error: "unknown op" }, { status: 400 });
+      }
+    } catch (error) {
+      return Response.json({ error: String(error && error.message || error) }, { status: 400 });
+    }
+  }
+}
+__runtimeClass("__Born", __BornCell, []);
+
 // ---- Queues --------------------------------------------------------------
 // A Queue is one runtime-supplied Durable Object. The producer binding writes
 // bytes and a content tag through RPC, and the cell owns the durable order,
