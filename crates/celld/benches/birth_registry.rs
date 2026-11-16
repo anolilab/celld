@@ -9,12 +9,20 @@
 //!   partition-hour, the age of the oldest retained bundle, lookup p99 and the
 //!   `Unknown` rate. The fold interval is `CELLD_BORN_FOLD_MS`.
 //! - `age`: loads partition 0 to `CELLD_BORN_MONTHS` months of births at the
-//!   rate, computed and not waited for, as `CELLD_BORN_FOLDS` L1 folds over
-//!   `CELLD_BORN_EPOCHS` epochs, which it forces by releasing the cell.
+//!   rate, computed and not waited for, as L1 folds over `CELLD_BORN_EPOCHS`
+//!   epochs, which it forces by draining the owner. A rerun on the same
+//!   `CELLD_BORN_RUN` resumes from the rows the cell holds. `CELLD_BORN_NO_PROXY`
+//!   bypasses the counting proxy, `CELLD_BORN_AGE_TXN_PER_S` paces the writer,
+//!   and the leg stops when free space falls under `CELLD_BORN_MIN_FREE_GIB`.
+//!   It records the folds the node logs show, and ends by killing the nodes, so
+//!   the next phase restores a fleet that never drained.
 //! - `aged`: starts a fresh fleet on the aged bucket and measures cold start,
-//!   lookups, RSS per registry cell, owner-kill failover, and a drain handoff.
+//!   lookups, RSS per registry cell, owner-kill failover (before any drain), a
+//!   drain handoff, and the restore chain.
 //! - `rolling`: new-id success through a rolling restart.
-//! - `gather`: time to serve after a node kill, with and without the spike.
+//! - `gather`: time until every agent answers after a node kill, for
+//!   `CELLD_BORN_GATHER_MODE` = `main` (a build of main in `CELLD_BENCH_BIN`),
+//!   `off` (this branch, spike unset) and `on` (the registry and its births too).
 //!
 //! ```text
 //! CELLD_BENCH_S3_ENDPOINT=http://127.0.0.1:19100 CELLD_BENCH_BUCKET=s3://born \
@@ -33,7 +41,7 @@ use rand::Rng;
 use serde_json::{json, Value};
 use support::{
     class_of, diff, env_text, out, percentile_us, positive, rss_kib, Class, Classifier, Node, Part,
-    Proxy, Tally, CELLD,
+    Proxy, Tally,
 };
 
 const FIXTURE: &str = "bench-hello";
@@ -56,11 +64,21 @@ struct Fleet {
     bucket: String,
     endpoint: String,
     upstream: String,
+    fixture: &'static str,
     env: Vec<(String, String)>,
 }
 
 impl Fleet {
     async fn start(run: &str, count: usize, env: &[(&str, String)]) -> Fleet {
+        Self::start_with(FIXTURE, run, count, env).await
+    }
+
+    async fn start_with(
+        fixture: &'static str,
+        run: &str,
+        count: usize,
+        env: &[(&str, String)],
+    ) -> Fleet {
         let upstream = std::env::var("CELLD_BENCH_S3_ENDPOINT")
             .expect("CELLD_BENCH_S3_ENDPOINT must name a plain-HTTP S3 endpoint");
         let base = env_text("CELLD_BENCH_BUCKET").unwrap_or_else(|| "s3://bench".into());
@@ -85,7 +103,13 @@ impl Fleet {
             .build()
             .expect("build http client");
         let mut fleet = Fleet {
-            endpoint: proxy.url.clone(),
+            // The counting proxy is not needed by the phases that count no
+            // requests, and a long restore through it adds its own errors.
+            endpoint: if env_text("CELLD_BORN_NO_PROXY").is_some() {
+                upstream.clone()
+            } else {
+                proxy.url.clone()
+            },
             proxy,
             nodes: Vec::new(),
             ep: Endpoints {
@@ -96,6 +120,7 @@ impl Fleet {
             dir,
             bucket,
             upstream,
+            fixture,
             env: env
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.clone()))
@@ -114,8 +139,8 @@ impl Fleet {
     async fn deploy(&self) {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
-            .join(FIXTURE);
-        let deployed = tokio::process::Command::new(CELLD)
+            .join(self.fixture);
+        let deployed = tokio::process::Command::new(support::celld_bin())
             .arg("deploy")
             .arg(&fixture)
             .args(["--bucket", &self.bucket, "--endpoint", &self.endpoint])
@@ -596,6 +621,27 @@ fn partition_env(
 // aged: the gates that need a resident registry, on a fresh or an aged bucket
 // ---------------------------------------------------------------------------
 
+/// Resident set of each node, in KiB, by node index.
+fn rss_by_node(fleet: &Fleet) -> Vec<u64> {
+    fleet
+        .nodes
+        .iter()
+        .map(|node| rss_kib(&[node.pid()]).unwrap_or(0))
+        .collect()
+}
+
+/// The node that serves a partition now, by a lookup that costs one row read.
+async fn serving_node(ep: &Endpoints, via: usize, partition: u32) -> Option<String> {
+    ep.raw(
+        via,
+        partition,
+        json!({ "op": "lookup", "h": "0".repeat(32) }),
+    )
+    .await
+    .ok()
+    .and_then(|v| v["node"].as_str().map(str::to_owned))
+}
+
 async fn phase_aged() {
     let partitions: u32 = positive("CELLD_BORN_P", 64);
     let run =
@@ -610,10 +656,13 @@ async fn phase_aged() {
     .await;
     let node_ready_s = started.elapsed().as_secs_f64();
     let rss_before = rss_kib(&pids(&fleet)).unwrap_or(0);
-    // Partition 0 is the aged one: leave it to the end so its cost shows alone.
+    // Partition 0 is the aged one: leave it until the others are warm, so its
+    // cost shows alone.
     let aged_partition: u32 = positive("CELLD_BORN_AGED_PARTITION", 0);
     let mut rng = rand::thread_rng();
     let others = (partitions - 1).max(1);
+    // What a restore of the aged cell reads, before anything has touched it.
+    let chain_before = chain_summary(&fleet, aged_partition).await;
     let (cold, answered) = {
         use futures_util::StreamExt as _;
         let t = Instant::now();
@@ -641,40 +690,57 @@ async fn phase_aged() {
         (t.elapsed(), n.iter().filter(|ok| **ok).count() as u32)
     };
     let rss_after_empty = rss_kib(&pids(&fleet)).unwrap_or(0);
-    // The aged partition's first activation: restore from the bucket.
+    let rss_nodes_after_empty = rss_by_node(&fleet);
+    // The aged partition's first activation: restore from the bucket alone.
     let aged_scope = scope_in(aged_partition, partitions, "aged-probe", &mut rng);
     let (restore, restored) =
         until_answered(&fleet, 0, &aged_scope, Duration::from_secs(3600)).await;
-    let rows = fleet
-        .raw(0, aged_partition, json!({ "op": "count" }))
-        .await
-        .ok()
-        .and_then(|v| v["count"].as_u64());
     let rss_after_aged = rss_kib(&pids(&fleet)).unwrap_or(0);
+    let rss_nodes_after_aged = rss_by_node(&fleet);
     // A named run is an aged bucket: refuse to report an empty one as aged.
     assert!(
-        env_text("CELLD_BORN_RUN").is_none() || rows.unwrap_or(0) > 0,
-        "CELLD_BORN_RUN names a bucket whose aged partition holds no rows; run the age phase first"
+        env_text("CELLD_BORN_RUN").is_none()
+            || chain_before["prefix_objects"].as_u64().unwrap_or(0) > 0,
+        "CELLD_BORN_RUN names a bucket whose aged partition holds no objects; run the age phase first"
     );
     let steady = steady_lookups(&fleet, partitions, None, 30, 200).await;
     let steady_aged = steady_lookups(&fleet, partitions, Some(aged_partition), 30, 200).await;
     let rss_after_load = rss_kib(&pids(&fleet)).unwrap_or(0);
+    let rss_nodes_after_load = rss_by_node(&fleet);
 
-    // Drain handoff of the aged cell: release it, then the first answer from
-    // another node.
-    let owner = fleet
-        .raw(0, aged_partition, json!({ "op": "count" }))
-        .await
-        .ok()
-        .and_then(|v| v["node"].as_str().map(str::to_owned));
+    // Owner kill first, while the restore plan is still the aged one: no
+    // drain has written a fresh snapshot since the fleet was killed. The first
+    // successful lookup from a survivor is the failover.
+    let owner = serving_node(&fleet.ep, 0, aged_partition).await;
     let owner_index = owner
         .as_deref()
         .and_then(|name| name.strip_prefix("node-"))
         .and_then(|i| i.parse::<usize>().ok())
         .unwrap_or(0);
-    // Drain the owner node, which hands every cell it holds to the others, the
-    // aged registry cell among them. The first answer from a survivor is the
-    // cell's handoff; the node's exit is the whole drain.
+    let chain_at_kill = chain_summary(&fleet, aged_partition).await;
+    fleet.nodes[owner_index].kill();
+    let survivor = (owner_index + 1) % fleet.nodes.len();
+    let (failover, failover_ok) = until_answered(
+        &fleet,
+        survivor,
+        &scope_in(aged_partition, partitions, "post-kill", &mut rng),
+        Duration::from_secs(900),
+    )
+    .await;
+    let owner_after_kill = serving_node(&fleet.ep, survivor, aged_partition).await;
+    let rss_nodes_after_kill = rss_by_node(&fleet);
+    fleet.spawn_node(owner_index);
+    fleet.nodes[owner_index].wait_ready(&fleet.client).await;
+
+    // Drain handoff of the aged cell: drain its owner, which hands every cell
+    // it holds to the others. The first answer from a survivor after the cell
+    // has left is the handoff; the node's exit is the whole drain.
+    let owner = serving_node(&fleet.ep, 0, aged_partition).await;
+    let owner_index = owner
+        .as_deref()
+        .and_then(|name| name.strip_prefix("node-"))
+        .and_then(|i| i.parse::<usize>().ok())
+        .unwrap_or(0);
     let drain_started = Instant::now();
     let survivor = (owner_index + 1) % fleet.nodes.len();
     let client = fleet.client.clone();
@@ -686,8 +752,6 @@ async fn phase_aged() {
         (exited, drain_started.elapsed().as_secs_f64())
     };
     let probe = async {
-        // A request hitting the draining owner is refused or forwarded; ask a
-        // survivor until it answers *and* the cell has left the owner.
         let mut first = None;
         loop {
             let (answer, _) = ep
@@ -701,15 +765,9 @@ async fn phase_aged() {
                     ),
                 )
                 .await;
-            let moved = ep
-                .raw(survivor, aged_partition, json!({ "op": "count" }))
+            let moved = serving_node(&ep, survivor, aged_partition)
                 .await
-                .ok()
-                .and_then(|v| {
-                    v["node"]
-                        .as_str()
-                        .map(|n| n != format!("node-{owner_index}"))
-                });
+                .map(|n| n != format!("node-{owner_index}"));
             if (answer == "new" || answer == "exists") && moved == Some(true) {
                 first = Some(drain_started.elapsed().as_secs_f64());
                 break;
@@ -722,51 +780,44 @@ async fn phase_aged() {
         first
     };
     let ((drain_exited, drain_s), handoff_first) = tokio::join!(drain, probe);
-    let owner_after = fleet
-        .raw(survivor, aged_partition, json!({ "op": "count" }))
-        .await
-        .ok()
-        .and_then(|v| v["node"].as_str().map(str::to_owned));
-    // Bring the drained node back, so the kill below leaves a fleet of three
-    // minus one, as in production.
+    let owner_after = serving_node(&fleet.ep, survivor, aged_partition).await;
     fleet.spawn_node(owner_index);
     fleet.nodes[owner_index].wait_ready(&fleet.client).await;
-
-    // Kill the owner of the aged partition: the first successful lookup from a
-    // survivor.
-    let owner_index = owner_after
-        .as_deref()
-        .and_then(|name| name.strip_prefix("node-"))
-        .and_then(|i| i.parse::<usize>().ok())
-        .unwrap_or(0);
-    fleet.nodes[owner_index].kill();
-    let killed_at = Instant::now();
-    let survivor = (owner_index + 1) % fleet.nodes.len();
-    let (failover, failover_ok) = until_answered(
-        &fleet,
-        survivor,
-        &scope_in(aged_partition, partitions, "post-kill", &mut rng),
-        Duration::from_secs(900),
-    )
-    .await;
-    let _ = killed_at;
+    // The row count scans the whole table, so it comes last and may take a
+    // while on a paged cell.
+    let mut rows = None;
+    let count_deadline = Instant::now() + Duration::from_secs(600);
+    while rows.is_none() && Instant::now() < count_deadline {
+        rows = fleet
+            .raw(0, aged_partition, json!({ "op": "count" }))
+            .await
+            .ok()
+            .and_then(|v| v["count"].as_u64());
+        if rows.is_none() {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
     fleet.save_logs("aged");
     record(
         "aged",
         json!({
             "partitions": partitions, "run": run, "aged_rows": rows,
             "nodes_ready_s": node_ready_s,
+            "chain_before_restore": chain_before,
+            "chain_at_owner_kill": chain_at_kill,
             "cold_start_s_for_other_partitions": cold.as_secs_f64(),
             "partitions_answered": answered, "partitions_expected": others,
             "aged_partition_first_answer_s": restore.as_secs_f64(), "aged_partition_restored": restored,
             "rss_kib": { "before": rss_before, "after_empty_partitions": rss_after_empty,
-                         "after_aged_partition": rss_after_aged, "after_lookup_load": rss_after_load },
+                         "after_aged_partition": rss_after_aged, "after_lookup_load": rss_after_load,
+                         "per_node_after_empty": rss_nodes_after_empty, "per_node_after_aged": rss_nodes_after_aged,
+                         "per_node_after_load": rss_nodes_after_load, "per_node_after_kill_takeover": rss_nodes_after_kill },
             "rss_mib_per_empty_registry_cell": (rss_after_empty.saturating_sub(rss_before)) as f64 / 1024.0 / f64::from(others),
             "rss_mib_aged_registry_cell": (rss_after_aged.saturating_sub(rss_after_empty)) as f64 / 1024.0,
             "steady_all_partitions": steady, "steady_aged_partition": steady_aged,
+            "owner_kill": { "owner": owner_after_kill.clone(), "first_successful_lookup_s": failover.as_secs_f64(), "answered": failover_ok },
             "drain": { "cell_handed_off_and_answering_s": handoff_first, "node_drain_exit_s": drain_s,
                        "node_exited": drain_exited, "owner_before": owner, "owner_after": owner_after },
-            "owner_kill": { "first_successful_lookup_s": failover.as_secs_f64(), "answered": failover_ok },
         }),
     );
 }
@@ -779,7 +830,7 @@ async fn phase_aged() {
 /// Which node holds the aged cell now, by asking the cell.
 async fn owner_of(fleet: &Fleet, partition: u32) -> Option<usize> {
     fleet
-        .raw(0, partition, json!({ "op": "count" }))
+        .raw(0, partition, json!({ "op": "lookup", "h": "0".repeat(32) }))
         .await
         .ok()
         .and_then(|v| v["node"].as_str().map(str::to_owned))
@@ -799,6 +850,125 @@ async fn cell_objects(fleet: &Fleet, partition: u32) -> (usize, u64) {
         .filter(|m| m.location.as_ref().ends_with(".ltx"))
         .count();
     (objects, listed.iter().map(|m| m.size).sum())
+}
+
+/// Free space under `path`, in GiB, by `df`.
+fn free_gib(path: &Path) -> f64 {
+    std::process::Command::new("df")
+        .args(["-k"])
+        .arg(path)
+        .output()
+        .ok()
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .nth(1)
+                .and_then(|line| line.split_whitespace().nth(3).map(str::to_owned))
+        })
+        .and_then(|kib| kib.parse::<f64>().ok())
+        .map_or(f64::MAX, |kib| kib / 1024.0 / 1024.0)
+}
+
+/// What a restore of the partition's cell would read, from one listing of its
+/// prefix: per epoch and level, the object count and bytes, and the chain a
+/// restore walks (the newest snapshot, then every level 1 object above it).
+async fn chain_summary(fleet: &Fleet, partition: u32) -> Value {
+    let prefix = format!("cells/{}/", celld::engine_api::born_cell_scope(partition));
+    let listed = fleet
+        .bucket_client()
+        .list(&prefix)
+        .await
+        .unwrap_or_default();
+    // (epoch, level) -> (objects, bytes)
+    let mut by: std::collections::BTreeMap<(u64, String), (u64, u64)> = Default::default();
+    for meta in &listed {
+        let path = meta.location.as_ref();
+        let Some(rest) = path.split("/ltx/e").nth(1) else {
+            continue;
+        };
+        let mut parts = rest.split('/');
+        let (Some(epoch), Some(level)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Ok(epoch) = epoch.parse::<u64>() else {
+            continue;
+        };
+        let entry = by.entry((epoch, level.to_owned())).or_default();
+        entry.0 += 1;
+        entry.1 += meta.size;
+    }
+    let snapshot_epoch = by
+        .keys()
+        .filter(|(_, level)| level == "0009")
+        .map(|(epoch, _)| *epoch)
+        .max();
+    let above = |level: &str| -> (u64, u64) {
+        by.iter()
+            .filter(|((epoch, l), _)| l == level && Some(*epoch) >= snapshot_epoch)
+            .fold((0, 0), |a, (_, v)| (a.0 + v.0, a.1 + v.1))
+    };
+    let (l1_objects, l1_bytes) = above("0001");
+    let (l0_objects, l0_bytes) = above("0000");
+    let (snap_objects, snap_bytes) = by
+        .iter()
+        .filter(|((epoch, l), _)| l == "0009" && Some(*epoch) == snapshot_epoch)
+        .fold((0, 0), |a, (_, v)| (a.0 + v.0, a.1 + v.1));
+    json!({
+        "snapshot_epoch": snapshot_epoch,
+        "restore_chain": {
+            "snapshot_objects": snap_objects, "snapshot_bytes": snap_bytes,
+            "l1_objects_above": l1_objects, "l1_bytes_above": l1_bytes,
+            "l0_objects_above": l0_objects, "l0_bytes_above": l0_bytes,
+            "objects": snap_objects + l1_objects + l0_objects,
+        },
+        "prefix_objects": listed.len(),
+        "prefix_bytes": listed.iter().map(|m| m.size).sum::<u64>(),
+        "by_epoch_level": by.iter().map(|((e, l), (n, b))| json!({"epoch": e, "level": l, "objects": n, "bytes": b})).collect::<Vec<_>>(),
+    })
+}
+
+/// Folds the nodes' logs record for registry cells: `ltx_compaction` with
+/// `result="ok"`, split by trigger. Counted from the logs, which the nodes
+/// append to across a respawn, and not from objects, since a round can fold
+/// many rows.
+fn folds_in_logs(fleet: &Fleet) -> Value {
+    let mut by_trigger: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut input_objects = 0_u64;
+    let mut output_bytes = 0_u64;
+    for index in 0..fleet.nodes.len() {
+        let Ok(text) =
+            std::fs::read_to_string(fleet.dir.path().join(format!("node-{index}/celld.log")))
+        else {
+            continue;
+        };
+        for line in text.lines() {
+            if !line.contains("event=\"ltx_compaction\"")
+                || !line.contains("result=\"ok\"")
+                || !line.contains("cell=__Born:")
+            {
+                continue;
+            }
+            let field = |name: &str| {
+                line.split(&format!(" {name}="))
+                    .nth(1)
+                    .and_then(|v| v.split_whitespace().next())
+                    .map(|v| v.trim_matches('"').to_owned())
+            };
+            *by_trigger
+                .entry(field("trigger").unwrap_or_default())
+                .or_default() += 1;
+            input_objects += field("input_objects")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            output_bytes += field("output_bytes")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+        }
+    }
+    json!({
+        "folds": by_trigger.values().sum::<u64>(), "by_trigger": by_trigger,
+        "input_objects": input_objects, "output_bytes": output_bytes,
+    })
 }
 
 async fn phase_age() {
@@ -849,16 +1019,32 @@ async fn phase_age() {
     let inflight: u64 = positive("CELLD_BORN_AGE_INFLIGHT", 4);
     // A rerun on the same run prefix resumes from the rows the cell already
     // holds, so a long age can be split across the background time limit.
-    let have = fleet
-        .raw(0, 0, json!({ "op": "count" }))
-        .await
-        .ok()
-        .and_then(|v| v["count"].as_u64())
-        .unwrap_or(0);
+    // The count waits for the cell's restore, which on an aged bucket takes
+    // longer than one request does, so ask until it answers.
+    let mut have = 0;
+    let resume_deadline = Instant::now() + Duration::from_secs(900);
+    while Instant::now() < resume_deadline {
+        if let Some(n) = fleet
+            .raw(0, 0, json!({ "op": "count" }))
+            .await
+            .ok()
+            .and_then(|v| v["count"].as_u64())
+        {
+            have = n;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
     let resumed_txns = have / rows_per_txn;
     let mut done_txns = resumed_txns;
     let mut epoch_changes: Vec<Value> = Vec::new();
     let mut last_report = Instant::now();
+    let min_free_gib = env_f64("CELLD_BORN_MIN_FREE_GIB", 12.0);
+    let pace = std::env::var("CELLD_BORN_AGE_TXN_PER_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|r| *r > 0.0);
+    let mut low_disk = false;
     let total_txns = folds * txns_per_fold;
     while done_txns < total_txns && started.elapsed() < Duration::from_secs_f64(limit_min * 60.0) {
         // `inflight` transactions at once: the cell serializes them, and their
@@ -876,6 +1062,12 @@ async fn phase_age() {
         }
         let before = done_txns;
         done_txns += ok;
+        // One L1 fold per few transactions needs the writer to leave the fold
+        // rounds room, so a leg can be paced to a transaction rate.
+        if let Some(rate) = pace {
+            let due = started + Duration::from_secs_f64((done_txns - resumed_txns) as f64 / rate);
+            tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+        }
         if before / per_epoch != done_txns / per_epoch && done_txns < total_txns {
             // A forced handoff: drain the owner, bring it back. The cell's
             // next epoch is claimed by whichever node is asked first.
@@ -892,6 +1084,11 @@ async fn phase_age() {
         }
         if last_report.elapsed() > Duration::from_secs(60) {
             last_report = Instant::now();
+            if free_gib(fleet.dir.path()) < min_free_gib {
+                eprintln!("age: free space under {min_free_gib} GiB, stopping this leg");
+                low_disk = true;
+                break;
+            }
             let (objects, bytes) = cell_objects(&fleet, 0).await;
             eprintln!(
                 "age: {done_txns}/{total_txns} txns, {:.1} txn/s, {objects} ltx objects, {:.2} GiB in cell prefix, {} epochs",
@@ -909,15 +1106,26 @@ async fn phase_age() {
         .await
         .ok()
         .and_then(|v| v["count"].as_u64());
+    let folds_seen = folds_in_logs(&fleet);
+    let chain = chain_summary(&fleet, 0).await;
     fleet.save_logs("age");
     record(
         "age",
         json!({
             "run": run, "resumed_from_txns": resumed_txns, "txns": done_txns, "rows": rows, "elapsed_s": started.elapsed().as_secs_f64(),
             "ltx_objects": objects, "cell_prefix_bytes": bytes, "epoch_changes": epoch_changes,
-            "target_folds": folds, "complete": done_txns >= total_txns,
+            "target_folds": folds, "complete": done_txns >= total_txns, "stopped_low_disk": low_disk,
+            "last_epoch_change_at_txn": epoch_changes.last().and_then(|e| e["at_txn"].as_u64()),
+            "folds_logged_this_leg": folds_seen,
+            "chain_at_end": chain,
         }),
     );
+    // End as a crash would: the next phase meets a fleet that never drained,
+    // so its restore reads the snapshot of the last forced epoch and every
+    // level 1 object folded since.
+    for node in &mut fleet.nodes {
+        node.kill();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,64 +1254,120 @@ async fn phase_rolling() {
 // gather: recovery after a node kill, with and without the time-based fold
 // ---------------------------------------------------------------------------
 
+/// Which fleet the gather runs on. `main` and `off` carry no registry: `main` is
+/// a build of main named by `CELLD_BENCH_BIN`, `off` is this branch with the
+/// spike unset. `on` adds the registry and its births beside the same agents.
 async fn phase_gather() {
+    let mode = env_text("CELLD_BORN_GATHER_MODE").unwrap_or_else(|| "on".into());
     let partitions: u32 = positive("CELLD_BORN_P", 16);
     let rate = env_f64("CELLD_BORN_RATE", 0.16);
-    // "today" is a fold interval no run reaches: only the threshold fold runs.
     let fold_ms: u64 = positive("CELLD_BORN_FOLD_MS", celld_logic::born::FOLD_INTERVAL_MS);
     let minutes = env_f64("CELLD_BORN_MINUTES", 12.0);
-    let run = format!("gather-{fold_ms}-{}", support::run_id("b"));
-    let mut fleet = Fleet::start(&run, 3, &partition_env(partitions, fold_ms, &[])).await;
-    let (_, _) = activate_all(&fleet, partitions, Duration::from_secs(300)).await;
-    let mut rng = rand::thread_rng();
-    let end = Instant::now() + Duration::from_secs_f64(minutes * 60.0);
-    let total_rate = rate * f64::from(partitions);
-    let mut turn = 0;
-    while Instant::now() < end {
-        let gap = -(1.0_f64 - rng.gen::<f64>()).ln() / total_rate;
-        tokio::time::sleep(Duration::from_secs_f64(gap)).await;
-        turn += 1;
-        let scope = scope_in(rng.gen_range(0..partitions), partitions, "g", &mut rng);
-        let _ = birth(&fleet.ep, turn % 3, &scope, Duration::from_secs(5)).await;
+    let agents: usize = positive("CELLD_BORN_AGENTS", 200);
+    let turn = Duration::from_millis(positive("CELLD_BORN_TURN_MS", 10_000));
+    let run = format!("gather-{mode}-{}", support::run_id("b"));
+    let env: Vec<(&str, String)> = if mode == "on" {
+        partition_env(partitions, fold_ms, &[])
+    } else {
+        Vec::new()
+    };
+    let fleet = Fleet::start_with("bench-agents", &run, 3, &env).await;
+    if mode == "on" {
+        let (_, _) = activate_all(&fleet, partitions, Duration::from_secs(300)).await;
     }
-    let (age, bundles) = fleet.bundles().await;
-    // Kill the node that owns the most partitions.
-    let mut owners = [0_usize; 3];
-    for p in 0..partitions {
-        if let Ok(v) = fleet.raw(0, p, json!({ "op": "count" })).await {
-            if let Some(i) = v["node"]
-                .as_str()
-                .and_then(|n| n.strip_prefix("node-"))
-                .and_then(|i| i.parse::<usize>().ok())
-            {
-                owners[i] += 1;
-            }
+    let bases: Vec<String> = fleet.nodes.iter().map(|n| n.public.clone()).collect();
+    let turns = ((minutes * 60.0 / turn.as_secs_f64()) as usize).max(2);
+    let agent_load = support::run_turns(
+        &fleet.client,
+        &bases,
+        "g",
+        agents,
+        turns,
+        turn,
+        Duration::from_secs(60),
+    );
+    let registry_load = async {
+        if mode != "on" {
+            return;
         }
-    }
-    let victim = (0..3).max_by_key(|i| owners[*i]).unwrap();
+        let mut rng = rand::thread_rng();
+        let end = Instant::now() + Duration::from_secs_f64(minutes * 60.0);
+        let total_rate = rate * f64::from(partitions);
+        let mut turn_no = 0;
+        while Instant::now() < end {
+            let gap = -(1.0_f64 - rng.gen::<f64>()).ln() / total_rate;
+            tokio::time::sleep(Duration::from_secs_f64(gap)).await;
+            turn_no += 1;
+            let scope = scope_in(rng.gen_range(0..partitions), partitions, "g", &mut rng);
+            let _ = birth(&fleet.ep, turn_no % 3, &scope, Duration::from_secs(5)).await;
+        }
+    };
+    let (errors, ()) = tokio::join!(agent_load, registry_load);
+    let (age, bundles) = fleet.bundles().await;
+    let victim = 1_usize;
     let before = fleet.proxy.take();
+    let mut fleet = fleet;
     fleet.nodes[victim].kill();
     let killed = Instant::now();
-    let survivor = (victim + 1) % 3;
-    // Every partition the victim held must answer again.
-    let mut worst = Duration::ZERO;
-    let mut all = true;
-    for p in 0..partitions {
-        let scope = scope_in(p, partitions, "after", &mut rng);
-        let (_, ok) = until_answered(&fleet, survivor, &scope, Duration::from_secs(900)).await;
-        all &= ok;
-        worst = worst.max(killed.elapsed());
+    let survivors = [0_usize, 2];
+    // Every agent answers again from a survivor: the time is the last one's.
+    use futures_util::StreamExt as _;
+    let times: Vec<f64> = futures_util::stream::iter(0..agents)
+        .map(|agent| {
+            let fleet = &fleet;
+            async move {
+                let url = format!(
+                    "{}/agent/g-{agent}",
+                    fleet.nodes[survivors[agent % 2]].public
+                );
+                let deadline = Instant::now() + Duration::from_secs(900);
+                while Instant::now() < deadline {
+                    if fleet
+                        .client
+                        .post(&url)
+                        .send()
+                        .await
+                        .is_ok_and(|r| r.status().is_success())
+                    {
+                        return killed.elapsed().as_secs_f64();
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                f64::INFINITY
+            }
+        })
+        .buffer_unordered(32)
+        .collect()
+        .await;
+    let mut sorted = times.clone();
+    sorted.sort_by(f64::total_cmp);
+    let agents_served = sorted.last().copied().unwrap_or(0.0);
+    let mut registry_served = 0.0_f64;
+    let mut registry_all = true;
+    if mode == "on" {
+        let mut rng = rand::thread_rng();
+        for p in 0..partitions {
+            let scope = scope_in(p, partitions, "after", &mut rng);
+            let (_, ok) = until_answered(&fleet, 0, &scope, Duration::from_secs(900)).await;
+            registry_all &= ok;
+            registry_served = killed.elapsed().as_secs_f64();
+        }
     }
-    let recovered = killed.elapsed();
     let diff_tally = diff(&fleet.proxy.take(), &before).unwrap_or_default();
     fleet.save_logs("gather");
     record(
-        &format!("gather_fold{fold_ms}"),
+        &format!("gather_{mode}"),
         json!({
-            "partitions": partitions, "rate_per_partition_s": rate, "fold_interval_ms": fold_ms,
+            "mode": mode, "binary": env_text("CELLD_BENCH_BIN"), "agents": agents, "turn_ms": turn.as_millis() as u64,
+            "load_errors": errors, "partitions": if mode == "on" { partitions } else { 0 },
+            "rate_per_partition_s": rate, "fold_interval_ms": fold_ms,
             "retained_bundles_at_kill": bundles, "oldest_bundle_age_s_at_kill": age.as_secs(),
-            "owners": owners, "victim": victim,
-            "all_partitions_served_s": recovered.as_secs_f64(), "all_answered": all,
+            "victim": victim,
+            "agents_all_served_s": agents_served,
+            "agents_served_p50_s": sorted.get(sorted.len() / 2),
+            "agents_served_p99_s": sorted.get((sorted.len() * 99 / 100).min(sorted.len().saturating_sub(1))),
+            "agents_unserved": times.iter().filter(|t| t.is_infinite()).count(),
+            "registry_all_served_s": registry_served, "registry_all_answered": registry_all,
             "requests_during_recovery": window(&diff_tally),
         }),
     );

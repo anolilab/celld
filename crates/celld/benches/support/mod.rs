@@ -1207,6 +1207,12 @@ pub fn free_port() -> u16 {
 /// The `celld` binary under test.
 pub const CELLD: &str = env!("CARGO_BIN_EXE_celld");
 
+/// The binary a fleet runs: `CELLD_BENCH_BIN` when set (a build of another
+/// revision), else the one built beside this bench.
+pub fn celld_bin() -> String {
+    env_text("CELLD_BENCH_BIN").unwrap_or_else(|| CELLD.to_owned())
+}
+
 /// One `celld` fleet node in its own process group, stopped on drop. Shared by
 /// the bench targets that run a real fleet.
 pub struct Node {
@@ -1226,8 +1232,14 @@ impl Node {
         let (public, internal) = (free_port(), free_port());
         let home = dir.join(format!("node-{index}"));
         std::fs::create_dir_all(&home).expect("create node directory");
-        let log = std::fs::File::create(home.join("celld.log")).expect("create node log");
-        let child = Command::new(CELLD)
+        // Appended, not truncated: a respawned node keeps its earlier lines, so
+        // a count over the log covers the node's whole run.
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(home.join("celld.log"))
+            .expect("open node log");
+        let child = Command::new(celld_bin())
             .args([
                 "--bucket",
                 bucket,
