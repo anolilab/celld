@@ -681,6 +681,9 @@ struct CellCompaction {
     /// L0 bytes uploaded since the last fold, the size trigger's measure.
     pending_bytes: AtomicU64,
     compacted_txid: AtomicU64,
+    /// When the last fold finished, on the monotonic clock. The birth registry
+    /// spike's time-based fold measures its interval from here.
+    last_fold_mono_ms: AtomicU64,
     /// Ship rounds also queue work, so the failure delay must gate admission
     /// rather than only delaying the worker's own requeue task.
     retry_after_ms: AtomicU64,
@@ -1488,6 +1491,11 @@ impl LtxRepl {
             "ltx_bundle",
             bundle_loop(cells.clone(), registration.clone(), stop.clone(), flush_ms),
         );
+        // The birth registry spike's time-based fold. Not spawned when the
+        // spike is off, so a node without it has no new task.
+        if crate::born::enabled() && compaction.is_some() {
+            tasks.spawn_owned("ltx_born_fold", born_fold_loop(cells.clone(), stop.clone()));
+        }
         let compaction_queue =
             compaction.map(|config| start_compaction_loop(config, tasks.clone()));
         Self {
@@ -2718,6 +2726,7 @@ impl LtxRepl {
                     min_bytes: self.compaction_min_bytes,
                     pending_bytes: AtomicU64::new(0),
                     compacted_txid: AtomicU64::new(resume_cut),
+                    last_fold_mono_ms: AtomicU64::new(asyncrt::mono_ms()),
                     retry_after_ms: AtomicU64::new(0),
                     failures: AtomicU64::new(0),
                     queued: AtomicBool::new(false),
@@ -4318,6 +4327,9 @@ async fn compact_cell(
             compaction
                 .compacted_txid
                 .store(info.max_txid.0, Ordering::SeqCst);
+            compaction
+                .last_fold_mono_ms
+                .store(asyncrt::mono_ms(), Ordering::SeqCst);
             // The fold consumed the tail it saw; bytes that landed during it
             // count toward the next one only approximately, which delays it
             // by at most one window.
@@ -4614,6 +4626,46 @@ async fn sync_loop(
                     dirty.notify_one();
                 }
             });
+        }
+    }
+}
+
+/// The birth registry's time-based fold (spike, plan 005 findings F3/F6/F7).
+///
+/// A registry cell at a steady birth rate may never reach the threshold fold's
+/// 256 txids, and until it folds, each of its rows keeps the node bundle that
+/// holds it alive. So a registry cell that has durable rows above its fold, and
+/// has not folded for `born::fold_interval_ms()`, queues a fold. The interval
+/// runs from the cell's last fold, so a cell the threshold fold keeps current
+/// is left alone, and a quiet cell queues nothing.
+async fn born_fold_loop(cells: Arc<Mutex<BTreeMap<(String, u64), CellHandle>>>, stop: StopToken) {
+    let mut tick = asyncrt::interval(Duration::from_millis(celld_logic::born::FOLD_TICK_MS));
+    tick.set_missed_tick_behavior(asyncrt::MissedTickBehavior::Delay);
+    let interval = crate::born::fold_interval_ms();
+    loop {
+        asyncrt::select_biased! {
+            "a stop signal that ties the registry fold tick starts no further fold";
+            _ = stop.stopped() => break,
+            _ = tick.tick() => {},
+        }
+        let due: Vec<CellHandle> = cells
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|handle| {
+                handle.compaction.as_ref().is_some_and(|compaction| {
+                    celld_logic::born::is_registry_scope(&compaction.cell)
+                        && handle.durable_txid.load(Ordering::SeqCst)
+                            > compaction.compacted_txid.load(Ordering::SeqCst)
+                        && asyncrt::mono_ms()
+                            .saturating_sub(compaction.last_fold_mono_ms.load(Ordering::SeqCst))
+                            >= interval
+                })
+            })
+            .cloned()
+            .collect();
+        for handle in due {
+            enqueue_compaction(&handle, "born_time");
         }
     }
 }
