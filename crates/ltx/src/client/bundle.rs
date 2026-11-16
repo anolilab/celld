@@ -13,6 +13,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -63,11 +64,63 @@ pub trait BundleFetcher: Send + Sync {
 pub struct BundleOverlayClient<C: ReplicaClient> {
     inner: C,
     fetcher: Option<Arc<dyn BundleFetcher>>,
+    /// A bounded level-0 listing that the overlay rows can answer alone skips
+    /// the inner client's listing. See [`Self::set_overlay_first`].
+    overlay_first: AtomicBool,
 }
 
 impl<C: ReplicaClient> BundleOverlayClient<C> {
     pub fn new(inner: C, fetcher: Option<Arc<dyn BundleFetcher>>) -> Self {
-        Self { inner, fetcher }
+        Self {
+            inner,
+            fetcher,
+            overlay_first: AtomicBool::new(false),
+        }
+    }
+
+    /// Answers a bounded level-0 listing from the overlay rows alone when they
+    /// run on from the seek without a gap, and lists the inner client only
+    /// when they do not (none, or a first row that is not at the seek).
+    ///
+    /// The rows are the same bytes a per-cell object of the same range holds,
+    /// so a compaction that reads them folds the same data. What it can miss is
+    /// a wider per-cell object that starts at the seek, and it then folds a
+    /// shorter prefix; the next round starts past that prefix and, finding no
+    /// row at its seek, lists. A listing never turns into "no work" from the
+    /// overlay alone.
+    pub fn set_overlay_first(&self, on: bool) {
+        self.overlay_first.store(on, Ordering::SeqCst);
+    }
+
+    /// The contiguous run of overlay rows that starts exactly at `seek`, at
+    /// most `limit` long. `None` when there is none.
+    async fn overlay_run(&self, seek: TXID, limit: usize) -> Result<Option<Vec<FileInfo>>> {
+        let mut rows: Vec<_> = self
+            .overlay_rows()
+            .await?
+            .into_iter()
+            .filter(|located| located.row.txid() >= seek)
+            .collect();
+        rows.sort_by_key(|located| located.row.txid());
+        rows.dedup_by_key(|located| located.row.txid());
+        let mut next = seek.0;
+        let mut files = Vec::new();
+        for located in rows {
+            if files.len() == limit || located.row.txid != next {
+                break;
+            }
+            files.push(FileInfo {
+                level: 0,
+                min_txid: located.row.txid(),
+                max_txid: located.row.txid(),
+                pre_apply_checksum: Default::default(),
+                post_apply_checksum: Default::default(),
+                size: located.row.len as i64,
+                created_at: None,
+            });
+            next = next.saturating_add(1);
+        }
+        Ok((!files.is_empty()).then_some(files))
     }
 
     async fn overlay_rows(&self) -> Result<Vec<LocatedRow>> {
@@ -108,6 +161,22 @@ impl<C: ReplicaClient> ReplicaClient for BundleOverlayClient<C> {
             files.sort_by_key(|f| (f.min_txid, f.max_txid));
             files.dedup_by_key(|f| (f.min_txid, f.max_txid));
         }
+        Ok(files)
+    }
+
+    async fn ltx_files_bounded(
+        &self,
+        level: i32,
+        seek: TXID,
+        limit: usize,
+    ) -> Result<Vec<FileInfo>> {
+        if level == 0 && limit > 0 && self.overlay_first.load(Ordering::SeqCst) {
+            if let Some(files) = self.overlay_run(seek, limit).await? {
+                return Ok(files);
+            }
+        }
+        let mut files = self.ltx_files(level, seek).await?;
+        files.truncate(limit);
         Ok(files)
     }
 

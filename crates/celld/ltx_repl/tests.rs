@@ -14,6 +14,7 @@ use celld_ltx::object_store::PutPayload;
 
 mod compaction;
 mod confirm;
+mod quiet_fold;
 mod restore;
 mod retained;
 
