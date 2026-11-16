@@ -36,6 +36,11 @@ path = "benches/agent_requests.rs"
 harness = false
 
 [[bench]]
+name = "birth_registry"
+path = "benches/birth_registry.rs"
+harness = false
+
+[[bench]]
 name = "runtime_latency"
 path = "benches/runtime_latency.rs"
 harness = false
