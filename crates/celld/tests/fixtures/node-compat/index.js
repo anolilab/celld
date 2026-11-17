@@ -358,6 +358,8 @@ export default {
       case "/concurrent/parked":
         return new Response(String(parked));
       case "/concurrent/release":
+        // Releasing a module that parked nothing is a misroute: say so at once.
+        if (!parked) return new Response("nothing is parked in this isolate", { status: 404 });
         return Response.json(await concurrent.release());
       case "/concurrent/arm":
         return Response.json(concurrent.arm());

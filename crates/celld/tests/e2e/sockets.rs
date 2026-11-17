@@ -10,14 +10,14 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpListener;
 
-use super::harness::{observe_for, wait_until, Server};
+use super::harness::{observe_for, wait_until, Server, ONE_ISOLATE};
 
 /// A TCP server that greets each connection, answers `pong\n` with `reply\n`,
 /// and keeps what every connection sent, in accept order.
@@ -87,13 +87,19 @@ impl Tcp {
     }
 }
 
-/// The fixture keeps what a request holds open in module state, which each
-/// isolate has its own copy of. The pool starts another isolate when turns
-/// overlap, and then `/info`, `/steal` or `/release` can land on an isolate
-/// that never saw the held request: the release is a silent no-op and the
-/// held request waits out the handler budget. One isolate keeps every request
-/// of these tests in the same module.
-const ONE_ISOLATE: &[(&str, &str)] = &[("CELLD_MAX_STATELESS_ISOLATES", "1")];
+/// How long the held request gets to reach the Worker before a 404 from
+/// `/info` counts as a misroute.
+const HOLD_ARRIVAL: Duration = Duration::from_secs(5);
+
+/// Lets the held request go. The fixture answers 404 when nothing is held
+/// under the name, which means the release reached another module.
+async fn release(server: &Server) {
+    let status = server.get_status("/release?name=a").await;
+    assert!(
+        status.is_success(),
+        "/release answered {status}: it reached an isolate that holds nothing (a misroute)"
+    );
+}
 
 /// Starts a request that holds a socket open until it is released, and waits
 /// until the Worker reports the socket ready. Returns the held socket's id and
@@ -109,11 +115,24 @@ async fn hold(server: &Server, path: &str) -> (u64, tokio::task::JoinHandle<Valu
         })
     });
     let info = server.url("/info?name=a");
+    let started = Instant::now();
     let id = wait_until(
         "the held socket to open",
         Duration::from_secs(20),
         || async {
-            let info: Value = reqwest::get(&info).await.ok()?.json().await.ok()?;
+            let response = reqwest::get(&info).await.ok()?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                // The held request may still be on its way. Once it had time
+                // to arrive, a 404 means the poll reached a module that never
+                // saw it.
+                assert!(
+                    started.elapsed() < HOLD_ARRIVAL,
+                    "/info answered 404 for a request that should be held: the poll reached \
+                     an isolate that never saw it (a misroute)"
+                );
+                return None;
+            }
+            let info: Value = response.json().await.ok()?;
             info["ready"].as_bool()?.then(|| info["id"].as_u64())?
         },
     )
@@ -192,7 +211,7 @@ async fn a_websocket_id_of_another_request_is_refused() {
     let (id, request) = hold(&server, "/ws/hold?name=a").await;
 
     let stolen: Value = server.get_json("/ws/steal?name=a").await;
-    server.get_text("/release?name=a").await;
+    release(&server).await;
     let held = request.await.expect("the held request finished");
 
     assert_eq!(held["id"].as_u64(), Some(id));
@@ -223,7 +242,7 @@ async fn a_tcp_id_of_another_request_is_refused() {
         .await;
     observe_for(Duration::from_millis(200)).await;
     let sent = tcp.received(0);
-    server.get_text("/release?name=a").await;
+    release(&server).await;
     request.await.expect("the held request finished");
 
     assert_ne!(
@@ -247,7 +266,15 @@ async fn hold_chat(server: &Server) -> (u64, tokio::task::JoinHandle<Value>) {
 }
 
 async fn client_log(server: &Server) -> Vec<String> {
-    let info: Value = server.get_json("/info?name=a").await;
+    let response = reqwest::get(server.url("/info?name=a"))
+        .await
+        .expect("GET /info");
+    assert!(
+        response.status().is_success(),
+        "/info answered {}: it reached an isolate that holds nothing (a misroute)",
+        response.status()
+    );
+    let info: Value = response.json().await.expect("the held client's info");
     serde_json::from_value(info["log"].clone()).expect("the held client's frames")
 }
 
@@ -271,7 +298,7 @@ async fn an_object_socket_of_another_cell_cannot_be_bound() {
         },
     );
     reached.await;
-    server.get_text("/release?name=a").await;
+    release(&server).await;
     request.await.expect("the held client finished");
 
     assert!(
@@ -286,7 +313,7 @@ async fn a_response_cannot_return_another_cells_socket() {
     let (_, request) = hold_chat(&server).await;
 
     let out: Value = server.get_json("/ws/forge-return-selftest?name=a").await;
-    server.get_text("/release?name=a").await;
+    release(&server).await;
     request.await.expect("the held client finished");
 
     assert_eq!(
@@ -303,7 +330,7 @@ async fn a_request_cannot_send_on_an_object_socket() {
 
     let out: Value = server.get_json("/ws/send-on-cell?name=a").await;
     let log = client_log(&server).await;
-    server.get_text("/release?name=a").await;
+    release(&server).await;
     request.await.expect("the held client finished");
 
     assert!(

@@ -23,6 +23,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 const CELLD: &str = env!("CARGO_BIN_EXE_celld");
+/// Caps the stateless pool at one isolate. A fixture that keeps what one
+/// request leaves for another in module state (a held socket, a parked
+/// promise) needs every request in the same module, and the pool starts a
+/// second isolate whenever turns overlap. This bounds how many isolates are
+/// alive at once; it does not pin the request to one for good, because the
+/// idle reaper can retire the only isolate and the next request then gets a
+/// fresh module. A test that depends on it must make the fixture answer an
+/// error when its state is missing, so a misroute fails at once.
+pub const ONE_ISOLATE: &[(&str, &str)] = &[("CELLD_MAX_STATELESS_ISOLATES", "1")];
+
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How often the readiness probe looks, much shorter than `POLL_INTERVAL`: the

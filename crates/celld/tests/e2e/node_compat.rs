@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use super::harness::Server;
+use super::harness::{Server, ONE_ISOLATE};
 
 /// A fixture check set answers `{ name: "ok" | <what it saw> }`.
 async fn assert_all_ok(server: &Server, path: &str, expected: usize) {
@@ -197,7 +197,7 @@ struct Released {
 async fn a_stateless_reaction_keeps_its_own_tmp_while_another_request_drives_it() {
     use std::time::Duration;
 
-    let server = std::sync::Arc::new(Server::start("node-compat", &[]).await);
+    let server = std::sync::Arc::new(Server::start("node-compat", ONE_ISOLATE).await);
     let parking = tokio::spawn({
         let server = server.clone();
         async move { server.get_json::<Parked>("/concurrent/park").await }
@@ -206,7 +206,15 @@ async fn a_stateless_reaction_keeps_its_own_tmp_while_another_request_drives_it(
         (server.get_text("/concurrent/parked").await == "true").then_some(())
     })
     .await;
-    let released: Released = server.get_json("/concurrent/release").await;
+    let response = reqwest::get(server.url("/concurrent/release"))
+        .await
+        .expect("GET /concurrent/release");
+    assert!(
+        response.status().is_success(),
+        "/concurrent/release answered {}: it reached an isolate that parked nothing (a misroute)",
+        response.status()
+    );
+    let released: Released = response.json().await.expect("the release answer");
     let parked = tokio::time::timeout(Duration::from_secs(10), parking)
         .await
         .expect("the parked request never answered")
@@ -232,7 +240,7 @@ struct Left {
 /// must not use the one of the request that runs its checkpoint.
 #[tokio::test]
 async fn a_reaction_of_a_finished_stateless_request_gets_no_tmp() {
-    let server = Server::start("node-compat", &[]).await;
+    let server = Server::start("node-compat", ONE_ISOLATE).await;
     let _: serde_json::Value = server.get_json("/concurrent/arm").await;
     let left: Left = server.get_json("/concurrent/fire").await;
     assert!(
@@ -256,7 +264,7 @@ struct Late {
 /// next request gets a normal `/tmp`.
 #[tokio::test]
 async fn a_request_that_loads_fs_mid_flight_gets_no_tmp_until_the_next_request() {
-    let server = Server::start("node-compat-late-fs", &[]).await;
+    let server = Server::start("node-compat-late-fs", ONE_ISOLATE).await;
     let first: Late = server.get_json("/write").await;
     assert!(first.first, "the worker had loaded node:fs already");
     assert!(
