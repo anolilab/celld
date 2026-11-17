@@ -6349,6 +6349,8 @@ const __cell = __celld.__cell = {
   namespaceKeys: {},
   node: "",
   deleteAllDeletesAlarm: false,
+  // `CELLD_HANDLER_BUDGET_S`, in milliseconds. A workflow turn is one handler.
+  handlerBudgetMs: 300000,
   compat: {
     jsRpc: false, fetcherGetPutDelete: false, queueJsonMessages: false,
     cacheOption: false,
@@ -8764,13 +8766,15 @@ const __wfEnterStep = (name, fn) => {
 // Race an attempt against its deadline. The abandoned callback keeps
 // running -- there is no cancellation to send it -- but its result is
 // discarded and the timeout counts as a failed attempt, as upstream.
-const __wfTimeout = (promise, ms, name, attempt) =>
+const __wfTimeout = (promise, ms, name, attempt, onTimeout) =>
   new Promise((resolve, reject) => {
     const timer = setTimeout(
-      () =>
+      () => {
+        onTimeout?.();
         reject(new Error(
           `step ${JSON.stringify(name)} timed out after ${ms} ms (attempt ${attempt})`,
-        )),
+        ));
+      },
       ms,
     );
     promise.then(
@@ -8787,6 +8791,16 @@ const __wfTrackStorageFailures = (storage, driver) => {
   for (const name of ["get", "put", "transactionSync"]) {
     Object.defineProperty(tracked, name, {
       value(...args) {
+        // A fenced drive no longer owns the ledger: a callback it abandoned
+        // must not record its outcome over the replacement drive's records.
+        // The failure is permanent so no retry policy or delay callback runs
+        // on the fenced drive, and the step frame leaves the step promise
+        // pending rather than rejecting it into user code.
+        if (name !== "get" && driver.fenced()) {
+          const fenced = __wfError("the workflow drive was fenced");
+          fenced.__wfPermanent = true;
+          throw fenced;
+        }
         try {
           const result = storage[name](...args);
           if (result !== null && typeof result === "object" &&
@@ -8813,6 +8827,13 @@ const __wfTrackStorageFailures = (storage, driver) => {
 // distinct keys in call order, and a repeated name in a loop cannot collide.
 const __wfMakeStep = (driver) => {
   const storage = driver.storage;
+  // The handler budget bounds one turn, not the run. A turn that has used
+  // half of it and made progress hands the rest to a fresh turn: the replay
+  // skips every finished step, so the next turn continues where this one
+  // stopped. A replay alone never yields, or a slow one would never end.
+  const turnSpent = () =>
+    driver.executed > 0 &&
+    Date.now() - driver.startedMs >= __cell.handlerBudgetMs / 2;
   // The shared step frame. `body` resolves to {value} or {block: at, kind};
   // a blocked step leaves its promise unsettled forever in this invocation.
   // The running counter covers the whole body, ledger reads included, so
@@ -8874,6 +8895,11 @@ const __wfMakeStep = (driver) => {
           driver.running -= 1;
           driver.clearStall();
           driver.check();
+          // A fenced drive's ledger write fails permanently. Rejecting would
+          // run the user's catch blocks, with their side effects, inside a
+          // replaced drive; the step's own promise stays pending instead, and
+          // nothing holds it, so it is collected with the drive.
+          if (driver.fenced()) return;
           reject(error);
         },
       );
@@ -8886,6 +8912,12 @@ const __wfMakeStep = (driver) => {
     const rollback = hasConfig ? maybeRollback : callbackOrRollback;
     try {
       __wfStepName(name);
+      // A rollback option would otherwise read as an unknown key.
+      if (__wfOwnObject(config) && "rollbackConfig" in config) {
+        throw __wfError(
+          "step rollbackOptions are not implemented in celld; remove the rollback handler and `rollbackConfig`",
+        );
+      }
       config = __wfStepConfig(config, name);
     } catch (error) {
       return Promise.reject(error);
@@ -8917,15 +8949,40 @@ const __wfMakeStep = (driver) => {
       if (record !== undefined && record.nextAt > Date.now()) {
         return { block: record.nextAt, kind: "retry" };
       }
+      if (turnSpent()) return { block: Date.now(), kind: "yield" };
       const attempt = (record === undefined ? 0 : record.attempt) + 1;
       const historyOrdinal = record?.ordinal ?? ordinal;
       const retries = config.retries ??
         { limit: 5, delay: 10000, backoff: "exponential" };
       const timeout = config.timeout ?? "10 minutes";
-      const timeoutMs = __wfDuration(
+      // An attempt must end before its handler does. The handler's expiry
+      // would cancel it without recording a failure, so the step would run
+      // again unchanged. A timeout records the failure instead and the retry
+      // policy applies. The attempt gets the least of its timeout, 90% of the
+      // budget, and what is left of that. A turn that has run something
+      // hands over instead when less than the smaller of the timeout and half
+      // the budget is left, so a step with the default timeout still runs in
+      // the current turn while half the budget remains.
+      const userTimeout = __wfDuration(
         timeout,
         `the timeout of step ${JSON.stringify(name)}`,
       );
+      const cap = Math.floor(__cell.handlerBudgetMs * 0.9);
+      const remaining = cap - (Date.now() - driver.startedMs);
+      if (
+        driver.executed > 0 &&
+        remaining < Math.min(userTimeout, Math.floor(__cell.handlerBudgetMs / 2))
+      ) {
+        return { block: Date.now(), kind: "yield" };
+      }
+      // A turn that already ran something may give the attempt less than its
+      // full timeout. Only such a turn can cut the attempt short; a fresh
+      // turn gives the full timeout, so the replay always makes progress.
+      const turnCanShorten = driver.executed > 0;
+      driver.executed += 1;
+      const timeoutMs = Math.max(1, Math.min(userTimeout, cap, remaining));
+      const shortened = turnCanShorten && timeoutMs < Math.min(userTimeout, cap);
+      let cutShort = false;
       // Upstream omits a dynamic delay from the step context. Copying the
       // config verbatim would expose the callback to itself as retry policy,
       // while callers expect only the serializable limit and backoff fields.
@@ -8954,6 +9011,7 @@ const __wfMakeStep = (driver) => {
           timeoutMs,
           name,
           attempt,
+          () => { cutShort = shortened; },
         );
         if (value !== undefined) {
           __wfCheckValue(value, `the return value of step ${JSON.stringify(name)}`);
@@ -8966,6 +9024,10 @@ const __wfMakeStep = (driver) => {
         });
         return { value };
       } catch (error) {
+        // The turn, not the step, ran out of time: the "running" record keeps
+        // the attempt number, so a fresh turn runs the same attempt with its
+        // full timeout and no retry is spent.
+        if (cutShort) return { block: Date.now(), kind: "yield" };
         // NonRetryableError skips retries by contract; a value-cap or
         // serialization failure is marked permanent above because another
         // attempt returns the same value.
@@ -9040,11 +9102,16 @@ const __wfMakeStep = (driver) => {
       });
     }
     if (at <= Date.now()) {
+      // Sleeps that complete at once count as progress, so a run of them
+      // hands over to a fresh turn like a run of steps. A sleep that is not
+      // due blocks until its deadline whatever the turn has spent.
+      if (turnSpent()) return { block: Date.now(), kind: "yield" };
       await storage.put(key, {
         kind: "sleep",
         status: "completed",
         ordinal: historyOrdinal,
       });
+      driver.executed += 1;
       return { value: undefined };
     }
     return { block: at, kind: "sleep" };
@@ -9155,6 +9222,8 @@ const __wfMakeStep = (driver) => {
             // A crash can therefore expose both or neither, so an
             // acknowledged event cannot disappear between them.
             storage.kv.delete(eventKey);
+            // Consuming an event is progress; replaying a completed one is not.
+            driver.executed += 1;
             /*__CELLD_TEST_WORKFLOW_EVENT_CONSUMED__*/
             storage.kv.put(key, {
               kind: "event",
@@ -9455,9 +9524,21 @@ const __WorkflowCell = (() => {
     // seeing the flag, the re-arm below starts a fresh drive immediately.
     // A failed drive is not re-raised here: the engine already retries the
     // alarm that fired it.
+    // A drive older than the handler budget belongs to a handler the runtime
+    // already ended: it cannot finish, and waiting for it would strand the
+    // instance. Fence it and start over from the ledger.
+    if (this._wfDriving !== undefined &&
+        Date.now() - this._wfDriveStartedMs >= __cell.handlerBudgetMs) {
+      this._wfDriveToken = undefined;
+      this._wfDriver.finished = true;
+      this._wfDriver.clearStall();
+      this._wfDriving = undefined;
+      // A fenced drive never settles, so wake whoever waits on it.
+      this._wfFence?.();
+    }
     if (this._wfDriving !== undefined) {
       this._wfNudge = Date.now();
-      await this._wfDriving.catch(() => {});
+      await Promise.race([this._wfDriving.catch(() => {}), this._wfFenced]);
       if (this._wfNudge !== undefined) {
         this._wfNudge = undefined;
         const meta = await storage.get("__wf.meta");
@@ -9514,15 +9595,19 @@ const __WorkflowCell = (() => {
     // the suspend-time re-arm would strand a "running" instance with no
     // alarm and no wake entry. The suspend path re-arms explicitly, and a
     // terminal drive deletes.
-    const driving = this._drive(meta);
+    const token = {};
+    this._wfDriveToken = token;
+    this._wfDriveStartedMs = Date.now();
+    this._wfFenced = new Promise((release) => { this._wfFence = release; });
+    const driving = this._drive(meta, token);
     this._wfDriving = driving;
     try {
       await driving;
     } finally {
-      this._wfDriving = undefined;
+      if (this._wfDriving === driving) this._wfDriving = undefined;
     }
   }
-  async _drive(meta) {
+  async _drive(meta, token) {
     const storage = this._state.storage;
     // The drive owns `status`, `output`, and `error`; every other piece of
     // instance state belongs to the RPCs (sendEvent's sequence lives in its
@@ -9535,7 +9620,8 @@ const __WorkflowCell = (() => {
     const settle = (mutate) => transactionSync(storage, (transaction) => {
       const current = transaction.kv.get("__wf.meta");
       if (current === undefined || __wfTerminal(current.status) ||
-          current.generation !== meta.generation) return false;
+          current.generation !== meta.generation ||
+          token !== this._wfDriveToken) return false;
       mutate(current, transaction);
       transaction.kv.put("__wf.meta", current);
       return true;
@@ -9573,6 +9659,12 @@ const __WorkflowCell = (() => {
       blocked: [],
       pauseRequested: false,
       finished: false,
+      startedMs: Date.now(),
+      // A newer drive or a fence took over this instance's token.
+      fenced: () => token !== this._wfDriveToken,
+      // Step callbacks started in this turn. A turn yields only after it
+      // made progress, or a replay slower than the yield point never ends.
+      executed: 0,
       checkQueued: false,
       stallTimer: undefined,
       clearStall() {
@@ -9583,6 +9675,7 @@ const __WorkflowCell = (() => {
       },
     };
     driver.storage = __wfTrackStorageFailures(storage, driver);
+    this._wfDriver = driver;
     const outcome = new Promise((resolve) => {
       driver.finish = (result) => {
         if (driver.finished) return;
@@ -9705,8 +9798,11 @@ const __WorkflowCell = (() => {
         at = Math.min(at, this._wfNudge);
         this._wfNudge = undefined;
       }
+      // A yield continues at once and is not a wait: the instance still
+      // runs, and `status()` says so.
+      const yielded = driver.blocked.every((entry) => entry.kind === "yield");
       settle((current, transaction) => {
-        current.status = "waiting";
+        current.status = yielded ? "running" : "waiting";
         transaction.setAlarm(at);
       });
       // The explicit re-arm replaces the alarm that fired this drive.

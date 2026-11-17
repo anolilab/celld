@@ -1003,13 +1003,15 @@ pub(super) fn inject_storage_compatibility(scope: &mut v8::PinScope, compat: Com
          c.compat.fetcherGetPutDelete = {};\n\
          c.compat.websocketStandardBinaryType = {};\n\
          c.compat.queueJsonMessages = {};\n\
-         c.compat.cacheOption = {};",
+         c.compat.cacheOption = {};\n\
+         c.handlerBudgetMs = {};",
         compat.delete_all_deletes_alarm,
         compat.js_rpc,
         compat.fetcher_get_put_delete,
         compat.websocket_standard_binary_type,
         compat.queue_json_messages,
         compat.cache_option,
+        super::handler_budget().as_millis(),
     );
     run_internal_snippet(scope, &source).ok_or_else(|| anyhow!("compatibility install failed"))?;
     Ok(())

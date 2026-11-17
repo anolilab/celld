@@ -45,4 +45,5 @@ mod e2e {
     pub mod version;
     pub mod version_metadata;
     pub mod webcrypto;
+    pub mod workflow_budget;
 }

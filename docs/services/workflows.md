@@ -42,6 +42,44 @@ so a step callback must tolerate a second attempt.
 await. celld fails the instance when such work keeps `run()` pending for 60
 seconds while no step runs or waits.
 
+## Handler budget
+
+`CELLD_HANDLER_BUDGET_S` bounds one turn of an instance, not the whole run. A
+turn that has used half the budget and has run a step hands over to a new turn
+before it starts the next step, and `status()` keeps reporting `running`. A
+run of any number of short steps therefore finishes.
+
+Sleeps that complete at once count toward that progress like steps do. A sleep
+that is not yet due blocks until its deadline, even in a turn that has used its
+half of the budget.
+
+One attempt of a step ends after at most 90% of the budget, even when its
+`timeout` is longer. It then fails like any timed-out attempt, and its retries
+apply. An attempt never outlives its turn: it gets at most what is left of the turn.
+A turn that has run something starts the next step only while at least half the
+budget (or the step's `timeout`, if that is shorter) remains before the 90% cap.
+For a step with the default timeout, that is while the turn has used at most 40%
+of the budget. Quick steps with the default timeout therefore share a turn, and a
+step that would get less starts in a fresh one. Consuming an event counts as progress like running a step. Keep a
+single step shorter than the budget, or split it.
+An attempt that times out only because its turn cut it short is not counted: it
+runs again in a fresh turn with its full timeout and uses no retry.
+A step's callback is not cancelled when its attempt times out or its turn ends, so
+the abandoned callback may still run beside the retry: keep steps idempotent.
+
+Turn age and the age of a stale drive are measured with the isolate's clock,
+which is the wall clock sampled at the last I/O; the isolate has no monotonic
+clock. A large clock jump can therefore end a turn early or late.
+
+A new turn replays the finished steps first. The replay alone must fit in half
+the budget, so a run of many thousands of steps can outgrow it.
+
+A turn that the runtime ended before it could hand over leaves a drive behind.
+The next alarm fences that drive, so its late callbacks cannot overwrite the
+step records of the drive that replaced it. Its ledger writes fail, and the
+step calls it still awaits stay unsettled: `run()`'s `catch` blocks do not run
+for them, and the abandoned drive is collected instead of continuing.
+
 ## Sleeps, events, and retries
 
 `step.waitForEvent()` times out after 24 hours by default. An event that
@@ -55,7 +93,8 @@ and `CELLD_ALARM_RESIDENT_MS` changes it.
 
 `step.do()` uses the Cloudflare retry defaults when the call supplies no
 `retries` object: 5 retries, a delay of 10 seconds, exponential backoff, and a
-timeout of 10 minutes for one attempt.
+timeout of 10 minutes for one attempt, capped by the
+[handler budget](#handler-budget).
 
 celld sets no limit on the number of concurrent instances. Fleet memory and the
 resident-cell cap bound it.
@@ -70,7 +109,10 @@ resident-cell cap bound it.
 - A step result, an event payload, and the workflow parameters each have a
   1 MiB limit.
 - Rollback, a sensitive step result, and a `ReadableStream` step result are
-  unavailable.
+  unavailable. A step given a rollback handler or `rollbackConfig`, and
+  `terminate({ rollback: true })`, fail with an error that says so. celld
+  cannot refuse them at deploy, because they are call arguments, not
+  configuration.
 - A `workflows` entry cannot carry `schedules`, `limits`, or a `script_name`
   that names another script.
 - The Workflows REST API and the `wrangler workflows` commands are
