@@ -530,6 +530,12 @@ async fn the_cache_option_accepts_only_no_store_and_follows_the_compat_date() {
         forced.starts_with("TypeError: Unsupported cache mode: force-cache"),
         "{on}"
     );
+    let data_forced = on["dataForceCache"].as_str().unwrap();
+    assert!(
+        data_forced.starts_with("TypeError: Unsupported cache mode: force-cache"),
+        "{on}"
+    );
+    assert_eq!(on["dataNoStore"], "x", "{on}");
 
     server
         .restart_after(|project| {
@@ -542,7 +548,12 @@ async fn the_cache_option_accepts_only_no_store_and_follows_the_compat_date() {
         .await;
     let off: Value = server.get_json("/cache").await;
     assert_eq!(off["flag"], false, "{off}");
-    for key in ["requestCache", "fetchNoStore", "forceCache"] {
+    for key in [
+        "requestCache",
+        "fetchNoStore",
+        "forceCache",
+        "dataForceCache",
+    ] {
         let message = off[key].as_str().unwrap_or_default();
         assert!(message.contains("'cache' field"), "{key}: {off}");
     }

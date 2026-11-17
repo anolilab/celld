@@ -95,6 +95,11 @@ export default {
           () => new Request(dead, { cache: { toString: () => "no-store" } }).cache),
         forceCache: await attempt(() => fetch(dead, { cache: "force-cache" })),
         cloned: await attempt(() => new Request(dead, { cache: "no-store" }).clone().cache),
+        // A data: URL never reaches the Request constructor, but its option
+        // is checked all the same.
+        dataForceCache: await attempt(() => fetch("data:,x", { cache: "force-cache" })),
+        dataNoStore: await attempt(
+          async () => (await fetch("data:,x", { cache: "no-store" })).text()),
         flag: globalThis.Cloudflare.compatibilityFlags.cache_option_enabled,
       });
     }

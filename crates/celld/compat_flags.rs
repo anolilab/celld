@@ -623,6 +623,17 @@ fn assess(flags: &[impl AsRef<str>], date: Option<&str>, strict: bool, python: b
             ));
         }
     }
+    // The old queue names pair the same way: each opposes one current name.
+    for (old, current) in [
+        ("queue_json_messages", "no_queues_json_messages"),
+        ("queue_v8_messages", "queues_json_messages"),
+    ] {
+        if has(old) && has(current) {
+            found.problems.push(format!(
+                "  {old} and {current} contradict each other; set only one"
+            ));
+        }
+    }
     if let Some(date) = date {
         for flag in FLAGS {
             let (Some(since), true) = (flag.since, matches!(flag.status, Unsupported | Partial))
@@ -1130,6 +1141,19 @@ mod tests {
         assert!(!compat(date, &["queue_v8_messages"]).queue_json_messages);
         assert!(compat("2020-01-01", &["queue_json_messages"]).queue_json_messages);
         assert!(!compat(&day_before(date), &[]).queue_json_messages);
+        // The opt-out beats the old alias.
+        let both = ["queue_json_messages", "no_queues_json_messages"];
+        assert!(!compat("2020-01-01", &both).queue_json_messages);
+        for (old, current) in [
+            ("queue_json_messages", "no_queues_json_messages"),
+            ("queue_v8_messages", "queues_json_messages"),
+        ] {
+            let error = check_flags(&[old, current], false).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("{old} and {current} contradict each other")),
+                "{error}"
+            );
+        }
         let found = assess(&["queue_v8_messages"], None, false, true);
         assert!(
             found.warnings[0].contains("did you mean `queues_json_messages`"),
