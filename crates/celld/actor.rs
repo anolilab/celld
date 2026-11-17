@@ -1741,6 +1741,7 @@ impl AppHandle {
             let ages = draining
                 .iter()
                 .filter(|generation| generation.id() < crate::cell_runtime::SHADOW_ID_BASE)
+                .filter(|generation| !generation.is_drained())
                 .filter_map(|generation| generation.retired_for_ms())
                 .collect::<Vec<_>>();
             state["deployment"] = serde_json::json!({

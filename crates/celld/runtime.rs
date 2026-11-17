@@ -2225,11 +2225,17 @@ async fn drive_worker(
     let mut ops = Ops::new();
 
     // Whether the retire deadline binds this event is what it was when the
-    // event began, not after its first turn: work that was already running
-    // when the timer fired is ended, and a turn can be what the timer
-    // interrupts.
-    let mut retire = (!slot.deadline_forced()).then_some(slot);
-    let (begun, started) = slot.turn(|worker| worker.turn_begin(job, trace)).await;
+    // event began: sampled in the turn, after any queueing for the isolate,
+    // so a request that waited past the deadline is not ended for it, while
+    // work already running when the timer fires, a turn included, is.
+    let mut binds = false;
+    let (begun, started) = slot
+        .turn(|worker| {
+            binds = !slot.deadline_forced();
+            worker.turn_begin(job, trace)
+        })
+        .await;
+    let mut retire = binds.then_some(slot);
     // Nothing is in flight; the reply already carries the error.
     let Some(mut entry) = begun else {
         drop(started);
