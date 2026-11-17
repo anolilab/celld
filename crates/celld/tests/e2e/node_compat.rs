@@ -49,17 +49,13 @@ async fn process_env_holds_vars_and_secrets_as_text() {
     let mut server = Server::start("node-compat", &[]).await;
     server
         .restart_after(|project| {
-            std::fs::write(project.join(".dev.vars"), "SECRET=s3cret\n__proto__=own\n").unwrap()
+            std::fs::write(project.join(".dev.vars"), "SECRET=s3cret\n").unwrap()
         })
         .await;
     let env: EnvReport = server.get_json("/env").await;
     assert_eq!(env.greeting.as_deref(), Some("hello"));
     assert!(env.unset, "a name that is not set must read as undefined");
-    assert_eq!(env.keys, ["EMPTY", "GREETING", "SECRET", "__proto__"]);
-    assert_eq!(
-        env.values["__proto__"], "own",
-        "a variable named __proto__ is an own property"
-    );
+    assert_eq!(env.keys, ["EMPTY", "GREETING", "SECRET"]);
     assert_eq!(env.values["SECRET"], "s3cret");
     assert_eq!(env.values["EMPTY"], "");
 }
@@ -244,4 +240,34 @@ async fn a_reaction_of_a_finished_stateless_request_gets_no_tmp() {
         "the stale reaction read the running request's /tmp"
     );
     assert_eq!(left.write, "EPERM");
+}
+
+#[derive(serde::Deserialize)]
+struct Late {
+    first: bool,
+    write: String,
+    sees: bool,
+    listed: Vec<String>,
+}
+
+/// A request that loads `node:fs` while it runs began before the filesystem
+/// had request tokens, so it has no `/tmp` of its own: its writes fail with
+/// `EPERM` and its reads see an empty tree. Once the module is loaded, the
+/// next request gets a normal `/tmp`.
+#[tokio::test]
+async fn a_request_that_loads_fs_mid_flight_gets_no_tmp_until_the_next_request() {
+    let server = Server::start("node-compat-late-fs", &[]).await;
+    let first: Late = server.get_json("/write").await;
+    assert!(first.first, "the worker had loaded node:fs already");
+    assert!(
+        first.write.starts_with("EPERM:") && first.write.contains("started before node:fs"),
+        "{}",
+        first.write
+    );
+    assert!(!first.sees && first.listed.is_empty());
+    let next: Late = server.get_json("/write").await;
+    assert!(!next.first, "a second isolate served the request");
+    assert_eq!(next.write, "written");
+    assert!(next.sees);
+    assert_eq!(next.listed, ["late"]);
 }

@@ -292,8 +292,12 @@ impl RequestVfs {
     }
 }
 
-/// The error code for a `/tmp` change with no request; the harness words it.
-const VFS_NO_REQUEST: &str = "ENOREQUEST";
+/// The error code for a `/tmp` change with no request-local tree; the harness
+/// words it. `tmp_unavailable_code` tells "no request" from "a request that
+/// began before `node:fs` was loaded".
+fn no_tmp(scope: &mut v8::PinScope) -> &'static str {
+    super::tmp_unavailable_code(scope)
+}
 
 fn lock_vfs(context: &IoContext) -> std::sync::MutexGuard<'_, RequestVfs> {
     context
@@ -311,15 +315,17 @@ fn with_vfs<R>(scope: &mut v8::PinScope, f: impl FnOnce(&mut RequestVfs) -> R) -
     Some(result)
 }
 
-/// Like `with_vfs` for a change: no request answers `ENOREQUEST`.
+/// Like `with_vfs` for a change: no request-local tree answers `ENOREQUEST`
+/// or `ENOTMPTOKEN`.
 fn with_vfs_mut(
     scope: &mut v8::PinScope,
     f: impl FnOnce(&mut RequestVfs) -> Result<(), &'static str>,
 ) -> &'static str {
-    with_vfs(scope, f)
-        .unwrap_or(Err(VFS_NO_REQUEST))
-        .err()
-        .unwrap_or("")
+    match with_vfs(scope, f) {
+        Some(Ok(())) => "",
+        Some(Err(code)) => code,
+        None => no_tmp(scope),
+    }
 }
 
 /// Read the current request's tree. With no request the tree is empty, as for
@@ -346,8 +352,10 @@ pub(super) fn op_vfs_mkdir(
 ) {
     let path = args.get(0).to_rust_string_lossy(scope);
     let recursive = args.get(1).boolean_value(scope);
-    let result = with_vfs(scope, |vfs| vfs.mkdir(&path, recursive))
-        .unwrap_or(VfsMkdirResult::Error(VFS_NO_REQUEST));
+    let result = match with_vfs(scope, |vfs| vfs.mkdir(&path, recursive)) {
+        Some(result) => result,
+        None => VfsMkdirResult::Error(no_tmp(scope)),
+    };
     let result = match result {
         VfsMkdirResult::Created(Some(path)) => path,
         VfsMkdirResult::Created(None) => String::new(),
@@ -369,8 +377,10 @@ pub(super) fn op_vfs_write(
     let view = args.get(1).try_cast::<v8::ArrayBufferView>().ok();
     let len = view.map_or(0, |view| view.byte_length());
     // Refuse a buffer that cannot fit before copying it out of the heap.
-    let limit =
-        with_vfs(scope, |vfs| vfs.write_limit(&path, append)).unwrap_or(Err(VFS_NO_REQUEST));
+    let limit = match with_vfs(scope, |vfs| vfs.write_limit(&path, append)) {
+        Some(limit) => limit,
+        None => Err(no_tmp(scope)),
+    };
     let code = match limit {
         Err(code) => code,
         Ok(limit) if len > limit => "ENOSPC",

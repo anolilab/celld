@@ -10901,23 +10901,39 @@ fn op_pending_event_end(
 /// Code that runs with no request (a module evaluating while the isolate
 /// loads) would otherwise fall back to the thread's default context, which is
 /// shared by every script on the thread and never dropped: its `/tmp` would
-/// outlive the script and leak into the next one. Only a context a guard
-/// installed counts; the lazily created default never does. A reaction of a
+/// outlive the script and leak into the next one. Only a context a token
+/// names counts; the lazily created default never does. A reaction of a
 /// finished event has a token whose context is gone and gets no `/tmp` at all,
 /// rather than the `/tmp` of the request that runs the checkpoint.
+///
+/// A stateless request answers only through its `/tmp` token. One that began
+/// before the Worker first loaded `node:fs` has none, and its reactions cannot
+/// be told from the code of the request driving the turn, so it gets no `/tmp`
+/// rather than a guess.
 fn request_context(scope: &mut v8::PinScope) -> Option<Arc<IoContext>> {
     if let Some(id) = tmp_token_id(scope) {
         return actor_runtime_state(scope).tmp_context(id);
     }
-    reaction_context_or(scope, || {
-        // Code with no token of its own may run inside the checkpoint of a
-        // request that has one: it was registered before that request's turn
-        // began, so it is some other request's reaction. It gets no `/tmp`
-        // rather than the driving request's.
-        CURRENT
-            .with(|current| current.borrow().clone())
-            .filter(|current| current.tmp_token.get().is_none())
-    })
+    reaction_context_or(scope, || None)
+}
+
+/// The error code for a `/tmp` change that has no request-local tree: a
+/// stateless request without a token began before `node:fs` was loaded, and
+/// code with no request at all (module scope) has none either.
+fn tmp_unavailable_code(scope: &mut v8::PinScope) -> &'static str {
+    let stateless_without_token = tmp_token_id(scope).is_none()
+        && reaction_continuation_id(scope).is_none()
+        && CURRENT.with(|current| {
+            current
+                .borrow()
+                .as_ref()
+                .is_some_and(|current| current.continuation.is_none())
+        });
+    if stateless_without_token {
+        "ENOTMPTOKEN"
+    } else {
+        "ENOREQUEST"
+    }
 }
 
 /// What a bundle path is, without copying the bytes a stat does not need.

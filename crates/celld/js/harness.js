@@ -11364,13 +11364,19 @@ const __fsPath = (value) => {
   return "/" + parts.join("/");
 };
 const __fsError = (code, syscall, path) => {
-  // A change to `/tmp` with no request, such as at module scope, is `EPERM`:
-  // there is no request-local tree to put it in.
+  // A change to `/tmp` with no request-local tree is `EPERM`: either there is
+  // no request, such as at module scope, or the request began before
+  // `node:fs` was loaded and so has no token to name its `/tmp` by.
   const noRequest = code === "ENOREQUEST";
-  const name = noRequest ? "EPERM" : code;
+  const noToken = code === "ENOTMPTOKEN";
+  const name = noRequest || noToken ? "EPERM" : code;
   const e = new Error(
     `${name}: ${syscall} '${path}'` +
-      (noRequest ? " (there is no request-local /tmp outside a request)" : ""),
+      (noRequest
+        ? " (there is no request-local /tmp outside a request)"
+        : noToken
+          ? " (this request started before node:fs was loaded, so it has no request-local /tmp; it is available from the next request)"
+          : ""),
   );
   e.errno = {
     EPERM: -1, ENOENT: -2, EBADF: -9, EEXIST: -17, ENOTDIR: -20, EISDIR: -21, ENOSPC: -28,
