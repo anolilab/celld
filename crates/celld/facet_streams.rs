@@ -74,12 +74,28 @@ impl FacetStreams {
         epoch: u64,
         names: &[String],
     ) -> anyhow::Result<PathBuf> {
+        self.open_inner(replication, db_path, root, epoch, names, false)
+            .await
+    }
+
+    /// `replacing` is a clone that holds the root's replace lock: it opens
+    /// its own facets although the root began to stop, since the stop waits
+    /// for the clone (`settled`) and lists the streams after it.
+    async fn open_inner(
+        &self,
+        replication: Option<&Replication>,
+        db_path: impl Fn(&str, u64) -> PathBuf,
+        root: &str,
+        epoch: u64,
+        names: &[String],
+        replacing: bool,
+    ) -> anyhow::Result<PathBuf> {
         let facet = crate::engine_api::facet_cell(root, names);
         let path = db_path(&facet, epoch);
         let resident = |roots: &HashMap<String, FacetRoot>| {
             roots
                 .get(root)
-                .filter(|entry| entry.epoch == epoch && !entry.stopping)
+                .filter(|entry| entry.epoch == epoch && (replacing || !entry.stopping))
                 .map(|entry| {
                     (
                         entry.streams.contains(&facet),
@@ -133,7 +149,7 @@ impl FacetStreams {
         let mut roots = self.0.lock().expect("facet streams poisoned");
         match roots
             .get_mut(root)
-            .filter(|entry| entry.epoch == epoch && !entry.stopping)
+            .filter(|entry| entry.epoch == epoch && (replacing || !entry.stopping))
         {
             Some(entry) => {
                 entry.streams.insert(facet);
@@ -164,7 +180,7 @@ impl FacetStreams {
     ) -> anyhow::Result<()> {
         let replacing = self.replacing(root)?;
         let _replacing = replacing.lock().await;
-        self.delete_locked(replication, local, root, epoch, names)
+        self.delete_locked(replication, local, root, epoch, names, false)
             .await
     }
 
@@ -194,6 +210,7 @@ impl FacetStreams {
         root: &str,
         epoch: u64,
         names: &[String],
+        replacing: bool,
     ) -> anyhow::Result<()> {
         let facet = crate::engine_api::facet_cell(root, names);
         let below = format!("{facet}/");
@@ -201,7 +218,7 @@ impl FacetStreams {
             let mut roots = self.0.lock().expect("facet streams poisoned");
             let entry = roots
                 .get_mut(root)
-                .filter(|entry| entry.epoch == epoch && !entry.stopping)
+                .filter(|entry| entry.epoch == epoch && (replacing || !entry.stopping))
                 .ok_or_else(|| anyhow!("{root} epoch {epoch} is not resident"))?;
             let doomed: Vec<String> = entry
                 .streams
@@ -239,33 +256,52 @@ impl FacetStreams {
     /// SQLite's backup API copies the source's committed pages into it in one
     /// write transaction of the target's own database. The replicator ships
     /// that transaction as any other write, so the copy is a write of the
-    /// target's stream that the caller proves before it answers. The source
-    /// keeps running: it is read through a second connection, and a
-    /// transaction it has not committed is not copied. Facets below either
-    /// facet are not copied; the target's own are deleted with it. A source
-    /// above `CLONE_MAX_BYTES` is refused before the target is touched.
+    /// target's stream that `prove` proves before the clone ends. The copy
+    /// holds whatever the source had committed, durable or not, so the source
+    /// is proved too, and a crash cannot leave the copy with a write that the
+    /// source lost. The clone holds the replace lock through both proofs, so
+    /// a stop of the root waits for the whole clone. The source keeps
+    /// running: it is read through a second connection, and a transaction it
+    /// has not committed is not copied. Facets below either facet are not
+    /// copied; the target's own are deleted with it.
+    ///
+    /// Every failure before the target is deleted is a `CloneRefused`: a
+    /// source above `CLONE_MAX_BYTES`, a root that is stopping, a source that
+    /// cannot be opened or read. The target is untouched then.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn clone_facet(
+    pub(crate) async fn clone_facet<P, PF>(
         &self,
         replication: Option<&Replication>,
         db_path: impl Fn(&str, u64) -> PathBuf,
         local: impl Fn(&str) -> PathBuf,
+        prove: P,
         root: &str,
         epoch: u64,
         source: &[String],
         target: &[String],
-    ) -> anyhow::Result<()> {
-        let replacing = self.replacing(root)?;
+    ) -> anyhow::Result<()>
+    where
+        P: Fn(String, u64) -> PF,
+        PF: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        let replacing = self.replacing(root).map_err(refuse)?;
         let _replacing = replacing.lock().await;
+        // A stop that began before the lock was taken may be past waiting for
+        // it. One that begins later waits for this clone, so the clone may
+        // open its own facets from here on.
+        self.ensure_running(root, epoch).map_err(refuse)?;
         let from = self
-            .open(replication, &db_path, root, epoch, source)
-            .await?;
+            .open_inner(replication, &db_path, root, epoch, source, true)
+            .await
+            .map_err(refuse)?;
         // A source that was never opened has no file, and its copy is empty.
         let present = match crate::asyncrt::fs().metadata(&from) {
             Ok(_) => true,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => {
-                return Err(error).with_context(|| format!("inspect {}", from.display()));
+                return Err(refuse(
+                    anyhow::Error::new(error).context(format!("inspect {}", from.display())),
+                ));
             }
         };
         if present {
@@ -274,17 +310,35 @@ impl FacetStreams {
                 move || ensure_clonable(&from)
             })
             .await
-            .map_err(|error| anyhow!("facet size check panicked: {error}"))??;
+            .map_err(|error| refuse(anyhow!("facet size check panicked: {error}")))?
+            .map_err(refuse)?;
         }
-        self.delete_locked(replication, local, root, epoch, target)
+        self.delete_locked(replication, local, root, epoch, target, true)
             .await?;
         let to = self
-            .open(replication, &db_path, root, epoch, target)
+            .open_inner(replication, &db_path, root, epoch, target, true)
             .await?;
         if present {
             copy_database(from, to).await?;
         }
+        for stream in [
+            crate::engine_api::facet_cell(root, source),
+            crate::engine_api::facet_cell(root, target),
+        ] {
+            prove(stream, epoch).await?;
+        }
         Ok(())
+    }
+
+    /// The root's entry is at `epoch` and has not begun to stop.
+    fn ensure_running(&self, root: &str, epoch: u64) -> anyhow::Result<()> {
+        self.0
+            .lock()
+            .expect("facet streams poisoned")
+            .get(root)
+            .filter(|entry| entry.epoch == epoch && !entry.stopping)
+            .map(|_| ())
+            .ok_or_else(|| anyhow!("{root} epoch {epoch} is not resident"))
     }
 
     /// The root begins to stop: see `FacetRoot::stopping`. Answers the
@@ -428,6 +482,15 @@ impl std::fmt::Display for CloneRefused {
 }
 
 impl std::error::Error for CloneRefused {}
+
+/// An error raised before a clone touched its target is a refusal, whatever
+/// its cause: the target's data is intact and its name stays usable.
+pub(crate) fn refuse(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<CloneRefused>() {
+        Some(_) => error,
+        None => CloneRefused(format!("{error:#}")).into(),
+    }
+}
 
 pub(crate) fn ensure_clonable(path: &std::path::Path) -> anyhow::Result<()> {
     let source =
@@ -658,7 +721,7 @@ mod tests {
         }
         database(&to, 7);
         let error = streams
-            .clone_facet(None, path, local, "root", 1, &source, &target)
+            .clone_facet(None, path, local, no_proof, "root", 1, &source, &target)
             .await
             .unwrap_err();
         assert!(error.downcast_ref::<CloneRefused>().is_some(), "{error:#}");
@@ -680,10 +743,131 @@ mod tests {
             .unwrap();
         database(&to, 7);
         streams
-            .clone_facet(None, path, local, "root", 1, &source, &target)
+            .clone_facet(None, path, local, no_proof, "root", 1, &source, &target)
             .await
             .unwrap();
         assert!(crate::asyncrt::fs().metadata(&to).is_err());
+    }
+
+    async fn no_proof(_: String, _: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Every failure before the target is deleted is a refusal, so the target
+    /// keeps its data and its name stays usable.
+    #[allow(clippy::disallowed_methods)] // a plain file stands in for a corrupt database
+    #[tokio::test]
+    async fn a_clone_that_fails_before_it_touches_the_target_is_refused() {
+        crate::asyncrt::install_test_host_runtime();
+        let (streams, directory) = streams();
+        let path = |cell: &str, _: u64| directory.path().join(cell.replace('/', "_"));
+        let local = |cell: &str| directory.path().join(cell.replace('/', "_"));
+        let (source, target) = (vec!["a".to_string()], vec!["b".to_string()]);
+        let from = path(&crate::engine_api::facet_cell("root", &source), 1);
+        let to = path(&crate::engine_api::facet_cell("root", &target), 1);
+        database(&to, 7);
+
+        // The source is not a database.
+        std::fs::write(&from, vec![0x5a; 4096]).unwrap();
+        let error = streams
+            .clone_facet(None, path, local, no_proof, "root", 1, &source, &target)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<CloneRefused>().is_some(), "{error:#}");
+        assert_eq!(rows(&to), 7);
+
+        // The root began to stop before the clone took its lock.
+        streams.stopping("root", 1);
+        let error = streams
+            .clone_facet(None, path, local, no_proof, "root", 1, &source, &target)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<CloneRefused>().is_some(), "{error:#}");
+        assert_eq!(rows(&to), 7);
+
+        // The root is not resident.
+        let error = streams
+            .clone_facet(None, path, local, no_proof, "other", 1, &source, &target)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<CloneRefused>().is_some(), "{error:#}");
+    }
+
+    /// A stop that begins while a clone holds the replace lock must not leave
+    /// the clone's target deleted and unopened.
+    #[tokio::test]
+    async fn a_stop_that_begins_during_a_clone_does_not_empty_the_target() {
+        crate::asyncrt::install_test_host_runtime();
+        let (streams, directory) = streams();
+        let (source, target) = (vec!["a".to_string()], vec!["b".to_string()]);
+        let place = |cell: &str, _: u64| directory.path().join(cell.replace('/', "_")).join("db");
+        let local = |cell: &str| directory.path().join(cell.replace('/', "_"));
+        let from = place(&crate::engine_api::facet_cell("root", &source), 1);
+        let to = place(&crate::engine_api::facet_cell("root", &target), 1);
+        crate::asyncrt::fs()
+            .create_dir_all(from.parent().unwrap())
+            .unwrap();
+        crate::asyncrt::fs()
+            .create_dir_all(to.parent().unwrap())
+            .unwrap();
+        database(&from, 3);
+        database(&to, 7);
+        // The stop begins when the clone opens its source, after it took the
+        // lock and before it deletes its target.
+        let path = |cell: &str, epoch: u64| {
+            streams.stopping("root", 1);
+            place(cell, epoch)
+        };
+        streams
+            .clone_facet(None, path, local, no_proof, "root", 1, &source, &target)
+            .await
+            .unwrap();
+        assert_eq!(rows(&to), 3);
+        // The stop lists the target's stream, which opened after it began.
+        let listed = streams.stopping("root", 1);
+        assert!(
+            listed.contains(&crate::engine_api::facet_cell("root", &target)),
+            "{listed:?}"
+        );
+    }
+
+    /// A stop that begins after the copy waits for the two proofs that
+    /// complete the clone.
+    #[tokio::test]
+    async fn a_stop_waits_for_the_proofs_of_a_clone() {
+        crate::asyncrt::install_test_host_runtime();
+        let (streams, directory) = streams();
+        let path = |cell: &str, _: u64| directory.path().join(cell.replace('/', "_")).join("db");
+        let local = |cell: &str| directory.path().join(cell.replace('/', "_"));
+        let (source, target) = (vec!["a".to_string()], vec!["b".to_string()]);
+        let from = path(&crate::engine_api::facet_cell("root", &source), 1);
+        crate::asyncrt::fs()
+            .create_dir_all(from.parent().unwrap())
+            .unwrap();
+        database(&from, 3);
+        let proofs = Arc::new(tokio::sync::Semaphore::new(0));
+        let prove = |_: String, _: u64| {
+            let proofs = proofs.clone();
+            async move {
+                proofs.acquire().await?.forget();
+                Ok(())
+            }
+        };
+        let mut clone =
+            Box::pin(streams.clone_facet(None, path, local, prove, "root", 1, &source, &target));
+        // The copy is made, and the first proof is pending.
+        assert!(clone.as_mut().now_or_never().is_none());
+        let mut stop = Box::pin(streams.stop_root(
+            "root",
+            1,
+            false,
+            || async { Ok(()) },
+            |_| async { Ok(()) },
+        ));
+        assert!(stop.as_mut().now_or_never().is_none());
+        proofs.add_permits(2);
+        clone.await.unwrap();
+        stop.await.unwrap();
     }
 
     #[tokio::test]
@@ -700,7 +884,16 @@ mod tests {
             .now_or_never()
             .is_none());
         assert!(streams
-            .clone_facet(None, path, local, "root", 1, &names, &["b".to_string()])
+            .clone_facet(
+                None,
+                path,
+                local,
+                no_proof,
+                "root",
+                1,
+                &names,
+                &["b".to_string()]
+            )
             .now_or_never()
             .is_none());
         let mut stop = Box::pin(streams.stop_root(

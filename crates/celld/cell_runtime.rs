@@ -264,6 +264,7 @@ impl CellRuntime {
                 self.replication.as_ref(),
                 |cell, epoch| self.db_path(cell, epoch),
                 |cell| self.data_dir.join(cell),
+                |stream, epoch| async move { self.prove_facet(&stream, epoch).await },
                 root,
                 epoch,
                 source,

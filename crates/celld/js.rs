@@ -8357,14 +8357,14 @@ async fn clone_facet_files(from: std::path::PathBuf, to: std::path::PathBuf) -> 
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => {
-            return Err(format!(
-                "clone facet storage: inspect {}: {error}",
-                from.display()
-            ))
+            return Err(clone_error(crate::facet_streams::refuse(
+                anyhow::Error::new(error).context(format!("inspect {}", from.display())),
+            )))
         }
     };
     if copy {
-        crate::facet_streams::ensure_clonable(&from).map_err(clone_error)?;
+        crate::facet_streams::ensure_clonable(&from)
+            .map_err(|error| clone_error(crate::facet_streams::refuse(error)))?;
     }
     remove_facet_files(&to)
         .map_err(|error| format!("clone facet storage: remove target: {error}"))?;
@@ -8433,7 +8433,7 @@ fn clone_error(error: anyhow::Error) -> String {
 
 /// `__facet_clone(parentScope, source, target)` — replace the facet `target`
 /// with a copy of the facet `source` of the same parent. The reply waits for
-/// the target's stream to prove the copy, so the cost is one database copy,
+/// the target's stream and the source's to prove the copy, so the cost is one database copy,
 /// proportional to the source's size, and the root's stream gains no request.
 fn op_facet_clone(
     scope: &mut v8::PinScope,
@@ -8466,8 +8466,6 @@ fn op_facet_clone(
             clone_facet_files(from, to).await?;
             return Ok(Vec::new());
         };
-        let source_stream = crate::engine_api::facet_cell(&parent.root_scope, &source);
-        let stream = crate::engine_api::facet_cell(&parent.root_scope, &target);
         let epoch = parent.epoch;
         let (reply, receive) = tokio::sync::oneshot::channel();
         let request = FacetReq::Clone {
@@ -8484,14 +8482,6 @@ fn op_facet_clone(
             .await
             .map_err(|_| "the facet clone was dropped".to_string())?
             .map_err(clone_error)?;
-        // The copy holds whatever the source had committed, durable or not.
-        // Prove the source too, so a crash cannot leave the copy with a
-        // write that the source lost.
-        for stream in [source_stream, stream] {
-            prove_facet(stream, epoch)
-                .await
-                .map_err(|refusal| format!("clone facet storage: {refusal}"))?;
-        }
         Ok(Vec::new())
     });
     rv.set(promise_for(scope, async_id));
@@ -12481,7 +12471,7 @@ mod facet_file_tests {
         let error = host
             .block_on(clone_facet_files(blocker.join("from.sqlite"), to.clone()))
             .unwrap_err();
-        assert!(error.starts_with("clone facet storage"), "{error}");
+        assert!(error.starts_with("facet clone refused"), "{error}");
         assert!(to.exists());
     }
 
