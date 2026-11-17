@@ -107,6 +107,12 @@ export class Streams extends DurableObject {
     if (url.pathname === "/close-codes") {
       return closeCodes();
     }
+    if (url.pathname === "/ext") {
+      return fetch(
+        `http://127.0.0.1:${url.searchParams.get("port")}/${url.searchParams.get("to")}`,
+        { headers: { Upgrade: "websocket" } },
+      );
+    }
     if (url.pathname === "/throwing") {
       return throwing("object");
     }
@@ -193,7 +199,7 @@ export class Streams extends DurableObject {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === "/__ready") {
       return new Response("ready");
@@ -212,6 +218,62 @@ export default {
     }
     if (url.pathname === "/sse") {
       return sse(Number(url.searchParams.get("events") ?? "3"));
+    }
+    if (url.pathname === "/ext") {
+      // A Worker in front of an upstream WebSocket server: the upgraded
+      // socket `fetch()` returns is the answer.
+      const upstream = `http://127.0.0.1:${url.searchParams.get("port")}/${url.searchParams.get("to")}`;
+      if (url.searchParams.has("force")) {
+        return fetch(upstream, { headers: { Upgrade: "websocket" } });
+      }
+      if (url.searchParams.has("offer")) {
+        // Asks the upstream for a subprotocol the client did not offer.
+        return fetch(upstream, {
+          headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": url.searchParams.get("offer") },
+        });
+      }
+      const delay = Number(url.searchParams.get("delay") ?? 0);
+      const response = await (url.searchParams.has("headers")
+        ? fetch(upstream, { headers: request.headers })
+        : fetch(new Request(upstream, request)));
+      if (delay) await sleep(delay);
+      if (url.searchParams.has("misuse")) {
+        // What the Worker can still do with the socket it returned.
+        const socket = response.webSocket;
+        ctx.waitUntil((async () => {
+          await sleep(200);
+          const outcome = [];
+          for (const use of [
+            () => socket.accept(),
+            () => socket.send("mixed"),
+            () => socket.close(1000, "mixed"),
+          ]) {
+            try {
+              use();
+              outcome.push("ok");
+            } catch (error) {
+              outcome.push(error.name);
+            }
+          }
+          globalThis.misuse = outcome;
+        })());
+      }
+      return response;
+    }
+    if (url.pathname === "/misuse") {
+      return Response.json(globalThis.misuse ?? null);
+    }
+    if (url.pathname === "/object-ext") {
+      // A Durable Object cannot return a socket `fetch()` opened.
+      const stub = env.STREAMS.get(env.STREAMS.idFromName("ext"));
+      try {
+        await stub.fetch(`http://object/ext?port=${url.searchParams.get("port")}&to=${url.searchParams.get("to")}`, {
+          headers: { Upgrade: "websocket" },
+        });
+        return Response.json({ error: null });
+      } catch (error) {
+        return Response.json({ error: String(error) });
+      }
     }
     if (url.pathname.startsWith("/proxy/")) {
       // Forwards to this Worker's own listener, as a Worker in front of an origin.

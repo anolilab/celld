@@ -5732,6 +5732,15 @@ const __dispatchTo = __celld.__dispatchTo = async (
     if (response instanceof Response && response.status === 101 &&
         response.webSocket && !response.webSocket._target) {
       const socket = response.webSocket._peer;
+      if (!socket && response.webSocket._outbound) {
+        // A socket this object opened with `fetch()` is a connection of its
+        // own, not one end of a pair, and nothing carries a client to it:
+        // the caller would get a 101 with no socket and the upstream would
+        // stay open.
+        __ws_close(response.webSocket._id, 1001, "response without a connected socket");
+        throw new TypeError(
+          "A WebSocket opened with fetch() in a Durable Object cannot be returned in a response");
+      }
       const target = { id: response.webSocket._id, scope };
       response.webSocket._target = target;
       if (socket) {
@@ -11151,7 +11160,15 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
   set binaryType(value) {
     if (value === "blob" || value === "arraybuffer") this._binaryType = value;
   }
+  _assertNotTransferred() {
+    if (this._transferred) {
+      throw new DOMException(
+        "WebSocket was returned in a response and belongs to its client",
+        "InvalidStateError");
+    }
+  }
   accept() {
+    this._assertNotTransferred();
     this._accepted = true;
     // A pair used directly, without being returned through a 101 response,
     // still has to carry frames once both ends are accepted. celld only
@@ -11180,6 +11197,7 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     }
   }
   send(data) {
+    this._assertNotTransferred();
     if (this.readyState !== WebSocket.READY_STATE_OPEN)
       throw new DOMException("WebSocket is not open", "InvalidStateError");
     const binary = data instanceof ArrayBuffer || ArrayBuffer.isView(data);
@@ -11209,6 +11227,7 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     }
   }
   close(code = 1000, reason = "") {
+    this._assertNotTransferred();
     [code, reason] = __wsCheckClose(code, reason);
     // Outbound sockets follow the WebSocket spec: closing a closed socket is a
     // no-op. Inbound sockets must NOT take that shortcut -- a Durable Object
@@ -12283,6 +12302,32 @@ __celld.__readResponse = (r) => {
       server._flushPending();
     }
   }
+  // A socket `fetch()` upgraded and the Worker returned unaccepted: the host
+  // already owns its connection, so the client takes the isolate's place on
+  // it instead of a pair's server end. An accepted socket is the Worker's own
+  // to read, and keeps its isolate-side pump.
+  let upstreamSocketId = 0;
+  let headers = Array.from(r.headers);
+  const upstream = r.webSocket;
+  if (r.status === 101 && upstream && wsTarget === null && workerSocketId === 0 &&
+      !upstream._peer && upstream._outbound && upstream._polled &&
+      upstream._boundTarget === null && !upstream._transferred &&
+      __sockets.get(upstream._id) === upstream) {
+    if (!upstream._accepted &&
+        upstream.readyState === WebSocket.READY_STATE_CONNECTING &&
+        __ws_prepare_upstream_handoff(upstream._id)) {
+      upstreamSocketId = upstream._id;
+      __sockets.delete(upstreamSocketId);
+      // The client is the socket's only user from here: the Worker's own
+      // accept(), send() and close() would mix frames into the client's.
+      upstream._transferred = true;
+      upstream.readyState = WebSocket.READY_STATE_CLOSED;
+      // The subprotocol the upstream chose is the one the client is told,
+      // and the only one: a value the Worker set itself would be a second.
+      headers = headers.filter(([name]) => name.toLowerCase() !== "sec-websocket-protocol");
+      if (upstream.protocol) headers.push(["sec-websocket-protocol", upstream.protocol]);
+    }
+  }
   const bodyStreamId = r._bodyBytes === null
     ? typeof r.body?.__celldStreamId === "number" &&
         !r.__celldRequestControllers
@@ -12297,9 +12342,10 @@ __celld.__readResponse = (r) => {
       status: r.status,
       bodyBytes: new Uint8Array(),
       bodyStreamId,
-      headersJson: JSON.stringify(Array.from(r.headers)),
+      headersJson: JSON.stringify(headers),
       wsTargetJson: JSON.stringify(wsTarget),
       workerSocketId,
+      upstreamSocketId,
     };
   }
   const bytes = r._bodyBytes;
@@ -12307,8 +12353,9 @@ __celld.__readResponse = (r) => {
     status: r.status,
     bodyBytes: bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes),
     bodyStreamId: 0,
-    headersJson: JSON.stringify(Array.from(r.headers)),
+    headersJson: JSON.stringify(headers),
     wsTargetJson: JSON.stringify(wsTarget),
     workerSocketId,
+    upstreamSocketId,
   };
 };

@@ -6429,6 +6429,7 @@ ops! { OP_NAMES, install_op_functions,
         "__ws_alloc" => websocket::op_ws_alloc,
         "__cell_delegate" => scoping::op_cell_delegate,
         "__ws_prepare_worker_handoff" => websocket::op_ws_prepare_worker_handoff,
+        "__ws_prepare_upstream_handoff" => websocket::op_ws_prepare_upstream_handoff,
         "__ws_accept" => websocket::op_ws_accept,
         "__ws_accept_regular" => websocket::op_ws_accept_regular,
         "__ws_list" => websocket::op_ws_list,
@@ -9821,7 +9822,7 @@ fn release_websocket(response: &mut HttpResponse) {
             Some(parked) => drop(take_tunnel_upgrade(parked)),
             None => ws_close(target.id, 1006, WEBSOCKET_WITHOUT_UPGRADE),
         },
-        Some(HttpResponseWebSocket::Worker(_)) | None => {}
+        Some(HttpResponseWebSocket::Worker(_) | HttpResponseWebSocket::Upstream(_)) | None => {}
     }
 }
 
@@ -9843,6 +9844,14 @@ fn encode_granted_response(
         Some(HttpResponseWebSocket::Cell(target)) => {
             ws_grant_target(&target, owner);
             response.websocket = Some(HttpResponseWebSocket::Cell(target));
+        }
+        // The connection is held by this process, but the caller's isolate
+        // has no way to name it; the socket closes as the response drops.
+        Some(HttpResponseWebSocket::Upstream(_)) => {
+            return Err(
+                "a WebSocket opened with fetch() cannot be returned through a service binding"
+                    .into(),
+            );
         }
         None => {}
     }
@@ -12038,6 +12047,7 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
     let hk = v8::String::new(scope, "headersJson").unwrap();
     let wk = v8::String::new(scope, "wsTargetJson").unwrap();
     let worker_wk = v8::String::new(scope, "workerSocketId").unwrap();
+    let upstream_wk = v8::String::new(scope, "upstreamSocketId").unwrap();
     let status = out
         .get(scope, sk.into())
         .and_then(|v| v.uint32_value(scope))
@@ -12109,6 +12119,19 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
                 .ok_or_else(|| anyhow!("Worker WebSocket {worker_id} has no frame handoff"))?,
         )
     };
+    let upstream_id = out
+        .get(scope, upstream_wk.into())
+        .and_then(|value| value.integer_value(scope))
+        .unwrap_or(0)
+        .max(0) as u64;
+    let upstream_ws = if upstream_id == 0 {
+        None
+    } else {
+        Some(
+            websocket::transfer_upstream_websocket_handoff(&caller, upstream_id)
+                .ok_or_else(|| anyhow!("WebSocket {upstream_id} has no upstream handoff"))?,
+        )
+    };
     if status == 101 {
         tracing::info!(%ws_json, has_target = ws.is_some(), "JS WebSocket response");
     }
@@ -12119,6 +12142,11 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
         (None, _, Some(worker)) => Some(HttpResponseWebSocket::Worker(worker)),
         (None, _, None) => None,
         (Some(_), _, Some(_)) => return Err(anyhow!("Worker response has two WebSocket targets")),
+    };
+    let websocket = match (websocket, upstream_ws) {
+        (None, Some(upstream)) => Some(HttpResponseWebSocket::Upstream(upstream)),
+        (Some(_), Some(_)) => return Err(anyhow!("Worker response has two WebSocket targets")),
+        (websocket, None) => websocket,
     };
     Ok(HttpResponse {
         status,

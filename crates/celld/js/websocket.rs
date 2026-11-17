@@ -93,6 +93,70 @@ fn prepare_worker_websocket_handoff(id: u64, owner: u64) {
     drop(replaced);
 }
 
+/// Whether the Worker request `caller` opened socket `id`.
+fn opened_by(registry: &WsRegistry, caller: &WsCaller, id: u64) -> bool {
+    caller.cell.is_empty() && registry.pull_owners.get(&id) == Some(&caller.owner)
+}
+
+/// Take an outbound socket's pull queue away from the isolate, for a response
+/// that returns the socket. False when the caller does not own the socket or
+/// the isolate already reads it. A connection that already ended still has its
+/// frames and close queued, and the client gets them.
+fn prepare_upstream_websocket_handoff(caller: &WsCaller, id: u64) -> bool {
+    let shared = ws_registry();
+    let mut registry = shared.lock().unwrap();
+    // The queue outlives the socket's registration, so the record of who
+    // opened it is the check; no record fails closed.
+    if !opened_by(&registry, caller, id) {
+        return false;
+    }
+    let Some(queue) = ws_pull().lock().unwrap().remove(&id) else {
+        return false;
+    };
+    // The isolate's pump holds a second reference once the Worker accepted
+    // the socket; then it keeps reading and the socket is not ours to move.
+    match Arc::try_unwrap(queue) {
+        Ok(queue) => {
+            let handoff = UpstreamHandoff {
+                pull: queue.into_inner(),
+                outbound: registry.outputs.get(&id).cloned(),
+                room: registry.rooms.get(&id).cloned(),
+            };
+            registry.upstream_handoffs.insert(id, handoff);
+            true
+        }
+        Err(queue) => {
+            ws_pull().lock().unwrap().insert(id, queue);
+            false
+        }
+    }
+}
+
+pub(super) fn transfer_upstream_websocket_handoff(
+    caller: &WsCaller,
+    id: u64,
+) -> Option<UpstreamWebSocket> {
+    let shared = ws_registry();
+    let mut registry = shared.lock().unwrap();
+    if !opened_by(&registry, caller, id) {
+        return None;
+    }
+    let handoff = registry.upstream_handoffs.remove(&id)?;
+    registry.pull_owners.remove(&id);
+    // The Worker no longer owns the socket: its own frames would mix with the
+    // client's and skip the room, so every op on this id refuses it.
+    registry.owners.remove(&id);
+    drop(registry);
+    // The response owns the socket from here, so the request's end must not
+    // close it.
+    current_context()
+        .sockets
+        .lock()
+        .unwrap()
+        .retain(|opened| *opened != id);
+    Some(UpstreamWebSocket::new(id, handoff))
+}
+
 pub(super) fn transfer_worker_websocket_handoff(
     caller: &WsCaller,
     id: u64,
@@ -128,8 +192,16 @@ pub(super) fn transfer_worker_websocket_handoff(
 pub(super) fn ws_close_request_sockets(opened: Vec<u64>) {
     for id in opened {
         let registry = ws_registry();
-        let handoff = registry.lock().unwrap().worker_handoffs.remove(&id);
+        let (handoff, upstream) = {
+            let mut registry = registry.lock().unwrap();
+            let upstream = registry.upstream_handoffs.remove(&id);
+            if upstream.is_some() {
+                registry.pull_owners.remove(&id);
+            }
+            (registry.worker_handoffs.remove(&id), upstream)
+        };
         drop(handoff);
+        drop(upstream);
         // A socket whose remote already hung up has no output sender left,
         // and that is the ordinary case rather than an error. `ws_emit` logs
         // a dropped frame for an unknown id, so ask before sending.
@@ -379,6 +451,20 @@ pub(super) fn op_ws_alloc(
         .unwrap()
         .insert(id);
     rv.set(v8::Number::new(scope, id as f64).into());
+}
+
+pub(super) fn op_ws_prepare_upstream_handoff(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args
+        .get(0)
+        .to_integer(scope)
+        .map(|n| n.value() as u64)
+        .unwrap_or(0);
+    let taken = prepare_upstream_websocket_handoff(&ws_caller(scope), id);
+    rv.set(v8::Boolean::new(scope, taken).into());
 }
 
 pub(super) fn op_ws_prepare_worker_handoff(
@@ -980,5 +1066,60 @@ pub(super) fn op_ws_auto_response_ts(
     match stamped {
         Some(ms) => rv.set(v8::Number::new(scope, ms).into()),
         None => rv.set(v8::null(scope).into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A queue that outlives its socket's registration is still its opening
+    /// request's alone: another request cannot take it over by id.
+    #[test]
+    fn another_request_cannot_take_the_handoff_of_a_closed_socket() {
+        let id = 9_200_001;
+        let (_inbound, receiver) = ws_pull_channel();
+        ws_pull_register(id, receiver);
+        ws_set_owner(id, 41);
+        ws_register_outbound(id, "", None);
+        // The connection ended: nothing but the queue is left.
+        ws_unregister(id);
+        let other = WsCaller {
+            cell: String::new(),
+            owner: 42,
+        };
+        let opener = WsCaller {
+            cell: String::new(),
+            owner: 41,
+        };
+        assert!(!prepare_upstream_websocket_handoff(&other, id));
+        assert!(ws_pull_registered(id), "the refused request took the queue");
+        assert!(transfer_upstream_websocket_handoff(&other, id).is_none());
+        assert!(prepare_upstream_websocket_handoff(&opener, id));
+        assert!(transfer_upstream_websocket_handoff(&other, id).is_none());
+        ws_pull_unregister(id);
+        ws_registry().lock().unwrap().upstream_handoffs.remove(&id);
+    }
+
+    /// A connection that ends between preparing a handoff and taking it over
+    /// keeps the handoff's owner, so the opening request can still claim it.
+    #[test]
+    fn a_prepared_handoff_keeps_its_owner_when_the_connection_ends() {
+        let id = 9_200_002;
+        let (_inbound, receiver) = ws_pull_channel();
+        ws_pull_register(id, receiver);
+        ws_set_owner(id, 51);
+        ws_register_outbound(id, "", None);
+        let opener = WsCaller {
+            cell: String::new(),
+            owner: 51,
+        };
+        assert!(prepare_upstream_websocket_handoff(&opener, id));
+        ws_unregister(id);
+        assert!(opened_by(&ws_registry().lock().unwrap(), &opener, id));
+        let shared = ws_registry();
+        let mut registry = shared.lock().unwrap();
+        registry.upstream_handoffs.remove(&id);
+        registry.pull_owners.remove(&id);
     }
 }
