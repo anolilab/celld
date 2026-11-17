@@ -2670,7 +2670,6 @@ struct TailReportState {
     url: String,
     method: String,
     headers: serde_json::Map<String, serde_json::Value>,
-    response_status: Option<u16>,
     failure: Option<TailException>,
 }
 
@@ -2720,7 +2719,7 @@ impl TailReportState {
         self.failure = Some(TailException::new(message));
     }
 
-    fn finish(self, context: &IoContext) {
+    fn finish(self, context: &IoContext, response_status: Option<u16>) {
         let outcome = if self.failure.is_some() {
             "exception"
         } else {
@@ -2736,7 +2735,7 @@ impl TailReportState {
                     "method": self.method,
                     "url": self.url,
                 },
-                "response": self.response_status.map(|status| serde_json::json!({
+                "response": response_status.map(|status| serde_json::json!({
                     "status": status,
                 })),
             },
@@ -2894,6 +2893,30 @@ pub(crate) enum GatedReplyCompletion {
     CallerClosed { failure: Option<String> },
 }
 
+/// The status the host answers for a handler status: one it cannot send
+/// becomes 500.
+fn sendable_status(status: u16) -> u16 {
+    if hyper::StatusCode::from_u16(status).is_ok() {
+        status
+    } else {
+        500
+    }
+}
+
+/// The status the client got once the reply gate settled. The handler's status
+/// reached it only when the reply was sent; a failed gate answers 500 in its
+/// place, and a client that left got none.
+fn status_after_gate(
+    status: Option<u16>,
+    completion: &Result<GatedReplyCompletion, tokio::sync::oneshot::error::RecvError>,
+) -> Option<u16> {
+    match completion {
+        Ok(GatedReplyCompletion::Sent { failure: None }) => status,
+        Ok(GatedReplyCompletion::Sent { failure: Some(_) }) => status.map(|_| 500),
+        Ok(GatedReplyCompletion::CallerClosed { .. }) | Err(_) => None,
+    }
+}
+
 pub(crate) struct GatedReplyRx {
     completion: tokio::sync::oneshot::Receiver<GatedReplyCompletion>,
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
@@ -3025,13 +3048,10 @@ impl InFlight {
                         .map_err(|error| fail_in_turn_error(error, positions))
                 });
                 if let Ok(response) = &read {
-                    self.response_status = Some(response.status);
+                    self.response_status = Some(sendable_status(response.status));
                 }
-                if let Some(report) = &mut self.tail_report {
-                    match &read {
-                        Ok(response) => report.response_status = Some(response.status),
-                        Err(error) => report.record_failure(format!("{error:#}")),
-                    }
+                if let (Some(report), Err(error)) = (&mut self.tail_report, &read) {
+                    report.record_failure(format!("{error:#}"));
                 }
                 send_and_end(tc, &self.context, reply, read)
             }
@@ -3265,6 +3285,7 @@ impl InFlight {
         completion: Result<GatedReplyCompletion, tokio::sync::oneshot::error::RecvError>,
     ) {
         self.gated_reply = None;
+        self.response_status = status_after_gate(self.response_status, &completion);
         if self.trace.is_some_and(|trace| trace.sampled) {
             match completion {
                 Ok(GatedReplyCompletion::Sent {
@@ -3327,7 +3348,7 @@ impl InFlight {
 
     pub(crate) fn finish_tail_report(&mut self) {
         if let Some(report) = self.tail_report.take() {
-            report.finish(&self.context);
+            report.finish(&self.context, self.response_status);
         }
     }
 
@@ -3913,7 +3934,7 @@ impl Worker {
                     .unwrap_or_else(|| anyhow!("fetch threw: {}", exc!(tc)));
                 if let Some((mut report, context)) = tail_report {
                     report.record_failure(format!("{error:#}"));
-                    report.finish(&context);
+                    report.finish(&context, None);
                 }
                 answer.fail(error);
                 (None, Vec::new())
@@ -4265,7 +4286,6 @@ fn begin<'s>(
         url,
         method,
         headers: tail_headers,
-        response_status: None,
         failure: None,
     });
     let promise = match started {
@@ -4319,7 +4339,7 @@ fn begin<'s>(
                 .unwrap_or(error);
             if let Some(mut report) = tail_report.take() {
                 report.record_failure(format!("{error:#}"));
-                report.finish(&context);
+                report.finish(&context, None);
             }
             drop(guard);
             let _ = reply.send(Err(error));
@@ -8750,7 +8770,7 @@ fn op_fetch(
             span.parent_span_id = Some(parent.span_id);
             span.parent_remote = Some(false);
             span.url = span_url;
-            span.http_method = Some(method.clone());
+            span.http_method = Some(crate::telemetry::http_method_label(&method));
             span
         });
         let mut finish = |ok: bool, status: Option<u16>, error: Option<String>| {
@@ -11956,5 +11976,39 @@ mod refuse_unrequested_websocket_tests {
         refuse_unrequested_websocket(&mut response, true).unwrap();
         assert!(response.websocket.is_some());
         assert!(take_tunnel_upgrade(parked).is_some());
+    }
+}
+
+#[cfg(test)]
+mod response_status_tests {
+    use super::*;
+
+    #[test]
+    fn a_reply_that_was_sent_keeps_the_handlers_status() {
+        let sent = Ok(GatedReplyCompletion::Sent { failure: None });
+        assert_eq!(status_after_gate(Some(418), &sent), Some(418));
+    }
+
+    #[test]
+    fn a_failed_gate_answers_500_instead_of_the_handlers_status() {
+        let failed = Ok(GatedReplyCompletion::Sent {
+            failure: Some("gate".to_string()),
+        });
+        assert_eq!(status_after_gate(Some(200), &failed), Some(500));
+        assert_eq!(status_after_gate(None, &failed), None);
+    }
+
+    #[test]
+    fn a_client_that_left_got_no_status() {
+        let closed = Ok(GatedReplyCompletion::CallerClosed { failure: None });
+        assert_eq!(status_after_gate(Some(200), &closed), None);
+    }
+
+    #[test]
+    fn a_status_the_host_cannot_send_is_a_500() {
+        assert_eq!(sendable_status(204), 204);
+        assert_eq!(sendable_status(599), 599);
+        assert_eq!(sendable_status(99), 500);
+        assert_eq!(sendable_status(1000), 500);
     }
 }

@@ -41,10 +41,18 @@ queue wait, and the known durability facts.
 
 A span for an HTTP request carries the OpenTelemetry names `http.request.method`
 and `http.response.status_code` (Parquet columns `http_method` and
-`http_status`). That covers the Worker fetch span, the cell fetch span, and the
-outbound `fetch()` span, which also carries `url.full`. The status of a request
-that failed before it had a response is absent. Neither attribute is built for
-a request the sampler skips.
+`http_status`). That covers the Worker fetch span (`celld.fetch`), the cell
+fetch span, and the outbound `fetch()` span, which also carries `url.full`.
+The method is one of `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH`,
+`OPTIONS`, `CONNECT`, `TRACE`, or `_OTHER` for any other method. The status is
+the one the client received. It is absent when the client got none: the
+handler threw or timed out, the client left, or the reply failed before it was
+sent. For those, the span's `ok` and `error` tell the failure. A reply that an
+output gate fails carries 500. Neither attribute is built for a request the
+sampler skips.
+
+Only fetch spans carry a method and a status. An RPC call into a Worker is also
+named `celld.fetch` and carries neither.
 
 Each `console.log` line becomes a log record with the trace id and span id of
 its handler, across `await`. The record carries the console method's severity
@@ -142,7 +150,8 @@ CREATE SECRET celld_telemetry (
   ENDPOINT 's3.example.com', URL_STYLE 'path'
 );
 CREATE VIEW traces AS SELECT * FROM
-  read_parquet('s3://YOUR-BUCKET/telemetry/traces/*/*/*/*/*/*.parquet');
+  read_parquet('s3://YOUR-BUCKET/telemetry/traces/*/*/*/*/*/*.parquet',
+               union_by_name = true);
 CREATE VIEW logs AS SELECT * FROM
   read_parquet('s3://YOUR-BUCKET/telemetry/logs/*/*/*/*/*/*.parquet');
 
@@ -157,6 +166,9 @@ SELECT time_unix_us, body FROM logs WHERE severity_number >= 17;
 SELECT l.body, t.name, t.duration_us FROM logs l
   JOIN traces t ON l.trace_id = t.trace_id AND l.span_id = t.span_id;
 ```
+
+Trace files from earlier celld versions have no `http_method` column, and the
+view fills it with null when `union_by_name = true` is set.
 
 A non-AWS S3-compatible endpoint needs `URL_STYLE 'path'`. A plain-HTTP
 endpoint also needs `USE_SSL false`.
@@ -197,7 +209,8 @@ hour, because a node still writes to it.
 ```sql
 COPY (
   SELECT * FROM
-    read_parquet('s3://YOUR-BUCKET/telemetry/traces/<node>/2026/08/09/22/*.parquet')
+    read_parquet('s3://YOUR-BUCKET/telemetry/traces/<node>/2026/08/09/22/*.parquet',
+                 union_by_name = true)
   ORDER BY start_unix_us
 ) TO 's3://YOUR-BUCKET/telemetry/traces/<node>/2026/08/09/22/compacted.parquet'
   (FORMAT parquet, COMPRESSION zstd);

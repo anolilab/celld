@@ -235,15 +235,32 @@ mod tests {
         Span::new(ids, "celld.fetch", KIND_SERVER)
     }
 
+    /// The bytes one attribute encodes to, so a test can look for the exact
+    /// name and value together.
+    fn attribute(name: &str, value: Vec<u8>) -> Vec<u8> {
+        let mut out = Vec::new();
+        key_value(&mut out, 9, name, value);
+        out
+    }
+
     #[test]
     fn an_http_span_exports_its_method_and_status() {
         let mut span = span();
-        span.http_method = Some("POST".to_string());
+        span.http_method = Some("POST");
         span.http_status = Some(503);
         let body = span_message(&span);
-        assert!(contains(&body, b"http.request.method"));
-        assert!(contains(&body, b"POST"));
-        assert!(contains(&body, b"http.response.status_code"));
+        assert!(contains(
+            &body,
+            &attribute("http.request.method", any_string("POST"))
+        ));
+        assert!(contains(
+            &body,
+            &attribute("http.response.status_code", any_int(503))
+        ));
+        assert!(!contains(
+            &body,
+            &attribute("http.response.status_code", any_int(200))
+        ));
     }
 
     #[test]

@@ -2725,11 +2725,23 @@ struct StatelessTiming {
     remote_parent: Option<crate::telemetry::ParentContext>,
     /// Why the handler failed, read from the entry when it was answered.
     failure: Option<String>,
-    /// Built only for a sampled fetch, so an unsampled request allocates nothing.
-    http_method: Option<String>,
+    /// Set only for a sampled fetch.
+    http_method: Option<&'static str>,
     http_status: Option<u16>,
     span_name: &'static str,
     span_kind: u8,
+}
+
+/// The span's `http.request.method` for a sampled Worker fetch; nothing for an
+/// unsampled one or another kind of job, so those pay for no more than the
+/// `sampled` test.
+fn sampled_fetch_method(job: &crate::WorkerJob, sampled: bool) -> Option<&'static str> {
+    match job {
+        crate::WorkerJob::Fetch { method, .. } if sampled => {
+            Some(crate::telemetry::http_method_label(method))
+        }
+        _ => None,
+    }
 }
 
 impl StatelessTiming {
@@ -2776,10 +2788,7 @@ impl StatelessTiming {
             trace,
             remote_parent,
             failure: None,
-            http_method: match job {
-                crate::WorkerJob::Fetch { method, .. } if trace.is_some() => Some(method.clone()),
-                _ => None,
-            },
+            http_method: sampled_fetch_method(job, trace.is_some()),
             http_status: None,
             span_name,
             span_kind,
@@ -2808,7 +2817,7 @@ impl StatelessTiming {
             span.error = self.failure.clone();
             span.request_id = self.request_id.map(js::request_id_string);
             span.isolate = Some(self.isolate as u64);
-            span.http_method = self.http_method.clone();
+            span.http_method = self.http_method;
             span.http_status = self.http_status;
             span.parent_span_id = self.remote_parent.map(|parent| parent.span_id);
             span.parent_remote = self.remote_parent.map(|_| true);
@@ -3136,10 +3145,7 @@ async fn drive_worker_on_cell(affiliation: crate::pool::Affiliation, job: crate:
     let trace = crate::telemetry::start_trace_with_parent(remote.as_ref());
     let recording = trace.and_then(crate::telemetry::TraceContext::recording_ids);
     let span_started = recording.map(|_| (Instant::now(), crate::telemetry::now_unix_us()));
-    let http_method = match &job {
-        crate::WorkerJob::Fetch { method, .. } if recording.is_some() => Some(method.clone()),
-        _ => None,
-    };
+    let http_method = sampled_fetch_method(&job, recording.is_some());
     drive_worker(
         &slot,
         job,
@@ -3154,7 +3160,7 @@ async fn drive_worker_on_cell(affiliation: crate::pool::Affiliation, job: crate:
                 span.duration_us = started.elapsed().as_micros() as i64;
                 span.ok = entry.finished() && entry.failure().is_none();
                 span.error = entry.failure().map(str::to_string);
-                span.http_method = http_method.clone();
+                span.http_method = http_method;
                 span.http_status = entry.response_status();
                 span.parent_span_id = remote.map(|parent| parent.span_id);
                 span.parent_remote = remote.map(|_| true);
@@ -3346,7 +3352,7 @@ async fn drive_cell_inner(
             CellJob::WsClosed { .. } => "celld.ws_close",
         };
         let method = match &job {
-            CellJob::Fetch { method, .. } => Some(method.clone()),
+            CellJob::Fetch { method, .. } => Some(crate::telemetry::http_method_label(method)),
             _ => None,
         };
         (

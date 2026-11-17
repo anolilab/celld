@@ -334,7 +334,8 @@ pub struct Span {
     pub isolate: Option<u64>,
     pub queue_wait_us: Option<i64>,
     pub url: Option<String>,
-    pub http_method: Option<String>,
+    /// `http.request.method`: a known method, or `_OTHER`.
+    pub http_method: Option<&'static str>,
     pub http_status: Option<u16>,
     /// `Some(true)` for a parent extracted from a caller's traceparent,
     /// `Some(false)` for an in-process parent, `None` for a root.
@@ -437,7 +438,6 @@ impl Event {
                     + LEN(&span.request_id)
                     + LEN(&span.cell)
                     + LEN(&span.url)
-                    + LEN(&span.http_method)
             }
             Event::Log(log) => 40 + log.body.len(),
         }
@@ -596,6 +596,19 @@ fn send(event: Event) {
     if telemetry.tx.try_send(event).is_err() {
         telemetry.dropped.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// The value of `http.request.method` for a request method: the known set,
+/// upper-cased, or `_OTHER`. A `&'static str`, so a span holds no copy of a
+/// client-chosen string and the label stays low-cardinality.
+pub fn http_method_label(method: &str) -> &'static str {
+    const KNOWN: [&str; 9] = [
+        "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "CONNECT", "TRACE",
+    ];
+    KNOWN
+        .into_iter()
+        .find(|known| known.eq_ignore_ascii_case(method))
+        .unwrap_or("_OTHER")
 }
 
 pub fn now_unix_us() -> i64 {
@@ -1086,9 +1099,9 @@ message celld_span {
   optional int64 isolate;
   optional int64 queue_wait_us;
   optional binary url (STRING);
-  optional binary http_method (STRING);
   optional int32 http_status (INTEGER(16,false));
   optional boolean parent_remote;
+  optional binary http_method (STRING);
 }";
 
 /// The logs signal: one row per captured console line, joined to traces
@@ -1177,9 +1190,9 @@ pub fn encode_spans(spans: &[Span], node: &str, region: &str) -> anyhow::Result<
     column!(Int64Type, opt each.clone().map(|s| s.isolate.map(|v| v as i64)).collect::<Vec<_>>());
     column!(Int64Type, opt each.clone().map(|s| s.queue_wait_us).collect::<Vec<_>>());
     column!(ByteArrayType, opt each.clone().map(|s| s.url.as_deref().map(text)).collect::<Vec<_>>());
-    column!(ByteArrayType, opt each.clone().map(|s| s.http_method.as_deref().map(text)).collect::<Vec<_>>());
     column!(Int32Type, opt each.clone().map(|s| s.http_status.map(|v| v as i32)).collect::<Vec<_>>());
     column!(BoolType, opt each.clone().map(|s| s.parent_remote).collect::<Vec<_>>());
+    column!(ByteArrayType, opt each.clone().map(|s| s.http_method.map(text)).collect::<Vec<_>>());
 
     group.close()?;
     Ok(writer.into_inner()?)
@@ -1241,4 +1254,65 @@ pub fn encode_logs(logs: &[Log], node: &str, region: &str) -> anyhow::Result<Vec
 
     group.close()?;
     Ok(writer.into_inner()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parquet::file::reader::FileReader;
+    use parquet::file::reader::SerializedFileReader;
+    use parquet::record::RowAccessor;
+
+    fn fetch_span(method: Option<&'static str>, status: Option<u16>) -> Span {
+        let ids = TraceIds {
+            trace_id: [7; 16],
+            span_id: [9; 8],
+        };
+        let mut span = Span::new(ids, "celld.fetch", KIND_SERVER);
+        span.http_method = method;
+        span.http_status = status;
+        span
+    }
+
+    #[test]
+    fn the_known_methods_keep_their_name_and_any_other_is_other() {
+        assert_eq!(http_method_label("GET"), "GET");
+        assert_eq!(http_method_label("patch"), "PATCH");
+        assert_eq!(http_method_label("Options"), "OPTIONS");
+        assert_eq!(http_method_label("PURGE"), "_OTHER");
+        assert_eq!(http_method_label(""), "_OTHER");
+    }
+
+    #[test]
+    fn spans_round_trip_their_method_and_status_through_parquet() {
+        let spans = [
+            fetch_span(Some("PATCH"), Some(418)),
+            fetch_span(Some("_OTHER"), Some(204)),
+            fetch_span(None, None),
+        ];
+        let file = encode_spans(&spans, "node", "region").unwrap();
+        let reader = SerializedFileReader::new(bytes::Bytes::from(file)).unwrap();
+        let schema = reader.metadata().file_metadata().schema_descr();
+        // New columns go last, so a file written before them still lines up
+        // with the schema ahead of them.
+        let names: Vec<_> = schema
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
+        assert_eq!(names.last().map(String::as_str), Some("http_method"));
+        let rows: Vec<_> = reader
+            .get_row_iter(None)
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let column = |name: &str| names.iter().position(|n| n == name).unwrap();
+        let (method, status) = (column("http_method"), column("http_status"));
+        assert_eq!(rows[0].get_string(method).unwrap(), "PATCH");
+        assert_eq!(rows[0].get_ushort(status).unwrap(), 418);
+        assert_eq!(rows[1].get_string(method).unwrap(), "_OTHER");
+        assert_eq!(rows[1].get_ushort(status).unwrap(), 204);
+        assert!(rows[2].get_string(method).is_err());
+        assert!(rows[2].get_ushort(status).is_err());
+    }
 }
