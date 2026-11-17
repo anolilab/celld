@@ -6207,6 +6207,14 @@ const __reportHandlerError = (what, error) => {
     __log("error", `Uncaught exception in ${what}: ${text}`);
   } catch {}
 };
+// Ends the current event's span as an error without failing the event.
+const __markSpanError = (what, error) => {
+  try {
+    __mark_span_error(`Uncaught exception in ${what}: ${
+      error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+    }`);
+  } catch {}
+};
 // The hook `dispatchEvent` calls when a listener throws. A symbol, so no other
 // EventTarget, a Worker's own subclass included, picks it up by accident.
 const __listenerFailed = Symbol("listenerFailed");
@@ -11284,6 +11292,7 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
   // keeps working.
   [__listenerFailed](error) {
     __reportHandlerError("WebSocket listener", error);
+    __markSpanError("WebSocket listener", error);
   }
   _dispatchMessage(data) {
     if (this._binaryType === "blob" && data instanceof ArrayBuffer) {

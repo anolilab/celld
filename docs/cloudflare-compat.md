@@ -142,8 +142,10 @@ The `tail` and `email` handlers are unavailable.
   code 1012. If a frame is incomplete, the ingress closes the transport instead.
 - `acceptWebSocket()` throws above 90 percent of the V8 heap limit.
 - An exception in a WebSocket `message`, `close` or `error` listener is logged
-  with its stack as a console error. The other listeners still run and the
-  socket stays open. An exception in `webSocketMessage`, `webSocketClose` or
+  with its stack as a console error, and the span of the event that delivered
+  the frame ends as an error. The other listeners still run and the socket
+  stays open. A listener on a Worker's own socket, which no event delivers,
+  has no frame span to mark. An exception in `webSocketMessage`, `webSocketClose` or
   `webSocketError` is logged the same way and fails the event. A failing
   `webSocketMessage` closes the socket with 1011; `webSocketClose` and
   `webSocketError` run while the socket is already closing, so their failure is

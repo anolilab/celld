@@ -1,5 +1,6 @@
 //! Request spans carry the HTTP method and the status the client received,
-//! through the OTLP exporter and a collector reachable over plain TCP.
+//! through the OTLP exporter and a collector reachable over plain TCP. A
+//! WebSocket frame whose listener throws ends its span as an error.
 
 #![allow(clippy::disallowed_methods)]
 
@@ -9,6 +10,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use super::client_streams;
 use super::harness::{client, wait_until, Server};
 
 /// Collector stand-in: records the body of every `POST /v1/traces`.
@@ -132,6 +134,14 @@ fn spans(request: &[u8]) -> Vec<(String, Vec<(String, String)>)> {
                         (key, value)
                     })
                     .collect();
+                // Status (15): code (3) 2 is an error.
+                let errored = nested(&span, 15).iter().any(|status| {
+                    fields(status).contains(&(3, 2_u64.to_le_bytes().to_vec(), false))
+                });
+                let mut attributes: Vec<_> = attributes;
+                if errored {
+                    attributes.push(("status.error".to_string(), "true".to_string()));
+                }
                 out.push((name, attributes));
             }
         }
@@ -195,4 +205,35 @@ async fn a_fetch_span_exports_the_method_and_the_status_the_client_got() {
     };
     assert_eq!(status_of("PATCH").as_deref(), Some("418"));
     assert_eq!(status_of("DELETE").as_deref(), Some("202"));
+}
+
+/// A message listener that throws ends the frame's span as an error, and the
+/// socket still answers the next frame.
+#[tokio::test]
+async fn a_websocket_listener_that_throws_marks_the_frame_span_as_an_error() {
+    let (port, bodies) = collector().await;
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let server = Server::start(
+        "client-streams",
+        &[("CELLD_OTEL", &endpoint), ("CELLD_OTEL_FLUSH_MS", "100")],
+    )
+    .await;
+    let mut socket = client_streams::client(&server, "/object/throwing").await;
+    socket.set_auto_close(false);
+    for text in ["one", "two"] {
+        let answer = client_streams::exchange(&mut socket, text).await;
+        assert_eq!(answer, Some(format!("echo:{text}")));
+    }
+    wait_until("an errored frame span", Duration::from_secs(30), || {
+        let found = bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|body| spans(body))
+            .any(|(name, attributes)| {
+                name == "celld.ws_message" && attribute(&attributes, "status.error").is_some()
+            });
+        async move { found.then_some(()) }
+    })
+    .await;
 }

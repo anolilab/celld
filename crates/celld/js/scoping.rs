@@ -256,6 +256,7 @@ const NOT_CELL_SCOPED: &[&str] = &[
     "__sql_cursor_next",
     "__sql_cursor_close",
     "__log",
+    "__mark_span_error",
     "__storage_flush_pending_puts",
     "__storage_sync",
     "__storage_cancel_pending_puts",
