@@ -102,6 +102,7 @@ the waker role, and it wakes only the cells whose owner node has stopped.
 - [Configure object storage](#configure-object-storage)
 - [Deploy an application](#deploy-an-application)
 - [Develop an application locally](#develop-an-application-locally)
+- [Secrets](#secrets)
 - [Operate D1, KV, and R2](#operate-d1-kv-and-r2)
 - [Start a node](#start-a-node)
 - [Add nodes](#add-nodes)
@@ -388,7 +389,7 @@ a quoted value can span lines, for example a PEM key. Comments after a
 value and variable references are not supported. In `.env` files, the
 command skips, with a warning, an entry that is not a valid binding name
 or that collides with another binding; in `.dev.vars` such an entry stops
-the build. `celld deploy` does not read these files. Add `.dev.vars`,
+the build. `celld deploy` does not read these files; for production secrets see [Secrets](#secrets). Add `.dev.vars`,
 `.env`, `.env.local`, and `.celld/` to `.gitignore`.
 
 The command keeps the local state in `.celld/dev`, across restarts and
@@ -405,6 +406,55 @@ and it does not watch files outside the project.
 
 The local object store is not available to a fleet node or an operator
 subcommand; they need a supported cloud bucket.
+
+## Secrets
+
+A secret is a string binding that a Worker reads as `env.NAME`, and that no
+config file or log holds.
+
+- In `celld dev`, put the secret in `.dev.vars` (see
+  [Develop an application locally](#develop-an-application-locally)).
+- In production, use `celld secret`. `celld deploy` never reads `.dev.vars`.
+
+```sh
+export CELLD_SECRETS_KEY="$(openssl rand -base64 32)"   # once, for the fleet
+printf %s "$STRIPE_KEY" | celld secret put STRIPE_KEY --script billing --bucket s3://my-cells-bucket
+celld secret list --script billing --bucket s3://my-cells-bucket
+celld secret delete STRIPE_KEY --script billing --bucket s3://my-cells-bucket
+```
+
+`--script` defaults to the `name` of the Wrangler config in the working
+directory. The value comes from standard input, never from an argument, without
+its final line break. It is at most 5 KiB. `list` prints names only.
+
+`celld secret put` encrypts the value with AES-256-GCM under the fleet key
+before it leaves the command. The key is 32 random bytes in base64, in
+`CELLD_SECRETS_KEY` or in the file `CELLD_SECRETS_KEY_FILE` names. Give every
+node and every `celld secret put` the same key. The bucket never holds it. Keep
+it in your secret manager: a lost key cannot be recovered, and the values must
+be put again.
+
+The encrypted values of a script are one object, `deploy/<script>/secrets.json`.
+Each value has its own random nonce and carries the id of its key. The
+encryption binds a value to its script and name, so a value copied under another
+name or into another script does not open. Two operators who put different names
+at the same time both keep their entries.
+
+A node reads the object when it loads a deployment, decrypts it once, and adds
+each secret to `env` as a string. That is one bucket request per deployment
+load and nothing per request. A node whose script has secrets and that has no
+key does not load the deployment and says why; a node that already serves keeps
+serving. A secret changes on a node at its next load of the deployment: a
+deploy, `POST /reload`, or a restart, and not on the poll.
+
+A secret cannot have the name of a variable or binding of the Worker.
+`celld secret put` refuses it against the current deployment, and `celld
+deploy` refuses it against the secrets already stored. A secret's value does
+not appear in a log, in `/state`, in an error message, or in the output of
+`celld deploy`.
+
+Key rotation is not part of this release. To change the key, put every secret
+again under the new key and give the new key to every node.
 
 ## Operate D1, KV, and R2
 
@@ -769,6 +819,8 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_INTERNAL_ADDR` | The peer and operator listener. The same as `--internal-listen` |
 | `CELLD_ADVERTISE` | The internal address that peers can reach. The same as `--advertise` |
 | `CELLD_OPERATOR_TOKEN` | Every request to the internal listener must send `Authorization: Bearer <token>`, and every celld command that calls it sends the token. Set the same value on every node and in each operator command. celld refuses an empty value, whitespace, or non-printable characters. Unset: a node whose internal listener binds and advertises only loopback generates a token into a file that only its owner can read and logs the file's path; a node bound to or advertising another address refuses to start. See [Require an operator token](security.md#require-an-operator-token) |
+| `CELLD_SECRETS_KEY` | The fleet key for Worker secrets: 32 bytes in base64. A node uses it to decrypt the secrets of a deployment when it loads it, and `celld secret put` uses it to encrypt. A node refuses to load a deployment whose script has secrets when no key is set, and refuses to start on a malformed one. Set the same key on every node. See [Secrets](#secrets) |
+| `CELLD_SECRETS_KEY_FILE` | The path of a file that holds the fleet key, in place of `CELLD_SECRETS_KEY`. Setting both is an error. celld reads the file at each deployment load |
 | `CELLD_OPERATOR_TOKEN_FILE` | The path of the file a node keeps its generated operator token in, and that the celld commands read when `CELLD_OPERATOR_TOKEN` is unset. Default: `operator-token` in the celld configuration directory (`CELLD_CONFIG_DIR`, else `$XDG_CONFIG_HOME/celld`, else `~/.config/celld`, else `.celld` in the working directory); `celld dev` keeps its node's file in `.celld/dev` and only `celld dev` reads it. celld refuses a file that is a symbolic link, that another user owns, or that other users can read, and a directory that other users can write to or that another user owns (celld's own directories are tightened instead) |
 | `CELLD_UNSAFE_PUBLIC_ADVERTISE` | Set to `1` to permit a literal public IP in `CELLD_ADVERTISE`. It does not resolve a DNS name or restrict the internal listener |
 | `CELLD_EGRESS` | `public` (default; `open` for `celld dev` unless set) or `open`. `public` refuses a Worker's `fetch()`, `connect()` and outbound WebSocket dials to loopback, private, link-local, CGNAT, unique-local, unspecified, multicast and reserved addresses, the metadata addresses, IPv4 addresses carried in IPv6 and the node's own addresses, on the resolved address and on every redirect hop. `open` turns the check off. `public` also stops a Worker's `fetch()` from using `HTTP_PROXY` or `ALL_PROXY`, so a node whose only route out is a proxy needs `open` (a breaking change from the old default). See [Limit Worker egress](security.md#limit-worker-egress) |

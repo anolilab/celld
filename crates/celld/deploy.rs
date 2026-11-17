@@ -1015,6 +1015,14 @@ pub async fn write(
     // A staged version is checked the same way, so activation cannot be the
     // first place that refusal appears.
     let queue_attachments = prepare_queue_attachments(bucket, &built.manifest).await?;
+    // A secret is bound as `env.NAME`, so a binding of the same name would be
+    // shadowed. Refuse before anything is uploaded; this reads names only.
+    crate::secrets::ensure_no_clash(
+        bucket,
+        &built.manifest.script_name,
+        &crate::secrets::binding_names(&built.manifest.raw_metadata),
+    )
+    .await?;
 
     // Images are fleet-wide and content-addressed like asset bodies, and
     // they are what a node loads before a container class can start.
@@ -1458,6 +1466,21 @@ pub struct D1Declaration {
     /// read an empty table on a project that had renamed it, and every
     /// already-applied migration re-ran.
     pub migrations_table: String,
+}
+
+/// The Worker name of the project at `given` (a directory or a config), for a
+/// command that acts on a deployed script without building it.
+pub fn read_script_name(given: Option<PathBuf>) -> anyhow::Result<String> {
+    let path = resolve_config(given)?;
+    let source =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let config: Value = serde_json::from_str(&strip_jsonc(&source))
+        .with_context(|| format!("parse {}", path.display()))?;
+    config
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("{} has no `name`", path.display()))
 }
 
 /// Read a project's D1 declarations. This reads the same config `build` reads,
@@ -2981,7 +3004,7 @@ fn optional_asset_mode(
     Ok(value.to_string())
 }
 
-fn valid_binding(binding: &str) -> bool {
+pub(crate) fn valid_binding(binding: &str) -> bool {
     binding.len() <= 128
         && binding
             .chars()
