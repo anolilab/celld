@@ -460,18 +460,6 @@ impl OutboundWebSocketSink {
     }
 }
 
-/// Pass one data frame an end sent to the queue of the end it faces. False
-/// when that end stopped reading, which ends the pipe.
-async fn forward_data(sink: &celld::js::WsPullSender, frame: celld::js::WsOut) -> bool {
-    match frame {
-        celld::js::WsOut::Text(text) => sink.send(celld::js::WsPull::Text(text)).await.is_ok(),
-        celld::js::WsOut::Binary(bytes) => {
-            sink.send(celld::js::WsPull::Binary(bytes)).await.is_ok()
-        }
-        celld::js::WsOut::Close(..) => false,
-    }
-}
-
 /// One direction of a pipe: the frames an end sent that the end it faces has
 /// not yet made room for.
 ///
@@ -520,20 +508,31 @@ impl Lane {
         self.waiting.front().map(celld::js::WsPull::queue_bytes)
     }
 
+    /// Take the frame next in line out of the backlog.
+    fn next(&mut self) -> Option<celld::js::WsPull> {
+        let frame = self.waiting.pop_front()?;
+        self.bytes -= frame.queue_bytes();
+        Some(frame)
+    }
+
     /// Pass the frame next in line to its queue, in the room already reserved.
     /// False when that end stopped reading.
     fn flush(&mut self, sink: &celld::js::WsPullSender, permit: celld::js::WsPullPermit) -> bool {
-        let Some(frame) = self.waiting.pop_front() else {
-            return true;
-        };
-        self.bytes -= frame.queue_bytes();
-        sink.send_reserved(frame, permit).is_ok()
+        match self.next() {
+            Some(frame) => sink.send_reserved(frame, permit).is_ok(),
+            None => true,
+        }
     }
 
     /// The end has closed and everything it sent before has been passed on.
     fn finished(&self) -> bool {
         self.end.is_some() && self.waiting.is_empty()
     }
+}
+
+/// What both ends hear when a pipe's backlog overflows.
+fn buffer_full() -> (u16, String) {
+    (1009, "WebSocket buffer is full".into())
 }
 
 /// Carry frames between a stateless Worker's socket and a client end another
@@ -584,7 +583,7 @@ async fn worker_websocket_pipe(
             frame = from_caller.recv(), if to_worker.end.is_none() => match frame {
                 Some(frame) => {
                     if !to_worker.hold(frame) {
-                        closing = (1009, "WebSocket buffer is full".into());
+                        closing = buffer_full();
                         break;
                     }
                 }
@@ -597,7 +596,7 @@ async fn worker_websocket_pipe(
             frame = from_worker.recv(), if to_caller.end.is_none() => match frame {
                 Some(frame) => {
                     if !to_caller.hold(frame) {
-                        closing = (1009, "WebSocket buffer is full".into());
+                        closing = buffer_full();
                         break;
                     }
                 }
@@ -637,6 +636,21 @@ async fn worker_websocket_pipe(
 /// `dispatch_ws_message` into the cell, a pull queue out to the caller —
 /// which is also why a hibernatable server end needs nothing special here.
 ///
+/// A dispatch waits while the cell is busy or its input gate is closed. The
+/// pipe keeps reading both ends meanwhile, into the same per-direction backlog
+/// the Worker pipe keeps: a caller that sends more than a queue's budget while
+/// the cell does not take frames is closed with 1009, and a close or a
+/// vanished end ends the pipe at once. The dispatches go one at a time, in the
+/// order the frames came. A close from the caller is answered at once, and the
+/// frames it sent before are still given to the cell, then the close, unless
+/// that takes longer than the handler budget: then the rest is dropped. What
+/// the object says meanwhile is read and dropped.
+///
+/// The close the caller reads is queued and its entry is left for the isolate
+/// to read, which removes it, so an isolate that was not already waiting still
+/// reads the code; a caller whose request retired has no reader, so its entry
+/// goes at once.
+///
 /// The task ends when either side closes, and it unregisters both.
 async fn local_websocket_pipe(
     app: AppHandle,
@@ -651,75 +665,226 @@ async fn local_websocket_pipe(
         )));
         return Ok(());
     };
+    let cell = ObjectSocket {
+        app,
+        socket: SocketRoute::of(&target),
+        id: target.id,
+    };
+    pipe_to_object(cell, id, pull, reply).await
+}
+
+/// What the pipe asks of the Durable Object's end of a socket. The pipe needs
+/// no more of the object than these, which is also what lets a test stand in
+/// for it.
+trait ObjectEnd: Sync {
+    /// Give the object a frame, once its cell takes it.
+    fn deliver(
+        &self,
+        data: celld::js::WsIn,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+    /// Tell the object's own handler its socket closed.
+    fn closed(&self, code: u16, reason: String) -> impl std::future::Future<Output = ()> + Send;
+    /// The socket's id on the object's side.
+    fn id(&self) -> u64;
+    /// The pipe is over: the cell may forget the socket.
+    fn release(&self);
+}
+
+struct ObjectSocket {
+    app: AppHandle,
+    socket: SocketRoute,
+    id: u64,
+}
+
+impl ObjectEnd for ObjectSocket {
+    async fn deliver(&self, data: celld::js::WsIn) -> anyhow::Result<()> {
+        dispatch_ws_message(&self.app, &self.socket, self.id, data).await
+    }
+
+    async fn closed(&self, code: u16, reason: String) {
+        let _ = dispatch_ws_closed(&self.app, &self.socket, self.id, code, reason, true).await;
+    }
+
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn release(&self) {
+        self.app
+            .websocket_closed(self.socket.cell().to_string(), self.id);
+    }
+}
+
+/// Wait for `work` while reading and dropping what the object sends, so an
+/// object that keeps sending during its close handler cannot fill its queue.
+async fn discard_while<T>(
+    work: impl std::future::Future<Output = T>,
+    from_cell: &mut mpsc::UnboundedReceiver<celld::js::WsOut>,
+) -> T {
+    let mut work = std::pin::pin!(work);
+    loop {
+        celld::asyncrt::select! {
+            result = &mut work => return result,
+            frame = from_cell.recv() => if frame.is_none() {
+                return work.await;
+            },
+        }
+    }
+}
+
+async fn pipe_to_object(
+    cell: impl ObjectEnd,
+    id: u64,
+    pull: celld::js::WsPullSender,
+    reply: tokio::sync::oneshot::Sender<anyhow::Result<celld::js::OutboundWsOpen>>,
+) -> anyhow::Result<()> {
     // Both registrations flush whatever each end queued before it had
     // anywhere to send: the cell's greeting frame is queued while its own
     // fetch handler still runs, and the caller can send the moment it
     // accepts.
-    let socket = SocketRoute::of(&target);
     let (caller_tx, mut from_caller) = mpsc::unbounded_channel();
     let (cell_tx, mut from_cell) = mpsc::unbounded_channel();
     celld::js::ws_register(id, caller_tx);
-    celld::js::ws_register(target.id, cell_tx);
+    celld::js::ws_register(cell.id(), cell_tx);
     let _ = reply.send(Ok(celld::js::OutboundWsOpen {
         protocol: None,
         declined: None,
     }));
-    // Set only by a close the caller sent. A close from the cell needs no
-    // entry here: the isolate that sent it has already told the cell's own
+    let mut to_cell = Lane::new();
+    let mut to_caller = Lane::new();
+    // The dispatch of the frame the cell is being given, kept across loop
+    // turns so that reading the ends does not cancel it.
+    let mut dispatching: Option<
+        std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>>,
+    > = None;
+    let mut dispatched = false;
+    // The caller's request retired: nobody reads its queue any more.
+    let mut caller_gone = false;
+    // Set when the cell's own handler must hear of the end: a close the
+    // caller sent, or an overflow that cut it off. A close from the cell needs
+    // no entry here: the isolate that sent it has already told the cell's own
     // handler, and telling it again would be a second `webSocketClose`.
-    let mut caller_close: Option<(u16, String)> = None;
+    let mut cell_close: Option<(u16, String)> = None;
+    // What the caller reads.
+    let mut closing = (1011, "WebSocket pipe failed".to_string());
+    // Set once the caller closed: nothing more is read, and what it had sent
+    // goes to the cell before the close, until the handler budget runs out.
+    let mut draining = false;
+    let mut drain_ends: Option<celld::asyncrt::Sleep> = None;
     loop {
+        if std::mem::take(&mut dispatched) {
+            dispatching = None;
+        }
+        // The cell already closed: what the caller sends now is read and
+        // dropped, never given to it.
+        let cell_closed = to_caller.end.is_some() && !draining;
+        if cell_closed {
+            to_cell = Lane::new();
+            dispatching = None;
+        }
+        if dispatching.is_none() {
+            let data = match to_cell.next() {
+                Some(celld::js::WsPull::Text(text)) => Some(celld::js::WsIn::Text(text)),
+                Some(celld::js::WsPull::Binary(bytes)) => Some(celld::js::WsIn::Binary(bytes)),
+                _ => None,
+            };
+            if let Some(data) = data {
+                dispatching = Some(Box::pin(cell.deliver(data)));
+            }
+        }
+        if draining {
+            if dispatching.is_none() {
+                break;
+            }
+        } else if let Some(end) = to_caller.end.as_ref().filter(|_| to_caller.finished()) {
+            closing = end.clone();
+            break;
+        }
+        let to_caller_front = to_caller.front_bytes().filter(|_| !draining);
         celld::asyncrt::select! {
-            frame = from_caller.recv() => match frame {
-                Some(celld::js::WsOut::Text(text)) => {
-                    if let Err(error) = dispatch_ws_message(
-                        &app, &socket, target.id, celld::js::WsIn::Text(text),
-                    ).await {
-                        tracing::warn!(%error, scope = %target.scope, "kept WebSocket message failed");
-                        break;
-                    }
-                }
-                Some(celld::js::WsOut::Binary(bytes)) => {
-                    if let Err(error) = dispatch_ws_message(
-                        &app, &socket, target.id, celld::js::WsIn::Binary(bytes),
-                    ).await {
-                        tracing::warn!(%error, scope = %target.scope, "kept WebSocket message failed");
-                        break;
-                    }
-                }
+            frame = from_caller.recv(), if !draining => match frame {
+                Some(_) if cell_closed => {}
                 Some(celld::js::WsOut::Close(code, reason)) => {
-                    caller_close = Some((code, reason));
-                    break;
-                }
-                // The caller's request retired and took its socket with it.
-                None => break,
-            },
-            frame = from_cell.recv() => match frame {
-                Some(celld::js::WsOut::Close(code, reason)) => {
-                    let _ = pull.send_close(code, reason, true);
-                    break;
+                    // The caller is answered and released now; the cell hears
+                    // the frames sent before the close, then the close.
+                    closing = (code, reason);
+                    cell_close = Some(closing.clone());
+                    let _ = pull.send_close(closing.0, closing.1.clone(), true);
+                    celld::js::ws_unregister(id);
+                    draining = true;
+                    drain_ends = Some(celld::asyncrt::sleep(celld::js::handler_budget()));
                 }
                 Some(frame) => {
-                    if !forward_data(&pull, frame).await { break; }
+                    if !to_cell.hold(frame) {
+                        closing = buffer_full();
+                        cell_close = Some(closing.clone());
+                        break;
+                    }
+                }
+                // The caller's request retired and took its socket with it.
+                None => {
+                    caller_gone = true;
+                    break;
+                }
+            },
+            // The caller was already answered once it closed, so what the
+            // object says meanwhile is read and dropped: left in the
+            // registry's unbounded channel it would grow without a cap.
+            frame = from_cell.recv(), if to_caller.end.is_none() || draining => match frame {
+                Some(_) if draining => {}
+                Some(frame) => {
+                    if !to_caller.hold(frame) {
+                        closing = buffer_full();
+                        cell_close = Some(closing.clone());
+                        break;
+                    }
                 }
                 None => break,
             },
+            permit = async { pull.reserve(to_caller_front.unwrap_or(0)).await },
+                if to_caller_front.is_some() => {
+                    let kept = permit.is_some_and(|permit| to_caller.flush(&pull, permit));
+                    if !kept { break; }
+                },
+            () = async { drain_ends.as_mut().expect("guarded").await }, if draining => break,
+            result = async { dispatching.as_mut().expect("guarded").await },
+                if dispatching.is_some() => {
+                    dispatched = true;
+                    if let Err(error) = result {
+                        tracing::warn!(%error, ws_id = cell.id(), "kept WebSocket message failed");
+                        break;
+                    }
+                },
         }
     }
-    // The caller's own close is echoed to it, and a pipe that ended without
-    // a close from either end closes the caller with 1011 rather than leaving
-    // it to read an abnormal end. A close the cell sent is already queued.
-    let (code, reason) = caller_close
-        .clone()
-        .unwrap_or((1011, "WebSocket pipe failed".into()));
+    drop(dispatching);
+    // The close the caller reads: its own, echoed to it; the cell's, once the
+    // data before it was passed on; a 1009 when a backlog overflowed; or, for
+    // a pipe that ended without a close from either end, 1011 rather than an
+    // abnormal end.
+    let (code, reason) = closing;
     let _ = pull.send_close(code, reason, true);
-    if let Some((code, reason)) = caller_close {
-        let _ = dispatch_ws_closed(&app, &socket, target.id, code, reason, true).await;
-    }
-    app.websocket_closed(socket.cell().to_string(), target.id);
-    celld::js::ws_unregister(target.id);
     celld::js::ws_unregister(id);
-    celld::js::ws_pull_unregister(id);
+    // The queue stays for the isolate to read the close, which removes it; a
+    // request that retired first removes it with its sockets, and one that
+    // already retired has nobody to read it.
+    if caller_gone {
+        celld::js::ws_pull_unregister(id);
+    }
+    // The cell's handler may wait on a gate that never opens, so hearing of
+    // the end is bounded by the handler budget too.
+    if let Some((code, reason)) = cell_close {
+        // The object keeps its registration, because its close handler may
+        // still send, but nobody reads what it sends, so it is dropped as it
+        // comes instead of piling up in the unbounded channel.
+        let _ = discard_while(
+            celld::asyncrt::timeout(celld::js::handler_budget(), cell.closed(code, reason)),
+            &mut from_cell,
+        )
+        .await;
+    }
+    cell.release();
+    celld::js::ws_unregister(cell.id());
     Ok(())
 }
 
@@ -1488,3 +1653,226 @@ fn emit_websocket_connection_timing(
 // in the same select! as the cell's outbound queue, so an outbound frame that
 // won the race dropped a read in progress. A lost frame keeps the workload
 // ledger exact while delivery is not, so frame-level observation is required.
+
+#[cfg(test)]
+mod pipe_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// An object whose cell takes a frame only when the test lets it.
+    struct Object {
+        id: u64,
+        gate: Arc<tokio::sync::Semaphore>,
+        log: Arc<Mutex<Vec<String>>>,
+        close_gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl ObjectEnd for Object {
+        async fn deliver(&self, data: celld::js::WsIn) -> anyhow::Result<()> {
+            self.gate.acquire().await?.forget();
+            if let celld::js::WsIn::Text(text) = data {
+                self.log.lock().unwrap().push(text);
+            }
+            Ok(())
+        }
+
+        async fn closed(&self, code: u16, _reason: String) {
+            self.close_gate.acquire().await.unwrap().forget();
+            self.log.lock().unwrap().push(format!("close:{code}"));
+        }
+
+        fn id(&self) -> u64 {
+            self.id
+        }
+
+        fn release(&self) {}
+    }
+
+    struct Pipe {
+        caller: u64,
+        object: u64,
+        gate: Arc<tokio::sync::Semaphore>,
+        log: Arc<Mutex<Vec<String>>>,
+        close_gate: Arc<tokio::sync::Semaphore>,
+        task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    /// Starts a pipe between caller socket `caller` and object socket
+    /// `caller + 1`, with the object's cell not taking frames yet.
+    async fn start(caller: u64) -> Pipe {
+        // The drain's timer runs on the process runtime, bound once per process.
+        static HOST: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        HOST.get_or_init(|| {
+            std::env::set_var("CELLD_HANDLER_BUDGET_S", "1");
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("host runtime");
+            celld::asyncrt::set_host_handle(runtime.handle().clone());
+            runtime
+        });
+        let object = caller + 1;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let close_gate = Arc::new(tokio::sync::Semaphore::new(1000));
+        let (pull, receiver) = celld::js::ws_pull_channel();
+        celld::js::ws_pull_register(caller, receiver);
+        let (reply, opened) = tokio::sync::oneshot::channel();
+        let cell = Object {
+            id: object,
+            gate: gate.clone(),
+            log: log.clone(),
+            close_gate: close_gate.clone(),
+        };
+        let task = tokio::spawn(pipe_to_object(cell, caller, pull, reply));
+        opened.await.unwrap().unwrap();
+        Pipe {
+            caller,
+            object,
+            gate,
+            log,
+            close_gate,
+            task,
+        }
+    }
+
+    fn emit(id: u64, frame: celld::js::WsOut) {
+        celld::js::ws_emit_batch(vec![(id, frame)]);
+    }
+
+    async fn ended(task: tokio::task::JoinHandle<anyhow::Result<()>>) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn an_object_that_keeps_sending_during_its_close_handler_is_read() {
+        let (tx, mut from_cell) = mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let work = {
+            let release = release.clone();
+            async move { release.notified().await }
+        };
+        let task = tokio::spawn(async move {
+            discard_while(work, &mut from_cell).await;
+            from_cell
+        });
+        for _ in 0..64 {
+            tx.send(celld::js::WsOut::Text("x".into())).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The handler is still running, and the frames are already gone.
+        assert!(!task.is_finished());
+        release.notify_one();
+        let from_cell = task.await.unwrap();
+        assert!(from_cell.is_empty(), "the object's frames piled up");
+    }
+
+    #[tokio::test]
+    async fn a_draining_pipe_keeps_reading_what_the_object_says() {
+        let pipe = start(9_200_000).await;
+        emit(pipe.caller, celld::js::WsOut::Text("kept".into()));
+        emit(pipe.caller, celld::js::WsOut::Close(3001, "done".into()));
+        // The object's cell is shut, so the pipe is draining. Frames the
+        // object sends now are read and dropped, and the pipe still waits.
+        for _ in 0..8 {
+            emit(pipe.object, celld::js::WsOut::Text("x".into()));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!pipe.task.is_finished(), "the pipe ended before the drain");
+        // Reading shows when the object's end went away, which a pipe that
+        // never reads it cannot see until the handler budget runs out.
+        celld::js::ws_unregister(pipe.object);
+        assert!(
+            ended(pipe.task).await,
+            "the object's end was not being read"
+        );
+        // The frame the cell never took is dropped; its handler hears the close.
+        assert_eq!(*pipe.log.lock().unwrap(), ["close:3001"]);
+        celld::js::ws_pull_unregister(pipe.caller);
+    }
+
+    #[tokio::test]
+    async fn a_draining_pipe_still_gives_the_object_what_the_caller_sent() {
+        let pipe = start(9_200_010).await;
+        emit(pipe.caller, celld::js::WsOut::Text("one".into()));
+        emit(pipe.caller, celld::js::WsOut::Text("two".into()));
+        emit(pipe.caller, celld::js::WsOut::Close(3002, "done".into()));
+        emit(pipe.object, celld::js::WsOut::Text("ignored".into()));
+        pipe.gate.add_permits(2);
+        assert!(ended(pipe.task).await);
+        assert_eq!(*pipe.log.lock().unwrap(), ["one", "two", "close:3002"]);
+        celld::js::ws_pull_unregister(pipe.caller);
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_is_not_reading_still_gets_the_close_it_was_sent() {
+        for (caller, close_from_caller) in [(9_200_020, true), (9_200_030, false)] {
+            let pipe = start(caller).await;
+            let (sender, code) = if close_from_caller {
+                (pipe.caller, 3003)
+            } else {
+                (pipe.object, 3004)
+            };
+            emit(sender, celld::js::WsOut::Close(code, "done".into()));
+            if close_from_caller {
+                pipe.gate.add_permits(1);
+            }
+            assert!(ended(pipe.task).await);
+            // Nobody has read the caller's queue yet: it must still be there.
+            assert!(
+                celld::js::ws_pull_registered(caller),
+                "the caller's queue went with the pipe (close {code})"
+            );
+            celld::js::ws_pull_unregister(caller);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caller_whose_request_retired_leaves_no_queue() {
+        let pipe = start(9_200_040).await;
+        // The request's socket goes with it, and the caller's sender drops.
+        celld::js::ws_unregister(pipe.caller);
+        assert!(ended(pipe.task).await);
+        assert!(!celld::js::ws_pull_registered(pipe.caller));
+    }
+
+    #[tokio::test]
+    async fn a_close_the_object_never_takes_does_not_hold_the_pipe() {
+        let pipe = start(9_200_050).await;
+        // The object's input gate stays shut: its close handler never runs.
+        pipe.close_gate.forget_permits(1000);
+        emit(pipe.caller, celld::js::WsOut::Close(3005, "done".into()));
+        assert!(
+            ended(pipe.task).await,
+            "the pipe waited on a close the object never took"
+        );
+        assert!(pipe.log.lock().unwrap().is_empty());
+        celld::js::ws_pull_unregister(pipe.caller);
+    }
+
+    #[tokio::test]
+    async fn a_closed_object_is_not_given_what_the_caller_sends_after() {
+        let pipe = start(9_200_060).await;
+        // The first frame takes the caller's queue; the second waits behind it
+        // in the pipe, so the object's close waits too.
+        let big = "x".repeat(celld::js::WS_PULL_QUEUE_MAX_BYTES);
+        emit(pipe.object, celld::js::WsOut::Text(big.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        emit(pipe.object, celld::js::WsOut::Text(big));
+        emit(pipe.object, celld::js::WsOut::Close(3006, "done".into()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        pipe.gate.add_permits(10);
+        emit(pipe.caller, celld::js::WsOut::Text("late".into()));
+        emit(pipe.caller, celld::js::WsOut::Close(3007, "late".into()));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The caller leaves without reading: the pipe ends.
+        celld::js::ws_pull_unregister(pipe.caller);
+        assert!(ended(pipe.task).await);
+        // The object closed itself: it gets neither frame nor a second close.
+        assert!(pipe.log.lock().unwrap().is_empty(), "{:?}", pipe.log);
+    }
+}

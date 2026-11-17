@@ -127,6 +127,12 @@ The `tail` and `email` handlers are unavailable.
   socket returned in the response stays open.
 - Each isolate-polled input queue has a 1 MiB budget for non-terminal frames. A
   message larger than 1 MiB uses the complete budget.
+- A caller that holds a Durable Object's socket from another isolate can have
+  at most 1 MiB of frames waiting for the object to take them, for example
+  while its input gate is closed. Past that, celld closes both ends with `1009`.
+  A close the caller sends is answered at once. The object still receives the
+  frames sent before it, then the close, unless that takes longer than
+  `CELLD_HANDLER_BUDGET_S`; the rest is then dropped.
 - If the isolate stops polling, celld discards unread frames during cleanup. A
   later pull reports an abnormal close.
 - A WebSocket transport cannot move to a new cell owner. A client must reconnect

@@ -408,6 +408,12 @@ pub fn ws_pull_register(id: u64, rx: WsPullReceiver) {
         .insert(id, Arc::new(tokio::sync::Mutex::new(rx)));
 }
 
+/// Whether an isolate can still read the queue of socket `id`.
+#[doc(hidden)]
+pub fn ws_pull_registered(id: u64) -> bool {
+    ws_pull().lock().unwrap().contains_key(&id)
+}
+
 pub fn ws_pull_unregister(id: u64) {
     ws_pull().lock().unwrap().remove(&id);
     ws_registry().lock().unwrap().pull_retention.remove(&id);
