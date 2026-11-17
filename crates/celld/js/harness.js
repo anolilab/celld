@@ -6103,6 +6103,20 @@ const __wsStub = __celld.__wsStub = (wsId) => ({
     __ws_close(wsId, code, reason);
   },
 });
+// An exception a socket's handler or listener throws is reported as a
+// console error with its stack, and the socket stays open: failing the event
+// would drop the frames the other listeners sent and close the socket.
+const __reportHandlerError = (what, error) => {
+  console.error(`Uncaught exception in ${what}:`, error);
+};
+// Runs a hibernation handler, reporting what it throws.
+const __runSocketHandler = async (name, handler) => {
+  try {
+    await handler();
+  } catch (error) {
+    __reportHandlerError(name, error);
+  }
+};
 __celld.__wsOpen = async (scope, wsId, protocol) => {
   const actorEvent = __beginActorEvent(scope);
   try {
@@ -6124,7 +6138,8 @@ __celld.__wsMessage = async (scope, wsId, msg) => {
     if (!socket._hibernatable && typeof socket._dispatchMessage === "function")
       socket._dispatchMessage(msg);
     else if (typeof inst.webSocketMessage === "function")
-      await inst.webSocketMessage(socket, msg);
+      await __runSocketHandler("webSocketMessage",
+        () => inst.webSocketMessage(socket, msg));
   } finally {
     __endActorEvent(actorEvent);
   }
@@ -6138,7 +6153,8 @@ __celld.__wsBinary = async (scope, wsId, data) => {
     if (!socket._hibernatable && typeof socket._dispatchMessage === "function")
       socket._dispatchMessage(bytes);
     else if (typeof inst.webSocketMessage === "function")
-      await inst.webSocketMessage(socket, bytes);
+      await __runSocketHandler("webSocketMessage",
+        () => inst.webSocketMessage(socket, bytes));
   } finally {
     __endActorEvent(actorEvent);
   }
@@ -6154,12 +6170,13 @@ __celld.__wsClosed = async (scope, wsId, code, reason, wasClean) => {
       // A hibernatable socket reports an abnormal closure through
       // webSocketError, which celld listed as a handler name and never
       // called.
-      await inst.webSocketError(
+      await __runSocketHandler("webSocketError", () => inst.webSocketError(
         socket,
         new Error(reason ? `WebSocket closed abnormally: ${reason}` : "WebSocket closed abnormally"),
-      );
+      ));
     else if (typeof inst.webSocketClose === "function")
-      await inst.webSocketClose(socket, code, reason, wasClean);
+      await __runSocketHandler("webSocketClose",
+        () => inst.webSocketClose(socket, code, reason, wasClean));
   } finally {
     __endActorEvent(actorEvent);
   }
@@ -10175,16 +10192,27 @@ if (!globalThis.EventTarget) {
         if (event._stopImmediate) break;
         if (item.once)
           this.removeEventListener(event.type, item.callback);
-        if (typeof item.callback === "function")
-          item.callback.call(this, event);
-        else item.callback.handleEvent(event);
+        try {
+          if (typeof item.callback === "function")
+            item.callback.call(this, event);
+          else item.callback.handleEvent(event);
+        } catch (error) {
+          if (typeof this._listenerFailed !== "function") throw error;
+          this._listenerFailed(error);
+        }
       }
       const handler = this["on" + event.type];
       const hasEventHandler = (this._listeners.get(event.type) || [])
         .some((item) => item[__eventHandlerEntry]);
       if (!hasEventHandler && !event._stopImmediate &&
-          typeof handler === "function")
-        handler.call(this, event);
+          typeof handler === "function") {
+        try {
+          handler.call(this, event);
+        } catch (error) {
+          if (typeof this._listenerFailed !== "function") throw error;
+          this._listenerFailed(error);
+        }
+      }
       event._end();
       return !event.defaultPrevented;
     }
@@ -11043,6 +11071,11 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     __ws_attachment_set(this._id, __sc_encode(value));
   }
   deserializeAttachment() { return this._attachment; }
+  // A listener that throws is reported and the rest still run, so the socket
+  // keeps working.
+  _listenerFailed(error) {
+    __reportHandlerError("WebSocket listener", error);
+  }
   _dispatchMessage(data) {
     if (this._binaryType === "blob" && data instanceof ArrayBuffer) {
       data = new Blob([data]);

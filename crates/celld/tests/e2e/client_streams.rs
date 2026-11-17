@@ -376,3 +376,77 @@ async fn a_close_takes_the_codes_an_endpoint_may_send_and_refuses_the_others() {
         assert_eq!(keys, wanted, "{path}");
     }
 }
+
+/// Sends one text frame and returns the next text frame the server sends.
+async fn exchange(socket: &mut WebSocket<TokioIo<Upgraded>>, text: &'static str) -> Option<String> {
+    socket
+        .write_frame(Frame::text(Payload::Borrowed(text.as_bytes())))
+        .await
+        .expect("send");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = socket.read_frame().await.ok()?;
+            if frame.opcode == OpCode::Text {
+                return Some(String::from_utf8_lossy(&frame.payload).into_owned());
+            }
+            if frame.opcode == OpCode::Close {
+                return None;
+            }
+        }
+    })
+    .await
+    .unwrap_or(None)
+}
+
+/// Waits until the server log holds `needle`.
+async fn log_has(server: &Server, needle: &str) {
+    super::harness::wait_until(needle, Duration::from_secs(10), || async {
+        server.log_text().contains(needle).then_some(())
+    })
+    .await;
+}
+
+/// An exception in a message or close listener is reported with its stack in
+/// the log, the other listeners still run, and the socket keeps working.
+#[tokio::test]
+async fn an_exception_in_a_websocket_listener_is_reported_and_the_socket_keeps_working() {
+    let server = Server::start("client-streams", &[]).await;
+    for (path, tag) in [("/throwing", "worker"), ("/object/throwing", "object")] {
+        let mut socket = client(&server, path).await;
+        socket.set_auto_close(false);
+        assert_eq!(
+            exchange(&mut socket, "one").await.as_deref(),
+            Some("echo:one"),
+            "{path}"
+        );
+        log_has(&server, &format!("message boom {tag}")).await;
+        assert_eq!(
+            exchange(&mut socket, "two").await.as_deref(),
+            Some("echo:two"),
+            "{path}"
+        );
+        socket
+            .write_frame(Frame::close(1000, b"bye"))
+            .await
+            .expect("close");
+        log_has(&server, &format!("close boom {tag}")).await;
+    }
+}
+
+/// An exception in a hibernation handler is reported, and the socket keeps
+/// working for the next message.
+#[tokio::test]
+async fn an_exception_in_a_hibernation_handler_is_reported_and_the_socket_keeps_working() {
+    let server = Server::start("client-streams", &[]).await;
+    let mut socket = client(&server, "/object/ws-hibernate").await;
+    socket.set_auto_close(false);
+    socket
+        .write_frame(Frame::text(Payload::Borrowed(b"throw")))
+        .await
+        .expect("send");
+    log_has(&server, "hibernation boom").await;
+    assert_eq!(
+        exchange(&mut socket, "echo").await.as_deref(),
+        Some("echoed")
+    );
+}
