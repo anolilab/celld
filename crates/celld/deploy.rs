@@ -203,6 +203,9 @@ pub struct Options {
     pub endpoint: Option<String>,
     pub region: Option<String>,
     pub dry_run: bool,
+    /// Fail the build when the bundle imports a `node:` module celld does
+    /// not implement. Without it the imports are listed as a warning.
+    pub strict: bool,
     pub json: bool,
     /// Upload the version and validate it, but move no pointer and publish no
     /// queue consumer attachment. `celld activate` selects it later.
@@ -247,7 +250,7 @@ pub fn print_help() {
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --sourcemap PATH       Write the entry's source map to PATH, with its sources\n                         relative to the project. The deployed module does not\n                         change. With `no_bundle`, the map is the file the\n                         entry's own build wrote beside it, <entry>.map\n  --tag TAG              Label the deployment; a `version_metadata` binding\n                         reports it as `tag`. It does not change the version\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate the version but select nothing; the\n                         fleet keeps serving what it serves. `celld activate`\n                         selects the version later and `celld discard` removes it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
+OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --sourcemap PATH       Write the entry's source map to PATH, with its sources\n                         relative to the project. The deployed module does not\n                         change. With `no_bundle`, the map is the file the\n                         entry's own build wrote beside it, <entry>.map\n  --tag TAG              Label the deployment; a `version_metadata` binding\n                         reports it as `tag`. It does not change the version\n  --dry-run              Bundle and print the version without writing\n  --strict               Fail when the bundle imports a node: module celld does\n                         not implement; without it they are listed as a warning\n  --no-activate          Upload and validate the version but select nothing; the\n                         fleet keeps serving what it serves. `celld activate`\n                         selects the version later and `celld discard` removes it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain, from Google\n\
 Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
 account key, managed identity, or workload identity for an az:// bucket.\n\n\
@@ -273,6 +276,7 @@ pub fn options_from_arguments(
         endpoint: None,
         region: None,
         dry_run: false,
+        strict: false,
         no_activate: false,
         local_images: false,
         json: false,
@@ -285,6 +289,7 @@ pub fn options_from_arguments(
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
             "--dry-run" => options.dry_run = true,
+            "--strict" => options.strict = true,
             "--no-activate" => options.no_activate = true,
             "--json" => options.json = true,
             "--config" => {
@@ -701,13 +706,21 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                         sourcemap::read_sibling(&root, &path)
                     })
                     .transpose()?;
-                Ok(BundleOutput { bundle, wasm, map })
+                Ok(BundleOutput {
+                    bundle,
+                    wasm,
+                    map,
+                    imports: None,
+                })
             } else {
                 run_esbuild(&root, entry, &project.bundle, want_map)
             }
         })
         .transpose()?;
     let bundled_in = started.elapsed();
+    if let Some(output) = &bundle {
+        report_unsupported_imports(output, options.strict)?;
+    }
     let sourcemap = bundle
         .as_ref()
         .and_then(|output| output.map.as_ref())
@@ -3208,6 +3221,8 @@ struct BundleOutput {
     /// The entry's map as its build wrote it, and the directory its relative
     /// sources are relative to. Only set when a map was asked for.
     map: Option<(Vec<u8>, PathBuf)>,
+    /// The specifiers the bundle leaves external, when the build says.
+    imports: Option<Vec<String>>,
 }
 
 /// Wrangler's default unbundled WASM rule discovers `**/*.wasm` and
@@ -3287,6 +3302,10 @@ fn run_esbuild(
     // provides them.
     let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
     let outdir = tempfile::tempdir().context("create esbuild output directory")?;
+    // Kept apart from the output: a `copy` rule for `.json` would otherwise
+    // deploy it.
+    let metadir = tempfile::tempdir().context("create esbuild metafile directory")?;
+    let metafile = metadir.path().join("meta.json");
     // esbuild writes the map's sources relative to its output directory's real
     // path, so that is the path it is given.
     let outdir_path = outdir
@@ -3337,6 +3356,7 @@ fn run_esbuild(
             )
             .arg(format!("--outdir={}", outdir_path.display()))
             .arg("--entry-names=index")
+            .arg(format!("--metafile={}", metafile.display()))
             // An external map leaves the bundle without a `sourceMappingURL`
             // line, so the module is the same bytes with or without one.
             .args(sourcemap.then_some("--sourcemap=external"))
@@ -3405,7 +3425,70 @@ fn run_esbuild(
                 .context("read esbuild source map")
         })
         .transpose()?;
-    Ok(BundleOutput { bundle, wasm, map })
+    Ok(BundleOutput {
+        bundle,
+        wasm,
+        map,
+        imports: Some(external_imports(&metafile)?),
+    })
+}
+
+/// The specifiers the bundle imports and esbuild left external, of every
+/// kind: `import`, dynamic `import()` and `require()`.
+fn external_imports(metafile: &Path) -> anyhow::Result<Vec<String>> {
+    let meta: Value =
+        serde_json::from_slice(&std::fs::read(metafile).context("read the esbuild metafile")?)
+            .context("parse the esbuild metafile")?;
+    Ok(meta["outputs"]
+        .as_object()
+        .into_iter()
+        .flat_map(|outputs| outputs.values())
+        .filter_map(|output| output["imports"].as_array())
+        .flatten()
+        .filter(|import| import["external"].as_bool() == Some(true))
+        .filter_map(|import| import["path"].as_str().map(str::to_string))
+        .collect())
+}
+
+/// List each `node:` module the bundle imports that celld does not implement.
+/// Importing one is not an error, because bundles name built-ins in code that
+/// never runs; the first call throws. Listing them here moves the discovery
+/// from production to the deploy. `strict` turns the list into a failure.
+fn report_unsupported_imports(output: &BundleOutput, strict: bool) -> anyhow::Result<()> {
+    let scanned;
+    let specifiers: Vec<&str> = match &output.imports {
+        Some(imports) => imports.iter().map(String::as_str).collect(),
+        // An entry that was already bundled has no build to ask: read its
+        // static imports the way the runtime does.
+        None => {
+            scanned =
+                crate::js::modules::scan_external_imports(&String::from_utf8_lossy(&output.bundle));
+            scanned.keys().map(String::as_str).collect()
+        }
+    };
+    let unsupported = crate::js::modules::unsupported_node_imports(specifiers);
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    let list = unsupported
+        .iter()
+        .map(|import| match import.alternative {
+            Some(alternative) => format!("  {} (use {alternative})", import.specifier),
+            None => format!("  {}", import.specifier),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if strict {
+        bail!(
+            "the bundle imports node: modules that celld does not implement:\n{list}\n\
+             Calling one throws; remove the import or drop --strict"
+        );
+    }
+    note!(
+        "Warning: the bundle imports node: modules that celld does not implement:\n{list}\n\
+         Importing them works; calling one throws. `--strict` makes this an error."
+    );
+    Ok(())
 }
 
 /// Minimal JSONC support: line and block comments, and trailing commas.

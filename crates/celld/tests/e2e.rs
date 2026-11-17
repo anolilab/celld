@@ -10,6 +10,7 @@ mod e2e {
     pub mod container_runs;
     pub mod d1_batch;
     pub mod d1_export;
+    pub mod deploy_node_imports;
     pub mod deploy_sourcemap;
     pub mod do_alarms;
     pub mod do_gates;
