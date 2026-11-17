@@ -558,7 +558,9 @@ async fn worker_websocket_pipe(
     let inbound = worker.inbound();
     let (caller_tx, mut from_caller) = mpsc::unbounded_channel();
     let (worker_tx, mut from_worker) = mpsc::unbounded_channel();
-    celld::js::ws_register(id, caller_tx);
+    // A caller that retired before this task ran has no entry left: its end
+    // reads as gone from the first turn and the pipe closes the Worker's.
+    celld::js::ws_register_if_open(id, caller_tx);
     celld::js::ws_register(worker.id(), worker_tx);
     let _ = reply.send(Ok(celld::js::OutboundWsOpen {
         protocol: None,
@@ -744,7 +746,9 @@ async fn pipe_to_object(
     // accepts.
     let (caller_tx, mut from_caller) = mpsc::unbounded_channel();
     let (cell_tx, mut from_cell) = mpsc::unbounded_channel();
-    celld::js::ws_register(id, caller_tx);
+    // A caller that retired before this task ran has no entry left: its end
+    // reads as gone from the first turn, as for a Worker pipe.
+    celld::js::ws_register_if_open(id, caller_tx);
     celld::js::ws_register(cell.id(), cell_tx);
     let _ = reply.send(Ok(celld::js::OutboundWsOpen {
         protocol: None,
@@ -1698,10 +1702,10 @@ mod pipe_tests {
         task: tokio::task::JoinHandle<anyhow::Result<()>>,
     }
 
-    /// Starts a pipe between caller socket `caller` and object socket
-    /// `caller + 1`, with the object's cell not taking frames yet.
-    async fn start(caller: u64) -> Pipe {
-        // The drain's timer runs on the process runtime, bound once per process.
+    /// The drain's timer runs on the process runtime, bound once per process.
+    /// A test binds it before it registers anything, so the registries it
+    /// uses stay the same ones for its whole run.
+    fn host() {
         static HOST: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
         HOST.get_or_init(|| {
             std::env::set_var("CELLD_HANDLER_BUDGET_S", "1");
@@ -1713,12 +1717,30 @@ mod pipe_tests {
             celld::asyncrt::set_host_handle(runtime.handle().clone());
             runtime
         });
+    }
+
+    /// Starts a pipe between caller socket `caller` and object socket
+    /// `caller + 1`, with the object's cell not taking frames yet.
+    async fn start(caller: u64) -> Pipe {
+        start_with(caller, false).await
+    }
+
+    /// Like `start`, but with the caller's request retired before the pipe
+    /// task first runs when `retired` is set.
+    async fn start_with(caller: u64, retired: bool) -> Pipe {
+        host();
         let object = caller + 1;
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let log = Arc::new(Mutex::new(Vec::new()));
         let close_gate = Arc::new(tokio::sync::Semaphore::new(1000));
         let (pull, receiver) = celld::js::ws_pull_channel();
         celld::js::ws_pull_register(caller, receiver);
+        celld::js::ws_register_outbound(caller, "", None);
+        if retired {
+            // What the request's end does to its socket.
+            celld::js::ws_pull_unregister(caller);
+            celld::js::ws_unregister(caller);
+        }
         let (reply, opened) = tokio::sync::oneshot::channel();
         let cell = Object {
             id: object,
@@ -1838,6 +1860,35 @@ mod pipe_tests {
         celld::js::ws_unregister(pipe.caller);
         assert!(ended(pipe.task).await);
         assert!(!celld::js::ws_pull_registered(pipe.caller));
+    }
+
+    #[tokio::test]
+    async fn a_caller_retired_before_the_pipe_starts_registers_nothing() {
+        let pipe = start_with(9_200_045, true).await;
+        // The object's end is told the caller left, and the pipe ends.
+        pipe.close_gate.add_permits(1);
+        assert!(ended(pipe.task).await, "the pipe outlived its caller");
+        assert!(!celld::js::ws_output_registered(pipe.caller));
+        assert!(!celld::js::ws_output_registered(pipe.object));
+        assert!(!celld::js::ws_pull_registered(pipe.caller));
+    }
+
+    #[tokio::test]
+    async fn a_worker_pipe_whose_caller_retired_before_it_starts_closes_the_worker() {
+        host();
+        let (caller, worker_id) = (9_200_047, 9_200_048);
+        let (inbound, _worker_queue) = celld::js::ws_pull_channel();
+        let (pull, _caller_queue) = celld::js::ws_pull_channel();
+        // The caller's request ended before the pipe task ran: its entry is gone.
+        celld::js::ws_register_outbound(caller, "", None);
+        celld::js::ws_unregister(caller);
+        let (reply, _opened) = tokio::sync::oneshot::channel();
+        let worker = celld::js::WorkerWebSocket::new(worker_id, inbound.clone());
+        let task = tokio::spawn(worker_websocket_pipe(caller, worker, pull, reply));
+        assert!(ended(task).await, "the pipe outlived its caller");
+        assert!(inbound.is_closed(), "the Worker's end was left open");
+        assert!(!celld::js::ws_output_registered(caller));
+        assert!(!celld::js::ws_output_registered(worker_id));
     }
 
     #[tokio::test]
