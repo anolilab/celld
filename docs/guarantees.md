@@ -66,10 +66,6 @@ read is unsupported, when the store ignores a condition, when it applies more
 than one of several racing conditional writes, when it ignores the `Range`
 header, or when it returns a wrong range or wrong bytes.
 
-The racing writes add 16 conditional writes and one delete per run. A store that
-lets a second writer through only rarely can still pass; the contract suite in
-`docs/testing.md` is the full proof.
-
 A process that stops mid-test can leave a small object under `probe/`; celld
 never reads it.
 

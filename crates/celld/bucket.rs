@@ -1553,33 +1553,38 @@ impl Bucket {
     /// writer that checked before the first one wrote applies. After they
     /// pass, [`CAS_RACERS`] writers race one create and then one update
     /// that carries the same token, and exactly one of each may apply.
-    /// That adds [`CAS_RACERS`] * 2 = 16 class A requests (the racing
+    /// That adds two rounds of [`CAS_RACERS`] class A requests (the racing
     /// PUTs, rejected ones included) and one DELETE to the four PUTs and
     /// one DELETE of the sequential steps, once per node boot. A store
     /// that lets a second writer through only rarely can still pass; the
     /// contract suite in `tests/store_contract.rs` is the full proof.
     pub(crate) async fn probe_cas_steps(&self) -> anyhow::Result<StorageProbeVerdict> {
-        let key = Self::probe_key("cas");
-        let race_key = Self::probe_key("cas-race");
-        let mut raced = false;
-        let verdict = match self.cas_contract(&key).await {
-            Ok(StorageProbeVerdict::Conformant) => {
-                raced = true;
-                self.race_contract(&race_key).await
-            }
-            other => other,
-        };
-        // The objects are debris on every path, so retire them before the
-        // verdict. A delete that fails leaves one tiny object under
-        // `probe/`, which nothing lists and nothing reads — but a
-        // credential that cannot delete accrues one per boot, so say so.
-        for key in [Some(&key), raced.then_some(&race_key)]
-            .into_iter()
-            .flatten()
+        match self
+            .probe_on_fresh_key("cas", async |key| self.cas_contract(key).await)
+            .await?
         {
-            if let Err(error) = self.delete(key).await {
-                tracing::warn!(%error, "the conditional-write probe could not delete its object");
+            StorageProbeVerdict::Conformant => {
+                self.probe_on_fresh_key("cas-race", async |key| self.race_contract(key).await)
+                    .await
             }
+            violation => Ok(violation),
+        }
+    }
+
+    /// Run one contract on a fresh probe key, then retire the key. The
+    /// object is debris on every path, so it goes before the verdict. A
+    /// delete that fails leaves one tiny object under `probe/`, which
+    /// nothing lists and nothing reads — but a credential that cannot
+    /// delete accrues one per boot, so say so.
+    async fn probe_on_fresh_key(
+        &self,
+        kind: &str,
+        contract: impl AsyncFnOnce(&str) -> anyhow::Result<StorageProbeVerdict>,
+    ) -> anyhow::Result<StorageProbeVerdict> {
+        let key = Self::probe_key(kind);
+        let verdict = contract(&key).await;
+        if let Err(error) = self.delete(&key).await {
+            tracing::warn!(%error, "the conditional-write probe could not delete its object");
         }
         verdict
     }
@@ -1641,13 +1646,7 @@ impl Bucket {
     /// a store that applies either one cannot fence.
     async fn cas_contract(&self, key: &str) -> anyhow::Result<StorageProbeVerdict> {
         let precondition = self.backend.precondition();
-        let ambiguous = || {
-            format!(
-                "the store answered a conditional write with an error where celld requires a \
-                 clean rejection, so celld cannot tell a lost race from a failed write and \
-                 reconciles forever; the store must answer {precondition} with a rejection"
-            )
-        };
+        let ambiguous = || ambiguous_rejection(precondition);
 
         // 1. A create on an absent key applies, and answers the token that
         //    steps 3 and 4 need.
@@ -1671,8 +1670,8 @@ impl Bucket {
         {
             return Ok(StorageProbeVerdict::Violation(format!(
                 "the store overwrote an object although the write was conditional on that object \
-                 being absent; the store accepts {precondition} and does not enforce it, so two \
-                 nodes can own one cell"
+                 being absent; {}",
+                unenforced(precondition)
             )));
         }
 
@@ -1699,40 +1698,38 @@ impl Bucket {
             .is_some()
         {
             return Ok(StorageProbeVerdict::Violation(format!(
-                "the store applied a conditional write that carried a stale token; the store \
-                 accepts {precondition} and does not enforce it, so two nodes can own one cell"
+                "the store applied a conditional write that carried a stale token; {}",
+                unenforced(precondition)
             )));
         }
 
         Ok(StorageProbeVerdict::Conformant)
     }
 
-    /// [`CAS_RACERS`] writers race one conditional write at the same moment.
-    /// A conforming store serializes them, so one applies and the rest get a
-    /// clean rejection.
-    async fn race_conditional_puts(
-        &self,
-        key: &str,
-        token: Option<&str>,
-    ) -> Vec<anyhow::Result<Option<String>>> {
-        futures_util::future::join_all(
-            (0..CAS_RACERS)
-                .map(|racer| self.put_cas(key, format!("probe-racer-{racer}").into_bytes(), token)),
-        )
-        .await
-    }
-
-    /// The two races, against one fresh key: racing creates, then racing
-    /// updates that all carry the winner's token. More than one applying
-    /// is a store that does not serialize, so two nodes can own one cell.
-    /// An error from a racer stays ambiguous, as in the sequential steps.
+    /// The two races, against one fresh key: [`CAS_RACERS`] writers race a
+    /// create, then race an update that all carry the winner's token. A
+    /// conforming store serializes them, so one applies and the rest get a
+    /// clean rejection. More than one applying is a store that does not
+    /// serialize, so two nodes can own one cell.
+    ///
+    /// A store may throttle writers that hit one key at once, and a
+    /// throttled request is rejected before it applies, so it counts as
+    /// not applied. Any other error from a racer stays ambiguous, as in the
+    /// sequential steps. Every write carries a body no earlier write used:
+    /// a store whose ETag is a hash of the body keeps the ETag when a
+    /// write repeats the body, and the next racer's condition would still
+    /// hold.
     async fn race_contract(&self, key: &str) -> anyhow::Result<StorageProbeVerdict> {
         let precondition = self.backend.precondition();
         let mut token: Option<String> = None;
         // The first race carries no token, so it is a create; the second
         // carries the winner's, so it is an update.
         for race in ["create", "update"] {
-            let outcomes = self.race_conditional_puts(key, token.as_deref()).await;
+            let outcomes = futures_util::future::join_all((0..CAS_RACERS).map(|racer| {
+                let body = format!("probe-race-{race}-{racer}").into_bytes();
+                self.put_cas(key, body, token.as_deref())
+            }))
+            .await;
             let applied: Vec<String> = outcomes
                 .iter()
                 .filter_map(|outcome| outcome.as_ref().ok().cloned().flatten())
@@ -1740,23 +1737,25 @@ impl Bucket {
             if applied.len() > 1 {
                 return Ok(StorageProbeVerdict::Violation(format!(
                     "the store applied {} of {CAS_RACERS} racing conditional {race}s that \
-                     carried the same condition; the store accepts {precondition} and does not \
-                     serialize writers that race, so two nodes can own one cell",
-                    applied.len()
+                     carried the same condition; {}",
+                    applied.len(),
+                    unenforced(precondition)
                 )));
             }
-            if let Some(error) = outcomes.into_iter().find_map(Result::err) {
-                return Err(error.context(format!(
-                    "the conditional-write probe could not finish its racing {race}s"
-                )));
+            if let Some(error) = outcomes
+                .into_iter()
+                .filter_map(Result::err)
+                .find(|error| !is_throttled(error))
+            {
+                return Err(error.context(ambiguous_rejection(precondition)));
             }
-            let Some(winner) = applied.first() else {
+            let Some(winner) = applied.into_iter().next() else {
                 return Err(anyhow!(
                     "no racing conditional {race} applied although the condition held, and the \
-                     store answered every one with a rejection"
+                     store answered every one with a rejection or a throttle"
                 ));
             };
-            token = Some(winner.clone());
+            token = Some(winner);
         }
         Ok(StorageProbeVerdict::Conformant)
     }
@@ -1837,6 +1836,37 @@ fn is_unsupported_operation(error: &anyhow::Error) -> bool {
             || text.contains("status 501")
             || text.contains("405 Method Not Allowed")
             || text.contains("501 Not Implemented")
+    })
+}
+
+/// The answer for a probe write that failed where a clean rejection is
+/// required.
+fn ambiguous_rejection(precondition: &str) -> String {
+    format!(
+        "the store answered a conditional write with an error where celld requires a clean \
+         rejection, so celld cannot tell a lost race from a failed write and reconciles \
+         forever; the store must answer {precondition} with a rejection"
+    )
+}
+
+/// The tail of a violation: the store takes the condition and ignores it.
+fn unenforced(precondition: &str) -> String {
+    format!(
+        "the store accepts {precondition} and does not enforce it, so two nodes can own one cell"
+    )
+}
+
+/// Whether the store throttled a request (429, or 503 `SlowDown`). A
+/// throttled request is rejected before it applies. The HTTP adapters keep
+/// the status in a private source error, so its text is the only boundary;
+/// a dependency update must verify these messages.
+fn is_throttled(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let text = cause.to_string();
+        text.contains("status 429")
+            || text.contains("status 503")
+            || text.contains("status code: 429 Too Many Requests")
+            || text.contains("status code: 503 Service Unavailable")
     })
 }
 
@@ -2165,214 +2195,5 @@ pub fn is_unauthorized(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use object_store::list::PaginatedListResult;
-    use object_store::memory::InMemory;
-    use object_store::{CopyOptions, ListResult, PutResult};
-    use std::fmt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// A store that answers every sequential conditional write correctly but
-    /// does not hold the object between checking the condition and writing:
-    /// every writer that checked before the first one wrote applies, which is
-    /// how a store that does not serialize racing writers behaves.
-    #[derive(Debug, Default)]
-    struct Unserialized {
-        inner: InMemory,
-        /// Which kind of conditional write loses its serialization.
-        creates: bool,
-        updates: bool,
-        puts: AtomicUsize,
-    }
-
-    impl fmt::Display for Unserialized {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            fmt::Display::fmt(&self.inner, formatter)
-        }
-    }
-
-    #[async_trait]
-    impl ObjectStore for Unserialized {
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: PutPayload,
-            options: PutOptions,
-        ) -> object_store::Result<PutResult> {
-            self.puts.fetch_add(1, Ordering::SeqCst);
-            let racy = match options.mode {
-                PutMode::Create => self.creates,
-                PutMode::Update(_) => self.updates,
-                PutMode::Overwrite => false,
-            };
-            if !racy {
-                return self.inner.put_opts(location, payload, options).await;
-            }
-            // Check, give the other writers the chance to check too, then
-            // write without the condition.
-            let held = match self.inner.head(location).await {
-                Ok(meta) => Some(meta),
-                Err(Error::NotFound { .. }) => None,
-                Err(error) => return Err(error),
-            };
-            match (&options.mode, held) {
-                (PutMode::Create, Some(_)) => {
-                    return Err(Error::AlreadyExists {
-                        path: location.to_string(),
-                        source: "exists".into(),
-                    })
-                }
-                (PutMode::Update(version), held)
-                    if held.as_ref().and_then(|meta| meta.e_tag.as_ref())
-                        != version.e_tag.as_ref() =>
-                {
-                    return Err(Error::Precondition {
-                        path: location.to_string(),
-                        source: "stale".into(),
-                    })
-                }
-                _ => {}
-            }
-            crate::asyncrt::sleep(Duration::from_millis(20)).await;
-            self.inner.put(location, payload).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            options: PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart_opts(location, options).await
-        }
-
-        async fn get_opts(
-            &self,
-            location: &Path,
-            options: GetOptions,
-        ) -> object_store::Result<object_store::GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: BoxStream<'static, object_store::Result<Path>>,
-        ) -> BoxStream<'static, object_store::Result<Path>> {
-            self.inner.delete_stream(locations)
-        }
-
-        fn list(
-            &self,
-            prefix: Option<&Path>,
-        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            self.inner.list(prefix)
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&Path>,
-        ) -> object_store::Result<ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(
-            &self,
-            from: &Path,
-            to: &Path,
-            options: CopyOptions,
-        ) -> object_store::Result<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
-    }
-
-    /// The probe does not list, so the paginated half only has to exist.
-    #[async_trait]
-    impl PaginatedListStore for Unserialized {
-        async fn list_paginated(
-            &self,
-            _prefix: Option<&str>,
-            _options: PaginatedListOptions,
-        ) -> object_store::Result<PaginatedListResult> {
-            Err(Error::NotImplemented {
-                operation: "list_paginated".to_string(),
-                implementer: "Unserialized".to_string(),
-            })
-        }
-    }
-
-    fn bucket_on(store: &Arc<Unserialized>) -> Bucket {
-        Bucket {
-            store: store.clone(),
-            paginated: store.clone(),
-            cas_store: store.clone(),
-            backend: StorageBackend::S3,
-            name: "probe-test".to_string(),
-            prefix: String::new(),
-        }
-    }
-
-    fn violation(verdict: anyhow::Result<StorageProbeVerdict>) -> String {
-        match verdict.expect("the probe reaches a verdict") {
-            StorageProbeVerdict::Violation(reason) => reason,
-            StorageProbeVerdict::Conformant => panic!("the probe passed a violating store"),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_store_that_serializes_racing_writes_passes_and_leaves_nothing() {
-        crate::asyncrt::install_test_host_runtime();
-        let store = Arc::new(Unserialized::default());
-        let verdict = bucket_on(&store).probe_cas_steps().await.unwrap();
-        assert!(matches!(verdict, StorageProbeVerdict::Conformant));
-        // Four sequential writes, and one create and one update per racer.
-        assert_eq!(store.puts.load(Ordering::SeqCst), 4 + 2 * CAS_RACERS);
-        assert_eq!(store.inner.list(None).count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn racing_creates_that_all_apply_are_a_violation() {
-        crate::asyncrt::install_test_host_runtime();
-        let store = Arc::new(Unserialized {
-            creates: true,
-            ..Unserialized::default()
-        });
-        let reason = violation(bucket_on(&store).probe_cas_steps().await);
-        assert!(
-            reason.contains(&format!(
-                "{CAS_RACERS} of {CAS_RACERS} racing conditional creates"
-            )),
-            "{reason}"
-        );
-        assert_eq!(store.inner.list(None).count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn racing_updates_that_all_apply_are_a_violation() {
-        crate::asyncrt::install_test_host_runtime();
-        let store = Arc::new(Unserialized {
-            updates: true,
-            ..Unserialized::default()
-        });
-        let reason = violation(bucket_on(&store).probe_cas_steps().await);
-        assert!(
-            reason.contains(&format!(
-                "{CAS_RACERS} of {CAS_RACERS} racing conditional updates"
-            )),
-            "{reason}"
-        );
-        assert_eq!(store.inner.list(None).count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn the_startup_probe_refuses_a_store_that_does_not_serialize() {
-        crate::asyncrt::install_test_host_runtime();
-        let store = Arc::new(Unserialized {
-            creates: true,
-            updates: true,
-            ..Unserialized::default()
-        });
-        let reason = violation(bucket_on(&store).probe_startup_storage_steps().await);
-        assert!(reason.contains("racing conditional creates"), "{reason}");
-    }
-}
+#[path = "bucket_tests.rs"]
+mod tests;
