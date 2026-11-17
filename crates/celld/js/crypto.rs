@@ -38,6 +38,21 @@ fn rsa_exponent(e: &rsa::BoxedUint) -> u64 {
         .fold(0, |acc, byte| acc << 8 | u64::from(*byte))
 }
 
+/// The longest salt an RSA-PSS signature can carry:
+/// `ceil((modBits - 1) / 8) - hLen - 2` (RFC 8017 section 9.1.1).
+fn pss_max_salt_len(modulus_bits: u32, hash: &str) -> Result<u64> {
+    let hash_len: u64 = match hash {
+        "SHA-256" => 32,
+        "SHA-384" => 48,
+        "SHA-512" => 64,
+        other => return Err(anyhow!("unsupported RSA hash {other}")),
+    };
+    let em_len = u64::from(modulus_bits.saturating_sub(1)).div_ceil(8);
+    em_len
+        .checked_sub(hash_len + 2)
+        .ok_or_else(|| anyhow!("RSA key is too small for {hash} PSS"))
+}
+
 /// The OS RNG in the `rand_core` 0.10 shape the RustCrypto crates take.
 fn os_rng() -> getrandom::rand_core::UnwrapErr<getrandom::SysRng> {
     getrandom::rand_core::UnwrapErr(getrandom::SysRng)
@@ -898,22 +913,33 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             use rsa::pkcs8::DecodePrivateKey;
             use rsa::signature::RandomizedSigner;
             use rsa::signature::SignatureEncoding;
+            use rsa::traits::PublicKeyParts;
             let key = crypto_bytes(args, "key")?;
             let data = crypto_bytes(args, "data")?;
             let salt_len = args
                 .get("saltLength")
                 .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as usize;
+                .ok_or_else(|| anyhow!("RSA-PSS needs a saltLength"))?;
             let hash = args
                 .get("hash")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("SHA-256");
             let key = rsa::PrivateKey::from_pkcs8_der(&key)
                 .map_err(|_| anyhow!("invalid RSA private key"))?;
+            // A salt the modulus cannot hold is refused before the signer
+            // allocates it or asserts on it.
+            let max = pss_max_salt_len(key.n().bit_width(), hash)?;
+            if salt_len > max {
+                return Err(anyhow!(
+                    "RSA-PSS saltLength {salt_len} is larger than the {max} this key allows"
+                ));
+            }
+            let salt_len = salt_len as usize;
             macro_rules! sign {
                 ($hash:ty) => {
                     rsa::pss::SigningKey::<$hash>::new_with_salt_len(key, salt_len)
-                        .sign_with_rng(&mut os_rng(), &data)
+                        .try_sign_with_rng(&mut os_rng(), &data)
+                        .map_err(|_| anyhow!("RSA signing failed"))?
                         .to_vec()
                 };
             }
@@ -928,6 +954,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
         "rsa-pss-verify" => {
             use rsa::pkcs8::DecodePublicKey;
             use rsa::signature::Verifier;
+            use rsa::traits::PublicKeyParts;
             let key = crypto_bytes(args, "key")?;
             let data = crypto_bytes(args, "data")?;
             let signature = crypto_bytes(args, "signature")?;
@@ -936,12 +963,16 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("SHA-256")
                 .to_string();
-            let salt_len = args
-                .get("saltLength")
-                .and_then(serde_json::Value::as_u64)
-                .map(|len| len as usize);
+            let salt_len = args.get("saltLength").and_then(serde_json::Value::as_u64);
             let key = rsa::PublicKey::from_public_key_der(&key)
                 .map_err(|_| anyhow!("invalid RSA SPKI key"))?;
+            // No signature carries a salt longer than the modulus allows.
+            let salt_len = match salt_len {
+                Some(len) if len > pss_max_salt_len(key.n().bit_width(), &hash)? => {
+                    return Ok(serde_json::json!({ "ok": false }));
+                }
+                other => other.map(|len| len as usize),
+            };
             macro_rules! verify {
                 ($hash:ty) => {{
                     let key = match salt_len {
@@ -2106,7 +2137,9 @@ fn aes_key_wrap(key: &[u8], data: &[u8], wrapping: bool) -> Result<Option<Vec<u8
                 slot.copy_from_slice(&block[8..]);
             }
         }
-        if !wrapping && a != IV {
+        // The integrity check compares in constant time, so the unwrap does
+        // not say how many bytes of a forged block matched.
+        if !wrapping && !bool::from(subtle::ConstantTimeEq::ct_eq(&a[..], &IV[..])) {
             return Ok(None);
         }
         let mut out = Vec::with_capacity(data.len() + 8);
@@ -2352,5 +2385,55 @@ mod scrypt_tests {
             scrypt_kdf(b"", b"", 1 << 20, 8, 1, u64::MAX, 16),
             Err(ScryptRefusal::MemoryLimit)
         );
+    }
+}
+
+#[cfg(test)]
+mod pss_tests {
+    use super::{crypto_operation, pss_max_salt_len};
+
+    #[test]
+    fn the_salt_limit_follows_the_modulus_and_the_hash() {
+        assert_eq!(pss_max_salt_len(2048, "SHA-256").unwrap(), 222);
+        assert_eq!(pss_max_salt_len(2048, "SHA-512").unwrap(), 190);
+        assert_eq!(pss_max_salt_len(1025, "SHA-256").unwrap(), 94);
+        assert!(pss_max_salt_len(512, "SHA-512").is_err());
+    }
+
+    #[test]
+    fn a_salt_the_key_cannot_hold_is_an_error_not_a_crash() {
+        let pair = crypto_operation(
+            "asym-key-generate",
+            &serde_json::json!({ "type": "rsa", "modulusLength": 1024 }),
+        )
+        .unwrap();
+        let sign = |salt: u64| {
+            crypto_operation(
+                "rsa-pss-sign",
+                &serde_json::json!({
+                    "key": pair["privateDer"], "data": [1, 2, 3],
+                    "hash": "SHA-256", "saltLength": salt,
+                }),
+            )
+        };
+        // 128 - 32 - 2 = 94 bytes at most.
+        assert!(sign(94).is_ok());
+        assert!(sign(95).is_err());
+        assert!(sign(u64::MAX).is_err());
+        let verify = |signature: &serde_json::Value, salt: u64| {
+            crypto_operation(
+                "rsa-pss-verify",
+                &serde_json::json!({
+                    "key": pair["publicDer"], "data": [1, 2, 3], "signature": signature,
+                    "hash": "SHA-256", "saltLength": salt,
+                }),
+            )
+            .unwrap()["ok"]
+                .as_bool()
+        };
+        let signature = sign(94).unwrap()["bytes"].clone();
+        assert_eq!(verify(&signature, 94), Some(true));
+        assert_eq!(verify(&signature, 95), Some(false));
+        assert_eq!(verify(&signature, u64::MAX), Some(false));
     }
 }

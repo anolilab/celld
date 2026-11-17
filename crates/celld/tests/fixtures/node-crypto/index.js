@@ -367,6 +367,18 @@ const checks = {
       try { call(); } catch { threw = true; }
       equal(threw, true, "an unsupported RSA padding throws");
     }
+    // `saltLength` means nothing without PSS padding, so it is ignored there.
+    const plain = crypto.sign("sha256", message, KEYS.rsa.private);
+    equal(crypto.sign("sha256", message, { key: KEYS.rsa.private, saltLength: 20 }).equals(plain), true, "saltLength without PSS padding");
+    equal(crypto.verify("sha256", message, { key: pub, saltLength: 20 }, plain), true, "verify with saltLength and no PSS padding");
+    // A salt the modulus cannot hold throws; 222 is the most a 2048-bit key
+    // holds with SHA-256.
+    equal(crypto.verify("sha256", message, { key: pub, ...pss(222) }, crypto.sign("sha256", message, { key: KEYS.rsa.private, ...pss(222) })), true, "the largest salt");
+    for (const saltLength of [223, 1000, 2 ** 31 - 1]) {
+      let threw = false;
+      try { crypto.sign("sha256", message, { key: KEYS.rsa.private, ...pss(saltLength) }); } catch { threw = true; }
+      equal(threw, true, `PSS saltLength ${saltLength} throws`);
+    }
     // ECDSA signatures are DER unless IEEE P1363 is asked for.
     for (const [curve, size] of [["p256", 32], ["p384", 48], ["p521", 66]]) {
       const key = crypto.createPublicKey(KEYS[curve].private);

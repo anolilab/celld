@@ -138,7 +138,15 @@ The `tail` and `email` handlers are unavailable.
   `raw` format, for ECDSA and ECDH on P-256, P-384 and P-521. `importKey()`
   rejects a compressed point with a `NotSupportedError`, and a point that is not
   on the curve with a `DataError`. An RSA key has no `raw` format.
-- RSA-PSS `verify()` checks the `saltLength` it is given.
+- RSA-PSS `sign()` and `verify()` require `saltLength` (an unsigned long; a
+  missing, negative or non-finite value is a `TypeError`). `verify()` checks the
+  length it is given, and `sign()` throws `OperationError` for a length the
+  modulus cannot hold.
+- A key is used only with the algorithm and usage it was made for: `encrypt()`,
+  `decrypt()`, `wrapKey()` and `unwrapKey()` throw `InvalidAccessError`
+  otherwise. `exportKey()` checks extractability first, and `raw` of a private
+  key is an `InvalidAccessError`. An EC public key imports with `verify` (ECDSA)
+  or no usages (ECDH).
 - Ed25519 signs and verifies, and `NODE-ED25519` names the same algorithm. A
   signature from one spelling verifies under the other.
 - X25519 derives bits and keys. A peer key of a low order gives a shared secret
@@ -164,7 +172,8 @@ execution.
   (`createSign()`, `createVerify()`), ciphers, or DSA signatures and key
   generation.
 - `crypto.sign()` and `crypto.verify()` honour `padding` with
-  `RSA_PKCS1_PSS_PADDING` and `saltLength`, and `dsaEncoding` with `der` or
+  `RSA_PKCS1_PSS_PADDING` and `saltLength` (ignored without PSS padding, and a
+  length the key cannot hold throws), and `dsaEncoding` with `der` or
   `ieee-p1363`. A padding other than PKCS#1 v1.5 and PSS throws instead of
   signing another way.
 - `scrypt()` and `scryptSync()` take Node.js's parameters (`N`, `r`, `p`,

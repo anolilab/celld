@@ -1081,9 +1081,9 @@
   }
   const HASH_BYTES = { "SHA-256": 32, "SHA-384": 48, "SHA-512": 64 };
   // The `padding`, `saltLength` and `dsaEncoding` options Node reads off a
-  // key given as an object. Each one changes the signature a key makes, so
-  // each is either honoured or refused: ignoring one would return a
-  // signature of a different scheme than the caller asked for.
+  // key given as an object. Each one that changes the signature is either
+  // honoured or refused: ignoring one would return a signature of a
+  // different scheme than the caller asked for.
   function signOptions(key) {
     const plain = key !== null && typeof key === "object" &&
       !isKeyObject(key) && !(key instanceof CryptoKey) &&
@@ -1096,12 +1096,9 @@
   // verifying.
   function rsaPss(options, material, hash, signing) {
     const { padding } = options;
-    if (padding === undefined || padding === constants.RSA_PKCS1_PADDING) {
-      if (options.saltLength !== undefined)
-        throw ERR_INVALID_ARG_VALUE("options.saltLength", options.saltLength,
-          "needs RSA_PKCS1_PSS_PADDING");
+    // `saltLength` only means something to PSS, so PKCS#1 v1.5 ignores it.
+    if (padding === undefined || padding === constants.RSA_PKCS1_PADDING)
       return null;
-    }
     if (padding !== constants.RSA_PKCS1_PSS_PADDING)
       throw ERR_METHOD_NOT_IMPLEMENTED(
         `${signing ? "sign" : "verify"} with RSA padding ${padding}`);
