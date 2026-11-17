@@ -321,6 +321,7 @@ async fn durable_object_events_running_at_the_deadline_are_ended_and_the_node_ke
     tokio::time::sleep(Duration::from_secs(8)).await;
 
     redeploy(&server).await;
+    let redeployed = std::time::Instant::now();
 
     // Let the deadline pass while the handoffs are still going. The node's own
     // clock says when: a fixed sleep is shorter than the deadline when the
@@ -330,9 +331,10 @@ async fn durable_object_events_running_at_the_deadline_are_ended_and_the_node_ke
         Duration::from_secs(30),
         || async {
             let state = state(&server).await;
-            // An empty list means the generation was already freed, which
-            // happens only at the deadline: the objects hold work until then.
-            let freed = state["deployment"]["retiring"]["generations"] == 0;
+            // A generation freed early (every object already moved) says
+            // nothing about the clock, so it counts only once 2.5 s passed.
+            let freed = state["deployment"]["retiring"]["generations"] == 0
+                && redeployed.elapsed() >= Duration::from_millis(2500);
             let draining = state["deployment"]["draining"].as_array()?;
             (freed
                 || (!draining.is_empty()
