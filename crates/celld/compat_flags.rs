@@ -197,7 +197,7 @@ pub static FLAGS: &[Flag] = &[
     row(
         "python_workers_20250116",
         AlwaysOn,
-        "Pyodide 0.28, the only line celld runs. celld applies this whatever the date.",
+        "Pyodide 0.28, the only line celld runs. A Python Worker without it is refused.",
     )
     .since("2025-09-29")
     .needs("python_workers")
@@ -206,7 +206,7 @@ pub static FLAGS: &[Flag] = &[
     row(
         "enable_python_external_sdk",
         AlwaysOn,
-        "The vendored Workers SDK, the only one celld runs. celld applies this whatever the date.",
+        "The vendored Workers SDK, the only one celld runs. A Python Worker without it is refused.",
     )
     .since("2026-04-21")
     .needs("python_workers")
@@ -215,7 +215,7 @@ pub static FLAGS: &[Flag] = &[
     row(
         "python_no_global_handlers",
         AlwaysOn,
-        "Handlers are `Default` entrypoint classes, the only form celld runs. celld applies this whatever the date.",
+        "Handlers are `Default` entrypoint classes, the only form celld runs. A Python Worker without it is refused.",
     )
     .since("2025-08-14")
     .needs("python_workers")
@@ -224,7 +224,7 @@ pub static FLAGS: &[Flag] = &[
     row(
         "python_workers_force_new_vendor_path",
         AlwaysOn,
-        "Vendored packages come from `python_modules`, the only path celld uses. celld applies this whatever the date.",
+        "Vendored packages come from `python_modules`, the only path celld uses. A Python Worker without it is refused.",
     )
     .since("2025-08-11")
     .needs("python_workers")

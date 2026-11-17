@@ -302,7 +302,7 @@ below when they build, so a flag costs nothing at runtime.
 - **Always on**: celld behaves as if the flag is set. Setting it is accepted.
   Its opt-out is unsupported and refused. A date in "implied from" does not
   gate an always-on row: celld applies the behavior whatever the compatibility
-  date.
+  date. The Python rows are the exception, described below.
 - **Not applicable**: the flag has no meaning on celld. Setting it, or its
   opt-out, is accepted and changes nothing.
 - **Partial**: celld accepts the flag, but the modules it enables are stubs
@@ -313,7 +313,10 @@ below when they build, so a flag costs nothing at runtime.
 A compatibility date on or after the "implied from" date of an unsupported or
 partial flag implies that flag. The build warns, naming the flag and its date,
 unless the config sets the opt-out. A flag set together with its opt-out is
-refused as contradictory. A `python_*` flag, `python_workers` and their opt-outs
+refused as contradictory. Python Workers are stricter: one dated 2026-09-08 or later
+is refused unless it sets `no_python_workers_314`, and one without the four
+always-on Python behaviours (a date from 2026-04-21, or their flags) is
+refused. A `python_*` flag, `python_workers` and their opt-outs
 are refused when the entry is not a `.py` file.
 
 A flag that is not in the table is a warning: celld runs without it. A name
@@ -348,13 +351,13 @@ that a Worker may test.
 | `assets_navigation_prefers_asset_serving` | **Honoured** | 2025-04-01 | A browser navigation request is served from the assets before the Worker runs. |
 | `assets_navigation_has_no_effect` | **Honoured** |  | Turns off `assets_navigation_prefers_asset_serving`. |
 | `python_workers` | **Honoured** |  | Required for a Python entry. |
-| `python_workers_20250116` | **Always on** | 2025-09-29, with `python_workers` | Pyodide 0.28, the only line celld runs. celld applies this whatever the date. |
+| `python_workers_20250116` | **Always on** | 2025-09-29, with `python_workers` | Pyodide 0.28, the only line celld runs. A Python Worker without it is refused. |
 | `no_python_workers_20250116` | **Unsupported** |  | celld always applies `python_workers_20250116`, so it cannot be turned off. |
-| `enable_python_external_sdk` | **Always on** | 2026-04-21, with `python_workers` | The vendored Workers SDK, the only one celld runs. celld applies this whatever the date. |
+| `enable_python_external_sdk` | **Always on** | 2026-04-21, with `python_workers` | The vendored Workers SDK, the only one celld runs. A Python Worker without it is refused. |
 | `disable_python_external_sdk` | **Unsupported** |  | celld always applies `enable_python_external_sdk`, so it cannot be turned off. |
-| `python_no_global_handlers` | **Always on** | 2025-08-14, with `python_workers` | Handlers are `Default` entrypoint classes, the only form celld runs. celld applies this whatever the date. |
+| `python_no_global_handlers` | **Always on** | 2025-08-14, with `python_workers` | Handlers are `Default` entrypoint classes, the only form celld runs. A Python Worker without it is refused. |
 | `disable_python_no_global_handlers` | **Unsupported** |  | celld always applies `python_no_global_handlers`, so it cannot be turned off. |
-| `python_workers_force_new_vendor_path` | **Always on** | 2025-08-11, with `python_workers` | Vendored packages come from `python_modules`, the only path celld uses. celld applies this whatever the date. |
+| `python_workers_force_new_vendor_path` | **Always on** | 2025-08-11, with `python_workers` | Vendored packages come from `python_modules`, the only path celld uses. A Python Worker without it is refused. |
 | `python_process_pth_files` | **Honoured** | 2026-05-26, with `python_workers` | A `.pth` file in a vendored package is processed. |
 | `disable_python_process_pth_files` | **Honoured** |  | Turns off `python_process_pth_files`. |
 | `python_request_headers_preserve_commas` | **Honoured** | 2026-02-17, with `python_workers` | A request header value keeps its commas. |
