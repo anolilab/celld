@@ -88,8 +88,6 @@ pub(crate) struct Report {
     /// The shortest trace of each invariant that failed.
     pub violations: BTreeMap<&'static str, Counterexample>,
     pub labels: BTreeMap<&'static str, usize>,
-    /// The shortest trace that first reached each label.
-    pub label_traces: BTreeMap<&'static str, Vec<String>>,
     pub elapsed: Duration,
 }
 
@@ -183,7 +181,6 @@ pub(crate) fn explore<M: Model>(model: &M, limits: Limits) -> Report {
         bound_hit: None,
         violations: BTreeMap::new(),
         labels: BTreeMap::new(),
-        label_traces: BTreeMap::new(),
         elapsed: Duration::ZERO,
     };
     let record = |report: &mut Report,
@@ -225,16 +222,6 @@ pub(crate) fn explore<M: Model>(model: &M, limits: Limits) -> Report {
                 let step = model.apply(world, &action);
                 for label in step.labels {
                     *report.labels.entry(label).or_default() += 1;
-                    if !report.label_traces.contains_key(label) {
-                        let mut trace = vec![format!("{action:?}")];
-                        let mut at = *fp;
-                        while let Some((parent, earlier)) = parents.get(&at) {
-                            trace.push(earlier.clone());
-                            at = *parent;
-                        }
-                        trace.reverse();
-                        report.label_traces.insert(label, trace);
-                    }
                 }
                 let next_fp = fingerprint(&step.world);
                 if !seen.insert(next_fp) {
