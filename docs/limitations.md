@@ -42,7 +42,5 @@ APIs, and Wrangler configuration.
 
 ## Platforms
 
-- The release workflow builds binaries for Linux x86-64, Linux ARM64, Apple
-  Silicon, and Intel macOS. Linux ARM64 has a separate `-64k-pages` binary for
-  kernels with 16 KiB or 64 KiB pages; the ARM64 container image uses 4 KiB
-  pages. Windows is not supported.
+- [Install](../README.md#install) lists the platforms the release workflow
+  builds. The ARM64 container image uses 4 KiB pages. Windows is not supported.

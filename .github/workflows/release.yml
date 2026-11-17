@@ -125,6 +125,9 @@ jobs:
             --build-arg "CELLD_VERSION=$version" \
             --cache-from "type=registry,ref=$IMAGE:buildcache-amd64" \
             .
+          # The ARM64 image is built only after the release is published, so
+          # check its esbuild pin here.
+          docker buildx build --platform linux/arm64 --target esbuild .
 
   draft-release:
     name: Attest and draft the release
