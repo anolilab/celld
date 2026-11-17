@@ -213,6 +213,17 @@ export default {
     if (url.pathname === "/sse") {
       return sse(Number(url.searchParams.get("events") ?? "3"));
     }
+    if (url.pathname === "/ext") {
+      // A Worker in front of an upstream WebSocket server: the upgraded
+      // socket `fetch()` returns is the answer.
+      const upstream = `http://127.0.0.1:${url.searchParams.get("port")}/${url.searchParams.get("to")}`;
+      if (url.searchParams.has("force")) {
+        return fetch(upstream, { headers: { Upgrade: "websocket" } });
+      }
+      return url.searchParams.has("headers")
+        ? fetch(upstream, { headers: request.headers })
+        : fetch(new Request(upstream, request));
+    }
     if (url.pathname.startsWith("/proxy/")) {
       // Forwards to this Worker's own listener, as a Worker in front of an origin.
       url.pathname = url.pathname.slice("/proxy".length);

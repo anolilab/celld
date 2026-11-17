@@ -219,6 +219,7 @@ const NOT_CELL_SCOPED: &[&str] = &[
     "__ws_alloc",
     "__cell_delegate",
     "__ws_prepare_worker_handoff",
+    "__ws_prepare_upstream_handoff",
     "__ws_accept",
     "__ws_accept_regular",
     "__ws_list",

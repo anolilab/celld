@@ -93,6 +93,53 @@ fn prepare_worker_websocket_handoff(id: u64, owner: u64) {
     drop(replaced);
 }
 
+/// Take an outbound socket's pull queue away from the isolate, for a response
+/// that returns the socket. False when the caller does not own the socket or
+/// the isolate already reads it.
+fn prepare_upstream_websocket_handoff(caller: &WsCaller, id: u64) -> bool {
+    let shared = ws_registry();
+    let mut registry = shared.lock().unwrap();
+    if !registry.may_use(caller, id) || !registry.outputs.contains_key(&id) {
+        return false;
+    }
+    let Some(queue) = ws_pull().lock().unwrap().remove(&id) else {
+        return false;
+    };
+    // The isolate's pump holds a second reference once the Worker accepted
+    // the socket; then it keeps reading and the socket is not ours to move.
+    match Arc::try_unwrap(queue) {
+        Ok(queue) => {
+            registry.upstream_handoffs.insert(id, queue.into_inner());
+            true
+        }
+        Err(queue) => {
+            ws_pull().lock().unwrap().insert(id, queue);
+            false
+        }
+    }
+}
+
+pub(super) fn transfer_upstream_websocket_handoff(
+    caller: &WsCaller,
+    id: u64,
+) -> Option<UpstreamWebSocket> {
+    let shared = ws_registry();
+    let mut registry = shared.lock().unwrap();
+    if !registry.may_use(caller, id) {
+        return None;
+    }
+    let pull = registry.upstream_handoffs.remove(&id)?;
+    drop(registry);
+    // The response owns the socket from here, so the request's end must not
+    // close it.
+    current_context()
+        .sockets
+        .lock()
+        .unwrap()
+        .retain(|opened| *opened != id);
+    Some(UpstreamWebSocket::new(id, pull))
+}
+
 pub(super) fn transfer_worker_websocket_handoff(
     caller: &WsCaller,
     id: u64,
@@ -128,8 +175,15 @@ pub(super) fn transfer_worker_websocket_handoff(
 pub(super) fn ws_close_request_sockets(opened: Vec<u64>) {
     for id in opened {
         let registry = ws_registry();
-        let handoff = registry.lock().unwrap().worker_handoffs.remove(&id);
+        let (handoff, upstream) = {
+            let mut registry = registry.lock().unwrap();
+            (
+                registry.worker_handoffs.remove(&id),
+                registry.upstream_handoffs.remove(&id),
+            )
+        };
         drop(handoff);
+        drop(upstream);
         // A socket whose remote already hung up has no output sender left,
         // and that is the ordinary case rather than an error. `ws_emit` logs
         // a dropped frame for an unknown id, so ask before sending.
@@ -379,6 +433,20 @@ pub(super) fn op_ws_alloc(
         .unwrap()
         .insert(id);
     rv.set(v8::Number::new(scope, id as f64).into());
+}
+
+pub(super) fn op_ws_prepare_upstream_handoff(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args
+        .get(0)
+        .to_integer(scope)
+        .map(|n| n.value() as u64)
+        .unwrap_or(0);
+    let taken = prepare_upstream_websocket_handoff(&ws_caller(scope), id);
+    rv.set(v8::Boolean::new(scope, taken).into());
 }
 
 pub(super) fn op_ws_prepare_worker_handoff(

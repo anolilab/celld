@@ -12120,6 +12120,23 @@ __celld.__readResponse = (r) => {
       server._flushPending();
     }
   }
+  // A socket `fetch()` upgraded and the Worker returned unaccepted: the host
+  // already owns its connection, so the client takes the isolate's place on
+  // it instead of a pair's server end. An accepted socket is the Worker's own
+  // to read, and keeps its isolate-side pump.
+  let upstreamSocketId = 0;
+  let headers = Array.from(r.headers);
+  const upstream = r.webSocket;
+  if (r.status === 101 && upstream && wsTarget === null && workerSocketId === 0 &&
+      !upstream._peer && upstream._outbound && upstream._polled &&
+      !upstream._accepted &&
+      upstream.readyState === WebSocket.READY_STATE_CONNECTING &&
+      __ws_prepare_upstream_handoff(upstream._id)) {
+    upstreamSocketId = upstream._id;
+    __sockets.delete(upstreamSocketId);
+    // The subprotocol the upstream chose is the one the client must be told.
+    if (upstream.protocol) headers.push(["sec-websocket-protocol", upstream.protocol]);
+  }
   const bodyStreamId = r._bodyBytes === null
     ? typeof r.body?.__celldStreamId === "number" &&
         !r.__celldRequestControllers
@@ -12134,9 +12151,10 @@ __celld.__readResponse = (r) => {
       status: r.status,
       bodyBytes: new Uint8Array(),
       bodyStreamId,
-      headersJson: JSON.stringify(Array.from(r.headers)),
+      headersJson: JSON.stringify(headers),
       wsTargetJson: JSON.stringify(wsTarget),
       workerSocketId,
+      upstreamSocketId,
     };
   }
   const bytes = r._bodyBytes;
@@ -12144,8 +12162,9 @@ __celld.__readResponse = (r) => {
     status: r.status,
     bodyBytes: bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes),
     bodyStreamId: 0,
-    headersJson: JSON.stringify(Array.from(r.headers)),
+    headersJson: JSON.stringify(headers),
     wsTargetJson: JSON.stringify(wsTarget),
     workerSocketId,
+    upstreamSocketId,
   };
 };

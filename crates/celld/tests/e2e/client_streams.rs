@@ -462,3 +462,224 @@ async fn an_exception_in_a_hibernation_handler_is_reported_and_closes_the_socket
     assert_eq!(closed, 1011);
     assert_eq!(server.get_text("/object/written").await, "yes");
 }
+
+/// What the upstream server of a proxied socket saw.
+#[derive(Debug, PartialEq)]
+enum Seen {
+    Text(String),
+    Binary(Vec<u8>),
+    Close(u16, String),
+    /// The connection ended without a close frame.
+    Ended,
+}
+
+/// A WebSocket server standing in for the origin behind a proxying Worker.
+/// `/first` sends a text and a binary message on connect, `/echo` answers every
+/// message with itself, and `/bye` closes with 4002 after its first message.
+/// Everything it receives is reported on the channel it returns.
+async fn upstream() -> (u16, tokio::sync::mpsc::UnboundedReceiver<Seen>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    let (seen, report) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(move |mut request| {
+                    let seen = seen.clone();
+                    async move {
+                        let route = request.uri().path().to_string();
+                        let (response, upgrade) = fastwebsockets::upgrade::upgrade(&mut request)
+                            .expect("an upgrade request");
+                        tokio::spawn(async move {
+                            let mut socket = upgrade.await.expect("upgraded");
+                            socket.set_auto_close(false);
+                            if route == "/first" {
+                                socket
+                                    .write_frame(Frame::text(Payload::Borrowed(b"from upstream")))
+                                    .await
+                                    .expect("first text");
+                                socket
+                                    .write_frame(Frame::binary(Payload::Borrowed(&[1, 2, 3])))
+                                    .await
+                                    .expect("first binary");
+                            }
+                            loop {
+                                let Ok(frame) = socket.read_frame().await else {
+                                    let _ = seen.send(Seen::Ended);
+                                    return;
+                                };
+                                match frame.opcode {
+                                    OpCode::Text => {
+                                        let text =
+                                            String::from_utf8_lossy(&frame.payload).into_owned();
+                                        let _ = seen.send(Seen::Text(text));
+                                        if route == "/echo" {
+                                            let _ = socket.write_frame(frame).await;
+                                        } else if route == "/bye" {
+                                            let _ = socket
+                                                .write_frame(Frame::close(4002, b"upstream bye"))
+                                                .await;
+                                        }
+                                    }
+                                    OpCode::Binary => {
+                                        let _ = seen.send(Seen::Binary(frame.payload.to_vec()));
+                                        if route == "/echo" {
+                                            let _ = socket.write_frame(frame).await;
+                                        }
+                                    }
+                                    OpCode::Close => {
+                                        let code = u16::from_be_bytes([
+                                            frame.payload[0],
+                                            frame.payload[1],
+                                        ]);
+                                        let reason = String::from_utf8_lossy(&frame.payload[2..])
+                                            .into_owned();
+                                        let _ = seen.send(Seen::Close(code, reason));
+                                        return;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        });
+                        Ok::<_, std::convert::Infallible>(response)
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .with_upgrades()
+                    .await;
+            });
+        }
+    });
+    (port, report)
+}
+
+/// The next data frame or close the client reads.
+async fn next_seen(socket: &mut WebSocket<TokioIo<Upgraded>>) -> Seen {
+    let read = async {
+        loop {
+            match socket.read_frame().await {
+                Ok(frame) => match frame.opcode {
+                    OpCode::Text => {
+                        return Seen::Text(String::from_utf8_lossy(&frame.payload).into_owned())
+                    }
+                    OpCode::Binary => return Seen::Binary(frame.payload.to_vec()),
+                    OpCode::Close => {
+                        let code = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
+                        let reason = String::from_utf8_lossy(&frame.payload[2..]).into_owned();
+                        return Seen::Close(code, reason);
+                    }
+                    _ => {}
+                },
+                Err(_) => return Seen::Ended,
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .expect("a frame from the proxied socket")
+}
+
+async fn upstream_seen(seen: &mut tokio::sync::mpsc::UnboundedReceiver<Seen>) -> Seen {
+    tokio::time::timeout(Duration::from_secs(10), seen.recv())
+        .await
+        .expect("the upstream heard something")
+        .expect("the upstream is still reporting")
+}
+
+/// A Worker that answers with the socket `fetch()` upgraded connects its
+/// client to that socket: what the upstream sends first arrives, and so does
+/// the close the client sends, with its code and reason.
+#[tokio::test]
+async fn a_returned_fetch_socket_carries_the_upstream_greeting_and_the_clients_close() {
+    let server = Server::start("client-streams", &[]).await;
+    for form in ["", "&headers"] {
+        let (port, mut seen) = upstream().await;
+        let mut socket = client(&server, &format!("/ext?port={port}&to=first{form}")).await;
+        socket.set_auto_close(false);
+        assert_eq!(
+            next_seen(&mut socket).await,
+            Seen::Text("from upstream".into())
+        );
+        assert_eq!(next_seen(&mut socket).await, Seen::Binary(vec![1, 2, 3]));
+        socket
+            .write_frame(Frame::close(4000, b"client done"))
+            .await
+            .expect("close");
+        assert_eq!(
+            upstream_seen(&mut seen).await,
+            Seen::Close(4000, "client done".into()),
+            "{form}"
+        );
+        assert_eq!(
+            next_seen(&mut socket).await,
+            Seen::Close(4000, "client done".into())
+        );
+    }
+}
+
+/// Frames go both ways, in order, text and binary.
+#[tokio::test]
+async fn a_returned_fetch_socket_echoes_frames_both_ways() {
+    let server = Server::start("client-streams", &[]).await;
+    for form in ["", "&headers"] {
+        let (port, mut seen) = upstream().await;
+        let mut socket = client(&server, &format!("/ext?port={port}&to=echo{form}")).await;
+        socket.set_auto_close(false);
+        for round in 0..20 {
+            let text = format!("message {round}");
+            socket
+                .write_frame(Frame::text(Payload::Owned(text.clone().into_bytes())))
+                .await
+                .expect("send text");
+            assert_eq!(next_seen(&mut socket).await, Seen::Text(text.clone()));
+            assert_eq!(upstream_seen(&mut seen).await, Seen::Text(text));
+            let bytes = vec![round as u8; 3];
+            socket
+                .write_frame(Frame::binary(Payload::Owned(bytes.clone())))
+                .await
+                .expect("send binary");
+            assert_eq!(next_seen(&mut socket).await, Seen::Binary(bytes.clone()));
+            assert_eq!(upstream_seen(&mut seen).await, Seen::Binary(bytes));
+        }
+    }
+}
+
+/// A close the upstream sends reaches the client with its code and reason.
+#[tokio::test]
+async fn a_returned_fetch_socket_passes_the_upstreams_close_to_the_client() {
+    let server = Server::start("client-streams", &[]).await;
+    let (port, _seen) = upstream().await;
+    let mut socket = client(&server, &format!("/ext?port={port}&to=bye")).await;
+    socket.set_auto_close(false);
+    socket
+        .write_frame(Frame::text(Payload::Borrowed(b"leave")))
+        .await
+        .expect("send");
+    assert_eq!(
+        next_seen(&mut socket).await,
+        Seen::Close(4002, "upstream bye".into())
+    );
+}
+
+/// A client that did not ask to upgrade is refused, and the upstream
+/// connection the Worker opened does not stay open.
+#[tokio::test]
+async fn a_returned_fetch_socket_is_refused_for_a_client_that_did_not_upgrade() {
+    let server = Server::start("client-streams", &[]).await;
+    let (port, mut seen) = upstream().await;
+    let response = reqwest::get(server.url(&format!("/ext?port={port}&to=echo&force")))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), 500);
+    let body = response.text().await.expect("body");
+    assert!(body.contains("TypeError"), "{body}");
+    let ended = upstream_seen(&mut seen).await;
+    assert!(
+        matches!(ended, Seen::Ended | Seen::Close(..)),
+        "the upstream connection was left open: {ended:?}"
+    );
+}

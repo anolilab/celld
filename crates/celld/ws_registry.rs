@@ -60,6 +60,7 @@ pub struct OutboundWsOpen {
 /// Outbound WebSocket traffic from a DO's `ws.send`/`ws.close`. The host holds
 /// the socket in a task decoupled from the isolate (so the cell can hibernate
 /// while the socket lives); `ws.send` routes here by wsId.
+#[derive(Debug)]
 pub enum WsOut {
     Text(String),
     Binary(Vec<u8>),
@@ -377,7 +378,7 @@ impl WsPullSender {
 }
 
 impl WsPullReceiver {
-    pub(crate) async fn recv(&mut self) -> Option<WsPull> {
+    pub async fn recv(&mut self) -> Option<WsPull> {
         let queued = self.rx.recv().await?;
         let QueuedWsPull { frame, _charge } = queued;
         if matches!(&frame, WsPull::Close(..)) {
@@ -518,6 +519,41 @@ impl Drop for WorkerWebSocket {
     }
 }
 
+/// A socket that a Worker's `fetch()` upgraded and then answered with. The
+/// connection is host-owned already: its task reads the upstream into
+/// `pull` and writes whatever is emitted to `id`. The client takes the
+/// isolate's place on both, so a frame crosses in one queue hop each way.
+pub struct UpstreamWebSocket {
+    id: u64,
+    pull: Option<WsPullReceiver>,
+}
+
+impl UpstreamWebSocket {
+    pub(crate) fn new(id: u64, pull: WsPullReceiver) -> Self {
+        Self {
+            id,
+            pull: Some(pull),
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The frames the upstream sent, for the client to read. Taken once.
+    pub fn take_pull(&mut self) -> Option<WsPullReceiver> {
+        self.pull.take()
+    }
+}
+
+impl Drop for UpstreamWebSocket {
+    fn drop(&mut self) {
+        // A response that never reached a client (refused, or dropped before
+        // the upgrade) must not leave the upstream connection open.
+        ws_close_open(self.id, 1001, "request ended");
+    }
+}
+
 pub enum WsIn {
     Text(String),
     Binary(Vec<u8>),
@@ -583,6 +619,9 @@ pub struct WsRegistry {
     pub(crate) outputs: HashMap<u64, tokio::sync::mpsc::UnboundedSender<WsOut>>,
     pub metadata: HashMap<u64, WsMeta>,
     pub(crate) worker_handoffs: HashMap<u64, WsPullSender>,
+    /// The pull queue of an outbound socket a Worker is returning, taken from
+    /// the isolate until the response claims it.
+    pub(crate) upstream_handoffs: HashMap<u64, WsPullReceiver>,
     /// The request that owns a Worker socket (one with no cell scope), keyed
     /// by socket id. Recorded by the host where the isolate opens the socket,
     /// never taken from an argument the script supplies.
@@ -1471,6 +1510,24 @@ fn emit_frames(
 /// barrier release cannot overtake an earlier frame on the same socket.
 pub fn ws_emit_batch(frames: impl Into<WsBatch>) {
     frames.into().release(Ok(()));
+}
+
+/// Send a frame to the connection behind socket `id`. False when it has no
+/// connection left, which is how a pipe learns the other end is gone.
+pub fn ws_send(id: u64, out: WsOut) -> bool {
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    let open = registry.outputs.contains_key(&id);
+    if open {
+        registry.emit(id, out);
+    }
+    open
+}
+
+/// Close socket `id` if its connection is still there. A socket whose remote
+/// already hung up has nothing to close, and that is not worth a warning.
+pub fn ws_close_open(id: u64, code: u16, reason: &str) -> bool {
+    ws_send(id, WsOut::Close(code, reason.to_string()))
 }
 
 /// Close one socket. A forced generation swap closes the regular and

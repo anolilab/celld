@@ -152,6 +152,12 @@ The `tail` and `email` handlers are unavailable.
   as in workerd. A Durable Object's, service binding's, or loaded Worker's `fetch()`
   call then rejects, and an HTTP client receives status 500. The server end of the socket receives a close
   event with code 1006.
+- A Worker that returns the response of a `fetch()` that upgraded (for example
+  `return fetch(request)` to a WebSocket server) connects its client to that
+  socket. Frames pass both ways, and a close passes with its code and reason;
+  the subprotocol the server chose reaches the client. A Worker that accepts
+  the socket itself keeps it as its own. Returning such a socket from a Durable
+  Object or through a service binding is not supported.
 - A Durable Object's `stub.fetch()` call rejects when the handler fails, on the
   owner node and on any other node.
 

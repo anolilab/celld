@@ -3,7 +3,7 @@
 //! Engine-neutral types and helpers that the cell runtimes and the host
 //! share. Nothing here touches V8; `crate::js`, `crate::runtime` and
 //! `crate::pool` re-export every item at its old path.
-use crate::ws_registry::WorkerWebSocket;
+use crate::ws_registry::{UpstreamWebSocket, WorkerWebSocket};
 use anyhow::Result;
 use celld_logic::isolate::Refusal;
 use std::cell::RefCell;
@@ -113,6 +113,8 @@ pub struct WsTarget {
 pub enum HttpResponseWebSocket {
     Cell(WsTarget),
     Worker(WorkerWebSocket),
+    /// An outbound socket the Worker opened with `fetch()` and returned.
+    Upstream(UpstreamWebSocket),
 }
 
 pub struct HttpResponse {
