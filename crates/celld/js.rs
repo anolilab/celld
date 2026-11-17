@@ -6521,6 +6521,7 @@ ops! { OP_NAMES, install_op_functions,
         "__facet_rpc" => op_facet_rpc,
         "__facet_abort" => op_facet_abort,
         "__facet_delete" => op_facet_delete,
+        "__facet_clone" => op_facet_clone,
         "__do_call" => op_do_call,
         "__svc_call" => op_svc_call,
         "__svc_call_cancellable" => op_svc_call_cancellable,
@@ -8358,6 +8359,73 @@ fn op_facet_delete(
             .await
             .map_err(|_| "the facet delete was dropped".to_string())?
             .map_err(|error| format!("delete facet storage: {error:#}"))?;
+        Ok(Vec::new())
+    });
+    rv.set(promise_for(scope, async_id));
+}
+
+/// `__facet_clone(parentScope, source, target)` — replace the facet `target`
+/// with a copy of the facet `source` of the same parent. The reply waits for
+/// the target's stream to prove the copy, so the cost is one database copy,
+/// proportional to the source's size, and the root's stream gains no request.
+fn op_facet_clone(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let parent_scope = args.get(0).to_rust_string_lossy(scope);
+    let source = args.get(1).to_rust_string_lossy(scope);
+    let target = args.get(2).to_rust_string_lossy(scope);
+    let parent = match storage::storage_identity(&parent_scope) {
+        Ok(Some(parent)) => parent,
+        Ok(None) => {
+            return loader_throw(
+                scope,
+                "facets are available only inside a Durable Object event",
+            )
+        }
+        Err(error) => return loader_throw(scope, &error.to_string()),
+    };
+    let path = |name: String| {
+        let mut names = parent.facet_path.clone();
+        names.push(name);
+        names
+    };
+    let (source, target) = (path(source), path(target));
+    let async_id = asyncrt::enqueue(async move {
+        let Some(sender) = FACET_TX.get() else {
+            let from = open_facet_file(&parent, source.last().unwrap()).await?;
+            let to = open_facet_file(&parent, target.last().unwrap()).await?;
+            for suffix in ["", "-wal", "-shm"] {
+                let mut file = to.clone().into_os_string();
+                file.push(suffix);
+                let _ = asyncrt::fs().remove_file(std::path::Path::new(&file));
+            }
+            crate::facet_streams::copy_database(from, to)
+                .await
+                .map_err(|error| format!("clone facet storage: {error:#}"))?;
+            return Ok(Vec::new());
+        };
+        let stream = crate::engine_api::facet_cell(&parent.root_scope, &target);
+        let epoch = parent.epoch;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let request = FacetReq::Clone {
+            root: parent.root_scope,
+            epoch,
+            source,
+            target,
+            reply,
+        };
+        sender
+            .send(request)
+            .map_err(|_| "the facet channel closed".to_string())?;
+        receive
+            .await
+            .map_err(|_| "the facet clone was dropped".to_string())?
+            .map_err(|error| format!("clone facet storage: {error:#}"))?;
+        prove_facet(stream, epoch)
+            .await
+            .map_err(|refusal| format!("clone facet storage: {refusal}"))?;
         Ok(Vec::new())
     });
     rv.set(promise_for(scope, async_id));

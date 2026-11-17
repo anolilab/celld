@@ -2317,6 +2317,27 @@ class DurableObjectFacets {
     // next get reload the image which the failed operation did not delete.
     barrier.then(clear, () => {});
   }
+  // Replaces `target` with a copy of `source`'s storage. The source keeps
+  // running; a transaction it has not committed is not copied. The target
+  // stops first and starts empty from the copy at its next `get`.
+  async clone(source, target) {
+    source = this._validName(source);
+    target = this._validName(target);
+    if (source === target)
+      throw new TypeError("Cannot clone a facet onto itself.");
+    const sourceBarrier = this._barriers.get(source);
+    const barrier = Promise.all([
+      sourceBarrier,
+      this._abort(target, new Error("Facet was replaced by a clone.")),
+    ]).then(() => __facet_clone(this._state._scope, source, target));
+    this._barriers.set(target, barrier);
+    const clear = () => {
+      if (this._barriers.get(target) === barrier) this._barriers.delete(target);
+    };
+    // As for `delete`: a failed clone leaves the target's storage unknown.
+    barrier.then(clear, () => {});
+    await barrier;
+  }
   _release() {
     // The host closes these facets during give-back. Queuing _abort here
     // leaves an undriven op whose promise retains the manager, its root,

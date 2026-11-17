@@ -195,6 +195,37 @@ impl FacetStreams {
         }
     }
 
+    /// Replace the facet at `target` with a copy of the one at `source`.
+    ///
+    /// The target's streams are deleted, the target activates empty, and
+    /// SQLite's backup API copies the source's committed pages into it in one
+    /// write transaction of the target's own database. The replicator ships
+    /// that transaction as any other write, so the copy is a write of the
+    /// target's stream that the caller proves before it answers. The source
+    /// keeps running: it is read through a second connection, and a
+    /// transaction it has not committed is not copied. Facets below either
+    /// facet are not copied; the target's own are deleted with it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn clone_facet(
+        &self,
+        replication: Option<&Replication>,
+        db_path: impl Fn(&str, u64) -> PathBuf,
+        local: impl Fn(&str) -> PathBuf,
+        root: &str,
+        epoch: u64,
+        source: &[String],
+        target: &[String],
+    ) -> anyhow::Result<()> {
+        let from = self
+            .open(replication, &db_path, root, epoch, source)
+            .await?;
+        self.delete(replication, local, root, epoch, target).await?;
+        let to = self
+            .open(replication, &db_path, root, epoch, target)
+            .await?;
+        copy_database(from, to).await
+    }
+
     /// The root begins to stop: see `FacetRoot::stopping`. Answers the
     /// streams the stop must stop, after which no open can add one.
     pub(crate) fn stopping(&self, root: &str, epoch: u64) -> Vec<String> {
@@ -307,4 +338,29 @@ impl FacetStreams {
             roots.remove(root);
         }
     }
+}
+
+/// Copy the committed pages of the database at `from` over the one at `to`,
+/// in one write transaction of `to`. A source with a writer of its own is
+/// read as of one moment: the copy is a single backup step.
+pub(crate) async fn copy_database(from: PathBuf, to: PathBuf) -> anyhow::Result<()> {
+    crate::asyncrt::blocking(move || {
+        let source = rusqlite::Connection::open_with_flags(
+            &from,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .with_context(|| format!("open facet database {}", from.display()))?;
+        let mut destination = rusqlite::Connection::open(&to)
+            .with_context(|| format!("open facet database {}", to.display()))?;
+        let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
+        loop {
+            match backup.step(-1)? {
+                rusqlite::backup::StepResult::Done => return Ok(()),
+                // A lock held for a moment by the source's writer.
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+    })
+    .await
+    .map_err(|error| anyhow!("facet copy panicked: {error}"))?
 }

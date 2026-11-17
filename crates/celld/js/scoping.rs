@@ -124,6 +124,7 @@ pub(super) const fn cell_scope_arg(op: &str) -> Option<usize> {
         | b"__queue_alarm_set_wait"
         | b"__actor_abort"
         | b"__facet_delete"
+        | b"__facet_clone"
         | b"__container_running"
         | b"__container_address"
         | b"__container_start"

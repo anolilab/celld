@@ -54,6 +54,16 @@ pub enum FacetReq {
         names: Vec<String>,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
+    /// Replace the facet at `target` with a copy of the one at `source`,
+    /// both below `root`. The copy is a committed write of the target's
+    /// stream; the caller proves it.
+    Clone {
+        root: String,
+        epoch: u64,
+        source: Vec<String>,
+        target: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
     /// Prove every committed write of the stream durable.
     Prove {
         stream: String,

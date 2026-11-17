@@ -21,7 +21,7 @@ export class Greeter extends WorkerEntrypoint {
 }
 
 export class Supervisor extends DurableObject {
-  fetch(request) {
+  facet(name) {
     const worker = this.env.LOADER.get("app-v1", () => ({
       compatibilityDate: "2025-01-01",
       mainModule: "app.js",
@@ -32,10 +32,20 @@ export class Supervisor extends DurableObject {
         }),
       },
     }));
-    const facet = this.ctx.facets.get("app", () => ({
+    return this.ctx.facets.get(name, () => ({
       class: worker.getDurableObjectClass("App"),
     }));
-    return facet.fetch(request);
+  }
+
+  async fetch(request) {
+    // `/clone` copies the facet's storage into a second facet, `/copy` is
+    // that second facet, and any other path is the original.
+    const path = new URL(request.url).pathname;
+    if (path === "/clone") {
+      await this.ctx.facets.clone("app", "copy");
+      return new Response("cloned");
+    }
+    return this.facet(path === "/copy" ? "copy" : "app").fetch(request);
   }
 }
 

@@ -23,6 +23,8 @@ Worker Loader provides.
 - `ctx.exports.App({ props })` creates a class handle with startup properties.
 - `ctx.facets.abort(name, reason)` stops a facet and keeps its database.
 - `ctx.facets.delete(name)` stops a facet and removes its database.
+- `ctx.facets.clone(source, target)` replaces the database of `target` with a
+  copy of the database of `source`.
 - The stub answers `fetch()` and the RPC methods of the class.
 
 ## A facet is a part of its root object
@@ -74,6 +76,15 @@ loopback class without properties supplies an empty object.
   call on the stopped stub throws the reason.
 - `ctx.facets.delete(name)` stops the facet and removes its database and the
   database of every facet below it.
+- `ctx.facets.clone(source, target)` stops `target`, removes its database and
+  the database of every facet below it, and copies the committed state of the
+  `source` database into a new one. The source keeps running, and a
+  transaction it has not committed is not copied. The call resolves when the
+  copy is durable on the stream of the target, and the next `get(target)`
+  starts from it. The source and the target must differ, and the facets below
+  the source are not copied. The copy reads and writes the whole database, so
+  its cost is proportional to the size of the source. It adds no request on the
+  root object's stream; the target's stream ships the copy as one write.
 
 No name reaches a facet from outside its root object, so external traffic
 must go through the supervisor. Use a separate Durable Object, addressed with
@@ -114,7 +125,6 @@ closes it with `1011`.
   socket closes.
 - A facet stub is not awaitable, and a pipelined property path is unavailable,
   so a call must name one method.
-- The `clone()` method is unavailable.
 
 The [Cloudflare compatibility](../cloudflare-compat.md#services)
 page lists the runtime APIs and the unsupported services.
