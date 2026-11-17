@@ -557,7 +557,7 @@ pub(super) fn populate_process_env(scope: &mut v8::PinScope, config: &WorkerConf
         // JSON, not Rust's `{:?}`: values are arbitrary text, and Debug writes
         // some characters as `\u{..}`, which is not JavaScript.
         src.push_str(&format!(
-            "globalThis.process.env[{}] = {};\n",
+            "Object.defineProperty(globalThis.process.env, {}, {{ value: {}, enumerable: true, writable: true, configurable: true }});\n",
             serde_json::to_string(name)?,
             serde_json::to_string(value)?
         ));

@@ -216,10 +216,14 @@ execution.
   outside `/tmp` fail with `EPERM`. `/tmp` belongs to a request: code that runs
   with no request, such as module scope while the Worker loads, cannot change
   it, and those calls fail with `EPERM`; reads there see an empty tree. A
-  reaction left behind by a finished cell event has no request either, even
-  when another request's turn runs it.
+  reaction left behind by a finished event has no request either, even
+  when another request's turn runs it, and a reaction of a live request keeps
+  its own `/tmp` when another request's turn runs it. A write takes the `open`
+  flags `r` (fails with `EBADF`), `r+` (writes at offset 0 and keeps the rest),
+  `w`, `a`, their `+` forms, and the exclusive `x` forms; any other flag throws
+  `ERR_INVALID_ARG_VALUE`.
 - `node:url` provides `URL`, `URLSearchParams`, `fileURLToPath`,
-  `pathToFileURL`, and `format` for `URL` objects, with Node.js's POSIX results
+  `pathToFileURL`, and `format` for `URL` objects (including `unicode`), with Node.js's POSIX results
   and errors. The legacy API (`parse`, `resolve`, `resolveObject`, `Url`,
   `domainToASCII`, `domainToUnicode`, `urlToHttpOptions`, and `format` of a
   string or a legacy object) throws `ERR_METHOD_NOT_IMPLEMENTED`.

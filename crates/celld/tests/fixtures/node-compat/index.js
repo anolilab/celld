@@ -35,6 +35,16 @@ const throwsCode = async (code, run) => {
   throw new Error(`expected ${code}, nothing was thrown`);
 };
 
+const throwsCodeSync = (code, run) => {
+  try {
+    run();
+  } catch (error) {
+    is(error.code, code);
+    return;
+  }
+  throw new Error(`expected ${code}, nothing was thrown`);
+};
+
 const processChecks = {
   global: () => is(process === globalThis.process, true),
   named: () => is(namedEnv === process.env, true),
@@ -74,6 +84,16 @@ const urlChecks = {
       url.format(new URL("http://u:p@a.com/x?y#z"), { auth: false, fragment: false, search: false }),
       "http://a.com/x",
     ),
+  fakeUrlObject: () =>
+    throwsCode("ERR_INVALID_ARG_TYPE", () =>
+      fileURLToPath({ href: "file:///etc/passwd", protocol: "file:", hostname: "", pathname: "/etc/passwd" })),
+  formatUnicode: () => {
+    const host = new URL("http://u:p@xn--bcher-kva.example:8080/p?q#h");
+    is(url.format(host, { unicode: true }), "http://u:p@bücher.example:8080/p?q#h");
+    is(url.format(host), "http://u:p@xn--bcher-kva.example:8080/p?q#h");
+    is(url.format(new URL("http://xn--mnchen-3ya.de/"), { unicode: true }), "http://münchen.de/");
+    is(url.format(new URL("http://a.com/x"), { unicode: true }), "http://a.com/x");
+  },
   formatLegacyObject: () =>
     throwsCode("ERR_METHOD_NOT_IMPLEMENTED", () => url.format({ protocol: "http", host: "a.com", query: { a: 1 } })),
   legacyNamesStayExported: async () => {
@@ -132,6 +152,28 @@ const fsChecks = {
     const entries = fs.readdirSync("/tmp/d", { withFileTypes: true });
     is([entries[0].name, entries[0].isFile(), entries[0].isDirectory()], ["x", true, false]);
     is(fs.readdirSync("/tmp").includes("d"), true);
+  },
+  writeFlags: () => {
+    fs.writeFileSync("/tmp/f.txt", "abcdef");
+    throwsCodeSync("EBADF", () => fs.writeFileSync("/tmp/f.txt", "x", { flag: "r" }));
+    is(fs.readFileSync("/tmp/f.txt", "utf8"), "abcdef");
+    throwsCodeSync("ENOENT", () => fs.writeFileSync("/tmp/f-missing.txt", "x", { flag: "r" }));
+    fs.writeFileSync("/tmp/f.txt", "XY", { flag: "r+" });
+    is(fs.readFileSync("/tmp/f.txt", "utf8"), "XYcdef");
+    fs.writeFileSync("/tmp/f.txt", "1234567", { flag: "r+" });
+    is(fs.readFileSync("/tmp/f.txt", "utf8"), "1234567");
+    throwsCodeSync("ENOENT", () => fs.writeFileSync("/tmp/f-missing.txt", "x", { flag: "r+" }));
+    fs.writeFileSync("/tmp/f.txt", "+", { flag: "a+" });
+    is(fs.readFileSync("/tmp/f.txt", "utf8"), "1234567+");
+    fs.writeFileSync("/tmp/f.txt", "w", { flag: "w+" });
+    is(fs.readFileSync("/tmp/f.txt", "utf8"), "w");
+    throwsCodeSync("EEXIST", () => fs.writeFileSync("/tmp/f.txt", "x", { flag: "ax" }));
+    fs.writeFileSync("/tmp/f-new.txt", "n", { flag: "ax" });
+    fs.appendFileSync("/tmp/f.txt", "z", { flag: "w" });
+    is(fs.readFileSync("/tmp/f.txt", "utf8"), "z");
+    for (const flag of ["rs", "z", "", 3]) {
+      throwsCodeSync("ERR_INVALID_ARG_VALUE", () => fs.writeFileSync("/tmp/f.txt", "x", { flag }));
+    }
   },
   readdirNotADirectory: () => throwsCode("ENOTDIR", () => fs.readdirSync("/tmp/a.txt")),
   readdirMissing: () => throwsCode("ENOENT", () => fs.readdirSync("/tmp/missing")),
@@ -199,6 +241,57 @@ const fill = () => {
   return { code, files, chunkBytes: chunk.length, refusedBig: small, exists: fs.existsSync("/tmp/one-more") };
 };
 
+// Module scope is shared by every request of the isolate, so one request's
+// continuation runs inside the checkpoint of another.
+const isolate = crypto.randomUUID().slice(0, 8);
+let parked = false;
+let release;
+const gate = new Promise((resolve) => {
+  release = resolve;
+});
+// A reaction left behind by a request that has already answered.
+let fireLeft;
+const leftGate = new Promise((resolve) => {
+  fireLeft = resolve;
+});
+let leftOutcome = "did not run";
+
+const concurrent = {
+  // Waits on the gate, then reads and writes its own `/tmp`.
+  async park() {
+    fs.writeFileSync("/tmp/own", "mine");
+    parked = true;
+    await gate;
+    return { isolate, own: fs.existsSync("/tmp/own"), foreign: fs.existsSync("/tmp/planted") };
+  },
+  // Plants a file, opens the gate while this request is the one running.
+  async release() {
+    fs.writeFileSync("/tmp/planted", "from the running request");
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return { isolate };
+  },
+  arm() {
+    leftGate.then(() => {
+      let write;
+      try {
+        fs.writeFileSync("/tmp/left", "x");
+        write = "written";
+      } catch (error) {
+        write = error.code;
+      }
+      leftOutcome = { write, sees: fs.existsSync("/tmp/planted") };
+    });
+    return { armed: true };
+  },
+  async fire() {
+    fs.writeFileSync("/tmp/planted", "from the running request");
+    fireLeft();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return leftOutcome;
+  },
+};
+
 export default {
   async fetch(request) {
     const path = new URL(request.url).pathname;
@@ -245,6 +338,16 @@ export default {
           }),
         );
       }
+      case "/concurrent/park":
+        return Response.json(await concurrent.park());
+      case "/concurrent/parked":
+        return new Response(String(parked));
+      case "/concurrent/release":
+        return Response.json(await concurrent.release());
+      case "/concurrent/arm":
+        return Response.json(concurrent.arm());
+      case "/concurrent/fire":
+        return Response.json(await concurrent.fire());
       case "/fill":
         return Response.json(fill());
       default:

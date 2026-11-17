@@ -11373,7 +11373,7 @@ const __fsError = (code, syscall, path) => {
       (noRequest ? " (there is no request-local /tmp outside a request)" : ""),
   );
   e.errno = {
-    EPERM: -1, ENOENT: -2, EEXIST: -17, ENOTDIR: -20, EISDIR: -21, ENOSPC: -28,
+    EPERM: -1, ENOENT: -2, EBADF: -9, EEXIST: -17, ENOTDIR: -20, EISDIR: -21, ENOSPC: -28,
   }[name];
   e.code = name;
   e.syscall = syscall;
@@ -11499,16 +11499,61 @@ const __fsBytes = (data, encoding) => {
   error.code = "ERR_INVALID_ARG_TYPE";
   throw error;
 };
+// The `open` flags a write accepts, as [create, exclusive, truncate, append,
+// writable]. `r` opens read-only, so writing through it fails as in Node.
+const __fsFlags = {
+  r: [false, false, false, false, false],
+  "r+": [false, false, false, false, true],
+  w: [true, false, true, false, true],
+  "w+": [true, false, true, false, true],
+  wx: [true, true, true, false, true],
+  xw: [true, true, true, false, true],
+  "wx+": [true, true, true, false, true],
+  "xw+": [true, true, true, false, true],
+  a: [true, false, false, true, true],
+  "a+": [true, false, false, true, true],
+  ax: [true, true, false, true, true],
+  xa: [true, true, false, true, true],
+  "ax+": [true, true, false, true, true],
+  "xa+": [true, true, false, true, true],
+};
 const __fsWrite = (value, data, options, append) => {
   const path = __fsPath(value);
   if (typeof options === "string") options = { encoding: options };
   options = __fsOptions(options, []);
   const flag = options.flag ?? (append ? "a" : "w");
-  const bytes = __fsBytes(data, options.encoding);
-  if (flag.includes("x") && __vfs_stat(path)[0]) {
-    throw __fsError("EEXIST", "open", path);
+  const mode = typeof flag === "string" &&
+    Object.prototype.hasOwnProperty.call(__fsFlags, flag)
+    ? __fsFlags[flag]
+    : undefined;
+  if (!mode) {
+    const error = new TypeError(
+      `The argument 'flags' is invalid. Received ${
+        typeof flag === "string" ? `'${flag}'` : String(flag)
+      }`,
+    );
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
   }
-  __fsThrowCode(__vfs_write(path, bytes, flag.startsWith("a")), "open", path);
+  const [create, exclusive, truncate, appending, writable] = mode;
+  const bytes = __fsBytes(data, options.encoding);
+  const kind = __vfs_stat(path)[0];
+  if (exclusive && kind) throw __fsError("EEXIST", "open", path);
+  if (!create && !kind) throw __fsError("ENOENT", "open", path);
+  if (!writable) throw __fsError("EBADF", "write", path);
+  if (appending) {
+    __fsThrowCode(__vfs_write(path, bytes, true), "open", path);
+    return;
+  }
+  let content = bytes;
+  if (!truncate && kind === 4) {
+    // `r+` writes at offset 0 and keeps whatever lies beyond the new bytes.
+    const old = new Uint8Array(__vfs_read_file(path));
+    if (old.length > bytes.byteLength) {
+      content = Buffer.concat([bytes, old.subarray(bytes.byteLength)]);
+    }
+  }
+  __fsThrowCode(__vfs_write(path, content, false), "open", path);
 };
 const __fsWriteFileSync = (path, data, options) =>
   __fsWrite(path, data, options, false);

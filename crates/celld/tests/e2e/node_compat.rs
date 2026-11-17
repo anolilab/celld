@@ -49,13 +49,17 @@ async fn process_env_holds_vars_and_secrets_as_text() {
     let mut server = Server::start("node-compat", &[]).await;
     server
         .restart_after(|project| {
-            std::fs::write(project.join(".dev.vars"), "SECRET=s3cret\n").unwrap()
+            std::fs::write(project.join(".dev.vars"), "SECRET=s3cret\n__proto__=own\n").unwrap()
         })
         .await;
     let env: EnvReport = server.get_json("/env").await;
     assert_eq!(env.greeting.as_deref(), Some("hello"));
     assert!(env.unset, "a name that is not set must read as undefined");
-    assert_eq!(env.keys, ["EMPTY", "GREETING", "SECRET"]);
+    assert_eq!(env.keys, ["EMPTY", "GREETING", "SECRET", "__proto__"]);
+    assert_eq!(
+        env.values["__proto__"], "own",
+        "a variable named __proto__ is an own property"
+    );
     assert_eq!(env.values["SECRET"], "s3cret");
     assert_eq!(env.values["EMPTY"], "");
 }
@@ -105,13 +109,13 @@ async fn node_process_is_the_global_process() {
 #[tokio::test]
 async fn node_url_matches_node() {
     let server = Server::start("node-compat", &[]).await;
-    assert_all_ok(&server, "/url", 18).await;
+    assert_all_ok(&server, "/url", 20).await;
 }
 
 #[tokio::test]
 async fn tmp_accepts_writes_and_mutations() {
     let server = Server::start("node-compat", &[]).await;
-    assert_all_ok(&server, "/fs", 21).await;
+    assert_all_ok(&server, "/fs", 22).await;
 }
 
 #[derive(serde::Deserialize, PartialEq, Debug)]
@@ -173,4 +177,71 @@ async fn a_response_body_pull_sees_the_requests_tmp() {
         "written by the handler|x",
         "a body pulled after the handler returned lost the request's /tmp"
     );
+}
+
+#[derive(serde::Deserialize)]
+struct Parked {
+    isolate: String,
+    own: bool,
+    foreign: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct Released {
+    isolate: String,
+}
+
+/// Request A waits on a promise that request B settles, so A's reaction runs
+/// inside B's microtask checkpoint. A stateless request installs no cell
+/// token, so what A reads and writes must still be its own `/tmp`.
+// Drives a server from the outside, like the harness; the boundary policy on
+// `tokio::spawn` and `tokio::time::timeout` is for code inside celld.
+#[allow(clippy::disallowed_methods)]
+#[tokio::test]
+async fn a_stateless_reaction_keeps_its_own_tmp_while_another_request_drives_it() {
+    use std::time::Duration;
+
+    let server = std::sync::Arc::new(Server::start("node-compat", &[]).await);
+    let parking = tokio::spawn({
+        let server = server.clone();
+        async move { server.get_json::<Parked>("/concurrent/park").await }
+    });
+    super::harness::wait_until("request a parks", Duration::from_secs(10), || async {
+        (server.get_text("/concurrent/parked").await == "true").then_some(())
+    })
+    .await;
+    let released: Released = server.get_json("/concurrent/release").await;
+    let parked = tokio::time::timeout(Duration::from_secs(10), parking)
+        .await
+        .expect("the parked request never answered")
+        .expect("the request task panicked");
+    assert_eq!(
+        parked.isolate, released.isolate,
+        "the requests ran in different isolates, so the test proves nothing"
+    );
+    assert!(parked.own, "the parked request lost its own /tmp");
+    assert!(
+        !parked.foreign,
+        "the parked request read the file of the request that ran its reaction"
+    );
+}
+
+#[derive(serde::Deserialize)]
+struct Left {
+    write: String,
+    sees: bool,
+}
+
+/// A reaction left by a request that has already answered has no `/tmp`: it
+/// must not use the one of the request that runs its checkpoint.
+#[tokio::test]
+async fn a_reaction_of_a_finished_stateless_request_gets_no_tmp() {
+    let server = Server::start("node-compat", &[]).await;
+    let _: serde_json::Value = server.get_json("/concurrent/arm").await;
+    let left: Left = server.get_json("/concurrent/fire").await;
+    assert!(
+        !left.sees,
+        "the stale reaction read the running request's /tmp"
+    );
+    assert_eq!(left.write, "EPERM");
 }

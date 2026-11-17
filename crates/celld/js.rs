@@ -2219,6 +2219,12 @@ struct ActorRuntimeState {
     termination: std::sync::Mutex<Option<ExecutionTermination>>,
     pending_puts: std::sync::Mutex<PendingPuts>,
     io_contexts: std::sync::Mutex<HashMap<u64, Weak<IoContext>>>,
+    /// Set once the Worker imports `node:fs`. From then on every stateless
+    /// request installs a `/tmp` token (see [`install_tmp_token`]); a Worker
+    /// that never touches the filesystem keeps the empty continuation slot.
+    tmp_tokens: AtomicBool,
+    /// The stateless requests that hold a `/tmp` token, by that token.
+    tmp_contexts: std::sync::Mutex<HashMap<u64, Weak<IoContext>>>,
     /// WebSocket captures that received a frame in the current isolate turn.
     /// Weak references record every continuation context without extending
     /// an event's lifetime merely to flush its output.
@@ -2292,6 +2298,15 @@ fn advance_io_time(scope: &mut v8::PinScope) -> i64 {
 }
 
 impl ActorRuntimeState {
+    fn tmp_context(&self, id: u64) -> Option<Arc<IoContext>> {
+        let mut contexts = self.tmp_contexts.lock().unwrap();
+        let context = contexts.get(&id)?.upgrade();
+        if context.is_none() {
+            contexts.remove(&id);
+        }
+        context
+    }
+
     fn io_context(&self, id: u64) -> Option<Arc<IoContext>> {
         let mut contexts = self.io_contexts.lock().unwrap();
         let context = contexts.get(&id)?.upgrade();
@@ -3625,15 +3640,59 @@ fn restore_trace(scope: &mut v8::PinScope, previous: Option<v8::Local<v8::Value>
 /// event's microtask checkpoint.
 fn install_io_context<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    context: &IoContext,
+    context: &Arc<IoContext>,
 ) -> Option<v8::Local<'s, v8::Value>> {
-    let (id, _) = context.continuation.as_ref()?;
+    let Some((id, _)) = context.continuation.as_ref() else {
+        return install_tmp_token(scope, context);
+    };
     let previous = scope.get_continuation_preserved_embedder_data();
     let frame = cped_frame(scope);
     let trace = cped_trace(scope);
     let token: v8::Local<v8::Value> = v8::BigInt::new_from_u64(scope, *id).into();
     set_cped(scope, frame, trace, token);
     Some(previous)
+}
+
+/// Name a stateless request in the continuation slot, so its `/tmp` follows
+/// its promise reactions.
+///
+/// A stateless request has no cell identity, and V8 runs one request's
+/// reaction inside the microtask checkpoint of whichever request is driving
+/// the isolate. Without a token that reaction cannot be told from the driving
+/// request's own code, and would read its `/tmp`. The token is a Number, so
+/// every reader of the cell-event BigInt token ignores it. Only a Worker that
+/// imports `node:fs` pays for it: the slot stays empty otherwise.
+fn install_tmp_token<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    context: &Arc<IoContext>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let runtime_state = actor_runtime_state(scope);
+    if !runtime_state.tmp_tokens.load(Ordering::Relaxed) {
+        return None;
+    }
+    let (id, _) = context.tmp_token.get_or_init(|| {
+        let id = allocate_io_context_id();
+        runtime_state
+            .tmp_contexts
+            .lock()
+            .unwrap()
+            .insert(id, Arc::downgrade(context));
+        (id, Arc::downgrade(&runtime_state))
+    });
+    let previous = scope.get_continuation_preserved_embedder_data();
+    let frame = cped_frame(scope);
+    let trace = cped_trace(scope);
+    let token: v8::Local<v8::Value> = v8::Number::new(scope, *id as f64).into();
+    set_cped(scope, frame, trace, token);
+    Some(previous)
+}
+
+/// The `/tmp` token of the code running at this point, if it has one.
+fn tmp_token_id(scope: &mut v8::PinScope) -> Option<u64> {
+    let token = cped_io_context(scope);
+    let number = v8::Local::<v8::Number>::try_from(token).ok()?;
+    // A BigInt is not a Number to V8, so a cell token never reads as one.
+    Some(number.value() as u64)
 }
 
 fn restore_io_context(scope: &mut v8::PinScope, previous: Option<v8::Local<v8::Value>>) {
@@ -3805,6 +3864,9 @@ impl Worker {
         let tc = &mut tc.init();
 
         advance_io_time(tc);
+        // `begin` may give the request a `/tmp` token that no caller holds the
+        // previous slot of, so the slot as it was is restored as a whole.
+        let slot = tc.get_continuation_preserved_embedder_data();
         let previous = install_trace(tc, trace.as_ref());
         let invocation_limits = match &job {
             crate::WorkerJob::Fetch {
@@ -3852,6 +3914,7 @@ impl Worker {
             Begun::Nothing => (None, Vec::new()),
         };
         restore_trace(tc, previous);
+        tc.set_continuation_preserved_embedder_data(slot);
         out
     }
 
@@ -4187,6 +4250,7 @@ fn begin<'s>(
         context.own_body_stream(stream_id);
     }
     let guard = CurrentGuard::enter(context.clone());
+    install_io_context(tc, &context);
     context.begin_cpu_turn();
     let target = match entrypoint {
         Some(entrypoint) => FetchTarget::Entrypoint(entrypoint),
@@ -4282,6 +4346,7 @@ fn begin_entrypoint_rpc(
         invocation_limits,
     ));
     let guard = CurrentGuard::enter(context.clone());
+    install_io_context(tc, &context);
     context.begin_cpu_turn();
     let started = (|| {
         let f = internal_function(tc, "__dispatchEntrypointRpc")?;
@@ -4538,6 +4603,7 @@ fn begin_queue(
 ) -> Begun {
     let context = IoContext::with_resource_limits(actor_runtime_state(tc).resource_limits);
     let guard = CurrentGuard::enter(context.clone());
+    install_io_context(tc, &context);
     context.begin_cpu_turn();
     let started = (|| {
         let dispatch = internal_function(tc, "__dispatchEntrypointQueue")?;
@@ -10001,6 +10067,9 @@ pub struct IoContext {
     /// cross-entry input gate adds an explicit claim that prevents this
     /// context's `InFlight` from retiring while its callback still runs.
     continuation: Option<(u64, Weak<ActorRuntimeState>)>,
+    /// The `/tmp` identity of a stateless request, given when it first needs
+    /// one. See [`install_tmp_token`].
+    tmp_token: OnceLock<(u64, Weak<ActorRuntimeState>)>,
     /// This caller's delivery order for each cell it has called. See
     /// `CallOrder` — it is here rather than in a process-wide map because
     /// nothing outside this caller ever reads it.
@@ -10282,6 +10351,7 @@ impl IoContext {
     fn with_options(limits: Option<ResourceLimits>, tail_reporting: bool) -> Arc<Self> {
         Arc::new(Self {
             continuation: None,
+            tmp_token: OnceLock::new(),
             call_chains: Mutex::new(CallChains::default()),
             events: Mutex::new(IoEventState::default()),
             vfs: OnceLock::new(),
@@ -10316,6 +10386,7 @@ impl IoContext {
         let id = allocate_io_context_id();
         let context = Arc::new(Self {
             continuation: Some((id, Arc::downgrade(runtime_state))),
+            tmp_token: OnceLock::new(),
             call_chains: Mutex::new(CallChains::default()),
             events: Mutex::new(IoEventState::default()),
             vfs: OnceLock::new(),
@@ -10675,6 +10746,11 @@ impl Drop for IoContext {
                 runtime_state.io_contexts.lock().unwrap().remove(id);
             }
         }
+        if let Some((id, runtime_state)) = self.tmp_token.get() {
+            if let Some(runtime_state) = runtime_state.upgrade() {
+                runtime_state.tmp_contexts.lock().unwrap().remove(id);
+            }
+        }
         if let Some(payload) = first_panic {
             if already_panicking {
                 std::mem::forget(payload);
@@ -10830,7 +10906,18 @@ fn op_pending_event_end(
 /// finished event has a token whose context is gone and gets no `/tmp` at all,
 /// rather than the `/tmp` of the request that runs the checkpoint.
 fn request_context(scope: &mut v8::PinScope) -> Option<Arc<IoContext>> {
-    reaction_context_or(scope, || CURRENT.with(|current| current.borrow().clone()))
+    if let Some(id) = tmp_token_id(scope) {
+        return actor_runtime_state(scope).tmp_context(id);
+    }
+    reaction_context_or(scope, || {
+        // Code with no token of its own may run inside the checkpoint of a
+        // request that has one: it was registered before that request's turn
+        // began, so it is some other request's reaction. It gets no `/tmp`
+        // rather than the driving request's.
+        CURRENT
+            .with(|current| current.borrow().clone())
+            .filter(|current| current.tmp_token.get().is_none())
+    })
 }
 
 /// What a bundle path is, without copying the bytes a stat does not need.

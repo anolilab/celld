@@ -561,6 +561,11 @@ pub(crate) fn unsupported_node_imports<'a>(
 /// ES module wrapper links. The old wrapper concatenated the full setup text,
 /// which turned a shared static source back into one owned string per isolate.
 fn install_lazy_module(scope: &mut v8::PinScope, spec: &str) -> Option<&'static LazyModule> {
+    if matches!(eager_module_global(spec), Some("__fs" | "__fsPromises")) {
+        actor_runtime_state(scope)
+            .tmp_tokens
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let module = LAZY_MODULES
         .iter()
         .find(|module| module.specs.contains(&spec))?;

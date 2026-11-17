@@ -49,9 +49,8 @@
     );
   };
 
-  const isURL = (value) =>
-    value != null && typeof value === "object" &&
-    typeof value.href === "string" && typeof value.protocol === "string";
+  // A real URL, not an object that happens to carry URL-looking fields.
+  const isURL = (value) => value instanceof URL;
 
   const fileURLToPath = (path) => {
     if (typeof path === "string") path = new URL(path);
@@ -125,8 +124,58 @@
     return new URL(`file://${escapePath(resolved)}`);
   };
 
+  // RFC 3492 decoding of one `xn--` label's payload.
+  const punycodeDecode = (input) => {
+    const base = 36, tMin = 1, tMax = 26, skew = 38, damp = 700;
+    const output = [];
+    const basic = input.lastIndexOf("-");
+    for (let j = 0; j < Math.max(basic, 0); j++) {
+      output.push(input.charCodeAt(j));
+    }
+    const digit = (code) =>
+      code >= 48 && code < 58 ? code - 22
+        : code >= 65 && code < 91 ? code - 65
+        : code >= 97 && code < 123 ? code - 97
+        : base;
+    let n = 128, i = 0, bias = 72;
+    for (let index = basic > 0 ? basic + 1 : 0; index < input.length;) {
+      const oldi = i;
+      for (let w = 1, k = base;; k += base) {
+        const d = digit(input.charCodeAt(index++));
+        if (d >= base) throw new RangeError("Invalid punycode input");
+        i += d * w;
+        const t = k <= bias ? tMin : k >= bias + tMax ? tMax : k - bias;
+        if (d < t) break;
+        w *= base - t;
+      }
+      const count = output.length + 1;
+      let delta = oldi === 0 ? Math.floor((i - oldi) / damp)
+        : Math.floor((i - oldi) / 2);
+      delta += Math.floor(delta / count);
+      let k = 0;
+      while (delta > ((base - tMin) * tMax) >> 1) {
+        delta = Math.floor(delta / (base - tMin));
+        k += base;
+      }
+      bias = k + Math.floor(((base - tMin + 1) * delta) / (delta + skew));
+      n += Math.floor(i / count);
+      i %= count;
+      output.splice(i++, 0, n);
+    }
+    return String.fromCodePoint(...output);
+  };
+  const unicodeHost = (hostname) =>
+    hostname.split(".").map((label) => {
+      if (!label.toLowerCase().startsWith("xn--")) return label;
+      try {
+        return punycodeDecode(label.slice(4));
+      } catch {
+        return label;
+      }
+    }).join(".");
+
   const format = (value, options) => {
-    if (isURL(value) && typeof value.searchParams === "object") {
+    if (isURL(value)) {
       if (options !== undefined && (options === null ||
           typeof options !== "object")) {
         throw nodeError(
@@ -144,6 +193,19 @@
       if (!auth) {
         url.username = "";
         url.password = "";
+      }
+      if (options?.unicode) {
+        const credentials = url.username
+          ? `${url.username}${url.password ? `:${url.password}` : ""}@`
+          : "";
+        const head = `${url.protocol}//${credentials}${url.host}`;
+        if (url.host && url.href.startsWith(head)) {
+          const port = url.port ? `:${url.port}` : "";
+          const host = unicodeHost(url.hostname) + port;
+          return `${url.protocol}//${credentials}${host}${
+            url.href.slice(head.length)
+          }`;
+        }
       }
       return url.href;
     }
