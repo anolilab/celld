@@ -438,3 +438,68 @@ async fn durable_object_events_running_at_the_deadline_are_ended_and_the_node_ke
 
     assert_eq!(server.get_text("/version").await, "v2");
 }
+
+/// Work one event started stays reachable through a promise another event
+/// holds. When the first event ends, that promise must settle, not wait for
+/// ever on an operation nothing drives any more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_promise_for_work_of_an_ended_event_rejects_instead_of_staying_pending() {
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_HANDLER_BUDGET_S", "3"),
+        ],
+    )
+    .await;
+    // The client gives up while the event waits, which ends the event.
+    let _ = reqwest::Client::new()
+        .get(server.url("/stash"))
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (status, body) =
+        get_within_budget(&reqwest::Client::new(), &server.url("/await-stash")).await;
+    assert!(status.is_success(), "{status} {body}");
+    assert!(body.starts_with("rejected: "), "{body}");
+}
+
+/// Storage work a leftover timer starts after the handler returned either
+/// completes or leaves nothing behind when its object is moved to the new
+/// deployment mid-way: a transaction is never half written.
+#[tokio::test(flavor = "multi_thread")]
+async fn background_storage_work_after_the_handler_returns_completes_or_leaves_nothing() {
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_RETIRE_DEADLINE_S", DEADLINE_S),
+            ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
+            ("CELLD_HANDLER_BUDGET_S", "1"),
+        ],
+    )
+    .await;
+    assert_eq!(server.get_text("/do-late").await, "started");
+    redeploy(&server).await;
+    wait_until(
+        "the superseded generation to be freed",
+        Duration::from_secs(60),
+        || async {
+            let state = state(&server).await;
+            state["deployment"]["draining"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+                .then_some(())
+        },
+    )
+    .await;
+    let (status, keys) =
+        get_within_budget(&reqwest::Client::new(), &server.url("/do-late-keys")).await;
+    assert!(status.is_success(), "{status} {keys}");
+    assert!(
+        keys.is_empty() || keys == "late,late2",
+        "half a transaction: {keys}"
+    );
+}

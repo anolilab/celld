@@ -28,6 +28,12 @@ APIs, and Wrangler configuration.
   to the new deployment, is not ended by the deadline. A setting at or below
   `CELLD_HANDLER_BUDGET_S` or `CELLD_DEPLOY_MAX_AGE_S` is refused at start, so a
   handler within its budget is never cut short by it.
+- When an event is ended (by the deadline, a move, a restart, a shutdown or a
+  client that hung up), the operations it still had pending are rejected with
+  the reason it was ended, and an operation a stale continuation of it starts
+  is rejected too. A promise that another event holds for that work therefore
+  rejects, not waits for ever. A write the ended event had not committed is
+  not acknowledged.
 - `/state` reports `deployment.retiring`: how many superseded deployments still
   hold isolates, and the age in milliseconds of the oldest. A cell that has not
   yet moved to the new deployment keeps its isolate until it does.

@@ -16,6 +16,31 @@ export class Pinned extends DurableObject {
       await new Promise((resolve) => setTimeout(resolve, 5000));
       return new Response("stayed");
     }
+    // Starts storage work after its handler has returned, from a leftover
+    // timer, and keeps the outcome for `/late-outcome`.
+    if (url.pathname === "/late") {
+      this.late = "pending";
+      setTimeout(async () => {
+        try {
+          await this.ctx.storage.transaction(async (txn) => {
+            await txn.put("late", 1);
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            await txn.put("late2", 1);
+          });
+          this.late = "committed";
+        } catch (error) {
+          this.late = `rejected: ${error.message}`;
+        }
+      }, 100);
+      return new Response("started");
+    }
+    if (url.pathname === "/late-outcome") {
+      return new Response(this.late ?? "none");
+    }
+    if (url.pathname === "/late-keys") {
+      const keys = [...(await this.ctx.storage.list()).keys()];
+      return new Response(keys.filter((key) => key.startsWith("late")).join(","));
+    }
     if (url.pathname === "/nap") {
       await new Promise((resolve) => setTimeout(resolve, 200));
       return new Response("napped");
@@ -46,6 +71,26 @@ export default {
       case "/pin":
         ctx.waitUntil(new Promise((resolve) => setTimeout(resolve, HOUR)));
         return new Response("pinned");
+      // A promise for work another event started stays reachable after that
+      // event ended. `/stash` leaves one behind and waits on it, so a client
+      // that hangs up ends the event; `/await-stash` waits on it again.
+      case "/stash":
+        globalThis.stashed = env.PIN.get(env.PIN.idFromName("stay")).fetch(
+          new Request("http://do/stay"),
+        );
+        return await globalThis.stashed;
+      case "/await-stash":
+        try {
+          return new Response(await (await globalThis.stashed).text());
+        } catch (error) {
+          return new Response(`rejected: ${error.message}`);
+        }
+      case "/do-late":
+      case "/do-late-outcome":
+      case "/do-late-keys":
+        return env.PIN.get(env.PIN.idFromName("late")).fetch(
+          new Request(`http://do/${url.pathname.slice("/do-".length)}`),
+        );
       case "/do-pin":
         return env.PIN.get(env.PIN.idFromName("a")).fetch(request);
       case "/do-hang":

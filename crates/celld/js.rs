@@ -1182,6 +1182,7 @@ fn wake_gate_waiters(cell: &str, outcome: Result<(), String>) {
 }
 
 const ABANDONED_INPUT_GATE: &str = "the cell's critical section ended without releasing";
+const ENDED_EVENT_OP: &str = "the event that started this operation has ended";
 const RETIRED_INPUT_GATE: &str = "the cell event ended before it could acquire an input gate";
 
 /// Release one completed block and remove the open gate from the process map.
@@ -3584,6 +3585,23 @@ impl InFlight {
         }
     }
 
+    /// Reject the promise of every operation this event still has pending.
+    ///
+    /// The event ends without driving them, and a promise another event holds
+    /// for that work would otherwise stay pending for ever. Rejections nobody
+    /// handles are silent, so the ones nobody awaits cost nothing.
+    fn reject_ops(&mut self, tc: &mut v8::PinScope, message: &str) {
+        let handed = self.context.close_handed_ops();
+        let ids: Vec<u64> = self
+            .ops
+            .drain()
+            .chain(handed.into_iter().map(|(id, _, _)| id))
+            .collect();
+        for id in ids {
+            resolve_res(tc, id, Err(message.to_string()));
+        }
+    }
+
     /// The context whose mailbox carries the ops other turns enqueued for
     /// this event.
     ///
@@ -3602,6 +3620,7 @@ impl InFlight {
     /// resolver goes with the op, exactly as `abandon` drops this event's own.
     fn hand_op(
         &mut self,
+        tc: &mut v8::PinScope,
         owner: u64,
         id: u64,
         future: asyncrt::OpFuture,
@@ -3615,7 +3634,9 @@ impl InFlight {
             .io_context(owner)
             .is_some_and(|context| context.hand_op(id, future, lifetime));
         if !delivered {
-            self.runtime_state.promises.lock().unwrap().remove(&id);
+            // Rejected, not dropped: the continuation that started the op
+            // ended, but a promise it left behind can still be awaited.
+            resolve_res(tc, id, Err(ENDED_EVENT_OP.to_string()));
         }
     }
 
@@ -4242,7 +4263,7 @@ fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
     //    write rather than the turn owner, because the checkpoint can run a
     //    continuation from another event.
     ws_capture_flush_touched(tc, &entry.runtime_state);
-    let ops = adopt(entry);
+    let ops = adopt(tc, entry);
     // 7. **close the request's sockets** — see above.
     if entry.retired() {
         entry.context.close_sockets();
@@ -4270,13 +4291,13 @@ pub type Op = (u64, asyncrt::OpFuture);
 /// so an op with a foreign name goes to that event's driver instead. Critical
 /// sections carry an explicit driver alongside their resource context; the
 /// op wrapper uses that driver so gate retirement and op cancellation agree.
-fn adopt(entry: &mut InFlight) -> Vec<Op> {
+fn adopt(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
     let spawns = asyncrt::drain_spawns();
     let mine = entry.context.continuation_id();
     let mut ops = Vec::with_capacity(spawns.len());
     for (id, future, lifetime, owner) in spawns {
         if let Some(owner) = owner.filter(|owner| Some(*owner) != mine) {
-            entry.hand_op(owner, id, future, lifetime);
+            entry.hand_op(tc, owner, id, future, lifetime);
             continue;
         }
         entry.ops.insert(id);
@@ -5448,7 +5469,9 @@ fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, cause: CancelCause) {
     drop(guard);
     // The reason is set here, inside the turn: the write delta it carries
     // reads the cell's storage, which only a turn installs.
-    entry.fail_cancelled(cancel_error(cause));
+    let error = cancel_error(cause);
+    let message = error.to_string();
+    entry.fail_cancelled(error);
     if shutdown {
         // A lifecycle cancellation can be consumed either between turns or
         // during an operation turn. Keep the background cleanup here so both
@@ -5464,6 +5487,9 @@ fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, cause: CancelCause) {
     // Not at shutdown: nothing will run the block to its end, so its gate is
     // given up instead.
     if shutdown || !entry.keeps_native_ops_after_disconnect() {
+        // Another event can hold a promise for this one's work. Settle it
+        // now, since nothing will drive the operation again.
+        entry.reject_ops(tc, &message);
         entry.abandon();
     }
 }
