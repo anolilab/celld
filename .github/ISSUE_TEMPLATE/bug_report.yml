@@ -1,0 +1,36 @@
+name: Bug report
+description: Something does not work as documented.
+labels: ["type:bug"]
+body:
+  - type: textarea
+    id: behaviour
+    attributes:
+      label: What happens
+      description: The behaviour you see, and the behaviour you expect.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: How to reproduce
+      description: The smallest Worker, config, and commands that show it.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `celld --version`, or the commit.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, bucket type (S3, gs, az, or local), and the number of nodes.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output. Remove credentials first.
+      render: text
