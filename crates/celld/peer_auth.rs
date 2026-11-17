@@ -61,9 +61,8 @@ struct CanonicalRequest<'a> {
 pub struct PeerAuth {
     key: [u8; 32],
     source: String,
-    /// `CELLD_OPERATOR_TOKEN`, read once. Every request this signs carries it
-    /// as a bearer credential, and the internal listener checks it on every
-    /// request when it is set.
+    /// Sent with every request this signs as a bearer credential, which the
+    /// internal listener of the peer requires.
     operator_token: Option<OperatorToken>,
     replay: Mutex<ReplayCache>,
 }
@@ -100,6 +99,9 @@ impl VerifyError {
 }
 
 impl PeerAuth {
+    /// Authentication that sends no operator token. A node and a test attach
+    /// theirs with [`with_operator_token`](Self::with_operator_token); a
+    /// command line client uses [`for_client`](Self::for_client).
     pub fn new(key: [u8; 32], source: impl Into<String>) -> anyhow::Result<Self> {
         let source = source.into();
         crate::machine::validate_node_name(&source)
@@ -107,7 +109,7 @@ impl PeerAuth {
         Ok(Self {
             key,
             source,
-            operator_token: OperatorToken::from_env()?,
+            operator_token: None,
             replay: Mutex::new(ReplayCache {
                 entries: HashMap::new(),
                 checks: 0,
@@ -119,14 +121,22 @@ impl PeerAuth {
         &self.source
     }
 
-    /// Replace the operator token read from the environment.
+    /// Authentication for a client of a node's internal listener, with the
+    /// operator token from `CELLD_OPERATOR_TOKEN` or the token file of a node
+    /// on this machine. An unusable value or file is an error here, where the
+    /// client needs it, and nowhere else.
+    pub fn for_client(key: [u8; 32], source: impl Into<String>) -> anyhow::Result<Self> {
+        Ok(Self::new(key, source)?.with_operator_token(OperatorToken::from_env()?))
+    }
+
+    /// Set the operator token to send.
     #[must_use]
     pub fn with_operator_token(mut self, token: Option<OperatorToken>) -> Self {
         self.operator_token = token;
         self
     }
 
-    /// The token the internal listener of this node requires, when set.
+    /// The operator token this sends, when it has one.
     pub fn operator_token(&self) -> Option<&OperatorToken> {
         self.operator_token.as_ref()
     }

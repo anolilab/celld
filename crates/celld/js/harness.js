@@ -7915,12 +7915,10 @@ class __D1DatabaseCell {
   }
   // The CLI's way in. `celld d1` signs each request with the fleet secret
   // and sends it to a live node's `/runtime/<scope>` route, which verifies the
-  // signature and then forwards to the owner over the same dispatch `/do/`
-  // uses -- so the CLI needs no ownership logic and the database is reached
-  // the way a Worker reaches it. The unauthenticated `/do/` route refuses a
-  // D1 scope outright: this cell answers arbitrary SQL, and its scope is an
-  // HMAC over names that sit in the project's config, so the scope itself
-  // is no secret.
+  // signature and then forwards to the owner -- so the CLI needs no ownership
+  // logic and the database is reached the way a Worker reaches it. This cell
+  // answers arbitrary SQL, and its scope is an HMAC over names that sit in the
+  // project's config, so the scope itself is no secret.
   async fetch(request) {
     // Set by the host for the signed operator route alone. The branches that
     // change the schema history or read every row of the database are the

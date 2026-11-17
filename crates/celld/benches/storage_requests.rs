@@ -309,17 +309,23 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
     }
 }
 
-/// Every node's `/state`, `None` for one that cannot be read. What a node
-/// counted of the cell directory's answers is `Null` when every node answered
-/// and none runs a directory; otherwise the totals say how many nodes they
-/// cover, so a node that could not be read never passes as a complete count.
-async fn read_states(client: &reqwest::Client, nodes: &[Node]) -> Vec<Option<Value>> {
+/// Every node's `/state`. A node whose state cannot be read stops the bench:
+/// it must not pass as a quiet one, with every counter reading zero.
+async fn read_states(client: &reqwest::Client, nodes: &[Node]) -> Vec<Value> {
     let mut states = Vec::new();
     for node in nodes {
-        states.push(read_state(client, &format!("{}/state", node.internal)).await);
+        let state = read_state(client, OPERATOR_TOKEN, &format!("{}/state", node.internal)).await;
+        states.push(state.unwrap_or_else(|| {
+            panic!(
+                "a node's /state is unreadable (is the operator token {OPERATOR_TOKEN:?} accepted?)"
+            )
+        }));
     }
     states
 }
+
+/// The operator token of every node this bench starts, and the one it sends.
+const OPERATOR_TOKEN: &str = "bench-operator-token";
 
 /// How often the retained bundles of the nodes are read while a run goes on.
 const RETENTION_SAMPLE: Duration = Duration::from_secs(2);
@@ -349,7 +355,7 @@ fn sample_retention(client: &reqwest::Client, nodes: &[Node]) -> RetentionSample
     let task = tokio::spawn(async move {
         loop {
             for url in &urls {
-                let sample = read_state(&client, url)
+                let sample = read_state(&client, OPERATOR_TOKEN, url)
                     .await
                     .as_ref()
                     .and_then(bundle_sample);
@@ -392,6 +398,10 @@ impl Node {
             .args(["--advertise", &format!("127.0.0.1:{internal}")])
             .env("CELLD_NODE", format!("node-{index}"))
             .env("CELLD_WATCH", home.join("state"))
+            // The internal listener asks for this token, and no node writes
+            // a token file into the developer's own configuration directory.
+            .env("CELLD_OPERATOR_TOKEN", OPERATOR_TOKEN)
+            .env("CELLD_CONFIG_DIR", home.join("config"))
             .envs(env.iter().copied())
             .current_dir(&home)
             .stdin(Stdio::null())

@@ -666,10 +666,8 @@ function kvService(host) {
     }
 
     // The operator surface, reached only over `/runtime/`, which authenticates
-    // with the fleet secret. `/do/` refuses every reserved class structurally,
-    // so adding this handler does not put a namespace on an unauthenticated
-    // route -- the trap d1.md decision 4 records paying for once, and the reason
-    // that refusal is one question rather than one per class.
+    // with the fleet secret, so adding this handler does not put a namespace
+    // on an unauthenticated route.
     //
     // Values cross this boundary as arrays of bytes rather than as text, because
     // a namespace holds bytes: a value written from a Worker as an ArrayBuffer

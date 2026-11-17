@@ -2500,16 +2500,7 @@ fn options_from_env() -> anyhow::Result<ConnectOptions> {
 }
 
 fn config_path() -> anyhow::Result<PathBuf> {
-    let base = if let Some(path) = std::env::var_os("CELLD_CONFIG_DIR") {
-        PathBuf::from(path)
-    } else if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-        PathBuf::from(path).join("celld")
-    } else if let Some(path) = std::env::var_os("HOME") {
-        PathBuf::from(path).join(".config").join("celld")
-    } else {
-        std::env::current_dir()?.join(".celld")
-    };
-    Ok(base.join("cloud.json"))
+    Ok(crate::config_dir::path()?.join("cloud.json"))
 }
 
 fn load_or_create_config(path: &Path, options: &ConnectOptions) -> anyhow::Result<CloudConfig> {
@@ -2609,7 +2600,7 @@ fn save_config(path: &Path, config: &CloudConfig) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .context("cloud config has no parent directory")?;
-    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    crate::config_dir::create_private(parent)?;
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, serde_json::to_vec_pretty(config)?)
         .with_context(|| format!("write {}", temporary.display()))?;
@@ -2706,7 +2697,7 @@ async fn open_enrollment_lock(config: &Path) -> anyhow::Result<(File, PathBuf)> 
         .context("managed installation lock has no parent directory")?
         .to_path_buf();
     tokio::task::spawn_blocking(move || {
-        std::fs::create_dir_all(&parent).with_context(|| format!("create {}", parent.display()))?;
+        crate::config_dir::create_private(&parent)?;
         let file = File::options()
             .read(true)
             .write(true)

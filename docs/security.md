@@ -40,8 +40,8 @@ path, so an operator request cannot become an application request.
 The internal listener has three request groups, and all three require the
 trusted private network:
 
-- Most operator routes have no request authentication, unless you set
-  [`CELLD_OPERATOR_TOKEN`](#require-an-operator-token), which gates every route.
+- Every route requires the [operator token](#require-an-operator-token),
+  which is on by default.
 - `/peer/tunnel` opens a tunnel for cell fetch, RPC, and WebSocket calls. The
   establishment request carries the fleet HMAC, a clock limit, and replay
   protection. The calls inside the tunnel are plain, unsigned HTTP.
@@ -54,8 +54,36 @@ traffic, so it does not replace the private network.
 
 ## Require an operator token
 
-Set `CELLD_OPERATOR_TOKEN` on every node to require
-`Authorization: Bearer <token>` on every request to the internal listener.
+Every request to the internal listener must carry
+`Authorization: Bearer <token>`. The token is on by default; there is no
+setting that turns it off. A node takes the token from `CELLD_OPERATOR_TOKEN`:
+
+- With `CELLD_OPERATOR_TOKEN` set, the node uses that value. Set the same
+  value on every node of a fleet.
+- With it unset, and the internal listener bound to and advertised on a
+  loopback address only (the default), the node generates a random token on
+  its first start and keeps it in a file that only its owner can read. It logs
+  the path of that file, never the token. The file is `operator-token` in the
+  per-user configuration directory (`CELLD_CONFIG_DIR`, else
+  `$XDG_CONFIG_HOME/celld`, else `~/.config/celld`, else `.celld` in the
+  working directory when `HOME` is unset), or the path in
+  `CELLD_OPERATOR_TOKEN_FILE`. A later start reuses the file. celld refuses a
+  token file that is a symbolic link, that another user owns, or that other
+  users can read. celld creates its own directories (the configuration
+  directory and `.celld/dev`) with mode 0700 and tightens one of them that group
+  or other users can write to. It refuses any other directory they can write
+  to, and one that another user owns, and leaves it unchanged.
+- With it unset and the internal listener bound to, or the node advertising,
+  any other address, the node refuses to start. A generated file cannot reach
+  the other machines, so a fleet needs one shared value.
+  Several loopback nodes on one host also share one token only when they
+  resolve the same file (the same user and config directory); nodes that run
+  as different users or with different `CELLD_CONFIG_DIR` values must set
+  `CELLD_OPERATOR_TOKEN`, or their calls to each other are refused.
+- `celld dev` is the exception to the file's location: it keeps its node's
+  file in `.celld/dev` and sets `CELLD_OPERATOR_TOKEN_FILE` for the node. Only
+  `celld dev` itself reads that file.
+
 The check runs before routing, so each route answers 401 without the token:
 the operator routes, the peer routes, the `/runtime/<SCOPE>` route, and a
 path celld does not serve. No route is exempt. Use the public health endpoint,
@@ -70,28 +98,41 @@ curl -H "Authorization: Bearer $CELLD_OPERATOR_TOKEN" http://127.0.0.1:8081/stat
 
 The value must be printable ASCII with no whitespace. celld refuses to start
 on an empty value, on surrounding whitespace, and on any other unusable
-value, so a mistake does not leave the listener open. Unset the variable to
-leave the listener without a token, as before. celld compares the token in
-constant time.
+value, so a mistake does not leave the listener open. celld compares the
+token in constant time.
 
-Every in-tree client reads the same variable and sends the token: peer
-forwarding, handoff, abort, the log tier, the signed probe, `celld diagnose`,
-`celld d1`, `celld kv`, `celld queue`, `celld invoke` and the `celld dev`
-shutdown request. Set
-the same value on every node and in the environment of every operator command.
+Every in-tree client reads `CELLD_OPERATOR_TOKEN`, or else the file named by
+`CELLD_OPERATOR_TOKEN_FILE` or the one in the configuration directory, and
+sends the token: peer forwarding, handoff, abort, the log tier, the signed
+probe, `celld diagnose`, `celld d1`, `celld kv`, `celld queue` and
+`celld invoke`; `celld dev` sends it on its own shutdown request. A command
+reads the file only when it needs the token, so a damaged file stops those
+commands and not `celld --version` or `celld deploy`. For a fleet, set the
+same value on every node and in the environment of every operator command.
 During a rolling change, nodes with different values answer 401 to each other,
 so set the value on all nodes in one step, or stop the fleet first. A node on
 a release that predates this variable never sends the token, so it gets 401
 from a node that has it set.
 
+**Upgrade note:** earlier releases left the internal listener open when no
+token was set. A node on a loopback address now generates a token and needs no
+change, and the celld commands on the same machine find it. A node bound to a
+non-loopback address now refuses to start until `CELLD_OPERATOR_TOKEN` is set,
+and a script or monitor that called the internal listener without a token now
+gets 401. The route `/do/<ID>` no longer exists; send the request through the
+public listener.
+
 celld removes the `Authorization` header from an accepted internal request
-before it reaches a handler. A caller of `/do/<ID>` therefore cannot pass its
-own `Authorization` header to the Durable Object while the token is set.
+before it reaches a handler, so the token never travels to a cell.
 
 The token authenticates the caller of the internal listener. It does not
-encrypt traffic, so keep the listener on a trusted private network. A Worker
-that calls the internal port with `fetch()` gets a 401 on every route, unless
-it holds the token.
+encrypt traffic, so keep the listener on a trusted private network. By
+default tenant code cannot reach the listener at all: a Worker's `fetch()`,
+`connect()` and WebSocket dials refuse the node's own addresses, including its
+loopback and advertised ones (see [Limit Worker egress](#limit-worker-egress)).
+The token is the second barrier there. Under `CELLD_EGRESS=open`, which `celld
+dev` uses by default, a Worker can dial the node's own addresses, and the token
+is the only barrier.
 
 ## Limit Worker egress
 
@@ -197,10 +238,8 @@ the node.
 It executes code that no pointer selects, so it asks for more than any other
 operator command:
 
-- **The node needs `CELLD_OPERATOR_TOKEN`.** The listener gate lets every
-  request through when no token is set, so `POST /invoke` refuses on its own
-  with 403 on such a node. A node that was never given a token runs no
-  staged code for anyone.
+- **The request needs the node's operator token.** The listener gate
+  answers 401 to a request without it, before the route runs.
 - **The request needs the token and the fleet HMAC.** The token is the
   bearer credential every internal route needs. The HMAC signs the request
   body, the node name and a timestamp, with replay protection, as on
@@ -245,19 +284,18 @@ What the staged version can reach:
 ## Use the internal operator API
 
 The operator API is an alpha interface. A release can change its paths or
-response formats. Without `CELLD_OPERATOR_TOKEN`, these routes do not
-authenticate the caller:
+response formats. These routes authenticate the caller only with the
+operator token:
 
 - `/state` reports node state.
 - `/cell/<SCOPE>` resolves or activates a cell.
 - `/evict/<SCOPE>` tries to evict a resident cell and reports the result.
-- `/do/<ID>` sends a direct request to an ordinary Durable Object.
 - `POST /shutdown` starts a graceful ownership handoff. `handoff=preserve`
   prepares a same-node reload.
 
-`/do/<ID>` refuses every reserved runtime class, such as D1, Workflows, KV,
-and Queues, because their protocols can access application data. Use the
-HMAC-authenticated `/runtime/<SCOPE>` route for these classes.
+The protocols of the reserved runtime classes, such as D1, Workflows, KV, and
+Queues, can access application data. They are reachable only through the
+HMAC-authenticated `/runtime/<SCOPE>` route.
 
 `/peer/probe` returns a signed diagnostic response. Do not call the other
 reserved peer paths directly.
@@ -354,13 +392,14 @@ list in the Worker.
 
 ## Limit request bodies
 
-The public listener and `/do/<ID>` limit a request body to 1 GiB by default.
+The public listener limits a request body to 1 GiB by default.
 Set `CELLD_MAX_REQUEST_BODY_BYTES` to a smaller positive value to lower it.
 celld returns 413 for a declared oversized body and when a Worker reads past
 the limit.
 
-For a method other than `GET` or `HEAD`, `/do/<ID>` streams a body of unknown
-length or of at least 1 MiB. It collects a smaller body before dispatch.
+For a method other than `GET` or `HEAD`, the public listener streams a body of
+unknown length or of at least 1 MiB. It collects a smaller body before
+dispatch.
 
 ## Protect the fleet bucket
 

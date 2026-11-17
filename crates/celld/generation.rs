@@ -341,7 +341,6 @@ pub struct Generation {
     /// of one script share them, so cells of one class share module scope
     /// exactly when they are colocated, which is what Durable Objects do.
     pub(crate) cell_isolates: HashMap<String, Arc<crate::pool::Pool>>,
-    pub(crate) default_do_class: Option<Arc<str>>,
     pub(crate) assets: HashMap<String, AssetResolver>,
     /// Every container class of every script in the graph.
     pub(crate) containers: Vec<crate::container::ContainerSpec>,
@@ -433,10 +432,6 @@ impl Generation {
 
     pub(crate) fn service(&self, script: &str) -> Option<crate::runtime::StatelessRuntime> {
         self.services.get(script).cloned()
-    }
-
-    pub(crate) fn default_do_class(&self) -> Option<&str> {
-        self.default_do_class.as_deref()
     }
 
     /// Stop every isolate of this generation from taking new work. Stateless
@@ -568,27 +563,6 @@ impl Generation {
         let prefix = primary.prefix.clone();
         let mut all_containers = Vec::new();
         let mut fence_image = None;
-        // Only classes the user declared can be a bare-id default. Every
-        // runtime-supplied class rides in `do_classes` so that its namespace
-        // key is minted, and counting one here made adding any D1 binding flip
-        // a one-class project past the `len == 1` condition — every
-        // `/do/<bare-id>` request then failed with "requires exactly one
-        // configured Durable Object class" for a config that still declared
-        // exactly one.
-        //
-        // This asks `deploy::is_reserved_class` rather than naming one class,
-        // because the first version of this filter named `__D1Database` alone
-        // and `__Workflow` walked straight back into the same bug when it
-        // shipped. A fourth reserved class must not be able to do it a third
-        // time.
-        let user_classes: Vec<&String> = primary
-            .options
-            .do_classes
-            .iter()
-            .filter(|class| !crate::deploy::is_reserved_class(class))
-            .collect();
-        let default_do_class =
-            (user_classes.len() == 1).then(|| Arc::from(user_classes[0].as_str()));
         // Two scripts exporting one class name is genuinely ambiguous and is
         // refused — but a *reserved* class is not an export, and the two kinds
         // behave differently:
@@ -711,7 +685,6 @@ impl Generation {
             services: service_pools,
             cell_configs,
             cell_isolates,
-            default_do_class,
             assets,
             containers: all_containers,
             fence_image,

@@ -121,6 +121,7 @@ docker run --rm --network host \
   -e AWS_SECRET_ACCESS_KEY \
   -e AWS_SESSION_TOKEN \
   -e CELLD_WATCH=/var/lib/celld/state \
+  -e CELLD_OPERATOR_TOKEN \
   -v celld-state:/var/lib/celld \
   celld \
   --bucket s3://my-cells-bucket \
@@ -131,7 +132,9 @@ docker run --rm --network host \
   --advertise node-a.internal:8081
 ```
 
-Drop `--endpoint` and `--region` for AWS S3. Expose port 8080 through the load
+Set `CELLD_OPERATOR_TOKEN` to one shared value on every node of a fleet: a node
+with a non-loopback internal listener refuses to start without it. Drop
+`--endpoint` and `--region` for AWS S3. Expose port 8080 through the load
 balancer, and keep port 8081 on the private network.
 
 ## Run it
@@ -177,6 +180,7 @@ against the same bucket:
 celld deploy . \
   --bucket s3://my-cells-bucket
 
+export CELLD_OPERATOR_TOKEN=...   # one value for the whole fleet
 celld \
   --bucket s3://my-cells-bucket \
   --listen 0.0.0.0:8080 \
@@ -189,9 +193,9 @@ round trip. Start a second node against the same bucket, and celld sends each
 write to it: the write then finishes as soon as the second node holds the data
 on its disk, which is much faster than the round trip.
 
-Run two or more nodes if write latency matters to you. The second node needs
-no extra configuration, because a node finds the other nodes through the
-bucket.
+Run two or more nodes if write latency matters to you. A node finds the other
+nodes through the bucket; give the second node the same bucket settings and the
+same `CELLD_OPERATOR_TOKEN` as the first.
 
 How much faster depends on how far your bucket is and how loaded the fleet
 is. A write to a region-local store takes about 90 ms. One loaded lab fleet
@@ -207,6 +211,7 @@ authenticates with Application Default Credentials. celld rejects an S3
 
 ```sh
 celld deploy . --bucket gs://my-cells-bucket
+export CELLD_OPERATOR_TOKEN=...   # one value for the whole fleet
 celld --bucket gs://my-cells-bucket --listen 0.0.0.0:8080 \
   --internal-listen 10.0.0.12:8081 --advertise 10.0.0.12:8081
 ```
@@ -226,6 +231,7 @@ and it ignores the storage region. See
 ```sh
 export AZURE_STORAGE_ACCOUNT_NAME=myaccount
 celld deploy . --bucket az://my-cells-container
+export CELLD_OPERATOR_TOKEN=...   # one value for the whole fleet
 celld --bucket az://my-cells-container --listen 0.0.0.0:8080 \
   --internal-listen 10.0.0.12:8081 --advertise 10.0.0.12:8081
 ```
@@ -333,7 +339,7 @@ celld queue resume jobs --bucket s3://my-cells-bucket
 Set a hard resident-cell limit on each loaded node:
 
 ```sh
-CELLD_MAX_RESIDENT_CELLS=1000 \
+CELLD_OPERATOR_TOKEN=... CELLD_MAX_RESIDENT_CELLS=1000 \
 celld --bucket s3://my-cells-bucket --listen 0.0.0.0:8080 \
   --internal-listen 10.0.0.12:8081 --advertise node-a.internal:8081
 ```

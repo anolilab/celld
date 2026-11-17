@@ -29,6 +29,7 @@ pub mod claim_provenance;
 pub mod clean_reload;
 pub mod cli_options;
 pub mod cli_output;
+pub(crate) mod config_dir;
 pub mod container;
 pub mod control_plane;
 pub mod d1_cli;

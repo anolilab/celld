@@ -205,19 +205,20 @@ fn dial_params<'a>(op: &str, internal: &'a str, port: &'a str) -> Vec<(&'static 
 }
 
 #[tokio::test]
-async fn loaded_code_with_open_egress_reads_a_host_object_through_the_internal_listener() {
+async fn loaded_code_with_open_egress_reaches_the_internal_listener_and_the_token_refuses_it() {
     // The positive control: with egress open (the `celld dev` default) the
-    // same loaded code reads the object's data through `/do/<ID>`. So the
-    // refusals in the next test are the egress mode's doing, and the probe
-    // names an object that is there.
+    // same loaded code dials the internal listener, and the operator token is
+    // the only thing that stops it. So the refusals in the next test are the
+    // egress mode's doing, and the probe names an object that is there.
     let server = Server::start("loader-isolation", &[]).await;
     let id = seed_host(&server, "vault", "internal-secret").await;
-    let internal = server.internal_url(&format!("/do/{id}")).await;
+    let internal = server.internal_url(&format!("/cell/{id}")).await;
     let result = loaded(&server, "default", "fetch", &[("url", &internal)]).await;
     assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["status"], 401, "{result}");
     assert!(
-        result.to_string().contains("internal-secret"),
-        "the probe does not read the object: {result}"
+        !result.to_string().contains("internal-secret"),
+        "the probe read the object: {result}"
     );
 }
 
@@ -225,13 +226,11 @@ async fn loaded_code_with_open_egress_reads_a_host_object_through_the_internal_l
 async fn loaded_code_cannot_reach_the_internal_listener_of_a_host_object() {
     // `CELLD_EGRESS=public` is set on purpose. `celld dev` leaves egress open
     // by default, and loaded code that inherits it can dial the internal
-    // listener, whose `/do/<ID>` route needs no credential while the operator
-    // token is unset (see the test above). The public default and the
-    // operator-token default close that on their own; this test holds the
-    // egress half of it.
+    // listener, where only the operator token stops it (see the test above).
+    // This test holds the egress half of that.
     let server = Server::start("loader-isolation", &[("CELLD_EGRESS", "public")]).await;
     let id = seed_host(&server, "vault", "internal-secret").await;
-    let internal = server.internal_url(&format!("/do/{id}")).await;
+    let internal = server.internal_url(&format!("/cell/{id}")).await;
     let port = url::Url::parse(&internal)
         .unwrap()
         .port()

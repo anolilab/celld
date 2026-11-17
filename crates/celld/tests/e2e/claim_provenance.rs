@@ -15,8 +15,9 @@ use super::harness::{wait_until, Server};
 const ENV: &[(&str, &str)] = &[("CELLD_STEP0_SAMPLE", "1")];
 
 async fn read(server: &Server, path: &str) -> Value {
-    reqwest::Client::new()
-        .get(server.internal_url(path).await)
+    server
+        .internal_get(path)
+        .await
         .send()
         .await
         .expect("read the node")

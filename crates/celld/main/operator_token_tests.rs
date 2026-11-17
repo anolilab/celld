@@ -31,7 +31,7 @@ fn gate_refuses_internal_and_recovery_without_the_token() {
     let token = token("s3cret");
     for surface in [HttpSurface::Internal, HttpSurface::Recovery] {
         for presented in [None, Some("Bearer wrong"), Some("s3cret")] {
-            let refusal = operator_gate(surface, Some(&token), &mut headers(presented))
+            let refusal = operator_gate(surface, &token, &mut headers(presented))
                 .unwrap_or_else(|| panic!("{} accepted {presented:?}", surface.name()));
             assert_eq!(refusal.status(), StatusCode::UNAUTHORIZED);
             // A peer must be able to read the refusal as a peer answer.
@@ -40,7 +40,7 @@ fn gate_refuses_internal_and_recovery_without_the_token() {
                 .contains_key(peer_auth::RESPONSE_VERSION_HEADER));
         }
         let mut accepted = headers(Some("Bearer s3cret"));
-        assert!(operator_gate(surface, Some(&token), &mut accepted).is_none());
+        assert!(operator_gate(surface, &token, &mut accepted).is_none());
         assert!(
             !accepted.contains_key(hyper::header::AUTHORIZATION),
             "the token must not reach a handler or a Durable Object"
@@ -49,12 +49,10 @@ fn gate_refuses_internal_and_recovery_without_the_token() {
 }
 
 #[test]
-fn gate_is_open_without_a_configured_token_and_on_the_public_listener() {
-    assert!(operator_gate(HttpSurface::Internal, None, &mut headers(None)).is_none());
-    assert!(operator_gate(HttpSurface::Recovery, None, &mut headers(None)).is_none());
+fn gate_leaves_the_public_listener_alone() {
     // A public request keeps its own Authorization header for the Worker.
     let mut public = headers(Some("Bearer s3cret"));
-    assert!(operator_gate(HttpSurface::Public, Some(&token("s3cret")), &mut public).is_none());
+    assert!(operator_gate(HttpSurface::Public, &token("s3cret"), &mut public).is_none());
     assert!(public.contains_key(hyper::header::AUTHORIZATION));
 }
 

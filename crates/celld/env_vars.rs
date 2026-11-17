@@ -294,7 +294,9 @@ pub fn validate() -> anyhow::Result<()> {
 
     shutdown_timing()?;
 
-    crate::operator_token::OperatorToken::from_env()?;
+    // The variable alone: a damaged token file must not stop `--version`,
+    // `deploy` or any command that never reads it.
+    crate::operator_token::OperatorToken::from_variable()?;
     crate::egress_filter::from_env()?;
     crate::container::FenceNodeNetns::from_env()?;
 

@@ -155,9 +155,16 @@ async fn a_worker_cannot_reach_the_nodes_loopback_listeners_even_when_allowed() 
         vec![("CELLD_EGRESS_ALLOW", "127.0.0.0/8")],
     ] {
         let server = Server::start("egress", &env).await;
-        let internal = server.internal_url("/").await;
-        let result = call(&server, "/fetch", &internal).await;
-        assert_refused(&result, "this node's own address");
+        // Every route is out of reach, whatever it answers to a caller that
+        // holds the operator token: the dial itself is refused. The routes are
+        // the ones the listener serves, so a route added later is covered.
+        let mut routes = super::operator_token::internal_routes();
+        routes.insert("/".to_string());
+        for route in &routes {
+            let internal = server.internal_url(route).await;
+            let result = call(&server, "/fetch", &internal).await;
+            assert_refused(&result, "this node's own address");
+        }
         let result = call(&server, "/fetch", &server.url("/hello")).await;
         assert_refused(&result, "this node's own address");
     }
