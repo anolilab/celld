@@ -425,6 +425,7 @@ fn handoff_shadow(d: Design) -> LazyConfig {
     c.modes = [Mode::Shadow; 3];
     c.no_ensemble = false;
     c.b.declared = 1;
+    c.b.flushes = 1;
     c
 }
 

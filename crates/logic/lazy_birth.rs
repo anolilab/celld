@@ -207,8 +207,10 @@ pub(crate) struct Design {
     /// The session acts on its own standard-path record only with evidence
     /// that its header was open after the write applied.
     pub session_acts_after_open_header: bool,
-    /// K3, step 4 for every record: the chunk holds a confirmed left entry
-    /// before the session releases a cell, also one with a plain record.
+    /// A trace in the bucket before every release by the minting session,
+    /// also of a plain record: the `Grant` of the cell in a bundle that counts
+    /// or in the chunk, or a confirmed left entry in the chunk for an id that
+    /// was never granted.
     pub trace_before_release: bool,
     /// The bound of the carried set.
     pub carried_bound: usize,

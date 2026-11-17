@@ -2940,8 +2940,18 @@ impl Model for Lazy {
                             {
                                 a.push(Act::K3ChunkLeft(c));
                             }
+                            // A granted cell of a session that is not `on` has
+                            // its trace once its `Grant` is in the bucket: in
+                            // a bundle that counts (K7) or in the chunk.
+                            let grant_in_bucket = self.d().trace_before_release
+                                && k == self.cfg.minter
+                                && p.mode != Mode::On
+                                && self.granted_in_log(w, k, c)
+                                && self.upload_allowed(w, k, c);
                             if !lazy
-                                && (synced || !self.d().left_in_chunk_before_release)
+                                && (synced
+                                    || grant_in_bucket
+                                    || !self.d().left_in_chunk_before_release)
                                 && w.b.handoffs > 0
                             {
                                 a.push(Act::Release(c));
