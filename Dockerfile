@@ -53,7 +53,8 @@ RUN set -eu; \
       "https://registry.npmjs.org/@esbuild/${package}/-/${package}-${ESBUILD_VERSION}.tgz"; \
     echo "${sha256}  /tmp/esbuild.tgz" | sha256sum -c -; \
     tar -xzf /tmp/esbuild.tgz -C /tmp package/bin/esbuild; \
-    install -m 755 /tmp/package/bin/esbuild /usr/local/bin/esbuild
+    install -m 755 /tmp/package/bin/esbuild /usr/local/bin/esbuild; \
+    /usr/local/bin/esbuild --version
 
 FROM debian:bookworm-slim
 RUN apt-get update && \
@@ -67,4 +68,5 @@ LABEL org.opencontainers.image.title="celld" \
 COPY LICENSE NOTICE /usr/share/doc/celld/
 COPY --from=test /out/celld /usr/local/bin/celld
 COPY --from=esbuild /usr/local/bin/esbuild /usr/local/bin/esbuild
+COPY licenses/esbuild-LICENSE.md /usr/share/doc/esbuild/LICENSE.md
 ENTRYPOINT ["/usr/local/bin/celld"]

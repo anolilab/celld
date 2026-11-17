@@ -28,6 +28,11 @@ at:
 
 The exact versions are recorded in Cargo.lock.
 
+The container image built from the Dockerfile also contains esbuild
+(https://github.com/evanw/esbuild), Copyright (c) 2020 Evan Wallace, under
+the MIT License (licenses/esbuild-LICENSE.md, installed in the image as
+/usr/share/doc/esbuild/LICENSE.md). The pinned version is in the Dockerfile.
+
 All other dependencies are under permissive licenses (Apache-2.0, MIT,
 BSD-3-Clause, ISC, Unicode-3.0, Zlib, BSL-1.0, CC0-1.0,
 CDLA-Permissive-2.0); Cargo.lock lists them.

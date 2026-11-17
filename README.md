@@ -98,7 +98,9 @@ Worker projects deployed with `celld deploy` need
 ## Container
 
 The [`Dockerfile`](Dockerfile) builds an image that contains the `celld` binary
-and a pinned `esbuild`, so `celld deploy` and `celld dev` run inside it:
+and a pinned `esbuild`, so `celld deploy` and `celld dev` run inside it. The
+ARM64 image is built for 4 KiB pages, so it aborts on a host kernel with 16 KiB
+or 64 KiB pages; use the `-64k-pages` binary there.
 
 ```sh
 docker build -t celld .
