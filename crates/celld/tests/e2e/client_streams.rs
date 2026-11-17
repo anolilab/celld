@@ -6,8 +6,15 @@
 // they are not part of the execution boundary that the policy protects.
 #![allow(clippy::disallowed_methods)]
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
+use fastwebsockets::{Frame, OpCode, Payload, WebSocket, WebSocketError};
+use http_body_util::Empty;
+use hyper::body::Bytes;
+use hyper::upgrade::Upgraded;
+use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -159,4 +166,156 @@ async fn many_concurrent_sse_streams_through_many_objects_all_end() {
 async fn many_concurrent_sse_streams_through_a_fetch_all_end() {
     let server = Server::start("client-streams", &[]).await;
     all_streams_end(&server, "/proxy/sse?events=5", 64).await;
+}
+
+/// Runs hyper's connection task on the test runtime.
+struct Spawn;
+
+impl hyper::rt::Executor<Pin<Box<dyn Future<Output = ()> + Send>>> for Spawn {
+    fn execute(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        tokio::spawn(future);
+    }
+}
+
+/// A WebSocket client library, so framing and masking are the library's.
+async fn client(server: &Server, path: &str) -> WebSocket<TokioIo<Upgraded>> {
+    let address = server.url("/").replace("http://", "").replace('/', "");
+    let stream = TcpStream::connect(&address).await.expect("connect");
+    let request = hyper::Request::builder()
+        .method("GET")
+        .uri(format!("http://{address}{path}"))
+        .header("Host", &address)
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header(
+            "Sec-WebSocket-Key",
+            fastwebsockets::handshake::generate_key(),
+        )
+        .header("Sec-WebSocket-Version", "13")
+        .body(Empty::<Bytes>::new())
+        .expect("request");
+    let (socket, _) = fastwebsockets::handshake::client(&Spawn, request, stream)
+        .await
+        .expect("handshake");
+    socket
+}
+
+/// A Worker that closes the socket on the first message the client sends, 300
+/// ms after it opens, ends the connection with that close frame, with or
+/// without a feed of ticks running on the socket. (A handler may close with
+/// 1000 or 3000-4999; `close(1008)` throws in the handler, so the socket stays
+/// open by design.)
+#[tokio::test]
+async fn a_websocket_the_worker_closes_on_the_first_message_closes_at_the_client() {
+    let server = Server::start("client-streams", &[]).await;
+    for round in 0..5 {
+        for path in [
+            "/refuse",
+            "/refuse?feed",
+            "/object/refuse",
+            "/object/refuse?feed",
+        ] {
+            let mut socket = client(&server, path).await;
+            socket.set_auto_close(false);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            socket
+                .write_frame(Frame::text(Payload::Borrowed(b"hello")))
+                .await
+                .expect("send");
+            let closed = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match socket.read_frame().await {
+                        Ok(frame) if frame.opcode == OpCode::Close => {
+                            let code = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
+                            let reason = String::from_utf8_lossy(&frame.payload[2..]).into_owned();
+                            return Some((code, reason));
+                        }
+                        Ok(_) => {}
+                        Err(WebSocketError::ConnectionClosed | WebSocketError::UnexpectedEOF) => {
+                            return None;
+                        }
+                        Err(error) => panic!("{path}: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("round {round} {path}: no close frame, no end"));
+            assert_eq!(
+                closed,
+                Some((4008, "refused".to_string())),
+                "round {round} {path}"
+            );
+        }
+    }
+}
+
+/// One object fans many requests in to a member socket: each request's stream
+/// is a `ReadableStream` the object closes when the member answers with its
+/// last frame.
+#[tokio::test]
+async fn many_concurrent_sse_streams_relayed_through_a_member_socket_all_end() {
+    const REQUESTS: usize = 32;
+    let server = Server::start("client-streams", &[]).await;
+    for round in 0..5 {
+        let (mut read, write) = client(&server, "/relay/member")
+            .await
+            .split(tokio::io::split);
+        let write = std::sync::Arc::new(tokio::sync::Mutex::new(write));
+        let http = reqwest::Client::new();
+        let responses: Vec<_> = (0..REQUESTS)
+            .map(|_| {
+                let (http, url) = (http.clone(), server.url("/relay/stream"));
+                tokio::spawn(async move {
+                    let response = http.post(url).body("{}").send().await?;
+                    response.text().await
+                })
+            })
+            .collect();
+        // The member answers every request 1.5 s after it arrives.
+        let answering = tokio::spawn(async move {
+            let mut answers = Vec::new();
+            let mut seen = 0;
+            while seen < REQUESTS {
+                let frame = read
+                    .read_frame(&mut |_| async { Ok::<(), WebSocketError>(()) })
+                    .await
+                    .expect("member frame");
+                if frame.opcode != OpCode::Text {
+                    continue;
+                }
+                seen += 1;
+                let request: serde_json::Value =
+                    serde_json::from_slice(&frame.payload).expect("request frame");
+                let (id, write) = (request["id"].clone(), write.clone());
+                answers.push(tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    let mut write = write.lock().await;
+                    for message in [
+                        serde_json::json!({"id": id, "delta": "a"}),
+                        serde_json::json!({"id": id, "delta": "b"}),
+                        serde_json::json!({"id": id, "delta": "c"}),
+                        serde_json::json!({"id": id, "done": true}),
+                    ] {
+                        let text = message.to_string();
+                        write
+                            .write_frame(Frame::text(Payload::Borrowed(text.as_bytes())))
+                            .await
+                            .expect("answer");
+                    }
+                }));
+            }
+            for answer in answers {
+                answer.await.expect("answer task");
+            }
+        });
+        for response in responses {
+            let body = tokio::time::timeout(Duration::from_secs(20), response)
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: a relayed stream never ended"))
+                .expect("task")
+                .expect("request");
+            assert_eq!(body.matches("data: ").count(), 3, "round {round}: {body}");
+        }
+        answering.await.expect("member");
+    }
 }

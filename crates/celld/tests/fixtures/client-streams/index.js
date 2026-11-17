@@ -36,9 +36,62 @@ const socket = (when) => {
   return new Response(null, { status: 101, webSocket: client });
 };
 
+// A WebSocket that refuses the first message it gets (a handler may close with
+// 1000 or 3000-4999 only; `close(1008)` throws); with `feed` it also
+// sends a tick every 100 ms until it closes.
+const refuse = (feed) => {
+  const [client, server] = Object.values(new WebSocketPair());
+  server.accept();
+  let ticker;
+  if (feed) {
+    ticker = setInterval(() => server.send("tick"), 100);
+  }
+  server.addEventListener("message", () => {
+    clearInterval(ticker);
+    server.close(4008, "refused");
+  });
+  server.addEventListener("close", () => clearInterval(ticker));
+  return new Response(null, { status: 101, webSocket: client });
+};
+
 export class Streams extends DurableObject {
+  member = null;
+  pending = new Map();
+  next = 0;
+
   async fetch(request) {
     const url = new URL(request.url);
+    if (url.pathname === "/refuse") {
+      return refuse(url.searchParams.has("feed"));
+    }
+    if (url.pathname === "/member") {
+      // The member relays answers to the requests this object forwards to it.
+      const [client, server] = Object.values(new WebSocketPair());
+      server.accept();
+      this.member = server;
+      server.addEventListener("message", (event) => {
+        const { id, done, delta } = JSON.parse(event.data);
+        const controller = this.pending.get(id);
+        if (!controller) return;
+        if (done) {
+          this.pending.delete(id);
+          controller.close();
+        } else {
+          controller.enqueue(new TextEncoder().encode(`data: ${delta}\n\n`));
+        }
+      });
+      return new Response(null, { status: 101, webSocket: client });
+    }
+    if (url.pathname === "/stream") {
+      const id = this.next++;
+      const stream = new ReadableStream({
+        start: (controller) => {
+          this.pending.set(id, controller);
+          this.member.send(JSON.stringify({ id }));
+        },
+      });
+      return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+    }
     if (url.pathname === "/ws-close") {
       return socket(url.searchParams.get("when"));
     }
@@ -73,6 +126,9 @@ export default {
     if (url.pathname === "/ws-close") {
       return socket(url.searchParams.get("when"));
     }
+    if (url.pathname === "/refuse") {
+      return refuse(url.searchParams.has("feed"));
+    }
     if (url.pathname === "/sse") {
       return sse(Number(url.searchParams.get("events") ?? "3"));
     }
@@ -80,6 +136,12 @@ export default {
       // Forwards to this Worker's own listener, as a Worker in front of an origin.
       url.pathname = url.pathname.slice("/proxy".length);
       return fetch(new Request(url, request));
+    }
+    if (url.pathname.startsWith("/relay/")) {
+      // One object relays every request through the member's socket.
+      const stub = env.STREAMS.get(env.STREAMS.idFromName("relay"));
+      url.pathname = url.pathname.slice("/relay".length);
+      return stub.fetch(new Request(url, request));
     }
     if (url.pathname.startsWith("/object/")) {
       const name = url.searchParams.get("name") ?? "shared";
