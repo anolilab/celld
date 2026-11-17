@@ -9660,7 +9660,6 @@ fn op_heap_limit_excessively_exceeded(
         .is_some_and(|state| state.excessively_exceeded.load(Ordering::Relaxed));
     rv.set(v8::Boolean::new(scope, exceeded).into());
 }
-/// Whether this isolate is too close to its heap limit to retain more state.
 /// Whether the node was started with `CELLD_TEST_PROBES`, which lets the
 /// harness show a test-only global. A Worker cannot set the node's environment.
 fn op_test_probes(
@@ -9672,6 +9671,7 @@ fn op_test_probes(
     rv.set(v8::Boolean::new(scope, on).into());
 }
 
+/// Whether this isolate is too close to its heap limit to retain more state.
 fn op_heap_over_admission_share(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
