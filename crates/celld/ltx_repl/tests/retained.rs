@@ -472,8 +472,11 @@ fn a_failed_resume_returns_the_database_to_the_cache() {
 }
 
 #[test]
-fn a_clean_reload_of_a_resumed_cell_needs_no_bucket() {
+fn a_clean_reload_with_a_compaction_round_due_reads_nothing_remote() {
     run(async {
+        // The same reload with a round that comes due: the round may list the
+        // bucket from a background task, so only the reload itself is checked.
+        // It succeeds with the store down, so it read nothing remote.
         let rig = rig_with(Some(EVERY_ROW));
         first_lifetime(&rig).await;
         rig.ltx
@@ -489,13 +492,50 @@ fn a_clean_reload_of_a_resumed_cell_needs_no_bucket() {
         rig.ltx.close_for_reload(CELL, 1).await.expect("reload");
 
         rig.store.down.store(true, Ordering::SeqCst);
+        rig.ltx
+            .activate(options(1, false, true))
+            .await
+            .expect("a reload reads nothing remote");
+    });
+}
+
+#[test]
+fn a_clean_reload_of_a_resumed_cell_needs_no_bucket() {
+    run(async {
+        // The reloaded cell has a row past its compaction cut. A round that
+        // came due would list the bucket from a background task, and the count
+        // below would depend on whether that task ran before the assertion.
+        let rig = rig_with(Some(CompactionConfig {
+            min_txids: u64::MAX,
+            ..EVERY_ROW
+        }));
+        first_lifetime(&rig).await;
+        rig.ltx
+            .evict(CELL, 1, Retained::Resumable, None)
+            .await
+            .expect("eviction");
+        let resumed = rig
+            .ltx
+            .activate(options(1, false, true))
+            .await
+            .expect("resume");
+        write(&resumed.path, "INSERT INTO t VALUES (2);");
+        rig.ltx.close_for_reload(CELL, 1).await.expect("reload");
+
+        rig.store.down.store(true, Ordering::SeqCst);
         let before = rig.store.requests.load(Ordering::SeqCst);
+        let touched = rig.store.touched.lock().unwrap().len();
         rig.ltx
             .activate(options(1, false, true))
             .await
             .expect("a reload reads nothing remote");
 
-        assert_eq!(rig.store.requests.load(Ordering::SeqCst), before);
+        assert_eq!(
+            rig.store.requests.load(Ordering::SeqCst),
+            before,
+            "the reload asked the bucket for {:?}",
+            &rig.store.touched.lock().unwrap()[touched..]
+        );
         assert_eq!(resident(&rig, 1).compaction.as_ref().unwrap().base_txid, 2);
     });
 }
