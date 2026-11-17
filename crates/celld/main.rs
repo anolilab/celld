@@ -2586,6 +2586,71 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
     }
 }
 
+/// The birth registry's holder is asked for a pass now. Fleet-HMAC verified
+/// like every internal peer surface.
+async fn internal_registry_pass(request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    let (parts, body) = request.into_parts();
+    let body = match collect_limited_body(body, MAX_PEER_CONTROL_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(error) => return peer_response(body_read_error("registry pass", error)),
+    };
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| parts.uri.path().to_string(), ToString::to_string);
+    if let Err(error) = app.peer_auth.verify(
+        &parts.method,
+        &path_and_query,
+        &parts.headers,
+        &body,
+        app.peer_auth.source(),
+    ) {
+        return peer_response(response(error.status(), error.message()));
+    }
+    if parts.method != hyper::Method::POST {
+        return peer_response(response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+        ));
+    }
+    let Some(registry) = celld::registry::global() else {
+        return peer_response(response(StatusCode::NOT_FOUND, "no registry"));
+    };
+    registry.request_pass_here();
+    peer_response(response(StatusCode::OK, "{\"ok\":true}"))
+}
+
+/// The registry's debug routes, which exist only with
+/// `CELLD_REGISTRY_DEBUG_API=1`.
+async fn internal_registry_debug(request: Request<Incoming>, path: String) -> HttpReply {
+    let Some(registry) = celld::registry::global() else {
+        return response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{\"error\":\"no registry\"}",
+        );
+    };
+    let method = request.method().to_string();
+    let query: std::collections::BTreeMap<String, String> = request
+        .uri()
+        .query()
+        .map(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let body = match collect_limited_body(request.into_body(), MAX_PEER_PROTOCOL_BODY_BYTES).await {
+        Ok(body) => serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        Err(error) => return body_read_error("registry", error),
+    };
+    match celld::registry_api::serve(&registry, &method, &path, &query, &body).await {
+        Some((status, text)) => {
+            response(StatusCode::from_u16(status).unwrap_or(StatusCode::OK), text)
+        }
+        None => response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}"),
+    }
+}
+
 async fn internal_probe(request: Request<Incoming>, app: AppHandle) -> HttpReply {
     let (parts, body) = request.into_parts();
     let body = match collect_limited_body(body, MAX_PEER_CONTROL_BODY_BYTES).await {
@@ -2914,6 +2979,10 @@ async fn handle_internal(
     let result = match path.as_str() {
         "/peer/probe" => internal_probe(request, app).await,
         "/peer/handoff" => internal_handoff(request, app).await,
+        "/peer/registry/pass" => internal_registry_pass(request, app).await,
+        _ if path.starts_with("/__registry/") && celld::registry_api::enabled() => {
+            internal_registry_debug(request, path.clone()).await
+        }
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),
         "/reload" if request.method() != hyper::Method::POST => {
@@ -3856,6 +3925,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 &node,
             )?;
             let cell_directory = replication.cell_directory();
+            let registry = replication.registry();
             let replication = Some(replication);
             // The same two calls a reload makes: there is no boot-only way from
             // a deployment to a serving generation.
@@ -3889,7 +3959,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 )
                 .with_lease_ttl_ms(lease_ttl_ms_from_environment())
                 .with_fleet_sample_ms(fleet_sample_ms)
-                .with_cell_directory(cell_directory),
+                .with_cell_directory(cell_directory)
+                .with_registry(registry),
             );
             let wake_scan = Some((client, bucket_ownership.clone()));
             let ownership = Ownership::Bucket(bucket_ownership);
@@ -4164,6 +4235,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         celld::telemetry::init(config, sink_bucket, node.clone(), settings.region.clone())?;
     }
     let peer_auth = Arc::new(PeerAuth::new(peer_key, node.clone())?);
+    let registry_peer_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(1))
+        .build()?;
+    if let Some(registry) = celld::registry::global() {
+        registry.set_peer(peer_auth.clone(), registry_peer_client);
+    }
     // Connect-only timeout: a peer request may legitimately run through a
     // restore, but a handshake that never completes provably ran nothing.
     let peer_http = reqwest::Client::builder()
