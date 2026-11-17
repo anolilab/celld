@@ -73,6 +73,7 @@ fn rig_configured(
             ..LtxConfig::from_lookup(|_| Ok(None))
         },
         None,
+        None,
     );
     Rig {
         ltx,
@@ -98,6 +99,7 @@ fn rig_over(rig: &Rig) -> Rig {
         production_ltx_host(),
         5_000,
         LtxConfig::from_lookup(|_| Ok(None)),
+        None,
         None,
     );
     Rig {
