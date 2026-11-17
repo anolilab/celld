@@ -169,3 +169,37 @@ async fn a_consumed_event_counts_as_progress_for_the_turn() {
     assert_eq!(done["status"], "complete", "{done}");
     assert_eq!(done["output"], "ok", "{done}");
 }
+
+#[tokio::test]
+async fn a_fenced_drive_does_not_keep_its_continuation_pending() {
+    let server = Server::start("workflow-budget", &[BUDGET]).await;
+    server.get_text("/start?flow=fence").await;
+    observe_for(Duration::from_millis(2300)).await;
+    server.get_text("/poke?flow=fence").await;
+
+    let done = finished(&server, "fence").await;
+    assert_eq!(done["status"], "complete", "{done}");
+
+    // The fenced drive's ledger write fails once it is let go, so its step
+    // promise rejects. A write that never settled would retain it for good.
+    wait_until("the fenced continuation to settle", WAIT, || async {
+        server
+            .log_text()
+            .contains("fenced continuation settled")
+            .then_some(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_sleep_that_is_not_due_blocks_in_a_spent_turn() {
+    let server = Server::start("workflow-budget", &[BUDGET]).await;
+    server.get_text("/start?flow=nap").await;
+
+    let done = finished(&server, "nap").await;
+
+    assert_eq!(done["status"], "complete", "{done}");
+    // One turn spends its budget and blocks on the sleep, one finishes. Handing
+    // the sleep over to a replay as soon as the turn is spent costs a third.
+    assert_eq!(count(&server, "nap").await, 2);
+}

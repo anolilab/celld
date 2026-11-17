@@ -43,6 +43,11 @@
       "binding": "EVT",
       "name": "evt",
       "class_name": "Evt"
+    },
+    {
+      "binding": "NAP",
+      "name": "nap",
+      "class_name": "Nap"
     }
   ],
   "durable_objects": {

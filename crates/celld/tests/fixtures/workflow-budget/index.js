@@ -70,7 +70,7 @@ export class Late extends WorkflowEntrypoint {
       { timeout: 1700, retries: { limit: 0, delay: 1 } },
       async () => {
         await count(this.env, "late", "/inc");
-        await sleep(1650);
+        await sleep(1400);
         return "ok";
       },
     );
@@ -141,7 +141,9 @@ const delayGate = new Promise((resolve) => {
 // write its retry record over the record of the drive that took over.
 export class Fence extends WorkflowEntrypoint {
   async run(event, step) {
-    const value = await step.do(
+    let value;
+    try {
+      value = await step.do(
       "work",
       {
         timeout: 1000,
@@ -160,6 +162,12 @@ export class Fence extends WorkflowEntrypoint {
         return "ok";
       },
     );
+    } catch (error) {
+      // Only the fenced drive's continuation lands here, once it is let go.
+      // Its invocation is over, so the sign is a log line, not a request.
+      console.log("fenced continuation settled");
+      throw error;
+    }
     // The work record is complete by now. Letting the fenced drive go writes
     // its retry record after it.
     await step.do("release", async () => {
@@ -167,6 +175,23 @@ export class Fence extends WorkflowEntrypoint {
     });
     await step.sleep("after", "1 second");
     return { value };
+  }
+}
+
+// A step after a turn that made progress and spent half its budget in run(),
+// then a sleep that is not due. The sleep must block until its deadline, not
+// hand over to a replay. Each turn counts itself.
+export class Nap extends WorkflowEntrypoint {
+  async run(event, step) {
+    await count(this.env, "nap", "/inc");
+    await step.do("first", async () => 1);
+    const seen = (globalThis.__napSeen ??= new Set());
+    if (!seen.has(event.instanceId)) {
+      seen.add(event.instanceId);
+      await sleep(1100);
+    }
+    await step.sleep("later", "2 seconds");
+    return "ok";
   }
 }
 
@@ -183,6 +208,7 @@ export default {
       fence: env.FENCE,
       quick: env.QUICK,
       evt: env.EVT,
+      nap: env.NAP,
     }[url.searchParams.get("flow")] ?? env.SLOW;
     if (url.pathname === "/count") {
       return Response.json({ n: await count(env, url.searchParams.get("key")) });

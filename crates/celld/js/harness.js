@@ -8791,9 +8791,13 @@ const __wfTrackStorageFailures = (storage, driver) => {
       value(...args) {
         // A fenced drive no longer owns the ledger: a callback it abandoned
         // must not record its outcome over the replacement drive's records.
+        // The call fails rather than hangs, so the abandoned continuation
+        // ends instead of being retained; the failure is permanent so no
+        // retry policy or delay callback runs on the fenced drive.
         if (name !== "get" && driver.fenced()) {
-          if (name === "put") return __wfNever;
-          throw new Error("the workflow drive was fenced");
+          const fenced = __wfError("the workflow drive was fenced");
+          fenced.__wfPermanent = true;
+          throw fenced;
         }
         try {
           const result = storage[name](...args);
@@ -9059,9 +9063,6 @@ const __wfMakeStep = (driver) => {
     if (record !== undefined && record.status === "completed") {
       return { value: undefined };
     }
-    // Sleeps that complete at once count as progress, so a run of them hands
-    // over to a fresh turn like a run of steps.
-    if (turnSpent()) return { block: Date.now(), kind: "yield" };
     const historyOrdinal = record?.ordinal ?? ordinal;
     let at = record === undefined ? undefined : record.deadline;
     if (at === undefined) {
@@ -9083,6 +9084,10 @@ const __wfMakeStep = (driver) => {
       });
     }
     if (at <= Date.now()) {
+      // Sleeps that complete at once count as progress, so a run of them
+      // hands over to a fresh turn like a run of steps. A sleep that is not
+      // due blocks until its deadline whatever the turn has spent.
+      if (turnSpent()) return { block: Date.now(), kind: "yield" };
       await storage.put(key, {
         kind: "sleep",
         status: "completed",

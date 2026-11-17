@@ -49,7 +49,9 @@ turn that has used half the budget and has run a step hands over to a new turn
 before it starts the next step, and `status()` keeps reporting `running`. A
 run of any number of short steps therefore finishes.
 
-Sleeps that complete at once count toward that progress like steps do.
+Sleeps that complete at once count toward that progress like steps do. A sleep
+that is not yet due blocks until its deadline, even in a turn that has used its
+half of the budget.
 
 One attempt of a step ends after at most 90% of the budget, even when its
 `timeout` is longer. It then fails like any timed-out attempt, and its retries
@@ -69,7 +71,8 @@ the budget, so a run of many thousands of steps can outgrow it.
 
 A turn that the runtime ended before it could hand over leaves a drive behind.
 The next alarm fences that drive, so its late callbacks cannot overwrite the
-step records of the drive that replaced it.
+step records of the drive that replaced it. Its ledger writes fail, so the
+step calls it still awaits reject and end.
 
 ## Sleeps, events, and retries
 
