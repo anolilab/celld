@@ -310,7 +310,8 @@ pub fn validate() -> anyhow::Result<()> {
     // A resident cell is forced onto the new deployment at the maximum age, so
     // a retire deadline at or before it would end work the swap still allows.
     if let Some(deadline) = positive::<u64>("CELLD_RETIRE_DEADLINE_S")? {
-        let max_age = with_default("CELLD_DEPLOY_MAX_AGE_S", 60u64)?;
+        optional::<u64>("CELLD_DEPLOY_MAX_AGE_S")?;
+        let max_age = crate::generation::max_age().as_secs();
         if deadline <= max_age {
             bail!(
                 "CELLD_RETIRE_DEADLINE_S ({deadline}) must exceed CELLD_DEPLOY_MAX_AGE_S ({max_age})"

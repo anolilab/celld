@@ -205,9 +205,14 @@ pub struct Slot {
     retiring: AtomicBool,
     /// Set once, by the generation's retire timer, when the deployment this
     /// isolate belongs to has been superseded for `CELLD_RETIRE_DEADLINE_S`.
-    /// A request driver samples it where it already samples its own
-    /// cancellation, and ends its work as a shutdown does.
+    /// A request driver that was already running then samples it where it
+    /// already samples its own cancellation, and ends its work as a shutdown
+    /// does. A driver that begins with it set is left alone: the cell it
+    /// serves has not swapped yet, and the swap is what ends its event.
     deadline_forced: AtomicBool,
+    /// Rung by the pool when the deadline passes, for the events that wait
+    /// with nothing to sample a flag. See [`Pool::force_retired`].
+    retire_bell: Arc<tokio::sync::Notify>,
 }
 
 thread_local! {
@@ -335,6 +340,7 @@ impl Slot {
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
             deadline_forced: AtomicBool::new(false),
+            retire_bell: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -362,6 +368,12 @@ impl Slot {
     /// Whether the retire deadline of this isolate's deployment has passed.
     pub(crate) fn deadline_forced(&self) -> bool {
         self.deadline_forced.load(Ordering::Relaxed)
+    }
+
+    /// A future that resolves once the retire deadline has been raised after
+    /// this call. It allocates nothing; read the flag after taking it.
+    pub(crate) fn retire_notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.retire_bell.notified()
     }
 
     /// Retire this isolate because its guest can no longer run in it, and
@@ -509,6 +521,8 @@ pub struct Pool {
     /// The retire deadline of this superseded pool has passed. Isolates
     /// grown afterwards start out forced.
     deadline_forced: AtomicBool,
+    /// Shared with every isolate of the pool; see [`Slot::retire_notified`].
+    retire_bell: Arc<tokio::sync::Notify>,
     /// Keeps admission and cell placement from racing isolate retirement.
     /// Stateless admission takes a shared guard, while maintenance and cell
     /// placement take the exclusive guard.
@@ -526,6 +540,7 @@ impl Pool {
             admission_wait,
             retired: AtomicBool::new(false),
             deadline_forced: AtomicBool::new(false),
+            retire_bell: Arc::new(tokio::sync::Notify::new()),
             maintenance: RwLock::new(()),
         }
     }
@@ -596,6 +611,7 @@ impl Pool {
             retiring: AtomicBool::new(self.retired.load(Ordering::Relaxed)),
             // An isolate grown after the deadline is past it from the start.
             deadline_forced: AtomicBool::new(self.deadline_forced.load(Ordering::Relaxed)),
+            retire_bell: self.retire_bell.clone(),
         });
         if let Some(id) = reusable {
             slots[id] = slot.clone();
@@ -781,7 +797,8 @@ impl Pool {
     pub(crate) fn force_retired(&self) -> usize {
         let _maintenance = self.maintenance.write().expect("pool poisoned");
         self.deadline_forced.store(true, Ordering::Relaxed);
-        self.slots
+        let requests = self
+            .slots
             .read()
             .expect("pool poisoned")
             .iter()
@@ -789,7 +806,10 @@ impl Pool {
                 slot.deadline_forced.store(true, Ordering::Relaxed);
                 slot.requests.load(Ordering::Relaxed)
             })
-            .sum()
+            .sum();
+        // After the flags, so a waiter woken by the bell finds one set.
+        self.retire_bell.notify_waiters();
+        requests
     }
 
     /// Whether every isolate this pool ever built has been freed. True for a
@@ -901,3 +921,50 @@ const _: fn() = || {
     assert_send_sync::<Slot>();
     assert_send_sync::<Affiliation>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pool() -> Pool {
+        crate::runtime::init_v8();
+        let config = Arc::new(js::WorkerConfig::new(js::WorkerConfigOptions {
+            src: "export default { fetch() { return new Response('ok'); } };".to_string(),
+            script_name: "retire-test".to_string(),
+            do_classes: Vec::new(),
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            d1_bindings: Vec::new(),
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
+            vars: Vec::new(),
+            node: String::new(),
+            modules: Vec::new(),
+            compat: js::Compat::default(),
+        }));
+        Pool::new(
+            crate::runtime::pool_limits(),
+            std::time::Duration::from_secs(1),
+            Box::new(move || js::Worker::load_config(config.clone())),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_isolate_grown_after_the_retire_deadline_starts_past_it() {
+        let pool = pool();
+        let before = pool.grow(None).expect("first isolate");
+        assert!(!before.deadline_forced());
+        let bell = before.retire_notified();
+
+        assert_eq!(pool.force_retired(), 0, "no request was running");
+        assert!(before.deadline_forced());
+        tokio::time::timeout(std::time::Duration::from_secs(5), bell)
+            .await
+            .expect("a waiter taken before the deadline hears it");
+
+        let after = pool.grow(None).expect("second isolate");
+        assert!(after.deadline_forced(), "grown after the deadline");
+    }
+}

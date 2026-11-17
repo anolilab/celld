@@ -106,6 +106,25 @@ pub fn max_age() -> std::time::Duration {
     std::time::Duration::from_secs(seconds)
 }
 
+/// How long a superseded deployment's isolates may live,
+/// `CELLD_RETIRE_DEADLINE_S`. Past it, work still running there is ended
+/// and the isolates are freed. The default is the handler budget plus the
+/// longer of a minute and `CELLD_DEPLOY_MAX_AGE_S`: a handler that obeys its
+/// budget is never cut short, a resident cell has been forced onto the new
+/// deployment by then, and what outlives both is `waitUntil` work or a
+/// stream nobody reads.
+pub fn retire_deadline() -> std::time::Duration {
+    static DEADLINE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *DEADLINE.get_or_init(|| {
+        let slack = max_age().as_secs().max(60);
+        let default = crate::js::handler_budget().as_secs().saturating_add(slack);
+        std::time::Duration::from_secs(
+            crate::env_vars::positive_or("CELLD_RETIRE_DEADLINE_S", default)
+                .expect("validated CELLD_RETIRE_DEADLINE_S"),
+        )
+    })
+}
+
 /// The scripts one deployment reaches: the primary script plus every
 /// service-binding target and queue consumer it declares, transitively.
 ///
@@ -461,7 +480,7 @@ impl Generation {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let deadline = crate::js::retire_deadline();
+        let deadline = retire_deadline();
         let generation = Arc::downgrade(self);
         handle.spawn(async move {
             tokio::time::sleep(deadline).await;

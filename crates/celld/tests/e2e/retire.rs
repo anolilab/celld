@@ -217,3 +217,75 @@ async fn an_answered_durable_object_event_with_a_leftover_timer_does_not_pin_a_s
     assert_eq!(server.get_text("/do-ticks").await, before);
     assert_eq!(server.get_text("/version").await, "v2");
 }
+
+/// Durable Object events still running when the deadline passes are ended by
+/// the timer, inside each object's own storage scope, and the node goes on
+/// serving.
+///
+/// A resident cell is normally moved to the new deployment at the maximum
+/// age, which ends its events first. The handoffs run one at a time, so with
+/// enough objects some are still on the old isolate when the deadline passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_object_events_running_at_the_deadline_are_ended_and_the_node_keeps_serving() {
+    const OBJECTS: usize = 300;
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_RETIRE_DEADLINE_S", "2"),
+            ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
+            ("CELLD_RELEASES", "1"),
+            ("CELLD_HANDLER_BUDGET_S", "3600"),
+        ],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let hung: Vec<_> = (0..OBJECTS)
+        .map(|n| {
+            let (client, url) = (client.clone(), server.url(&format!("/do-hang?n={n}")));
+            tokio::spawn(async move {
+                let response = client.get(url).send().await.expect("hang");
+                (response.status(), response.text().await.unwrap_or_default())
+            })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    redeploy(&server).await;
+
+    let mut superseded = 0;
+    for task in hung {
+        let (status, body) = tokio::time::timeout(Duration::from_secs(60), task)
+            .await
+            .expect("the hung event ended")
+            .expect("hang task");
+        assert!(status.is_server_error(), "{status} {body}");
+        superseded += usize::from(body.contains("superseded"));
+    }
+    assert!(
+        superseded > 0,
+        "the swap moved every object before the deadline"
+    );
+    assert!(
+        !server.log_text().contains("panicked"),
+        "{}",
+        server.log_text()
+    );
+
+    // Only what was running at the deadline is ended. An event that starts
+    // afterwards on an object that has not moved yet is left to the swap.
+    let naps: Vec<_> = (0..OBJECTS)
+        .map(|n| {
+            let (client, url) = (client.clone(), server.url(&format!("/do-nap?n={n}")));
+            tokio::spawn(async move {
+                let response = client.get(url).send().await.expect("nap");
+                response.text().await.unwrap_or_default()
+            })
+        })
+        .collect();
+    for task in naps {
+        let body = task.await.expect("nap task");
+        assert!(!body.contains("superseded"), "{body}");
+    }
+    assert_eq!(server.get_text("/version").await, "v2");
+}
