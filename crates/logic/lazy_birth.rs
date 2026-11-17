@@ -186,10 +186,16 @@ pub(crate) struct Design {
     /// K7: a bundle counts for the wait of a first per-cell object only after
     /// the session read its header as open, after the bundle was written.
     pub bundle_counts_after_open_header: bool,
-    /// A first record of an id that was never granted is a K5 claim of a new
-    /// cell: a first-form record and the taken mark. A cell with a taken entry
-    /// and no record is refused, in every mode.
+    /// A first record of an id that was never granted, with no record in the
+    /// bucket, is a K5 claim of a new cell: a first-form record and the taken
+    /// mark. A cell with a taken entry and no record is refused, in every mode.
     pub ungranted_claim_marks: bool,
+    /// The plain record of the minting session at epoch 1, found over an id
+    /// that was never granted, is taken over by K5: a first-form record over
+    /// it, with the taken mark.
+    pub session_record_takeover_marks: bool,
+    /// A sealer keeps the taken entries of the chunk it read.
+    pub sealer_keeps_taken: bool,
     /// The plain record of the minting session at epoch 1 is refused once the
     /// cell has a taken entry.
     pub session_record_refused_when_taken: bool,
@@ -220,6 +226,11 @@ pub(crate) struct Design {
 }
 
 impl Design {
+    /// Whether a release or a reload marker waits for a trace in the bucket.
+    pub(crate) fn needs_trace(&self) -> bool {
+        self.trace_before_release || self.trace_before_marker
+    }
+
     pub(crate) fn rev4() -> Self {
         Self {
             sealer_writes_no_record: true,
@@ -259,6 +270,8 @@ impl Design {
             waived_by_session_row: true,
             bundle_counts_after_open_header: true,
             ungranted_claim_marks: true,
+            session_record_takeover_marks: true,
+            sealer_keeps_taken: true,
             session_record_refused_when_taken: true,
             shadow_granted_absent_refuses: true,
             placed_claim_marks: true,
@@ -279,10 +292,10 @@ impl Design {
         Self {
             bundle_counts_after_open_header: false,
             ungranted_claim_marks: false,
+            session_record_takeover_marks: false,
             session_record_refused_when_taken: false,
             shadow_granted_absent_refuses: false,
             placed_claim_marks: false,
-            session_merges_chunk: true,
             session_claims_once: false,
             session_acts_after_open_header: false,
             trace_before_release: false,
@@ -332,7 +345,7 @@ impl Design {
         }
     }
 
-    /// Revision 4 with one rule removed: mutant `n` of M1..M41, or a second
+    /// Revision 4 with one rule removed: mutant `n` of M1..M43, or a second
     /// form of it as `(n, form)`.
     pub(crate) fn mutant(n: u8, form: u8) -> Self {
         let mut d = Self::rev4();
@@ -392,6 +405,8 @@ impl Design {
             (39, _) => d.session_acts_after_open_header = false,
             (40, _) => d.trace_before_release = false,
             (41, _) => d.trace_before_marker = false,
+            (42, _) => d.session_record_takeover_marks = false,
+            (43, _) => d.sealer_keeps_taken = false,
             _ => panic!("no mutant M{n}"),
         }
         d
@@ -549,7 +564,7 @@ fn decide_record(d: &Design, v: &View, rec: &Rec, chunk: &Chunk, mode: Mode) -> 
             if session_first && d.session_record_refused_when_taken && taken.is_some() {
                 return Take::Refuse("a record of the session over a taken cell");
             }
-            if session_first && d.ungranted_claim_marks && !chunk.granted[c] {
+            if session_first && d.session_record_takeover_marks && !chunk.granted[c] {
                 return Take::FirstOverRecord {
                     epoch: rec.epoch + 1,
                 };
@@ -630,9 +645,12 @@ fn decide_record(d: &Design, v: &View, rec: &Rec, chunk: &Chunk, mode: Mode) -> 
 
 /// Build the sealed body of a chunk from what it holds and what a gather
 /// found. A left entry always implies the granted bit.
-pub(crate) fn seal_chunk(cur: &Chunk, gather: &Gather) -> Chunk {
+pub(crate) fn seal_chunk(d: &Design, cur: &Chunk, gather: &Gather) -> Chunk {
     let mut sealed = cur.clone();
     sealed.sealed = true;
+    if !d.sealer_keeps_taken {
+        sealed.taken = [None; CELLS];
+    }
     for entry in &gather.entries {
         match *entry {
             Entry::Grant(c) => sealed.granted[c] = true,

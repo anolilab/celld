@@ -7571,6 +7571,8 @@ mod lazy_birth;
 #[cfg(test)]
 mod lazy_birth_model;
 #[cfg(test)]
+mod lazy_birth_scenarios;
+#[cfg(test)]
 mod lazy_birth_tests;
 #[cfg(test)]
 mod ownership_model;

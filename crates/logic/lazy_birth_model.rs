@@ -51,10 +51,10 @@
 //! - The ensemble is two followers, each with a tail; a session without an
 //!   ensemble keeps its marks in the chunk. The minting node acknowledges on a
 //!   bucket proof only in a scenario that gives it the budget for one.
-//! - A taker claims before the seal in one case only: a waived id that the
-//!   session placed on it, while the session's lease is live. A handoff of a
-//!   released record to a peer while the session lives is not modelled; the
-//!   peer's claim is taken after the seal.
+//! - A taker claims before the seal in two cases only: a waived id that the
+//!   session placed on it, while the session's lease is live, and, in a
+//!   scenario with `early_handoff`, a record that the session released while
+//!   it lives. Otherwise the peer's claim is taken after the seal.
 //! - A sealed session's log is sealed by the fence; the node record is one
 //!   record with the log state of the latest process.
 //! - The read-only variant of the design (the birth-form record and P3) is not
@@ -185,6 +185,8 @@ enum Cs {
     Active {
         ep: Epoch,
         lazy: bool,
+        /// A trace of the cell is in the bucket: its left entry in the chunk,
+        /// which a release and a reload marker wait for.
         synced: bool,
     },
     Leaving {
@@ -445,7 +447,8 @@ pub(crate) struct LazyConfig {
     /// A taker that read no record goes on once the header of the id's tag is
     /// sealed, also while a successor of the minting node lives. Without it a
     /// taker waits for every session of that node, which hides what a peer
-    /// does beside a successor of a preserved restart.
+    /// does beside a successor of a preserved restart. It overrides the design's
+    /// `gate_keyed_by_node` for a taker that read no record.
     pub sealed_header_final: bool,
     /// Invariants whose failures are not reported: a scenario that wants a
     /// deeper failure than the one a rule's removal shows at once.
@@ -1093,7 +1096,7 @@ impl Lazy {
             ep: 1,
             lazy: false,
             // A release, and a reload marker, wait for a trace in the bucket.
-            synced: !(self.d().trace_before_release || self.d().trace_before_marker),
+            synced: !self.d().needs_trace(),
         };
         let mut proven = false;
         if w.ps[ki].mode != Mode::On
@@ -1144,24 +1147,12 @@ impl Lazy {
         w.ps[usize::from(k) - 1].placed[c] && w.s.node.live && w.s.node.gen == k
     }
 
-    /// Whether a peer may claim cell `c` as a handoff: its record is released
-    /// and the session that released it lives.
-    fn handoff_live(&self, w: &World, c: Cell) -> bool {
+    /// Whether a record is a handoff: released by a session that lives, in a
+    /// scenario that lets a peer claim over it before the seal.
+    fn handed_off(&self, w: &World, rec: Option<&Rec>) -> bool {
         self.cfg.early_handoff
             && w.s.node.live
-            && w.s.own[c]
-                .as_ref()
-                .is_some_and(|r| r.released && w.s.node.carried.contains(&r.by))
-    }
-
-    /// A task that read a released record of a live session goes on without
-    /// the gate, as a peer does in a handoff.
-    fn early(&self, w: &World, t: &Task) -> bool {
-        self.cfg.early_handoff
-            && w.s.node.live
-            && t.rec
-                .as_ref()
-                .is_some_and(|r| r.released && w.s.node.carried.contains(&r.by))
+            && rec.is_some_and(|r| r.released && w.s.node.carried.contains(&r.by))
     }
 
     /// An acknowledgement on a bucket proof: the row is uploaded under the
@@ -1432,9 +1423,7 @@ impl Lazy {
             Some(n) => n,
             // A cell with a plain record of the minting session: the entry is
             // made for the release, under a nonce of its own.
-            None if (self.d().trace_before_release || self.d().trace_before_marker)
-                && k == self.cfg.minter =>
-            {
+            None if self.d().needs_trace() && k == self.cfg.minter => {
                 let n = w.ps[ki].next_nonce;
                 w.ps[ki].next_nonce += 1;
                 n
@@ -1734,7 +1723,7 @@ impl Lazy {
             }
             SSt::CasChunk => {
                 let snap = s.chunk_snap.clone().expect("snapshot");
-                let new = seal_chunk(&snap, &s.gather);
+                let new = seal_chunk(self.d(), &snap, &s.gather);
                 let blind = !self.d().first_seal_fixes_chunk;
                 let kind = WK::Chunk {
                     tag: s.target,
@@ -2928,7 +2917,7 @@ impl Model for Lazy {
             // it claimed and released, and finds no record. The design places
             // the first again, which is a claim of a peer, and refuses the
             // second; without the rule the session claims the id itself.
-            if w.b.reclaims > 0 && !self.d().session_claims_once && self.can_mint(w, k) {
+            if w.b.reclaims > 0 && self.can_mint(w, k) {
                 for c in 0..CELLS {
                     let placed = p.placed[c] && p.cs[c] == Cs::Waived;
                     if (placed || p.cs[c] == Cs::Released) && w.s.own[c].is_none() {
@@ -3087,7 +3076,7 @@ impl Model for Lazy {
                             if self.minted(w, c)
                                 && (self.taker_may_start(w)
                                     || self.placement_live(w, c)
-                                    || self.handoff_live(w, c))
+                                    || self.handed_off(w, w.s.own[c].as_ref()))
                                 && self.cfg.takers & (1 << i) != 0
                             {
                                 a.push(Act::TkStart(i, c));
@@ -3101,7 +3090,7 @@ impl Model for Lazy {
                             if self.minted(w, c)
                                 && (self.taker_may_start(w)
                                     || self.placement_live(w, c)
-                                    || self.handoff_live(w, c))
+                                    || self.handed_off(w, w.s.own[c].as_ref()))
                                 && self.cfg.takers & (1 << i) != 0
                             {
                                 a.push(Act::TkStart(i, c));
@@ -3114,7 +3103,7 @@ impl Model for Lazy {
                         && self.d().taker_waits_for_seal
                         && !self.gate_ok(w, task.rec.as_ref())
                         && !self.placement_live(w, task.c)
-                        && !self.early(w, task);
+                        && !self.handed_off(w, task.rec.as_ref());
                     if matches!(
                         task.st,
                         TSt::ReadRec | TSt::ReadChunk | TSt::MarkChunk | TSt::Settle
@@ -3246,8 +3235,15 @@ impl Model for Lazy {
             Act::Reclaim(c) => {
                 let k = self.cfg.minter;
                 w.b.reclaims -= 1;
-                l.push("session_claims_again");
-                self.std_put(&mut w, k, *c, &mut l);
+                if !self.d().session_claims_once {
+                    l.push("session_claims_again");
+                    self.std_put(&mut w, k, *c, &mut l);
+                } else if w.ps[usize::from(k) - 1].placed[*c] {
+                    // A placement writes nothing: the peer decides.
+                    l.push("placed_again");
+                } else {
+                    l.push("claimed_again_refused");
+                }
             }
             Act::Confirm(k) => {
                 // The header was open after the bundle was written.
@@ -3362,10 +3358,9 @@ impl Model for Lazy {
                                 .task
                                 .as_ref()
                                 .and_then(|t| t.rec.as_ref()),
-                        ) || w.tk[usize::from(*i)]
-                            .task
-                            .as_ref()
-                            .is_some_and(|t| self.placement_live(w, t.c) || self.early(w, t)))
+                        ) || w.tk[usize::from(*i)].task.as_ref().is_some_and(|t| {
+                            self.placement_live(w, t.c) || self.handed_off(w, t.rec.as_ref())
+                        }))
                 };
                 if self.cfg.fresh_reads && ready(&w) {
                     self.taker_step(&mut w, *i, &mut l);
