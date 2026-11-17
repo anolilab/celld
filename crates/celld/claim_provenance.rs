@@ -163,6 +163,19 @@ struct Identity {
     process_start_ms: u64,
 }
 
+/// The process-wide counters, as plain numbers for `/metrics`.
+pub(crate) struct Counts {
+    pub minted_untracked: u64,
+    pub first_claims_minted_local: u64,
+    pub first_claims_minted_local_no_ensemble: u64,
+    pub second_claims_prior_released: u64,
+    pub second_claims_prior_self: u64,
+    pub second_claims_prior_other: u64,
+    pub releases_drain: u64,
+    pub releases_handoff: u64,
+    pub preserved_resumes: u64,
+}
+
 pub(crate) struct ClaimProvenance {
     sample: AtomicU64,
     identity: OnceLock<Identity>,
@@ -377,6 +390,22 @@ impl ClaimProvenance {
         counters
     }
 
+    pub(crate) fn counts(&self) -> Counts {
+        Counts {
+            minted_untracked: self.minted_untracked.load(Relaxed),
+            first_claims_minted_local: self.first_claims_minted_local.load(Relaxed),
+            first_claims_minted_local_no_ensemble: self
+                .first_claims_minted_local_no_ensemble
+                .load(Relaxed),
+            second_claims_prior_released: self.second_claims_prior_released.load(Relaxed),
+            second_claims_prior_self: self.second_claims_prior_self.load(Relaxed),
+            second_claims_prior_other: self.second_claims_prior_other.load(Relaxed),
+            releases_drain: self.releases_drain.load(Relaxed),
+            releases_handoff: self.releases_handoff.load(Relaxed),
+            preserved_resumes: self.preserved_resumes.load(Relaxed),
+        }
+    }
+
     /// The body of `/state/step0`.
     pub(crate) fn step0_json(&self) -> Value {
         let mut body = self.header();
@@ -424,6 +453,10 @@ pub(crate) fn preserved_resume(cell: &str, epoch: u64) {
 
 pub(crate) fn drain_started() {
     GLOBAL.drain_started(crate::ownership_store::now_ms());
+}
+
+pub(crate) fn counts() -> Counts {
+    GLOBAL.counts()
 }
 
 pub(crate) fn counters_json() -> serde_json::Map<String, Value> {

@@ -1157,6 +1157,21 @@ impl State {
         self.capacity_waiters.iter().cloned().collect()
     }
 
+    /// Cells waiting for a residency slot, without copying the queue.
+    pub fn capacity_waiting(&self) -> usize {
+        self.capacity_waiters.len()
+    }
+
+    /// Cells queued behind the activation ceiling, without copying the queue.
+    pub fn activation_waiting_count(&self) -> usize {
+        self.activation_waiters.len()
+    }
+
+    /// The node's advisory activity counters.
+    pub fn activity(&self) -> ActivitySnapshot {
+        self.activity
+    }
+
     pub fn activation_waiting(&self) -> Vec<CellId> {
         self.activation_waiters.iter().cloned().collect()
     }

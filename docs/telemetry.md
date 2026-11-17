@@ -66,7 +66,65 @@ Durable Object call keeps the trace id, uses a new span id, and keeps the
 sampled flag clear.
 
 Under load, telemetry sheds before requests do, and celld counts what it
-sheds. celld records no metrics yet.
+sheds.
+
+## Metrics
+
+`GET /metrics` on the internal listener returns the node's counters, gauges
+and histograms in Prometheus text format (`text/plain; version=0.0.4`). It
+sits behind the operator token like every internal route. Point a scraper at
+the internal address with `Authorization: Bearer <token>`.
+
+Label values come from fixed sets. No cell id, tenant string or URL path is
+ever a label, so the series count does not grow with the number of cells.
+Series that read a value the node cannot report (the cgroup figures outside
+a container) are left out, not set to zero. When the node's actor has
+stopped, `/metrics` answers 503 instead of reporting zero cells; `/state` shows
+`actor_stopped`. celld does not push metrics over
+OTLP yet.
+
+| Series | Type | Labels |
+| --- | --- | --- |
+| `celld_owned_cells` | gauge | as of the last load sample |
+| `celld_resident_cells` | gauge | |
+| `celld_cells_restoring` | gauge | cold starts not yet finished: `activating` plus `activation_waiting` |
+| `celld_cells_in_transition` | gauge | `state`: `quiescing`, `evicting`, `releasing`, `adopting`, `activating`, `activation_waiting`, `capacity_waiting` (a subset of `activating`) |
+| `celld_handoffs_total` | counter | `outcome`: `ok`, `failed` |
+| `celld_rebalances_total` | counter | `outcome`: `ok`, `failed` |
+| `celld_remote_route_refreshes_total` | counter | |
+| `celld_shedding` | gauge | 1 while the node refuses new cells |
+| `celld_rss_bytes`, `celld_in_use_bytes` | gauge | |
+| `celld_cgroup_working_set_bytes`, `celld_cgroup_current_bytes` | gauge | |
+| `celld_ids_minted_total` | counter | |
+| `celld_claims_total`, `celld_first_claims_total` | counter | |
+| `celld_evictions_total` | counter | `outcome`: `snapshot`, `paged`, `over_budget`, `publish_failed`, `empty` |
+| `celld_second_claims_total` | counter | `prior`: `released`, `self`, `other` |
+| `celld_releases_total` | counter | `reason`: `drain`, `handoff` |
+| `celld_mint_tracking_evictions_total`, `celld_first_claims_minted_local_total`, `celld_first_claims_minted_local_no_ensemble_total`, `celld_preserved_resumes_total` | counter | |
+| `celld_retained_bundles` | gauge | |
+| `celld_http_requests_total` | counter | `listener`: `public`, `internal`, `peer`; `class`: `1xx` to `5xx`, `dropped` |
+| `celld_http_request_duration_seconds` | histogram | `listener`; buckets from 1 ms to 10 s |
+
+A scrape does not build the `/state` document and does not walk the cells.
+The node answers with a handful of counts it already keeps, and the storage
+counters are read directly. The per-phase cell census and the age of the
+oldest retained bundle stay in `/state`, where they are built on demand.
+`celld_mint_tracking_evictions_total` counts ids pushed out of the bounded set
+that remembers what this process minted. A rise means a first claim of such an
+id can no longer be told from one minted elsewhere.
+
+The request series are plain atomic counters, kept per thread on separate
+cache lines and summed when you scrape, so concurrent requests do not
+contend. A request adds a few relaxed increments and two clock reads (its
+start, and its elapsed time at the response head), and allocates nothing.
+The latency excludes the body stream. A request whose connection goes away
+before it has a response, or that a forced drain cuts off, counts under
+`class="dropped"`, with its time up to that point.
+
+`public` is the Worker listener, `peer` is the `/peer/` routes of the
+internal listener, and `internal` is the rest of it. On `peer`, a tunnel
+upgrade counts once, with a `1xx` class, and the calls carried over the
+tunnel are not counted. A WebSocket upgrade on `public` counts once.
 
 ## Query the bucket with DuckDB
 

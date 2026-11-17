@@ -611,6 +611,10 @@ pub enum Message {
     Health {
         reply: oneshot::Sender<bool>,
     },
+    /// The gauges `/metrics` reads, without the full `/state` document.
+    Counts {
+        reply: oneshot::Sender<crate::metrics::Counts>,
+    },
     Presence {
         reply: oneshot::Sender<celld_logic::PresenceSnapshot>,
     },
@@ -1813,6 +1817,15 @@ impl AppHandle {
         receive.await.unwrap_or(false)
     }
 
+    /// The gauges only the actor knows, for `/metrics`. Every one is a field
+    /// read, so a scrape does not walk the cell table. `None` when the actor
+    /// has stopped: zeroes would read as an idle node.
+    pub async fn counts(&self) -> Option<crate::metrics::Counts> {
+        let (reply, receive) = oneshot::channel();
+        self.tx.send(Message::Counts { reply }).ok()?;
+        receive.await.ok()
+    }
+
     pub async fn presence(&self) -> Option<celld_logic::PresenceSnapshot> {
         let (reply, receive) = oneshot::channel();
         self.tx.send(Message::Presence { reply }).ok()?;
@@ -2948,6 +2961,9 @@ impl Actor {
             }
             Message::Health { reply } => {
                 let _ = reply.send(self.state.ready_to_serve());
+            }
+            Message::Counts { reply } => {
+                let _ = reply.send(self.metrics_counts());
             }
             Message::Presence { reply } => {
                 let _ = reply.send(self.state.presence_snapshot());
@@ -4143,6 +4159,43 @@ impl Actor {
                 }
                 let _ = self.fence.send(code);
             }
+        }
+    }
+
+    /// What `/metrics` needs from the actor. Cell counts come from the
+    /// counters the state machine keeps, and the owned count from the last
+    /// load tick, so nothing here scales with the number of cells.
+    fn metrics_counts(&self) -> crate::metrics::Counts {
+        let live = &self.live_load;
+        let sample = live.sample();
+        let activity = self.state.activity();
+        crate::metrics::Counts {
+            owned_cells: live.owned_cells.load(Ordering::Relaxed),
+            resident_cells: self.state.occupied(),
+            quiescing: self.state.quiescing(),
+            evicting: self.state.evicting(),
+            releasing: self.state.releasing(),
+            adopting: self.state.adopting(),
+            restoring: self.state.activation_backlog(),
+            activating: self.state.activating(),
+            activation_waiting: self.state.activation_waiting_count(),
+            capacity_waiting: self.state.capacity_waiting(),
+            handed_off: activity.handed_off,
+            handoff_failed: activity.handoff_failed,
+            rebalanced: activity.rebalanced,
+            rebalance_failed: activity.rebalance_failed,
+            remote_route_refreshes: activity.remote_route_refreshes,
+            shedding: self.state.shed_reason().is_some(),
+            rss_bytes: sample.rss_bytes,
+            in_use_bytes: sample.in_use_bytes,
+            cgroup_working_set_bytes: sample.cgroup_working_set_bytes,
+            cgroup_current_bytes: sample.cgroup_current_bytes,
+            retained_bundles: self
+                .node_log
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(0, |log| log.retained_bundle_count()),
         }
     }
 

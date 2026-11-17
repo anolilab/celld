@@ -83,3 +83,23 @@ pub(crate) fn to_json() -> serde_json::Value {
         .extend(claim_provenance::counters_json());
     counters
 }
+
+/// The counters `/metrics` reports, read straight from the atomics.
+pub(crate) struct Counts {
+    pub ids_minted: u64,
+    pub claims: u64,
+    pub first_claims: u64,
+    /// In `EvictionOutcome::slot` order.
+    pub evictions: [u64; 5],
+    pub provenance: claim_provenance::Counts,
+}
+
+pub(crate) fn counts() -> Counts {
+    Counts {
+        ids_minted: IDS_MINTED.load(Ordering::Relaxed),
+        claims: CLAIMS.load(Ordering::Relaxed),
+        first_claims: FIRST_CLAIMS.load(Ordering::Relaxed),
+        evictions: std::array::from_fn(|slot| EVICTIONS[slot].load(Ordering::Relaxed)),
+        provenance: claim_provenance::counts(),
+    }
+}

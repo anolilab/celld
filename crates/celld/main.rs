@@ -2893,6 +2893,25 @@ async fn handle_public(
     Ok(result)
 }
 
+/// The scrape answer. Without the actor's gauges the node cannot say what it
+/// holds, so it answers 503 rather than a body of zeroes.
+fn metrics_reply(counts: Option<celld::metrics::Counts>) -> HttpReply {
+    let Some(counts) = counts else {
+        let mut reply = response(StatusCode::SERVICE_UNAVAILABLE, "actor stopped\n");
+        reply.headers_mut().insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        return reply;
+    };
+    let mut reply = response(StatusCode::OK, celld::metrics::render(counts));
+    reply.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static(celld::metrics::CONTENT_TYPE),
+    );
+    reply
+}
+
 async fn handle_internal(
     request: Request<Incoming>,
     app: AppHandle,
@@ -2907,6 +2926,7 @@ async fn handle_internal(
         "/peer/handoff" => internal_handoff(request, app).await,
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),
+        "/metrics" => metrics_reply(app.counts().await),
         "/state/step0" => response(
             StatusCode::OK,
             celld::claim_provenance::step0_json().to_string(),
@@ -3127,6 +3147,14 @@ impl HttpSurface {
             Self::Recovery => "recovery",
         }
     }
+
+    fn listener(self, path: &str) -> celld::metrics::Listener {
+        match self {
+            Self::Public => celld::metrics::Listener::Public,
+            Self::Internal => celld::metrics::Listener::internal(path),
+            Self::Recovery => celld::metrics::Listener::internal(path),
+        }
+    }
 }
 
 struct ShutdownConnection {
@@ -3252,7 +3280,8 @@ fn serve_http_connection(
                 let app = app.clone();
                 let shutdown = shutdown.clone();
                 let service_requests = service_requests.clone();
-                async move {
+                let listener = surface.listener(request.uri().path());
+                celld::metrics::observe(listener, async move {
                     let mut request = request;
                     if let Some(refusal) =
                         operator_gate(surface, &app.operator_token, request.headers_mut())
@@ -3275,7 +3304,7 @@ fn serve_http_connection(
                             })
                         }
                     }
-                }
+                })
             });
             let connection = http1::Builder::new()
                 // Reclaim a connection that never sends a complete request
