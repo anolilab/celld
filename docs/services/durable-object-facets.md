@@ -91,10 +91,11 @@ loopback class without properties supplies an empty object.
 - A clone refuses a source database above 16 MiB, because the copy is one
   write that must reach the bucket within the durability wait. The refusal
   leaves the target as it was, stopped, and the name usable.
-- A clone that fails part way leaves the database of `target` empty
-  and the name stays blocked until the root object restarts, as after
-  a failed `delete()`. Calling `clone()` or `delete()` on the target again
-  replaces the unknown state.
+- A failure during the copy leaves the database of `target` empty. A failure
+  while proving durability leaves the copy, whose durability is unknown. In
+  both cases the name stays blocked until the root object restarts or a later
+  `clone()` or `delete()` of the target replaces it, as after a failed
+  `delete()`.
 - Writes to the source during a clone succeed. The copy reads one consistent
   snapshot of the source, and a source writer may wait up to the busy
   timeout, never for the whole copy. A source that grows past 16 MiB after

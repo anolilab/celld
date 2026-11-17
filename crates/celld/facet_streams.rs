@@ -372,7 +372,7 @@ impl FacetStreams {
         root: &str,
         epoch: u64,
         root_resident: bool,
-        stop_root: impl FnOnce() -> R,
+        stop_root: impl FnOnce(Vec<String>) -> R,
         mut stop_facet: F,
     ) -> anyhow::Result<()>
     where
@@ -384,7 +384,10 @@ impl FacetStreams {
         // None starts after `stopping`, since each opens its facets.
         self.settled(root).await;
         if root_resident {
-            if let Err(error) = stop_root().await {
+            // The streams after the clone settled: the root's retention
+            // depends on every facet that opened, a clone's target included.
+            let open = self.stopping(root, epoch);
+            if let Err(error) = stop_root(open).await {
                 self.resume(root, epoch);
                 return Err(error);
             }
@@ -861,13 +864,57 @@ mod tests {
             "root",
             1,
             false,
-            || async { Ok(()) },
+            |_| async { Ok(()) },
             |_| async { Ok(()) },
         ));
         assert!(stop.as_mut().now_or_never().is_none());
         proofs.add_permits(2);
         clone.await.unwrap();
         stop.await.unwrap();
+    }
+
+    /// A stop that begins during a clone hands the root's stop the clone's
+    /// target, which the root's retention decision needs.
+    #[tokio::test]
+    async fn a_stop_during_a_clone_sees_the_target_facet() {
+        crate::asyncrt::install_test_host_runtime();
+        let (streams, directory) = streams();
+        let path = |cell: &str, _: u64| directory.path().join(cell.replace('/', "_")).join("db");
+        let local = |cell: &str| directory.path().join(cell.replace('/', "_"));
+        let (source, target) = (vec!["a".to_string()], vec!["b".to_string()]);
+        let from = path(&crate::engine_api::facet_cell("root", &source), 1);
+        crate::asyncrt::fs()
+            .create_dir_all(from.parent().unwrap())
+            .unwrap();
+        database(&from, 3);
+        let proofs = Arc::new(tokio::sync::Semaphore::new(0));
+        let prove = |_: String, _: u64| {
+            let proofs = proofs.clone();
+            async move {
+                proofs.acquire().await?.forget();
+                Ok(())
+            }
+        };
+        let mut clone =
+            Box::pin(streams.clone_facet(None, path, local, prove, "root", 1, &source, &target));
+        assert!(clone.as_mut().now_or_never().is_none());
+        let seen = std::sync::Mutex::new(Vec::new());
+        let mut stop = Box::pin(streams.stop_root(
+            "root",
+            1,
+            true,
+            |open| async {
+                *seen.lock().unwrap() = open;
+                Ok(())
+            },
+            |_| async { Ok(()) },
+        ));
+        assert!(stop.as_mut().now_or_never().is_none());
+        proofs.add_permits(2);
+        clone.await.unwrap();
+        stop.await.unwrap();
+        let target = crate::engine_api::facet_cell("root", &target);
+        assert!(seen.lock().unwrap().contains(&target));
     }
 
     #[tokio::test]
@@ -900,7 +947,7 @@ mod tests {
             "root",
             1,
             false,
-            || async { Ok(()) },
+            |_| async { Ok(()) },
             |_| async { Ok(()) },
         ));
         assert!(stop.as_mut().now_or_never().is_none());
