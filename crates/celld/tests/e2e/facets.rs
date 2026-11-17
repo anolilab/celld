@@ -132,6 +132,23 @@ async fn a_delete_of_the_source_waits_for_a_pending_clone() {
     assert_eq!(count(&server.get_text("/").await), 0);
 }
 
+/// An abort of the source between the clone and the delete keeps the clone's
+/// barrier, so the delete still waits for the copy.
+#[tokio::test]
+async fn an_abort_of_the_source_does_not_let_a_delete_skip_a_pending_clone() {
+    let server = Server::start("facets", &[]).await;
+    count(&server.get_text("/").await);
+    let before = count(&server.get_text("/").await);
+
+    assert_eq!(
+        server.get_text("/clone-abort-delete-source").await,
+        "cloned"
+    );
+
+    assert_eq!(count(&server.get_text("/copy").await), before + 1);
+    assert_eq!(count(&server.get_text("/").await), 0);
+}
+
 /// A stub taken before a clone is the old target: it throws afterwards.
 #[tokio::test]
 async fn a_stub_from_before_a_clone_throws() {

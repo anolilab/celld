@@ -2295,7 +2295,12 @@ class DurableObjectFacets {
       .then(([loader, className]) =>
         __facet_abort(
           loader, className, this._state._scope, record.owner, name), () => {});
-    this._hold(name, barrier, false);
+    // An operation already pending on the name, such as a clone reading it
+    // as its source, stays in force: later operations wait for it as well as
+    // for the abort, and a failure it ends with is kept.
+    const pending = this._barriers.get(name);
+    if (pending === undefined) this._hold(name, barrier, false);
+    else this._hold(name, Promise.all([pending, barrier]).then(() => {}), true);
     return barrier;
   }
   abort(name, reason) {

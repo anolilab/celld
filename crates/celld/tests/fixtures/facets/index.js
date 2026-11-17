@@ -81,6 +81,15 @@ export class Supervisor extends DurableObject {
       await cloned;
       return new Response("cloned");
     }
+    // An abort of the source in between must not let the delete skip the
+    // clone either.
+    if (path === "/clone-abort-delete-source") {
+      const cloned = this.ctx.facets.clone("app", "copy");
+      this.ctx.facets.abort("app");
+      this.ctx.facets.delete("app");
+      await cloned;
+      return new Response("cloned");
+    }
     if (path === "/clone-self") {
       try {
         await this.ctx.facets.clone("app", "app");
