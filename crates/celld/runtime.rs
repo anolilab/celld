@@ -698,7 +698,7 @@ pub(crate) async fn receive_service_fetch_response(
     // The waiter is dropped, rather than told, when its caller goes away
     // (an abort rejects the caller's promise and abandons the call), so the
     // target's request would run on with a live `request.signal`.
-    let mut abort = AbortOnDrop(Some(cancellation.clone()));
+    let mut abort = AbortOnDrop::armed(cancellation.clone());
     let received = match cancel {
         Some(mut cancel) => crate::asyncrt::select_biased! {
             "a completed service response wins a tie with an external disconnect";
@@ -716,9 +716,13 @@ pub(crate) async fn receive_service_fetch_response(
 
 /// Aborts a request when its waiter is dropped before the request answers,
 /// as when the caller disconnects.
-pub(crate) struct AbortOnDrop(pub(crate) Option<Arc<RequestCancellationLifetime>>);
+pub(crate) struct AbortOnDrop(Option<Arc<RequestCancellationLifetime>>);
 
 impl AbortOnDrop {
+    pub(crate) fn armed(cancellation: Arc<RequestCancellationLifetime>) -> Self {
+        Self(Some(cancellation))
+    }
+
     pub(crate) fn disarm(&mut self) {
         self.0 = None;
     }

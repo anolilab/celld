@@ -8622,13 +8622,14 @@ fn op_fetch(
             headers,
             reply: tx,
         };
-        let ws_owner = websocket::ws_caller(scope).owner;
         let stream_service = http_stream_service();
         let id = asyncrt::enqueue(async move {
             let mut cancel_guard = cancel_guard;
             gated_channel_send(gate, &SVC_CALL_TX, request, "no service binding channel").await?;
             let result = match rx.await {
-                Ok(Ok(response)) => encode_granted_response(ws_owner, response, &stream_service),
+                // Global `fetch()` never reads a socket target, so a 101 hands
+                // nothing over and its socket closes with the response.
+                Ok(Ok(response)) => encode_http_response(response, false, &stream_service),
                 Ok(Err(error)) => Err(format!("{error}")),
                 Err(error) => Err(format!("globalOutbound Fetcher dropped: {error}")),
             };
@@ -11745,7 +11746,8 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
     // object carried, so only the request the host handed the target to can
     // return it.
     let caller = websocket::ws_caller(scope);
-    if let Some(target) = &ws {
+    // A parked Worker socket is checked when it is taken, below.
+    if let Some(target) = ws.as_ref().filter(|target| !target.scope.is_empty()) {
         if !ws_may_return_target(&caller, target) {
             return Err(anyhow!("WebSocket target was not handed to this request"));
         }
@@ -11769,8 +11771,9 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
     let websocket = match (ws, worker_ws) {
         // A socket a loaded Worker answered with, returned as it was handed.
         (Some(target), None) if target.scope.is_empty() => Some(HttpResponseWebSocket::Worker(
-            websocket::ws_take_parked_worker(&target)
-                .ok_or_else(|| anyhow!("Worker WebSocket {} was already taken", target.id))?,
+            websocket::ws_take_parked_worker(&target, caller.owner).ok_or_else(|| {
+                anyhow!("WebSocket target was not handed to this request, or was already taken")
+            })?,
         )),
         (Some(target), None) => Some(HttpResponseWebSocket::Cell(target)),
         (None, Some(worker)) => Some(HttpResponseWebSocket::Worker(worker)),

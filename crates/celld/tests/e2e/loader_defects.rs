@@ -13,7 +13,7 @@ use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 
-use super::harness::{wait_until, Server};
+use super::harness::{wait_until, Server, ONE_ISOLATE};
 
 #[tokio::test]
 async fn sibling_modules_resolve_their_own_named_imports_from_one_builtin() {
@@ -101,4 +101,81 @@ async fn a_101_from_the_loaded_worker_carries_its_websocket_to_the_caller() {
         "the response lost its webSocket: {out}"
     );
     assert_eq!(out["echo"], "echo:hi", "{out}");
+}
+
+#[tokio::test]
+async fn the_callers_close_reaches_the_loaded_worker_with_its_own_code() {
+    let server = Server::start("loader-defects", ONE_ISOLATE).await;
+    let out: Value = server.get_json("/socket-close?who=caller").await;
+    assert_eq!(
+        out["caller"]["code"], 3001,
+        "the caller's close is echoed: {out}"
+    );
+    let closes = out["loaded"]["closes"].as_array().expect("closes");
+    assert_eq!(closes.len(), 1, "{out}");
+    assert_eq!(closes[0]["code"], 3001, "{out}");
+    assert_eq!(closes[0]["reason"], "from caller", "{out}");
+    assert_eq!(closes[0]["wasClean"], true, "{out}");
+    assert_eq!(
+        out["loaded"]["errors"], 0,
+        "the close is not an error: {out}"
+    );
+}
+
+#[tokio::test]
+async fn the_loaded_workers_close_reaches_the_caller_with_its_own_code() {
+    let server = Server::start("loader-defects", ONE_ISOLATE).await;
+    let out: Value = server.get_json("/socket-close?who=worker").await;
+    assert_eq!(out["caller"]["code"], 3002, "{out}");
+    assert_eq!(out["caller"]["reason"], "from worker", "{out}");
+    assert_eq!(out["caller"]["wasClean"], true, "{out}");
+    let closes = out["loaded"]["closes"].as_array().expect("closes");
+    // The closing end is not told of its own close, as on a pair in one isolate.
+    assert!(closes.is_empty(), "{out}");
+    assert_eq!(out["loaded"]["errors"], 0, "{out}");
+}
+
+#[tokio::test]
+async fn a_loaded_worker_cannot_fill_a_socket_the_caller_never_accepts() {
+    let server = Server::start("loader-defects", ONE_ISOLATE).await;
+    let out: Value = server.get_json("/socket-flood").await;
+    let sent = out["sent"].as_u64().expect("sent");
+    // 1 MiB is the cap, and the Worker sends 64 KiB per frame.
+    assert!(
+        sent < 100,
+        "the Worker kept sending into a full buffer: {out}"
+    );
+    assert_eq!(out["closes"], serde_json::json!([1009]), "{out}");
+}
+
+#[tokio::test]
+async fn a_service_call_nobody_waits_for_aborts_its_target() {
+    let server = Server::start("loader-defects", ONE_ISOLATE).await;
+    assert_eq!(server.get_text("/outbound-drop").await, "answered");
+    wait_until(
+        "the outbound Fetcher's request to abort",
+        Duration::from_secs(5),
+        || async {
+            let out: Value = server.get_json("/outbound-state").await;
+            (out["started"] == 1 && out["aborted"] == 1).then_some(())
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_durable_object_can_return_a_loaded_workers_socket_to_an_upgrading_caller() {
+    let server = Server::start("loader-defects", &[]).await;
+    let out: Value = server.get_json("/relay").await;
+    assert_eq!(out["status"], 101, "{out}");
+    assert_eq!(out["echo"], "echo:hi", "{out}");
+}
+
+#[tokio::test]
+async fn a_durable_object_cannot_answer_a_plain_request_with_a_loaded_workers_socket() {
+    let server = Server::start("loader-defects", &[]).await;
+    // The upgrade check applies to every socket a Durable Object returns, so
+    // a caller that did not ask for one gets an error instead of a 101.
+    let out: Value = server.get_json("/relay?upgrade=no").await;
+    assert!(out["threw"].is_string(), "{out}");
 }

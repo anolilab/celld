@@ -507,6 +507,7 @@ pub(super) fn op_ws_upgrade(
                 headers,
                 want_response: true,
                 target: None,
+                worker: None,
                 facet,
                 reply: tx,
             })
@@ -639,6 +640,7 @@ pub(super) fn op_ws_connect(
                 headers: Vec::new(),
                 want_response: false,
                 target: None,
+                worker: None,
                 facet,
                 reply: tx,
             })
@@ -691,9 +693,18 @@ pub(super) fn op_ws_bind_target(
     if !ws_own_cell(scope, &cell) || !ws_claim(scope, id) {
         return;
     }
-    if !ws_target_granted(&target, owner) {
+    // A stateless Worker's socket is taken here, under the grant check, so
+    // the bind owns it from this call on. A cell's socket is only checked.
+    let worker = if target.scope.is_empty() {
+        match ws_take_parked_worker(&target, owner) {
+            Some(worker) => Some(worker),
+            None => return loader_throw(scope, "WebSocket target was not handed to this request"),
+        }
+    } else if ws_target_granted(&target, owner) {
+        None
+    } else {
         return loader_throw(scope, "WebSocket target was not handed to this request");
-    }
+    };
     // The caller end's frames reach this isolate through its pull queue, so
     // they never route by `cell`. The record still matters: a facet that
     // stops closes its sockets by it, and this end would otherwise keep the
@@ -724,7 +735,8 @@ pub(super) fn op_ws_bind_target(
                 pull: Some(pull_tx),
                 headers: Vec::new(),
                 want_response: false,
-                target: Some(target),
+                target: worker.is_none().then_some(target),
+                worker,
                 // `scope` names the target, which keeps its own route.
                 facet: None,
                 reply: tx,

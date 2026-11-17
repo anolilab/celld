@@ -31,6 +31,7 @@ use crate::actor::AppHandle;
 use crate::bucket::Bucket;
 use crate::generation::{DeploymentGraph, Generation, GenerationOptions};
 use crate::protocol::{ComponentPointer, DeployPointer, Rollout};
+use crate::runtime::AbortOnDrop;
 
 /// The internal-listener route.
 pub const PATH: &str = "/invoke";
@@ -146,8 +147,6 @@ pub fn shadow_pointer(
     }
 }
 
-use crate::runtime::AbortOnDrop;
-
 /// Answer one request to [`PATH`]. Returns the HTTP status and the JSON body.
 pub async fn handle(
     app: &AppHandle,
@@ -231,7 +230,7 @@ async fn run(
         .ok_or_else(|| Refusal::new(500, "the shadow generation lacks the requested script"))?;
 
     let cancellation = crate::runtime::RequestCancellationLifetime::stateless();
-    let mut abort = AbortOnDrop(Some(cancellation.clone()));
+    let mut abort = AbortOnDrop::armed(cancellation.clone());
     let fetching = service.fetch(
         prepared.url,
         prepared.method,

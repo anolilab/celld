@@ -460,25 +460,33 @@ impl OutboundWebSocketSink {
     }
 }
 
+/// Pass one data frame an end sent to the queue of the end it faces. False
+/// when that end stopped reading, which ends the pipe.
+async fn forward_data(sink: &celld::js::WsPullSender, frame: celld::js::WsOut) -> bool {
+    match frame {
+        celld::js::WsOut::Text(text) => sink.send(celld::js::WsPull::Text(text)).await.is_ok(),
+        celld::js::WsOut::Binary(bytes) => {
+            sink.send(celld::js::WsPull::Binary(bytes)).await.is_ok()
+        }
+        celld::js::WsOut::Close(..) => false,
+    }
+}
+
 /// Carry frames between a stateless Worker's socket and a client end another
 /// isolate in this process kept. The Worker end answered an upgrade as a
 /// top-level Worker does, so its frames use the channels it prepared for an
 /// external client: its output queue out, its inbound queue in.
 ///
 /// The task ends when either side closes, and it unregisters the client end.
-/// Dropping the Worker's socket unregisters its own.
+/// Dropping the Worker's socket unregisters its own. Both ends are told how it
+/// ended: the close one end sent is echoed to the other, and a pipe that fails
+/// closes both with 1011.
 async fn worker_websocket_pipe(
     id: u64,
-    target: &celld::js::WsTarget,
+    worker: celld::js::WorkerWebSocket,
     pull: celld::js::WsPullSender,
     reply: tokio::sync::oneshot::Sender<anyhow::Result<celld::js::OutboundWsOpen>>,
 ) -> anyhow::Result<()> {
-    let Some(worker) = celld::js::websocket::ws_take_parked_worker(target) else {
-        let _ = reply.send(Err(anyhow::anyhow!(
-            "the Worker WebSocket was already taken"
-        )));
-        return Ok(());
-    };
     let inbound = worker.inbound();
     let (caller_tx, mut from_caller) = mpsc::unbounded_channel();
     let (worker_tx, mut from_worker) = mpsc::unbounded_channel();
@@ -488,40 +496,40 @@ async fn worker_websocket_pipe(
         protocol: None,
         declined: None,
     }));
+    let mut closing = (1011, "WebSocket pipe failed".to_string());
     loop {
         celld::asyncrt::select! {
             frame = from_caller.recv() => match frame {
-                Some(celld::js::WsOut::Text(text)) => {
-                    if inbound.send(celld::js::WsIn::Text(text).into()).await.is_err() { break; }
-                }
-                Some(celld::js::WsOut::Binary(bytes)) => {
-                    if inbound.send(celld::js::WsIn::Binary(bytes).into()).await.is_err() { break; }
-                }
                 Some(celld::js::WsOut::Close(code, reason)) => {
-                    let _ = inbound.send_close(code, reason, true);
+                    closing = (code, reason);
                     break;
+                }
+                Some(frame) => {
+                    if !forward_data(&inbound, frame).await { break; }
                 }
                 // The caller's request retired and took its socket with it.
                 None => {
-                    let _ = inbound.send_close(1001, "request ended".into(), true);
+                    closing = (1001, "request ended".into());
                     break;
                 }
             },
             frame = from_worker.recv() => match frame {
-                Some(celld::js::WsOut::Text(text)) => {
-                    if pull.send(celld::js::WsPull::Text(text)).await.is_err() { break; }
-                }
-                Some(celld::js::WsOut::Binary(bytes)) => {
-                    if pull.send(celld::js::WsPull::Binary(bytes)).await.is_err() { break; }
-                }
                 Some(celld::js::WsOut::Close(code, reason)) => {
-                    let _ = pull.send_close(code, reason, true);
+                    closing = (code, reason);
                     break;
+                }
+                Some(frame) => {
+                    if !forward_data(&pull, frame).await { break; }
                 }
                 None => break,
             },
         }
     }
+    // The first close on a queue is the only one, so an end that already
+    // closed keeps its own.
+    let (code, reason) = closing;
+    let _ = inbound.send_close(code, reason.clone(), true);
+    let _ = pull.send_close(code, reason, true);
     celld::js::ws_unregister(id);
     celld::js::ws_pull_unregister(id);
     Ok(())
@@ -551,9 +559,6 @@ async fn local_websocket_pipe(
         )));
         return Ok(());
     };
-    if target.scope.is_empty() {
-        return worker_websocket_pipe(id, &target, pull, reply).await;
-    }
     // Both registrations flush whatever each end queued before it had
     // anywhere to send: the cell's greeting frame is queued while its own
     // fetch handler still runs, and the caller can send the moment it
@@ -598,20 +603,24 @@ async fn local_websocket_pipe(
                 None => break,
             },
             frame = from_cell.recv() => match frame {
-                Some(celld::js::WsOut::Text(text)) => {
-                    if pull.send(celld::js::WsPull::Text(text)).await.is_err() { break; }
-                }
-                Some(celld::js::WsOut::Binary(bytes)) => {
-                    if pull.send(celld::js::WsPull::Binary(bytes)).await.is_err() { break; }
-                }
                 Some(celld::js::WsOut::Close(code, reason)) => {
                     let _ = pull.send_close(code, reason, true);
                     break;
+                }
+                Some(frame) => {
+                    if !forward_data(&pull, frame).await { break; }
                 }
                 None => break,
             },
         }
     }
+    // The caller's own close is echoed to it, and a pipe that ended without
+    // a close from either end closes the caller with 1011 rather than leaving
+    // it to read an abnormal end. A close the cell sent is already queued.
+    let (code, reason) = caller_close
+        .clone()
+        .unwrap_or((1011, "WebSocket pipe failed".into()));
+    let _ = pull.send_close(code, reason, true);
     if let Some((code, reason)) = caller_close {
         let _ = dispatch_ws_closed(&app, &socket, target.id, code, reason, true).await;
     }
@@ -637,9 +646,19 @@ pub(crate) async fn outbound_websocket_task(
         headers,
         want_response,
         target,
+        worker,
         facet,
         reply,
     } = request;
+    if let Some(worker) = worker {
+        let Some(pull) = pull else {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "a bound WebSocket target needs an isolate queue"
+            )));
+            return Ok(());
+        };
+        return worker_websocket_pipe(id, worker, pull, reply).await;
+    }
     if let Some(target) = target {
         return local_websocket_pipe(app, id, target, pull, reply).await;
     }

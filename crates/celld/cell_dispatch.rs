@@ -349,12 +349,16 @@ async fn dispatch_local_fetch(
             // has installed its request context. That context now
             // owns an unread tail through its waitUntil work.
             body_guard.disarm();
-            if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
-                accepted = Some(target.clone());
+            // A Durable Object can return a loaded Worker's socket as well as
+            // its own, and either needs the caller to have asked to upgrade.
+            if response.websocket.is_some() {
                 // workerd applies this check in the object's own response
                 // path, so the caller's `stub.fetch()` rejects whichever
                 // node the caller runs on.
                 anyhow::ensure!(upgrade, "TypeError: {WEBSOCKET_WITHOUT_UPGRADE}");
+            }
+            if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
+                accepted = Some(target.clone());
                 let (cell, hibernatable) = crate::js::ws_core_registration(target);
                 let kind = if hibernatable {
                     WebSocketKind::Hibernatable
