@@ -70,7 +70,9 @@ deployment mode.
 ## Specification: exhaustive at small size
 
 *Status: no TLA+ specification is in this repository. A clean-room
-specification is tracked in [#4](https://github.com/anolilab/celld/issues/4).*
+specification is tracked in [#4](https://github.com/anolilab/celld/issues/4).
+In the meantime `crates/logic` holds an exhaustive explorer that runs in
+`cargo test`; see [the explorer](#the-explorer-in-the-repository) below.*
 
 The coordination protocol is specified in TLA+. Heyang Zhou wrote the
 specifications against celld v0.1.0. His model checking found four bugs and a
@@ -101,6 +103,30 @@ recoverable ordering error into permanent data loss.
 We update the specifications by hand with protocol changes. They do not run in
 continuous integration. A separate record tracks what the model does not yet
 describe, including guarantees weaker than the code's.
+
+### The explorer in the repository
+
+`explorer.rs`, `ownership_model.rs` and their tests in `crates/logic` visit
+every interleaving of a small configuration of today's ownership protocol. Each
+node is the real decision core, fed through `on_event`. The model supplies only
+the effects: a store with create-only and token-guarded writes, an error that
+does not say whether a write applied, a write that lands after its writer
+crashed, node-log sessions, lease expiry, record loss, a drain and a preserved
+restart. A node that is paused is a node whose steps are not chosen.
+
+It checks that no epoch has two writers, that no acknowledged write is lost,
+that a stale owner never acknowledges, and that a lost record is not answered
+as a new cell. Each run prints its state count, its depth, the bound it hit and
+its time. The pass runs are exhaustive and fit a debug build. Shell-side
+mutants, each removing one rule, must each break an invariant that their
+control keeps, so a pass cannot come from a checker that cannot fail.
+
+The model finds one window in today's design, pinned as an expected
+counterexample: a first claim that read a record as absent can land after the
+record was created and lost. A longer configuration runs with
+`CELLD_EXPLORE=large cargo test -p celld-logic --lib explore_large -- --ignored
+--nocapture`. What the model leaves out is listed at the top of
+`ownership_model.rs`.
 
 ## Simulation: the protocol under adversarial schedules
 

@@ -66,6 +66,16 @@ fn pass_configs() -> Vec<(&'static str, ModelConfig)> {
             },
         ),
         (
+            "preserved restart of the owner, mixed proofs",
+            ModelConfig {
+                preserved: 1,
+                crashes: 0,
+                evicts: 0,
+                ambiguous: 0,
+                ..config(2, 1)
+            },
+        ),
+        (
             "body-hash tokens, ambiguous claims",
             ModelConfig {
                 token: TokenKind::BodyHash,
@@ -87,14 +97,96 @@ fn pass_configs() -> Vec<(&'static str, ModelConfig)> {
     ]
 }
 
+/// Events the adversary must reach across the pass runs. A pass over a model
+/// that never reaches them proves nothing.
+const REQUIRED_LABELS: &[&str] = &[
+    "acknowledged",
+    "ambiguous_after_apply",
+    "bucket_proof",
+    "fleet_proof",
+    "late_landing",
+    "log_recovered",
+    "preserved_restart",
+    "released",
+    "restart",
+    "resumed",
+    "takeover_applied",
+    "verify_refused",
+];
+
 #[test]
 fn baseline_holds_every_invariant() {
+    let mut reached = std::collections::BTreeSet::new();
     for (name, cfg) in pass_configs() {
         let report = run(name, cfg, false);
         report.print_labels();
         report.print_violations();
         assert!(report.passed(), "{name}");
         assert!(report.complete(), "{name} hit a bound");
+        reached.extend(report.labels.keys().copied());
+    }
+    let missing: Vec<_> = REQUIRED_LABELS
+        .iter()
+        .filter(|label| !reached.contains(*label))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the pass runs never reached {missing:?}"
+    );
+}
+
+/// The larger runs: `CELLD_EXPLORE=large cargo test -p celld-logic --lib
+/// explore_large -- --ignored --nocapture`.
+#[test]
+#[ignore = "large configuration; set CELLD_EXPLORE=large and run with --ignored"]
+fn explore_large() {
+    if std::env::var("CELLD_EXPLORE").as_deref() != Ok("large") {
+        return;
+    }
+    let bigger = [
+        (
+            "three requests, ambiguous claims, one crash",
+            ModelConfig {
+                ambiguous: 1,
+                ..config(3, 1)
+            },
+        ),
+        (
+            "two writes, an eviction, a drain",
+            ModelConfig {
+                writes: 2,
+                drains: 1,
+                crashes: 0,
+                ..config(2, 2)
+            },
+        ),
+        (
+            "three nodes",
+            ModelConfig {
+                nodes: 3,
+                crashes: 0,
+                ambiguous: 0,
+                evicts: 0,
+                ..config(3, 1)
+            },
+        ),
+    ];
+    for (name, cfg) in bigger {
+        let report = explore(
+            &Ownership::new(cfg.clone()),
+            Limits {
+                max_states: 3_000_000,
+                max_depth: 400,
+                stop_at_first: false,
+            },
+        );
+        eprintln!(
+            "{name} [{} nodes, 1 cell, {} requests, {} writes, {} crashes, {} ambiguous, {} drains, {} evicts]\n  {}",
+            cfg.nodes, cfg.requests, cfg.writes, cfg.crashes, cfg.ambiguous, cfg.drains, cfg.evicts,
+            report.summary("result")
+        );
+        report.print_violations();
+        assert!(report.passed_except(&[STALLED_CREATE]), "{name}");
     }
 }
 

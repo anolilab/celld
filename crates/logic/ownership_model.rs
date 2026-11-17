@@ -27,7 +27,8 @@
 //! | `epoch_prefix_two_writers` | one epoch prefix holds rows of two writers |
 //! | `stale_ack` | a write is acknowledged at an epoch below the record's |
 //! | `lost_ack` | a restore misses a write acknowledged at a lower epoch |
-//! | `new_over_data` | a first claim applies over a cell that has data |
+//! | `new_over_data` | a first claim applies over rows its claimer could see |
+//! | `stalled_create_over_lost_record` | a first claim that read the record as absent lands after the record was created and lost (the one window of today's design the model finds) |
 //! | `core_panic` | the decision core refused an event it was sent |
 //!
 //! # What the model leaves out
@@ -49,6 +50,14 @@
 //! - A forwarded request is not delivered: a request that routes to another
 //!   node ends there.
 //! - Alarms, websockets and the capacity lookup are not driven.
+//! - A preserved restart runs through the core's lease start and its local
+//!   resume, but the predecessor's quiesce is one step, taken only when every
+//!   row its log holds is already in the bucket.
+//! - A recovery that fails and is retried, a follower that errs, and a
+//!   partial tail are not modelled: a fleet proof either completes or the
+//!   session is sealed.
+//! - A write that the store applies twice is outside the model, as it is
+//!   outside the protocol.
 
 use crate::explorer::{Model, Step, Violation};
 use crate::*;
@@ -104,6 +113,7 @@ pub(crate) struct ModelConfig {
     pub losses: u8,
     pub evicts: u8,
     pub drains: u8,
+    pub preserved: u8,
     pub flushes: u8,
     /// Nodes may renew their leases, and a renewal that finds its lease
     /// fenced ends the process.
@@ -126,6 +136,7 @@ impl ModelConfig {
             losses: 0,
             evicts: 1,
             drains: 0,
+            preserved: 0,
             flushes: 0,
             renew: false,
             token: TokenKind::PerWrite,
@@ -261,6 +272,9 @@ struct Proc {
     reqs: BTreeMap<RequestId, Req>,
     next_request: RequestId,
     local: Option<Local>,
+    /// The cells a preserved restart left on disk for this process.
+    marker: Vec<LocalCell>,
+    pred_log_sealed: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -273,6 +287,7 @@ struct Budget {
     losses: u8,
     evicts: u8,
     drains: u8,
+    preserved: u8,
     flushes: u8,
 }
 
@@ -319,6 +334,8 @@ pub(crate) enum Action {
     Finish(Node, RequestId),
     Evict(Node),
     Drain(Node),
+    /// A planned replacement of the process that keeps its cells.
+    PreservedRestart(Node),
     Crash(Node),
     Start(Node),
     Advance,
@@ -354,6 +371,8 @@ impl Ownership {
             reqs: BTreeMap::new(),
             next_request: 1,
             local: None,
+            marker: Vec::new(),
+            pred_log_sealed: false,
         }
     }
 
@@ -363,9 +382,7 @@ impl Ownership {
                 store.next_token += 1;
                 store.next_token
             }
-            TokenKind::BodyHash => {
-                1000 + body_node.map_or(0, |n| n as u16 + 1) * 16 + epoch as u16
-            }
+            TokenKind::BodyHash => 1000 + body_node.map_or(0, |n| n as u16 + 1) * 16 + epoch as u16,
         }
     }
 
@@ -462,7 +479,11 @@ impl Ownership {
                 queue.push(event);
             }
             Effect::AwaitDurable { .. } => {
-                world.procs[node].as_mut().expect("proc").pending.push(effect);
+                world.procs[node]
+                    .as_mut()
+                    .expect("proc")
+                    .pending
+                    .push(effect);
             }
             Effect::CasOwner {
                 op,
@@ -523,6 +544,25 @@ impl Ownership {
                     op,
                     result: Err(Failure::Definite),
                 });
+            }
+            Effect::ReadSelfNodeLease { op } => {
+                let record = self.predecessor_lease(world, node);
+                queue.push(Event::SelfNodeLeaseRead {
+                    op,
+                    now_ms: era_ms(world.era),
+                    now_mono_ms: era_ms(world.era),
+                    result: Ok(Some(record)),
+                });
+            }
+            Effect::CasNodeLease { op, .. } => queue.push(Event::NodeLeaseCasCompleted {
+                op,
+                now_mono_ms: era_ms(world.era),
+                result: Ok(LeaseCasOutcome::Applied { etag: "e".into() }),
+                stamped_log_state: None,
+            }),
+            Effect::ReadLocalCells => {
+                let cells = world.procs[node].as_ref().expect("proc").marker.clone();
+                queue.push(Event::LocalCellsRead { result: Ok(cells) });
             }
             Effect::Halt { .. } => {
                 labels.push("halted");
@@ -613,6 +653,23 @@ impl Ownership {
         let lineage = world.last[owner].0;
         for (epoch, row) in rows {
             Self::put_bucket(world, epoch, row, (owner, lineage));
+        }
+    }
+
+    /// The record a preserved restart's successor finds: the predecessor's
+    /// lease, still unexpired, with its log sealed.
+    fn predecessor_lease(&self, world: &World, node: Node) -> NodeLeaseRecord {
+        let generation = world.procs[node].as_ref().expect("proc").generation - 1;
+        NodeLeaseRecord {
+            node: name(node),
+            addr: format!("{}:8081", name(node)),
+            expires_ms: era_ms(world.era) + 30_000,
+            peer_protocol: 1,
+            generation: format!("g{generation}"),
+            log_state: world.procs[node]
+                .as_ref()
+                .and_then(|p| p.pred_log_sealed.then_some(log_tier::LogState::Sealed)),
+            etag: "previous".into(),
         }
     }
 
@@ -710,7 +767,13 @@ impl Ownership {
                 }
             }
             Effect::Restore { op, spec, .. } => {
-                let max_used = world.store.bucket.iter().filter(|(_, r)| !r.is_empty()).map(|(e, _)| *e).max();
+                let max_used = world
+                    .store
+                    .bucket
+                    .iter()
+                    .filter(|(_, r)| !r.is_empty())
+                    .map(|(e, _)| *e)
+                    .max();
                 let proc = world.procs[node].as_mut().expect("proc");
                 if spec.resume.is_some() {
                     labels.push("resumed");
@@ -734,8 +797,7 @@ impl Ownership {
                             alarm: None,
                         }),
                     }
-                } else if max_used.is_some_and(|used| used >= spec.epoch)
-                {
+                } else if max_used.is_some_and(|used| used >= spec.epoch) {
                     labels.push("restore_refused_used_epoch");
                     Event::RestoreCompleted {
                         op,
@@ -780,16 +842,21 @@ impl Ownership {
                 }
             }
             Effect::VerifyOwnership { op, epoch, .. } => {
-                let named = self.cfg.mutant == ShellMutant::SkipVerifyOwnership
-                    || world.store.owner.as_ref().is_some_and(|record| {
-                        record.node == Some(node) && record.epoch == epoch
-                    });
+                let named =
+                    self.cfg.mutant == ShellMutant::SkipVerifyOwnership
+                        || world.store.owner.as_ref().is_some_and(|record| {
+                            record.node == Some(node) && record.epoch == epoch
+                        });
                 if !named {
                     labels.push("verify_refused");
                 }
                 Event::OwnershipVerified {
                     op,
-                    result: if named { Ok(()) } else { Err(Failure::Definite) },
+                    result: if named {
+                        Ok(())
+                    } else {
+                        Err(Failure::Definite)
+                    },
                 }
             }
             other => unreachable!("{other:?} is not a read"),
@@ -879,10 +946,8 @@ impl Ownership {
 
     fn fleet_possible(&self, world: &World, node: Node, proc: &Proc) -> bool {
         let lease = &world.store.leases[node];
-        matches!(
-            self.cfg.durability,
-            Durability::Fleet | Durability::Mixed
-        ) && lease.generation == proc.generation
+        matches!(self.cfg.durability, Durability::Fleet | Durability::Mixed)
+            && lease.generation == proc.generation
             && (lease.log != LogSt::Sealed || self.cfg.mutant == ShellMutant::SealedLogStillProves)
     }
 
@@ -938,16 +1003,13 @@ impl Ownership {
                             ));
                         }
                     }
-                    match earlier {
-                        Some(other) if other != writer => {
-                            if !matches!(guard, CasGuard::Absent) {
-                                world.ghost.violations.push(Violation::new(
-                                    "epoch_two_claims",
-                                    format!("epoch {epoch} claimed by {other:?} and {writer:?}"),
-                                ));
-                            }
+                    if let Some(other) = earlier.filter(|other| *other != writer) {
+                        if !matches!(guard, CasGuard::Absent) {
+                            world.ghost.violations.push(Violation::new(
+                                "epoch_two_claims",
+                                format!("epoch {epoch} claimed by {other:?} and {writer:?}"),
+                            ));
                         }
-                        _ => {}
                     }
                     world.ghost.claimed.insert(*epoch, writer);
                     if *takeover {
@@ -1070,6 +1132,7 @@ impl Model for Ownership {
                 losses: self.cfg.losses,
                 evicts: self.cfg.evicts,
                 drains: self.cfg.drains,
+                preserved: self.cfg.preserved,
                 flushes: self.cfg.flushes,
             },
             ghost: Ghost::default(),
@@ -1096,10 +1159,8 @@ impl Model for Ownership {
                 };
                 if matches!(effect, Effect::AwaitDurable { .. }) {
                     let fleet = self.fleet_possible(world, node, proc);
-                    let bucket = matches!(
-                        self.cfg.durability,
-                        Durability::Bucket | Durability::Mixed
-                    );
+                    let bucket =
+                        matches!(self.cfg.durability, Durability::Bucket | Durability::Mixed);
                     if fleet {
                         actions.push(Action::Prove(node, op, Some(ProofSource::Fleet)));
                     }
@@ -1112,8 +1173,7 @@ impl Model for Ownership {
                 }
             }
             if let Some(epoch) = Self::resident_epoch(proc) {
-                if world.budget.writes > 0
-                    && proc.local.as_ref().is_some_and(|l| l.epoch == epoch)
+                if world.budget.writes > 0 && proc.local.as_ref().is_some_and(|l| l.epoch == epoch)
                 {
                     for (request, req) in &proc.reqs {
                         if req.active && req.write.is_none() {
@@ -1132,6 +1192,24 @@ impl Model for Ownership {
             }
             if world.budget.drains > 0 && !proc.state.draining() {
                 actions.push(Action::Drain(node));
+            }
+            if world.budget.preserved > 0 && !proc.state.draining() {
+                let covered = world
+                    .store
+                    .sessions
+                    .get(&(node, proc.generation))
+                    .is_none_or(|s| {
+                        s.rows
+                            .iter()
+                            .all(|(e, r)| world.store.bucket.get(e).is_some_and(|b| b.contains(r)))
+                    });
+                let quiet = !world
+                    .writes
+                    .iter()
+                    .any(|w| w.node == node && w.generation == proc.generation);
+                if covered && quiet {
+                    actions.push(Action::PreservedRestart(node));
+                }
             }
             if world.budget.crashes > 0 {
                 actions.push(Action::Crash(node));
@@ -1256,6 +1334,61 @@ impl Model for Ownership {
             Action::Drain(node) => {
                 world.budget.drains -= 1;
                 labels.extend(self.send(&mut world, *node, Event::ReleaseAll));
+            }
+            Action::PreservedRestart(node) => {
+                world.budget.preserved -= 1;
+                labels.push("preserved_restart");
+                let proc = world.procs[*node].as_ref().expect("proc");
+                let (generation, lineage) = (proc.generation, proc.lineage);
+                let epoch = proc.state.accepted_epoch(CELL);
+                if let Some(epoch) = epoch {
+                    self.upload_local(&mut world, *node, epoch);
+                }
+                let lease = &mut world.store.leases[*node];
+                let sealed = lease.log == LogSt::Open;
+                if sealed {
+                    lease.log = LogSt::Sealed;
+                }
+                let old = world.procs[*node].take().expect("proc");
+                world.writes.retain(|w| {
+                    !(w.node == *node && w.generation == generation && w.landed.is_some())
+                });
+                let mut next = self.fresh_proc(*node, generation + 1, lineage);
+                next.pred_log_sealed = sealed;
+                next.local = old.local.map(|mut local| {
+                    local.unproven.clear();
+                    local
+                });
+                if let (Some(epoch), Some(_)) = (epoch, next.local.as_ref()) {
+                    next.marker = vec![LocalCell {
+                        id: CELL.into(),
+                        epoch,
+                        live: true,
+                    }];
+                }
+                world.last[*node] = (lineage, generation + 1);
+                world.store.leases[*node] = Lease {
+                    generation: generation + 1,
+                    expires: world.era + TTL_ERAS,
+                    log: LogSt::None,
+                };
+                world.procs[*node] = Some(next);
+                let era = world.era;
+                labels.extend(self.send(
+                    &mut world,
+                    *node,
+                    Event::StartNodeLease {
+                        now_ms: era_ms(era),
+                        now_mono_ms: era_ms(era),
+                        spec: NodeLeaseSpec {
+                            addr: format!("{}:8081", name(*node)),
+                            peer_protocol: 1,
+                            generation: format!("g{}", generation + 1),
+                            resume_generation: Some(format!("g{generation}")),
+                            ttl_ms: 30_000,
+                        },
+                    },
+                ));
             }
             Action::Crash(node) => {
                 world.budget.crashes -= 1;

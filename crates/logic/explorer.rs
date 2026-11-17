@@ -141,15 +141,6 @@ impl Report {
             eprintln!("  reached {label}: {count}");
         }
     }
-
-    pub(crate) fn print_label_trace(&self, label: &str) {
-        if let Some(trace) = self.label_traces.get(label) {
-            eprintln!("  first trace to {label}:");
-            for (index, step) in trace.iter().enumerate() {
-                eprintln!("    {:>2}. {step}", index + 1);
-            }
-        }
-    }
 }
 
 thread_local! {
@@ -175,6 +166,8 @@ pub(crate) fn fingerprint(value: &impl Debug) -> u128 {
     })
 }
 
+// Test tooling: the run time it reports is the one clock the explorer reads.
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn explore<M: Model>(model: &M, limits: Limits) -> Report {
     let started = Instant::now();
     let init = model.init();
@@ -218,7 +211,7 @@ pub(crate) fn explore<M: Model>(model: &M, limits: Limits) -> Report {
     let mut frontier = vec![(init, init_fp)];
     let mut depth = 0;
     'levels: while !frontier.is_empty() {
-        if report.violations.len() > 0 && limits.stop_at_first {
+        if !report.violations.is_empty() && limits.stop_at_first {
             break;
         }
         if depth >= limits.max_depth {
