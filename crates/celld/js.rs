@@ -3337,18 +3337,6 @@ impl InFlight {
         self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
     }
 
-    /// The isolate this request runs in belongs to a superseded deployment
-    /// that has outlived `CELLD_RETIRE_DEADLINE_S`. Answer the client, if it
-    /// still waits, and drop the background work so the isolate can free.
-    pub fn retired_by_deadline(&mut self, deadline: Duration) {
-        self.fail(anyhow!(
-            "this deployment was superseded and its isolate was retired after {}s",
-            deadline.as_secs()
-        ));
-        self.background = None;
-        self.context.seal_wait_until();
-    }
-
     /// Nothing this request awaits can move it, so it will never settle on
     /// its own. Reachable when a handler awaits a promise only some *other*
     /// request could resolve — which the pump concealed, because it settled
@@ -3942,6 +3930,22 @@ impl Worker {
     /// abandoned and the events queued behind it are refused now rather
     /// than left waiting through the shutdown.
     pub fn turn_cancel_for_shutdown(&mut self, entry: &mut InFlight) -> Vec<Op> {
+        self.cancel_turn(entry, true)
+    }
+
+    /// The event's deployment was superseded and outlived
+    /// `CELLD_RETIRE_DEADLINE_S`: end it as a shutdown ends it, and answer a
+    /// client that still waits with the reason.
+    pub fn turn_cancel_for_retirement(
+        &mut self,
+        entry: &mut InFlight,
+        deadline: Duration,
+    ) -> Vec<Op> {
+        // The first failure is the one the client sees.
+        entry.fail_cancelled(anyhow!(
+            "this deployment was superseded and its isolate was retired after {}s",
+            deadline.as_secs()
+        ));
         self.cancel_turn(entry, true)
     }
 

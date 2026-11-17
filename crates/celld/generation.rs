@@ -439,13 +439,59 @@ impl Generation {
     /// Stop every isolate of this generation from taking new work. Stateless
     /// isolates free as their affiliations drop; cell isolates free as their
     /// cells move to a newer generation.
-    pub(crate) fn retire(&self) {
+    pub(crate) fn retire(self: &Arc<Self>) {
         let _ = self.retired_at.set(crate::asyncrt::mono_ms());
         for service in self.services.values() {
             service.isolates.retire_all();
         }
         for pool in self.cell_isolates.values() {
             pool.retire_all();
+        }
+        self.spawn_retire_deadline();
+    }
+
+    /// Start the one timer that ends this generation's remaining work at
+    /// `CELLD_RETIRE_DEADLINE_S`. It holds a weak reference, so a generation
+    /// that drains sooner is not kept alive by it, and it reads the same
+    /// clock `/state` reports.
+    // Spawned on the ambient runtime like the generation's maintenance loop,
+    // and not at all where there is none.
+    #[allow(clippy::disallowed_methods)]
+    fn spawn_retire_deadline(self: &Arc<Self>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let deadline = crate::js::retire_deadline();
+        let generation = Arc::downgrade(self);
+        handle.spawn(async move {
+            tokio::time::sleep(deadline).await;
+            if let Some(generation) = generation.upgrade() {
+                generation.force_retired(deadline);
+            }
+        });
+    }
+
+    /// The retire deadline passed: end the work still running in this
+    /// generation's isolates. Each request driver notices at its next
+    /// cancellation sample and ends as a shutdown ends it, so its
+    /// `waitUntil` work and native operations go and the isolate frees
+    /// through the ordinary reclaim path.
+    fn force_retired(&self, deadline: std::time::Duration) {
+        let requests: usize = self
+            .services
+            .values()
+            .map(|service| service.isolates.force_retired())
+            .chain(self.cell_isolates.values().map(|pool| pool.force_retired()))
+            .sum();
+        if requests > 0 {
+            tracing::warn!(
+                event = "retire_deadline_forced",
+                generation = self.id,
+                version = %self.version,
+                deadline_s = deadline.as_secs(),
+                requests,
+                "superseded deployment outlived its deadline; ending its work"
+            );
         }
     }
 

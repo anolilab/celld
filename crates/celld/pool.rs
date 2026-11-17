@@ -36,7 +36,6 @@ use celld_logic::isolate::PoolLimits;
 use celld_logic::isolate::PoolLoad;
 use celld_logic::isolate::Refusal;
 
-use crate::asyncrt;
 use crate::js;
 
 pub use crate::engine_api::AdmitError;
@@ -204,13 +203,11 @@ pub struct Slot {
     // toward the collection boundary. Residency drop retires both counts.
     adopted_cells: AtomicUsize,
     retiring: AtomicBool,
-    /// When this isolate was retired because its deployment was superseded,
-    /// in `asyncrt::mono_ms`. Work still running here once the retire
-    /// deadline has passed from this instant is ended.
-    superseded_at: tokio::sync::watch::Sender<Option<u64>>,
-    /// Whether the deadline already forced this isolate, so the log line
-    /// appears once per isolate and not once per request.
-    forced: AtomicBool,
+    /// Set once, by the generation's retire timer, when the deployment this
+    /// isolate belongs to has been superseded for `CELLD_RETIRE_DEADLINE_S`.
+    /// A request driver samples it where it already samples its own
+    /// cancellation, and ends its work as a shutdown does.
+    deadline_forced: AtomicBool,
 }
 
 thread_local! {
@@ -337,8 +334,7 @@ impl Slot {
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
-            superseded_at: tokio::sync::watch::channel(None).0,
-            forced: AtomicBool::new(false),
+            deadline_forced: AtomicBool::new(false),
         })
     }
 
@@ -363,52 +359,9 @@ impl Slot {
         self.retiring.load(Ordering::Relaxed)
     }
 
-    /// Retire this isolate because its deployment was superseded, and start
-    /// the clock on [`Self::superseded_deadline`]. Returns whether it was
-    /// not retiring already.
-    fn supersede(&self) -> bool {
-        self.superseded_at.send_if_modified(|at| {
-            let first = at.is_none();
-            if first {
-                *at = Some(asyncrt::mono_ms());
-            }
-            first
-        });
-        !self.retiring.swap(true, Ordering::Relaxed)
-    }
-
-    /// Resolves once this isolate has been superseded for `deadline`, and
-    /// never for an isolate that is not superseded. A request driver races
-    /// it against its own wake, and on a win ends the request, so no
-    /// request or `waitUntil` task can keep a superseded heap alive past
-    /// the deadline.
-    pub(crate) async fn superseded_deadline(&self, deadline: std::time::Duration) {
-        let mut at = self.superseded_at.subscribe();
-        loop {
-            let since = *at.borrow_and_update();
-            match since {
-                Some(since) => {
-                    let ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
-                    asyncrt::sleep_until(since.saturating_add(ms)).await;
-                    if !self.forced.swap(true, Ordering::Relaxed) {
-                        tracing::warn!(
-                            event = "retire_deadline_forced",
-                            isolate = %self.heap_id,
-                            slot = self.id,
-                            deadline_s = deadline.as_secs(),
-                            requests = self.requests.load(Ordering::Relaxed),
-                            "superseded isolate outlived its deadline; ending its work"
-                        );
-                    }
-                    return;
-                }
-                None => {
-                    if at.changed().await.is_err() {
-                        std::future::pending::<()>().await;
-                    }
-                }
-            }
-        }
+    /// Whether the retire deadline of this isolate's deployment has passed.
+    pub(crate) fn deadline_forced(&self) -> bool {
+        self.deadline_forced.load(Ordering::Relaxed)
     }
 
     /// Retire this isolate because its guest can no longer run in it, and
@@ -553,6 +506,9 @@ pub struct Pool {
     /// the old generation just before the flip can still land, but nothing
     /// it builds outlives the work it was built for.
     retired: AtomicBool,
+    /// The retire deadline of this superseded pool has passed. Isolates
+    /// grown afterwards start out forced.
+    deadline_forced: AtomicBool,
     /// Keeps admission and cell placement from racing isolate retirement.
     /// Stateless admission takes a shared guard, while maintenance and cell
     /// placement take the exclusive guard.
@@ -569,6 +525,7 @@ impl Pool {
             reclaim: Arc::new(tokio::sync::Notify::new()),
             admission_wait,
             retired: AtomicBool::new(false),
+            deadline_forced: AtomicBool::new(false),
             maintenance: RwLock::new(()),
         }
     }
@@ -637,12 +594,8 @@ impl Pool {
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(self.retired.load(Ordering::Relaxed)),
-            // An isolate grown after the flip is superseded from the start.
-            superseded_at: tokio::sync::watch::channel(
-                self.retired.load(Ordering::Relaxed).then(asyncrt::mono_ms),
-            )
-            .0,
-            forced: AtomicBool::new(false),
+            // An isolate grown after the deadline is past it from the start.
+            deadline_forced: AtomicBool::new(self.deadline_forced.load(Ordering::Relaxed)),
         });
         if let Some(id) = reusable {
             slots[id] = slot.clone();
@@ -816,11 +769,27 @@ impl Pool {
         let _maintenance = self.maintenance.write().expect("pool poisoned");
         self.retired.store(true, Ordering::Relaxed);
         for slot in self.slots.read().expect("pool poisoned").iter() {
-            if slot.supersede() {
+            if !slot.retiring.swap(true, Ordering::Relaxed) {
                 tracing::info!(isolate = %slot.heap_id, slot = slot.id, "isolate retiring");
             }
         }
         self.free_retired();
+    }
+
+    /// The retire deadline has passed: tell every isolate to end the work
+    /// still running in it. Returns how many requests that was.
+    pub(crate) fn force_retired(&self) -> usize {
+        let _maintenance = self.maintenance.write().expect("pool poisoned");
+        self.deadline_forced.store(true, Ordering::Relaxed);
+        self.slots
+            .read()
+            .expect("pool poisoned")
+            .iter()
+            .map(|slot| {
+                slot.deadline_forced.store(true, Ordering::Relaxed);
+                slot.requests.load(Ordering::Relaxed)
+            })
+            .sum()
     }
 
     /// Whether every isolate this pool ever built has been freed. True for a

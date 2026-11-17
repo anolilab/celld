@@ -48,6 +48,11 @@ const RECLAIM_RETRY: Duration = Duration::from_millis(10);
 /// blocking run loop's own cap, which exists for the same reason: a client
 /// disconnect is raised on another thread and has nothing to wake this one.
 const CANCELLATION_TICK: Duration = Duration::from_millis(10);
+
+/// How often an event with no request id, waiting on work it left behind,
+/// looks at whether its deployment's retire deadline has passed. Such an
+/// event has no cancellation tick, and nothing else wakes it.
+const RETIRE_RECHECK: Duration = Duration::from_secs(1);
 /// Cell fetches that one target can hold before celld refuses excess work.
 ///
 /// The last nonsaturated Queue step in the AWS partition staircase held
@@ -2236,18 +2241,9 @@ async fn drive_worker(
     }
     after_turn(&entry);
 
+    let mut retire = Some(slot);
     while !entry.finished() {
-        let retire_deadline = js::retire_deadline();
-        let woke = asyncrt::select_biased! {
-            "a request still running when its superseded isolate's deadline passes is ended, even if it is ready";
-            _ = slot.superseded_deadline(retire_deadline) => Wake::Retired,
-            woke = wake_with_cross_entry_gate(&mut ops, &mut entry, budget) => woke,
-        };
-        let started = match woke {
-            Wake::Retired => {
-                entry.retired_by_deadline(retire_deadline);
-                Vec::new()
-            }
+        let started = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget, retire).await {
             Wake::Op(op, result) => {
                 slot.turn(|worker| worker.turn_deliver(&mut entry, op, result))
                     .await
@@ -2265,9 +2261,13 @@ async fn drive_worker(
                 Vec::new()
             }
             Wake::Cancelled { shutdown } => {
+                let superseded =
+                    shutdown && retire.take().is_some_and(|slot| slot.deadline_forced());
                 let started = slot
                     .turn(|worker| {
-                        if shutdown {
+                        if superseded {
+                            worker.turn_cancel_for_retirement(&mut entry, js::retire_deadline())
+                        } else if shutdown {
                             worker.turn_cancel_for_shutdown(&mut entry)
                         } else {
                             worker.turn_cancel(&mut entry)
@@ -2320,9 +2320,6 @@ enum Wake {
     CrossEntryGateChanged,
     /// Its client hung up, or shutdown forced the complete event to retire.
     Cancelled { shutdown: bool },
-    /// The isolate's deployment was superseded long enough ago that its
-    /// work must end, answered or not.
-    Retired,
     /// It ran past the handler budget without answering.
     Expired,
     /// Nothing outstanding could ever move it.
@@ -2335,10 +2332,26 @@ enum Wake {
     Poll,
 }
 
-fn take_cancellation_wake(request_id: Option<js::RequestId>) -> Option<Wake> {
-    js::take_request_cancellation(request_id).then(|| Wake::Cancelled {
-        shutdown: js::take_shutdown_cancellation(request_id),
-    })
+fn take_cancellation_wake(
+    retire: Option<&crate::pool::Slot>,
+    request_id: Option<js::RequestId>,
+) -> Option<Wake> {
+    js::take_request_cancellation(request_id)
+        .then(|| Wake::Cancelled {
+            shutdown: js::take_shutdown_cancellation(request_id),
+        })
+        .or_else(|| retire_wake(retire))
+}
+
+/// The retire deadline of this isolate's deployment has passed, so end the
+/// event as a shutdown ends it. The timer that raises it runs once per
+/// superseded generation; a driver pays one relaxed load where it already
+/// samples its own cancellation, and the caller drops `retire` once the event
+/// has been ended, so the flag is acted on once per event.
+fn retire_wake(retire: Option<&crate::pool::Slot>) -> Option<Wake> {
+    retire
+        .is_some_and(crate::pool::Slot::deadline_forced)
+        .then_some(Wake::Cancelled { shutdown: true })
 }
 
 /// Wait for whichever comes first, holding no isolate.
@@ -2350,10 +2363,13 @@ async fn wake_with_cross_entry_gate(
     ops: &mut Ops,
     entry: &mut js::InFlight,
     budget: Duration,
+    retire: Option<&crate::pool::Slot>,
 ) -> Wake {
     let wait = entry.prepare_cross_entry_gate_wait();
     match wait
-        .wait(wake(ops, entry, budget), |wake| matches!(wake, Wake::Idle))
+        .wait(wake(ops, entry, budget, retire), |wake| {
+            matches!(wake, Wake::Idle)
+        })
         .await
     {
         js::input_gate_lifecycle::WaitOutcome::StateChanged => Wake::CrossEntryGateChanged,
@@ -2361,7 +2377,12 @@ async fn wake_with_cross_entry_gate(
     }
 }
 
-async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake {
+async fn wake(
+    ops: &mut Ops,
+    entry: &mut js::InFlight,
+    budget: Duration,
+    retire: Option<&crate::pool::Slot>,
+) -> Wake {
     loop {
         // An op this event enqueued from inside another event's turn reaches
         // this driver here rather than through `adopt`, because the turn that
@@ -2389,6 +2410,7 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
                             "a completed gated reply wins a tie with an op another turn hands over";
                             completion = gated_reply => Some(Wake::GatedReply(completion)),
                             _ = context.handed_ready() => None,
+                            _ = asyncrt::sleep(RETIRE_RECHECK) => None,
                         }
                     } else {
                         asyncrt::select_biased! {
@@ -2396,13 +2418,20 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
                             completion = gated_reply => Some(Wake::GatedReply(completion)),
                             result = ops.next() => result.map(|(op, result)| Wake::Op(op, result)),
                             _ = context.handed_ready() => None,
+                            _ = asyncrt::sleep(RETIRE_RECHECK) => None,
                         }
                     };
                     match next {
                         Some(wake) => return wake,
-                        // A hand-off, or an exhausted stream after its final
-                        // completion; take the mailbox before waiting again.
-                        None => continue,
+                        // A hand-off, an exhausted stream after its final
+                        // completion, or the recheck; take the mailbox
+                        // before waiting again.
+                        None => {
+                            if let Some(wake) = retire_wake(retire) {
+                                return wake;
+                            }
+                            continue;
+                        }
                     }
                 };
                 // The domain select is declaration-order biased. A reply that
@@ -2437,7 +2466,7 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
                 if let Some(next) = next {
                     return next;
                 }
-                if let Some(cancelled) = take_cancellation_wake(Some(request_id)) {
+                if let Some(cancelled) = take_cancellation_wake(retire, Some(request_id)) {
                     return if matches!(cancelled, Wake::Cancelled { shutdown: true }) {
                         cancelled
                     } else {
@@ -2455,12 +2484,18 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
                     "an operation result wins a tie with an op another turn hands over";
                     result = ops.next() => Some(result),
                     _ = context.handed_ready() => None,
+                    _ = asyncrt::sleep(RETIRE_RECHECK) => None,
                 };
                 match next {
                     Some(Some((op, result))) => return Wake::Op(op, result),
                     Some(None) => return Wake::Idle,
-                    // Handed over; the next pass takes it.
-                    None => continue,
+                    // Handed over, or the recheck; the next pass takes it.
+                    None => {
+                        if let Some(wake) = retire_wake(retire) {
+                            return wake;
+                        }
+                        continue;
+                    }
                 }
             };
             let next = if ops.is_empty() {
@@ -2479,7 +2514,7 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
             if let Some(next) = next {
                 return next;
             }
-            if let Some(cancelled) = take_cancellation_wake(Some(request_id)) {
+            if let Some(cancelled) = take_cancellation_wake(retire, Some(request_id)) {
                 if matches!(cancelled, Wake::Cancelled { shutdown: true }) {
                     return cancelled;
                 }
@@ -2527,7 +2562,7 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
             // Re-read the flag on this path too. A request with nothing
             // outstanding can still have its client hang up, and only the
             // branch below used to look.
-            if let Some(cancelled) = take_cancellation_wake(entry.request_id()) {
+            if let Some(cancelled) = take_cancellation_wake(retire, entry.request_id()) {
                 return cancelled;
             }
             return Wake::Poll;
@@ -2546,7 +2581,7 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
             // Another turn handed this event an op. The next pass takes it.
             Ok(None) => continue,
             Err(_) => {
-                if let Some(cancelled) = take_cancellation_wake(entry.request_id()) {
+                if let Some(cancelled) = take_cancellation_wake(retire, entry.request_id()) {
                     return cancelled;
                 }
                 if capped == left {
@@ -3275,80 +3310,74 @@ async fn drive_cell_inner(
         abort_ops(&mut ops, &mut entry);
     }
 
+    let mut retire = Some(&*slot);
     while !entry.finished() {
-        let retire_deadline = js::retire_deadline();
-        let woke = asyncrt::select_biased! {
-            "a request still running when its superseded isolate's deadline passes is ended, even if it is ready";
-            _ = slot.superseded_deadline(retire_deadline) => Wake::Retired,
-            woke = wake_with_cross_entry_gate(&mut ops, &mut entry, budget) => woke,
-        };
-        let (started, moves) = match woke {
-            Wake::Retired => {
-                entry.retired_by_deadline(retire_deadline);
-                slot.turn(|worker| worker.turn_retire_input_gates(&entry))
-                    .await;
-                (Vec::new(), Vec::new())
-            }
-            Wake::Op(op, result) => {
-                slot.turn(|worker| {
-                    let started = worker.turn_deliver(&mut entry, op, result);
-                    (started, worker.take_alarm_moves())
-                })
-                .await
-            }
-            Wake::GatedReply(completion) => {
-                entry.finish_gated_reply(completion);
-                (Vec::new(), Vec::new())
-            }
-            Wake::CancelGatedReply => {
-                entry.cancel_gated_reply();
-                (Vec::new(), Vec::new())
-            }
-            Wake::CrossEntryGateChanged => {
-                entry.finish_cross_entry_gates();
-                (Vec::new(), Vec::new())
-            }
-            Wake::Cancelled { shutdown } => {
-                let cancelled = slot
-                    .turn(|worker| {
-                        let started = if shutdown {
-                            worker.turn_cancel_for_shutdown(&mut entry)
-                        } else {
-                            worker.turn_cancel(&mut entry)
-                        };
+        let (started, moves) =
+            match wake_with_cross_entry_gate(&mut ops, &mut entry, budget, retire).await {
+                Wake::Op(op, result) => {
+                    slot.turn(|worker| {
+                        let started = worker.turn_deliver(&mut entry, op, result);
                         (started, worker.take_alarm_moves())
                     })
-                    .await;
-                entry.cancel_gated_reply();
-                cancelled
-            }
-            Wake::Expired => {
-                entry.time_out(budget);
-                slot.turn(|worker| worker.turn_retire_input_gates(&entry))
-                    .await;
-                (Vec::new(), Vec::new())
-            }
-            Wake::Idle => {
-                entry.stuck();
-                slot.turn(|worker| worker.turn_retire_input_gates(&entry))
-                    .await;
-                (Vec::new(), Vec::new())
-            }
-            Wake::PendingEventIdle => {
-                slot.turn(|worker| {
-                    let started = worker.turn_cancel_pending_events(&mut entry);
-                    (started, worker.take_alarm_moves())
-                })
-                .await
-            }
-            Wake::Poll => {
-                slot.turn(|worker| {
-                    let started = worker.turn_poll(&mut entry);
-                    (started, worker.take_alarm_moves())
-                })
-                .await
-            }
-        };
+                    .await
+                }
+                Wake::GatedReply(completion) => {
+                    entry.finish_gated_reply(completion);
+                    (Vec::new(), Vec::new())
+                }
+                Wake::CancelGatedReply => {
+                    entry.cancel_gated_reply();
+                    (Vec::new(), Vec::new())
+                }
+                Wake::CrossEntryGateChanged => {
+                    entry.finish_cross_entry_gates();
+                    (Vec::new(), Vec::new())
+                }
+                Wake::Cancelled { shutdown } => {
+                    let superseded =
+                        shutdown && retire.take().is_some_and(|slot| slot.deadline_forced());
+                    let cancelled = slot
+                        .turn(|worker| {
+                            let started = if superseded {
+                                worker.turn_cancel_for_retirement(&mut entry, js::retire_deadline())
+                            } else if shutdown {
+                                worker.turn_cancel_for_shutdown(&mut entry)
+                            } else {
+                                worker.turn_cancel(&mut entry)
+                            };
+                            (started, worker.take_alarm_moves())
+                        })
+                        .await;
+                    entry.cancel_gated_reply();
+                    cancelled
+                }
+                Wake::Expired => {
+                    entry.time_out(budget);
+                    slot.turn(|worker| worker.turn_retire_input_gates(&entry))
+                        .await;
+                    (Vec::new(), Vec::new())
+                }
+                Wake::Idle => {
+                    entry.stuck();
+                    slot.turn(|worker| worker.turn_retire_input_gates(&entry))
+                        .await;
+                    (Vec::new(), Vec::new())
+                }
+                Wake::PendingEventIdle => {
+                    slot.turn(|worker| {
+                        let started = worker.turn_cancel_pending_events(&mut entry);
+                        (started, worker.take_alarm_moves())
+                    })
+                    .await
+                }
+                Wake::Poll => {
+                    slot.turn(|worker| {
+                        let started = worker.turn_poll(&mut entry);
+                        (started, worker.take_alarm_moves())
+                    })
+                    .await
+                }
+            };
         if entry.keeps_native_ops() {
             adopt(&mut ops, started);
         } else {

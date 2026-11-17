@@ -307,6 +307,17 @@ pub fn validate() -> anyhow::Result<()> {
 
     positive::<usize>("CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES")?;
 
+    // A resident cell is forced onto the new deployment at the maximum age, so
+    // a retire deadline at or before it would end work the swap still allows.
+    if let Some(deadline) = positive::<u64>("CELLD_RETIRE_DEADLINE_S")? {
+        let max_age = with_default("CELLD_DEPLOY_MAX_AGE_S", 60u64)?;
+        if deadline <= max_age {
+            bail!(
+                "CELLD_RETIRE_DEADLINE_S ({deadline}) must exceed CELLD_DEPLOY_MAX_AGE_S ({max_age})"
+            );
+        }
+    }
+
     if let Some(value) = optional::<u64>("CELLD_PRESENCE_HEARTBEAT_MS")? {
         if !(50..=30_000).contains(&value) {
             bail!("CELLD_PRESENCE_HEARTBEAT_MS must be between 50 and 30000, not {value}");

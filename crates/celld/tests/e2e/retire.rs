@@ -17,6 +17,8 @@ use super::harness::{host_runtime, wait_until, Server};
 
 const TOKEN: &str = "e2e-retire-token";
 const DEADLINE_S: &str = "4";
+// The deadline must exceed the maximum age, whose default is 60 seconds.
+const MAX_AGE_S: &str = "1";
 
 async fn state(server: &Server) -> Value {
     reqwest::Client::new()
@@ -83,6 +85,7 @@ async fn a_superseded_generation_is_freed_at_its_deadline_though_its_work_never_
         &[
             ("CELLD_OPERATOR_TOKEN", TOKEN),
             ("CELLD_RETIRE_DEADLINE_S", DEADLINE_S),
+            ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
             // Far past the test, so only the retire deadline can end the work.
             ("CELLD_HANDLER_BUDGET_S", "3600"),
         ],
@@ -148,12 +151,13 @@ async fn a_superseded_generation_is_freed_at_its_deadline_though_its_work_never_
 }
 
 #[tokio::test]
-async fn background_work_alone_does_not_pin_a_superseded_generation() {
+async fn wait_until_work_that_never_ends_is_ended_at_the_deadline() {
     let server = Server::start(
         "retire",
         &[
             ("CELLD_OPERATOR_TOKEN", TOKEN),
             ("CELLD_RETIRE_DEADLINE_S", DEADLINE_S),
+            ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
             ("CELLD_HANDLER_BUDGET_S", "3600"),
         ],
     )
@@ -174,5 +178,42 @@ async fn background_work_alone_does_not_pin_a_superseded_generation() {
         },
     )
     .await;
+    assert_eq!(server.get_text("/version").await, "v2");
+}
+
+#[tokio::test]
+async fn an_answered_durable_object_event_with_a_leftover_timer_does_not_pin_a_superseded_generation(
+) {
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_RETIRE_DEADLINE_S", DEADLINE_S),
+            ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
+            ("CELLD_HANDLER_BUDGET_S", "3600"),
+        ],
+    )
+    .await;
+    assert_eq!(server.get_text("/do-pin").await, "pinned");
+
+    redeploy(&server).await;
+
+    wait_until(
+        "the generation held by the object's interval to be freed",
+        Duration::from_secs(60),
+        || async {
+            let state = state(&server).await;
+            state["deployment"]["draining"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+                .then_some(())
+        },
+    )
+    .await;
+    // No JavaScript of the retired isolate runs after it is freed: the count
+    // its interval kept stops moving.
+    let before = server.get_text("/do-ticks").await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(server.get_text("/do-ticks").await, before);
     assert_eq!(server.get_text("/version").await, "v2");
 }
