@@ -336,7 +336,7 @@ pub fn build(
             bundle,
             wasm,
             map: None,
-            imports: None,
+            imports: Vec::new(),
         },
         descriptor,
     ))

@@ -226,12 +226,13 @@ static IMPORT_BRACES_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"\{([^}]*)\}").unwrap());
 
 /// External specifier -> the bindings a bundle pulls from it.
-pub type ExternalImports = std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
+pub(crate) type ExternalImports =
+    std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
 
 /// Scan a bundle for its external (`cloudflare:*` / `node:*`) imports and the
 /// named/default bindings pulled from each. V8 static-links these, so a stub
 /// must provide exactly these names; namespace imports (`* as x`) need none.
-pub fn scan_external_imports(src: &str) -> ExternalImports {
+pub(crate) fn scan_external_imports(src: &str) -> ExternalImports {
     let mut map = ExternalImports::default();
     for cap in IMPORT_RE.captures_iter(src) {
         if !is_external(&cap[2]) {
@@ -479,28 +480,33 @@ pub(super) fn install_lazy_globals(scope: &mut v8::PinScope) -> Result<()> {
 /// builtins. These cost every isolate, so new modules belong in
 /// `LAZY_MODULES` instead.
 fn eager_module_global(spec: &str) -> Option<&'static str> {
-    Some(match spec {
-        "fs" | "node:fs" => "__fs",
-        "fs/promises" | "node:fs/promises" => "__fsPromises",
-        "zlib" | "node:zlib" => "__zlibModule",
-        _ => return None,
-    })
+    EAGER_MODULES
+        .iter()
+        .find(|(specs, _)| specs.contains(&spec))
+        .map(|(_, global)| *global)
 }
+
+const EAGER_MODULES: &[(&[&str], &str)] = &[
+    (&["fs", "node:fs"], "__fs"),
+    (&["fs/promises", "node:fs/promises"], "__fsPromises"),
+    (&["zlib", "node:zlib"], "__zlibModule"),
+];
 
 /// A `node:` import the runtime has no implementation for: its stub imports
 /// fine and throws on the first call.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnsupportedImport {
+pub(crate) struct UnsupportedImport {
     /// The module as `node:name`, whichever form the bundle used.
     pub specifier: String,
     /// What to use instead, when there is something.
     pub alternative: Option<&'static str>,
 }
 
-/// Is a Node.js built-in module implemented? Reads the same tables the stub
-/// builder does, so the two cannot disagree.
-fn is_implemented_builtin(name: &str) -> bool {
-    LAZY_MODULES.iter().any(|m| m.specs.contains(&name)) || eager_module_global(name).is_some()
+/// Is `spec` a module the runtime serves? The lookup is the stub builder's,
+/// on the specifier as written: `node:test/reporters` is served, a bare
+/// `test/reporters` is not.
+fn is_implemented_builtin(spec: &str) -> bool {
+    LAZY_MODULES.iter().any(|m| m.specs.contains(&spec)) || eager_module_global(spec).is_some()
 }
 
 /// What a Worker can use in place of a module celld does not implement.
@@ -522,19 +528,20 @@ fn alternative(name: &str) -> Option<&'static str> {
 }
 
 /// The `node:` built-ins among `specifiers` that celld does not implement,
-/// once each and sorted. A bare `buffer` counts as `node:buffer`, as it does
-/// at runtime; `cloudflare:*` specifiers and everything the bundler inlined
-/// are not Node.js built-ins and are skipped.
-pub fn unsupported_node_imports<'a>(
+/// once each and sorted. A specifier is judged as the runtime resolves it, as
+/// written; a bare `https` is the same module as `node:https`.
+/// `cloudflare:*` specifiers and everything the bundler inlined are not
+/// Node.js built-ins and are skipped.
+pub(crate) fn unsupported_node_imports<'a>(
     specifiers: impl IntoIterator<Item = &'a str>,
 ) -> Vec<UnsupportedImport> {
     let names: std::collections::BTreeSet<&str> = specifiers
         .into_iter()
+        .filter(|spec| !is_implemented_builtin(spec))
         .filter_map(|spec| match spec.strip_prefix("node:") {
             Some(name) => Some(name),
             None => (!spec.contains(':') && is_external(spec)).then_some(spec),
         })
-        .filter(|name| !is_implemented_builtin(name))
         .collect();
     names
         .into_iter()
@@ -1092,6 +1099,20 @@ mod unsupported_import_tests {
     #[test]
     fn an_implemented_module_is_not_reported_in_either_spelling() {
         assert!(unsupported_node_imports(["node:events", "buffer", "node:fs", "zlib"]).is_empty());
+    }
+
+    #[test]
+    fn no_module_the_runtime_serves_is_reported() {
+        let served = LAZY_MODULES
+            .iter()
+            .flat_map(|m| m.specs.iter())
+            .chain(EAGER_MODULES.iter().flat_map(|(specs, _)| specs.iter()));
+        for spec in served {
+            assert!(
+                unsupported_node_imports([*spec]).is_empty(),
+                "{spec} is served but reported unsupported"
+            );
+        }
     }
 
     #[test]

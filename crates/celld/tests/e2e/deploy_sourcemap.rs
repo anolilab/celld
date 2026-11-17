@@ -10,36 +10,9 @@ use std::process::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use super::harness::{copy_dir, fixture_dir};
+use super::harness::{copy_dir, deploy, esbuild, fixture_dir, Run};
 
 const CELLD: &str = env!("CARGO_BIN_EXE_celld");
-
-struct Run {
-    success: bool,
-    stdout: String,
-    stderr: String,
-}
-
-/// `celld deploy --dry-run --json` on a copy of `fixture`, plus `extra`
-/// arguments. Nothing is written to a bucket.
-fn deploy(fixture: &str, project: &Path, extra: &[&str], esbuild: Option<&str>) -> Run {
-    copy_dir(&fixture_dir(fixture), project);
-    let mut command = Command::new(CELLD);
-    command
-        .args(["deploy", "--dry-run", "--json"])
-        .arg(project)
-        .args(extra)
-        .env("RUST_LOG", "error");
-    if let Some(esbuild) = esbuild {
-        command.env("CELLD_ESBUILD", esbuild);
-    }
-    let output = command.output().expect("run celld deploy");
-    Run {
-        success: output.status.success(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
-}
 
 /// The deployment version a dry run reports.
 fn version(run: &Run) -> String {
@@ -102,17 +75,6 @@ fn a_prebuilt_entry_without_a_map_is_refused() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!out.exists(), "no map is written when there is none");
-}
-
-/// The esbuild a test may use: `CELLD_ESBUILD`, or `esbuild` on the path.
-fn esbuild() -> Option<String> {
-    let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
-    Command::new(&binary)
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|_| binary)
 }
 
 #[test]

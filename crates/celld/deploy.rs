@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+mod node_imports;
 mod python;
 mod sourcemap;
 
@@ -706,11 +707,12 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                         sourcemap::read_sibling(&root, &path)
                     })
                     .transpose()?;
+                let imports = node_imports::scan(&bundle);
                 Ok(BundleOutput {
                     bundle,
                     wasm,
                     map,
-                    imports: None,
+                    imports,
                 })
             } else {
                 run_esbuild(&root, entry, &project.bundle, want_map)
@@ -719,7 +721,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .transpose()?;
     let bundled_in = started.elapsed();
     if let Some(output) = &bundle {
-        report_unsupported_imports(output, options.strict)?;
+        node_imports::report(&output.imports, options.strict)?;
     }
     let sourcemap = bundle
         .as_ref()
@@ -3221,8 +3223,9 @@ struct BundleOutput {
     /// The entry's map as its build wrote it, and the directory its relative
     /// sources are relative to. Only set when a map was asked for.
     map: Option<(Vec<u8>, PathBuf)>,
-    /// The specifiers the bundle leaves external, when the build says.
-    imports: Option<Vec<String>>,
+    /// The specifiers the bundle leaves external. Empty for a build that
+    /// does not list them.
+    imports: Vec<String>,
 }
 
 /// Wrangler's default unbundled WASM rule discovers `**/*.wasm` and
@@ -3429,66 +3432,8 @@ fn run_esbuild(
         bundle,
         wasm,
         map,
-        imports: Some(external_imports(&metafile)?),
+        imports: node_imports::from_metafile(&metafile)?,
     })
-}
-
-/// The specifiers the bundle imports and esbuild left external, of every
-/// kind: `import`, dynamic `import()` and `require()`.
-fn external_imports(metafile: &Path) -> anyhow::Result<Vec<String>> {
-    let meta: Value =
-        serde_json::from_slice(&std::fs::read(metafile).context("read the esbuild metafile")?)
-            .context("parse the esbuild metafile")?;
-    Ok(meta["outputs"]
-        .as_object()
-        .into_iter()
-        .flat_map(|outputs| outputs.values())
-        .filter_map(|output| output["imports"].as_array())
-        .flatten()
-        .filter(|import| import["external"].as_bool() == Some(true))
-        .filter_map(|import| import["path"].as_str().map(str::to_string))
-        .collect())
-}
-
-/// List each `node:` module the bundle imports that celld does not implement.
-/// Importing one is not an error, because bundles name built-ins in code that
-/// never runs; the first call throws. Listing them here moves the discovery
-/// from production to the deploy. `strict` turns the list into a failure.
-fn report_unsupported_imports(output: &BundleOutput, strict: bool) -> anyhow::Result<()> {
-    let scanned;
-    let specifiers: Vec<&str> = match &output.imports {
-        Some(imports) => imports.iter().map(String::as_str).collect(),
-        // An entry that was already bundled has no build to ask: read its
-        // static imports the way the runtime does.
-        None => {
-            scanned =
-                crate::js::modules::scan_external_imports(&String::from_utf8_lossy(&output.bundle));
-            scanned.keys().map(String::as_str).collect()
-        }
-    };
-    let unsupported = crate::js::modules::unsupported_node_imports(specifiers);
-    if unsupported.is_empty() {
-        return Ok(());
-    }
-    let list = unsupported
-        .iter()
-        .map(|import| match import.alternative {
-            Some(alternative) => format!("  {} (use {alternative})", import.specifier),
-            None => format!("  {}", import.specifier),
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if strict {
-        bail!(
-            "the bundle imports node: modules that celld does not implement:\n{list}\n\
-             Calling one throws; remove the import or drop --strict"
-        );
-    }
-    note!(
-        "Warning: the bundle imports node: modules that celld does not implement:\n{list}\n\
-         Importing them works; calling one throws. `--strict` makes this an error."
-    );
-    Ok(())
 }
 
 /// Minimal JSONC support: line and block comments, and trailing commas.
