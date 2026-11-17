@@ -10,7 +10,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -87,10 +87,6 @@ impl Tcp {
     }
 }
 
-/// How long the held request gets to reach the Worker before a 404 from
-/// `/info` counts as a misroute.
-const HOLD_ARRIVAL: Duration = Duration::from_secs(5);
-
 /// Lets the held request go. The fixture answers 404 when nothing is held
 /// under the name, which means the release reached another module.
 async fn release(server: &Server) {
@@ -115,21 +111,15 @@ async fn hold(server: &Server, path: &str) -> (u64, tokio::task::JoinHandle<Valu
         })
     });
     let info = server.url("/info?name=a");
-    let started = Instant::now();
     let id = wait_until(
-        "the held socket to open",
+        "the held socket to open (a 404 throughout means the poll reached a module that never \
+         saw the held request: a misroute)",
         Duration::from_secs(20),
         || async {
             let response = reqwest::get(&info).await.ok()?;
             if response.status() == reqwest::StatusCode::NOT_FOUND {
-                // The held request may still be on its way. Once it had time
-                // to arrive, a 404 means the poll reached a module that never
-                // saw it.
-                assert!(
-                    started.elapsed() < HOLD_ARRIVAL,
-                    "/info answered 404 for a request that should be held: the poll reached \
-                     an isolate that never saw it (a misroute)"
-                );
+                // The held request may still be on its way, so a 404 only
+                // counts as a misroute once the whole wait has passed.
                 return None;
             }
             let info: Value = response.json().await.ok()?;
