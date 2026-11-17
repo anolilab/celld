@@ -25,6 +25,11 @@
       "class_name": "Late"
     },
     {
+      "binding": "SQUEEZED",
+      "name": "squeezed",
+      "class_name": "Squeezed"
+    },
+    {
       "binding": "NAPS",
       "name": "naps",
       "class_name": "Naps"

@@ -61,6 +61,8 @@ budget (or the step's `timeout`, if that is shorter) remains, so quick steps
 with the default timeout share a turn, and a step that would get less starts in
 a fresh one. Consuming an event counts as progress like running a step. Keep a
 single step shorter than the budget, or split it.
+An attempt that times out only because its turn cut it short is not counted: it
+runs again in a fresh turn with its full timeout and uses no retry.
 
 Turn age and the age of a stale drive are measured with the isolate's clock,
 which is the wall clock sampled at the last I/O; the isolate has no monotonic

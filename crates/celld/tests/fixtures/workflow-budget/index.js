@@ -77,6 +77,24 @@ export class Late extends WorkflowEntrypoint {
   }
 }
 
+// A step that needs more than the time left in the turn but less than its own
+// timeout. The turn must not count its cut-short attempt as a failure.
+export class Squeezed extends WorkflowEntrypoint {
+  async run(event, step) {
+    await step.do("first", async () => {
+      await sleep(400);
+    });
+    return await step.do(
+      "second",
+      { timeout: 1700, retries: { limit: 0, delay: 1 } },
+      async () => {
+        await sleep(1600);
+        return "ok";
+      },
+    );
+  }
+}
+
 // Sleeps that complete at once. The time between them is spent in run(), and
 // the longest turn is recorded: a turn must hand over before it uses the budget.
 export class Naps extends WorkflowEntrypoint {
@@ -204,6 +222,7 @@ export default {
       stuck: env.STUCK,
       undo: env.UNDO,
       late: env.LATE,
+      squeezed: env.SQUEEZED,
       naps: env.NAPS,
       fence: env.FENCE,
       quick: env.QUICK,

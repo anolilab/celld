@@ -103,6 +103,21 @@ async fn a_step_that_cannot_get_its_full_timeout_starts_in_a_fresh_turn() {
 }
 
 #[tokio::test]
+async fn an_attempt_cut_short_by_the_turn_is_run_again_without_a_retry() {
+    let server = Server::start("workflow-budget", &[BUDGET]).await;
+    // The second step needs 1.6 s of its 1.7 s timeout, but the first turn has
+    // about 1.4 s left, more than half the budget, so it starts there.
+    server.get_text("/start?flow=squeezed").await;
+
+    let done = finished(&server, "squeezed").await;
+
+    // The step has no retries: counting the turn's timeout as a failure ends
+    // the workflow.
+    assert_eq!(done["status"], "complete", "{done}");
+    assert_eq!(done["output"], "ok", "{done}");
+}
+
+#[tokio::test]
 async fn sleeps_that_complete_at_once_count_toward_the_turn_budget() {
     let server = Server::start("workflow-budget", &[BUDGET]).await;
     // Twelve zero-length sleeps, 200 ms of run() time before each.

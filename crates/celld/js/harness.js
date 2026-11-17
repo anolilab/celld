@@ -8766,13 +8766,15 @@ const __wfEnterStep = (name, fn) => {
 // Race an attempt against its deadline. The abandoned callback keeps
 // running -- there is no cancellation to send it -- but its result is
 // discarded and the timeout counts as a failed attempt, as upstream.
-const __wfTimeout = (promise, ms, name, attempt) =>
+const __wfTimeout = (promise, ms, name, attempt, onTimeout) =>
   new Promise((resolve, reject) => {
     const timer = setTimeout(
-      () =>
+      () => {
+        onTimeout?.();
         reject(new Error(
           `step ${JSON.stringify(name)} timed out after ${ms} ms (attempt ${attempt})`,
-        )),
+        ));
+      },
       ms,
     );
     promise.then(
@@ -8968,8 +8970,14 @@ const __wfMakeStep = (driver) => {
       ) {
         return { block: Date.now(), kind: "yield" };
       }
+      // A turn that already ran something may give the attempt less than its
+      // full timeout. Only such a turn can cut the attempt short; a fresh
+      // turn gives the full timeout, so the replay always makes progress.
+      const turnCanShorten = driver.executed > 0;
       driver.executed += 1;
       const timeoutMs = Math.max(1, Math.min(userTimeout, cap, remaining));
+      const shortened = turnCanShorten && timeoutMs < Math.min(userTimeout, cap);
+      let cutShort = false;
       // Upstream omits a dynamic delay from the step context. Copying the
       // config verbatim would expose the callback to itself as retry policy,
       // while callers expect only the serializable limit and backoff fields.
@@ -8998,6 +9006,7 @@ const __wfMakeStep = (driver) => {
           timeoutMs,
           name,
           attempt,
+          () => { cutShort = shortened; },
         );
         if (value !== undefined) {
           __wfCheckValue(value, `the return value of step ${JSON.stringify(name)}`);
@@ -9010,6 +9019,10 @@ const __wfMakeStep = (driver) => {
         });
         return { value };
       } catch (error) {
+        // The turn, not the step, ran out of time: the "running" record keeps
+        // the attempt number, so a fresh turn runs the same attempt with its
+        // full timeout and no retry is spent.
+        if (cutShort) return { block: Date.now(), kind: "yield" };
         // NonRetryableError skips retries by contract; a value-cap or
         // serialization failure is marked permanent above because another
         // attempt returns the same value.
