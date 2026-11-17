@@ -24,6 +24,34 @@ pub(super) fn from_metafile(metafile: &Path) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
+/// The imports of an already-bundled entry, read by esbuild with every import
+/// left external, so comments, strings and unusual spacing are parsed the way
+/// the bundler parses them. The output is discarded; the entry deploys as it
+/// is. `None` when esbuild is missing or cannot parse the entry.
+pub(super) fn analyse(root: &Path, entry: &Path) -> Option<Vec<String>> {
+    let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
+    let dir = tempfile::tempdir().ok()?;
+    let metafile = dir.path().join("meta.json");
+    let output = std::process::Command::new(binary)
+        .current_dir(root)
+        .arg(entry)
+        .args([
+            "--bundle",
+            "--format=esm",
+            "--platform=neutral",
+            "--external:*",
+        ])
+        .arg(format!("--metafile={}", metafile.display()))
+        .arg(format!("--outfile={}", dir.path().join("out.js").display()))
+        .arg("--log-level=silent")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    from_metafile(&metafile).ok()
+}
+
 /// A string literal after `from`, `import`, `import(`, `require(` or
 /// `__require(`: static and side-effect imports, re-exports, dynamic
 /// `import()` and CommonJS `require()`.
@@ -31,9 +59,9 @@ static SPECIFIER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::ne
     regex::Regex::new(r#"\b(?:from|import|require|__require)\s*\(?\s*["']([^"']+)["']"#).unwrap()
 });
 
-/// The specifiers an already-bundled entry names. There is no build to ask,
-/// so the source is read; a specifier in a string or comment is listed too,
-/// which at worst adds a warning.
+/// The specifiers an already-bundled entry names, read from its text. Only
+/// for when esbuild is not there to ask: a specifier in a string or comment is
+/// listed, and one with a comment or odd spacing in front of it is missed.
 pub(super) fn scan(bundle: &[u8]) -> Vec<String> {
     SPECIFIER_RE
         .captures_iter(&String::from_utf8_lossy(bundle))
@@ -45,8 +73,31 @@ pub(super) fn scan(bundle: &[u8]) -> Vec<String> {
 /// Importing one is not an error, because bundles name built-ins in code that
 /// never runs; the first call throws. Listing them here moves the discovery
 /// from production to the deploy. `strict` turns the list into a failure.
-pub(super) fn report(imports: &[String], strict: bool) -> anyhow::Result<()> {
+pub(super) fn report(imports: &[String], strict: bool, approximate: bool) -> anyhow::Result<()> {
     let unsupported = unsupported_node_imports(imports.iter().map(String::as_str));
+    if approximate {
+        // Failing on a guess would fail deploys for text that is not an import
+        // and pass ones whose import the guess missed.
+        if strict {
+            note!(
+                "Warning: cannot check --strict without esbuild to read the prebuilt entry's imports; \
+                 install it or set CELLD_ESBUILD"
+            );
+        }
+        if unsupported.is_empty() {
+            return Ok(());
+        }
+        let list = unsupported
+            .iter()
+            .map(|import| format!("  {}", import.specifier))
+            .collect::<Vec<_>>()
+            .join("\n");
+        note!(
+            "Warning: the prebuilt entry appears to import node: modules that celld does not \
+             implement (the list is approximate, read without esbuild):\n{list}"
+        );
+        return Ok(());
+    }
     if unsupported.is_empty() {
         return Ok(());
     }

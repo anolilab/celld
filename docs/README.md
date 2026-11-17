@@ -249,6 +249,10 @@ a warning; `--strict` makes it an error. Importing such a module still works
 and the first call throws, so a bundle that names one in code it never runs is
 unaffected. `celld dev` prints the same warning at startup.
 
+With `no_bundle`, esbuild reads the prebuilt entry's imports without changing
+it. Without esbuild the entry's text is scanned instead; that list is marked
+approximate, and `--strict` warns that it cannot check instead of failing.
+
 `celld deploy --sourcemap PATH` writes the entry's source map to `PATH`, for
 an error tracker or a stack-trace decoder. The map is not part of the
 deployment: the deployed module and its version are the same with or without
