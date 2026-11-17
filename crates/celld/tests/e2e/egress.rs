@@ -154,12 +154,12 @@ async fn exceptions_permit_a_destination_and_not_a_redirect_into_another() {
     // or on another port, is still refused.
     let result = call(&server, "/fetch", &format!("http://localhost:{port}/hello")).await;
     assert_refused(&result, "loopback");
-    let result = call(
-        &server,
-        "/fetch",
-        &format!("http://127.0.0.1:{}/", port.wrapping_add(1)),
-    )
-    .await;
+    // A port no listener of the node holds: bound and released just now.
+    let unused = {
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        socket.local_addr().unwrap().port()
+    };
+    let result = call(&server, "/fetch", &format!("http://127.0.0.1:{unused}/")).await;
     assert_refused(&result, "loopback");
     assert_eq!(internal.hits(), before);
     // connect() agrees with fetch(): the exception names the literal address.

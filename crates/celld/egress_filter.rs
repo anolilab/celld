@@ -21,18 +21,27 @@
 //! `CELLD_EGRESS_ALLOW` lists exceptions, separated by commas or whitespace:
 //!
 //! - `10.0.0.0/8`, `fd00::/8`: a CIDR range. Any address inside it is
-//!   permitted, however celld reached it. A name that resolves into the range
-//!   needs the range here, so use `10.0.0.5/32` for one address.
+//!   permitted, however celld reached it, except a listener of this node (see
+//!   below). A name that resolves into the range needs the range here, so use
+//!   `10.0.0.5/32` for one address.
 //! - `db.internal:5432`, `10.0.0.5:5432`, `[fd00::5]:5432`: one destination. A
 //!   hostname entry permits any address that name resolves to, on that port
 //!   only: the name is refused on every other port, so the exception cannot
 //!   open the rest of the host. An IP entry matches a request that names that
 //!   IP literally.
 //!
+//! No exception opens a listener of this node: an address of the node (what its
+//! listeners bind, what it advertises, what an operator pinned, and loopback)
+//! on a port celld listens on or advertises is always refused. Another port of
+//! those addresses follows the exceptions. When the port is not known, as for
+//! the name lookup of `fetch()`, any address of the node counts as a listener;
+//! name the destination as an IP literal, or with a `host:port` entry, to reach
+//! a service of the host on another port.
+//!
 //! celld's own traffic (peers, the bucket, the control plane) does not use this
-//! filter. The addresses of the node's running containers are always
-//! permitted, because `getTcpPort()` reaches a container on its private or
-//! published loopback address.
+//! filter. The addresses of the node's running containers are permitted even
+//! when private, because `getTcpPort()` reaches a container on its private or
+//! published loopback address, unless the address is a listener of the node.
 //!
 //! The public policy also stops Worker `fetch()` from using a
 //! `HTTP_PROXY`-style proxy, because a proxy would receive the name and
@@ -66,7 +75,8 @@ pub enum Class {
     /// translation ranges with no public use.
     Reserved,
     /// An address of this node. [`classify`] never returns it; the policy
-    /// uses it for a public address that belongs to the node itself.
+    /// uses it for a node address that is refused as a listener, and for a
+    /// public address of the node on another port.
     Own,
 }
 
@@ -285,6 +295,15 @@ impl Refused {
             class.describe()
         ))
     }
+
+    /// A node address refused with the port unknown: say how to name the port.
+    fn own_port_unknown(ip: IpAddr) -> Self {
+        Self(format!(
+            "egress refused: {ip} is {} on a port not known here ({MODE_ENV}=public); \
+             use the IP literal or a host:port entry in {ALLOW_ENV} to reach another port",
+            Class::Own.describe()
+        ))
+    }
 }
 
 impl std::fmt::Display for Refused {
@@ -436,7 +455,7 @@ impl Filter {
             || (self.container_endpoint)(SocketAddr::new(ip, addr.port()))
         {
             return if listener {
-                Err(Refused::address(addr.ip(), Class::Own))
+                Err(Refused::own_port_unknown(addr.ip()))
             } else {
                 Ok(())
             };
@@ -537,9 +556,10 @@ impl Filter {
                 let dialed =
                     SocketAddr::new(addr.ip(), if addr.port() == 0 { port } else { addr.port() });
                 // A `host:port` exception for an IP applies to a request that
-                // names the IP. The port is not part of this check, so
-                // `fetch()`, which resolves without a port, and `connect()`
-                // agree: a name that resolves to a listed IP needs a range.
+                // names the IP, never to a name that resolves to it, so a name
+                // needs a range. The listener check differs: `connect()` knows
+                // its port, while `fetch()` resolves without one and treats
+                // every address of the node as a listener.
                 match self.permits_on(SocketAddr::new(addr.ip(), 0), port) {
                     Ok(()) => Some(dialed),
                     Err(refusal) => {
@@ -678,8 +698,14 @@ fn from_settings(mode: Option<&str>, allow: Option<&str>) -> anyhow::Result<Opti
 /// What `celld dev` sets `CELLD_EGRESS` to when the operator set neither
 /// variable: developers fetch local services. `None` leaves the setting alone.
 pub fn dev_default_mode() -> Option<&'static str> {
-    (std::env::var_os(MODE_ENV).is_none() && std::env::var_os(ALLOW_ENV).is_none())
-        .then_some("open")
+    dev_mode_for(
+        std::env::var_os(MODE_ENV).is_some(),
+        std::env::var_os(ALLOW_ENV).is_some(),
+    )
+}
+
+fn dev_mode_for(mode_set: bool, allow_set: bool) -> Option<&'static str> {
+    (!mode_set && !allow_set).then_some("open")
 }
 
 /// The node's own addresses and the ports its listeners bind.
@@ -689,20 +715,23 @@ struct NodeAddrs {
     listener_ports: Vec<u16>,
 }
 
+/// How long startup waits for the advertised name to resolve.
+const ADVERTISED_NAME_LOOKUP: std::time::Duration = std::time::Duration::from_secs(2);
+
 static NODE: OnceLock<NodeAddrs> = OnceLock::new();
 
 impl NodeAddrs {
     /// What the node knows about itself: every address its listeners bind
     /// (every interface address for a wildcard bind), the addresses it
-    /// advertises, and those an operator pinned. Loopback is always the
+    /// advertises (with their ports), and those an operator pinned. Loopback is always the
     /// node's own and is not listed.
     fn new(
         listeners: &[SocketAddr],
-        advertised: Vec<IpAddr>,
+        advertised: Vec<SocketAddr>,
         pinned: Vec<IpAddr>,
         interfaces: impl FnOnce() -> Vec<IpAddr>,
     ) -> Self {
-        let mut addrs = advertised;
+        let mut addrs: Vec<IpAddr> = advertised.iter().map(SocketAddr::ip).collect();
         addrs.extend(pinned);
         let mut interfaces = Some(interfaces);
         for listener in listeners {
@@ -718,7 +747,14 @@ impl NodeAddrs {
             .collect();
         addrs.sort();
         addrs.dedup();
-        let mut listener_ports: Vec<u16> = listeners.iter().map(SocketAddr::port).collect();
+        // The advertised port is a listener port: behind a port mapping it
+        // reaches a listener of this node, on the advertised address and on
+        // every other address of the node.
+        let mut listener_ports: Vec<u16> = listeners
+            .iter()
+            .chain(&advertised)
+            .map(SocketAddr::port)
+            .collect();
         listener_ports.sort_unstable();
         listener_ports.dedup();
         Self {
@@ -777,11 +813,19 @@ pub async fn register_node_addresses(listeners: &[SocketAddr], advertise: &Adver
         return;
     }
     let advertised = match advertise {
-        Advertise::Addr(address) => vec![address.ip()],
+        Advertise::Addr(address) => vec![*address],
         Advertise::Name { host, port } => {
-            match tokio::net::lookup_host((host.as_str(), *port)).await {
-                Ok(resolved) => resolved.map(|address| address.ip()).collect(),
-                Err(error) => {
+            let lookup = tokio::net::lookup_host((host.as_str(), *port));
+            match crate::asyncrt::timeout(ADVERTISED_NAME_LOOKUP, lookup).await {
+                Ok(Ok(resolved)) => resolved.collect(),
+                Err(_) => {
+                    tracing::warn!(
+                        host,
+                        "resolving the advertised name timed out, so a Worker is not stopped from dialing the address it names"
+                    );
+                    Vec::new()
+                }
+                Ok(Err(error)) => {
                     tracing::warn!(
                         host,
                         %error,
@@ -931,6 +975,38 @@ mod tests {
     }
 
     #[test]
+    fn the_advertised_port_is_a_listener_port_behind_a_port_mapping() {
+        // Bound on 0.0.0.0:8081, advertised as 10.0.0.1:9000.
+        let node = NodeAddrs::new(
+            &[sock("0.0.0.0:8081")],
+            vec![sock("10.0.0.1:9000")],
+            Vec::new(),
+            || vec![ip("172.17.0.2")],
+        );
+        let at = |text: &str| node.endpoint(sock(text));
+        assert_eq!(at("10.0.0.1:9000"), NodeEndpoint::Listener);
+        assert_eq!(at("172.17.0.2:9000"), NodeEndpoint::Listener);
+        assert_eq!(at("10.0.0.1:8081"), NodeEndpoint::Listener);
+        assert_eq!(at("10.0.0.1:5432"), NodeEndpoint::Address);
+        assert_eq!(at("10.0.0.2:9000"), NodeEndpoint::Elsewhere);
+    }
+
+    #[test]
+    fn an_unknown_port_refusal_names_the_workaround() {
+        let filter = on_node("10.0.0.0/8");
+        let refusal = filter
+            .filter_resolved("self.internal", 0, vec![sock("10.0.0.5:0")])
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("own address"), "{refusal}");
+        assert!(refusal.contains("IP literal"), "{refusal}");
+        assert!(refusal.contains(ALLOW_ENV), "{refusal}");
+        // With the port known the plain refusal stays.
+        let known = filter.permits(sock("10.0.0.5:8081")).unwrap_err();
+        assert!(!known.to_string().contains("IP literal"), "{known}");
+    }
+
+    #[test]
     fn a_name_exception_does_not_open_a_listener() {
         let filter = on_node("db.internal:8081");
         let refused = filter.filter_resolved("db.internal", 8081, vec![sock("10.0.0.5:0")]);
@@ -992,7 +1068,7 @@ mod tests {
         let interfaces = || vec![ip("172.17.0.2"), ip("fd00::2")];
         let node = NodeAddrs::new(
             &listeners,
-            vec![ip("198.51.100.7")],
+            vec![sock("198.51.100.7:9100")],
             vec![ip("203.0.113.9"), ip("::ffff:203.0.113.10")],
             interfaces,
         );
@@ -1006,6 +1082,9 @@ mod tests {
         // The advertised address and the pinned ones, which are on no
         // interface when a NAT maps them to the node.
         assert_eq!(at("198.51.100.7:80"), NodeEndpoint::Address);
+        // The advertised port is a listener port, on every address of the node.
+        assert_eq!(at("198.51.100.7:9100"), NodeEndpoint::Listener);
+        assert_eq!(at("172.17.0.2:9100"), NodeEndpoint::Listener);
         assert_eq!(at("203.0.113.9:8787"), NodeEndpoint::Listener);
         assert_eq!(at("203.0.113.10:80"), NodeEndpoint::Address);
         // Anything else, including a public address not known to the node.
@@ -1027,10 +1106,19 @@ mod tests {
 
     #[test]
     fn dev_leaves_egress_open_unless_the_operator_chose() {
-        // The process environment is shared, so only the rule is checked
-        // against what this test run set.
-        let set = std::env::var_os(MODE_ENV).is_some() || std::env::var_os(ALLOW_ENV).is_some();
-        assert_eq!(dev_default_mode().is_none(), set);
+        // (CELLD_EGRESS set, CELLD_EGRESS_ALLOW set) -> the default dev sets.
+        for (mode_set, allow_set, expected) in [
+            (false, false, Some("open")),
+            (true, false, None),
+            (false, true, None),
+            (true, true, None),
+        ] {
+            assert_eq!(
+                dev_mode_for(mode_set, allow_set),
+                expected,
+                "mode set {mode_set}, allow set {allow_set}"
+            );
+        }
     }
 
     #[test]
