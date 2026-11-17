@@ -34,17 +34,11 @@ pub fn open_local_bucket(database: &Path) -> anyhow::Result<Bucket> {
     Bucket::open_dev(database)
 }
 
-/// Where the local node of `celld dev` keeps the operator token it generates:
-/// in the state directory of `project`. A client has no `--state-dir` flag, so
-/// the `CELLD_DEV_STATE_DIR` value decides, then the project.
-#[doc(hidden)]
-pub fn operator_token_path(project: &Path) -> anyhow::Result<PathBuf> {
-    operator_token_path_with(project, std::env::var_os("CELLD_DEV_STATE_DIR"))
-}
-
-/// `operator_token_path` for a node that was given `state_dir` as its
-/// `CELLD_DEV_STATE_DIR` value. The project is resolved the way `run` resolves
-/// it, so a relative path, `..` or a symbolic link finds the same directory.
+/// Where the local node of `celld dev` keeps the operator token it generates,
+/// for a node that was given `state_dir` as its `CELLD_DEV_STATE_DIR` value
+/// (`None` keeps it in the project). The project is resolved the way `run`
+/// resolves it, so a relative path, `..` or a symbolic link finds the same
+/// directory.
 #[doc(hidden)]
 #[allow(clippy::disallowed_methods)] // Project resolution uses the operator's host filesystem.
 pub fn operator_token_path_with(
