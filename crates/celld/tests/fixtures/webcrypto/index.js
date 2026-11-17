@@ -411,6 +411,64 @@ const checks = {
     equal(await outcome(subtle.importKey("jwk", jwk, ecdh, true, ["deriveKey"])), "SyntaxError", "ECDH public jwk with deriveKey");
     equal(await outcome(subtle.importKey("jwk", jwk, ecdh, true, [])), "ok", "ECDH public jwk with none");
   },
+  // sign and verify run only with a key made for that algorithm and usage.
+  async "sign and verify need the key's usage"() {
+    const outcome = (promise) => promise.then(() => "ok", (error) => error.name);
+    const ecdsa = { name: "ECDSA", namedCurve: "P-256" };
+    const params = { name: "ECDSA", hash: "SHA-256" };
+    const vector = V["ECDSA P-256"];
+    const point = unhex(vector.spki).slice(-65);
+    const bare = await subtle.importKey("raw", point, ecdsa, true, []);
+    const signature = unhex(vector.signature);
+    equal(await outcome(subtle.verify(params, bare, signature, message)), "InvalidAccessError", "ECDSA verify with no usage");
+    const pub = await subtle.importKey("raw", point, ecdsa, true, ["verify"]);
+    equal(await subtle.verify(params, pub, signature, message), true, "ECDSA verify with the usage");
+    const priv = await subtle.importKey("pkcs8", unhex(vector.pkcs8), ecdsa, true, ["sign"]);
+    equal(await outcome(subtle.verify(params, priv, signature, message)), "InvalidAccessError", "ECDSA verify with a sign-only key");
+    const verifyOnly = await subtle.importKey("pkcs8", unhex(vector.pkcs8), ecdsa, true, []);
+    equal(await outcome(subtle.sign(params, verifyOnly, message)), "InvalidAccessError", "ECDSA sign with no usage");
+    // A key of another algorithm is refused, even with the usage.
+    const rsa = V["RSASSA-PKCS1-v1_5"];
+    const rsaPub = await subtle.importKey("spki", unhex(rsa.spki), { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, true, ["verify"]);
+    equal(await outcome(subtle.verify(params, rsaPub, signature, message)), "InvalidAccessError", "ECDSA verify with an RSA key");
+    const rsaBare = await subtle.importKey("spki", unhex(rsa.spki), { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, true, []);
+    equal(await outcome(subtle.verify("RSASSA-PKCS1-v1_5", rsaBare, unhex(rsa.signature), message)), "InvalidAccessError", "RSASSA verify with no usage");
+    const pss = V["RSA-PSS"];
+    const pssBare = await subtle.importKey("spki", unhex(pss.spki), { name: "RSA-PSS", hash: "SHA-256" }, true, []);
+    equal(await outcome(subtle.verify({ name: "RSA-PSS", saltLength: 32 }, pssBare, unhex(pss.signature), message)), "InvalidAccessError", "RSA-PSS verify with no usage");
+    const edVector = V.Ed25519;
+    const edBare = await subtle.importKey("spki", unhex(edVector.spki), "Ed25519", true, []);
+    equal(await outcome(subtle.verify("Ed25519", edBare, unhex(edVector.signature), message)), "InvalidAccessError", "Ed25519 verify with no usage");
+    const mac = await subtle.importKey("raw", aesKey, { name: "HMAC", hash: "SHA-256" }, true, ["sign"]);
+    equal(await outcome(subtle.verify("HMAC", mac, new Uint8Array(32), message)), "InvalidAccessError", "HMAC verify with a sign-only key");
+    const macVerify = await subtle.importKey("raw", aesKey, { name: "HMAC", hash: "SHA-256" }, true, ["verify"]);
+    equal(await outcome(subtle.sign("HMAC", macVerify, message)), "InvalidAccessError", "HMAC sign with a verify-only key");
+  },
+  // deriveKey and deriveBits are separate usages of a base key, and each
+  // operation asks for its own.
+  async "derive needs the base key's usage"() {
+    const outcome = (promise) => promise.then(() => "ok", (error) => error.name);
+    const material = unhex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+    const params = { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(4), info: new Uint8Array(4) };
+    const bitsOnly = await subtle.importKey("raw", material, "HKDF", false, ["deriveBits"]);
+    const keyOnly = await subtle.importKey("raw", material, "HKDF", false, ["deriveKey"]);
+    for (const [target, usages] of [
+      [{ name: "AES-KW", length: 128 }, ["wrapKey"]],
+      [{ name: "AES-GCM", length: 128 }, ["encrypt"]],
+      [{ name: "HMAC", hash: "SHA-256" }, ["sign"]],
+    ]) {
+      equal(await outcome(subtle.deriveKey(params, bitsOnly, target, true, usages)), "InvalidAccessError", `${target.name} derived with a deriveBits-only key`);
+      equal(await outcome(subtle.deriveKey(params, keyOnly, target, true, usages)), "ok", `${target.name} derived with a deriveKey key`);
+    }
+    equal(await outcome(subtle.deriveBits(params, keyOnly, 128)), "InvalidAccessError", "deriveBits with a deriveKey-only key");
+    equal(await outcome(subtle.deriveBits(params, bitsOnly, 128)), "ok", "deriveBits with a deriveBits key");
+    // The base key must be of the algorithm being derived with.
+    const pbkdf2 = { name: "PBKDF2", hash: "SHA-256", salt: new Uint8Array(4), iterations: 1 };
+    equal(await outcome(subtle.deriveBits(pbkdf2, bitsOnly, 128)), "InvalidAccessError", "PBKDF2 with an HKDF key");
+    const pair = await subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+    const ecdh = { name: "ECDH", public: pair.publicKey };
+    equal(await outcome(subtle.deriveKey(ecdh, pair.privateKey, { name: "AES-KW", length: 128 }, true, ["wrapKey"])), "InvalidAccessError", "ECDH deriveKey with a deriveBits-only key");
+  },
   // An EC public key's `raw` form is the uncompressed point, which is the
   // bit string at the end of its SPKI document.
   ...Object.fromEntries(["ECDSA", "ECDH"].flatMap((name) =>

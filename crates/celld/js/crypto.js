@@ -220,7 +220,9 @@
   // `encrypt` and `decrypt` for the operations of that name, `wrapKey` and
   // `unwrapKey` when the same cipher runs under them.
   function _checkKeyUse(name, key, usage) {
-    if (_algorithmName(key?.algorithm) !== name) {
+    const keyName = _algorithmName(key?.algorithm);
+    if (keyName !== name &&
+        !(_ED25519_ALGS.has(keyName) && _ED25519_ALGS.has(name))) {
       throw new DOMException(
         `key is not a ${name} key`, "InvalidAccessError");
     }
@@ -228,6 +230,66 @@
       throw new DOMException(
         `key does not permit ${usage}`, "InvalidAccessError");
     }
+  }
+
+  // The derivation shared by `deriveBits` and `deriveKey`. Each asks for its
+  // own usage, so a key granted only one of them cannot be used for the other.
+  function _derive(algorithm, baseKey, length, usage) {
+    _checkKeyUse(_algorithmName(algorithm), baseKey, usage);
+    const name = _algorithmName(algorithm);
+    if (name === "HKDF" || name === "PBKDF2") {
+      const bits = Number(length);
+      if (!Number.isInteger(bits) || bits <= 0 || bits % 8 !== 0) {
+        throw _operationError(
+          name + " length must be a positive multiple of 8 bits");
+      }
+      const hash = _hashName(algorithm?.hash);
+      if (!_DIGEST_ALGS.has(hash)) {
+        throw _notSupported("unsupported " + name + " hash: " + hash);
+      }
+      const ikm = baseKey.__celldMaterial.bytes;
+      const salt = _toBuf(algorithm?.salt ?? new Uint8Array());
+      let out;
+      if (name === "HKDF") {
+        out = $$hkdf(
+          hash, ikm, salt,
+          _toBuf(algorithm?.info ?? new Uint8Array()), bits / 8);
+        if (!out) {
+          throw _operationError("HKDF length is too large for the hash");
+        }
+      } else {
+        const iterations = Number(algorithm?.iterations);
+        if (!Number.isInteger(iterations) || iterations <= 0) {
+          throw _operationError(
+            "PBKDF2 iterations must be a positive integer");
+        }
+        out = $$pbkdf2(hash, ikm, salt, iterations, bits / 8);
+      }
+      return out.buffer.slice(
+        out.byteOffset, out.byteOffset + out.byteLength);
+    }
+    if (name !== "ECDH" && name !== "X25519") {
+      throw _notSupported("unsupported derive algorithm: " + name);
+    }
+    const publicKey = algorithm?.public;
+    if (!publicKey || publicKey.type !== "public") {
+      throw new TypeError(name + " requires a public key in algorithm.public");
+    }
+    // X25519 carries no `namedCurve`, so it cannot ride the curve match
+    // `ecdh-derive` runs; its op is separate for that reason alone. Both
+    // answer the raw shared secret, so everything below is shared.
+    const shared = Uint8Array.from(_extra(
+      name === "X25519" ? "x25519-derive" : "ecdh-derive", {
+        private: Array.from(_toBuf(baseKey.__celldMaterial.bytes)),
+        public: Array.from(_toBuf(publicKey.__celldMaterial.bytes)),
+      }).bytes);
+    if (length === null || length === undefined) return shared.buffer;
+    const bytes = Number(length) / 8;
+    if (!Number.isInteger(bytes) || bytes < 0 || bytes > shared.byteLength) {
+      throw _operationError("requested length exceeds the derived secret");
+    }
+    return shared.slice(0, bytes).buffer;
+  
   }
 
   // RSA-PSS `saltLength` is a required `[EnforceRange] unsigned long`: a
@@ -534,59 +596,7 @@
     // HKDF and PBKDF2 have no natural output size, so for them a missing
     // or unaligned length is the OperationError the spec names.
     async deriveBits(algorithm, baseKey, length) {
-      const name = _algorithmName(algorithm);
-      if (name === "HKDF" || name === "PBKDF2") {
-        const bits = Number(length);
-        if (!Number.isInteger(bits) || bits <= 0 || bits % 8 !== 0) {
-          throw _operationError(
-            name + " length must be a positive multiple of 8 bits");
-        }
-        const hash = _hashName(algorithm?.hash);
-        if (!_DIGEST_ALGS.has(hash)) {
-          throw _notSupported("unsupported " + name + " hash: " + hash);
-        }
-        const ikm = baseKey.__celldMaterial.bytes;
-        const salt = _toBuf(algorithm?.salt ?? new Uint8Array());
-        let out;
-        if (name === "HKDF") {
-          out = $$hkdf(
-            hash, ikm, salt,
-            _toBuf(algorithm?.info ?? new Uint8Array()), bits / 8);
-          if (!out) {
-            throw _operationError("HKDF length is too large for the hash");
-          }
-        } else {
-          const iterations = Number(algorithm?.iterations);
-          if (!Number.isInteger(iterations) || iterations <= 0) {
-            throw _operationError(
-              "PBKDF2 iterations must be a positive integer");
-          }
-          out = $$pbkdf2(hash, ikm, salt, iterations, bits / 8);
-        }
-        return out.buffer.slice(
-          out.byteOffset, out.byteOffset + out.byteLength);
-      }
-      if (name !== "ECDH" && name !== "X25519") {
-        throw _notSupported("unsupported derive algorithm: " + name);
-      }
-      const publicKey = algorithm?.public;
-      if (!publicKey || publicKey.type !== "public") {
-        throw new TypeError(name + " requires a public key in algorithm.public");
-      }
-      // X25519 carries no `namedCurve`, so it cannot ride the curve match
-      // `ecdh-derive` runs; its op is separate for that reason alone. Both
-      // answer the raw shared secret, so everything below is shared.
-      const shared = Uint8Array.from(_extra(
-        name === "X25519" ? "x25519-derive" : "ecdh-derive", {
-          private: Array.from(_toBuf(baseKey.__celldMaterial.bytes)),
-          public: Array.from(_toBuf(publicKey.__celldMaterial.bytes)),
-        }).bytes);
-      if (length === null || length === undefined) return shared.buffer;
-      const bytes = Number(length) / 8;
-      if (!Number.isInteger(bytes) || bytes < 0 || bytes > shared.byteLength) {
-        throw _operationError("requested length exceeds the derived secret");
-      }
-      return shared.slice(0, bytes).buffer;
+      return _derive(algorithm, baseKey, length, "deriveBits");
     }
 
     async deriveKey(algorithm, baseKey, derived, extractable, usages) {
@@ -600,7 +610,7 @@
             ? ({ "SHA-384": 1024, "SHA-512": 1024 }[
               _hashName(derived?.hash)] ?? 512)
             : null);
-      const bits = await this.deriveBits(algorithm, baseKey, length);
+      const bits = await _derive(algorithm, baseKey, length, "deriveKey");
       return this.importKey(
         "raw", bits, derived, extractable, usages);
     }
@@ -732,6 +742,7 @@
 
     async sign(algorithm, key, data) {
       const name = _algorithmName(algorithm || key?.algorithm);
+      _checkKeyUse(name, key, "sign");
       const bytes = _toBuf(data);
       if (name === "HMAC") {
         const hash = _hashName(key?.algorithm?.hash);
@@ -771,6 +782,7 @@
 
     async verify(algorithm, key, signature, data) {
       const name = _algorithmName(algorithm || key?.algorithm);
+      _checkKeyUse(name, key, "verify");
       if (name === "HMAC") {
         return _hmacVerify(
           _hashName(key?.algorithm?.hash),

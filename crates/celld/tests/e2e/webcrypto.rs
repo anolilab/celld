@@ -14,7 +14,7 @@ async fn webcrypto_matches_the_reference_vectors() {
     let results: BTreeMap<String, String> = server.get_json("/").await;
     assert_eq!(
         results.len(),
-        57,
+        59,
         "the fixture ran a different set of checks: {results:#?}"
     );
     let failed: Vec<_> = results

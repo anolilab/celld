@@ -966,12 +966,22 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             let salt_len = args.get("saltLength").and_then(serde_json::Value::as_u64);
             let key = rsa::PublicKey::from_public_key_der(&key)
                 .map_err(|_| anyhow!("invalid RSA SPKI key"))?;
-            // No signature carries a salt longer than the modulus allows.
-            let salt_len = match salt_len {
-                Some(len) if len > pss_max_salt_len(key.n().bit_width(), &hash)? => {
+            // No signature carries a salt longer than the modulus allows, and
+            // a modulus too small for the hash holds no signature at all.
+            // Only an unsupported hash is an error.
+            let max = match pss_max_salt_len(key.n().bit_width(), &hash) {
+                Ok(max) => Some(max),
+                Err(error) if error.to_string().starts_with("NotSupportedError") => {
+                    return Err(error);
+                }
+                Err(_) => None,
+            };
+            let salt_len = match (salt_len, max) {
+                (Some(_), None) => return Ok(serde_json::json!({ "ok": false })),
+                (Some(len), Some(max)) if len > max => {
                     return Ok(serde_json::json!({ "ok": false }));
                 }
-                other => other.map(|len| len as usize),
+                (other, _) => other.map(|len| len as usize),
             };
             macro_rules! verify {
                 ($hash:ty) => {{
@@ -2503,5 +2513,25 @@ mod pss_tests {
         assert_eq!(verify(&signature, 94), Some(true));
         assert_eq!(verify(&signature, 95), Some(false));
         assert_eq!(verify(&signature, u64::MAX), Some(false));
+    }
+
+    #[test]
+    fn verifying_with_an_unsupported_hash_is_still_an_error() {
+        let pair = crypto_operation(
+            "asym-key-generate",
+            &serde_json::json!({ "type": "rsa", "modulusLength": 1024 }),
+        )
+        .unwrap();
+        let verify = crypto_operation(
+            "rsa-pss-verify",
+            &serde_json::json!({
+                "key": pair["publicDer"], "data": [1], "signature": vec![0u8; 128],
+                "hash": "SHA-1", "saltLength": 20,
+            }),
+        );
+        assert!(verify
+            .unwrap_err()
+            .to_string()
+            .starts_with("NotSupportedError"));
     }
 }
