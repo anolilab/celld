@@ -86,3 +86,19 @@ async fn a_public_reply_carries_neither_the_peer_marker_nor_the_workers_stack() 
     assert!(!body.contains("worker.js"), "{body}");
     assert!(!body.contains("rejected"), "{body}");
 }
+
+#[tokio::test]
+async fn the_body_follows_the_sentences_the_cancel_itself_uses() {
+    for (sentence, expected) in [
+        (celld::js::CANCEL_MOVED_TEXT, "moved to a new deployment"),
+        (
+            celld::js::CANCEL_RESTARTED_TEXT,
+            "restarted after a storage error",
+        ),
+        (celld::js::CANCEL_SHUTDOWN_TEXT, "shutting down"),
+    ] {
+        let body = body_text(retryable_cancel_response(&cancel(sentence))).await;
+        assert!(body.contains(expected), "{body}");
+        assert!(!body.contains("this request was ended"), "{body}");
+    }
+}

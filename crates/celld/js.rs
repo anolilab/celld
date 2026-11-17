@@ -69,8 +69,10 @@ pub use crate::engine_api::WorkerConfigOptions;
 pub use crate::engine_api::WorkflowBinding;
 pub use crate::engine_api::WsTarget;
 pub(crate) use crate::engine_api::BARE_NODE_BUILTINS;
-pub use crate::engine_api::CANCEL_RETRYABLE_ERROR_MARKER;
 pub use crate::engine_api::CELL_OVERLOAD_ERROR_MARKER;
+pub use crate::engine_api::{
+    CANCEL_MOVED_TEXT, CANCEL_RESTARTED_TEXT, CANCEL_RETRYABLE_ERROR_MARKER, CANCEL_SHUTDOWN_TEXT,
+};
 pub(crate) use crate::host_channels::outbound_ws_tx;
 pub use crate::host_channels::set_asset_call_tx;
 pub use crate::host_channels::set_broken_tx;
@@ -5378,17 +5380,18 @@ fn cancel_error(cause: CancelCause) -> anyhow::Error {
             crate::generation::retire_deadline().as_secs()
         ),
         CancelCause::Moved => anyhow!(
-            "this Durable Object was moved to a new deployment and its request was ended; \
-             retry it ({})",
+            "{} ({})",
+            crate::engine_api::CANCEL_MOVED_TEXT,
             crate::engine_api::CANCEL_RETRYABLE_ERROR_MARKER
         ),
         CancelCause::Restarted => anyhow!(
-            "this Durable Object restarted after a storage error and its request was ended; \
-             retry it ({})",
+            "{} ({})",
+            crate::engine_api::CANCEL_RESTARTED_TEXT,
             crate::engine_api::CANCEL_RETRYABLE_ERROR_MARKER
         ),
         CancelCause::Shutdown => anyhow!(
-            "this node is shutting down and its request was ended; retry it ({})",
+            "{} ({})",
+            crate::engine_api::CANCEL_SHUTDOWN_TEXT,
             crate::engine_api::CANCEL_RETRYABLE_ERROR_MARKER
         ),
         CancelCause::Client => anyhow!("The client has disconnected"),

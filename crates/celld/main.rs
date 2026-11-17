@@ -1534,8 +1534,7 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                     return Err(anyhow::Error::new(celld::js::CellOverloaded));
                 }
                 if is_retryable_cancel_reply(response.status(), response.headers()) {
-                    let body = response
-                        .into_body()
+                    let body = Limited::new(response.into_body(), MAX_PEER_CONTROL_BODY_BYTES)
                         .collect()
                         .await
                         .map(|body| body.to_bytes())
@@ -1687,7 +1686,6 @@ fn retryable_cancel_error(error: &anyhow::Error) -> bool {
 /// for a move, restart or shutdown, so it can answer its own client the same.
 const RETRYABLE_CANCEL_HEADER: &str = "x-celld-retryable-cancel";
 
-/// The cause text of a retryable cancel, without the internal marker.
 /// The public sentence for a retryable cancel. It is chosen from the cause,
 /// never copied from the error text, which can carry a Worker's stack.
 fn retryable_cancel_text(error: &anyhow::Error) -> &'static str {
@@ -1697,15 +1695,14 @@ fn retryable_cancel_text(error: &anyhow::Error) -> &'static str {
         .map(|cause| cause.to_string())
         .find(|text| text.contains(marker))
         .unwrap_or_default();
-    if text.contains("was moved to a new deployment") {
-        "this Durable Object was moved to a new deployment and its request was ended; retry it"
-    } else if text.contains("restarted after a storage error") {
-        "this Durable Object restarted after a storage error and its request was ended; retry it"
-    } else if text.contains("node is shutting down") {
-        "this node is shutting down and its request was ended; retry it"
-    } else {
-        "this request was ended; retry it"
-    }
+    [
+        celld::js::CANCEL_MOVED_TEXT,
+        celld::js::CANCEL_RESTARTED_TEXT,
+        celld::js::CANCEL_SHUTDOWN_TEXT,
+    ]
+    .into_iter()
+    .find(|sentence| text.contains(sentence))
+    .unwrap_or("this request was ended; retry it")
 }
 
 fn retryable_cancel_response(error: &anyhow::Error) -> HttpReply {
