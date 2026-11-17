@@ -38,6 +38,11 @@ pub const KEY_FILE_VARIABLE: &str = "CELLD_SECRETS_KEY_FILE";
 
 /// Cloudflare's limit for one secret.
 pub const MAX_VALUE_BYTES: usize = 5 * 1024;
+/// Most secrets one script holds.
+pub const MAX_ENTRIES: usize = 128;
+/// Largest encoded `secrets.json`. A node reads and decrypts the whole object
+/// at every deployment load, so it stays small.
+pub const MAX_OBJECT_BYTES: usize = 64 * 1024;
 const SCHEMA_VERSION: u32 = 1;
 const KEY_BYTES: usize = 32;
 /// A key is 44 characters of base64; a file larger than this is not one.
@@ -263,12 +268,22 @@ async fn read(bucket: &Bucket, script: &str) -> anyhow::Result<Option<(SecretSet
     let Some((body, token)) = bucket.get(&key).await? else {
         return Ok(None);
     };
+    anyhow::ensure!(
+        body.len() <= MAX_OBJECT_BYTES,
+        "{key} is {} bytes, over the {MAX_OBJECT_BYTES}-byte limit; delete secrets of script {script}",
+        body.len()
+    );
     let set: SecretSet =
         serde_json::from_slice(&body).with_context(|| format!("decode the secrets in {key}"))?;
     anyhow::ensure!(
         set.v == SCHEMA_VERSION,
         "{key} has schema version {}, and this celld reads version {SCHEMA_VERSION}",
         set.v
+    );
+    anyhow::ensure!(
+        set.secrets.len() <= MAX_ENTRIES,
+        "{key} holds {} secrets, over the limit of {MAX_ENTRIES}; delete secrets of script {script}",
+        set.secrets.len()
     );
     Ok(Some((set, token)))
 }
@@ -350,6 +365,10 @@ pub async fn put(
              use that key, or delete the secrets of script {script} first"
         );
         set.secrets.insert(name.to_string(), sealed.clone());
+        anyhow::ensure!(
+            set.secrets.len() <= MAX_ENTRIES,
+            "script {script} can hold at most {MAX_ENTRIES} secrets; delete one first"
+        );
         Ok(())
     })
     .await
@@ -381,6 +400,12 @@ async fn update(
         };
         change(&mut set)?;
         let body = serde_json::to_vec(&set)?;
+        anyhow::ensure!(
+            body.len() <= MAX_OBJECT_BYTES,
+            "the secrets of script {script} would take {} bytes, over the {MAX_OBJECT_BYTES}-byte \
+             limit for all of them; delete one first",
+            body.len()
+        );
         if bucket
             .put_cas(&key, body, token.as_deref())
             .await?
@@ -697,6 +722,90 @@ mod tests {
         put(&bucket, &key(3), "app", "B", "two", &none)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_entry_count_and_object_size_are_capped() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let key = key(3);
+        let none = BTreeSet::new();
+
+        // Size: values of the largest allowed length overflow the object first.
+        let big = "x".repeat(MAX_VALUE_BYTES);
+        let mut stored = 0;
+        let error = loop {
+            match put(&bucket, &key, "big", &format!("S{stored}"), &big, &none).await {
+                Ok(()) => stored += 1,
+                Err(error) => break error,
+            }
+            assert!(stored < MAX_ENTRIES, "the size limit never applied");
+        };
+        let text = format!("{error:#}");
+        assert!(text.contains("byte limit"), "{text}");
+        assert_eq!(names(&bucket, "big").await.unwrap().len(), stored);
+
+        // Count: small values reach the entry limit.
+        for index in 0..MAX_ENTRIES {
+            put(&bucket, &key, "many", &format!("S{index}"), "v", &none)
+                .await
+                .unwrap();
+        }
+        let error = put(&bucket, &key, "many", "EXTRA", "v", &none)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("at most 128 secrets"),
+            "{error:#}"
+        );
+        // Replacing an existing entry is still allowed at the limit.
+        put(&bucket, &key, "many", "S0", "w", &none).await.unwrap();
+        assert_eq!(names(&bucket, "many").await.unwrap().len(), MAX_ENTRIES);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_object_is_refused_before_decrypting() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let key = key(3);
+        put(&bucket, &key, "app", "A", "v", &BTreeSet::new())
+            .await
+            .unwrap();
+        let (mut set, token) = read(&bucket, "app").await.unwrap().unwrap();
+        let entry = set.secrets["A"].clone();
+        for index in 0..=MAX_ENTRIES {
+            set.secrets.insert(format!("S{index}"), entry.clone());
+        }
+        let token = bucket
+            .put_cas(
+                &object_key("app"),
+                serde_json::to_vec(&set).unwrap(),
+                Some(&token),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let error = load(&bucket, &manifest(&[]), || Ok(Some(&key)))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("over the limit of 128"),
+            "{error:#}"
+        );
+
+        // Too many bytes, however few entries.
+        set.secrets.clear();
+        let mut body = serde_json::to_vec(&set).unwrap();
+        body.resize(MAX_OBJECT_BYTES + 1, b' ');
+        bucket
+            .put_cas(&object_key("app"), body, Some(&token))
+            .await
+            .unwrap()
+            .unwrap();
+        let error = load(&bucket, &manifest(&[]), || Ok(Some(&key)))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("byte limit"), "{error:#}");
     }
 
     #[tokio::test]

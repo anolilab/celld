@@ -110,6 +110,14 @@ encryption binds a value to its script and name, so a value copied under another
 name or into another script does not open. Two operators who put different names
 at the same time both keep their entries.
 
+A script holds at most 128 secrets, and the encoded object is at most 64 KiB, so
+a node's read and decrypt at each load stays small. `celld secret put` refuses
+the entry that would pass either limit, and a node refuses to load an object
+over either; delete secrets to get back under them. Replacing an existing secret
+is always allowed while the object stays under 64 KiB. Because each sealed
+value is about a third larger than its text, the size limit is reached first
+when values are long.
+
 A node reads the object when it loads a deployment, decrypts it once, and adds
 each secret to `env` as a string. That is one bucket request per deployment
 load and nothing per request. A node whose script has secrets and that has no
