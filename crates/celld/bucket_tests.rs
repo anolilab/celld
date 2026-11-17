@@ -22,8 +22,12 @@ struct CheckThenWrite {
     content_hash_etag: bool,
     /// A write that arrives while another is in flight is throttled with a 429.
     throttle_concurrent: bool,
+    /// A throttled write lands after the winner's and is still answered 503,
+    /// as a proxy that commits and then fails would.
+    throttled_writes_apply: bool,
     in_flight: AtomicUsize,
     puts: AtomicUsize,
+    gets: AtomicUsize,
 }
 
 impl CheckThenWrite {
@@ -100,6 +104,10 @@ impl ObjectStore for CheckThenWrite {
         self.puts.fetch_add(1, Ordering::SeqCst);
         let first = self.in_flight.fetch_add(1, Ordering::SeqCst) == 0;
         let result = if self.throttle_concurrent && !first {
+            if self.throttled_writes_apply {
+                crate::asyncrt::sleep(Duration::from_millis(40)).await;
+                let _ = self.inner.put(location, payload).await;
+            }
             Err(Error::Generic {
                 store: "test",
                 source: "Server returned non-2xx status code: 429 Too Many Requests: SlowDown"
@@ -125,6 +133,7 @@ impl ObjectStore for CheckThenWrite {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
         self.inner.get_opts(location, options).await
     }
 
@@ -194,6 +203,8 @@ async fn a_store_that_serializes_racing_writes_passes_and_leaves_nothing() {
     assert!(matches!(verdict, StorageProbeVerdict::Conformant));
     // Four sequential writes, and one create and one update per racer.
     assert_eq!(store.puts.load(Ordering::SeqCst), 4 + 2 * CAS_RACERS);
+    // Nothing was throttled, so nothing is read back.
+    assert_eq!(store.gets.load(Ordering::SeqCst), 0);
     assert_eq!(store.inner.list(None).count().await, 0);
 }
 
@@ -217,6 +228,25 @@ async fn a_store_that_throttles_all_but_one_racer_passes() {
     });
     let verdict = bucket_on(&store).probe_cas_steps().await.unwrap();
     assert!(matches!(verdict, StorageProbeVerdict::Conformant));
+    assert_eq!(store.inner.list(None).count().await, 0);
+    // One read-back per race, because racers were throttled in both.
+    assert_eq!(store.gets.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_throttled_racer_that_applied_anyway_is_a_violation() {
+    crate::asyncrt::install_test_host_runtime();
+    let store = Arc::new(CheckThenWrite {
+        throttle_concurrent: true,
+        throttled_writes_apply: true,
+        ..CheckThenWrite::default()
+    });
+    let reason = violation(bucket_on(&store).probe_cas_steps().await);
+    assert!(
+        reason.contains("answered with a throttle had in fact applied"),
+        "{reason}"
+    );
+    assert_eq!(store.gets.load(Ordering::SeqCst), 1);
     assert_eq!(store.inner.list(None).count().await, 0);
 }
 

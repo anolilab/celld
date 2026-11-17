@@ -1555,7 +1555,8 @@ impl Bucket {
     /// that carries the same token, and exactly one of each may apply.
     /// That adds two rounds of [`CAS_RACERS`] class A requests (the racing
     /// PUTs, rejected ones included) and one DELETE to the four PUTs and
-    /// one DELETE of the sequential steps, once per node boot. A store
+    /// one DELETE of the sequential steps, once per node boot, plus one GET
+    /// per race in which the store throttled a racer. A store
     /// that lets a second writer through only rarely can still pass; the
     /// contract suite in `tests/store_contract.rs` is the full proof.
     pub(crate) async fn probe_cas_steps(&self) -> anyhow::Result<StorageProbeVerdict> {
@@ -1713,8 +1714,11 @@ impl Bucket {
     /// serialize, so two nodes can own one cell.
     ///
     /// A store may throttle writers that hit one key at once, and a
-    /// throttled request is rejected before it applies, so it counts as
-    /// not applied. Any other error from a racer stays ambiguous, as in the
+    /// throttled request is taken as rejected before it applies. A proxy
+    /// can commit a write and still answer 503, so when a racer was
+    /// throttled the object is read back and must carry the reporting
+    /// winner's body and token; a throttled racer that applied is a
+    /// violation. Any other error from a racer stays ambiguous, as in the
     /// sequential steps. Every write carries a body no earlier write used:
     /// a store whose ETag is a hash of the body keeps the ETag when a
     /// write repeats the body, and the next racer's condition would still
@@ -1730,9 +1734,10 @@ impl Bucket {
                 self.put_cas(key, body, token.as_deref())
             }))
             .await;
-            let applied: Vec<String> = outcomes
+            let applied: Vec<(usize, String)> = outcomes
                 .iter()
-                .filter_map(|outcome| outcome.as_ref().ok().cloned().flatten())
+                .enumerate()
+                .filter_map(|(racer, outcome)| Some((racer, outcome.as_ref().ok()?.clone()?)))
                 .collect();
             if applied.len() > 1 {
                 return Ok(StorageProbeVerdict::Violation(format!(
@@ -1742,6 +1747,11 @@ impl Bucket {
                     unenforced(precondition)
                 )));
             }
+            let throttled = outcomes
+                .iter()
+                .filter_map(|outcome| outcome.as_ref().err())
+                .filter(|error| is_throttled(error))
+                .count();
             if let Some(error) = outcomes
                 .into_iter()
                 .filter_map(Result::err)
@@ -1749,12 +1759,39 @@ impl Bucket {
             {
                 return Err(error.context(ambiguous_rejection(precondition)));
             }
-            let Some(winner) = applied.into_iter().next() else {
+            let Some((winner_racer, winner)) = applied.into_iter().next() else {
                 return Err(anyhow!(
                     "no racing conditional {race} applied although the condition held, and the \
                      store answered every one with a rejection or a throttle"
                 ));
             };
+            // A throttle is only believed to mean "not applied" if the object
+            // agrees: a store or proxy can commit a write and still answer
+            // 503. The last writer's body and token are what remain, so the
+            // winner's must be what is there.
+            if throttled > 0 {
+                let held = self.get(key).await.with_context(|| {
+                    format!(
+                        "the conditional-write probe could not read its object back after \
+                         throttling {throttled} racing {race}s"
+                    )
+                })?;
+                let Some((body, held_token)) = held else {
+                    return Err(anyhow!(
+                        "the conditional-write probe's object is gone after a racing {race} \
+                         reported success"
+                    ));
+                };
+                let expected = format!("probe-race-{race}-{winner_racer}");
+                if body.as_ref() != expected.as_bytes() || held_token != winner {
+                    return Ok(StorageProbeVerdict::Violation(format!(
+                        "a racing conditional {race} that the store answered with a throttle had \
+                         in fact applied, so the store does not serialize or report conditional \
+                         writes reliably; {}",
+                        unenforced(precondition)
+                    )));
+                }
+            }
             token = Some(winner);
         }
         Ok(StorageProbeVerdict::Conformant)

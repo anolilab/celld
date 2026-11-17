@@ -232,7 +232,9 @@ ownership records on it. The startup probe also races eight writers on one
 create and eight on one update, and refuses a store that lets more than one of
 either apply, so a node does not start on it. The probe is small (16 extra
 conditional writes per boot), so a store that lets a second writer through only
-rarely can still pass; this suite is the full proof. MinIO could not be tested
+rarely can still pass; this suite is the full proof. When the store throttles
+a racer, the probe reads the object back once and refuses the store if a
+throttled racer had applied anyway. MinIO could not be tested
 because neither Docker Hub nor quay.io served a MinIO tag on 2026-11-13.
 Start a store locally with
 `crates/celld/tests/stores/run.sh rustfs|seaweedfs`, which brings the store up
