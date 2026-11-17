@@ -1117,7 +1117,8 @@ mod tests {
         assert!(prepare_upstream_websocket_handoff(&opener, id));
         ws_unregister(id);
         assert!(opened_by(&ws_registry().lock().unwrap(), &opener, id));
-        let mut registry = ws_registry().lock().unwrap();
+        let shared = ws_registry();
+        let mut registry = shared.lock().unwrap();
         registry.upstream_handoffs.remove(&id);
         registry.pull_owners.remove(&id);
     }
