@@ -2893,6 +2893,25 @@ async fn handle_public(
     Ok(result)
 }
 
+/// The scrape answer. Without the actor's gauges the node cannot say what it
+/// holds, so it answers 503 rather than a body of zeroes.
+fn metrics_reply(counts: Option<celld::metrics::Counts>) -> HttpReply {
+    let Some(counts) = counts else {
+        let mut reply = response(StatusCode::SERVICE_UNAVAILABLE, "actor stopped\n");
+        reply.headers_mut().insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        return reply;
+    };
+    let mut reply = response(StatusCode::OK, celld::metrics::render(counts));
+    reply.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static(celld::metrics::CONTENT_TYPE),
+    );
+    reply
+}
+
 async fn handle_internal(
     request: Request<Incoming>,
     app: AppHandle,
@@ -2907,14 +2926,7 @@ async fn handle_internal(
         "/peer/handoff" => internal_handoff(request, app).await,
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),
-        "/metrics" => {
-            let mut reply = response(StatusCode::OK, celld::metrics::render(app.counts().await));
-            reply.headers_mut().insert(
-                hyper::header::CONTENT_TYPE,
-                hyper::header::HeaderValue::from_static(celld::metrics::CONTENT_TYPE),
-            );
-            reply
-        }
+        "/metrics" => metrics_reply(app.counts().await),
         "/state/step0" => response(
             StatusCode::OK,
             celld::claim_provenance::step0_json().to_string(),
@@ -3140,7 +3152,7 @@ impl HttpSurface {
         match self {
             Self::Public => celld::metrics::Listener::Public,
             Self::Internal => celld::metrics::Listener::internal(path),
-            Self::Recovery => celld::metrics::Listener::Peer,
+            Self::Recovery => celld::metrics::Listener::internal(path),
         }
     }
 }

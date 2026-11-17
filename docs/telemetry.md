@@ -78,7 +78,9 @@ the internal address with `Authorization: Bearer <token>`.
 Label values come from fixed sets. No cell id, tenant string or URL path is
 ever a label, so the series count does not grow with the number of cells.
 Series that read a value the node cannot report (the cgroup figures outside
-a container) are left out, not set to zero. celld does not push metrics over
+a container) are left out, not set to zero. When the node's actor has
+stopped, `/metrics` answers 503 instead of reporting zero cells; `/state` shows
+`actor_stopped`. celld does not push metrics over
 OTLP yet.
 
 | Series | Type | Labels |

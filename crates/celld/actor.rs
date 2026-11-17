@@ -1818,13 +1818,12 @@ impl AppHandle {
     }
 
     /// The gauges only the actor knows, for `/metrics`. Every one is a field
-    /// read, so a scrape does not walk the cell table.
-    pub async fn counts(&self) -> crate::metrics::Counts {
+    /// read, so a scrape does not walk the cell table. `None` when the actor
+    /// has stopped: zeroes would read as an idle node.
+    pub async fn counts(&self) -> Option<crate::metrics::Counts> {
         let (reply, receive) = oneshot::channel();
-        if self.tx.send(Message::Counts { reply }).is_err() {
-            return crate::metrics::Counts::default();
-        }
-        receive.await.unwrap_or_default()
+        self.tx.send(Message::Counts { reply }).ok()?;
+        receive.await.ok()
     }
 
     pub async fn presence(&self) -> Option<celld_logic::PresenceSnapshot> {

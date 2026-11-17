@@ -93,3 +93,34 @@ async fn tunnel_establishment_carries_the_operator_token() {
         vec![Some("Bearer tok-4".to_string())]
     );
 }
+
+#[test]
+fn recovery_requests_are_labelled_by_path() {
+    use celld::metrics::Listener;
+    assert_eq!(
+        HttpSurface::Recovery.listener("/peer/probe"),
+        Listener::Peer
+    );
+    assert_eq!(HttpSurface::Recovery.listener("/state"), Listener::Internal);
+    assert_eq!(
+        HttpSurface::Recovery.listener("/metrics"),
+        Listener::Internal
+    );
+    assert_eq!(
+        HttpSurface::Public.listener("/peer/probe"),
+        Listener::Public
+    );
+}
+
+#[tokio::test]
+async fn metrics_answer_503_without_the_actors_gauges() {
+    use http_body_util::BodyExt;
+    let stopped = metrics_reply(None);
+    assert_eq!(stopped.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = stopped.into_body().collect().await.unwrap().to_bytes();
+    assert!(!body.is_empty());
+
+    let up = metrics_reply(Some(celld::metrics::Counts::default()));
+    assert_eq!(up.status(), StatusCode::OK);
+    assert_eq!(up.headers()["content-type"], celld::metrics::CONTENT_TYPE);
+}
