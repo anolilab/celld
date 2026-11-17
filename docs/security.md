@@ -144,12 +144,12 @@ listens on (the ingress and internal listeners) is always refused, whatever
 `CELLD_EGRESS_ALLOW` says, so an exception cannot reach the operator API. That
 includes every loopback address, and a hostname that resolves to a node address
 when the port is not known, as for `fetch()`; use an IP literal or a
-`host:port` exception to reach a service on another port of the node. A name
-with exceptions for a listener port and for another port is refused on the
-listener port only, and a name that resolves to a container's published
-loopback port is allowed on that port, for `fetch()` as for `connect()`. For
-a port a node listens on or a container publishes, `fetch()` resolves the name
-once more before the request, on the first URL and on every redirect hop. Another
+`host:port` exception to reach a service on another port of the node. For the
+same reason, a name allowed on a listener port and on another port cannot be
+fetched by name on the other port (allow the IP literal with that port), and
+`fetch()` cannot reach a container's published loopback port by hostname (use
+the container API or the IP literal). `connect()` and WebSockets know the port,
+so they decide it. Another
 port of a node address is refused like a private address and an exception can
 open it, for a database on the same host.
 
