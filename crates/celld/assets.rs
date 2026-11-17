@@ -642,21 +642,11 @@ impl AssetResolver {
             return false;
         }
         let config = &self.inner.index.config;
-        if config
-            .compatibility_flags
-            .iter()
-            .any(|flag| flag == "assets_navigation_has_no_effect")
-        {
-            return false;
-        }
-        config
-            .compatibility_flags
-            .iter()
-            .any(|flag| flag == "assets_navigation_prefers_asset_serving")
-            || config
-                .compatibility_date
-                .as_deref()
-                .is_some_and(|date| date >= "2025-04-01")
+        crate::compat_flags::switch(
+            "assets_navigation_prefers_asset_serving",
+            &config.compatibility_flags,
+            config.compatibility_date.as_deref(),
+        )
     }
 
     async fn open_asset(

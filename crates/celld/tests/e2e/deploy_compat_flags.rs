@@ -27,6 +27,21 @@ fn an_unknown_flag_warns_unless_the_operator_asks_for_strict_flags() {
         warned.stderr
     );
 
+    assert!(
+        warned
+            .stderr
+            .contains("enable_nodejs_vm_module: only partly supported"),
+        "{}",
+        warned.stderr
+    );
+    assert!(
+        warned.stderr.contains(
+            "compatibility_date 2026-01-01 implies `cache_option_enabled` (from 2024-11-11)"
+        ),
+        "{}",
+        warned.stderr
+    );
+
     let refused = deploy(
         "compat-flags-ok",
         &dir.path().join("b"),
@@ -45,6 +60,13 @@ fn an_unknown_flag_warns_unless_the_operator_asks_for_strict_flags() {
         refused
             .stderr
             .contains("webgpu: celld does not handle this workerd flag yet"),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        refused
+            .stderr
+            .contains("enable_nodejs_vm_module: only partly supported"),
         "{}",
         refused.stderr
     );
