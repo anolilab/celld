@@ -11,6 +11,7 @@ mod e2e {
     pub mod container_runs;
     pub mod d1_batch;
     pub mod d1_export;
+    pub mod d1_local;
     pub mod deploy_compat_flags;
     pub mod deploy_node_imports;
     pub mod deploy_sourcemap;

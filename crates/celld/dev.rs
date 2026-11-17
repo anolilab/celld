@@ -52,6 +52,28 @@ pub fn operator_token_path_with(
         .join(crate::operator_token::FILE_NAME))
 }
 
+/// The dev store and the operator token file of the node that `celld dev`
+/// runs for `project` (a canonical directory), for a command that reaches that
+/// node: the same state directory `run` resolves from `state_dir` and
+/// `CELLD_DEV_STATE_DIR`.
+#[allow(clippy::disallowed_methods)] // Local development state is an operator-owned host path.
+pub(crate) fn local_node_files(
+    project: &Path,
+    state_dir: Option<PathBuf>,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let state = DevState::resolve(project, state_dir, std::env::var_os("CELLD_DEV_STATE_DIR"))?;
+    let database = state.path().join("objects.sqlite3");
+    anyhow::ensure!(
+        database.exists(),
+        "no local state at {}; start `celld dev` for this project first",
+        state.path().display()
+    );
+    Ok((
+        database,
+        state.path().join(crate::operator_token::FILE_NAME),
+    ))
+}
+
 #[derive(Debug)]
 struct Options {
     project: Option<PathBuf>,

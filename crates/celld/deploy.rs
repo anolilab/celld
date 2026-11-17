@@ -1467,6 +1467,9 @@ async fn cas_pointer(
 /// What `celld d1` needs out of a project: the declared databases, so a name
 /// the project never declared fails here instead of creating an empty one.
 pub struct D1Project {
+    /// The directory holding the config, resolved as `celld dev` resolves it,
+    /// so `--local` finds the same local state.
+    pub root: PathBuf,
     /// One entry per declaration, in config order.
     pub databases: Vec<D1Declaration>,
 }
@@ -1612,7 +1615,12 @@ pub fn read_d1_project(given: Option<PathBuf>) -> anyhow::Result<D1Project> {
         }
         unique.push(declaration);
     }
-    Ok(D1Project { databases: unique })
+    let root = std::fs::canonicalize(&root)
+        .with_context(|| format!("resolve project directory {}", root.display()))?;
+    Ok(D1Project {
+        root,
+        databases: unique,
+    })
 }
 
 /// A path may name the config itself or the directory holding it; with no

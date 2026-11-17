@@ -410,8 +410,10 @@ build, and a failed build does not replace it. The watcher ignores
 `.celld`, `.git`, `.wrangler`, `node_modules`, and `target` at each depth,
 and it does not watch files outside the project.
 
-The local object store is not available to a fleet node or an operator
-subcommand; they need a supported cloud bucket.
+The local object store is not available to a fleet node; it needs a supported
+cloud bucket. `celld d1 ... --local` is the one operator subcommand that
+reaches `celld dev`: it runs against the dev node's database, from the same
+project (and `--state-dir`), while `celld dev` is running.
 
 ## Operate D1, KV, and R2
 
@@ -420,6 +422,7 @@ database cell through a node.
 
 ```sh
 celld d1 migrations apply ledger --bucket "$CELLD_BUCKET"
+celld d1 migrations apply ledger --local   # the database of `celld dev`
 celld kv bulk put sessions wrangler-export.json --bucket "$CELLD_BUCKET"
 ```
 
