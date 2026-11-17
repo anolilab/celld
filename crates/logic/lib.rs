@@ -491,6 +491,10 @@ struct Cell {
     /// The swap is a recycle (`runtime_broken`): the instance is unusable, so
     /// its activity is cancelled at once rather than waited out.
     recycle: bool,
+    /// An eviction stop gave up and the cell restarts on the handle it kept,
+    /// so the instance that latched the error may still be the one serving.
+    /// A queued recycle report stays until the cell is resident again.
+    stop_failed: bool,
     /// When this cell was last nominated for a recycle.
     last_recycle_mono_ms: Option<u64>,
     /// The queue deadline now watching this cell, if it is parked. A timer
@@ -643,6 +647,7 @@ impl Default for Cell {
             swapping: false,
             swap_cancelled: false,
             recycle: false,
+            stop_failed: false,
             last_recycle_mono_ms: None,
             queued_generation: None,
             eviction_refused_mono_ms: None,
@@ -3362,9 +3367,16 @@ impl State {
             // its alarm), which `begin_eviction` refuses until the deadline.
             // The alarm stays armed and covered for the successor; the
             // timer below keeps it live should the cell stay after all. A
-            // recycled cell defers the same way: its instance is unusable,
-            // and the restart reads the armed alarm from storage.
-            Phase::Resident { .. } if (self.draining && cell.quiescing) || cell.recycle => {
+            // recycled cell defers the same way, and so does one with a report
+            // still queued: its instance is unusable, a handler would burn a
+            // retry on it, and the restart reads the armed alarm from storage.
+            Phase::Resident { .. } | Phase::EnsuringDurability { .. }
+                if cell.recycle
+                    || self.recycle_pending.contains(id)
+                    || (self.draining
+                        && cell.quiescing
+                        && matches!(cell.phase, Phase::Resident { .. })) =>
+            {
                 effects.push(Effect::ScheduleTimer {
                     timer: Timer::CellAlarm {
                         cell: id.to_string(),
@@ -5138,6 +5150,7 @@ impl State {
                 cell.swapping = false;
                 cell.swap_cancelled = false;
                 cell.recycle = false;
+                cell.stop_failed = false;
                 self.finish_requests(&id, &mut cell, Ok(Route::Local), effects);
             }
             Err(_) => {
@@ -5454,6 +5467,7 @@ impl State {
         cell.isolate = None;
         cell.evict_rebalance = false;
         cell.handoff = false;
+        cell.stop_failed = true;
         cell.eviction_refused_mono_ms = Some(self.now_mono_ms);
         self.eviction_permits.remove(&id);
         let next = self.cell_op(&id);
@@ -5522,6 +5536,14 @@ impl State {
             };
             match cell.phase {
                 Phase::EnsuringDurability { .. } => continue,
+                // An eviction stop in progress can still fail before it closes
+                // the latched instance; `runtime_stopped` is what clears the
+                // latch, and the pump drops the report once that has run.
+                Phase::Cleaning {
+                    cause: StopCause::Evict { .. },
+                    ..
+                } => continue,
+                Phase::Starting { .. } | Phase::Publishing { .. } if cell.stop_failed => continue,
                 Phase::Resident { .. } => {}
                 _ => {
                     self.recycle_pending.remove(&id);

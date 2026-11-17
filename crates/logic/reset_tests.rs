@@ -428,3 +428,94 @@ fn a_recycling_cell_defers_a_due_alarm() {
     );
     let _ = busy;
 }
+
+#[test]
+fn a_report_queued_behind_the_room_defers_a_due_alarm() {
+    let mut shell = Shell::new(config());
+    let a = shell.request("a");
+    let b = shell.request("b");
+    shell.finish(a);
+    let due = shell.now + 5_000;
+    let (now_ms, now_mono_ms) = (shell.now, shell.now);
+    shell.send(Event::AlarmObserved {
+        cell: "b".into(),
+        alarm: wake::AlarmSnapshot::without_wake(Some(due as i64)),
+        covered: true,
+        now_ms,
+        now_mono_ms,
+    });
+    let generation = shell.expect("an alarm timer", |effect| match effect {
+        Effect::ScheduleTimer {
+            timer: Timer::CellAlarm { cell, generation },
+            ..
+        } if cell == "b" => Some(*generation),
+        _ => None,
+    });
+    // `a` takes the single swap room, so `b`'s report waits in the queue.
+    broken(&mut shell, "a");
+    broken(&mut shell, "b");
+    assert_eq!(shell.state.swapping(), 1, "b should be waiting for room");
+
+    let now = shell.tick(5_000);
+    let effects = shell.send(Event::TimerFired {
+        timer: Timer::CellAlarm {
+            cell: "b".into(),
+            generation,
+        },
+        now_ms: now,
+        now_mono_ms: now,
+    });
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::FireAlarm { .. })),
+        "an alarm fired on the latched instance: {effects:?}"
+    );
+    let _ = b;
+}
+
+#[test]
+fn a_report_survives_an_eviction_whose_stop_fails() {
+    let mut shell = Shell::new(config());
+    let busy = shell.request("a");
+    shell.finish(busy);
+    // Recycle once, then report again inside the back-off window.
+    broken(&mut shell, "a");
+    let stop = shell.expect("the first stop", |effect| match effect {
+        Effect::StopRuntime { op, .. } => Some(*op),
+        _ => None,
+    });
+    shell.send(Event::RuntimeStopped { op: stop });
+    shell.settle();
+    broken(&mut shell, "a");
+    // The eviction proves and begins its stop; the stop gives up before it
+    // closes the latched instance, and the cell serves again.
+    shell.send(Event::Evict { cell: "a".into() });
+    let proof = shell.expect("the durability proof", |effect| match effect {
+        Effect::EnsureDurable { op, .. } => Some(*op),
+        _ => None,
+    });
+    shell.send(Event::DurabilityChecked {
+        op: proof,
+        result: Ok(()),
+    });
+    let stop = shell.expect("the eviction stop", |effect| match effect {
+        Effect::StopRuntime {
+            op,
+            cause: StopCause::Evict { .. },
+            ..
+        } => Some(*op),
+        _ => None,
+    });
+    shell.send(Event::RuntimeStopFailed { op: stop });
+    shell.settle();
+    assert!(matches!(
+        shell.state.phase("a"),
+        Some(Phase::Resident { .. })
+    ));
+    // The report outlived the failed stop: once the window passes the cell
+    // recycles.
+    shell.tick(RECYCLE_BACKOFF_MS + 1);
+    broken_pump(&mut shell);
+    assert!(shell.state.swapping() > 0, "the report was dropped");
+}
