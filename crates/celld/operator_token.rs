@@ -327,9 +327,18 @@ impl OperatorToken {
     }
 }
 
+/// Whether `path` is a directory celld creates itself: the default
+/// configuration directory or the `celld dev` state directory.
+#[cfg(unix)]
+fn is_celld_directory(path: &Path) -> bool {
+    path.ends_with(".celld/dev") || crate::config_dir::path().is_ok_and(|own| own == path)
+}
+
 /// Refuse to create a token in a directory another user could replace the
-/// file in: one that is not the node owner's own. The owner's own directory
-/// that group or other users can write to is tightened to 0700.
+/// file in. A directory owned by another user is refused. One of celld's own
+/// directories (see [`is_celld_directory`]) that group or other users can
+/// write to is tightened to 0700; any other such directory is the user's, so
+/// it is refused and left unchanged.
 #[cfg(unix)]
 #[allow(clippy::disallowed_methods)] // A per-user credential directory, not node storage.
 fn check_directory(path: &Path, euid: u32) -> anyhow::Result<()> {
@@ -345,16 +354,24 @@ fn check_directory(path: &Path, euid: u32) -> anyhow::Result<()> {
         );
     }
     let mode = metadata.permissions().mode();
-    if mode & 0o022 != 0 {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("restrict {}", path.display()))?;
-        tracing::warn!(
-            path = %path.display(),
-            "the token file's directory could be written by other users (mode {:o}); \
-             changed it to 700",
+    if mode & 0o022 == 0 {
+        return Ok(());
+    }
+    if !is_celld_directory(path) {
+        bail!(
+            "{} can be written by other users (mode {:o}); remove group and other write \
+             permission from it, or choose another path for {FILE_ENV}",
+            path.display(),
             mode & 0o777
         );
     }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("restrict {}", path.display()))?;
+    tracing::warn!(
+        path = %path.display(),
+        "celld's directory could be written by other users (mode {:o}); changed it to 700",
+        mode & 0o777
+    );
     Ok(())
 }
 
@@ -571,17 +588,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_directory_others_can_write_is_tightened_for_a_new_token() {
+    fn cellds_own_directory_others_can_write_is_tightened() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(FILE_NAME);
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        let own = dir.path().join(".celld").join("dev");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let path = own.join(FILE_NAME);
         OperatorToken::load_or_create(&path).unwrap();
         assert_eq!(
-            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&own).unwrap().permissions().mode() & 0o777,
             0o700
         );
         assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_chosen_directory_others_can_write_is_refused_and_left_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let error = OperatorToken::load_or_create(&path).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("can be written by other users"), "{text}");
+        assert!(text.contains(FILE_ENV), "{text}");
+        assert!(text.contains(&dir.path().display().to_string()), "{text}");
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o775
+        );
+        assert!(!path.exists());
     }
 
     #[cfg(unix)]
@@ -605,15 +643,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_private_directory_is_created_whatever_the_umask() {
+    fn a_private_directory_is_created_with_mode_0700() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: `umask` only swaps the process mask; it is restored below.
-        let old = unsafe { libc::umask(0o002) };
         let nested = dir.path().join("a").join("b");
-        let created = crate::config_dir::create_private(&nested);
-        unsafe { libc::umask(old) };
-        created.unwrap();
+        crate::config_dir::create_private(&nested).unwrap();
         for path in [dir.path().join("a"), nested] {
             assert_eq!(
                 std::fs::metadata(path).unwrap().permissions().mode() & 0o777,

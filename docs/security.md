@@ -69,7 +69,10 @@ setting that turns it off. A node takes the token from `CELLD_OPERATOR_TOKEN`:
   working directory when `HOME` is unset), or the path in
   `CELLD_OPERATOR_TOKEN_FILE`. A later start reuses the file. celld refuses a
   token file that is a symbolic link, that another user owns, or that other
-  users can read.
+  users can read. celld creates its own directories (the configuration
+  directory and `.celld/dev`) with mode 0700 and tightens one of them that group
+  or other users can write to. It refuses any other directory they can write
+  to, and one that another user owns, and leaves it unchanged.
 - With it unset and the internal listener bound to, or the node advertising,
   any other address, the node refuses to start. A generated file cannot reach
   the other machines, so a fleet needs one shared value.

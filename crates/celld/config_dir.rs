@@ -30,7 +30,16 @@ pub(crate) fn create_private(path: &Path) -> anyhow::Result<()> {
         use std::os::unix::fs::DirBuilderExt as _;
         builder.mode(0o700);
     }
+    let existed = path.exists();
     builder
         .create(path)
-        .with_context(|| format!("create {}", path.display()))
+        .with_context(|| format!("create {}", path.display()))?;
+    #[cfg(unix)]
+    if !existed {
+        // The creation mode is masked by the umask; fix the directory itself.
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restrict {}", path.display()))?;
+    }
+    Ok(())
 }
