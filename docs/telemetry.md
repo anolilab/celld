@@ -98,15 +98,18 @@ OTLP yet.
 | `celld_evictions_total` | counter | `outcome`: `snapshot`, `paged`, `over_budget`, `publish_failed`, `empty` |
 | `celld_second_claims_total` | counter | `prior`: `released`, `self`, `other` |
 | `celld_releases_total` | counter | `reason`: `drain`, `handoff` |
-| `celld_minted_untracked_total`, `celld_first_claims_minted_local_total`, `celld_first_claims_minted_local_no_ensemble_total`, `celld_preserved_resumes_total` | counter | |
-| `celld_retained_bundles`, `celld_retained_bundles_oldest_age_seconds` | gauge | |
+| `celld_mint_tracking_evictions_total`, `celld_first_claims_minted_local_total`, `celld_first_claims_minted_local_no_ensemble_total`, `celld_preserved_resumes_total` | counter | |
+| `celld_retained_bundles` | gauge | |
 | `celld_http_requests_total` | counter | `listener`: `public`, `internal`, `peer`; `class`: `1xx` to `5xx`, `dropped` |
 | `celld_http_request_duration_seconds` | histogram | `listener`; buckets from 1 ms to 10 s |
 
 A scrape does not build the `/state` document and does not walk the cells.
 The node answers with a handful of counts it already keeps, and the storage
-counters are read directly. The per-phase cell census stays in `/state`
-(`phases`), where it is built on demand.
+counters are read directly. The per-phase cell census and the age of the
+oldest retained bundle stay in `/state`, where they are built on demand.
+`celld_mint_tracking_evictions_total` counts ids pushed out of the bounded set
+that remembers what this process minted. A rise means a first claim of such an
+id can no longer be told from one minted elsewhere.
 
 The request series are plain atomic counters, kept per thread on separate
 cache lines and summed when you scrape, so concurrent requests do not

@@ -4196,7 +4196,7 @@ impl Actor {
                 .lock()
                 .unwrap()
                 .as_ref()
-                .map_or((0, None), |log| log.retained_bundles()),
+                .map_or(0, |log| log.retained_bundle_count()),
         }
     }
 

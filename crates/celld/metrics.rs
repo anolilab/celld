@@ -190,8 +190,8 @@ pub struct Counts {
     pub in_use_bytes: u64,
     pub cgroup_working_set_bytes: Option<u64>,
     pub cgroup_current_bytes: Option<u64>,
-    /// The bundle count and the age of the oldest, in milliseconds.
-    pub retained_bundles: (usize, Option<u64>),
+    /// How many node log bundles are kept.
+    pub retained_bundles: usize,
 }
 
 /// Everything one scrape reads.
@@ -371,8 +371,8 @@ const FAMILIES: &[Family] = &[
         ],
     ),
     counter(
-        "celld_minted_untracked_total",
-        "First claims of ids this process did not mint and has no record of.",
+        "celld_mint_tracking_evictions_total",
+        "Minted ids dropped from the bounded tracking set before their first claim.",
         "",
         &[("", |r| n(r.store.provenance.minted_untracked))],
     ),
@@ -422,18 +422,7 @@ const FAMILIES: &[Family] = &[
         "celld_retained_bundles",
         "Node log bundles kept for a replica that has not caught up.",
         "",
-        &[("", |r| size(r.node.retained_bundles.0))],
-    ),
-    gauge(
-        "celld_retained_bundles_oldest_age_seconds",
-        "Age of the oldest retained node log bundle.",
-        "",
-        &[("", |r| {
-            r.node
-                .retained_bundles
-                .1
-                .map(|ms| ms as f64 / 1000.0)
-        })],
+        &[("", |r| size(r.node.retained_bundles))],
     ),
 ];
 
@@ -443,11 +432,10 @@ const REQUEST_FAMILIES: [&str; 2] = [
 ];
 
 /// The series a node leaves out when it has nothing to report: the cgroup
-/// figures outside a container, and the age of a bundle when none is kept.
-pub const OPTIONAL_FAMILIES: [&str; 3] = [
+/// figures outside a container.
+pub const OPTIONAL_FAMILIES: [&str; 2] = [
     "celld_cgroup_working_set_bytes",
     "celld_cgroup_current_bytes",
-    "celld_retained_bundles_oldest_age_seconds",
 ];
 
 /// The name of every family the exposition can carry.
@@ -591,7 +579,7 @@ mod tests {
             remote_route_refreshes: 5,
             rss_bytes: 1024,
             in_use_bytes: 512,
-            retained_bundles: (2, Some(1500)),
+            retained_bundles: 2,
             ..Counts::default()
         }
     }
@@ -620,7 +608,7 @@ mod tests {
             "celld_cells_in_transition{state=\"capacity_waiting\"} 3",
             "celld_handoffs_total{outcome=\"ok\"} 4",
             "celld_retained_bundles 2",
-            "celld_retained_bundles_oldest_age_seconds 1.5",
+            "# TYPE celld_mint_tracking_evictions_total counter",
             "celld_shedding 0",
             "celld_http_requests_total{listener=\"public\",class=\"dropped\"}",
             "celld_http_request_duration_seconds_bucket{listener=\"peer\",le=\"+Inf\"}",
