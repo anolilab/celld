@@ -2289,7 +2289,7 @@ async fn drive_worker(
                 Vec::new()
             }
             Wake::CancelGatedReply => {
-                entry.cancel_gated_reply();
+                entry.cancel_gated_reply(js::CancelCause::Client);
                 Vec::new()
             }
             Wake::CrossEntryGateChanged => {
@@ -2303,7 +2303,7 @@ async fn drive_worker(
                 let started = slot
                     .turn(|worker| worker.turn_cancel_for(&mut entry, cause))
                     .await;
-                entry.cancel_gated_reply();
+                entry.cancel_gated_reply(cause);
                 started
             }
             Wake::Expired => {
@@ -3465,7 +3465,7 @@ async fn drive_cell_inner(
                 (Vec::new(), Vec::new())
             }
             Wake::CancelGatedReply => {
-                entry.cancel_gated_reply();
+                entry.cancel_gated_reply(js::CancelCause::Client);
                 (Vec::new(), Vec::new())
             }
             Wake::CrossEntryGateChanged => {
@@ -3482,7 +3482,7 @@ async fn drive_cell_inner(
                         (started, worker.take_alarm_moves())
                     })
                     .await;
-                entry.cancel_gated_reply();
+                entry.cancel_gated_reply(cause);
                 cancelled
             }
             Wake::Expired => {
