@@ -641,8 +641,9 @@ async fn worker_websocket_pipe(
 /// the Worker pipe keeps: a caller that sends more than a queue's budget while
 /// the cell does not take frames is closed with 1009, and a close or a
 /// vanished end ends the pipe at once. The dispatches go one at a time, in the
-/// order the frames came; a frame whose dispatch had not returned when the
-/// pipe ended is dropped.
+/// order the frames came. A close from the caller is answered at once, and the
+/// frames it sent before are still given to the cell, then the close, unless
+/// that takes longer than the handler budget: then the rest is dropped.
 ///
 /// The task ends when either side closes, and it unregisters both.
 async fn local_websocket_pipe(
@@ -686,6 +687,10 @@ async fn local_websocket_pipe(
     let mut cell_close: Option<(u16, String)> = None;
     // What the caller reads.
     let mut closing = (1011, "WebSocket pipe failed".to_string());
+    // Set once the caller closed: nothing more is read, and what it had sent
+    // goes to the cell before the close, until the handler budget runs out.
+    let mut draining = false;
+    let mut drain_ends: Option<celld::asyncrt::Sleep> = None;
     loop {
         if std::mem::take(&mut dispatched) {
             dispatching = None;
@@ -702,17 +707,27 @@ async fn local_websocket_pipe(
                 )));
             }
         }
-        if let Some(end) = to_caller.end.as_ref().filter(|_| to_caller.finished()) {
+        if draining {
+            if dispatching.is_none() {
+                break;
+            }
+        } else if let Some(end) = to_caller.end.as_ref().filter(|_| to_caller.finished()) {
             closing = end.clone();
             break;
         }
-        let to_caller_front = to_caller.front_bytes();
+        let to_caller_front = to_caller.front_bytes().filter(|_| !draining);
         celld::asyncrt::select! {
-            frame = from_caller.recv() => match frame {
+            frame = from_caller.recv(), if !draining => match frame {
                 Some(celld::js::WsOut::Close(code, reason)) => {
+                    // The caller is answered and released now; the cell hears
+                    // the frames sent before the close, then the close.
                     closing = (code, reason);
                     cell_close = Some(closing.clone());
-                    break;
+                    let _ = pull.send_close(closing.0, closing.1.clone(), true);
+                    celld::js::ws_unregister(id);
+                    celld::js::ws_pull_unregister(id);
+                    draining = true;
+                    drain_ends = Some(celld::asyncrt::sleep(celld::js::handler_budget()));
                 }
                 Some(frame) => {
                     if !to_cell.hold(frame) {
@@ -724,7 +739,7 @@ async fn local_websocket_pipe(
                 // The caller's request retired and took its socket with it.
                 None => break,
             },
-            frame = from_cell.recv(), if to_caller.end.is_none() => match frame {
+            frame = from_cell.recv(), if to_caller.end.is_none() && !draining => match frame {
                 Some(frame) => {
                     if !to_caller.hold(frame) {
                         closing = buffer_full();
@@ -739,6 +754,7 @@ async fn local_websocket_pipe(
                     let kept = permit.is_some_and(|permit| to_caller.flush(&pull, permit));
                     if !kept { break; }
                 },
+            () = async { drain_ends.as_mut().expect("guarded").await }, if draining => break,
             result = async { dispatching.as_mut().expect("guarded").await },
                 if dispatching.is_some() => {
                     dispatched = true;

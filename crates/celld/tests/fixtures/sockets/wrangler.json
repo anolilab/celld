@@ -9,8 +9,9 @@
       { "name": "CHAT", "class_name": "Chat" },
       { "name": "PLAIN", "class_name": "Plain" },
       { "name": "HOST", "class_name": "Host" },
-      { "name": "STUCK", "class_name": "Stuck" }
+      { "name": "STUCK", "class_name": "Stuck" },
+      { "name": "RECORDER", "class_name": "Recorder" }
     ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Chat", "Plain", "Host", "Stuck"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Chat", "Plain", "Host", "Stuck", "Recorder"] }]
 }

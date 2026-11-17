@@ -164,6 +164,13 @@ async fn a_close_sent_while_the_object_does_not_take_frames_ends_the_pipe() {
 }
 
 #[tokio::test]
+async fn a_message_sent_right_before_a_close_reaches_the_object_first() {
+    let server = Server::start("sockets", &[]).await;
+    let out: Value = server.get_json("/do/message-then-close").await;
+    assert_eq!(out, json!(["message:last", "close:3002"]));
+}
+
+#[tokio::test]
 async fn a_regular_object_socket_keeps_working() {
     let server = Server::start("sockets", &[]).await;
     let out: Value = server.get_json("/do/selftest?kind=plain").await;

@@ -91,6 +91,31 @@ export class Stuck extends DurableObject {
   }
 }
 
+// A Durable Object that keeps the order of the events its socket saw.
+export class Recorder extends DurableObject {
+  async fetch() {
+    const [client, server] = Object.values(new WebSocketPair());
+    this.ctx.acceptWebSocket(server);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // Kept in memory and written before the handler awaits anything, so the
+  // order is the order the events started in.
+  log = [];
+
+  webSocketMessage(ws, message) {
+    this.log.push(`message:${message}`);
+  }
+
+  webSocketClose(ws, code) {
+    this.log.push(`close:${code}`);
+  }
+
+  events() {
+    return this.log;
+  }
+}
+
 // A Durable Object that serves a regular, non-hibernatable socket.
 export class Plain extends DurableObject {
   async fetch(request) {
@@ -265,6 +290,23 @@ export default {
       ws.close(3001, "done");
       const code = await Promise.race([closed, sleep(5000).then(() => "timeout")]);
       return Response.json({ code });
+    }
+    // A close sent right behind a message must still follow it at the object.
+    if (url.pathname === "/do/message-then-close") {
+      const stub = env.RECORDER.getByName("order");
+      const response = await stub.fetch(request.url, {
+        headers: { Upgrade: "websocket" },
+      });
+      const ws = response.webSocket;
+      ws.accept();
+      ws.send("last");
+      ws.close(3002, "done");
+      let events = [];
+      for (let i = 0; i < 100 && events.length < 2; i++) {
+        await sleep(50);
+        events = await stub.events();
+      }
+      return Response.json(events);
     }
     if (url.pathname === "/proxy/chat") {
       return env.CHAT.getByName("room").fetch(request);
