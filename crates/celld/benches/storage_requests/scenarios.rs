@@ -254,7 +254,7 @@ pub fn sum_storage(states: &[Option<Value>], agents: usize) -> Value {
 }
 
 fn share(part: u64, whole: u64) -> Option<f64> {
-    (whole > 0).then(|| part as f64 / whole as f64)
+    (whole > 0).then_some(part as f64 / whole as f64)
 }
 
 /// One node's retained node-log bundles at one instant: how many, and the age
