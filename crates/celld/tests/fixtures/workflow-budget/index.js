@@ -181,9 +181,9 @@ export class Fence extends WorkflowEntrypoint {
       },
     );
     } catch (error) {
-      // Only the fenced drive's continuation lands here, once it is let go.
-      // Its invocation is over, so the sign is a log line, not a request.
-      console.log("fenced continuation settled");
+      // The fenced drive's continuation must never land here once it is let
+      // go; its invocation is over, so the sign is a log line.
+      console.log("fenced catch ran");
       throw error;
     }
     // The work record is complete by now. Letting the fenced drive go writes

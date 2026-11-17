@@ -186,7 +186,7 @@ async fn a_consumed_event_counts_as_progress_for_the_turn() {
 }
 
 #[tokio::test]
-async fn a_fenced_drive_does_not_keep_its_continuation_pending() {
+async fn a_fenced_drive_never_runs_the_catch_block_of_its_workflow() {
     let server = Server::start("workflow-budget", &[BUDGET]).await;
     server.get_text("/start?flow=fence").await;
     observe_for(Duration::from_millis(2300)).await;
@@ -195,15 +195,14 @@ async fn a_fenced_drive_does_not_keep_its_continuation_pending() {
     let done = finished(&server, "fence").await;
     assert_eq!(done["status"], "complete", "{done}");
 
-    // The fenced drive's ledger write fails once it is let go, so its step
-    // promise rejects. A write that never settled would retain it for good.
-    wait_until("the fenced continuation to settle", WAIT, || async {
-        server
-            .log_text()
-            .contains("fenced continuation settled")
-            .then_some(())
-    })
-    .await;
+    // The fenced drive's ledger write fails once it is let go. Its step
+    // promise stays pending, so the workflow's catch block (and its side
+    // effects) never runs on a drive that was replaced.
+    observe_for(Duration::from_millis(500)).await;
+    assert!(
+        !server.log_text().contains("fenced catch ran"),
+        "the fenced drive ran the workflow's catch block"
+    );
 }
 
 #[tokio::test]

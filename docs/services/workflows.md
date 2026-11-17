@@ -64,6 +64,8 @@ step that would get less starts in a fresh one. Consuming an event counts as pro
 single step shorter than the budget, or split it.
 An attempt that times out only because its turn cut it short is not counted: it
 runs again in a fresh turn with its full timeout and uses no retry.
+A step's callback is not cancelled when its attempt times out or its turn ends, so
+the abandoned callback may still run beside the retry: keep steps idempotent.
 
 Turn age and the age of a stale drive are measured with the isolate's clock,
 which is the wall clock sampled at the last I/O; the isolate has no monotonic

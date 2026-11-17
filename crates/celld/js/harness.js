@@ -8793,9 +8793,9 @@ const __wfTrackStorageFailures = (storage, driver) => {
       value(...args) {
         // A fenced drive no longer owns the ledger: a callback it abandoned
         // must not record its outcome over the replacement drive's records.
-        // The call fails rather than hangs, so the abandoned continuation
-        // ends instead of being retained; the failure is permanent so no
-        // retry policy or delay callback runs on the fenced drive.
+        // The failure is permanent so no retry policy or delay callback runs
+        // on the fenced drive, and the step frame leaves the step promise
+        // pending rather than rejecting it into user code.
         if (name !== "get" && driver.fenced()) {
           const fenced = __wfError("the workflow drive was fenced");
           fenced.__wfPermanent = true;
@@ -8895,6 +8895,11 @@ const __wfMakeStep = (driver) => {
           driver.running -= 1;
           driver.clearStall();
           driver.check();
+          // A fenced drive's ledger write fails permanently. Rejecting would
+          // run the user's catch blocks, with their side effects, inside a
+          // replaced drive; the step's own promise stays pending instead, and
+          // nothing holds it, so it is collected with the drive.
+          if (driver.fenced()) return;
           reject(error);
         },
       );
