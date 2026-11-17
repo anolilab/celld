@@ -5,7 +5,7 @@
 //! process `a/g1`, which began before the first poll and drains at minute 28,
 //! then `a/g2`, which began at minute 31. Node `b` runs `b/g1` throughout, is
 //! down at minutes 10 and 15, and is polled once more three days in. Every id is
-//! sampled, and nine agents are followed:
+//! sampled, and ten agents are followed:
 //!
 //! | agent | minted by | first claimed by | what became of it |
 //! | --- | --- | --- | --- |
@@ -18,6 +18,7 @@
 //! | 7 | a1 | b1 | b1 claimed it while a1 lived, never seen again |
 //! | 8 | a1 | b1 | b1 claimed it after a1 ended |
 //! | 9 | b1 | b1 | three days in, never seen again |
+//! | 10 | a1 | a1 | claimed while the node had no fleet ensemble, so it is not m |
 
 #![allow(dead_code, clippy::disallowed_methods)]
 
@@ -89,11 +90,11 @@ fn the_shares_come_from_the_rings() {
 
     close(&json["volume"]["first_claims_a_month"], 800.0);
     // m_upper and m_local come from the counters, m from the rings: seven of
-    // the nine sampled first claims are of an id that a live process minted.
+    // the ten sampled first claims are of an id that a live process minted.
     close(&json["m"]["upper"], 48.0 / 80.0);
     close(&json["m"]["local"], 30.0 / 80.0);
-    close(&json["m"]["estimate"], 7.0 / 9.0);
-    assert_eq!(json["m"]["sampled_first_claims"], 9);
+    close(&json["m"]["estimate"], 7.0 / 10.0);
+    assert_eq!(json["m"]["sampled_first_claims"], 10);
     assert_eq!(json["m"]["sampled_in_m"], 7);
     close(&json["m"]["no_ensemble_share_of_local"], 8.0 / 30.0);
 
@@ -141,8 +142,8 @@ fn the_gate_says_the_window_is_too_short_and_nothing_else() {
 }
 
 #[test]
-fn the_dollars_follow_the_plans_formulas() {
-    // Rows of the plan's cost model, at its own load: m = 1.
+fn the_dollars_follow_the_formulas() {
+    // The cost model's rows at its own load, with m = 1.
     let at = |r_n, r_d| {
         MODEL.savings(Shares {
             m: 1.0,
@@ -196,7 +197,7 @@ fn the_summary_puts_the_dollars_in_a_table() {
     let summary = summary::summarize(&fixture());
 
     let at_modelled = &summary.json["net_dollars_a_month"]["at_modelled_volume"];
-    let m = 7.0 / 9.0;
+    let m = 7.0 / 10.0;
     close(&at_modelled["a_set"], m * (2900.0 - 2365.0 / 7.0) - 44.0);
     close(
         &at_modelled["a_reg"],
@@ -243,7 +244,7 @@ fn a_ring_that_turned_over_between_two_polls_is_a_gap() {
     let line = log
         .iter_mut()
         .find(|line| {
-            line["counters"]["session"] == "a/g1" && line["rings"]["first_claims"]["next_seq"] == 5
+            line["counters"]["session"] == "a/g1" && line["rings"]["first_claims"]["next_seq"] == 6
         })
         .expect("a line that carries the whole ring");
     let entries = line["rings"]["first_claims"]["entries"]
@@ -252,7 +253,7 @@ fn a_ring_that_turned_over_between_two_polls_is_a_gap() {
     for entry in entries.iter_mut() {
         entry["seq"] = json!(entry["seq"].as_u64().unwrap() + 5);
     }
-    line["rings"]["first_claims"]["next_seq"] = json!(10);
+    line["rings"]["first_claims"]["next_seq"] = json!(11);
 
     let summary = summary::summarize(&log);
     let gate: Vec<&Value> = summary.json["gate"].as_array().unwrap().iter().collect();

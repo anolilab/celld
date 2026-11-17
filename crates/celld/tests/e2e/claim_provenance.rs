@@ -7,7 +7,9 @@
 
 use serde_json::Value;
 
-use super::harness::Server;
+use std::time::Duration;
+
+use super::harness::{wait_until, Server};
 
 /// Every id is sampled, so the rings hold all of them.
 const ENV: &[(&str, &str)] = &[("CELLD_STEP0_SAMPLE", "1")];
@@ -81,10 +83,19 @@ async fn a_preserved_restart_resumes_each_cell_once_and_claims_nothing() {
 
     server.restart().await;
 
-    let state = read(&server, "/state").await;
+    // The restores run after the node answers, so wait for both.
+    let probe = &server;
+    let state = wait_until(
+        "both cells to resume",
+        Duration::from_secs(30),
+        || async move {
+            let state = read(probe, "/state").await;
+            (state["storage_counters"]["preserved_resumes"] == 2).then_some(state)
+        },
+    )
+    .await;
     let counters = counters(&state);
     assert_ne!(counters["session"], self::counters(&before)["session"]);
-    assert_eq!(counters["preserved_resumes"], 2, "{counters}");
     assert_eq!(counters["claims"], 0, "a resume is not a claim: {counters}");
     let step0 = read(&server, "/state/step0").await;
     let resumes = ring(&step0, "resumes");

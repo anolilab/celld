@@ -22,8 +22,8 @@ const EARLY_DAYS: f64 = 2.0;
 /// A window shorter than this cannot pass the gate.
 const MIN_WINDOW_DAYS: f64 = 7.0;
 
-/// The cost model. **Modelled, not measured**: these figures are the plan's
-/// price of a request (a class A request $0.005 and a class B request $0.0004
+/// The cost model. **Modelled, not measured**: these figures price a
+/// request (a class A request $0.005 and a class B request $0.0004
 /// per 1,000, a regional bucket), multiplied out for 438M agents a month on
 /// 100 nodes. Change them here and nowhere else.
 pub struct Model {
@@ -48,7 +48,7 @@ pub struct Model {
     /// $ a month lost on every minted agent that a preserved restart carries
     /// over in its first epoch (A-set and A-reg): one create-only write.
     pub preserved_resume: f64,
-    /// The net saving a month at which the plan goes ahead.
+    /// The net saving a month at which a variant is worth building.
     pub go_threshold: f64,
 }
 
@@ -223,7 +223,8 @@ pub fn parse_log(text: &str) -> Result<Vec<Value>, String> {
 #[derive(Default)]
 struct Events {
     mints: HashMap<String, usize>,
-    first_claims: Vec<(String, usize, u64)>,
+    /// Key, bearing process, time, and whether the node had a fleet ensemble.
+    first_claims: Vec<(String, usize, u64, bool)>,
     /// The earliest second claim of a key: time and process.
     second_claims: HashMap<String, (u64, usize)>,
     releases: HashMap<(usize, String, u64), String>,
@@ -354,7 +355,10 @@ fn read_rings(
                     "mints" => {
                         events.mints.entry(key).or_insert(slot);
                     }
-                    "first_claims" => events.first_claims.push((key, slot, t_ms)),
+                    "first_claims" => {
+                        let ensemble = entry["ensemble"].as_bool().unwrap_or(false);
+                        events.first_claims.push((key, slot, t_ms, ensemble));
+                    }
                     "second_claims" => {
                         let earliest = events.second_claims.entry(key).or_insert((t_ms, slot));
                         if t_ms < earliest.0 {
@@ -389,12 +393,13 @@ fn follow_agents(
     let early_end = window_start as f64 + EARLY_DAYS * DAY_MS;
     let (mut all, mut early) = (Returns::default(), Returns::default());
     let mut delays: Vec<u64> = Vec::new();
-    for (key, bearer, claimed_ms) in &events.first_claims {
+    for (key, bearer, claimed_ms, ensemble) in &events.first_claims {
         let minted_alive = events
             .mints
             .get(key)
             .is_some_and(|minter| processes[*minter].alive_at(*claimed_ms));
-        if !minted_alive {
+        // A node without a fleet ensemble cannot grant, so its claims are not m.
+        if !minted_alive || !ensemble {
             continue;
         }
         let second = events.second_claims.get(key);
@@ -819,7 +824,7 @@ fn render(r: &Render<'_>) -> String {
         r.all.agents, r.sampled_first_claims, percent(r.m)
     ));
     line(format!(
-        "| claims of m_local without a fleet ensemble | {} | these cannot be granted: subtract them from m |",
+        "| claims of m_local without a fleet ensemble | {} | these cannot be granted, so they are left out of m |",
         percent(share(
             r.totals["first_claims_minted_local_no_ensemble"],
             r.totals["first_claims_minted_local"]
@@ -893,7 +898,7 @@ fn render(r: &Render<'_>) -> String {
     line(String::new());
     line("## Net dollars a month".into());
     line(format!(
-        "**Modelled**: the constants are the plan's cost model, for {:.0}M agents a month on {:.0} nodes, and the measured m, r_n, r_d and volume are put into them. A positive figure is a saving against the design without grants. The plan goes ahead at {} a month at the measured volume.",
+        "**Modelled**: the constants are the cost model's, for {:.0}M agents a month on {:.0} nodes, and the measured m, r_n, r_d and volume are put into them. A positive figure is a saving against the design without grants. A variant is worth building at {} a month at the measured volume.",
         MODEL.agents_a_month / 1e6,
         MODEL.nodes,
         dollars(Some(MODEL.go_threshold))
@@ -923,7 +928,7 @@ fn render(r: &Render<'_>) -> String {
     }
     line(String::new());
     line(format!(
-        "Both biases push toward \"go\": m_upper is from above and r from below. If m_upper alone, with no agent returning, gives A-set {} and the plan needs {}, track A stops without further analysis.",
+        "Both biases push toward \"go\": m_upper is from above and r from below. If m_upper alone, with no agent returning, gives A-set {} against the {} a month that a variant needs, none of them can reach it.",
         dollars(r.best_case.map(|s| s.a_set)),
         dollars(Some(MODEL.go_threshold)),
     ));

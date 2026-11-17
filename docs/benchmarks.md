@@ -364,7 +364,7 @@ The summary reports:
   bound**: it counts an id that is never used. `m_local` is
   `first_claims_minted_local / first_claims`, a lower bound. `m` is the share of
   the sampled first claims whose id was minted by a process that was still
-  running at the claim, and it is the estimate the dollar figures use.
+  running at the claim and whose node had a fleet ensemble, which a grant needs; it is the estimate the dollar figures use.
 - **The return shares**, of the sampled agents counted in m: `r_n`, the share
   whose first second claim came from another process than the one that bore it
   when that process did not release the cell in a drain; `r_d`, the same after a
