@@ -169,9 +169,17 @@ execution.
 
 ### [Node.js compatibility](https://developers.cloudflare.com/workers/runtime-apis/nodejs/)
 
-- celld implements `node:assert`, `node:async_hooks`, `node:buffer`,
-  `node:diagnostics_channel`, `node:events`, `node:fs`, `node:os`, `node:path`,
-  `node:stream`, `node:timers/promises`, and `node:util`.
+- celld implements `node:assert` (and `assert/strict`), `node:async_hooks`,
+  `node:buffer`, `node:crypto`, `node:diagnostics_channel`, `node:events`,
+  `node:fs` (and `fs/promises`), `node:os`, `node:path` (including `posix` and
+  `win32`), `node:stream` (including `promises`, `web` and `consumers`),
+  `node:test` (and `test/reporters`), `node:timers/promises`, `node:util`
+  (and `util/types`), and `node:zlib`.
+- Importing any other `node:` module succeeds, and the first call throws
+  "`node:<name>` is not implemented in celld". `celld deploy` and
+  `celld dev` list each such import of the bundle as a warning, with what to
+  use instead; `celld deploy --strict` fails instead. `--dry-run` prints the
+  same list.
 - `node:diagnostics_channel` does not export messages to a tail Worker.
 - `node:crypto` does not implement Diffie-Hellman, streaming signatures
   (`createSign()`, `createVerify()`), ciphers, or DSA signatures and key

@@ -501,3 +501,42 @@ fn print_log(path: &Path) {
         path.display()
     );
 }
+
+/// What `celld deploy` printed and whether it succeeded.
+pub struct Run {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// `celld deploy --dry-run --json` on a copy of `fixture`, plus `extra`
+/// arguments. Nothing is written to a bucket.
+pub fn deploy(fixture: &str, project: &Path, extra: &[&str], esbuild: Option<&str>) -> Run {
+    copy_dir(&fixture_dir(fixture), project);
+    let mut command = Command::new(CELLD);
+    command
+        .args(["deploy", "--dry-run", "--json"])
+        .arg(project)
+        .args(extra)
+        .env("RUST_LOG", "error");
+    if let Some(esbuild) = esbuild {
+        command.env("CELLD_ESBUILD", esbuild);
+    }
+    let output = command.output().expect("run celld deploy");
+    Run {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// The esbuild a test may use: `CELLD_ESBUILD`, or `esbuild` on the path.
+pub fn esbuild() -> Option<String> {
+    let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
+    Command::new(&binary)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|_| binary)
+}
