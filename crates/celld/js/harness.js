@@ -6060,6 +6060,30 @@ __celld.__dispatchEntrypointRpc =
     undefined,
     propsSc === null || propsSc.length === 0
       ? undefined : __sc_decode(propsSc));
+// A close from Worker code may carry any code RFC 6455 lets an endpoint send:
+// 1000-1003, 1007-1014 and 3000-4999. 1004 is reserved and 1005, 1006 and 1015
+// only report a state locally. The reason is at most 123 bytes of UTF-8 (the
+// frame body holds 125, two of them the code), so a multibyte reason can
+// exceed the cap at well under 123 characters.
+const __wsCheckClose = (code, reason) => {
+  const wanted = Number(code);
+  if (!Number.isInteger(wanted) ||
+      !((wanted >= 1000 && wanted <= 1003) ||
+        (wanted >= 1007 && wanted <= 1014) ||
+        (wanted >= 3000 && wanted <= 4999))) {
+    throw new DOMException(
+      `WebSocket close code ${code} is not permitted`,
+      "InvalidAccessError");
+  }
+  const text = String(reason);
+  if (new TextEncoder().encode(text).length > 123) {
+    throw new DOMException(
+      "WebSocket close reason must not exceed 123 bytes",
+      "SyntaxError");
+  }
+  // Callers send what was checked, so a code given as "1008" goes out as 1008.
+  return [wanted, text];
+};
 // WebSocket: the host holds the socket; these deliver events into the DO.
 // `ws` is a lightweight stub whose send/close route back to the host task
 // by wsId -- so the isolate can be hibernated between messages.
@@ -6074,7 +6098,10 @@ const __wsStub = __celld.__wsStub = (wsId) => ({
     else
       __ws_send(wsId, String(data));
   },
-  close: (code = 1000, reason = "") => __ws_close(wsId, code, reason),
+  close: (code = 1000, reason = "") => {
+    [code, reason] = __wsCheckClose(code, reason);
+    __ws_close(wsId, code, reason);
+  },
 });
 __celld.__wsOpen = async (scope, wsId, protocol) => {
   const actorEvent = __beginActorEvent(scope);
@@ -10964,22 +10991,7 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     }
   }
   close(code = 1000, reason = "") {
-    // WHATWG: an application may send 1000 or 3000-4999. Everything else is
-    // reserved for the protocol itself.
-    const wanted = Number(code);
-    if (wanted !== 1000 && !(wanted >= 3000 && wanted <= 4999)) {
-      throw new DOMException(
-        `WebSocket close code ${code} is not permitted`,
-        "InvalidAccessError");
-    }
-    // RFC 6455 5.5: the close frame body is at most 125 bytes, two of which
-    // are the code. Measured in UTF-8, so a multibyte reason can exceed the
-    // cap at well under 123 characters.
-    if (new TextEncoder().encode(String(reason)).length > 123) {
-      throw new DOMException(
-        "WebSocket close reason must not exceed 123 bytes",
-        "SyntaxError");
-    }
+    [code, reason] = __wsCheckClose(code, reason);
     // Outbound sockets follow the WebSocket spec: closing a closed socket is a
     // no-op. Inbound sockets must NOT take that shortcut -- a Durable Object
     // answers a peer-initiated close from inside `webSocketClose`, by which
