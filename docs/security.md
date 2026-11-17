@@ -76,6 +76,10 @@ setting that turns it off. A node takes the token from `CELLD_OPERATOR_TOKEN`:
 - With it unset and the internal listener bound to, or the node advertising,
   any other address, the node refuses to start. A generated file cannot reach
   the other machines, so a fleet needs one shared value.
+  Several loopback nodes on one host also share one token only when they
+  resolve the same file (the same user and config directory); nodes that run
+  as different users or with different `CELLD_CONFIG_DIR` values must set
+  `CELLD_OPERATOR_TOKEN`, or their calls to each other are refused.
 - `celld dev` is the exception to the file's location: it keeps its node's
   file in `.celld/dev` and sets `CELLD_OPERATOR_TOKEN_FILE` for the node. Only
   `celld dev` itself reads that file.
