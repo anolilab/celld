@@ -57,9 +57,10 @@ One attempt of a step ends after at most 90% of the budget, even when its
 `timeout` is longer. It then fails like any timed-out attempt, and its retries
 apply. An attempt never outlives its turn: it gets at most what is left of the turn.
 A turn that has run something starts the next step only while at least half the
-budget (or the step's `timeout`, if that is shorter) remains, so quick steps
-with the default timeout share a turn, and a step that would get less starts in
-a fresh one. Consuming an event counts as progress like running a step. Keep a
+budget (or the step's `timeout`, if that is shorter) remains before the 90% cap.
+For a step with the default timeout, that is while the turn has used at most 40%
+of the budget. Quick steps with the default timeout therefore share a turn, and a
+step that would get less starts in a fresh one. Consuming an event counts as progress like running a step. Keep a
 single step shorter than the budget, or split it.
 An attempt that times out only because its turn cut it short is not counted: it
 runs again in a fresh turn with its full timeout and uses no retry.
