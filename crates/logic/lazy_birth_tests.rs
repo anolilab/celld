@@ -825,49 +825,49 @@ const PAST: &[Past] = &[
         &[],
     ),
     (
-        "F-A on revision 3, a late bundle",
+        "a late bundle, on revision 3",
         "rev3",
         "late_bundle",
         &["a8_sealed_chunk_incomplete"],
         &[],
     ),
     (
-        "F-B on revision 3, a stalled first record",
+        "standard path, on revision 3, a stalled first record",
         "rev3",
         "stalled_std",
         &["a6_stalled_first_record"],
         &[],
     ),
     (
-        "F-B on revision 3, a waived id in mode on",
+        "standard path, on revision 3, a waived id in mode on",
         "rev3",
         "stalled_std_on",
         TWO_WRITERS,
         &[],
     ),
     (
-        "F-B on revision 3, a placed id",
+        "standard path, on revision 3, a placed id",
         "rev3",
         "placed",
         TWO_WRITERS,
         &[],
     ),
     (
-        "F-B on revision 3, a waived id handed off live",
+        "standard path, on revision 3, a waived id handed off live",
         "rev3",
         "handoff_std",
         TWO_WRITERS,
         &[],
     ),
     (
-        "F-B on revision 3, a waived id carried over a preserved restart",
+        "standard path, on revision 3, a waived id carried over a preserved restart",
         "rev3",
         "resume_std",
         TWO_WRITERS,
         &[],
     ),
     (
-        "F-B on revision 3, the session acts on its late record",
+        "standard path, on revision 3, the session acts on its late record",
         "rev3",
         "late_std",
         TWO_WRITERS,
@@ -1036,11 +1036,11 @@ fn the_carried_set_is_what_invariant_eleven_asks_for() {
     assert!(r.violations.keys().all(|n| *n == "a11_resume"));
 }
 
-/// Finding F-A, on revision 3: a fenced session that continues writes a
-/// bundle and a per-cell object after a sealer gathered under a declared
-/// loss, so a sealed chunk lacks a grant that the bucket depends on. Revision
-/// 4 lets the object through only after the session read its header as open,
-/// after the bundle was written.
+/// A finding on revision 3, a late bundle: a fenced session that continues
+/// writes a bundle and a per-cell object after a sealer gathered under a
+/// declared loss, so a sealed chunk lacks a grant that the bucket depends on.
+/// Revision 4 lets the object through only after the session read its header
+/// as open, after the bundle was written.
 #[test]
 fn a_late_bundle_no_longer_leaves_a_sealed_chunk_without_its_grant() {
     for scn in ["late_bundle", "late_bundle_ckpt"] {
@@ -1053,7 +1053,7 @@ fn a_late_bundle_no_longer_leaves_a_sealed_chunk_without_its_grant() {
             CAP,
         );
         assert!(found(
-            "finding F-A on revision 3",
+            "late bundle on revision 3",
             &before,
             &["a8_sealed_chunk_incomplete"]
         ));
@@ -1098,8 +1098,9 @@ fn run_unfiltered(name: &str, scn: &str, design: &str, cap: usize) -> Report {
     run(name, cfg, false, cap)
 }
 
-/// Finding F-B, on revision 3: on the standard path of a tagged id (a waived
-/// id, or any id of a `shadow` session) two writers reach one epoch prefix,
+/// A finding on revision 3, the standard path: on the standard path of a
+/// tagged id (a waived id, or any id of a `shadow` session) two writers reach
+/// one epoch prefix,
 /// with the stalled first record of the minting session and without it.
 /// Revision 4 leaves a trace in the chunk for every such claim, and no
 /// scenario of the standard path reports anything, the window included.
@@ -1112,7 +1113,7 @@ fn the_standard_path_of_a_tagged_id_has_one_writer() {
         CAP,
     );
     assert!(found(
-        "finding F-B on revision 3",
+        "standard path on revision 3",
         &before,
         &["a6_stalled_first_record"]
     ));
