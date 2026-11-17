@@ -1009,9 +1009,12 @@ async fn ensure_image_tar(bucket: &Bucket, image: &str) -> anyhow::Result<()> {
 /// Upload a deployment. With `activate` it also becomes the serving one:
 /// queue consumers attach to it and the pointers move. Without it the version
 /// is complete and validated but inert, and only `celld activate` can select it.
-/// Returns whether this call wrote the manifest: `false` means the version was
-/// already deployed and its first manifest, with its tag and time, stays.
-pub async fn write(bucket: &Bucket, built: &Built, activate: bool) -> anyhow::Result<bool> {
+/// Returns what happened to the manifest, see [`write_manifest`].
+pub async fn write(
+    bucket: &Bucket,
+    built: &Built,
+    activate: bool,
+) -> anyhow::Result<ManifestWrite> {
     // Read every attachment before uploading immutable deployment objects.
     // A competing consumer is a deploy refusal, so it must not leave a new
     // version in the bucket that an operator can mistake for a published one.
@@ -1049,21 +1052,10 @@ pub async fn write(bucket: &Bucket, built: &Built, activate: bool) -> anyhow::Re
             )
             .await?;
     }
-    // The manifest is written once. A second deploy of the same version keeps
-    // the first one's tag and creation time, so every node reports the same
-    // metadata for a version; concurrent deploys leave the first writer's.
-    let manifest_key = format!("{}/manifest.json", built.prefix);
-    let first_manifest = bucket
-        .put_cas(
-            &manifest_key,
-            serde_json::to_vec_pretty(&built.manifest)?,
-            None,
-        )
-        .await?
-        .is_some();
+    let manifest = write_manifest(bucket, &built.prefix, &built.manifest).await?;
 
     if !activate {
-        return Ok(first_manifest);
+        return Ok(manifest);
     }
 
     // An attachment names this exact immutable prefix. Publish it only after
@@ -1111,7 +1103,86 @@ pub async fn write(bucket: &Bucket, built: &Built, activate: bool) -> anyhow::Re
         components,
     };
     write_fleet_pointer(bucket, current.map(|(_, token)| token), &pointer).await?;
-    Ok(first_manifest)
+    Ok(manifest)
+}
+
+/// What [`write_manifest`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestWrite {
+    /// First deploy of this version.
+    Created,
+    /// The version was deployed before and something outside its hash (the
+    /// cron schedules) changed; the manifest now has the new content under
+    /// the first deploy's tag and time.
+    Updated,
+    /// The version was deployed before with this same manifest; nothing written.
+    Unchanged,
+}
+
+const MANIFEST_WRITE_ATTEMPTS: usize = 5;
+
+/// Write a version's manifest. The first deploy creates it. A later deploy of
+/// the same version keeps the first one's `tag` and `created_at`, so every
+/// node reports the same metadata for a version, but still replaces anything
+/// else that differs: the cron schedules are not an input of the version
+/// hash, so a cron-only redeploy lands here. The replacement is conditional
+/// on the manifest that was read, and is retried when a concurrent deploy
+/// changed it first.
+pub(crate) async fn write_manifest(
+    bucket: &Bucket,
+    prefix: &str,
+    manifest: &Manifest,
+) -> anyhow::Result<ManifestWrite> {
+    const FIRST: [&str; 2] = ["tag", "created_at"];
+    let key = format!("{prefix}/manifest.json");
+    let body = serde_json::to_vec_pretty(manifest)?;
+    if bucket.put_cas(&key, body, None).await?.is_some() {
+        return Ok(ManifestWrite::Created);
+    }
+    let wanted = serde_json::to_value(manifest)?;
+    for _ in 0..MANIFEST_WRITE_ATTEMPTS {
+        let Some((existing_body, token)) = bucket.get(&key).await? else {
+            // Deleted between the two requests: create it again.
+            if bucket
+                .put_cas(&key, serde_json::to_vec_pretty(manifest)?, None)
+                .await?
+                .is_some()
+            {
+                return Ok(ManifestWrite::Created);
+            }
+            continue;
+        };
+        let existing = serde_json::from_slice::<Value>(&existing_body).unwrap_or(Value::Null);
+        let strip = |value: &Value| {
+            let mut value = value.clone();
+            if let Some(object) = value.as_object_mut() {
+                for field in FIRST {
+                    object.remove(field);
+                }
+            }
+            value
+        };
+        if strip(&existing) == strip(&wanted) {
+            return Ok(ManifestWrite::Unchanged);
+        }
+        let mut next = wanted.clone();
+        if let Some(object) = next.as_object_mut() {
+            for field in FIRST {
+                match existing.get(field) {
+                    Some(value) => object.insert(field.to_string(), value.clone()),
+                    None => object.remove(field),
+                };
+            }
+        }
+        if bucket
+            .put_cas(&key, serde_json::to_vec_pretty(&next)?, Some(&token))
+            .await?
+            .is_some()
+        {
+            return Ok(ManifestWrite::Updated);
+        }
+    }
+    bail!("could not update {key}: it kept changing under concurrent deploys")
 }
 
 /// The fleet pointer and the token a conditional write must present, or

@@ -611,7 +611,7 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     validate_bucket(&store).await?;
     crate::wake_format::ensure_ready(&store).await?;
     let started = std::time::Instant::now();
-    let first_manifest = deploy::write(&store, &built, !options.no_activate).await?;
+    let manifest_write = deploy::write(&store, &built, !options.no_activate).await?;
     let location = format!(
         "{}://{}/{}{}",
         store.scheme(),
@@ -625,8 +625,14 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
         started.elapsed().as_secs_f64()
     );
     note!("  {location}");
-    if !first_manifest {
-        note!("This version was already deployed; it keeps its first tag and timestamp.");
+    match manifest_write {
+        deploy::ManifestWrite::Created => {}
+        deploy::ManifestWrite::Updated => note!(
+            "This version was already deployed; its manifest is updated and keeps its first tag and timestamp."
+        ),
+        deploy::ManifestWrite::Unchanged => {
+            note!("This version was already deployed; it keeps its first tag and timestamp.")
+        }
     }
     out.row(&Deployed {
         worker: built.script_name.clone(),

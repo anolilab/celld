@@ -529,12 +529,19 @@ async fn redeploying_a_version_keeps_the_first_manifest() {
     second.manifest.tag = Some("second".to_string());
     second.manifest.created_at = Some("2026-02-02T00:00:00.000Z".to_string());
 
-    assert!(crate::deploy::write(&fleet.bucket, &first, true)
-        .await
-        .unwrap());
-    assert!(!crate::deploy::write(&fleet.bucket, &second, true)
-        .await
-        .unwrap());
+    use crate::deploy::ManifestWrite;
+    assert_eq!(
+        crate::deploy::write(&fleet.bucket, &first, true)
+            .await
+            .unwrap(),
+        ManifestWrite::Created
+    );
+    assert_eq!(
+        crate::deploy::write(&fleet.bucket, &second, true)
+            .await
+            .unwrap(),
+        ManifestWrite::Unchanged
+    );
 
     let (body, _) = fleet
         .bucket
@@ -543,6 +550,41 @@ async fn redeploying_a_version_keeps_the_first_manifest() {
         .unwrap()
         .expect("the manifest exists");
     let kept: Manifest = serde_json::from_slice(&body).unwrap();
+    assert_eq!(kept.tag.as_deref(), Some("first"));
+    assert_eq!(kept.created_at.as_deref(), Some("2026-01-01T00:00:00.000Z"));
+}
+
+#[tokio::test]
+async fn a_cron_only_redeploy_updates_the_schedule_and_keeps_the_first_tag() {
+    use crate::deploy::ManifestWrite;
+    let fleet = fleet();
+    let mut first = built("worker", "v1", &[]);
+    first.manifest.tag = Some("first".to_string());
+    first.manifest.created_at = Some("2026-01-01T00:00:00.000Z".to_string());
+    first.manifest.crons = vec!["0 * * * *".to_string()];
+    let mut second = built("worker", "v1", &[]);
+    second.manifest.tag = Some("second".to_string());
+    second.manifest.created_at = Some("2026-02-02T00:00:00.000Z".to_string());
+    second.manifest.crons = vec!["*/5 * * * *".to_string()];
+
+    crate::deploy::write(&fleet.bucket, &first, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::deploy::write(&fleet.bucket, &second, true)
+            .await
+            .unwrap(),
+        ManifestWrite::Updated
+    );
+
+    let (body, _) = fleet
+        .bucket
+        .get("deploy/worker/v1/manifest.json")
+        .await
+        .unwrap()
+        .expect("the manifest exists");
+    let kept: Manifest = serde_json::from_slice(&body).unwrap();
+    assert_eq!(kept.crons, vec!["*/5 * * * *".to_string()]);
     assert_eq!(kept.tag.as_deref(), Some("first"));
     assert_eq!(kept.created_at.as_deref(), Some("2026-01-01T00:00:00.000Z"));
 }
