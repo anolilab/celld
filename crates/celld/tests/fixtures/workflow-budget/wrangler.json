@@ -1,0 +1,23 @@
+{
+  "name": "workflow-budget",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "workflows": [
+    {
+      "binding": "SLOW",
+      "name": "slow",
+      "class_name": "Slow"
+    },
+    {
+      "binding": "STUCK",
+      "name": "stuck",
+      "class_name": "Stuck"
+    },
+    {
+      "binding": "UNDO",
+      "name": "undo",
+      "class_name": "Undo"
+    }
+  ]
+}

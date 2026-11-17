@@ -42,6 +42,17 @@ so a step callback must tolerate a second attempt.
 await. celld fails the instance when such work keeps `run()` pending for 60
 seconds while no step runs or waits.
 
+## Handler budget
+
+`CELLD_HANDLER_BUDGET_S` bounds one turn of an instance, not the whole run. A
+turn that has used half the budget and has run a step hands over to a new turn
+before it starts the next step, and `status()` keeps reporting `running`. A
+run of any number of short steps therefore finishes.
+
+One attempt of a step ends after at most 90% of the budget, even when its
+`timeout` is longer. It then fails like any timed-out attempt, and its retries
+apply. Keep a single step shorter than that, or split it.
+
 ## Sleeps, events, and retries
 
 `step.waitForEvent()` times out after 24 hours by default. An event that
@@ -55,7 +66,8 @@ and `CELLD_ALARM_RESIDENT_MS` changes it.
 
 `step.do()` uses the Cloudflare retry defaults when the call supplies no
 `retries` object: 5 retries, a delay of 10 seconds, exponential backoff, and a
-timeout of 10 minutes for one attempt.
+timeout of 10 minutes for one attempt, capped by the
+[handler budget](#handler-budget).
 
 celld sets no limit on the number of concurrent instances. Fleet memory and the
 resident-cell cap bound it.
@@ -70,7 +82,10 @@ resident-cell cap bound it.
 - A step result, an event payload, and the workflow parameters each have a
   1 MiB limit.
 - Rollback, a sensitive step result, and a `ReadableStream` step result are
-  unavailable.
+  unavailable. A step given a rollback handler or `rollbackConfig`, and
+  `terminate({ rollback: true })`, fail with an error that says so. celld
+  cannot refuse them at deploy, because they are call arguments, not
+  configuration.
 - A `workflows` entry cannot carry `schedules`, `limits`, or a `script_name`
   that names another script.
 - The Workflows REST API and the `wrangler workflows` commands are

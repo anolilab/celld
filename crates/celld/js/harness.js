@@ -6349,6 +6349,8 @@ const __cell = __celld.__cell = {
   namespaceKeys: {},
   node: "",
   deleteAllDeletesAlarm: false,
+  // `CELLD_HANDLER_BUDGET_S`, in milliseconds. A workflow turn is one handler.
+  handlerBudgetMs: 300000,
   compat: {
     jsRpc: false, fetcherGetPutDelete: false, queueJsonMessages: false,
     cacheOption: false,
@@ -8886,6 +8888,12 @@ const __wfMakeStep = (driver) => {
     const rollback = hasConfig ? maybeRollback : callbackOrRollback;
     try {
       __wfStepName(name);
+      // A rollback option would otherwise read as an unknown key.
+      if (__wfOwnObject(config) && "rollbackConfig" in config) {
+        throw __wfError(
+          "step rollbackOptions are not implemented in celld; remove the rollback handler and `rollbackConfig`",
+        );
+      }
       config = __wfStepConfig(config, name);
     } catch (error) {
       return Promise.reject(error);
@@ -8917,14 +8925,26 @@ const __wfMakeStep = (driver) => {
       if (record !== undefined && record.nextAt > Date.now()) {
         return { block: record.nextAt, kind: "retry" };
       }
+      // The handler budget bounds one turn, not the run. A turn that has
+      // used half of it and ran a step hands the rest to a fresh turn: the
+      // replay skips every finished step, so the next turn continues here.
+      if (driver.executed > 0 &&
+          Date.now() - driver.startedMs >= __cell.handlerBudgetMs / 2) {
+        return { block: Date.now(), kind: "yield" };
+      }
+      driver.executed += 1;
       const attempt = (record === undefined ? 0 : record.attempt) + 1;
       const historyOrdinal = record?.ordinal ?? ordinal;
       const retries = config.retries ??
         { limit: 5, delay: 10000, backoff: "exponential" };
       const timeout = config.timeout ?? "10 minutes";
-      const timeoutMs = __wfDuration(
-        timeout,
-        `the timeout of step ${JSON.stringify(name)}`,
+      // An attempt must end before its handler does. The handler's expiry
+      // would cancel it without recording a failure, so the step would run
+      // again unchanged, forever. A timeout records the failure instead and
+      // the retry policy applies.
+      const timeoutMs = Math.min(
+        __wfDuration(timeout, `the timeout of step ${JSON.stringify(name)}`),
+        Math.floor(__cell.handlerBudgetMs * 0.9),
       );
       // Upstream omits a dynamic delay from the step context. Copying the
       // config verbatim would expose the callback to itself as retry policy,
@@ -9455,6 +9475,16 @@ const __WorkflowCell = (() => {
     // seeing the flag, the re-arm below starts a fresh drive immediately.
     // A failed drive is not re-raised here: the engine already retries the
     // alarm that fired it.
+    // A drive older than the handler budget belongs to a handler the runtime
+    // already ended: it cannot finish, and waiting for it would strand the
+    // instance. Fence it and start over from the ledger.
+    if (this._wfDriving !== undefined &&
+        Date.now() - this._wfDriveStartedMs >= __cell.handlerBudgetMs) {
+      this._wfDriveToken = undefined;
+      this._wfDriver.finished = true;
+      this._wfDriver.clearStall();
+      this._wfDriving = undefined;
+    }
     if (this._wfDriving !== undefined) {
       this._wfNudge = Date.now();
       await this._wfDriving.catch(() => {});
@@ -9514,15 +9544,18 @@ const __WorkflowCell = (() => {
     // the suspend-time re-arm would strand a "running" instance with no
     // alarm and no wake entry. The suspend path re-arms explicitly, and a
     // terminal drive deletes.
-    const driving = this._drive(meta);
+    const token = {};
+    this._wfDriveToken = token;
+    this._wfDriveStartedMs = Date.now();
+    const driving = this._drive(meta, token);
     this._wfDriving = driving;
     try {
       await driving;
     } finally {
-      this._wfDriving = undefined;
+      if (this._wfDriving === driving) this._wfDriving = undefined;
     }
   }
-  async _drive(meta) {
+  async _drive(meta, token) {
     const storage = this._state.storage;
     // The drive owns `status`, `output`, and `error`; every other piece of
     // instance state belongs to the RPCs (sendEvent's sequence lives in its
@@ -9535,7 +9568,8 @@ const __WorkflowCell = (() => {
     const settle = (mutate) => transactionSync(storage, (transaction) => {
       const current = transaction.kv.get("__wf.meta");
       if (current === undefined || __wfTerminal(current.status) ||
-          current.generation !== meta.generation) return false;
+          current.generation !== meta.generation ||
+          token !== this._wfDriveToken) return false;
       mutate(current, transaction);
       transaction.kv.put("__wf.meta", current);
       return true;
@@ -9573,6 +9607,10 @@ const __WorkflowCell = (() => {
       blocked: [],
       pauseRequested: false,
       finished: false,
+      startedMs: Date.now(),
+      // Step callbacks started in this turn. A turn yields only after it
+      // made progress, or a replay slower than the yield point never ends.
+      executed: 0,
       checkQueued: false,
       stallTimer: undefined,
       clearStall() {
@@ -9583,6 +9621,7 @@ const __WorkflowCell = (() => {
       },
     };
     driver.storage = __wfTrackStorageFailures(storage, driver);
+    this._wfDriver = driver;
     const outcome = new Promise((resolve) => {
       driver.finish = (result) => {
         if (driver.finished) return;
@@ -9705,8 +9744,11 @@ const __WorkflowCell = (() => {
         at = Math.min(at, this._wfNudge);
         this._wfNudge = undefined;
       }
+      // A yield continues at once and is not a wait: the instance still
+      // runs, and `status()` says so.
+      const yielded = driver.blocked.every((entry) => entry.kind === "yield");
       settle((current, transaction) => {
-        current.status = "waiting";
+        current.status = yielded ? "running" : "waiting";
         transaction.setAlarm(at);
       });
       // The explicit re-arm replaces the alarm that fired this drive.
