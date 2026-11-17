@@ -441,6 +441,11 @@ pub(crate) struct LazyConfig {
     /// The minting node never has an ensemble, so it grants nothing: every id
     /// it mints is waived.
     pub no_ensemble: bool,
+    /// A taker that read no record goes on once the header of the id's tag is
+    /// sealed, also while a successor of the minting node lives. Without it a
+    /// taker waits for every session of that node, which hides what a peer
+    /// does beside a successor of a preserved restart.
+    pub sealed_header_final: bool,
     /// Invariants whose failures are not reported: a scenario that wants a
     /// deeper failure than the one a rule's removal shows at once.
     pub ignore: Vec<&'static str>,
@@ -463,6 +468,7 @@ impl LazyConfig {
             fresh_reads: false,
             early_handoff: false,
             no_ensemble: false,
+            sealed_header_final: false,
             ignore: Vec::new(),
         }
     }
@@ -962,7 +968,9 @@ impl Lazy {
                     for (c, ep, tag, confirmed) in m.cells {
                         let rec = w.s.own[c].clone();
                         let granted_by_pred = self.cfg.minter == m.from && m.mode_on;
-                        if rec.is_none() || (granted_by_pred && !confirmed) {
+                        // A record that was written and is lost is not this
+                        // invariant's: the resume reads no record.
+                        if !w.g.ever_rec[c] || (granted_by_pred && !confirmed) {
                             Self::violate(
                                 w,
                                 "a11_resume",
@@ -1083,8 +1091,8 @@ impl Lazy {
         w.ps[ki].cs[c] = Cs::Active {
             ep: 1,
             lazy: false,
-            // A release waits for the left entry in the chunk.
-            synced: !self.d().trace_before_release,
+            // A release, and a reload marker, wait for a trace in the bucket.
+            synced: !(self.d().trace_before_release || self.d().trace_before_marker),
         };
         let mut proven = false;
         if w.ps[ki].mode != Mode::On
@@ -1423,7 +1431,9 @@ impl Lazy {
             Some(n) => n,
             // A cell with a plain record of the minting session: the entry is
             // made for the release, under a nonce of its own.
-            None if self.d().trace_before_release && k == self.cfg.minter => {
+            None if (self.d().trace_before_release || self.d().trace_before_marker)
+                && k == self.cfg.minter =>
+            {
                 let n = w.ps[ki].next_nonce;
                 w.ps[ki].next_nonce += 1;
                 n
@@ -2477,8 +2487,11 @@ impl Lazy {
         let Ph::Quiesce(step) = w.ps[ki].phase else {
             return false;
         };
-        if step == 0 && self.d().leave_before_log_seal {
-            return (0..CELLS).all(|c| match w.ps[ki].cs[c] {
+        if step != 0 {
+            return true;
+        }
+        let left = !self.d().leave_before_log_seal
+            || ((0..CELLS).all(|c| match w.ps[ki].cs[c] {
                 Cs::Active { lazy, .. } => !lazy,
                 Cs::Leaving { .. } | Cs::Pending | Cs::StdPut => false,
                 _ => true,
@@ -2487,9 +2500,20 @@ impl Lazy {
                     || !w.ps[ki].granted[c]
                     || w.ps[ki].mode != Mode::On
                     || w.g.confirmed[c]
+            }));
+        // A cell of the process's own tag that was never granted has its left
+        // entry in the chunk before the log seal.
+        let traced = !self.d().trace_before_marker
+            || k != self.cfg.minter
+            || (0..CELLS).all(|c| match w.ps[ki].cs[c] {
+                Cs::Active {
+                    lazy: false,
+                    synced,
+                    ..
+                } => synced || self.granted_in_log(w, k, c),
+                _ => true,
             });
-        }
-        true
+        left && traced
     }
 
     fn pr_step(&self, w: &mut World, k: u8, labels: &mut Vec<&'static str>) {
@@ -2585,7 +2609,8 @@ impl Lazy {
                     ) {
                         ok = false;
                     }
-                    cells.push((c, ep, rec.map(|r| r.by), confirmed));
+                    // A cell that this process did not grant needs no leave.
+                    cells.push((c, ep, rec.map(|r| r.by), confirmed || !granted_here));
                 }
                 if ok {
                     labels.push("marker_written");
@@ -2931,12 +2956,13 @@ impl Model for Lazy {
                                     a.push(Act::K3Begin(c, 2));
                                 }
                             }
+                            let for_release = self.d().trace_before_release && w.b.handoffs > 0;
+                            let for_marker =
+                                self.d().trace_before_marker && p.phase == Ph::Quiesce(0);
                             if !lazy
                                 && !synced
                                 && (p.mode == Mode::On
-                                    || (self.d().trace_before_release
-                                        && k == self.cfg.minter
-                                        && w.b.handoffs > 0))
+                                    || (k == self.cfg.minter && (for_release || for_marker)))
                             {
                                 a.push(Act::K3ChunkLeft(c));
                             }
@@ -2948,9 +2974,15 @@ impl Model for Lazy {
                                 && p.mode != Mode::On
                                 && self.granted_in_log(w, k, c)
                                 && self.upload_allowed(w, k, c);
+                            // Without the rule, a cell that never left the lazy
+                            // state is released as it was before it.
+                            let untraced = !self.d().trace_before_release
+                                && k == self.cfg.minter
+                                && !w.g.confirmed[c];
                             if !lazy
                                 && (synced
                                     || grant_in_bucket
+                                    || untraced
                                     || !self.d().left_in_chunk_before_release)
                                 && w.b.handoffs > 0
                             {
@@ -3442,7 +3474,9 @@ impl Lazy {
     /// rows is sealed. It is keyed by the node, so it covers the session of a
     /// successor too.
     fn gate_ok(&self, w: &World, rec: Option<&Rec>) -> bool {
-        let tags: Vec<Tag> = if self.d().gate_keyed_by_node {
+        let tags: Vec<Tag> = if self.cfg.sealed_header_final && rec.is_none() {
+            vec![self.minter_tag()]
+        } else if self.d().gate_keyed_by_node {
             (1..=w.s.node.gen.max(self.minter_tag())).collect()
         } else {
             vec![rec.map_or(self.minter_tag(), |r| {

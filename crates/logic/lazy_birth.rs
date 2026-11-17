@@ -212,6 +212,9 @@ pub(crate) struct Design {
     /// or in the chunk, or a confirmed left entry in the chunk for an id that
     /// was never granted.
     pub trace_before_release: bool,
+    /// The same trace before the reload marker of a preserved restart, for a
+    /// captured cell of the process's own tag that was never granted.
+    pub trace_before_marker: bool,
     /// The bound of the carried set.
     pub carried_bound: usize,
 }
@@ -263,6 +266,7 @@ impl Design {
             session_claims_once: true,
             session_acts_after_open_header: true,
             trace_before_release: true,
+            trace_before_marker: true,
             carried_bound: 2,
         }
     }
@@ -282,6 +286,7 @@ impl Design {
             session_claims_once: false,
             session_acts_after_open_header: false,
             trace_before_release: false,
+            trace_before_marker: false,
             ..Self::rev4()
         }
     }
@@ -327,7 +332,7 @@ impl Design {
         }
     }
 
-    /// Revision 4 with one rule removed: mutant `n` of M1..M40, or a second
+    /// Revision 4 with one rule removed: mutant `n` of M1..M41, or a second
     /// form of it as `(n, form)`.
     pub(crate) fn mutant(n: u8, form: u8) -> Self {
         let mut d = Self::rev4();
@@ -386,6 +391,7 @@ impl Design {
             (38, _) => d.session_claims_once = false,
             (39, _) => d.session_acts_after_open_header = false,
             (40, _) => d.trace_before_release = false,
+            (41, _) => d.trace_before_marker = false,
             _ => panic!("no mutant M{n}"),
         }
         d

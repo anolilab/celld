@@ -429,6 +429,25 @@ fn handoff_shadow(d: Design) -> LazyConfig {
     c
 }
 
+/// A waived id that the session hosts and carries over a preserved restart:
+/// the successor serves it under the predecessor's record, the record is
+/// lost, and a peer finds the predecessor's header sealed.
+fn resume_std(d: Design) -> LazyConfig {
+    let mut c = LazyConfig::base(d);
+    c.late_takers = true;
+    c.fresh_reads = true;
+    c.sealed_header_final = true;
+    c.b.mints = 1;
+    c.b.degrades = 1;
+    c.b.preserved = 1;
+    c.b.restarts = 1;
+    c.b.takes = 1;
+    c.b.writes = 2;
+    c.b.seals = 1;
+    c.b.losses = 1;
+    c
+}
+
 /// The record of a placed id is lost while the session lives, and the next
 /// request reaches the session.
 fn placed_reclaim(d: Design) -> LazyConfig {
@@ -598,6 +617,7 @@ fn scenario(name: &str) -> Build {
         "placed_reclaim" => placed_reclaim,
         "handoff_std" => handoff_std,
         "handoff_shadow" => handoff_shadow,
+        "resume_std" => resume_std,
         "broad" => broad,
         "broad_large" => broad_large,
         other => panic!("no scenario {other}"),
@@ -800,6 +820,13 @@ const PAST: &[Past] = &[
         &[],
     ),
     (
+        "F-B on revision 3, a waived id carried over a preserved restart",
+        "rev3",
+        "resume_std",
+        TWO_WRITERS,
+        &[],
+    ),
+    (
         "F-B on revision 3, the session acts on its late record",
         "rev3",
         "late_std",
@@ -891,6 +918,17 @@ const MUTANTS: &[(&str, &str, &[&str])] = &[
     ("M38", "placed_reclaim", SECOND_WRITER),
     ("M39", "late_std", SECOND_WRITER),
     ("M40", "handoff_std", TWO_WRITERS),
+    ("M41", "resume_std", RESUMED_BESIDE),
+];
+
+/// What a missing trace before the reload marker shows first: a peer claims
+/// the cell between the seal and the successor's start, and the successor
+/// resumes it under the peer's record.
+const RESUMED_BESIDE: &[&str] = &[
+    "a11_resume",
+    "a3_lost_ack",
+    "a1_one_acting_writer",
+    "a2_prefix_two_writers",
 ];
 
 /// What a second writer shows first in a scenario where the first writer
@@ -927,11 +965,15 @@ fn each_mutant_breaks_an_invariant_its_control_keeps() {
     check_mutants(MUTANTS, CAP);
 }
 
-/// `M38` and `M39` stop first at a lost acknowledgement. Explored to the end,
+/// `M38`, `M39` and `M41` stop first at a lost acknowledgement. Explored to the end,
 /// each also reaches the two acting writers that its rule is there to stop.
 #[test]
 fn a_session_that_claims_twice_or_acts_on_a_late_record_is_a_second_writer() {
-    for (m, scn) in [("M38", "placed_reclaim"), ("M39", "late_std")] {
+    for (m, scn) in [
+        ("M38", "placed_reclaim"),
+        ("M39", "late_std"),
+        ("M41", "resume_std"),
+    ] {
         let r = run_design(
             &format!("{m} in {scn}, to the end"),
             scn,
@@ -1004,6 +1046,7 @@ const STANDARD_PATH: &[&str] = &[
     "placed_shadow",
     "placed_reclaim",
     "handoff_std",
+    "resume_std",
 ];
 
 fn run_unfiltered(name: &str, scn: &str, design: &str, cap: usize) -> Report {
