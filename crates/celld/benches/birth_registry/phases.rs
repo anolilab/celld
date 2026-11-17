@@ -40,16 +40,7 @@ pub async fn run(phase: &str) {
         "cold" => faults::cold().await,
         "race" => race::race().await,
         "flap" => faults::flap().await,
-        "real" => {
-            let mut gates = Gates::new();
-            gates.add(
-                "G-t",
-                json!("not run: no real bucket available"),
-                "lookup p99 <= LIST p99; as G-a; pass->covered p99 <= 4 s",
-                None,
-            );
-            record("real", json!({ "gates": gates.json() }));
-        }
+        "real" => load_phase(Cfg::real()).await,
         other => panic!("unknown CELLD_REG_PHASE {other:?}"),
     }
 }
@@ -94,10 +85,18 @@ impl Rig {
         aged: Option<&str>,
         env: &[(&str, String)],
     ) -> Rig {
-        let run = format!("{phase}-{}", super::support::run_id("r"));
+        // The real phase runs in place on the set the aging tool built in the
+        // store under test: there is no container to copy inside.
+        let in_place = phase == "real";
+        let run = match aged {
+            Some(template) if in_place => template.to_owned(),
+            _ => format!("{phase}-{}", super::support::run_id("r")),
+        };
         let mut samples = Samples::default();
         if let Some(template) = aged {
-            copy_aged(template, &run);
+            if !in_place {
+                copy_aged(template, &run);
+            }
             samples = probe::load_samples(&out_dir(), template);
         }
         let mut all: Vec<(&str, String)> = vec![(
@@ -446,6 +445,22 @@ impl Cfg {
             aged: Some(env_text("CELLD_REG_AGED1").expect("CELLD_REG_AGED1 names the month-1 run")),
             complete: false,
             ..Cfg::base("month1", 10.0)
+        }
+    }
+
+    /// `steady` for 15 minutes against a store outside the harness
+    /// (`CELLD_REG_REAL_S3`, a bucket named as `s3://bucket`; endpoint and
+    /// credentials from `CELLD_BENCH_S3_ENDPOINT`, `AWS_ACCESS_KEY_ID` and
+    /// `AWS_SECRET_ACCESS_KEY`), on the small aged set the aging tool built
+    /// there. The counting proxy is bypassed.
+    fn real() -> Cfg {
+        let bucket = env_text("CELLD_REG_REAL_S3")
+            .expect("CELLD_REG_REAL_S3 names the bucket of the store under test, as s3://bucket");
+        std::env::set_var("CELLD_BENCH_BUCKET", bucket);
+        Cfg {
+            name: "real",
+            complete: false,
+            ..Cfg::base("real", 15.0)
         }
     }
 
@@ -979,12 +994,26 @@ fn gates_of(cfg: &Cfg, result: &Value, gates: &mut Gates) {
     if cfg.lookups > 0.0 {
         let list_p99 = result["guard"]["list_ms"]["p99"].as_f64();
         let p99 = n(&lookups["node_p99_ms"]);
-        gates.add(
-            "G-a",
-            json!({ "lookup_p99_ms": p99, "list_p99_ms": list_p99, "gets_mean": lookups["gets_mean"], "bytes_mean": lookups["bytes_mean"], "bytes_max": lookups["bytes_max"] }),
-            "p99 <= 25 ms and <= the LIST's p99; <= 3.05 GETs, <= 16 KiB",
-            hold(p99 <= 25.0 && list_p99.is_none_or(|l| p99 <= l) && n(&lookups["gets_mean"]) <= 3.05 && n(&lookups["bytes_mean"]) <= 16384.0),
-        );
+        let shape = n(&lookups["gets_mean"]) <= 3.05 && n(&lookups["bytes_mean"]) <= 16384.0;
+        if cfg.name == "real" {
+            // G-t: the absolute latency is reported, not gated.
+            let covered = &result["node_samples"]["pass_to_covered_ms"];
+            gates.add(
+                "G-t (docker stand-in)",
+                json!({ "lookup_p99_ms": p99, "lookup_p50_ms": lookups["node_p50_ms"], "list_p99_ms": list_p99, "list_p50_ms": result["guard"]["list_ms"]["p50"], "guard_lookup_p99_ms": result["guard"]["lookup_ms"]["p99"], "gets_mean": lookups["gets_mean"], "bytes_mean": lookups["bytes_mean"], "bytes_max": lookups["bytes_max"], "pass_to_covered_ms": covered, "pass_to_covered_measured": n(&covered["n"]) > 0.0, "heavy_lookups": lookups["heavy"], "light_lookups": lookups["light"] }),
+                "lookup p99 <= the LIST's p99; <= 3.05 GETs, <= 16 KiB; requested pass -> covered p99 <= 4 s; absolute latencies reported",
+                // With no sample of a requested pass that clause is not measured; the
+                // others decide.
+                hold(list_p99.is_none_or(|l| p99 <= l) && shape && (n(&covered["n"]) == 0.0 || n(&covered["p99"]) <= 4_000.0)),
+            );
+        } else {
+            gates.add(
+                "G-a",
+                json!({ "lookup_p99_ms": p99, "list_p99_ms": list_p99, "guard_lookup_p99_ms": result["guard"]["lookup_ms"]["p99"], "gets_mean": lookups["gets_mean"], "bytes_mean": lookups["bytes_mean"], "bytes_max": lookups["bytes_max"], "heavy_lookups": lookups["heavy"], "light_lookups": lookups["light"] }),
+                "p99 <= 25 ms and <= the LIST's p99; <= 3.05 GETs, <= 16 KiB",
+                hold(p99 <= 25.0 && list_p99.is_none_or(|l| p99 <= l) && shape),
+            );
+        }
         gates.add("G-b", json!({ "unknown_pct": lookups["unknown_pct"], "unknown": lookups["unknown"], "of": lookups["total"] }), "< 0.5 %", hold(n(&lookups["unknown_pct"]) < 0.5));
     }
     let ns = &result["node_samples"];

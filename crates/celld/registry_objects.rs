@@ -8,6 +8,7 @@ use crate::cell_directory_runs::Versioned;
 use anyhow::Context as _;
 use bytes::Bytes;
 use celld_logic::registry::{self as reg, Delta, DeltaId, Map, Root, RunRef};
+use futures_util::StreamExt as _;
 use object_store::path::Path;
 use object_store::{
     ObjectStore, ObjectStoreExt as _, PutMode, PutOptions, PutPayload, UpdateVersion,
@@ -221,6 +222,22 @@ pub(crate) async fn read_page(
 
 pub(crate) async fn delete(store: &dyn ObjectStore, key: &str) {
     let _ = store.delete(&Path::from(key)).await;
+}
+
+/// Delete `keys` in as few requests as the store allows: an S3-compatible
+/// store sends one DeleteObjects per 1,000 keys. A key that fails stays and is
+/// found again by the sweep.
+pub(crate) async fn delete_many(store: &dyn ObjectStore, keys: &[String]) {
+    if keys.is_empty() {
+        return;
+    }
+    let locations = futures_util::stream::iter(
+        keys.iter()
+            .map(|key| Ok(Path::from(key.as_str())))
+            .collect::<Vec<_>>(),
+    )
+    .boxed();
+    store.delete_stream(locations).for_each(|_| async {}).await;
 }
 
 #[cfg(test)]

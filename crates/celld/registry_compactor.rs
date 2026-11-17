@@ -457,9 +457,7 @@ pub(crate) async fn prepare_spill(
         }
     }
     if let Some(error) = failure {
-        for key in &outputs {
-            objects::delete(store.as_ref(), key).await;
-        }
+        objects::delete_many(store.as_ref(), &outputs).await;
         return Err(error);
     }
     partitions.sort_by_key(|(index, _, _)| *index);
@@ -927,11 +925,7 @@ impl Registry {
         if (changed || beat_due) && !self.write_root(holding).await? {
             return Ok(false);
         }
-        futures_util::stream::iter(&folded)
-            .for_each_concurrent(FETCH_CONCURRENCY, |key| async move {
-                objects::delete(self.store.as_ref(), key).await;
-            })
-            .await;
+        objects::delete_many(self.store.as_ref(), &folded).await;
         holding.last_pass_ms = crate::asyncrt::mono_ms();
         self.schedule(holding);
         self.housekeeping(holding);
@@ -1074,9 +1068,7 @@ impl Registry {
                 Err(why) => {
                     self.counters.jobs_discarded.fetch_add(1, Ordering::Relaxed);
                     tracing::info!(event = "registry_job_discarded", kind = job.kind, ?why);
-                    for key in &job.outputs {
-                        objects::delete(self.store.as_ref(), key).await;
-                    }
+                    objects::delete_many(self.store.as_ref(), &job.outputs).await;
                     self.record_job(&job, "discarded");
                 }
             }
@@ -1200,9 +1192,7 @@ impl Registry {
                     prepared.lock().unwrap().push(job)
                 }
                 Ok(Some(job)) => {
-                    for key in &job.outputs {
-                        objects::delete(store.as_ref(), key).await;
-                    }
+                    objects::delete_many(store.as_ref(), &job.outputs).await;
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -1256,9 +1246,7 @@ impl Registry {
         );
         let retired: HashSet<String> = holding.retired.iter().map(|(key, _)| key.clone()).collect();
         crate::asyncrt::spawn(async move {
-            for key in &due {
-                objects::delete(this.store.as_ref(), key).await;
-            }
+            objects::delete_many(this.store.as_ref(), &due).await;
             if sweep {
                 this.sweep(&map, &retired).await;
             }
@@ -1295,6 +1283,7 @@ impl Registry {
             }
         }
         let wall = chrono::Utc::now().timestamp_millis();
+        let mut stale = Vec::new();
         for root_prefix in [
             objects::deltas_root(&self.prefix),
             objects::maps_root(&self.prefix),
@@ -1306,10 +1295,11 @@ impl Registry {
                 let key = meta.location.to_string();
                 let old = wall - meta.last_modified.timestamp_millis() >= GRACE_MS as i64;
                 if old && !named.contains(&key) && !retired.contains(&key) {
-                    objects::delete(self.store.as_ref(), &key).await;
+                    stale.push(key);
                 }
             }
         }
+        objects::delete_many(self.store.as_ref(), &stale).await;
     }
 
     /// Look up up to 16 cells that hold LTX, continuing where the last page
@@ -1401,3 +1391,7 @@ mod tests;
 #[cfg(test)]
 #[path = "registry_compactor/synth.rs"]
 mod synth;
+
+#[cfg(test)]
+#[path = "registry_compactor/smoke.rs"]
+mod smoke;

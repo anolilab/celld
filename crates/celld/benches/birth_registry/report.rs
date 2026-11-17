@@ -83,6 +83,15 @@ fn units(result: &Value) -> Option<Value> {
         "writes_per_delta": (get("PUT delta") + get("PUT root")) / get("PUT delta").max(1.0),
         "delta_gets_per_node_per_delta": get("GET delta") / (nodes * get("PUT delta")).max(1.0),
         "segment_deletes_per_segment": get("BATCH_DELETE seg") / get("PUT seg").max(1.0),
+        // One DeleteObjects per pass covers the segments it folded; the objects a
+        // spill or a merge replaces are deleted together, after the grace.
+        "segment_delete_batches_per_pass": get("BATCH_DELETE seg") / passes.max(1.0),
+        "retire_delete_batches_per_spill": counts
+            .iter()
+            .filter(|(name, _)| name.starts_with("BATCH_DELETE ") && *name != "BATCH_DELETE seg")
+            .map(|(_, count)| count)
+            .sum::<f64>()
+            / spills.max(1.0),
         "run_puts_per_spill": (get("PUT run") - merges) / spills.max(1.0),
         "run_gets_per_spill": (get("GET run") - lookup_run_gets - 2.0 * merges) / spills.max(1.0),
         "passes_per_s": passes / window,
@@ -122,6 +131,8 @@ pub async fn report() {
         let a_per_pass = mean("lists_per_pass") + mean("writes_per_delta");
         let delta_gets = mean("delta_gets_per_node_per_delta");
         let seg_deletes = mean("segment_deletes_per_segment");
+        let seg_batches = mean("segment_delete_batches_per_pass");
+        let retire_batches = mean("retire_delete_batches_per_spill");
         let run_puts = mean("run_puts_per_spill");
         let run_gets = mean("run_gets_per_spill");
         let passes_per_s = mean("passes_per_s");
@@ -139,10 +150,10 @@ pub async fn report() {
             "audit_list": { "a": AGENTS / 256.0 },
             "sampler": { "a": 0.04e6, "b": 2.1e6 },
         });
+        // Measured per pass and per spill, from the proxy's tally of DeleteObjects.
         let deletes = json!({
-            "segments": { "a": NODES * months_windows * seg_puts * seg_deletes },
-            "deltas": { "a": passes },
-            "runs": { "a": spills * run_puts },
+            "segments_per_pass": { "a": passes * seg_batches },
+            "retired_after_spills": { "a": spills * retire_batches },
         });
         let (mut a, mut b) = (0.0, 0.0);
         for (_, line) in lines.as_object().unwrap() {
@@ -185,8 +196,9 @@ pub async fn report() {
             "G-k",
             json!({ "usd_per_month_deletes_counted_class_a_as_the_bench_does": total, "usd_per_month_if_deletes_are_free": total_deletes_free,
                     "class_a_per_month_without_deletes": a, "delete_requests_per_month": delete_requests, "class_b_per_month": b, "storage_usd": storage,
-                    "segment_deletes_per_segment": seg_deletes, "units": within, "plan_table_usd": 735 }),
-            "<= $800 per month; each per-unit count within 15 % of the cost table (extrapolated: 438M agents, 100 nodes, W=10 s, P=5 s, M=15 min, from per-unit counts at 2 and 4 nodes; base merges, audit LIST, sampler and storage analytic; every DeleteObjects counted as class A, as storage_requests classes it)",
+                    "segment_deletes_per_segment": seg_deletes, "segment_delete_batches_per_pass": seg_batches, "retire_delete_batches_per_spill": retire_batches,
+                    "deletes": deletes, "units": within, "plan_table_usd": 735 }),
+            "<= $800 per month; each per-unit count within 15 % of the cost table (extrapolated: 438M agents, 100 nodes, W=10 s, P=5 s, M=15 min, from per-unit counts at 2 and 4 nodes; base merges, audit LIST, sampler and storage analytic; every DeleteObjects counted as class A, as storage_requests classes it; deletes projected from the DeleteObjects requests measured per pass and per spill)",
             Some(total <= 800.0 && all_within),
         );
     } else {

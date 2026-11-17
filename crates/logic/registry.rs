@@ -845,6 +845,32 @@ impl Map {
             .get(index + 1)
             .map_or(u64::MAX, |next| next.lo - 1)
     }
+
+    /// Where `level_no` (1 or 2) of the partition holding `key` is read.
+    pub fn aim(&self, key: &Key, level_no: u8) -> Aim {
+        let index = self.partition_for(key);
+        let partition = &self.partitions[index];
+        Aim {
+            lo: partition.lo,
+            hi: self.hi(index),
+            level: if level_no == 1 {
+                partition.l1
+            } else {
+                partition.l2
+            },
+        }
+    }
+}
+
+/// Everything that decides which bytes a lookup reads at one level: the key
+/// range the bucket index is computed from, and the run the map names. A read
+/// made for one aim is the read another aim would make only when the two are
+/// equal, because a run is immutable and its key is never reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Aim {
+    pub lo: u64,
+    pub hi: u64,
+    pub level: Level,
 }
 
 const MAP_MAGIC: &[u8; 4] = b"RGM1";
@@ -1381,6 +1407,35 @@ mod tests {
         }
         assert_eq!(map.hi(1023), u64::MAX);
         assert_eq!(map.hi(0) + 1, map.partitions[1].lo);
+    }
+
+    #[test]
+    fn an_aim_differs_when_the_run_the_range_or_the_level_differs() {
+        let run = |id| {
+            Level::Run(RunRef {
+                epoch: 1,
+                id,
+                buckets: 4,
+                overflow: 0,
+                records: 10,
+            })
+        };
+        let mut map = Map::empty(4);
+        let probe = key(u64::MAX / 2 + 10, 0);
+        let index = map.partition_for(&probe);
+        map.partitions[index].l1 = run(1);
+        let before = map.aim(&probe, 1);
+        assert_eq!(before, map.aim(&probe, 1));
+        assert_ne!(before, map.aim(&probe, 2), "the levels are separate aims");
+        map.partitions[index].l1 = run(2);
+        assert_ne!(before, map.aim(&probe, 1), "another run");
+        assert_eq!(map.aim(&probe, 2), Map::empty(4).aim(&probe, 2));
+        let split = Map::empty(8);
+        assert_ne!(
+            Map::empty(4).aim(&probe, 1).hi,
+            split.aim(&probe, 1).hi,
+            "a split changes the range the bucket index comes from"
+        );
     }
 
     fn facts(l1: Probe, l2: Probe) -> Facts {
