@@ -611,7 +611,7 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     validate_bucket(&store).await?;
     crate::wake_format::ensure_ready(&store).await?;
     let started = std::time::Instant::now();
-    deploy::write(&store, &built, !options.no_activate).await?;
+    let first_manifest = deploy::write(&store, &built, !options.no_activate).await?;
     let location = format!(
         "{}://{}/{}{}",
         store.scheme(),
@@ -625,6 +625,9 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
         started.elapsed().as_secs_f64()
     );
     note!("  {location}");
+    if !first_manifest {
+        note!("This version was already deployed; it keeps its first tag and timestamp.");
+    }
     out.row(&Deployed {
         worker: built.script_name.clone(),
         version: built.version.clone(),
@@ -925,16 +928,7 @@ async fn load_worker_at_pointer(
         .collect();
     let version_metadata = bindings(&manifest, "version_metadata")
         .find_map(|binding| binding.get("name")?.as_str())
-        .map(|binding| crate::engine_api::VersionMetadata {
-            binding: binding.to_string(),
-            id: crate::protocol::version_metadata_id(&manifest.version),
-            tag: manifest.tag.clone().unwrap_or_default(),
-            // A manifest from before `created_at` existed has no creation time.
-            timestamp: manifest
-                .created_at
-                .clone()
-                .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string()),
-        });
+        .map(|binding| manifest.version_metadata(binding));
     let services = service_bindings(&manifest);
     let vars = worker_vars(&manifest);
     let compat = crate::worker_compat(&manifest.raw_metadata);

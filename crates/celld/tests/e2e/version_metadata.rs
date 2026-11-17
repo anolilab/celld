@@ -11,6 +11,9 @@ fn is_uuid(id: &str) -> bool {
     let groups: Vec<&str> = id.split('-').collect();
     groups.iter().map(|group| group.len()).collect::<Vec<_>>() == [8, 4, 4, 4, 12]
         && id.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
+        // Version 8 (custom) and the RFC 4122/9562 variant, 10xx.
+        && groups[2].starts_with('8')
+        && matches!(groups[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b')
 }
 
 #[tokio::test]

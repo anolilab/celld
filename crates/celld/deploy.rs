@@ -20,7 +20,8 @@ use crate::protocol::{
     QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1,
     FEATURE_CONTAINER_IMAGES_V1, FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_KV_V1,
     FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1,
-    FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1, QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+    FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -578,6 +579,10 @@ impl Built {
                         format!("env.{name} (Worker Loader)"),
                         "Dynamic Workers".to_string(),
                     )),
+                    Some("version_metadata") => Some((
+                        format!("env.{name} (Version Metadata)"),
+                        "Deployment id, tag and timestamp".to_string(),
+                    )),
                     Some("plain_text") => Some((
                         format!("env.{name} (Text)"),
                         "Environment Variable".to_string(),
@@ -744,6 +749,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .is_some_and(|flags| flags.iter().any(|flag| flag.as_str() == Some("sqlite_vec")));
     let uses_d1 = project.do_classes.iter().any(|class| class == D1_CLASS);
     let python_runtime = project.python.is_some();
+    let uses_version_metadata = has_binding_type(&project.metadata, "version_metadata");
     let manifest = Manifest {
         schema_version: if asset_reference.is_some() { 2 } else { 1 },
         version: version.clone(),
@@ -765,14 +771,14 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         containers: container_specs.clone(),
         fence_image: fence_image.clone(),
         queue_consumers: project.queue_consumers,
-        // Each capability the manifest depends on is named here, so a node
-        // that predates it rejects the deployment up front instead of
-        // partially deserializing the manifest and failing at worker load.
         tag: options.tag.clone(),
         created_at: Some(
             chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         ),
+        // Each capability the manifest depends on is named here, so a node
+        // that predates it rejects the deployment up front instead of
+        // partially deserializing the manifest and failing at worker load.
         required_features: {
             let mut features = Vec::new();
             if built_assets.is_some() {
@@ -811,6 +817,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             if python_runtime {
                 features.push(FEATURE_PYTHON_WORKERS_V1.to_string());
             }
+            if uses_version_metadata {
+                features.push(FEATURE_VERSION_METADATA_V1.to_string());
+            }
             features
         },
         raw_metadata: project.metadata,
@@ -828,6 +837,18 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         upload_images: !options.local_images,
         sourcemap,
     })
+}
+
+/// Whether the project's `bindings` has an entry of `kind`.
+fn has_binding_type(metadata: &Value, kind: &str) -> bool {
+    metadata
+        .get("bindings")
+        .and_then(Value::as_array)
+        .is_some_and(|bindings| {
+            bindings
+                .iter()
+                .any(|binding| binding.get("type").and_then(Value::as_str) == Some(kind))
+        })
 }
 
 /// Whether `image` names a Dockerfile in the project rather than an image
@@ -988,7 +1009,9 @@ async fn ensure_image_tar(bucket: &Bucket, image: &str) -> anyhow::Result<()> {
 /// Upload a deployment. With `activate` it also becomes the serving one:
 /// queue consumers attach to it and the pointers move. Without it the version
 /// is complete and validated but inert, and only `celld activate` can select it.
-pub async fn write(bucket: &Bucket, built: &Built, activate: bool) -> anyhow::Result<()> {
+/// Returns whether this call wrote the manifest: `false` means the version was
+/// already deployed and its first manifest, with its tag and time, stays.
+pub async fn write(bucket: &Bucket, built: &Built, activate: bool) -> anyhow::Result<bool> {
     // Read every attachment before uploading immutable deployment objects.
     // A competing consumer is a deploy refusal, so it must not leave a new
     // version in the bucket that an operator can mistake for a published one.
@@ -1026,15 +1049,21 @@ pub async fn write(bucket: &Bucket, built: &Built, activate: bool) -> anyhow::Re
             )
             .await?;
     }
-    bucket
-        .put(
-            &format!("{}/manifest.json", built.prefix),
+    // The manifest is written once. A second deploy of the same version keeps
+    // the first one's tag and creation time, so every node reports the same
+    // metadata for a version; concurrent deploys leave the first writer's.
+    let manifest_key = format!("{}/manifest.json", built.prefix);
+    let first_manifest = bucket
+        .put_cas(
+            &manifest_key,
             serde_json::to_vec_pretty(&built.manifest)?,
+            None,
         )
-        .await?;
+        .await?
+        .is_some();
 
     if !activate {
-        return Ok(());
+        return Ok(first_manifest);
     }
 
     // An attachment names this exact immutable prefix. Publish it only after
@@ -1081,7 +1110,8 @@ pub async fn write(bucket: &Bucket, built: &Built, activate: bool) -> anyhow::Re
         rollout: Rollout { percent: 100 },
         components,
     };
-    write_fleet_pointer(bucket, current.map(|(_, token)| token), &pointer).await
+    write_fleet_pointer(bucket, current.map(|(_, token)| token), &pointer).await?;
+    Ok(first_manifest)
 }
 
 /// The fleet pointer and the token a conditional write must present, or
@@ -3527,6 +3557,47 @@ mod version_metadata_config_tests {
         ] {
             assert!(read(&base(extra)).is_err(), "{extra}");
         }
+    }
+
+    fn build_with(extra: &str) -> Built {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
+        let path = dir.path().join("wrangler.jsonc");
+        std::fs::write(&path, base(extra)).unwrap();
+        let options = options_from_arguments([
+            "--config".to_string(),
+            path.display().to_string(),
+            "--dry-run".to_string(),
+            "--tag".to_string(),
+            "v7".to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+        build(&options).unwrap()
+    }
+
+    #[test]
+    fn a_declared_binding_requires_the_feature_an_older_node_lacks() {
+        let built = build_with(r#""version_metadata": { "binding": "META" }"#);
+        assert!(built
+            .manifest
+            .required_features
+            .contains(&FEATURE_VERSION_METADATA_V1.to_string()));
+        assert_eq!(built.manifest.tag.as_deref(), Some("v7"));
+        assert!(built
+            .bindings()
+            .iter()
+            .any(|(binding, _)| binding == "env.META (Version Metadata)"));
+        crate::protocol::validate_required_features(&built.manifest.required_features).unwrap();
+    }
+
+    #[test]
+    fn a_project_without_the_binding_does_not_require_it() {
+        let built = build_with(r#""vars": { "A": "b" }"#);
+        assert!(!built
+            .manifest
+            .required_features
+            .contains(&FEATURE_VERSION_METADATA_V1.to_string()));
     }
 
     #[test]

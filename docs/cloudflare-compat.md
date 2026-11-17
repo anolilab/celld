@@ -22,6 +22,7 @@ An unsupported feature that does not cause an error is a defect.
 | [Static assets](services/static-assets.md) | **Yes** |
 | [Cron Triggers](services/cron-triggers.md) | **Yes** |
 | [Dynamic Workers](services/dynamic-workers.md) | **Yes** |
+| [Version metadata](services/workers.md#version-metadata) | **Yes** |
 | [KV](services/kv.md) | **Yes** |
 | [Queues](services/queues.md) | **Yes** |
 | [D1](services/d1.md) | **Yes** |
@@ -77,12 +78,7 @@ An unsupported feature that does not cause an error is a defect.
 
 ### [Bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/)
 
-Only the binding types in the [services table](#services) are available, and
-the [version metadata](services/workers.md#version-metadata) binding.
-
-| binding | status |
-| --- | --- |
-| `version_metadata` | **Yes** — `id`, `tag` and `timestamp` of the deployment |
+Only the binding types in the [services table](#services) are available.
 
 ### [Context](https://developers.cloudflare.com/workers/runtime-apis/context/)
 

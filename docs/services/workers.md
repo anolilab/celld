@@ -57,8 +57,16 @@ the deployment the Worker runs under:
 - `tag` is the label given with `celld deploy --tag`, or `""` when there is
   none. The tag is not part of the version, so the same bundle with another tag
   keeps its `id`.
-- `timestamp` is the ISO-8601 UTC time at which `celld deploy` built the
+- `timestamp` is the ISO-8601 UTC time at which `celld deploy` first built the
   deployment. It is not part of the version either.
+
+A version's manifest is written once. Deploying the same bundle and
+configuration again, with another `--tag` or later, changes neither the `tag`
+nor the `timestamp`: they stay those of the first deploy, so every node reports
+the same values. `celld deploy` says so when it finds the version already
+deployed. A deployment that declares the binding requires the
+`version-metadata-v1` feature, so a node that predates it refuses the
+deployment instead of serving a Worker without the binding.
 
 `celld dev` fills the binding too: `tag` is `""`, and `timestamp` is the time of
 the build that produced the running version. The values are fixed when the
