@@ -27,7 +27,7 @@
 //! | `a3_lost_ack` | a restore misses a write acknowledged at a lower epoch |
 //! | `a4_epoch1_foreign` | a record at epoch 1 of a tagged id, written by another than its minting session |
 //! | `a5_claim_over_gap` | a claim lands over a cell whose newest record was written and is gone |
-//! | `a6_standard_window` | a first claim of the standard path (a waived or shadow id) acts over a record that is gone: the window of today's design, reported and not failed. Revision 3 reaches it; revision 4 does not, in any scenario here |
+//! | `a6_standard_window` | a first claim of the standard path (a waived or shadow id) acts over a record that is gone: the window of today's design, reported and not failed. Revision 3 reaches it. Revision 4 reaches it only when a declared loss took the session's `Grant` and its acknowledged row, one writer (`r4a`, `handoff_shadow`, `handoff_read`) |
 //! | `a6_stalled_first_record` | a stalled create-only write of the minting session lands after its header was sealed, and two writers follow |
 //! | `a7_taken_leave` | a leave-form record is taken over against the sealed chunk |
 //! | `a8_sealed_chunk_incomplete` | a sealed chunk misses a grant or a confirmed leave that the bucket depends on |
@@ -1423,7 +1423,7 @@ impl Lazy {
             Some(n) => n,
             // A cell with a plain record of the minting session: the entry is
             // made for the release, under a nonce of its own.
-            None if self.d().needs_trace() && k == self.cfg.minter => {
+            None if self.d().needs_trace() && k == self.cfg.minter && ch.left[c].is_none() => {
                 let n = w.ps[ki].next_nonce;
                 w.ps[ki].next_nonce += 1;
                 n

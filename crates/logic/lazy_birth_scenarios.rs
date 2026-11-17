@@ -396,6 +396,13 @@ fn handoff_shadow(d: Design) -> LazyConfig {
     c
 }
 
+/// The same in a session of mode `read`.
+fn handoff_read(d: Design) -> LazyConfig {
+    let mut c = handoff_shadow(d);
+    c.modes = [Mode::Read; 3];
+    c
+}
+
 /// A waived id that the session hosts and carries over a preserved restart:
 /// the successor serves it under the predecessor's record, the record is
 /// lost, and a peer finds the predecessor's header sealed.
@@ -587,6 +594,7 @@ pub(super) fn scenario(name: &str) -> Build {
         "placed_reclaim" => placed_reclaim,
         "handoff_std" => handoff_std,
         "handoff_shadow" => handoff_shadow,
+        "handoff_read" => handoff_read,
         "resume_std" => resume_std,
         "handoff_reclaim" => handoff_reclaim,
         "q2_final" => q2_final,

@@ -369,9 +369,19 @@ const MUTANTS: &[(&str, &str, &[&str])] = &[
     ("M38", "placed_reclaim", SECOND_WRITER),
     ("M39", "late_std", SECOND_WRITER),
     ("M40", "handoff_std", TWO_WRITERS),
+    ("M40", "handoff_shadow", HANDOFF_GRANTED),
+    ("M40", "handoff_read", HANDOFF_GRANTED),
     ("M41", "resume_std", RESUMED_BESIDE),
     ("M42", "stalled_std", TWO_WRITERS),
     ("M43", "placed", TWO_WRITERS),
+];
+
+/// What a missing trace before a release shows for a granted cell: two writers,
+/// or a sealed chunk without the grant of a cell that has an object.
+const HANDOFF_GRANTED: &[&str] = &[
+    "a8_sealed_chunk_incomplete",
+    "a1_one_acting_writer",
+    "a2_prefix_two_writers",
 ];
 
 /// What a missing trace before the reload marker shows first: a peer claims
