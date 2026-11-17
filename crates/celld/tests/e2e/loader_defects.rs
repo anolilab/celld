@@ -179,3 +179,17 @@ async fn a_durable_object_cannot_answer_a_plain_request_with_a_loaded_workers_so
     let out: Value = server.get_json("/relay?upgrade=no").await;
     assert!(out["threw"].is_string(), "{out}");
 }
+
+#[tokio::test]
+async fn a_fetchers_101_answer_to_a_plain_fetch_closes_its_socket_at_once() {
+    let server = Server::start("loader-defects", ONE_ISOLATE).await;
+    let out: Value = server.get_json("/outbound-upgraded").await;
+    assert_eq!(out["status"], 101, "{out}");
+    // Nobody can reach the socket, so it is closed while the loaded Worker's
+    // request still runs, not parked until the request ends.
+    assert_eq!(
+        out["state"]["socketCloses"].as_array().map(Vec::len),
+        Some(1),
+        "{out}"
+    );
+}

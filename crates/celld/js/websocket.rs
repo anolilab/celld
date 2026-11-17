@@ -695,16 +695,10 @@ pub(super) fn op_ws_bind_target(
     }
     // A stateless Worker's socket is taken here, under the grant check, so
     // the bind owns it from this call on. A cell's socket is only checked.
-    let worker = if target.scope.is_empty() {
-        match ws_take_parked_worker(&target, owner) {
-            Some(worker) => Some(worker),
-            None => return loader_throw(scope, "WebSocket target was not handed to this request"),
-        }
-    } else if ws_target_granted(&target, owner) {
-        None
-    } else {
+    let worker = ws_take_parked_worker(&target, owner);
+    if worker.is_none() && !ws_target_granted(&target, owner) {
         return loader_throw(scope, "WebSocket target was not handed to this request");
-    };
+    }
     // The caller end's frames reach this isolate through its pull queue, so
     // they never route by `cell`. The record still matters: a facet that
     // stops closes its sockets by it, and this end would otherwise keep the

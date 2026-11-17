@@ -884,11 +884,9 @@ pub(crate) fn ws_take_parked_worker(target: &WsTarget, owner: u64) -> Option<Wor
     if !ws_granted(&registry, target, owner) {
         return None;
     }
+    let parked = registry.parked_workers.remove(&target.id)?;
     registry.grants.remove(&(target.id, None));
-    registry
-        .parked_workers
-        .remove(&target.id)
-        .map(|parked| parked.socket)
+    Some(parked.socket)
 }
 
 /// Whether `owner` was handed exactly the response target `target`.
@@ -1438,19 +1436,22 @@ mod parked_worker_tests {
 
     #[test]
     fn only_the_request_that_was_handed_a_parked_socket_takes_it() {
-        let (target, _receiver) = park(9_100_001, 7);
+        let (target, _receiver) = park(9_100_001, 7_001);
         assert!(
-            ws_take_parked_worker(&target, 8).is_none(),
+            ws_take_parked_worker(&target, 7_002).is_none(),
             "another request"
         );
-        assert!(ws_take_parked_worker(&target, 7).is_some());
-        assert!(ws_take_parked_worker(&target, 7).is_none(), "taken once");
+        assert!(ws_take_parked_worker(&target, 7_001).is_some());
+        assert!(
+            ws_take_parked_worker(&target, 7_001).is_none(),
+            "taken once"
+        );
     }
 
     #[test]
     fn a_parked_socket_nobody_claimed_goes_with_its_request() {
-        let (target, _receiver) = park(9_100_002, 7);
-        ws_revoke_grants(7);
+        let (target, _receiver) = park(9_100_002, 7_003);
+        ws_revoke_grants(7_003);
         let registry = ws_registry();
         let registry = registry.lock().unwrap();
         assert!(!registry.parked_workers.contains_key(&target.id));
@@ -1460,7 +1461,7 @@ mod parked_worker_tests {
     #[tokio::test]
     async fn a_worker_cannot_fill_a_parked_socket_past_its_limit() {
         let id = 9_100_003;
-        let (target, mut receiver) = park(id, 7);
+        let (target, mut receiver) = park(id, 7_004);
         let frame = || WsOut::Binary(vec![0; 64 * 1024]);
         let registry = ws_registry();
         for _ in 0..PARKED_WS_BUFFER_MAX_BYTES / (64 * 1024) + 4 {
@@ -1480,7 +1481,7 @@ mod parked_worker_tests {
             pending.len()
         );
         drop(registry);
-        ws_revoke_grants(7);
-        assert!(!ws_target_granted(&target, 7));
+        ws_revoke_grants(7_004);
+        assert!(!ws_target_granted(&target, 7_004));
     }
 }

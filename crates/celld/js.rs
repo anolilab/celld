@@ -6700,8 +6700,8 @@ fn op_svc_call_impl(
     // Shares the Durable Object cancel registry and the id encoding
     // `attach_cancel_id` writes, so `__do_call_cancel` works unchanged for a
     // service call. Only a cancellable call registers: a caller with no
-    // AbortSignal has nothing that can cancel it, and the router already ends
-    // the call when the reply sender drops.
+    // AbortSignal has nothing that can cancel it, and the router aborts the
+    // target when the reply receiver drops.
     let (request_id, cancel, cancel_guard) = if cancellable {
         let request_id = next_do_request_id();
         let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
@@ -11746,8 +11746,14 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
     // object carried, so only the request the host handed the target to can
     // return it.
     let caller = websocket::ws_caller(scope);
-    // A parked Worker socket is checked when it is taken, below.
-    if let Some(target) = ws.as_ref().filter(|target| !target.scope.is_empty()) {
+    // A socket a loaded Worker answered with is taken, under the grant check,
+    // by the request it was handed to. Any other target must be one this
+    // request may return.
+    let parked = match &ws {
+        Some(target) => websocket::ws_take_parked_worker(target, caller.owner),
+        None => None,
+    };
+    if let Some(target) = ws.as_ref().filter(|_| parked.is_none()) {
         if !ws_may_return_target(&caller, target) {
             return Err(anyhow!("WebSocket target was not handed to this request"));
         }
@@ -11768,17 +11774,13 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
     if status == 101 {
         tracing::info!(%ws_json, has_target = ws.is_some(), "JS WebSocket response");
     }
-    let websocket = match (ws, worker_ws) {
+    let websocket = match (ws, parked, worker_ws) {
         // A socket a loaded Worker answered with, returned as it was handed.
-        (Some(target), None) if target.scope.is_empty() => Some(HttpResponseWebSocket::Worker(
-            websocket::ws_take_parked_worker(&target, caller.owner).ok_or_else(|| {
-                anyhow!("WebSocket target was not handed to this request, or was already taken")
-            })?,
-        )),
-        (Some(target), None) => Some(HttpResponseWebSocket::Cell(target)),
-        (None, Some(worker)) => Some(HttpResponseWebSocket::Worker(worker)),
-        (None, None) => None,
-        (Some(_), Some(_)) => return Err(anyhow!("Worker response has two WebSocket targets")),
+        (Some(_), Some(socket), None) => Some(HttpResponseWebSocket::Worker(socket)),
+        (Some(target), None, None) => Some(HttpResponseWebSocket::Cell(target)),
+        (None, _, Some(worker)) => Some(HttpResponseWebSocket::Worker(worker)),
+        (None, _, None) => None,
+        (Some(_), _, Some(_)) => return Err(anyhow!("Worker response has two WebSocket targets")),
     };
     Ok(HttpResponse {
         status,

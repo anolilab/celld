@@ -1,12 +1,21 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 
 // What the outbound Fetcher saw of the requests the loaded Worker made.
-const outbound = { started: 0, aborted: 0 };
+const outbound = { started: 0, aborted: 0, socketCloses: [] };
 
 // A Fetcher for the loaded Worker's global `fetch()`. It holds each request
 // open until the request's own signal aborts it.
 export class Outbound extends WorkerEntrypoint {
   async fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === "/state") return Response.json(outbound);
+    // Answers with a socket, which a plain `fetch()` cannot use.
+    if (path === "/upgrade") {
+      const [client, server] = Object.values(new WebSocketPair());
+      server.accept();
+      server.addEventListener("close", (event) => outbound.socketCloses.push(event.code));
+      return new Response(null, { status: 101, webSocket: client });
+    }
     outbound.started++;
     await new Promise((resolve) => request.signal.addEventListener("abort", resolve));
     outbound.aborted++;
@@ -112,6 +121,18 @@ export class Relay extends DurableObject {
   }
 }
 
+// Loaded code whose `fetch()` is answered with a 101 it has no use for.
+const UPGRADED_CODE = `
+  export default {
+    async fetch() {
+      const response = await fetch("http://outbound.test/upgrade");
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const state = await (await fetch("http://outbound.test/state")).json();
+      return Response.json({ status: response.status, state });
+    },
+  };
+`;
+
 const load = (env, id, code, main = "main.js", extra = {}, options = {}) =>
   env.LOADER.get(id, () => ({
     compatibilityDate: "2025-01-01",
@@ -127,6 +148,13 @@ export default {
       return new Response("ready");
     }
     if (url.pathname === "/outbound-state") return Response.json(outbound);
+    // A Fetcher answers the loaded Worker's `fetch()` with a socket.
+    if (url.pathname === "/outbound-upgraded") {
+      const worker = load(env, "upgraded", UPGRADED_CODE, "main.js", {}, {
+        globalOutbound: ctx.exports.Outbound,
+      });
+      return worker.getEntrypoint().fetch("http://loaded/");
+    }
     // The loaded Worker's request ends with a service call still pending that
     // had no signal to cancel it.
     if (url.pathname === "/outbound-drop") {
