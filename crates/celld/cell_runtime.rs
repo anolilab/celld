@@ -251,6 +251,28 @@ impl CellRuntime {
             .await
     }
 
+    /// Replace a facet with a copy of another facet of the same root.
+    pub async fn clone_facet(
+        &self,
+        root: &str,
+        epoch: u64,
+        source: &[String],
+        target: &[String],
+    ) -> anyhow::Result<()> {
+        self.facets
+            .clone_facet(
+                self.replication.as_ref(),
+                |cell, epoch| self.db_path(cell, epoch),
+                |cell| self.data_dir.join(cell),
+                |stream, epoch| async move { self.prove_facet(&stream, epoch).await },
+                root,
+                epoch,
+                source,
+                target,
+            )
+            .await
+    }
+
     /// Prove every committed write of a facet's stream durable.
     pub async fn prove_facet(&self, stream: &str, epoch: u64) -> anyhow::Result<()> {
         self.await_durable(stream, epoch, 0).await.map(|_| ())

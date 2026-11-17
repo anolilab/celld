@@ -2295,27 +2295,94 @@ class DurableObjectFacets {
       .then(([loader, className]) =>
         __facet_abort(
           loader, className, this._state._scope, record.owner, name), () => {});
-    this._barriers.set(name, barrier);
-    const clear = () => {
-      if (this._barriers.get(name) === barrier) this._barriers.delete(name);
-    };
-    barrier.then(clear, clear);
+    // An operation already pending on the name, such as a clone reading it
+    // as its source, stays in force: later operations wait for it as well as
+    // for the abort, and a failure it ends with is kept.
+    const pending = this._barriers.get(name);
+    if (pending === undefined) this._hold(name, barrier, false);
+    else this._hold(name, Promise.all([pending, barrier]).then(() => {}), true);
     return barrier;
   }
   abort(name, reason) {
     this._abort(name, reason);
   }
-  delete(name) {
-    name = this._validName(name);
-    const barrier = this._abort(name, new Error("Facet was deleted.")).then(() =>
-      __facet_delete(this._state._scope, name));
+  // Makes `barrier` the name's barrier until it settles. A failed one stays
+  // when `keepFailed`: clearing it would let the next `get` reload the image
+  // of a facet whose storage the failed operation left in an unknown state.
+  _hold(name, barrier, keepFailed) {
     this._barriers.set(name, barrier);
     const clear = () => {
       if (this._barriers.get(name) === barrier) this._barriers.delete(name);
     };
-    // Keep a failed delete as the name's barrier. Clearing it would let the
-    // next get reload the image which the failed operation did not delete.
-    barrier.then(clear, () => {});
+    barrier.then(clear, keepFailed ? () => {} : clear);
+  }
+  // Stops `name`, waits for the operations pending on it (a failed one does
+  // not block a retry), then runs `replace`, which replaces its storage.
+  _replace(name, reason, replace, keepFailed) {
+    const pending = this._barriers.get(name);
+    // Set when an earlier operation on the name failed: its storage is
+    // still in an unknown state, whatever `replace` does.
+    let failed;
+    const barrier = Promise.all([
+      pending === undefined ? undefined : pending.catch((error) => {
+        failed = { error };
+      }),
+      this._abort(name, reason),
+    ]).then(() => replace(failed));
+    this._hold(name, barrier, keepFailed);
+    return barrier;
+  }
+  delete(name) {
+    name = this._validName(name);
+    this._replace(name, new Error("Facet was deleted."), () =>
+      __facet_delete(this._state._scope, name), true);
+  }
+  // Replaces `target` with a copy of `source`'s storage. The source keeps
+  // running; a transaction it has not committed is not copied. The target
+  // stops first and starts from the copy at its next `get`. Until the copy
+  // settles, a later `delete(source)` or `clone(x, source)` waits for it, so
+  // it cannot empty the source under the copy.
+  async clone(source, target) {
+    source = this._validName(source);
+    target = this._validName(target);
+    if (source === target)
+      throw new TypeError("Cannot clone a facet onto itself.");
+    const sourceBarrier = this._barriers.get(source);
+    // `copying` never rejects, so the source's barrier fails only when an
+    // earlier operation on the source had failed.
+    let copied;
+    const copying = new Promise((resolve) => { copied = resolve; });
+    this._hold(source, Promise.all([sourceBarrier, copying]), true);
+    // A failure that left the target's storage as it was does not keep the
+    // target's barrier, so the name is usable again, unless an earlier
+    // operation on it had failed.
+    let untouched;
+    try {
+      await this._replace(target, new Error("Facet was replaced by a clone."),
+        async (failedBefore) => {
+          try {
+            await sourceBarrier;
+          } catch (error) {
+            untouched = error;
+          }
+          if (untouched === undefined) {
+            try {
+              await __facet_clone(this._state._scope, source, target);
+            } catch (error) {
+              if (!String(error && error.message)
+                .startsWith("facet clone refused")) throw error;
+              untouched = error;
+            }
+          }
+          if (untouched !== undefined && failedBefore !== undefined)
+            throw failedBefore.error;
+        }, true);
+    } catch (error) {
+      throw untouched === undefined ? error : untouched;
+    } finally {
+      copied();
+    }
+    if (untouched !== undefined) throw untouched;
   }
   _release() {
     // The host closes these facets during give-back. Queuing _abort here

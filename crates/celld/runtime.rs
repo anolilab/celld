@@ -1135,6 +1135,10 @@ impl RuntimeManager {
                     // Keep it registered until the final capture proves the
                     // stopped database position present in the bucket.
                     runtime.swap_out_cell(&cell.id, cell.epoch).await?;
+                    // A clone in flight finishes before its facets close, and
+                    // its streams are listed after it.
+                    runtime.facets.stopping(&cell.id, cell.epoch);
+                    runtime.facets.settled(&cell.id).await;
                     for facet in runtime.facets.stopping(&cell.id, cell.epoch) {
                         replication.close_for_reload(&facet, cell.epoch).await?;
                         runtime.facets.stopped(&cell.id, cell.epoch, &facet);
@@ -1392,9 +1396,9 @@ impl RuntimeManager {
         epoch: u64,
         mode: StopMode,
     ) -> anyhow::Result<()> {
-        // No facet opens once the stop begins; the facet loop below stops
-        // the streams this answers again, with any that opened before.
-        let facet_streams = self.facets.stopping(cell, epoch);
+        // No facet opens once the stop begins, except a clone's target that
+        // is already in flight; `stop_root` waits for it.
+        self.facets.stopping(cell, epoch);
         if let Some(engine) = crate::container::engine_if_ready() {
             // Only an idle eviction keeps the cell on this node, so only it
             // keeps the container: the next activation here reconnects.
@@ -1455,52 +1459,61 @@ impl RuntimeManager {
         // the facet's eviction unlinked.
         crate::js::release_root_facets(cell, epoch, crate::js::RootRelease::Stop).await;
         let Some(replication) = &self.replication else {
+            // Without replication no `stop_root` waits for a clone in flight,
+            // so wait here: a clone still writing would otherwise leave its
+            // target empty or write into a file the next start already uses.
+            self.facets.settled(cell).await;
             self.facets.forget(cell, epoch);
             return Ok(());
         };
         // The root and its facets stop in the order `FacetStreams::stop_root`
         // owns, which a test drives through its failures.
-        let stop_root = || async {
-            // Every stop releases the handle, and this does not consult
-            // `stopped_runtime`. The replication entry is created by
-            // `Effect::Restore` and the registry entry by
-            // `Effect::StartRuntime`, so the entry outlives a start that fails
-            // between the two and there is nothing else that would ever remove
-            // it. Its lifetime is the activation's, not the registry's.
-            //
-            // The mode pairs the durability authority with the file outcome.
-            // Passing these as independent booleans let cleanup close a proved
-            // remote restore in place, where no later activation could use it.
-            match &mode {
-                // A failed final sync leaves the handle and files in place.
-                // This call is therefore intentionally retryable after the
-                // runtime itself has already stopped. An abandoned one is not:
-                // it returns `EvictionAbandoned`, and the caller ends the stop
-                // instead of trying again.
-                StopMode::Evict { retained, abandon } => replication
-                    .evict(
-                        cell,
-                        epoch,
-                        // A facet keeps no database past its stop, and its
-                        // epoch already holds the objects it published, so a
-                        // facet that opened at the epoch the root resumes at
-                        // could be restored into neither. The root's wake
-                        // claims the next epoch instead.
-                        match retained {
-                            crate::ltx_repl::Retained::Resumable if !facet_streams.is_empty() => {
-                                crate::ltx_repl::Retained::Base
-                            }
-                            retained => *retained,
-                        },
-                        abandon.as_deref(),
-                    )
-                    .await
-                    .map(|_| ()),
-                StopMode::Rebase => replication.release(cell, epoch).await,
-                StopMode::CloseInPlace => replication.close_in_place(cell, epoch).await,
-                StopMode::Discard => {
-                    replication.ltx().discard(cell, epoch);
-                    Ok(())
+        let stop_root = |facet_streams: Vec<String>| {
+            let mode = &mode;
+            async move {
+                // Every stop releases the handle, and this does not consult
+                // `stopped_runtime`. The replication entry is created by
+                // `Effect::Restore` and the registry entry by
+                // `Effect::StartRuntime`, so the entry outlives a start that fails
+                // between the two and there is nothing else that would ever remove
+                // it. Its lifetime is the activation's, not the registry's.
+                //
+                // The mode pairs the durability authority with the file outcome.
+                // Passing these as independent booleans let cleanup close a proved
+                // remote restore in place, where no later activation could use it.
+                match &mode {
+                    // A failed final sync leaves the handle and files in place.
+                    // This call is therefore intentionally retryable after the
+                    // runtime itself has already stopped. An abandoned one is not:
+                    // it returns `EvictionAbandoned`, and the caller ends the stop
+                    // instead of trying again.
+                    StopMode::Evict { retained, abandon } => replication
+                        .evict(
+                            cell,
+                            epoch,
+                            // A facet keeps no database past its stop, and its
+                            // epoch already holds the objects it published, so a
+                            // facet that opened at the epoch the root resumes at
+                            // could be restored into neither. The root's wake
+                            // claims the next epoch instead.
+                            match retained {
+                                crate::ltx_repl::Retained::Resumable
+                                    if !facet_streams.is_empty() =>
+                                {
+                                    crate::ltx_repl::Retained::Base
+                                }
+                                retained => *retained,
+                            },
+                            abandon.as_deref(),
+                        )
+                        .await
+                        .map(|_| ()),
+                    StopMode::Rebase => replication.release(cell, epoch).await,
+                    StopMode::CloseInPlace => replication.close_in_place(cell, epoch).await,
+                    StopMode::Discard => {
+                        replication.ltx().discard(cell, epoch);
+                        Ok(())
+                    }
                 }
             }
         };

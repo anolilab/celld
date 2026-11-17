@@ -6521,6 +6521,7 @@ ops! { OP_NAMES, install_op_functions,
         "__facet_rpc" => op_facet_rpc,
         "__facet_abort" => op_facet_abort,
         "__facet_delete" => op_facet_delete,
+        "__facet_clone" => op_facet_clone,
         "__do_call" => op_do_call,
         "__svc_call" => op_svc_call,
         "__svc_call_cancellable" => op_svc_call_cancellable,
@@ -8315,6 +8316,66 @@ fn op_facet_abort(
     rv.set(promise_for(scope, async_id));
 }
 
+/// Without a host loop a facet is a file beside the root's database, named
+/// `<root file>.<facet>.sqlite`, and a facet below it appends `-facets-<hash>`
+/// to that name. Remove the database of the facet at `path` and of every facet
+/// below it.
+fn remove_facet_files(path: &std::path::Path) -> std::io::Result<()> {
+    let (Some(directory), Some(own)) = (path.parent(), path.file_name()) else {
+        return Ok(());
+    };
+    let own = own.to_string_lossy();
+    let below = format!("{}-facets-", own.strip_suffix(".sqlite").unwrap_or(&own));
+    let entries = match asyncrt::fs().read_dir(directory) {
+        Ok(entries) => entries,
+        // No directory, so no database.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let file = entry.file_name.to_string_lossy();
+        let database = file
+            .strip_suffix("-wal")
+            .or_else(|| file.strip_suffix("-shm"))
+            .unwrap_or(&file);
+        if database == own || (database.starts_with(&below) && database.ends_with(".sqlite")) {
+            match asyncrt::fs().remove_file(&entry.path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Without a host loop, replace the facet database `to` (and the facets below
+/// it) with a copy of the file `from`. A source that does not exist was never
+/// opened, so its copy is empty; any other failure to look at it is an error,
+/// raised before the target is touched.
+async fn clone_facet_files(from: std::path::PathBuf, to: std::path::PathBuf) -> Result<(), String> {
+    let copy = match asyncrt::fs().metadata(&from) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(clone_error(crate::facet_streams::refuse(
+                anyhow::Error::new(error).context(format!("inspect {}", from.display())),
+            )))
+        }
+    };
+    if copy {
+        crate::facet_streams::ensure_clonable(&from)
+            .map_err(|error| clone_error(crate::facet_streams::refuse(error)))?;
+    }
+    remove_facet_files(&to)
+        .map_err(|error| format!("clone facet storage: remove target: {error}"))?;
+    if copy {
+        crate::facet_streams::copy_database(from, to)
+            .await
+            .map_err(clone_error)?;
+    }
+    Ok(())
+}
+
 fn op_facet_delete(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -8337,11 +8398,7 @@ fn op_facet_delete(
     let async_id = asyncrt::enqueue(async move {
         let Some(sender) = FACET_TX.get() else {
             let path = open_facet_file(&parent, names.last().unwrap()).await?;
-            for suffix in ["", "-wal", "-shm"] {
-                let mut file = path.clone().into_os_string();
-                file.push(suffix);
-                let _ = asyncrt::fs().remove_file(std::path::Path::new(&file));
-            }
+            remove_facet_files(&path).map_err(|error| format!("delete facet storage: {error}"))?;
             return Ok(Vec::new());
         };
         let (reply, receive) = tokio::sync::oneshot::channel();
@@ -8358,6 +8415,73 @@ fn op_facet_delete(
             .await
             .map_err(|_| "the facet delete was dropped".to_string())?
             .map_err(|error| format!("delete facet storage: {error:#}"))?;
+        Ok(Vec::new())
+    });
+    rv.set(promise_for(scope, async_id));
+}
+
+/// The prefix of the error of a clone that was refused before it touched the
+/// target, which the harness tells from a clone that failed part way.
+const FACET_CLONE_REFUSED: &str = "facet clone refused";
+
+fn clone_error(error: anyhow::Error) -> String {
+    match error.downcast_ref::<crate::facet_streams::CloneRefused>() {
+        Some(refused) => format!("{FACET_CLONE_REFUSED}: {refused}"),
+        None => format!("clone facet storage: {error:#}"),
+    }
+}
+
+/// `__facet_clone(parentScope, source, target)` — replace the facet `target`
+/// with a copy of the facet `source` of the same parent. The reply waits for
+/// the target's stream and the source's to prove the copy, so the cost is one database copy,
+/// proportional to the source's size, and the root's stream gains no request.
+fn op_facet_clone(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let parent_scope = args.get(0).to_rust_string_lossy(scope);
+    let source = args.get(1).to_rust_string_lossy(scope);
+    let target = args.get(2).to_rust_string_lossy(scope);
+    let parent = match storage::storage_identity(&parent_scope) {
+        Ok(Some(parent)) => parent,
+        Ok(None) => {
+            return loader_throw(
+                scope,
+                "facets are available only inside a Durable Object event",
+            )
+        }
+        Err(error) => return loader_throw(scope, &error.to_string()),
+    };
+    let path = |name: String| {
+        let mut names = parent.facet_path.clone();
+        names.push(name);
+        names
+    };
+    let (source, target) = (path(source), path(target));
+    let async_id = asyncrt::enqueue(async move {
+        let Some(sender) = FACET_TX.get() else {
+            let from = open_facet_file(&parent, source.last().unwrap()).await?;
+            let to = open_facet_file(&parent, target.last().unwrap()).await?;
+            clone_facet_files(from, to).await?;
+            return Ok(Vec::new());
+        };
+        let epoch = parent.epoch;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let request = FacetReq::Clone {
+            root: parent.root_scope,
+            epoch,
+            source,
+            target,
+            reply,
+        };
+        sender
+            .send(request)
+            .map_err(|_| "the facet channel closed".to_string())?;
+        receive
+            .await
+            .map_err(|_| "the facet clone was dropped".to_string())?
+            .map_err(clone_error)?;
         Ok(Vec::new())
     });
     rv.set(promise_for(scope, async_id));
@@ -12271,5 +12395,102 @@ mod response_status_tests {
         assert_eq!(sendable_status(599), 599);
         assert_eq!(sendable_status(99), 500);
         assert_eq!(sendable_status(1000), 500);
+    }
+}
+
+#[cfg(test)]
+mod facet_file_tests {
+    use super::{clone_facet_files, remove_facet_files};
+
+    /// Without a host loop a facet's database is a file beside the root's:
+    /// removing a facet takes the facets below it and leaves a sibling whose
+    /// name only starts the same.
+    #[test]
+    fn removing_a_facet_removes_the_facets_below_it() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let file = |name: &str| directory.path().join(format!("root.sqlite.{name}.sqlite"));
+        for name in ["facets-a", "facets-a-facets-b", "facets-a2", "facets-c"] {
+            std::fs::write(file(name), b"x").unwrap();
+            std::fs::write(format!("{}-wal", file(name).display()), b"x").unwrap();
+        }
+        remove_facet_files(&file("facets-a")).unwrap();
+        let mut left: Vec<String> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "root.sqlite.facets-a2.sqlite",
+                "root.sqlite.facets-a2.sqlite-wal",
+                "root.sqlite.facets-c.sqlite",
+                "root.sqlite.facets-c.sqlite-wal",
+            ]
+        );
+    }
+
+    fn database(path: &std::path::Path, rows: u32) {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE t (v INTEGER);")
+            .unwrap();
+        for row in 0..rows {
+            connection
+                .execute("INSERT INTO t VALUES (?)", [row])
+                .unwrap();
+        }
+    }
+
+    /// A source that was never opened has no file, and its copy is empty.
+    #[test]
+    fn cloning_a_source_that_was_never_opened_empties_the_target() {
+        let host = crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let (from, to) = (
+            directory.path().join("from.sqlite"),
+            directory.path().join("to.sqlite"),
+        );
+        database(&to, 3);
+        host.block_on(clone_facet_files(from, to.clone())).unwrap();
+        assert!(!to.exists());
+    }
+
+    /// A source that cannot be inspected is not "never opened": the target
+    /// keeps its data.
+    #[test]
+    fn a_source_that_cannot_be_inspected_keeps_the_target() {
+        let host = crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let blocker = directory.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let to = directory.path().join("to.sqlite");
+        database(&to, 3);
+        let error = host
+            .block_on(clone_facet_files(blocker.join("from.sqlite"), to.clone()))
+            .unwrap_err();
+        assert!(error.starts_with("facet clone refused"), "{error}");
+        assert!(to.exists());
+    }
+
+    /// A target database that cannot be removed fails the clone and the
+    /// delete instead of leaving old data behind a success.
+    #[test]
+    fn a_removal_that_fails_is_reported() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("root.sqlite.facets-a.sqlite");
+        // A directory cannot be removed as a file.
+        std::fs::create_dir(&target).unwrap();
+        assert!(remove_facet_files(&target).is_err());
+        // Nothing to remove is not a failure, so a repeat is harmless.
+        let missing = directory
+            .path()
+            .join("absent")
+            .join("root.sqlite.facets-b.sqlite");
+        remove_facet_files(&missing).unwrap();
+        remove_facet_files(&directory.path().join("root.sqlite.facets-c.sqlite")).unwrap();
     }
 }

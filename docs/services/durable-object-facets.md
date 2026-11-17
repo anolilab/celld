@@ -23,6 +23,8 @@ Worker Loader provides.
 - `ctx.exports.App({ props })` creates a class handle with startup properties.
 - `ctx.facets.abort(name, reason)` stops a facet and keeps its database.
 - `ctx.facets.delete(name)` stops a facet and removes its database.
+- `ctx.facets.clone(source, target)` replaces the database of `target` with a
+  copy of the database of `source`.
 - The stub answers `fetch()` and the RPC methods of the class.
 
 ## A facet is a part of its root object
@@ -74,6 +76,36 @@ loopback class without properties supplies an empty object.
   call on the stopped stub throws the reason.
 - `ctx.facets.delete(name)` stops the facet and removes its database and the
   database of every facet below it.
+- `ctx.facets.clone(source, target)` stops `target`, removes its database and
+  the database of every facet below it, and copies the database of `source`
+  into a new one. The copy is the committed state of the source at the moment
+  of the clone: the source keeps running, and a transaction it has not
+  committed is not copied. The call resolves when the copy is durable on the
+  stream of the target and everything the source had committed is durable on
+  its own stream, so the copy never holds a write that the source can still
+  lose. The next `get(target)` starts from the copy. The source and the target
+  must differ, and the facets below the source are not copied. The copy reads
+  and writes the whole database, so its cost is proportional to the size of
+  the source. It adds no request on the root object's stream; the target's
+  stream ships the copy as one write. A source that was not running when the
+  clone began starts only once the clone has finished: `get(source)` waits
+  for it.
+- A clone refuses a source database above 16 MiB, because the copy is one
+  write that must reach the bucket within the durability wait. The refusal
+  leaves the target as it was, stopped, and the name usable.
+- A failure during the copy leaves the database of `target` empty. A failure
+  while proving durability leaves the copy, whose durability is unknown. In
+  both cases the name stays blocked until the root object restarts or a later
+  `clone()` or `delete()` of the target replaces it, as after a failed
+  `delete()`.
+- Writes to the source during a clone succeed. The copy reads one consistent
+  snapshot of the source, and a source writer may wait up to the busy
+  timeout, never for the whole copy. A source that grows past 16 MiB after
+  the size check fails the clone, as any clone that fails part way. A
+  `delete()` or `clone()` of any facet of the root waits for a clone in
+  flight, and a `delete(source)` or `clone(x, source)` issued while a clone
+  of `source` is pending waits for it, so it cannot empty the source under
+  the copy.
 
 No name reaches a facet from outside its root object, so external traffic
 must go through the supervisor. Use a separate Durable Object, addressed with
@@ -95,7 +127,8 @@ without its root object. A socket that the facet accepts or opens keeps the root
 cell resident until it closes. The client end of a `101` response from another
 Durable Object does not. `getWebSockets()` returns the sockets of that facet.
 
-`ctx.facets.abort()` and `ctx.facets.delete()` close the sockets of each stopped
+`ctx.facets.abort()`, `ctx.facets.delete()` and `ctx.facets.clone()` (for the
+target and the facets below it) close the sockets of each stopped
 facet with code `1001`, and the facet receives no close event. workerd drops the
 connection instead, so its client sees `1006`. A drain, an ownership move, or a
 generation swap closes a facet socket with `1012`, and an output gate failure
@@ -114,7 +147,7 @@ closes it with `1011`.
   socket closes.
 - A facet stub is not awaitable, and a pipelined property path is unavailable,
   so a call must name one method.
-- The `clone()` method is unavailable.
+- `ctx.facets.clone()` refuses a source database above 16 MiB.
 
 The [Cloudflare compatibility](../cloudflare-compat.md#services)
 page lists the runtime APIs and the unsupported services.
