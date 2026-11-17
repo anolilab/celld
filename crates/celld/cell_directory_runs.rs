@@ -711,6 +711,8 @@ pub(crate) mod testing {
             self.inner.list(prefix)
         }
 
+        // `fetch_update` is `try_update` from Rust 1.99; the pinned toolchain is older.
+        #[allow(deprecated)]
         fn list_with_offset(
             &self,
             prefix: Option<&Path>,
