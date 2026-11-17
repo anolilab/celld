@@ -320,6 +320,33 @@ pub fn requests_websocket_upgrade(headers: &[(String, String)]) -> bool {
     })
 }
 
+/// The owner half of a tunneled WebSocket 101, parked until the caller's own
+/// client socket finishes upgrading. A response that cannot upgrade releases
+/// it with [`take_tunnel_upgrade`].
+static TUNNEL_UPGRADES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u64, hyper::upgrade::OnUpgrade>>,
+> = std::sync::OnceLock::new();
+static NEXT_TUNNEL_UPGRADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn park_tunnel_upgrade(upgrade: hyper::upgrade::OnUpgrade) -> u64 {
+    let id = NEXT_TUNNEL_UPGRADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TUNNEL_UPGRADES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(id, upgrade);
+    id
+}
+
+/// Take a parked upgrade out, once. A second call for the same id finds none.
+pub fn take_tunnel_upgrade(parked: u64) -> Option<hyper::upgrade::OnUpgrade> {
+    TUNNEL_UPGRADES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .remove(&parked)
+}
+
 /// Execute an admitted local call and retain its activity through the response.
 ///
 /// The response is the only owner of a socket that the cell accepted, and
@@ -349,12 +376,20 @@ async fn dispatch_local_fetch(
             // has installed its request context. That context now
             // owns an unread tail through its waitUntil work.
             body_guard.disarm();
+            // Record the object's own socket first, so a refusal below still
+            // releases it (`RefusedWebSocket`).
             if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
                 accepted = Some(target.clone());
+            }
+            // A Durable Object can return a loaded Worker's socket as well as
+            // its own, and either needs the caller to have asked to upgrade.
+            if response.websocket.is_some() {
                 // workerd applies this check in the object's own response
                 // path, so the caller's `stub.fetch()` rejects whichever
                 // node the caller runs on.
                 anyhow::ensure!(upgrade, "TypeError: {WEBSOCKET_WITHOUT_UPGRADE}");
+            }
+            if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
                 let (cell, hibernatable) = crate::js::ws_core_registration(target);
                 let kind = if hibernatable {
                     WebSocketKind::Hibernatable

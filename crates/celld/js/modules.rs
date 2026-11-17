@@ -635,7 +635,20 @@ pub(super) fn register_stubs(scope: &mut v8::PinScope, config: &WorkerConfig) {
     let registry = modreg(scope);
     registry.modules.lock().unwrap().clear();
     registry.trusted.lock().unwrap().clear();
-    for (spec, names) in &config.main_imports {
+    // One stub per builtin, exporting the names every module of the worker
+    // imports from it: the main module and each sibling bind the same stub,
+    // so a stub built from the main module's names alone would leave a
+    // sibling's other named imports unresolved.
+    let mut imports = config.main_imports.clone();
+    for (_name, _source, sibling) in config.es_modules() {
+        for (spec, names) in sibling {
+            imports
+                .entry(spec.clone())
+                .or_default()
+                .extend(names.iter().cloned());
+        }
+    }
+    for (spec, names) in &imports {
         install_lazy_module(scope, spec);
         // `import * as x` binds the whole namespace, so the stub's exports
         // must be the module's full surface — probed from the backing
@@ -825,30 +838,15 @@ pub(super) fn register_wasm_modules(scope: &mut v8::PinScope, modules: &[(String
 }
 
 /// Register a loaded worker's sibling JS modules (Worker Loader multi-module
-/// bundles), in addition to the builtins `register_stubs` already added for the
-/// main module. Each module is registered under its own name and `./name` so
+/// bundles), in addition to the builtins `register_stubs` already added for
+/// every module. Each module is registered under its own name and `./name` so
 /// both bare and relative sibling imports resolve; the whole graph links when
-/// the main module instantiates. Any builtin a sibling imports (and the main
-/// module did not) is stubbed too.
+/// the main module instantiates.
 pub(super) fn register_loader_modules(
     scope: &mut v8::PinScope,
     config: &WorkerConfig,
     main: v8::Local<v8::Module>,
 ) {
-    for (_name, _source, imports) in config.es_modules() {
-        for (spec, names) in imports {
-            if modreg(scope).modules.lock().unwrap().contains_key(spec) {
-                continue;
-            }
-            install_lazy_module(scope, spec);
-            let s = if names.contains("*") {
-                full_surface_source(scope, spec, names).unwrap_or_else(|| stub_source(spec, names))
-            } else {
-                stub_source(spec, names)
-            };
-            register_internal_stub(scope, spec, &s);
-        }
-    }
     register_named_module(scope, &config.main_module_name, main, false);
     for (name, source, _imports) in config.es_modules() {
         register_sibling_module(scope, name, source, false);

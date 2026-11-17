@@ -6696,12 +6696,14 @@ fn op_svc_call_impl(
         },
         None => RequestBodyGuard::of(&body),
     };
+    // The headers move into the call, so ask now whether it wants an upgrade.
+    let upgrade = crate::cell_dispatch::requests_websocket_upgrade(&headers);
     let (tx, rx) = tokio::sync::oneshot::channel();
     // Shares the Durable Object cancel registry and the id encoding
     // `attach_cancel_id` writes, so `__do_call_cancel` works unchanged for a
     // service call. Only a cancellable call registers: a caller with no
-    // AbortSignal has nothing that can cancel it, and the router already ends
-    // the call when the reply sender drops.
+    // AbortSignal has nothing that can cancel it, and the router aborts the
+    // target when the reply receiver drops.
     let (request_id, cancel, cancel_guard) = if cancellable {
         let request_id = next_do_request_id();
         let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
@@ -6736,7 +6738,8 @@ fn op_svc_call_impl(
         let mut cancel_guard = cancel_guard;
         gated_channel_send(gate, &SVC_CALL_TX, request, "no service binding channel").await?;
         let result = match rx.await {
-            Ok(Ok(response)) => encode_granted_response(ws_owner, response, &stream_service),
+            Ok(Ok(mut response)) => refuse_unrequested_websocket(&mut response, upgrade)
+                .and_then(|()| encode_granted_response(ws_owner, response, &stream_service)),
             Ok(Err(error)) => Err(format!("{error}")),
             Err(error) => Err(format!("service dropped: {error}")),
         };
@@ -7280,6 +7283,9 @@ fn op_loader_fetch(
                 )
             }
         };
+    // The headers move into the child job, so ask now whether the caller's
+    // fetch wants an upgrade; a socket may only answer one that does.
+    let upgrade = crate::cell_dispatch::requests_websocket_upgrade(&headers);
     let want_tail_report = args.get(9).boolean_value(scope);
     // The caller's AbortSignal cancels through the registry that
     // `__do_call_cancel` already reads, as a service-binding call does. Only a
@@ -7320,6 +7326,7 @@ fn op_loader_fetch(
         .map(|entry| entry.state.clone());
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
     let stream_service = http_stream_service();
+    let ws_owner = websocket::ws_caller(scope).owner;
     let async_id = asyncrt::enqueue(async move {
         let mut cancel_guard = cancel_guard;
         // The child's own `IoContext` has an empty egress stack, so nothing
@@ -7370,7 +7377,11 @@ fn op_loader_fetch(
         // context. That context owns an unread body tail through its
         // waitUntil work.
         body_guard.disarm();
-        encode_http_response(response, false, &stream_service)
+        let mut response = response;
+        refuse_unrequested_websocket(&mut response, upgrade)?;
+        // A loaded worker can answer with an upgrade, and the caller may bind
+        // or return its socket, so the grant names this request as its owner.
+        encode_granted_response(ws_owner, response, &stream_service)
     });
     let response = promise_for(scope, async_id);
     if let Some(request_id) = cancel_id {
@@ -8619,13 +8630,17 @@ fn op_fetch(
             headers,
             reply: tx,
         };
-        let ws_owner = websocket::ws_caller(scope).owner;
         let stream_service = http_stream_service();
         let id = asyncrt::enqueue(async move {
             let mut cancel_guard = cancel_guard;
             gated_channel_send(gate, &SVC_CALL_TX, request, "no service binding channel").await?;
             let result = match rx.await {
-                Ok(Ok(response)) => encode_granted_response(ws_owner, response, &stream_service),
+                // Global `fetch()` never reads a socket target, so a 101 hands
+                // nothing over and its socket closes with the response.
+                Ok(Ok(mut response)) => {
+                    release_websocket(&mut response);
+                    encode_http_response(response, false, &stream_service)
+                }
                 Ok(Err(error)) => Err(format!("{error}")),
                 Err(error) => Err(format!("globalOutbound Fetcher dropped: {error}")),
             };
@@ -9493,16 +9508,53 @@ fn op_do_id(
     );
 }
 
+/// A socket answers only a fetch that asked to upgrade. For one that did not,
+/// release the socket and return the `TypeError`: dropping a Worker's socket
+/// closes it, a cell's needs the explicit close, and a tunneled cell's parked
+/// peer upgrade is taken out so loaded code cannot strand it.
+fn refuse_unrequested_websocket(response: &mut HttpResponse, upgrade: bool) -> Result<(), String> {
+    use crate::cell_dispatch::WEBSOCKET_WITHOUT_UPGRADE;
+    if upgrade || response.websocket.is_none() {
+        return Ok(());
+    }
+    release_websocket(response);
+    Err(format!("TypeError: {WEBSOCKET_WITHOUT_UPGRADE}"))
+}
+
+/// Release the socket a response carries, if any: dropping a Worker's socket
+/// closes it, a cell's needs the explicit close, and a tunneled cell's parked
+/// peer upgrade is taken out so nothing strands it.
+fn release_websocket(response: &mut HttpResponse) {
+    use crate::cell_dispatch::{take_tunnel_upgrade, WEBSOCKET_WITHOUT_UPGRADE};
+    match response.websocket.take() {
+        Some(HttpResponseWebSocket::Cell(target)) => match target.tunnel {
+            Some(parked) => drop(take_tunnel_upgrade(parked)),
+            None => ws_close(target.id, 1006, WEBSOCKET_WITHOUT_UPGRADE),
+        },
+        Some(HttpResponseWebSocket::Worker(_)) | None => {}
+    }
+}
+
 /// Encode a response for the request `owner`. A cell's WebSocket the response
 /// carries is recorded as handed to that request, and only that request can
 /// bind to it or return it.
 fn encode_granted_response(
     owner: u64,
-    response: HttpResponse,
+    mut response: HttpResponse,
     stream_service: &Arc<crate::http_streams::HttpStreamService>,
 ) -> Result<String, String> {
-    if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
-        ws_grant_target(target, owner);
+    // A stateless Worker's socket is parked for the request it is handed to,
+    // which names it by a target of its own kind.
+    match response.websocket.take() {
+        Some(HttpResponseWebSocket::Worker(socket)) => {
+            let target = websocket::ws_park_worker(socket, owner);
+            response.websocket = Some(HttpResponseWebSocket::Cell(target));
+        }
+        Some(HttpResponseWebSocket::Cell(target)) => {
+            ws_grant_target(&target, owner);
+            response.websocket = Some(HttpResponseWebSocket::Cell(target));
+        }
+        None => {}
     }
     encode_http_response(response, true, stream_service)
 }
@@ -10145,6 +10197,10 @@ pub struct IoContext {
     /// a service-binding dispatch or a Durable Object call gets a context of
     /// its own rather than a frame inside this one.
     sockets: Mutex<Vec<u64>>,
+    /// Worker sockets this request opened and returned in a response. The
+    /// response owns them, but their pull queues are read by this request's
+    /// isolate, so retirement is the last point a queue can have a reader.
+    handed_off_sockets: Mutex<Vec<u64>>,
     /// HTMLRewriter instances this request created. Each holds a parked
     /// parser thread; freeing them at retirement is what reclaims the
     /// thread when a transform is abandoned unread — nothing else can,
@@ -10404,6 +10460,7 @@ impl IoContext {
             events: Mutex::new(IoEventState::default()),
             vfs: OnceLock::new(),
             sockets: Mutex::new(Vec::new()),
+            handed_off_sockets: Mutex::new(Vec::new()),
             rewriters: Mutex::new(Vec::new()),
             tcp_sockets: Mutex::new(Vec::new()),
             allocated_sockets: Mutex::new(HashSet::new()),
@@ -10439,6 +10496,7 @@ impl IoContext {
             events: Mutex::new(IoEventState::default()),
             vfs: OnceLock::new(),
             sockets: Mutex::new(Vec::new()),
+            handed_off_sockets: Mutex::new(Vec::new()),
             rewriters: Mutex::new(Vec::new()),
             tcp_sockets: Mutex::new(Vec::new()),
             allocated_sockets: Mutex::new(HashSet::new()),
@@ -10773,6 +10831,10 @@ impl Drop for IoContext {
         let _ = abandon_context_input_gates(self);
         ws_revoke_grants(self.owner_id());
         self.close_sockets();
+        // Only the context's end is final for a returned socket: its pump
+        // keeps reading after the request has answered.
+        let handed_off = std::mem::take(self.handed_off_sockets.get_mut().unwrap());
+        ws_retire_handoff_readers(handed_off);
         let mut claims = self
             .body_streams
             .get_mut()
@@ -11732,7 +11794,14 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
     // object carried, so only the request the host handed the target to can
     // return it.
     let caller = websocket::ws_caller(scope);
-    if let Some(target) = &ws {
+    // A socket a loaded Worker answered with is taken, under the grant check,
+    // by the request it was handed to. Any other target must be one this
+    // request may return.
+    let parked = match &ws {
+        Some(target) => websocket::ws_take_parked_worker(target, caller.owner),
+        None => None,
+    };
+    if let Some(target) = ws.as_ref().filter(|_| parked.is_none()) {
         if !ws_may_return_target(&caller, target) {
             return Err(anyhow!("WebSocket target was not handed to this request"));
         }
@@ -11753,11 +11822,13 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
     if status == 101 {
         tracing::info!(%ws_json, has_target = ws.is_some(), "JS WebSocket response");
     }
-    let websocket = match (ws, worker_ws) {
-        (Some(target), None) => Some(HttpResponseWebSocket::Cell(target)),
-        (None, Some(worker)) => Some(HttpResponseWebSocket::Worker(worker)),
-        (None, None) => None,
-        (Some(_), Some(_)) => return Err(anyhow!("Worker response has two WebSocket targets")),
+    let websocket = match (ws, parked, worker_ws) {
+        // A socket a loaded Worker answered with, returned as it was handed.
+        (Some(_), Some(socket), None) => Some(HttpResponseWebSocket::Worker(socket)),
+        (Some(target), None, None) => Some(HttpResponseWebSocket::Cell(target)),
+        (None, _, Some(worker)) => Some(HttpResponseWebSocket::Worker(worker)),
+        (None, _, None) => None,
+        (Some(_), _, Some(_)) => return Err(anyhow!("Worker response has two WebSocket targets")),
     };
     Ok(HttpResponse {
         status,
@@ -11790,5 +11861,83 @@ mod current_context_tests {
         }
         assert!(CURRENT.with(|current| current.borrow().is_none()));
         assert!(std::sync::Arc::ptr_eq(&default, &current_context()));
+    }
+}
+
+#[cfg(test)]
+mod refuse_unrequested_websocket_tests {
+    use super::{
+        refuse_unrequested_websocket, release_websocket, HttpResponse, HttpResponseWebSocket,
+        WsTarget,
+    };
+    use crate::cell_dispatch::{park_tunnel_upgrade, take_tunnel_upgrade};
+
+    fn tunneled_response() -> (HttpResponse, u64) {
+        let mut upgraded = hyper::Response::new(());
+        let parked = park_tunnel_upgrade(hyper::upgrade::on(&mut upgraded));
+        let response = HttpResponse {
+            status: 101,
+            body: Vec::new(),
+            stream: None,
+            headers: Vec::new(),
+            websocket: Some(HttpResponseWebSocket::Cell(WsTarget {
+                id: 0,
+                scope: String::new(),
+                tunnel: Some(parked),
+            })),
+            write_position: None,
+            observed_position: None,
+        };
+        (response, parked)
+    }
+
+    #[test]
+    fn a_refused_tunneled_socket_releases_its_parked_upgrade() {
+        let (mut response, parked) = tunneled_response();
+        let error = refuse_unrequested_websocket(&mut response, false).unwrap_err();
+        assert!(error.starts_with("TypeError: "), "{error}");
+        assert!(response.websocket.is_none());
+        assert!(
+            take_tunnel_upgrade(parked).is_none(),
+            "the parked upgrade survived the refusal"
+        );
+    }
+
+    #[test]
+    fn releasing_a_response_closes_a_cell_socket_and_frees_a_parked_upgrade() {
+        let (mut tunneled, parked) = tunneled_response();
+        release_websocket(&mut tunneled);
+        assert!(tunneled.websocket.is_none());
+        assert!(take_tunnel_upgrade(parked).is_none());
+
+        let id = 9_200_001;
+        crate::ws_registry::ws_register_outbound(id, "", None);
+        let mut cell = tunneled_response().0;
+        cell.websocket = Some(HttpResponseWebSocket::Cell(WsTarget {
+            id,
+            scope: String::new(),
+            tunnel: None,
+        }));
+        release_websocket(&mut cell);
+        assert!(cell.websocket.is_none());
+        let registry = crate::ws_registry::ws_registry();
+        let registry = registry.lock().unwrap();
+        assert!(
+            matches!(
+                registry.metadata[&id].pending.as_slice(),
+                [crate::ws_registry::WsOut::Close(1006, _)]
+            ),
+            "the object's socket got no close"
+        );
+        drop(registry);
+        crate::ws_registry::ws_unregister(id);
+    }
+
+    #[test]
+    fn a_requested_upgrade_keeps_its_parked_upgrade() {
+        let (mut response, parked) = tunneled_response();
+        refuse_unrequested_websocket(&mut response, true).unwrap();
+        assert!(response.websocket.is_some());
+        assert!(take_tunnel_upgrade(parked).is_some());
     }
 }

@@ -32,6 +32,10 @@ pub struct OutboundWsReq {
     /// to run and no connection to open: the host only has to carry frames
     /// between two isolates.
     pub target: Option<WsTarget>,
+    /// The socket a stateless Worker answered an upgrade with, which this
+    /// request joins in place of `target`. The host took it out of the parking
+    /// registry, so the connector owns it and ends it with the pipe.
+    pub worker: Option<WorkerWebSocket>,
     /// The facet that dialed, when `scope` names a Durable Object facet. The
     /// op derives it from the running event, so the socket routes through
     /// the facet's root and never names the facet as a cell.
@@ -200,7 +204,7 @@ pub enum WsPull {
 
 /// Maximum charged bytes for non-terminal frames in one isolate-polled
 /// WebSocket input queue.
-pub(crate) const WS_PULL_QUEUE_MAX_BYTES: usize = 1024 * 1024;
+pub const WS_PULL_QUEUE_MAX_BYTES: usize = 1024 * 1024;
 
 /// Tags for the byte frame `__ws_next` resolves with. A tagged buffer keeps a
 /// binary message on its fast path instead of base64 through a JSON envelope.
@@ -232,6 +236,9 @@ impl WsPull {
         framed
     }
 }
+
+/// Room in a pull queue for one data frame, from `WsPullSender::reserve`.
+pub struct WsPullPermit(tokio::sync::OwnedSemaphorePermit);
 
 struct WsPullCharge {
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -277,7 +284,7 @@ pub fn ws_pull_channel() -> (WsPullSender, WsPullReceiver) {
 }
 
 impl WsPull {
-    fn queue_bytes(&self) -> usize {
+    pub fn queue_bytes(&self) -> usize {
         let payload = match self {
             Self::Open(protocol) | Self::Text(protocol) => protocol.len(),
             Self::Binary(bytes) => bytes.len(),
@@ -300,16 +307,32 @@ impl WsPullSender {
             }
             frame => frame,
         };
-        let bytes = frame.queue_bytes();
+        match self.reserve(frame.queue_bytes()).await {
+            Some(permit) => self.send_reserved(frame, permit),
+            None => Err(frame),
+        }
+    }
+
+    /// Wait for room for a data frame of `bytes`, which `queue_bytes` gives.
+    /// Holds nothing but the room, so a caller can race it against other work
+    /// and keep the frame until the room is its own. `None` once the queue
+    /// ended.
+    pub async fn reserve(&self, bytes: usize) -> Option<WsPullPermit> {
         // One message can exceed this queue limit until the separate incoming
         // message limit rejects it. Reserving the complete budget admits that
         // message only into an empty queue and prevents a second message from
         // increasing its retained peak.
         let permit_bytes = bytes.min(WS_PULL_QUEUE_MAX_BYTES) as u32;
-        let permit = match self.capacity.clone().acquire_many_owned(permit_bytes).await {
-            Ok(permit) => permit,
-            Err(_) => return Err(frame),
-        };
+        self.capacity
+            .clone()
+            .acquire_many_owned(permit_bytes)
+            .await
+            .ok()
+            .map(WsPullPermit)
+    }
+
+    /// Queue a data frame in the room `reserve` gave it.
+    pub fn send_reserved(&self, frame: WsPull, permit: WsPullPermit) -> Result<(), WsPull> {
         // The terminal sender closes the semaphore before it queues the close.
         // A data sender can already own a permit at that point, so this lock
         // either orders that data before the close or rejects it after the
@@ -324,7 +347,7 @@ impl WsPullSender {
             .send(QueuedWsPull {
                 frame,
                 _charge: WsPullCharge {
-                    _permit: Some(permit),
+                    _permit: Some(permit.0),
                 },
             })
             .map_err(|error| error.0.frame)
@@ -387,6 +410,45 @@ pub fn ws_pull_register(id: u64, rx: WsPullReceiver) {
 
 pub fn ws_pull_unregister(id: u64) {
     ws_pull().lock().unwrap().remove(&id);
+    ws_registry().lock().unwrap().pull_retention.remove(&id);
+}
+
+/// Where a handed-off Worker socket's pull queue stands once one of its two
+/// owners is gone. The queue belongs to the isolate that opened the socket
+/// (its reader) and to the [`WorkerWebSocket`] that carries the sender.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PullRetention {
+    /// The sender is gone and left a close for the reader to consume.
+    ClosedUnread,
+    /// The reader's request context retired; the sender is still alive.
+    ReaderRetired,
+}
+
+/// The request context that opened the handed-off sockets `ids` retired, so
+/// no isolate can read their queues any more. A queue whose sender already
+/// left a close is removed now; one whose sender is alive is removed when the
+/// sender drops.
+pub(crate) fn ws_retire_handoff_readers(ids: Vec<u64>) {
+    // The registry lock covers the pull queue's removal and the retention
+    // state together (registry, then pull queues, never the reverse), so a
+    // sender dropping at the same time sees one or the other, not a mix.
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    let pulls = ws_pull();
+    for id in ids {
+        let mut pull = pulls.lock().unwrap();
+        match registry.pull_retention.remove(&id) {
+            Some(PullRetention::ClosedUnread) => {
+                pull.remove(&id);
+            }
+            _ if pull.contains_key(&id) => {
+                registry
+                    .pull_retention
+                    .insert(id, PullRetention::ReaderRetired);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The frame channel that a top-level Worker transfers with its 101 response.
@@ -411,7 +473,30 @@ impl WorkerWebSocket {
 
 impl Drop for WorkerWebSocket {
     fn drop(&mut self) {
-        ws_pull_unregister(self.id);
+        // A queue that already holds its close stays for the isolate to read
+        // it, and that read removes the entry. If the isolate's request
+        // already retired, nothing will read it, so it goes now; otherwise
+        // the retirement removes it (`ws_retire_handoff_readers`).
+        // The entry is only recorded while a queue is still registered: a
+        // reader that already consumed the close and removed it leaves nothing
+        // to retain.
+        let retain = self.inbound.is_closed() && {
+            let registry = ws_registry();
+            let mut registry = registry.lock().unwrap();
+            let queued = ws_pull().lock().unwrap().contains_key(&self.id);
+            let retired =
+                registry.pull_retention.get(&self.id) == Some(&PullRetention::ReaderRetired);
+            let retain = queued && !retired;
+            if retain {
+                registry
+                    .pull_retention
+                    .insert(self.id, PullRetention::ClosedUnread);
+            }
+            retain
+        };
+        if !retain {
+            ws_pull_unregister(self.id);
+        }
         ws_unregister(self.id);
     }
 }
@@ -490,7 +575,27 @@ pub struct WsRegistry {
     /// Only that request can bind to it or return it, and only as handed: the
     /// scope and the tunnel cross application JavaScript like the id does.
     grants: HashMap<(u64, Option<u64>), (u64, String)>,
+    /// The socket a stateless Worker answered an upgrade with, held for the
+    /// request it was handed to, keyed by the Worker end's id. That request
+    /// either binds a client end to it or returns it, and takes it out here.
+    parked_workers: HashMap<u64, ParkedWorker>,
+    /// Pull queues a handed-off socket left registered for their reader.
+    pull_retention: HashMap<u64, PullRetention>,
 }
+
+/// A parked Worker socket and the frames its Worker sent while nobody held
+/// the other end.
+struct ParkedWorker {
+    socket: WorkerWebSocket,
+    /// The size of the frames buffered for the socket, so a Worker that
+    /// sends without end cannot grow the buffer past `PARKED_WS_BUFFER_MAX_BYTES`.
+    buffered: usize,
+    overflowed: bool,
+}
+
+/// How much a Worker may send to a parked socket before it is closed.
+const PARKED_WS_BUFFER_MAX_BYTES: usize = WS_PULL_QUEUE_MAX_BYTES;
+const PARKED_FULL: &str = "parked WebSocket buffer is full";
 impl WsRegistry {
     #[doc(hidden)]
     pub fn register(&mut self, id: u64, tx: tokio::sync::mpsc::UnboundedSender<WsOut>) {
@@ -543,11 +648,47 @@ impl WsRegistry {
         }
     }
 
+    /// Count a frame against a parked socket's buffer. `None` while it fits
+    /// or when the socket is not parked, `Some(true)` for the frame that
+    /// overflows it, and `Some(false)` for every frame after.
+    fn park_overflow(&mut self, id: u64, out: &WsOut) -> Option<bool> {
+        let parked = self.parked_workers.get_mut(&id)?;
+        if parked.overflowed {
+            return Some(false);
+        }
+        parked.buffered += size_of::<WsOut>()
+            + match out {
+                WsOut::Text(text) => text.len(),
+                WsOut::Binary(bytes) => bytes.len(),
+                WsOut::Close(_, reason) => reason.len(),
+            };
+        parked.overflowed = parked.buffered > PARKED_WS_BUFFER_MAX_BYTES;
+        parked.overflowed.then_some(true)
+    }
+
     #[doc(hidden)]
     pub fn emit(&mut self, id: u64, out: WsOut) {
         if let Some(tx) = self.outputs.get(&id) {
             tracing::debug!(ws_id = id, "queued outbound WebSocket frame");
             let _ = tx.send(out);
+        } else if let Some(first) = self.park_overflow(id, &out) {
+            // Nobody holds the other end and the Worker sent more than a
+            // parked socket may keep. The Worker learns it, and the request
+            // that binds or returns the socket later still reads the close.
+            // Frames after the first overflow are dropped.
+            if first {
+                if let Some(parked) = self.parked_workers.get(&id) {
+                    let _ = parked
+                        .socket
+                        .inbound
+                        .send_close(1009, PARKED_FULL.into(), true);
+                }
+                if let Some(meta) = self.metadata.get_mut(&id) {
+                    meta.pending.clear();
+                    meta.pending.push(WsOut::Close(1009, PARKED_FULL.into()));
+                }
+                tracing::warn!(ws_id = id, "closed a parked WebSocket whose buffer filled");
+            }
         } else if let Some(meta) = self.metadata.get_mut(&id) {
             tracing::debug!(ws_id = id, "buffered pre-upgrade WebSocket frame");
             meta.pending.push(out);
@@ -770,9 +911,72 @@ pub(crate) fn ws_grant_target(target: &WsTarget, owner: u64) {
 pub(crate) fn ws_revoke_grants(owner: u64) {
     let registry = ws_registry();
     let mut registry = registry.lock().unwrap();
-    if !registry.grants.is_empty() {
-        registry.grants.retain(|_, (granted, _)| *granted != owner);
+    if registry.grants.is_empty() {
+        return;
     }
+    let mut revoked = Vec::new();
+    registry.grants.retain(|(id, _), (granted, _)| {
+        let keep = *granted != owner;
+        if !keep {
+            revoked.push(*id);
+        }
+        keep
+    });
+    // Dropping a Worker socket unregisters it, which takes this lock.
+    let unclaimed: Vec<ParkedWorker> = revoked
+        .iter()
+        .filter_map(|id| registry.parked_workers.remove(id))
+        .collect();
+    drop(registry);
+    // A discarded socket's close has no reader (its request is the one that
+    // was refused it), so its queue goes with it, including the close that a
+    // buffer overflow queued.
+    let ids: Vec<u64> = unclaimed.iter().map(|parked| parked.socket.id).collect();
+    drop(unclaimed);
+    for id in ids {
+        ws_pull_unregister(id);
+    }
+}
+
+/// Hand `owner` the socket a stateless Worker answered an upgrade with. The
+/// Worker end lives in another isolate, so the owner gets a target with an
+/// empty scope (no cell has one) that it can bind a client end to, or return.
+pub(crate) fn ws_park_worker(socket: WorkerWebSocket, owner: u64) -> WsTarget {
+    let target = WsTarget {
+        id: socket.id,
+        scope: String::new(),
+        tunnel: None,
+    };
+    let shared = ws_registry();
+    let mut registry = shared.lock().unwrap();
+    registry
+        .grants
+        .insert((target.id, None), (owner, String::new()));
+    let replaced = registry.parked_workers.insert(
+        target.id,
+        ParkedWorker {
+            socket,
+            buffered: 0,
+            overflowed: false,
+        },
+    );
+    drop(registry);
+    drop(replaced);
+    target
+}
+
+/// Take the parked Worker socket that `owner` was handed as `target`. The
+/// grant is checked and the socket removed under one lock, so a request that
+/// was not handed the target takes nothing, and a socket is taken once.
+pub(crate) fn ws_take_parked_worker(target: &WsTarget, owner: u64) -> Option<WorkerWebSocket> {
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    if !ws_granted(&registry, target, owner) {
+        return None;
+    }
+    let parked = registry.parked_workers.remove(&target.id)?;
+    registry.grants.remove(&(target.id, None));
+    Some(parked.socket)
 }
 
 /// Whether `owner` was handed exactly the response target `target`.
@@ -1304,5 +1508,173 @@ pub(crate) fn ws_close_facet(scope: &str, reason: &str) {
         .collect();
     for id in ids {
         registry.emit(id, WsOut::Close(1001, reason.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod parked_worker_tests {
+    use super::*;
+
+    /// A Worker socket as the loader hands it over: registered, with a frame
+    /// channel, and parked for `owner`.
+    fn park(id: u64, owner: u64) -> (WsTarget, WsPullReceiver) {
+        let (inbound, receiver) = ws_pull_channel();
+        ws_register_outbound(id, "", None);
+        let target = ws_park_worker(WorkerWebSocket { id, inbound }, owner);
+        (target, receiver)
+    }
+
+    #[test]
+    fn only_the_request_that_was_handed_a_parked_socket_takes_it() {
+        let (target, _receiver) = park(9_100_001, 7_001);
+        assert!(
+            ws_take_parked_worker(&target, 7_002).is_none(),
+            "another request"
+        );
+        assert!(ws_take_parked_worker(&target, 7_001).is_some());
+        assert!(
+            ws_take_parked_worker(&target, 7_001).is_none(),
+            "taken once"
+        );
+    }
+
+    #[test]
+    fn a_parked_socket_nobody_claimed_goes_with_its_request() {
+        let (target, _receiver) = park(9_100_002, 7_003);
+        ws_revoke_grants(7_003);
+        let registry = ws_registry();
+        let registry = registry.lock().unwrap();
+        assert!(!registry.parked_workers.contains_key(&target.id));
+        assert!(!registry.metadata.contains_key(&target.id));
+    }
+
+    #[tokio::test]
+    async fn a_worker_cannot_fill_a_parked_socket_past_its_limit() {
+        let id = 9_100_003;
+        let (target, mut receiver) = park(id, 7_004);
+        let frame = || WsOut::Binary(vec![0; 64 * 1024]);
+        let registry = ws_registry();
+        for _ in 0..PARKED_WS_BUFFER_MAX_BYTES / (64 * 1024) + 4 {
+            registry.lock().unwrap().emit(id, frame());
+        }
+        // The Worker is told, and whoever binds the socket later reads the
+        // close instead of a megabyte of frames.
+        assert!(matches!(
+            receiver.recv().await,
+            Some(WsPull::Close(1009, _, true))
+        ));
+        let registry = registry.lock().unwrap();
+        let pending = &registry.metadata[&id].pending;
+        assert!(
+            matches!(pending.as_slice(), [WsOut::Close(1009, _)]),
+            "{}",
+            pending.len()
+        );
+        drop(registry);
+        ws_revoke_grants(7_004);
+        assert!(!ws_target_granted(&target, 7_004));
+        // The overflow close nobody will read is gone with the socket.
+        assert!(!ws_pull().lock().unwrap().contains_key(&id));
+    }
+
+    #[test]
+    fn a_revoked_parked_socket_leaves_no_pull_queue() {
+        let id = 9_100_004;
+        let (inbound, receiver) = ws_pull_channel();
+        ws_pull_register(id, receiver);
+        ws_register_outbound(id, "", None);
+        let sender = inbound.clone();
+        ws_park_worker(WorkerWebSocket { id, inbound }, 7_005);
+        sender
+            .send_close(1001, "gone".into(), true)
+            .is_ok()
+            .then_some(())
+            .unwrap();
+        ws_revoke_grants(7_005);
+        assert!(!ws_pull().lock().unwrap().contains_key(&id));
+        assert!(!ws_registry()
+            .lock()
+            .unwrap()
+            .pull_retention
+            .contains_key(&id));
+    }
+
+    /// A handed-off socket whose sender dropped with a close queued.
+    fn handed_off(id: u64) -> WsPullSender {
+        let (inbound, receiver) = ws_pull_channel();
+        ws_pull_register(id, receiver);
+        ws_register_outbound(id, "", None);
+        inbound
+    }
+
+    #[test]
+    fn retiring_the_reader_clears_a_closed_queue_the_sender_left() {
+        let id = 9_100_005;
+        let inbound = handed_off(id);
+        inbound
+            .send_close(1000, String::new(), true)
+            .is_ok()
+            .then_some(())
+            .unwrap();
+        drop(WorkerWebSocket { id, inbound });
+        assert!(
+            ws_pull().lock().unwrap().contains_key(&id),
+            "kept for its reader"
+        );
+        ws_retire_handoff_readers(vec![id]);
+        assert!(!ws_pull().lock().unwrap().contains_key(&id));
+        assert!(!ws_registry()
+            .lock()
+            .unwrap()
+            .pull_retention
+            .contains_key(&id));
+    }
+
+    #[test]
+    fn a_sender_that_drops_after_the_reader_retired_clears_its_queue() {
+        let id = 9_100_006;
+        let inbound = handed_off(id);
+        let socket = WorkerWebSocket {
+            id,
+            inbound: inbound.clone(),
+        };
+        ws_retire_handoff_readers(vec![id]);
+        inbound
+            .send_close(1000, String::new(), true)
+            .is_ok()
+            .then_some(())
+            .unwrap();
+        drop(socket);
+        assert!(!ws_pull().lock().unwrap().contains_key(&id));
+        assert!(!ws_registry()
+            .lock()
+            .unwrap()
+            .pull_retention
+            .contains_key(&id));
+    }
+
+    #[test]
+    fn a_sender_that_drops_after_its_reader_consumed_the_close_leaves_no_entry() {
+        let id = 9_100_007;
+        let inbound = handed_off(id);
+        let socket = WorkerWebSocket {
+            id,
+            inbound: inbound.clone(),
+        };
+        inbound
+            .send_close(1000, String::new(), true)
+            .is_ok()
+            .then_some(())
+            .unwrap();
+        // The reader consumed the close and its socket was removed.
+        ws_pull_unregister(id);
+        ws_retire_handoff_readers(vec![id]);
+        drop(socket);
+        assert!(!ws_pull().lock().unwrap().contains_key(&id));
+        assert!(!ws_registry()
+            .lock()
+            .unwrap()
+            .pull_retention
+            .contains_key(&id));
     }
 }

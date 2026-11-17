@@ -655,30 +655,11 @@ pub(crate) async fn rpc(
     .await
 }
 
-/// The owner half of a tunneled WebSocket 101, parked until the caller's own
-/// client socket finishes upgrading.
-static TUNNEL_UPGRADES: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<u64, hyper::upgrade::OnUpgrade>>,
-> = std::sync::OnceLock::new();
-static NEXT_TUNNEL_UPGRADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-pub(crate) fn park_upgrade(upgrade: hyper::upgrade::OnUpgrade) -> u64 {
-    let id = NEXT_TUNNEL_UPGRADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    TUNNEL_UPGRADES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .insert(id, upgrade);
-    id
-}
-
-fn remove_upgrade(parked: u64) -> Option<hyper::upgrade::OnUpgrade> {
-    TUNNEL_UPGRADES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .remove(&parked)
-}
+// The parked owner half of a tunneled WebSocket 101 lives in the library, so
+// the JavaScript host can release one it refuses.
+pub(crate) use celld::cell_dispatch::{
+    park_tunnel_upgrade as park_upgrade, take_tunnel_upgrade as remove_upgrade,
+};
 
 /// Own one parked upgrade after its numeric id returns from JavaScript.
 ///

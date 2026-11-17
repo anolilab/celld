@@ -108,11 +108,13 @@ pub(super) fn transfer_worker_websocket_handoff(
     drop(registry);
     // The response now owns cleanup. Transfer the frame channel and request
     // ownership together so request retirement cannot close a returned socket.
-    current_context()
+    let context = current_context();
+    context
         .sockets
         .lock()
         .unwrap()
         .retain(|opened| *opened != id);
+    context.handed_off_sockets.lock().unwrap().push(id);
     Some(WorkerWebSocket { id, inbound })
 }
 
@@ -507,6 +509,7 @@ pub(super) fn op_ws_upgrade(
                 headers,
                 want_response: true,
                 target: None,
+                worker: None,
                 facet,
                 reply: tx,
             })
@@ -563,12 +566,19 @@ pub(super) fn op_ws_next(
         let Some(queue) = queue else {
             return Ok(WsPull::Close(1006, "socket is not registered".into(), false).encode());
         };
-        let mut queue = queue.lock().await;
-        Ok(queue
+        let frame = queue
+            .lock()
+            .await
             .recv()
             .await
-            .unwrap_or_else(|| WsPull::Close(1006, String::new(), false))
-            .encode())
+            .unwrap_or_else(|| WsPull::Close(1006, String::new(), false));
+        // The host leaves a queue holding its close in place, so a read that
+        // starts later still gets that close; the read that consumes it
+        // removes the entry.
+        if matches!(frame, WsPull::Close(..)) {
+            ws_pull_unregister(id);
+        }
+        Ok(frame.encode())
     });
     rv.set(promise_for(scope, async_id));
 }
@@ -639,6 +649,7 @@ pub(super) fn op_ws_connect(
                 headers: Vec::new(),
                 want_response: false,
                 target: None,
+                worker: None,
                 facet,
                 reply: tx,
             })
@@ -691,7 +702,10 @@ pub(super) fn op_ws_bind_target(
     if !ws_own_cell(scope, &cell) || !ws_claim(scope, id) {
         return;
     }
-    if !ws_target_granted(&target, owner) {
+    // A stateless Worker's socket is taken here, under the grant check, so
+    // the bind owns it from this call on. A cell's socket is only checked.
+    let worker = ws_take_parked_worker(&target, owner);
+    if worker.is_none() && !ws_target_granted(&target, owner) {
         return loader_throw(scope, "WebSocket target was not handed to this request");
     }
     // The caller end's frames reach this isolate through its pull queue, so
@@ -724,7 +738,8 @@ pub(super) fn op_ws_bind_target(
                 pull: Some(pull_tx),
                 headers: Vec::new(),
                 want_response: false,
-                target: Some(target),
+                target: worker.is_none().then_some(target),
+                worker,
                 // `scope` names the target, which keeps its own route.
                 facet: None,
                 reply: tx,

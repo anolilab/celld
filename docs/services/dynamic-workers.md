@@ -71,9 +71,32 @@ parameters, never as globals, so `globalThis` exposes none.
 
 When `WorkerCode` omits `globalOutbound`, the loaded Worker inherits the egress
 policy of the loader. A `null` value makes `fetch()` and `connect()` throw. A
-Fetcher brokers each `fetch()` through the loader. A `connect()` or a WebSocket
-through a Fetcher throws, because the celld service protocol carries no
-bidirectional tunnel.
+Fetcher brokers each `fetch()` through the loader. A `connect()`, a
+`new WebSocket()`, or a `fetch()` upgrade through a Fetcher throws, because a
+Fetcher call carries no bidirectional tunnel.
+
+## Calls into a loaded Worker
+
+Every module of a loaded Worker can import any name from a built-in module such
+as `cloudflare:workers`, whichever other modules import from it.
+
+A `fetch()` on an entrypoint takes an `AbortSignal`. Aborting it rejects the
+caller and aborts the request of the loaded Worker, so its `request.signal`
+fires and a provider request that uses that signal stops. The same happens
+when the caller goes away before the call answers.
+
+A loaded Worker can answer a request with a `101` response and a `webSocket`.
+The caller receives that `webSocket`, which carries messages to and from the
+loaded Worker after the caller calls `accept()`, or the caller can return the
+response to its own client. A Durable Object can return it too, to a caller on
+the same node. A close sent by either side reaches the other with its code and
+reason.
+
+The socket belongs to the request that received it. A socket the caller never
+accepts or returns closes with `1009` once the loaded Worker has sent it 1 MiB,
+and it closes with the caller's request. A `globalOutbound` Fetcher that answers
+a loaded Worker's `fetch()` with `101` hands over no socket, because a plain
+`fetch()` cannot use one.
 
 ## Lifetime and caching
 
@@ -106,7 +129,9 @@ compiles the code again.
 - `getEntrypoint()` supports `props` and `limits` options, while
   `getDurableObjectClass()` supports only `props`. A structured-clone encoded
   `props` value can be at most 1 MiB.
-- A `globalOutbound` Fetcher cannot use `connect()` or a WebSocket.
+- A `globalOutbound` Fetcher cannot use `connect()` or an upgrade: a `new WebSocket()`
+  or a `fetch()` upgrade through it throws, and its `101` answer to a plain `fetch()`
+  carries no socket.
 - A `WorkerCode.tails` array accepts Service Binding Fetchers. Each Fetcher
   receives one event after a Dynamic Worker fetch invocation finishes.
 - The event contains the request metadata, the response status, the console

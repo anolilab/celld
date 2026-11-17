@@ -2100,6 +2100,13 @@ pub(crate) async fn dispatch_forwarded_fetch(
                     // handler that is still running.
                     abort.handler_answered();
                     let response = result?;
+                    // A loaded Worker's socket lives in this process's
+                    // registry, so it cannot be spliced to a peer's client.
+                    // Refuse it rather than answer 101 with no socket.
+                    anyhow::ensure!(
+                        !matches!(response.websocket, Some(HttpResponseWebSocket::Worker(_))),
+                        "a Durable Object cannot return a Worker's WebSocket to a peer node"
+                    );
                     if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
                         accepted = Some(target.clone());
                         // The same object-level check as a local call, so a
@@ -2446,20 +2453,27 @@ async fn dispatch_service_call(app: AppHandle, call: SvcCallReq) {
     // guard here as well, so a missing runtime or a cancellation before
     // admission cannot leave the source in the process registry.
     let mut body_guard = call.body_guard;
+    let mut reply = call.reply;
     let response = match &app.runtime {
         Some(runtime) => {
-            runtime
-                .fetch_service(ServiceFetch {
-                    generation: call.generation,
-                    script: call.script,
-                    entrypoint: call.entrypoint,
-                    url: call.url,
-                    method: call.method,
-                    body: call.body,
-                    headers: call.headers,
-                    cancel: call.cancel,
-                })
-                .await
+            let fetch = runtime.fetch_service(ServiceFetch {
+                generation: call.generation,
+                script: call.script,
+                entrypoint: call.entrypoint,
+                url: call.url,
+                method: call.method,
+                body: call.body,
+                headers: call.headers,
+                cancel: call.cancel,
+            });
+            // The caller drops its reply when it goes away, with an abort or
+            // when its request ends. Dropping the fetch then aborts the
+            // target's request, so its `request.signal` fires.
+            celld::asyncrt::select_biased! {
+                "a finished call wins a tie with the caller going away";
+                response = fetch => response,
+                _ = reply.closed() => return,
+            }
         }
         None => Err(anyhow::anyhow!("no Worker runtime")),
     };
@@ -2468,7 +2482,7 @@ async fn dispatch_service_call(app: AppHandle, call: SvcCallReq) {
         // context. Keep an unread tail there until its waitUntil work ends.
         body_guard.disarm();
     }
-    let _ = call.reply.send(response);
+    let _ = reply.send(response);
 }
 
 async fn dispatch_service_rpc(app: AppHandle, call: SvcRpcReq) {
