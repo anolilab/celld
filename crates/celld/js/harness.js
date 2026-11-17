@@ -6109,14 +6109,25 @@ const __wsStub = __celld.__wsStub = (wsId) => ({
 //
 // Reporting never throws: a value whose formatting throws must not stop the
 // other listeners or replace the exception a handler rethrows.
+//
+// It writes through the host log directly, so a Worker that replaces
+// `console.error` cannot hide it, and the text is capped, so a handler that
+// throws a huge value on every frame cannot flood the node's log.
+const __HANDLER_ERROR_MAX = 8192;
 const __reportHandlerError = (what, error) => {
+  let text;
   try {
-    console.error(`Uncaught exception in ${what}:`, error);
+    text = error instanceof Error
+      ? (error.stack || `${error.name}: ${error.message}`)
+      : String(error);
   } catch {
-    try {
-      console.error(`Uncaught exception in ${what} (the value could not be printed)`);
-    } catch {}
+    text = "(the value could not be printed)";
   }
+  if (text.length > __HANDLER_ERROR_MAX)
+    text = `${text.slice(0, __HANDLER_ERROR_MAX)}... (truncated)`;
+  try {
+    __log("error", `Uncaught exception in ${what}: ${text}`);
+  } catch {}
 };
 // The hook `dispatchEvent` calls when a listener throws. A symbol, so no other
 // EventTarget, a Worker's own subclass included, picks it up by accident.
