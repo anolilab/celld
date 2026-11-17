@@ -82,10 +82,16 @@ const FACET_CODE = `
           exports: Object.keys(this.ctx.exports ?? {}),
           facets: {},
         };
+        const nested = (name) =>
+          this.ctx.facets.get(name, () => ({ class: this.ctx.exports.App }));
+        // Every nested facet gets a row of its own first, so a read that
+        // shows another facet's row is a shared store and not an empty one.
+        for (const name of names) {
+          await nested(name).fetch("http://facet/?op=seed&v=nested-" + name);
+        }
         for (const name of names) {
           out.facets[name] = await attempt(async () => {
-            const facet = this.ctx.facets.get(name, () => ({ class: this.ctx.exports.App }));
-            return await (await facet.fetch("http://facet/?op=dump")).json();
+            return await (await nested(name).fetch("http://facet/?op=dump")).json();
           });
         }
         out.sibling = await attempt(async () => {

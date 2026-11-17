@@ -160,15 +160,7 @@ async fn a_facet_sees_only_its_own_storage() {
     // The facet holds no binding and exports no object class but its own.
     assert_eq!(reach["env"], serde_json::json!([]), "{reach}");
     assert_eq!(reach["exports"], serde_json::json!(["App"]), "{reach}");
-    // A facet it starts under any name is a new one, with empty storage.
-    for name in ["b", "a", "app", "one", "two"] {
-        let nested = &reach["facets"][name];
-        assert_eq!(
-            nested["value"],
-            serde_json::json!({ "kv": [], "sql": [] }),
-            "nested facet {name} is not empty: {reach}"
-        );
-    }
+    assert_nested_facets_apart(&reach, &["b", "a", "app", "one", "two"]);
     // With no `Host` among its exports there is no stub of another object.
     assert_eq!(reach["sibling"]["value"]["absent"], true, "{reach}");
     // Naming the host's own id gets the facet nothing either.
@@ -176,7 +168,22 @@ async fn a_facet_sees_only_its_own_storage() {
         .get_json(&format!("/host/one?facet=b&op=reach&names=a&sibling={one}"))
         .await;
     assert_nothing_foreign(&reach, &["parent-one", "facet-one-a"]);
+    assert_nested_facets_apart(&reach, &["a"]);
     assert_eq!(reach["sibling"]["value"]["absent"], true, "{reach}");
+}
+
+/// The facet wrote `nested-<name>` into each facet it started. Every one reads
+/// back exactly that row and none of the others', so two names cannot share a
+/// store unseen.
+fn assert_nested_facets_apart(reach: &Value, names: &[&str]) {
+    for name in names {
+        let own = format!("nested-{name}");
+        assert_eq!(
+            reach["facets"][name]["value"],
+            serde_json::json!({ "kv": [["secret", own]], "sql": [{ "v": own }] }),
+            "nested facet {name} does not hold exactly its own row: {reach}"
+        );
+    }
 }
 
 fn assert_nothing_foreign(reach: &Value, foreign: &[&str]) {

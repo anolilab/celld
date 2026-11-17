@@ -4,6 +4,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use serde_json::Value;
+use tokio::net::TcpListener;
 
 use super::harness::{run_expecting_exit, CountingListener, Server};
 
