@@ -74,6 +74,7 @@ pub mod queue_policy;
 pub mod r2_cli;
 pub(crate) mod r2_store;
 pub mod replication;
+pub(crate) mod response_encoding;
 pub mod runtime;
 pub mod staged;
 pub mod startup;

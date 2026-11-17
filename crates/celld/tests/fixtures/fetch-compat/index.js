@@ -1,5 +1,11 @@
 import { connect } from "cloudflare:sockets";
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject, RpcTarget } from "cloudflare:workers";
+
+class Probe extends RpcTarget {
+  ping() {
+    return "pong";
+  }
+}
 
 export class Cell extends DurableObject {
   plain() {
@@ -13,6 +19,18 @@ export class Cell extends DurableObject {
   }
   nested() {
     return { inner: { b: 2 }, items: [{ c: 3 }] };
+  }
+  // A plain result forwarded beside an RpcTarget, and the target forwarded
+  // alone.
+  async forwardWithPlain(name) {
+    const plain = await this.env.CELL.getByName(name).plain();
+    return { plain, target: new Probe() };
+  }
+  entries() {
+    return globalThis.__celld_stub_entries();
+  }
+  async forwardStubOnly() {
+    return { target: new Probe() };
   }
 }
 
@@ -37,6 +55,8 @@ export default {
         const init = {};
         const mode = url.searchParams.get("encode");
         if (mode) init.encodeResponseBody = mode;
+        const method = url.searchParams.get("method");
+        if (method) init.method = method;
         const response = await fetch(target, init);
         const bytes = new Uint8Array(await response.arrayBuffer());
         return Response.json({
@@ -91,6 +111,20 @@ export default {
       plain[Symbol.dispose]();
       list[Symbol.dispose]();
       return Response.json(out);
+    }
+    if (url.pathname === "/forward") {
+      const stub = env.CELL.getByName("outer");
+      // The entries the callee holds after each call, while the caller still
+      // holds the result.
+      const held = [];
+      const results = [];
+      for (const method of ["forwardStubOnly", "forwardWithPlain"]) {
+        const before = await stub.entries();
+        results.push(await stub[method]("inner"));
+        held.push((await stub.entries()) - before);
+      }
+      for (const result of results) result[Symbol.dispose]?.();
+      return Response.json({ stubOnly: held[0], withPlain: held[1] });
     }
     return new Response("not found", { status: 404 });
   },

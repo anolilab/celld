@@ -71,8 +71,12 @@ An unsupported feature that does not cause an error is a defect.
   cannot prove the geolocation, colo, or TLS metadata.
 - celld removes `Content-Length` from a Worker response, except for a `HEAD`
   response.
-- `fetch()` decodes a response body whose `Content-Encoding` is exactly `gzip`
-  or `br`, as it streams, and does so by default. With
+- `fetch()` decodes a response body whose `Content-Encoding` is exactly one
+  `gzip` or `br` value, as it streams, and does so by default. A `HEAD`, `204`
+  or `304` response, and a response with several `Content-Encoding` values, are
+  not decoded and keep their headers. A gzip body may hold several members.
+  A body that expands to more than 1024 times its encoded size, once it passes
+  1 MiB decoded, ends with an error. With
   `encodeResponseBody: "manual"` the Worker reads the encoded bytes and
   `Content-Encoding` and `Content-Length` stay. celld sends no `Accept-Encoding`
   of its own. Unlike workerd, celld drops `Content-Encoding` and
@@ -271,7 +275,9 @@ celld provides an always-miss cache because it has no shared edge cache.
   later event.
 - celld verifies a TLS server, for `connect()` with `secureTransport` or
   `startTls()` and for `fetch()`, against its bundled Mozilla root store and the
-  certificates in the PEM file that `CELLD_EXTRA_CA_CERTS` names.
+  certificates in the PEM file that `CELLD_EXTRA_CA_CERTS` names. The same
+  holds for an outbound `wss://`. celld's own connections, the control-plane
+  WebSocket included, trust only the bundled roots.
 - celld does not block the destination ports that Cloudflare blocks. The fleet
   network controls the egress policy.
 

@@ -680,6 +680,13 @@ pub fn guard(
     }
 }
 
+/// A client builder for a Worker's outbound HTTP: the egress policy's DNS and
+/// proxy rules, and the operator's extra TLS roots. Every client that carries a
+/// Worker's request starts here, so none can miss either.
+pub fn worker_egress_builder(filter: Option<&Arc<Filter>>) -> reqwest::ClientBuilder {
+    crate::tls_roots::apply(guard(reqwest::Client::builder(), filter))
+}
+
 /// A redirect policy that checks each hop's destination, then applies `next`.
 pub fn redirect_policy(
     filter: Arc<Filter>,

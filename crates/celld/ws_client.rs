@@ -36,7 +36,6 @@ use hyper::StatusCode;
 use hyper_util::rt::TokioIo;
 use sha1::Digest;
 use sha1::Sha1;
-use std::sync::OnceLock;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 
@@ -80,20 +79,6 @@ pub struct Connection {
     pub headers: HeaderMap,
 }
 
-/// Mozilla's roots and `CELLD_EXTRA_CA_CERTS`, the same set the previous client compiled in. Deliberately
-/// not the platform store: a downloaded celld should reach `wss://` on a host
-/// that has no `/etc/ssl/certs`.
-fn tls_config() -> &'static tokio_rustls::TlsConnector {
-    static CONFIG: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
-    CONFIG.get_or_init(|| {
-        let roots = crate::tls_roots::root_store().expect("validated CELLD_EXTRA_CA_CERTS");
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
-    })
-}
-
 /// RFC 6455's proof the server read the key rather than blindly answering 101.
 fn accept_key(key: &str) -> String {
     let mut digest = Sha1::new();
@@ -103,25 +88,29 @@ fn accept_key(key: &str) -> String {
 }
 
 /// Open a WebSocket to `url`, sending `extra` alongside the handshake headers.
+/// For celld's own connections: a `wss://` server is verified against the
+/// bundled roots only, never `CELLD_EXTRA_CA_CERTS`.
 ///
 /// The caller owns the timeout: nothing here bounds how long a server may take
 /// to answer.
 pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
-    connect_filtered(url, extra, None).await
+    connect_filtered(url, extra, None, crate::tls_roots::bundled_connector()).await
 }
 
 /// [`connect`] for a Worker's outbound WebSocket: with `CELLD_EGRESS=public`
-/// it dials only addresses the egress policy permits. celld's own
-/// connections use [`connect`] and are not filtered.
+/// it dials only addresses the egress policy permits, and a `wss://` server is
+/// also verified against `CELLD_EXTRA_CA_CERTS`. celld's own connections use
+/// [`connect`] and are neither filtered nor given the extra roots.
 pub async fn connect_for_worker(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
     let filter = crate::egress_filter::active();
-    connect_filtered(url, extra, filter.as_deref()).await
+    connect_filtered(url, extra, filter.as_deref(), crate::tls_roots::connector()).await
 }
 
 async fn connect_filtered(
     url: &str,
     extra: HeaderMap,
     filter: Option<&crate::egress_filter::Filter>,
+    connector: tokio_rustls::TlsConnector,
 ) -> Result<Connection, Error> {
     let url = url::Url::parse(url).context("parse WebSocket URL")?;
     // `fetch("http://…", { headers: { Upgrade: "websocket" } })` is the
@@ -162,7 +151,7 @@ async fn connect_filtered(
         let name = rustls::pki_types::ServerName::try_from(host.clone())
             .map_err(|_| anyhow!("invalid TLS server name: {host}"))?;
         Box::new(
-            tls_config()
+            connector
                 .connect(name, tcp)
                 .await
                 .with_context(|| format!("TLS handshake with {authority}"))?,

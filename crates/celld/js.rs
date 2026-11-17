@@ -579,32 +579,23 @@ thread_local! {
     // One outbound HTTP client per JS thread — building it per fetch rebuilds
     // the TLS stack every call (async-op-hazards.md).
     static HTTP: reqwest::Client = match crate::egress_filter::active() {
-        None => crate::tls_roots::apply(reqwest::Client::builder())
+        None => crate::egress_filter::worker_egress_builder(None)
             .build()
             .unwrap(),
-        Some(filter) => crate::tls_roots::apply(crate::egress_filter::guard(
-            reqwest::Client::builder(),
-            Some(&filter),
-        ))
-        .redirect(crate::egress_filter::redirect_policy(
-            filter,
-            crate::egress_filter::default_redirect_limit,
-        ))
-        .build()
-        .unwrap(),
+        Some(filter) => crate::egress_filter::worker_egress_builder(Some(&filter))
+            .redirect(crate::egress_filter::redirect_policy(
+                filter,
+                crate::egress_filter::default_redirect_limit,
+            ))
+            .build()
+            .unwrap(),
     };
-    static HTTP_MANUAL: reqwest::Client = crate::tls_roots::apply(crate::egress_filter::guard(
-        reqwest::Client::builder(),
-        crate::egress_filter::active().as_ref(),
-    ))
+    static HTTP_MANUAL: reqwest::Client = crate::egress_filter::worker_egress_builder(crate::egress_filter::active().as_ref())
     .redirect(reqwest::redirect::Policy::none()).build().unwrap();
     // A separate policy stops an `error` request before reqwest can replay it
     // at the destination. Inspecting the final response would be too late:
     // the method, body, and credentials could already have left the process.
-    static HTTP_ERROR: reqwest::Client = crate::tls_roots::apply(crate::egress_filter::guard(
-        reqwest::Client::builder(),
-        crate::egress_filter::active().as_ref(),
-    ))
+    static HTTP_ERROR: reqwest::Client = crate::egress_filter::worker_egress_builder(crate::egress_filter::active().as_ref())
     .redirect(reqwest::redirect::Policy::custom(|attempt| {
         attempt.error("fetch redirect mode is error")
     })).build().unwrap();
@@ -8730,7 +8721,7 @@ fn op_fetch(
         let fetch_timeout = crate::env_vars::positive_or("CELLD_FETCH_TIMEOUT_S", 120)
             .expect("validated CELLD_FETCH_TIMEOUT_S");
         let mut rb = client
-            .request(m, &url)
+            .request(m.clone(), &url)
             .timeout(std::time::Duration::from_secs(fetch_timeout));
         // reqwest omits Content-Length for an empty Vec, which collapses the
         // wire representation of `Some([])` into the representation of
@@ -8789,7 +8780,11 @@ fn op_fetch(
                 let encoding = if manual_encoding {
                     None
                 } else {
-                    crate::http_streams::ResponseEncoding::of(resp.headers())
+                    crate::response_encoding::ResponseEncoding::of(
+                        &m,
+                        resp.status(),
+                        resp.headers(),
+                    )
                 };
                 let headers = resp
                     .headers()
@@ -10285,29 +10280,26 @@ impl IoContext {
             .get_or_init(|| {
                 let context = Arc::downgrade(self);
                 let filter = crate::egress_filter::active();
-                crate::tls_roots::apply(crate::egress_filter::guard(
-                    reqwest::Client::builder(),
-                    filter.as_ref(),
-                ))
-                .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                    // Each hop is checked before it is counted or followed.
-                    if let Some(filter) = &filter {
-                        if let Err(refused) = filter.check_url(attempt.url()) {
-                            return attempt.error(refused);
+                crate::egress_filter::worker_egress_builder(filter.as_ref())
+                    .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                        // Each hop is checked before it is counted or followed.
+                        if let Some(filter) = &filter {
+                            if let Err(refused) = filter.check_url(attempt.url()) {
+                                return attempt.error(refused);
+                            }
                         }
-                    }
-                    if attempt.previous().len() >= 10 {
-                        return attempt.error("too many redirects");
-                    }
-                    if let Some(context) = context.upgrade() {
-                        if let Err(error) = context.charge_subrequest() {
-                            return attempt.error(RedirectSubrequestLimit(error));
+                        if attempt.previous().len() >= 10 {
+                            return attempt.error("too many redirects");
                         }
-                    }
-                    attempt.follow()
-                }))
-                .build()
-                .expect("build the redirect-counting HTTP client")
+                        if let Some(context) = context.upgrade() {
+                            if let Err(error) = context.charge_subrequest() {
+                                return attempt.error(RedirectSubrequestLimit(error));
+                            }
+                        }
+                        attempt.follow()
+                    }))
+                    .build()
+                    .expect("build the redirect-counting HTTP client")
             })
             .clone()
     }

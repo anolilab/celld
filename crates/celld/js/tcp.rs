@@ -80,23 +80,10 @@ fn insert(id: u64, owner: u64, stream: Duplex) {
     );
 }
 
-fn tls_connector() -> tokio_rustls::TlsConnector {
-    static CONNECTOR: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
-    CONNECTOR
-        .get_or_init(|| {
-            let roots = crate::tls_roots::root_store().expect("validated CELLD_EXTRA_CA_CERTS");
-            let config = rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-            tokio_rustls::TlsConnector::from(Arc::new(config))
-        })
-        .clone()
-}
-
 async fn handshake(stream: Duplex, host: String) -> Result<Duplex, String> {
     let name = rustls::pki_types::ServerName::try_from(host)
         .map_err(|error| format!("invalid TLS server name: {error}"))?;
-    let tls = tls_connector()
+    let tls = crate::tls_roots::connector()
         .connect(name, stream)
         .await
         .map_err(|error| format!("TLS handshake failed: {error}"))?;

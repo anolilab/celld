@@ -4136,6 +4136,8 @@ const __ctxAbortCurrent =
 // running its target, the handle's for the serialize-elsewhere
 // check.
 const __stubEntries = new Map();
+// How many stubs and disposers the isolate holds; the RPC tests read it.
+globalThis.__celld_stub_entries = () => __stubEntries.size;
 const __stubMeta = new WeakMap();
 // Keep the Durable Object brand outside the user-visible object. Reading a
 // string property here would invoke an inherited getter before validation can
@@ -4559,8 +4561,10 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
     for (const key of Object.keys(v)) out[key] = lift(v[key]);
     const disposerSource = originals?.get(v) ?? v;
     const disposer = disposerSource[Symbol.dispose];
+    // The shared no-op on a plain RPC result releases nothing, so it is not
+    // a capability to forward.
     if (allowCapabilities && !Array.isArray(v) &&
-        typeof disposer === "function") {
+        typeof disposer === "function" && disposer !== __noDispose) {
       lifted = true;
       caps = true;
       out["__celld$disp"] =
