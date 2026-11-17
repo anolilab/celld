@@ -37,17 +37,17 @@ impl PeerProbeSigner {
         Self::from_secret(secret)
     }
 
-    fn from_secret(mut secret: [u8; 32]) -> Self {
+    pub(crate) fn from_secret(mut secret: [u8; 32]) -> Self {
         let key = SigningKey::from_bytes(&secret);
         secret.fill(0);
         Self { key }
     }
 
-    fn public_key_hex(&self) -> String {
+    pub(crate) fn public_key_hex(&self) -> String {
         encode_hex(&self.key.verifying_key().to_bytes())
     }
 
-    fn respond(
+    pub(crate) fn respond(
         &self,
         node: &str,
         advertise: &str,

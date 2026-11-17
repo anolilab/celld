@@ -107,7 +107,9 @@ pub(crate) struct Reachable {
     unreachable: Option<String>,
     /// Credentials, without the operator token, for the signed probe a caller
     /// that sends the token to a node it did not choose by address needs first.
-    proof: Option<(reqwest::Client, crate::peer_auth::PeerAuth)>,
+    /// The probe goes through `http`, so the request that follows it can take
+    /// the connection the node answered on.
+    proof: Option<crate::peer_auth::PeerAuth>,
 }
 
 impl Reachable {
@@ -161,6 +163,9 @@ impl Reachable {
         };
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
+            // One idle connection, so the request that follows the identity
+            // probe takes the connection the node answered on.
+            .pool_max_idle_per_host(1)
             // A migration on a large table is not a diagnostic ping, so this
             // budget is the handler budget's order rather than the probe's.
             .timeout(subject.timeout)
@@ -190,18 +195,9 @@ impl Reachable {
     /// holds the leased key and the fleet secret. `proof` is signed with the
     /// fleet secret and carries no token, because the first request goes to
     /// the address that is not yet trusted.
-    pub(crate) fn proving_the_node(
-        mut self,
-        proof: crate::peer_auth::PeerAuth,
-    ) -> anyhow::Result<Self> {
-        // Its own short budget: a listener that accepts and never answers must
-        // not hold the command for the length of a migration.
-        let http = reqwest::Client::builder()
-            .timeout(PROOF_TIMEOUT)
-            .build()
-            .context("build the identity probe client")?;
-        self.proof = Some((http, proof));
-        Ok(self)
+    pub(crate) fn proving_the_node(mut self, proof: crate::peer_auth::PeerAuth) -> Self {
+        self.proof = Some(proof);
+        self
     }
 
     /// Answer a connection refused by every entrance with `message` rather
@@ -274,8 +270,23 @@ impl Reachable {
         for (index, entrance) in self.entrances.iter().enumerate() {
             let last = index + 1 == self.entrances.len();
             let url = &entrance.url;
-            if let Some((http, proof)) = &self.proof {
-                if let Err(error) = crate::peer_probe::probe(http, &entrance.lease, proof).await {
+            if let Some(proof) = &self.proof {
+                // Its own short budget: a listener that accepts and never
+                // answers must not hold the command for the length of a
+                // migration.
+                // A command-line client, outside the execution boundary.
+                #[allow(clippy::disallowed_methods)]
+                let proven = tokio::time::timeout(
+                    PROOF_TIMEOUT,
+                    crate::peer_probe::probe(&self.http, &entrance.lease, proof),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow!(
+                        "no answer to the identity probe in {PROOF_TIMEOUT:?}"
+                    ))
+                });
+                if let Err(error) = proven {
                     refused.push(format!("{url}: {error:#}"));
                     let refused_connection = error.chain().any(|cause| {
                         cause
@@ -455,8 +466,7 @@ mod operator_token_tests {
             unreachable: Some("start `celld dev` first".to_string()),
             proof: None,
         }
-        .proving_the_node(crate::peer_auth::PeerAuth::new([7; 32], "d1-cli").unwrap())
-        .unwrap();
+        .proving_the_node(crate::peer_auth::PeerAuth::new([7; 32], "d1-cli").unwrap());
         let error = reachable.call(serde_json::json!({})).await.unwrap_err();
         assert!(
             error.to_string().starts_with("start `celld dev` first"),
@@ -466,6 +476,111 @@ mod operator_token_tests {
         assert_eq!(heads.len(), 1, "only the probe is sent: {heads:?}");
         assert!(heads[0].starts_with("GET /peer/probe"), "{}", heads[0]);
         assert_eq!(stub.authorizations(), vec![None]);
+    }
+
+    /// The token request takes the connection the node proved itself on: a
+    /// second connection would let another listener that took the port after
+    /// the probe collect the token.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+    async fn the_token_goes_out_on_the_connection_that_was_probed() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let signer = crate::peer_probe::PeerProbeSigner::from_secret([9; 32]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, String)>::new()));
+        let (count, log, advertised) = (connections.clone(), served.clone(), addr.clone());
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let id = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (log, advertised) = (log.clone(), advertised.clone());
+                let signer = crate::peer_probe::PeerProbeSigner::from_secret([9; 32]);
+                tokio::spawn(async move {
+                    let mut seen = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    loop {
+                        while !seen.windows(4).any(|window| window == b"\r\n\r\n") {
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(read) => seen.extend_from_slice(&chunk[..read]),
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&seen).into_owned();
+                        log.lock().unwrap().push((id, head.clone()));
+                        if let Some(line) = head.lines().next().filter(|l| l.starts_with("GET ")) {
+                            assert!(line.contains("/peer/probe"), "{line}");
+                            let challenge = head
+                                .lines()
+                                .find_map(|line| line.strip_prefix("x-cells-probe-challenge: "))
+                                .expect("the probe carries a challenge");
+                            let body = serde_json::to_vec(
+                                &signer.respond("node-b", &advertised, challenge).unwrap(),
+                            )
+                            .unwrap();
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n{}: {}\r\n\r\n",
+                                body.len(),
+                                crate::peer_auth::RESPONSE_VERSION_HEADER,
+                                crate::peer_auth::PROTOCOL_VERSION_TEXT,
+                            );
+                            stream.write_all(head.as_bytes()).await.unwrap();
+                            stream.write_all(&body).await.unwrap();
+                            seen.clear();
+                        } else {
+                            let _ = stream
+                                .write_all(
+                                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                                )
+                                .await;
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let mut wire = lease("node-b", &addr);
+        wire.probe_public_key = signer.public_key_hex();
+        let token = OperatorToken::parse(std::ffi::OsStr::new("tok-8")).unwrap();
+        let path = "/runtime/scope".to_string();
+        let reachable = Reachable {
+            http: reqwest::Client::builder()
+                .pool_max_idle_per_host(1)
+                .build()
+                .unwrap(),
+            auth: crate::peer_auth::PeerAuth::new([7; 32], "d1-cli")
+                .unwrap()
+                .with_operator_token(Some(token)),
+            entrances: vec![Entrance {
+                node: "node-b".to_string(),
+                url: format!("http://{addr}{path}"),
+                path,
+                lease: wire,
+            }],
+            subject: Subject {
+                noun: "database",
+                source: "d1-cli",
+                timeout: Duration::from_secs(5),
+            },
+            unreachable: None,
+            proof: None,
+        }
+        .proving_the_node(crate::peer_auth::PeerAuth::new([7; 32], "d1-cli").unwrap());
+        let _ = reachable.call(serde_json::json!({})).await;
+        let served = served.lock().unwrap().clone();
+        let post = served
+            .iter()
+            .find(|(_, head)| head.starts_with("POST "))
+            .expect("the proven node got the request");
+        assert!(post
+            .1
+            .to_ascii_lowercase()
+            .contains("authorization: bearer tok-8"));
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the token request opened a second connection: {served:?}"
+        );
     }
 
     #[tokio::test]

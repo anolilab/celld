@@ -96,14 +96,21 @@ setting that turns it off. A node takes the token from `CELLD_OPERATOR_TOKEN`:
   address in the lease. It sends the token only when the answer is signed with
   the probe key the lease names, which only that node process holds. Another
   user who has bound the port since the node stopped gets the probe and no
-  token, and the command says to start `celld dev`.
+  token, and the command says to start `celld dev`. The token request goes
+  out on the same client and takes the connection the probe was answered on.
+  The proof covers that connection, not the port: if the connection closes
+  between the probe and the request, the client opens a new one, and a
+  process that took the port in that moment would receive the token. The
+  window is the gap between two requests of one command.
 
 The check runs before routing, so each route answers 401 without the token:
 the operator routes, the peer routes, the `/runtime/<SCOPE>` route, and a
 path celld does not serve. One route is exempt: the signed probe
 `/peer/probe` on the internal listener, because a client that holds the token
-uses it to check the node before sending the token (see below). The probe still
-demands the fleet HMAC and answers with nothing secret. Use the public health
+uses it to check the node before sending the token (see above). The probe still
+demands the fleet HMAC and answers with nothing secret. It takes a GET
+without a body and refuses anything else before it reads a byte, so an unsigned
+caller cannot hold a task open with a slow body. Use the public health
 endpoint, `/.well-known/celld/health`, for probes. The public listener does not check
 the token. Peer routes still verify the fleet HMAC after the token.
 

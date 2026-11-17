@@ -2686,10 +2686,22 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
 
 async fn internal_probe(request: Request<Incoming>, app: AppHandle) -> HttpReply {
     let (parts, body) = request.into_parts();
-    let body = match collect_limited_body(body, MAX_PEER_CONTROL_BODY_BYTES).await {
-        Ok(body) => body,
-        Err(error) => return peer_response(body_read_error("probe", error)),
-    };
+    // The probe skips the operator-token gate, so an unsigned caller reaches
+    // this handler. It takes a GET with no body and reads nothing: a caller
+    // that streams a body slowly must not hold a task open before the
+    // signature is checked.
+    if parts.method != hyper::Method::GET {
+        return peer_response(response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+        ));
+    }
+    if !hyper::body::Body::is_end_stream(&body) {
+        return peer_response(response(
+            StatusCode::BAD_REQUEST,
+            "the probe takes no request body",
+        ));
+    }
     let path_and_query = parts
         .uri
         .path_and_query()
@@ -2698,16 +2710,10 @@ async fn internal_probe(request: Request<Incoming>, app: AppHandle) -> HttpReply
         &parts.method,
         &path_and_query,
         &parts.headers,
-        &body,
+        &[],
         app.peer_auth.source(),
     ) {
         return peer_response(response(error.status(), error.message()));
-    }
-    if parts.method != hyper::Method::GET {
-        return peer_response(response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "method not allowed",
-        ));
     }
     let Some(challenge) = parts
         .headers

@@ -153,7 +153,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         .await
         .map_err(|error| not_running(&format!("{error:#}")))?
         .when_unreachable(not_running(&"the node does not answer").to_string())
-        .proving_the_node(proof)?
+        .proving_the_node(proof)
     } else {
         let storage = command.fleet.clone().resolve("celld d1")?;
         Reachable::open(
