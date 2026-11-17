@@ -6,10 +6,10 @@
 //! `lazy_birth_model`. Every rule that a past failure removed or weakened is a
 //! knob of [`Design`], and a variant of the design is a setting of those knobs:
 //!
-//! - [`Design::rev3`] is the design as it now stands;
-//! - [`Design::rev2`] and [`Design::rev1`] are the earlier designs, with the
-//!   rules they lacked, taken from the review findings they failed;
-//! - [`Design::mutant`] flips one knob of revision 3 and nothing else.
+//! - [`Design::rev4`] is the design as it now stands;
+//! - [`Design::rev3`], [`Design::rev2`] and [`Design::rev1`] are the earlier
+//!   designs, with the rules they lacked, taken from the findings they failed;
+//! - [`Design::mutant`] flips one knob of revision 4 and nothing else.
 //!
 //! Rule labels (B3, K5, ...) are the design's own names for its rules.
 
@@ -135,7 +135,7 @@ pub(crate) enum Release {
 }
 
 /// The rules of the design. `true` keeps the rule; every field of
-/// [`Design::rev3`] is `true` except the bounds.
+/// [`Design::rev4`] is `true` except the bounds.
 #[derive(Clone, Debug)]
 pub(crate) struct Design {
     // Sealing (K2).
@@ -182,12 +182,40 @@ pub(crate) struct Design {
     pub carried_set: bool,
     pub retag_at_bound: bool,
     pub waived_by_session_row: bool,
+    // Rules added by revision 4.
+    /// K7: a bundle counts for the wait of a first per-cell object only after
+    /// the session read its header as open, after the bundle was written.
+    pub bundle_counts_after_open_header: bool,
+    /// A first record of an id that was never granted is a K5 claim of a new
+    /// cell: a first-form record and the taken mark. A cell with a taken entry
+    /// and no record is refused, in every mode.
+    pub ungranted_claim_marks: bool,
+    /// The plain record of the minting session at epoch 1 is refused once the
+    /// cell has a taken entry.
+    pub session_record_refused_when_taken: bool,
+    /// Mode `shadow`: a granted id without a record is a lost record.
+    pub shadow_granted_absent_refuses: bool,
+    /// A waived id that the session placed on a peer is claimed by K5 on the
+    /// open chunk.
+    pub placed_claim_marks: bool,
+    /// The session writes its open chunk only over a body it read, and keeps
+    /// what another writer put there.
+    pub session_merges_chunk: bool,
+    /// The session writes one first record for an id, or places it; never both
+    /// and never twice.
+    pub session_claims_once: bool,
+    /// The session acts on its own standard-path record only with evidence
+    /// that its header was open after the write applied.
+    pub session_acts_after_open_header: bool,
+    /// K3, step 4 for every record: the chunk holds a confirmed left entry
+    /// before the session releases a cell, also one with a plain record.
+    pub trace_before_release: bool,
     /// The bound of the carried set.
     pub carried_bound: usize,
 }
 
 impl Design {
-    pub(crate) fn rev3() -> Self {
+    pub(crate) fn rev4() -> Self {
         Self {
             sealer_writes_no_record: true,
             first_seal_fixes_chunk: true,
@@ -224,7 +252,35 @@ impl Design {
             carried_set: true,
             retag_at_bound: true,
             waived_by_session_row: true,
+            bundle_counts_after_open_header: true,
+            ungranted_claim_marks: true,
+            session_record_refused_when_taken: true,
+            shadow_granted_absent_refuses: true,
+            placed_claim_marks: true,
+            session_merges_chunk: true,
+            session_claims_once: true,
+            session_acts_after_open_header: true,
+            trace_before_release: true,
             carried_bound: 2,
+        }
+    }
+
+    /// Revision 3: revision 4 without the rules that the explorer's two
+    /// findings added. A fenced session's late bundle lets a per-cell object
+    /// through, and the standard path of a tagged id leaves no trace in the
+    /// chunk.
+    pub(crate) fn rev3() -> Self {
+        Self {
+            bundle_counts_after_open_header: false,
+            ungranted_claim_marks: false,
+            session_record_refused_when_taken: false,
+            shadow_granted_absent_refuses: false,
+            placed_claim_marks: false,
+            session_merges_chunk: true,
+            session_claims_once: false,
+            session_acts_after_open_header: false,
+            trace_before_release: false,
+            ..Self::rev4()
         }
     }
 
@@ -269,10 +325,10 @@ impl Design {
         }
     }
 
-    /// Revision 3 with one rule removed: mutant `n` of M1..M31, or a second
+    /// Revision 4 with one rule removed: mutant `n` of M1..M40, or a second
     /// form of it as `(n, form)`.
     pub(crate) fn mutant(n: u8, form: u8) -> Self {
-        let mut d = Self::rev3();
+        let mut d = Self::rev4();
         match (n, form) {
             (1, _) => d.taker_waits_for_seal = false,
             (2, _) => d.tagged_first_record_epoch2 = false,
@@ -319,6 +375,15 @@ impl Design {
             (30, _) => d.retag_at_bound = false,
             (31, 0) => d.header_close_rereads_node = false,
             (31, _) => d.header_close_token_before_node = false,
+            (32, _) => d.bundle_counts_after_open_header = false,
+            (33, _) => d.ungranted_claim_marks = false,
+            (34, _) => d.session_record_refused_when_taken = false,
+            (35, _) => d.shadow_granted_absent_refuses = false,
+            (36, _) => d.placed_claim_marks = false,
+            (37, _) => d.session_merges_chunk = false,
+            (38, _) => d.session_claims_once = false,
+            (39, _) => d.session_acts_after_open_header = false,
+            (40, _) => d.trace_before_release = false,
             _ => panic!("no mutant M{n}"),
         }
         d
@@ -334,6 +399,10 @@ pub(crate) enum Take {
     Standard { epoch: Epoch },
     /// K5 from nothing: a create-only first-form record, then the mark.
     FirstFromNothing { epoch: Epoch },
+    /// K5 for an id that was never granted: the guard of the standard path,
+    /// then a create-only first-form record and the mark. A new cell: it
+    /// restores nothing.
+    FirstNew { epoch: Epoch },
     /// K5 over a record: a compare-and-swap at this epoch, then the mark.
     FirstOverRecord { epoch: Epoch },
     /// A normal compare-and-swap of a dead author's or released record.
@@ -359,6 +428,11 @@ pub(crate) struct View<'a> {
     pub flag: Mode,
     /// A live lease carries `rec.by`.
     pub author_live: bool,
+    /// The tag of the id, which is the tag of its minting session.
+    pub minter: Tag,
+    /// The session placed this waived id on the deciding node, and its lease
+    /// is live: the chunk is open.
+    pub placed: bool,
 }
 
 /// The mode a reader follows.
@@ -402,15 +476,31 @@ pub(crate) fn decide(d: &Design, v: &View) -> Take {
 
 fn decide_absent(d: &Design, v: &View, _hdr: &Hdr, chunk: &Chunk, mode: Mode) -> Take {
     let c = v.cell;
-    if !chunk.granted[c] {
-        return Take::Standard {
+    // The claim of an id that was never granted leaves the mark, after the
+    // seal and, for a placed id, before it.
+    let marks = if v.placed {
+        d.placed_claim_marks
+    } else {
+        d.ungranted_claim_marks
+    };
+    let ungranted = if marks {
+        Take::FirstNew {
             epoch: standard_epoch(d),
-        };
+        }
+    } else {
+        Take::Standard {
+            epoch: standard_epoch(d),
+        }
+    };
+    if marks && chunk.taken[c].is_some() {
+        return Take::Refuse("a later record was written and is lost");
+    }
+    if !chunk.granted[c] {
+        return ungranted;
     }
     match mode {
-        Mode::Shadow => Take::Standard {
-            epoch: standard_epoch(d),
-        },
+        Mode::Shadow if d.shadow_granted_absent_refuses => Take::Refuse("record lost"),
+        Mode::Shadow => ungranted,
         Mode::Read if d.read_mode_granted_absent_refuses => Take::Refuse("record lost"),
         Mode::Read => Take::FirstFromNothing { epoch: 2 },
         Mode::On => {
@@ -433,12 +523,31 @@ fn decide_record(d: &Design, v: &View, rec: &Rec, chunk: &Chunk, mode: Mode) -> 
     let taken = chunk.taken[c];
     match rec.form {
         Form::Plain => {
-            if v.author_live && !rec.released {
-                Take::Forward
-            } else {
-                Take::Plain {
+            if v.author_live {
+                // A released record of a live author is claimed as today. The
+                // chunk is not read: the author left its trace there before
+                // the release.
+                return if rec.released {
+                    Take::Plain {
+                        epoch: rec.epoch + 1,
+                    }
+                } else {
+                    Take::Forward
+                };
+            }
+            // The one plain record that a create-only write of the minting
+            // session makes: the standard path at epoch 1. It can land late.
+            let session_first = rec.by == v.minter && rec.epoch == 1;
+            if session_first && d.session_record_refused_when_taken && taken.is_some() {
+                return Take::Refuse("a record of the session over a taken cell");
+            }
+            if session_first && d.ungranted_claim_marks && !chunk.granted[c] {
+                return Take::FirstOverRecord {
                     epoch: rec.epoch + 1,
-                }
+                };
+            }
+            Take::Plain {
+                epoch: rec.epoch + 1,
             }
         }
         Form::First => {
