@@ -73,6 +73,14 @@ export class Supervisor extends DurableObject {
       ]);
       return new Response("cloned");
     }
+    // A delete of the source that follows a clone without waiting for it
+    // runs after the copy, so the copy holds the source's data.
+    if (path === "/clone-then-delete-source") {
+      const cloned = this.ctx.facets.clone("app", "copy");
+      this.ctx.facets.delete("app");
+      await cloned;
+      return new Response("cloned");
+    }
     if (path === "/clone-self") {
       try {
         await this.ctx.facets.clone("app", "app");

@@ -2334,13 +2334,20 @@ class DurableObjectFacets {
   }
   // Replaces `target` with a copy of `source`'s storage. The source keeps
   // running; a transaction it has not committed is not copied. The target
-  // stops first and starts from the copy at its next `get`.
+  // stops first and starts from the copy at its next `get`. Until the copy
+  // settles, a later `delete(source)` or `clone(x, source)` waits for it, so
+  // it cannot empty the source under the copy.
   async clone(source, target) {
     source = this._validName(source);
     target = this._validName(target);
     if (source === target)
       throw new TypeError("Cannot clone a facet onto itself.");
     const sourceBarrier = this._barriers.get(source);
+    // `copying` never rejects, so the source's barrier fails only when an
+    // earlier operation on the source had failed.
+    let copied;
+    const copying = new Promise((resolve) => { copied = resolve; });
+    this._hold(source, Promise.all([sourceBarrier, copying]), true);
     // A failure that left the target's storage as it was does not keep the
     // target's barrier, so the name is usable again, unless an earlier
     // operation on it had failed.
@@ -2367,6 +2374,8 @@ class DurableObjectFacets {
         }, true);
     } catch (error) {
       throw untouched === undefined ? error : untouched;
+    } finally {
+      copied();
     }
     if (untouched !== undefined) throw untouched;
   }

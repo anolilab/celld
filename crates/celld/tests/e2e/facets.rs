@@ -117,6 +117,21 @@ async fn clones_and_deletes_of_one_target_run_in_order() {
     );
 }
 
+/// A delete of the source that is issued while a clone of it is pending waits
+/// for the clone, so the copy is not taken from an emptied source.
+#[tokio::test]
+async fn a_delete_of_the_source_waits_for_a_pending_clone() {
+    let server = Server::start("facets", &[]).await;
+    count(&server.get_text("/").await);
+    let before = count(&server.get_text("/").await);
+
+    assert_eq!(server.get_text("/clone-then-delete-source").await, "cloned");
+
+    assert_eq!(count(&server.get_text("/copy").await), before + 1);
+    // The source was deleted after the copy: it starts empty.
+    assert_eq!(count(&server.get_text("/").await), 0);
+}
+
 /// A stub taken before a clone is the old target: it throws afterwards.
 #[tokio::test]
 async fn a_stub_from_before_a_clone_throws() {

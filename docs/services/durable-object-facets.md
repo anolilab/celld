@@ -95,10 +95,14 @@ loopback class without properties supplies an empty object.
   and the name stays blocked until the root object restarts, as after
   a failed `delete()`. Calling `clone()` or `delete()` on the target again
   replaces the unknown state.
-- Writes to the source during a clone wait for the copy, which holds a read
-  transaction on the source while it reads at most 16 MiB; they do not fail.
-  A `delete()` or `clone()` of any facet of the root waits for a clone in
-  flight.
+- Writes to the source during a clone succeed. The copy reads one consistent
+  snapshot of the source, and a source writer may wait up to the busy
+  timeout, never for the whole copy. A source that grows past 16 MiB after
+  the size check fails the clone, as any clone that fails part way. A
+  `delete()` or `clone()` of any facet of the root waits for a clone in
+  flight, and a `delete(source)` or `clone(x, source)` issued while a clone
+  of `source` is pending waits for it, so it cannot empty the source under
+  the copy.
 
 No name reaches a facet from outside its root object, so external traffic
 must go through the supervisor. Use a separate Durable Object, addressed with
