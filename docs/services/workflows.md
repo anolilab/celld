@@ -76,8 +76,9 @@ the budget, so a run of many thousands of steps can outgrow it.
 
 A turn that the runtime ended before it could hand over leaves a drive behind.
 The next alarm fences that drive, so its late callbacks cannot overwrite the
-step records of the drive that replaced it. Its ledger writes fail, so the
-step calls it still awaits reject and end.
+step records of the drive that replaced it. Its ledger writes fail, and the
+step calls it still awaits stay unsettled: `run()`'s `catch` blocks do not run
+for them, and the abandoned drive is collected instead of continuing.
 
 ## Sleeps, events, and retries
 
