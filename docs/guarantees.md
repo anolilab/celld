@@ -77,8 +77,9 @@ An operator must not delete, expire, or overwrite an object under these
 prefixes, except under `probe/` and `telemetry/`. celld reads these objects to
 fence and restore cells, and celld deletes the objects that it no longer needs.
 A bucket lifecycle rule therefore must not select an object under another
-reserved prefix. With a key prefix, each reserved prefix follows the key prefix,
-for example `PREFIX/telemetry/`.
+reserved prefix. In particular, it must exclude `cells/*/own.json`. With a key
+prefix, each reserved prefix follows the key prefix, for example
+`PREFIX/telemetry/`.
 
 ## The supervisor
 
@@ -114,6 +115,15 @@ write takes a bucket proof. celld detects the loss only from LTX under
 `cells/<cell>/ltx/`. A new cell can keep its first writes in a node bundle under
 `log/` until the tiering path drains them, so a loss before that drain starts
 the cell empty.
+
+While a cell has no LTX yet, a lost record also lets another node claim the
+cell as new at epoch 1 while the first owner still serves it, whether that
+node reads the record after the loss or read it as absent before the first
+claim and its claim lands after the loss. Both nodes then
+write epoch 1 to the same LTX keys, so a write that either node acknowledged
+after the loss can be overwritten. The protection is to never delete
+`own.json`: a lifecycle rule must exclude `cells/*/own.json`. #180 tracks the
+gap.
 
 To restore the cell, first stop each node that served the cell with SIGTERM, not
 with `POST /shutdown?handoff=preserve`. A preserved restart resumes its cells
