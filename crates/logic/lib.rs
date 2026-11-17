@@ -7412,13 +7412,19 @@ mod drain_tests;
 #[cfg(test)]
 mod epoch_gc_tests;
 #[cfg(test)]
-mod failed_restore_tests;
-#[cfg(test)]
 mod explorer;
+#[cfg(test)]
+mod failed_restore_tests;
 #[cfg(test)]
 mod fence_confirming_tests;
 #[cfg(test)]
 mod imminent_alarm_tests;
+#[cfg(test)]
+mod lazy_birth;
+#[cfg(test)]
+mod lazy_birth_model;
+#[cfg(test)]
+mod lazy_birth_tests;
 #[cfg(test)]
 mod ownership_model;
 #[cfg(test)]
