@@ -414,6 +414,12 @@ pub fn ws_pull_registered(id: u64) -> bool {
     ws_pull().lock().unwrap().contains_key(&id)
 }
 
+/// Whether socket `id` has an output channel registered.
+#[doc(hidden)]
+pub fn ws_output_registered(id: u64) -> bool {
+    ws_registry().lock().unwrap().outputs.contains_key(&id)
+}
+
 pub fn ws_pull_unregister(id: u64) {
     ws_pull().lock().unwrap().remove(&id);
     ws_registry().lock().unwrap().pull_retention.remove(&id);
@@ -468,6 +474,11 @@ pub struct WorkerWebSocket {
 }
 
 impl WorkerWebSocket {
+    #[doc(hidden)]
+    pub fn new(id: u64, inbound: WsPullSender) -> Self {
+        Self { id, inbound }
+    }
+
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -871,6 +882,20 @@ pub fn ws_next_id() -> u64 {
 }
 pub fn ws_register(id: u64, tx: tokio::sync::mpsc::UnboundedSender<WsOut>) {
     ws_registry().lock().unwrap().register(id, tx);
+}
+
+/// Register the output channel of socket `id` only while its entry is still
+/// open. A request that retired already removed the entry, and nothing reads a
+/// channel registered after that, so `tx` is dropped instead and the receiver
+/// sees its end at once.
+pub fn ws_register_if_open(id: u64, tx: tokio::sync::mpsc::UnboundedSender<WsOut>) -> bool {
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    let open = registry.metadata.contains_key(&id);
+    if open {
+        registry.register(id, tx);
+    }
+    open
 }
 
 /// Register an outbound socket of `scope`. A socket that a facet opened
@@ -1611,6 +1636,19 @@ mod parked_worker_tests {
         ws_pull_register(id, receiver);
         ws_register_outbound(id, "", None);
         inbound
+    }
+
+    #[test]
+    fn an_output_channel_registers_only_while_its_socket_is_open() {
+        let (open_tx, _open_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (gone_tx, mut gone_rx) = tokio::sync::mpsc::unbounded_channel();
+        ws_register_outbound(9_100_020, "", None);
+        assert!(ws_register_if_open(9_100_020, open_tx));
+        assert!(ws_output_registered(9_100_020));
+        ws_unregister(9_100_020);
+        assert!(!ws_register_if_open(9_100_020, gone_tx));
+        assert!(!ws_output_registered(9_100_020));
+        assert!(gone_rx.try_recv().is_err(), "the sender was dropped");
     }
 
     #[test]
