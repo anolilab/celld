@@ -97,14 +97,14 @@ fn a_scenario_records_its_own_value_over_the_inherited_one() {
     assert_eq!(agents["CELLD_CELL_DIRECTORY_SHADOW"], "1");
 }
 
-fn state(new_no_ltx: u64) -> Option<Value> {
-    Some(json!({
+fn state(new_no_ltx: u64) -> Value {
+    json!({
         "cell_directory_answers": {
             "new": { "no_ltx": new_no_ltx, "ltx": 0 },
             "exists": { "no_ltx": 0, "ltx": 2 },
             "unknown": { "no_ltx": 1, "ltx": 0 },
         }
-    }))
+    })
 }
 
 #[test]
@@ -114,28 +114,12 @@ fn answers_from_every_node_are_summed_and_marked_complete() {
     assert_eq!(total["exists"]["ltx"], 4);
     assert_eq!(total["unknown"]["no_ltx"], 2);
     assert_eq!(total["nodes_counted"], 2);
-    assert_eq!(total["nodes_unreadable"], 0);
-}
-
-#[test]
-fn a_node_that_cannot_be_read_is_counted_as_missing_not_as_zero() {
-    let total = sum_answers(&[state(3), None]);
-    assert_eq!(total["new"]["no_ltx"], 3);
-    assert_eq!(total["nodes_counted"], 1);
-    assert_eq!(total["nodes_unreadable"], 1);
 }
 
 #[test]
 fn a_fleet_without_a_directory_has_no_answers() {
-    let without = Some(json!({ "cell_directory_answers": null }));
+    let without = json!({ "cell_directory_answers": null });
     assert_eq!(sum_answers(&[without.clone(), without]), Value::Null);
-}
-
-#[test]
-fn a_fleet_of_unreadable_nodes_is_reported_rather_than_hidden() {
-    let total = sum_answers(&[None, None]);
-    assert_eq!(total["nodes_counted"], 0);
-    assert_eq!(total["nodes_unreadable"], 2);
 }
 
 #[test]
@@ -233,8 +217,6 @@ async fn a_refused_state_read_is_unreadable_not_a_node_without_a_directory() {
         read_state(&reqwest::Client::new(), "bench", &url).await,
         None
     );
-    let total = sum_answers(&[None, None]);
-    assert_eq!(total["nodes_unreadable"], 2);
 }
 
 /// A node that answers 200 to a request that carries `Authorization: Bearer
@@ -278,9 +260,9 @@ async fn a_node_that_does_not_answer_is_unreadable() {
     );
 }
 
-fn counters(minted: u64, claims: u64, first: u64, evictions: [u64; 5]) -> Option<Value> {
+fn counters(minted: u64, claims: u64, first: u64, evictions: [u64; 5]) -> Value {
     let [snapshot, paged, over_budget, publish_failed, empty] = evictions;
-    Some(json!({
+    json!({
         "storage_counters": {
             "ids_minted": minted,
             "claims": claims,
@@ -293,7 +275,7 @@ fn counters(minted: u64, claims: u64, first: u64, evictions: [u64; 5]) -> Option
                 "empty": empty,
             },
         }
-    }))
+    })
 }
 
 #[test]
@@ -340,9 +322,9 @@ fn a_share_with_nothing_to_divide_by_is_null_not_zero() {
 
 #[test]
 fn a_node_without_counters_is_unreadable_not_zero() {
-    let total = sum_storage(&[counters(0, 4, 4, [0; 5]), None, Some(json!({}))], 4);
+    let total = sum_storage(&[counters(0, 4, 4, [0; 5]), json!({})], 4);
     assert_eq!(total["nodes_counted"], 1);
-    assert_eq!(total["nodes_unreadable"], 2);
+    assert_eq!(total["nodes_unreadable"], 1);
 }
 
 #[test]

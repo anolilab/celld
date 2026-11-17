@@ -162,17 +162,15 @@ pub fn effective_env(scenario: &Scenario, inherited: impl Fn(&str) -> Option<Str
         .into()
 }
 
-/// The totals of the `cell_directory_answers` of `states`, one per node, where
-/// `None` is a node whose state could not be read.
-pub fn sum_answers(states: &[Option<Value>]) -> Value {
-    let unreadable = states.iter().filter(|state| state.is_none()).count();
+/// The totals of the `cell_directory_answers` of `states`, one per node. It is
+/// `Null` when no node runs a directory.
+pub fn sum_answers(states: &[Value]) -> Value {
     let counted: Vec<&Value> = states
         .iter()
-        .flatten()
         .map(|state| &state["cell_directory_answers"])
         .filter(|counts| !counts.is_null())
         .collect();
-    if counted.is_empty() && unreadable == 0 {
+    if counted.is_empty() {
         return Value::Null;
     }
     let total = |answer: &str, listing: &str| -> u64 {
@@ -185,7 +183,6 @@ pub fn sum_answers(states: &[Option<Value>]) -> Value {
         |answer: &str| json!({ "no_ltx": total(answer, "no_ltx"), "ltx": total(answer, "ltx") });
     json!({
         "nodes_counted": counted.len(),
-        "nodes_unreadable": unreadable,
         "new": pair("new"),
         "exists": pair("exists"),
         "unknown": pair("unknown"),
@@ -193,18 +190,17 @@ pub fn sum_answers(states: &[Option<Value>]) -> Value {
 }
 
 /// The sum of the `storage_counters` of `states`, one per node, with the shares
-/// they give. `None` is a node whose state could not be read, and a node that
-/// reports no counters counts as unreadable too, so a total never passes as
-/// complete when a node is missing from it.
+/// they give. A node that reports no counters counts as unreadable, so a total
+/// never passes as complete when a node is missing from it.
 ///
 /// `agents` is the number of agents the run started, the divisor of the
 /// evicted share. That share is the share of agents ever evicted only while no
 /// cell is evicted twice, which `evictions_exceed_agents` says it is not.
-pub fn sum_storage(states: &[Option<Value>], agents: usize) -> Value {
+pub fn sum_storage(states: &[Value], agents: usize) -> Value {
     let counters: Vec<&Value> = states
         .iter()
-        .map(|state| state.as_ref().map(|state| &state["storage_counters"]))
-        .filter_map(|counters| counters.filter(|counters| !counters.is_null()))
+        .map(|state| &state["storage_counters"])
+        .filter(|counters| !counters.is_null())
         .collect();
     let total = |path: &[&str]| -> u64 {
         counters

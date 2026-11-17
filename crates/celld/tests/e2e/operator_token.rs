@@ -11,7 +11,7 @@ const TOKEN: &str = "e2e-operator-token";
 
 /// Every route the internal listener serves, read from the source of its
 /// handlers, so a route added later is covered without editing this test.
-fn internal_routes() -> BTreeSet<String> {
+pub(super) fn internal_routes() -> BTreeSet<String> {
     let source = include_str!("../../main.rs");
     let handler = {
         let start = source

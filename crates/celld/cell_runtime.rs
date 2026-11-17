@@ -9,7 +9,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::anyhow;
 use anyhow::Context;
 
 use crate::asyncrt;
@@ -162,34 +161,6 @@ impl CellRuntime {
             .expect("generation lock poisoned")
             .draining
             .clone()
-    }
-
-    /// Resolve a client-supplied cell id to a scope.
-    ///
-    /// The id arrives from the network, and the scope it becomes is used as a
-    /// path component and as an object-store key, so the charset gate runs
-    /// first. Without it a scope carries its own path segments and `db_path`
-    /// walks out of the data directory through them.
-    ///
-    /// The fleet-wide storage gate runs a second time on the composed scope. A
-    /// bare id takes a class prefix, so the scope that reaches storage is the
-    /// value that must fit.
-    pub fn cell_scope(&self, id: &str) -> anyhow::Result<String> {
-        if !celld_logic::cell::valid_cell_scope(id) {
-            return Err(anyhow!("cell id is not a well-formed scope"));
-        }
-        if id.contains(':') {
-            return Ok(id.to_string());
-        }
-        let generation = self.generation();
-        let class = generation.default_do_class().ok_or_else(|| {
-            anyhow!("a bare cell id requires exactly one configured Durable Object class")
-        })?;
-        let scope = format!("{class}:{id}");
-        if !celld_logic::cell::valid_cell_scope(&scope) {
-            return Err(anyhow!("cell id is not a well-formed scope"));
-        }
-        Ok(scope)
     }
 
     pub fn replication(&self) -> Option<Replication> {

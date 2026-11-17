@@ -43,6 +43,10 @@ pub const FILE_NAME: &str = "operator-token";
 
 const SCHEME: &str = "Bearer";
 
+/// The most a token file may hold. A token is a short line; a larger file is
+/// not one, and is refused before it is read into memory.
+const MAX_FILE_BYTES: u64 = 4096;
+
 /// Where the generated token lives, and where a client looks for it.
 fn token_file() -> anyhow::Result<PathBuf> {
     match std::env::var_os(FILE_ENV) {
@@ -149,9 +153,11 @@ impl OperatorToken {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            options.custom_flags(libc::O_NOFOLLOW);
+            // `O_NONBLOCK` keeps the open of a named pipe with no writer from
+            // blocking; the type is checked before anything is read.
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
-        let mut file = match options.open(path) {
+        let file = match options.open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             #[cfg(unix)]
@@ -181,9 +187,21 @@ impl OperatorToken {
             "{} is not a regular file",
             path.display()
         );
+        anyhow::ensure!(
+            metadata.len() <= MAX_FILE_BYTES,
+            "{} is too large to be a token file",
+            path.display()
+        );
+        // Bounded again on the read, for a file that grows after the check.
         let mut text = String::new();
-        file.read_to_string(&mut text)
+        file.take(MAX_FILE_BYTES + 1)
+            .read_to_string(&mut text)
             .with_context(|| format!("read {}", path.display()))?;
+        anyhow::ensure!(
+            text.len() as u64 <= MAX_FILE_BYTES,
+            "{} is too large to be a token file",
+            path.display()
+        );
         Self::parse(OsStr::new(text.trim_end_matches(['\r', '\n'])))
             .with_context(|| format!("{} does not hold a usable token", path.display()))
             .map(Some)
@@ -203,8 +221,12 @@ impl OperatorToken {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty());
         if let Some(parent) = parent {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
+            create_private_dir(parent)?;
+        }
+        #[cfg(unix)]
+        {
+            // SAFETY: `geteuid` takes no arguments and cannot fail.
+            check_directory(parent.unwrap_or(Path::new(".")), unsafe { libc::geteuid() })?;
         }
         let mut rng = crate::asyncrt::rng("operator_token");
         let mut random = [0_u8; 32];
@@ -241,15 +263,16 @@ impl OperatorToken {
                 if let Some(Ok(directory)) = parent.map(std::fs::File::open) {
                     let _ = directory.sync_all();
                 }
-                Self::parse(OsStr::new(&value))
             }
             // Another node won the race; its token is the one in the file.
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                Self::from_file(path)?
-                    .ok_or_else(|| anyhow!("{} vanished while it was created", path.display()))
-            }
-            Err(error) => Err(error).with_context(|| format!("create {}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error).with_context(|| format!("create {}", path.display())),
         }
+        // Whatever the path names now is what clients read, so the node
+        // enforces that: the file just linked, the winner's, or one that
+        // replaced it, as long as it is the owner's own private file.
+        Self::from_file(path)?
+            .ok_or_else(|| anyhow!("{} vanished while it was created", path.display()))
     }
 
     /// Validate a token. It must be non-empty printable ASCII with no
@@ -302,6 +325,50 @@ impl OperatorToken {
         let presented: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
         presented.ct_eq(&self.digest).into()
     }
+}
+
+/// Create the directory a token file goes in, private to its owner, along
+/// with any missing parents.
+fn create_private_dir(path: &Path) -> anyhow::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder
+        .create(path)
+        .with_context(|| format!("create {}", path.display()))
+}
+
+/// Refuse to create a token in a directory another user could replace the
+/// file in: one that is not the node owner's own, or that group or other
+/// users can write to.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // A per-user credential directory, not node storage.
+fn check_directory(path: &Path, euid: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let metadata = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    anyhow::ensure!(metadata.is_dir(), "{} is not a directory", path.display());
+    if metadata.uid() != euid {
+        bail!(
+            "{} is owned by user {}, not by the user running this command ({euid}); \
+             keep the token file in a directory of your own",
+            path.display(),
+            metadata.uid()
+        );
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o022 != 0 {
+        bail!(
+            "{} can be written by other users (mode {:o}); run `chmod go-w` on it or keep the \
+             token file in another directory",
+            path.display(),
+            mode & 0o777
+        );
+    }
+    Ok(())
 }
 
 /// Refuse a token file that is not the node owner's own private file.
@@ -487,6 +554,49 @@ mod tests {
         check_private(&path, &metadata, metadata.uid()).unwrap();
         let error = check_private(&path, &metadata, metadata.uid() + 1).unwrap_err();
         assert!(format!("{error:#}").contains("owned by user"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let error = OperatorToken::from_file(&path).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a regular file"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_oversized_file_is_refused_without_its_content() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(&path, "x".repeat(MAX_FILE_BYTES as usize + 1)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = OperatorToken::from_file(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("too large"), "{error:#}");
+        assert!(!format!("{error:#}").contains("xxxx"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_others_can_write_is_refused_for_a_new_token() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+        let error = OperatorToken::load_or_create(&path).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("can be written by other users"),
+            "{error:#}"
+        );
+        assert!(!path.exists());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        OperatorToken::load_or_create(&path).unwrap();
     }
 
     #[test]

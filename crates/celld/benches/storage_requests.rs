@@ -309,21 +309,18 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
     }
 }
 
-/// Every node's `/state`, `None` for one that cannot be read. What a node
-/// counted of the cell directory's answers is `Null` when every node answered
-/// and none runs a directory; otherwise the totals say how many nodes they
-/// cover, so a node that could not be read never passes as a complete count.
-async fn read_states(client: &reqwest::Client, nodes: &[Node]) -> Vec<Option<Value>> {
+/// Every node's `/state`. A node whose state cannot be read stops the bench:
+/// it must not pass as a quiet one, with every counter reading zero.
+async fn read_states(client: &reqwest::Client, nodes: &[Node]) -> Vec<Value> {
     let mut states = Vec::new();
     for node in nodes {
-        states.push(read_state(client, OPERATOR_TOKEN, &format!("{}/state", node.internal)).await);
+        let state = read_state(client, OPERATOR_TOKEN, &format!("{}/state", node.internal)).await;
+        states.push(state.unwrap_or_else(|| {
+            panic!(
+                "a node's /state is unreadable (is the operator token {OPERATOR_TOKEN:?} accepted?)"
+            )
+        }));
     }
-    // A node whose state cannot be read must not pass as a quiet one: the
-    // counters would all read zero.
-    assert!(
-        states.iter().all(Option::is_some),
-        "a node's /state is unreadable (is the operator token {OPERATOR_TOKEN:?} accepted?)"
-    );
     states
 }
 
