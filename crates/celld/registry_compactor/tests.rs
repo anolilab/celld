@@ -39,12 +39,18 @@ fn cell(index: u32) -> String {
     format!("Agent:test-{index:06}")
 }
 
+/// The role, with no spill or base merge due: a test that prepares jobs by
+/// hand must not race the scheduler's own takeover spill.
 async fn holder_of(registry: &Arc<Registry>) -> Holding {
-    registry
+    let mut holding = registry
         .take(None, false)
         .await
         .unwrap()
-        .expect("took the role")
+        .expect("took the role");
+    let now = crate::asyncrt::mono_ms();
+    holding.last_spill_ms = Some(now);
+    holding.last_base_ms = now;
+    holding
 }
 
 async fn take_over(registry: &Arc<Registry>) -> Holding {
@@ -494,4 +500,566 @@ async fn a_run_streams_back_in_key_order_with_every_record() {
         back.extend(chunk);
     }
     assert_eq!(back, records);
+}
+
+// ---------------------------------------------------------------------------
+// One round trip per lookup: the bucket reads start beside the root read
+// ---------------------------------------------------------------------------
+
+mod store {
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures_util::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+    };
+    use std::fmt;
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::{Notify, Semaphore};
+
+    /// An in-memory store that records every read by key, can fail the reads
+    /// of the keys that contain a pattern, and can hold them until released.
+    pub(super) struct Scripted {
+        inner: Arc<InMemory>,
+        reads: Mutex<Vec<String>>,
+        failing: Mutex<Vec<String>>,
+        held: Mutex<Vec<(String, Arc<Semaphore>)>>,
+        seen: Notify,
+        batches: Mutex<Vec<Arc<AtomicUsize>>>,
+    }
+
+    impl Scripted {
+        /// A counting view of `inner`: the reads made through it, and only
+        /// those, are recorded.
+        pub(super) fn over(inner: Arc<InMemory>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                reads: Mutex::new(Vec::new()),
+                failing: Mutex::new(Vec::new()),
+                held: Mutex::new(Vec::new()),
+                seen: Notify::new(),
+                batches: Mutex::new(Vec::new()),
+            })
+        }
+
+        pub(super) fn reset(&self) {
+            self.reads.lock().unwrap().clear();
+            self.batches.lock().unwrap().clear();
+        }
+
+        /// Reads whose key contains `pattern`, since the last reset.
+        pub(super) fn reads(&self, pattern: &str) -> usize {
+            self.reads
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|key| key.contains(pattern))
+                .count()
+        }
+
+        /// The keys read since the last reset whose key contains `pattern`.
+        pub(super) fn keys(&self, pattern: &str) -> Vec<String> {
+            self.reads
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|key| key.contains(pattern))
+                .cloned()
+                .collect()
+        }
+
+        pub(super) fn fail(&self, pattern: &str, on: bool) {
+            let mut failing = self.failing.lock().unwrap();
+            failing.retain(|held| held != pattern);
+            if on {
+                failing.push(pattern.to_owned());
+            }
+        }
+
+        /// Hold every read of a key that contains `pattern` until `release`.
+        pub(super) fn hold(&self, pattern: &str) {
+            self.held
+                .lock()
+                .unwrap()
+                .push((pattern.to_owned(), Arc::new(Semaphore::new(0))));
+        }
+
+        pub(super) fn release(&self, pattern: &str) {
+            for (held, gate) in self.held.lock().unwrap().drain(..).collect::<Vec<_>>() {
+                if held == pattern {
+                    gate.add_permits(1 << 20);
+                }
+            }
+        }
+
+        /// Wait until `count` reads of `pattern` have started.
+        pub(super) async fn started(&self, pattern: &str, count: usize) {
+            let waiting = async {
+                loop {
+                    let seen = self.seen.notified();
+                    if self.reads(pattern) >= count {
+                        return;
+                    }
+                    seen.await;
+                }
+            };
+            crate::asyncrt::timeout(Duration::from_secs(5), waiting)
+                .await
+                .unwrap_or_else(|_| panic!("{count} reads of {pattern} never started"));
+        }
+
+        /// The sizes of the delete batches sent, since the last reset.
+        pub(super) fn delete_batches(&self) -> Vec<usize> {
+            self.batches
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|keys| keys.load(Ordering::SeqCst))
+                .collect()
+        }
+    }
+
+    impl fmt::Display for Scripted {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fmt::Display::fmt(&self.inner, formatter)
+        }
+    }
+
+    impl fmt::Debug for Scripted {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("Scripted")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for Scripted {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let key = location.to_string();
+            self.reads.lock().unwrap().push(key.clone());
+            self.seen.notify_waiters();
+            let gate = self
+                .held
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(pattern, _)| key.contains(pattern.as_str()))
+                .map(|(_, gate)| gate.clone());
+            if let Some(gate) = gate {
+                gate.acquire().await.expect("the gate stays open").forget();
+            }
+            let refused = self
+                .failing
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|pattern| key.contains(pattern.as_str()));
+            if refused {
+                return Err(object_store::Error::Generic {
+                    store: "scripted",
+                    source: "refused for the test".into(),
+                });
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[Range<u64>],
+        ) -> object_store::Result<Vec<Bytes>> {
+            let mut found = Vec::new();
+            for range in ranges {
+                let options = GetOptions {
+                    range: Some(object_store::GetRange::Bounded(range.clone())),
+                    ..GetOptions::default()
+                };
+                found.push(self.get_opts(location, options).await?.bytes().await?);
+            }
+            Ok(found)
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            use futures_util::StreamExt as _;
+            // One call is one request: it carries every key it is given.
+            let keys = Arc::new(AtomicUsize::new(0));
+            self.batches.lock().unwrap().push(keys.clone());
+            let counted = locations
+                .inspect(move |_| {
+                    keys.fetch_add(1, Ordering::SeqCst);
+                })
+                .boxed();
+            self.inner.delete_stream(counted)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(from, to, options).await
+        }
+    }
+}
+
+use store::Scripted;
+
+/// A bucket and a counting view of it. The writer's registry uses the plain
+/// bucket, so its own background reads (the holder loads the live deltas to
+/// prepare a spill) are not counted as the reader's.
+fn scripted() -> (Arc<Scripted>, Arc<dyn ObjectStore>) {
+    let bucket = Arc::new(InMemory::new());
+    (Scripted::over(bucket.clone()), bucket)
+}
+
+/// Another node's view of the registry: the same bucket, its own cache.
+fn reader_of(view: &Arc<Scripted>) -> Arc<Registry> {
+    let store: Arc<dyn ObjectStore> = view.clone();
+    registry_on(&store, "reader")
+}
+
+/// A name in the same partition as `like`, not yet registered anywhere.
+fn neighbour(like: &str) -> String {
+    let want = celld_logic::registry::partition_of(&objects::key_of(like), config().partitions);
+    (0..)
+        .map(|index| format!("Agent:neighbour-{index}"))
+        .find(|name| {
+            celld_logic::registry::partition_of(&objects::key_of(name), config().partitions) == want
+        })
+        .expect("a name in the partition")
+}
+
+/// A holder whose map names a level 1 run in every partition and whose
+/// reader has loaded that map, then a second spill that moves `new` into
+/// replacement runs. The reader's cache still names the first runs.
+async fn spilled_after_the_reader_looked(
+    node: &Arc<Registry>,
+    holding: &mut Holding,
+    reader: &Arc<Registry>,
+    new: &str,
+) -> Vec<String> {
+    let first: Vec<String> = (0..200).map(cell).collect();
+    register_and_fold(node, holding, &first).await;
+    let spill = spill_now(node, holding).await;
+    run_job(node, holding, spill).await;
+    assert!(matches!(answer(reader, &first[0]).await, Answer::Exists(_)));
+    register_and_fold(node, holding, &[new.to_owned()]).await;
+    let spill = spill_now(node, holding).await;
+    run_job(node, holding, spill).await;
+    first
+}
+
+#[tokio::test]
+async fn a_root_that_changed_since_the_cached_map_makes_the_lookup_read_the_new_runs() {
+    let (scripted, store) = scripted();
+    let node = registry_on(&store, "node-a");
+    let reader = reader_of(&scripted);
+    let mut holding = holder_of(&node).await;
+    let new = cell(5_000);
+    spilled_after_the_reader_looked(&node, &mut holding, &reader, &new).await;
+    scripted.reset();
+    // The cached map names the run that does not hold `new`; the fresh root
+    // names the run that does. Answering from the cached run reads New.
+    let result = reader.lookup(&objects::key_of(&new)).await;
+    assert!(
+        matches!(result.answer, Answer::Exists(_)),
+        "{:?}",
+        result.answer
+    );
+    assert_eq!(
+        scripted.reads("/run/"),
+        2,
+        "the discarded guess and the fresh run"
+    );
+    assert_eq!(
+        result.gets,
+        scripted.reads("/root") as u64
+            + scripted.reads("/map/") as u64
+            + scripted.reads("/run/") as u64
+            + scripted.reads("/delta/") as u64,
+        "the discarded read is counted in the lookup's requests"
+    );
+}
+
+#[tokio::test]
+async fn a_guess_that_fails_while_the_fresh_root_names_other_runs_is_read_again() {
+    let (scripted, store) = scripted();
+    let node = registry_on(&store, "node-a");
+    let reader = reader_of(&scripted);
+    let mut holding = holder_of(&node).await;
+    let new = cell(5_000);
+    let old_runs: Vec<String> = {
+        let first: Vec<String> = (0..200).map(cell).collect();
+        register_and_fold(&node, &mut holding, &first).await;
+        let spill = spill_now(&node, &mut holding).await;
+        run_job(&node, &mut holding, spill).await;
+        assert!(matches!(
+            answer(&reader, &first[0]).await,
+            Answer::Exists(_)
+        ));
+        let mut listing = store.list(Some(&object_store::path::Path::from(objects::runs_root(
+            PREFIX,
+        ))));
+        let mut keys = Vec::new();
+        while let Some(Ok(meta)) = listing.next().await {
+            keys.push(meta.location.to_string());
+        }
+        keys
+    };
+    register_and_fold(&node, &mut holding, std::slice::from_ref(&new)).await;
+    let spill = spill_now(&node, &mut holding).await;
+    run_job(&node, &mut holding, spill).await;
+    // The runs the reader's cache names are gone, as after the grace.
+    for key in &old_runs {
+        objects::delete(store.as_ref(), key).await;
+    }
+    scripted.reset();
+    let result = reader.lookup(&objects::key_of(&new)).await;
+    assert!(
+        matches!(result.answer, Answer::Exists(_)),
+        "the failed guess is dropped: {:?}",
+        result.answer
+    );
+    let absent = neighbour(&new);
+    let result = reader.lookup(&objects::key_of(&absent)).await;
+    assert_eq!(
+        result.answer,
+        Answer::New,
+        "a 404 on the guess is not Unknown"
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_root_that_cannot_be_read_is_unknown_though_the_guess_read_the_key() {
+    let (scripted, store) = scripted();
+    let node = registry_on(&store, "node-a");
+    let reader = reader_of(&scripted);
+    let mut holding = holder_of(&node).await;
+    let cells: Vec<String> = (0..200).map(cell).collect();
+    register_and_fold(&node, &mut holding, &cells).await;
+    let spill = spill_now(&node, &mut holding).await;
+    run_job(&node, &mut holding, spill).await;
+    assert!(matches!(
+        answer(&reader, &cells[0]).await,
+        Answer::Exists(_)
+    ));
+    scripted.reset();
+    scripted.fail("/root", true);
+    let result = reader.lookup(&objects::key_of(&cells[0])).await;
+    assert_eq!(
+        result.answer,
+        Answer::Unknown,
+        "the cached run holds the key"
+    );
+    assert!(scripted.reads("/run/") >= 1, "the guess did read the run");
+    scripted.fail("/root", false);
+    assert!(matches!(
+        answer(&reader, &cells[0]).await,
+        Answer::Exists(_)
+    ));
+}
+
+#[tokio::test]
+async fn the_bucket_reads_start_while_the_root_read_is_still_in_flight() {
+    let (scripted, store) = scripted();
+    let node = registry_on(&store, "node-a");
+    let reader = reader_of(&scripted);
+    let mut holding = holder_of(&node).await;
+    let cells: Vec<String> = (0..200).map(cell).collect();
+    register_and_fold(&node, &mut holding, &cells).await;
+    let spill = spill_now(&node, &mut holding).await;
+    run_job(&node, &mut holding, spill).await;
+    assert!(matches!(
+        answer(&reader, &cells[0]).await,
+        Answer::Exists(_)
+    ));
+    scripted.reset();
+    scripted.hold("/root");
+    let lookup = {
+        let (reader, key) = (reader.clone(), objects::key_of(&cells[0]));
+        crate::asyncrt::spawn(async move { reader.lookup(&key).await })
+    };
+    scripted.started("/root", 1).await;
+    scripted.started("/run/", 1).await;
+    scripted.release("/root");
+    let result = lookup.await.unwrap();
+    assert!(matches!(result.answer, Answer::Exists(_)));
+    assert_eq!(result.gets, 2, "the root and the one bucket that exists");
+}
+
+#[tokio::test]
+async fn with_no_cached_map_the_lookup_reads_the_root_first() {
+    let (scripted, store) = scripted();
+    let node = registry_on(&store, "node-a");
+    let reader = reader_of(&scripted);
+    let mut holding = holder_of(&node).await;
+    let cells: Vec<String> = (0..200).map(cell).collect();
+    register_and_fold(&node, &mut holding, &cells).await;
+    let spill = spill_now(&node, &mut holding).await;
+    run_job(&node, &mut holding, spill).await;
+    scripted.reset();
+    scripted.hold("/root");
+    let lookup = {
+        let (reader, key) = (reader.clone(), objects::key_of(&cells[0]));
+        crate::asyncrt::spawn(async move { reader.lookup(&key).await })
+    };
+    scripted.started("/root", 1).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        scripted.reads("/run/"),
+        0,
+        "nothing is named before a root is read"
+    );
+    scripted.release("/root");
+    assert!(matches!(lookup.await.unwrap().answer, Answer::Exists(_)));
+}
+
+// ---------------------------------------------------------------------------
+// One fetch of a delta, however many lookups miss it
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn lookups_that_miss_the_same_delta_share_one_fetch() {
+    let (scripted, store) = scripted();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    let name = cell(1);
+    register_and_fold(&node, &mut holding, std::slice::from_ref(&name)).await;
+    let reader = reader_of(&scripted);
+    scripted.reset();
+    scripted.hold("/delta/");
+    let lookups: Vec<_> = (0..8)
+        .map(|_| {
+            let (reader, key) = (reader.clone(), objects::key_of(&name));
+            crate::asyncrt::spawn(async move { reader.lookup(&key).await })
+        })
+        .collect();
+    scripted.started("/root", 8).await;
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        scripted.reads("/delta/"),
+        1,
+        "the others wait for the first: {:?}",
+        scripted.keys("/delta/")
+    );
+    scripted.release("/delta/");
+    for lookup in lookups {
+        assert!(matches!(lookup.await.unwrap().answer, Answer::Exists(_)));
+    }
+    assert_eq!(reader.counters.delta_loads.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn a_failed_delta_fetch_is_not_remembered() {
+    let (scripted, store) = scripted();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    let name = cell(1);
+    register_and_fold(&node, &mut holding, std::slice::from_ref(&name)).await;
+    let reader = reader_of(&scripted);
+    scripted.fail("/delta/", true);
+    assert_eq!(answer(&reader, &name).await, Answer::Unknown);
+    scripted.fail("/delta/", false);
+    assert!(matches!(answer(&reader, &name).await, Answer::Exists(_)));
+}
+
+#[tokio::test]
+async fn a_load_from_an_older_root_does_not_drop_a_delta_a_newer_root_names() {
+    let (scripted, store) = scripted();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &[cell(1)]).await;
+    let older = node.read_root(&Io::default()).await.unwrap().unwrap().0;
+    register_and_fold(&node, &mut holding, &[cell(2)]).await;
+    let newer = node.read_root(&Io::default()).await.unwrap().unwrap().0;
+    assert_eq!(older.deltas.len() + 1, newer.deltas.len());
+    let reader = reader_of(&scripted);
+    let io = Io::default();
+    reader.load(newer.clone(), &io).await;
+    scripted.reset();
+    reader.load(older, &io).await;
+    reader.load(newer, &io).await;
+    assert_eq!(
+        scripted.reads("/delta/"),
+        0,
+        "the older root's load evicted nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// One DeleteObjects per pass
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_pass_deletes_every_segment_it_folded_in_one_request() {
+    let (scripted, _) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    for index in 0..5 {
+        node.register_at_claim(&cell(index), 1);
+        node.flush_now().await.unwrap();
+    }
+    scripted.reset();
+    assert!(node.pass(&mut holding).await.unwrap());
+    assert_eq!(
+        scripted.delete_batches(),
+        vec![5],
+        "5 segments, one request"
+    );
 }

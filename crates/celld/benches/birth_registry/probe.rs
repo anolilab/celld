@@ -145,7 +145,21 @@ impl Lookups {
             self.bytes.lock().unwrap().clone(),
         );
         let total = self.total.load(Ordering::Relaxed);
+        // A lookup that read more than the common three GETs or 16 KiB loaded a
+        // delta (or a map, or met a changed run): the cause G-a's relative clause
+        // would fail on, apart from the common one-round-trip lookup.
+        let (mut heavy_us, mut light_us) = (Vec::new(), Vec::new());
+        for ((micros, gets), bytes) in node.iter().zip(&gets).zip(&bytes) {
+            if *gets > 3 || *bytes > 16 * 1024 {
+                heavy_us.push(*micros);
+            } else {
+                light_us.push(*micros);
+            }
+        }
         json!({
+            "heavy": { "n": heavy_us.len(), "share_pct": heavy_us.len() as f64 * 100.0 / node.len().max(1) as f64,
+                       "node_p50_ms": us_to_ms_p(&heavy_us, 50.0), "node_p99_ms": us_to_ms_p(&heavy_us, 99.0) },
+            "light": { "n": light_us.len(), "node_p50_ms": us_to_ms_p(&light_us, 50.0), "node_p99_ms": us_to_ms_p(&light_us, 99.0) },
             "total": total,
             "exists": self.exists.load(Ordering::Relaxed),
             "new": self.new.load(Ordering::Relaxed),

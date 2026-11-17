@@ -632,10 +632,10 @@ pub async fn cold() {
         rig.samples
             .others
             .iter()
-            .take(1000)
+            .take(2_500)
             .map(|k| (k.clone(), Expect::Exists)),
     );
-    keys.truncate(10_000);
+    assert_eq!(keys.len(), 10_000, "G-n asks for 10,000 sampled keys");
     let before = answers(&rig, &keys).await;
     for node in &mut rig.fleet.nodes {
         node.kill();

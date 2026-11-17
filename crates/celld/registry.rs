@@ -84,7 +84,9 @@ struct View {
     /// When this node first saw the version it holds, on its own clock.
     first_seen_ms: u64,
     read_ms: u64,
-    deltas: HashMap<reg::DeltaId, Arc<Loaded>>,
+    /// One cell per delta this node holds or is loading: concurrent lookups
+    /// that miss the same delta share one fetch.
+    deltas: HashMap<reg::DeltaId, Arc<tokio::sync::OnceCell<Arc<Loaded>>>>,
     map: Option<((u64, u64), Arc<Map>)>,
 }
 
@@ -371,59 +373,54 @@ impl Registry {
         Some(snapshot)
     }
 
-    /// Load the deltas and the map that `root` names. A delta the root does
-    /// not name is dropped from the cache and never counted.
+    /// Load the deltas and the map that `root` names. A delta that no root
+    /// names is never counted. The cache keeps a delta a newer root names, so a
+    /// lookup that holds an older root does not evict it.
     pub(crate) async fn load(&self, root: Arc<Root>, io: &Io) -> Snapshot {
         let over_cap = reg::over_cap(root.deltas.len());
-        let missing: Vec<reg::DeltaId> = {
+        let cells: Vec<(reg::DeltaId, Arc<tokio::sync::OnceCell<Arc<Loaded>>>)> = {
             let mut view = self.view.lock().unwrap();
-            view.deltas.retain(|id, _| root.deltas.contains(id));
-            root.deltas
-                .iter()
-                .filter(|id| !view.deltas.contains_key(id))
-                .copied()
-                .collect()
+            if let Some(newest) = root.deltas.last().copied() {
+                view.deltas
+                    .retain(|id, _| root.deltas.contains(id) || *id > newest);
+            }
+            if over_cap {
+                Vec::new()
+            } else {
+                root.deltas
+                    .iter()
+                    .map(|id| (*id, view.deltas.entry(*id).or_default().clone()))
+                    .collect()
+            }
         };
         let mut deltas_ok = !over_cap;
-        if !over_cap {
-            let loaded: Vec<_> = futures_util::stream::iter(missing)
-                .map(|id| async move {
-                    (
-                        id,
-                        objects::read_delta(self.store.as_ref(), &self.prefix, id).await,
-                    )
-                })
-                .buffer_unordered(16)
-                .collect()
-                .await;
-            for (id, result) in loaded {
-                match result {
-                    Ok((delta, size)) => {
+        let loaded: Vec<Option<Arc<Loaded>>> = futures_util::stream::iter(cells)
+            .map(|(id, cell)| async move {
+                let load = cell
+                    .get_or_try_init(|| async {
+                        let (delta, size) =
+                            objects::read_delta(self.store.as_ref(), &self.prefix, id).await?;
                         io.get(size);
                         self.counters.delta_loads.fetch_add(1, Ordering::Relaxed);
-                        let loaded = Arc::new(Loaded {
+                        anyhow::Ok(Arc::new(Loaded {
                             segments: delta.segments.into_iter().collect(),
                             records: delta.records,
-                        });
-                        self.view.lock().unwrap().deltas.insert(id, loaded);
-                    }
+                        }))
+                    })
+                    .await;
+                match load {
+                    Ok(loaded) => Some(loaded.clone()),
                     Err(error) => {
                         tracing::debug!(%error, "registry delta unreadable");
-                        deltas_ok = false;
+                        None
                     }
                 }
-            }
-        }
-        let deltas: Vec<Arc<Loaded>> = {
-            let view = self.view.lock().unwrap();
-            root.deltas
-                .iter()
-                .filter_map(|id| view.deltas.get(id).cloned())
-                .collect()
-        };
-        if !over_cap && deltas.len() != root.deltas.len() {
-            deltas_ok = false;
-        }
+            })
+            .buffered(16)
+            .collect()
+            .await;
+        deltas_ok &= loaded.iter().all(Option::is_some);
+        let deltas: Vec<Arc<Loaded>> = loaded.into_iter().flatten().collect();
         let (map, map_ok) = match root.map {
             None => (Arc::new(Map::empty(root.k)), true),
             Some(named) => {
@@ -465,17 +462,19 @@ impl Registry {
         }
     }
 
+    /// Where the buckets of `key` were, by the map this node last loaded: the
+    /// guess a lookup reads while the fresh root is in flight. `None` before
+    /// this node has loaded any map.
+    fn speculation(&self, key: &Key) -> Option<(reg::Aim, reg::Aim)> {
+        let view = self.view.lock().unwrap();
+        let (_, map) = view.map.as_ref()?;
+        Some((map.aim(key, 1), map.aim(key, 2)))
+    }
+
     /// One level of one partition: a read of the bucket the key falls in, and
     /// of its overflow chain.
-    async fn probe(
-        &self,
-        key: &Key,
-        lo: u64,
-        hi: u64,
-        level_no: u8,
-        level: Level,
-        io: &Io,
-    ) -> Probe {
+    async fn probe(&self, key: &Key, aim: reg::Aim, level_no: u8, io: &Io) -> Probe {
+        let reg::Aim { lo, hi, level } = aim;
         let Level::Run(run) = level else {
             return Probe::Empty;
         };
@@ -544,8 +543,27 @@ impl Registry {
         }
     }
 
+    /// The fresh root, the deltas and the map it names, and the two buckets,
+    /// in one round trip when the map this node last loaded still names the
+    /// key's runs. The bucket reads start with the root read, from the cached
+    /// map, and are only a guess: the answer is decided from the fresh root
+    /// alone. A guess is used for a level only if the fresh map's aim for that
+    /// level is identical; otherwise it is dropped and the level is read from
+    /// the fresh map. A fresh root that cannot be read is `Unknown`, whatever
+    /// the guess read.
     async fn lookup_inner(&self, key: &Key, io: &Io) -> Answer {
-        let Some(snapshot) = self.refresh(io).await else {
+        let guess = self.speculation(key);
+        let guessed = async {
+            match guess {
+                Some((first, second)) => Some(futures_util::join!(
+                    self.probe(key, first, 1, io),
+                    self.probe(key, second, 2, io)
+                )),
+                None => None,
+            }
+        };
+        let (fresh, guessed) = futures_util::join!(self.refresh(io), guessed);
+        let Some(snapshot) = fresh else {
             return Answer::Unknown;
         };
         let in_deltas = snapshot
@@ -554,12 +572,27 @@ impl Registry {
             .filter_map(|delta| reg::find(&delta.records, key))
             .reduce(reg::merge);
         let (l1, l2) = if snapshot.map_ok {
-            let index = snapshot.map.partition_for(key);
-            let partition = snapshot.map.partitions[index];
-            let hi = snapshot.map.hi(index);
+            let (first, second) = (snapshot.map.aim(key, 1), snapshot.map.aim(key, 2));
+            let reuse = |aimed: Option<reg::Aim>, probe: Option<Probe>, fresh: reg::Aim| {
+                probe.filter(|_| aimed == Some(fresh))
+            };
+            let kept = (
+                reuse(guess.map(|g| g.0), guessed.map(|g| g.0), first),
+                reuse(guess.map(|g| g.1), guessed.map(|g| g.1), second),
+            );
             futures_util::join!(
-                self.probe(key, partition.lo, hi, 1, partition.l1, io),
-                self.probe(key, partition.lo, hi, 2, partition.l2, io)
+                async {
+                    match kept.0 {
+                        Some(probe) => probe,
+                        None => self.probe(key, first, 1, io).await,
+                    }
+                },
+                async {
+                    match kept.1 {
+                        Some(probe) => probe,
+                        None => self.probe(key, second, 2, io).await,
+                    }
+                }
             )
         } else {
             (Probe::Unreadable, Probe::Unreadable)
@@ -586,6 +619,7 @@ impl Registry {
             let live: u64 = view
                 .deltas
                 .values()
+                .filter_map(|cell| cell.get())
                 .map(|delta| delta.records.len() as u64)
                 .sum();
             serde_json::json!({
