@@ -3914,25 +3914,18 @@ impl Worker {
         out
     }
 
-    /// Enter the isolate solely to end a request whose client has hung up.
+    /// Enter the isolate solely to end an event that was cancelled: its client
+    /// hung up, the runtime is stopping, or its deployment outlived
+    /// `CELLD_RETIRE_DEADLINE_S`.
     ///
-    /// A suspended request notices the disconnect without any isolate — the
-    /// flag is host state — so this is reached only when it has actually
+    /// A suspended request notices a cancellation without any isolate — the
+    /// flag is host state — so this is reached only when one has actually
     /// fired, rather than on a timer as the blocking run loop did.
-    pub fn turn_cancel(&mut self, entry: &mut InFlight) -> Vec<Op> {
-        self.cancel_turn(entry, false)
+    pub fn turn_cancel_for(&mut self, entry: &mut InFlight, cause: CancelCause) -> Vec<Op> {
+        self.cancel_turn(entry, cause)
     }
 
-    /// The runtime is stopping: end the event as a client hang-up does, but
-    /// keep nothing running for it, a critical section included. The block
-    /// would not reach its end before the process exits, so its gate is
-    /// abandoned and the events queued behind it are refused now rather
-    /// than left waiting through the shutdown.
-    pub fn turn_cancel_for_shutdown(&mut self, entry: &mut InFlight) -> Vec<Op> {
-        self.cancel_turn(entry, true)
-    }
-
-    fn cancel_turn(&mut self, entry: &mut InFlight, shutdown: bool) -> Vec<Op> {
+    fn cancel_turn(&mut self, entry: &mut InFlight, cause: CancelCause) -> Vec<Op> {
         let Some(inner) = self.inner.as_mut() else {
             return Vec::new();
         };
@@ -3952,7 +3945,7 @@ impl Worker {
             entry.context.remaining_cpu_budget(),
             entry.context.cpu_limit_ms(),
         );
-        cancel(tc, entry, shutdown);
+        cancel(tc, entry, cause);
         drop(cpu_watchdog);
         let ops = finish_turn(tc, entry);
         restore_trace(tc, previous);
@@ -5218,13 +5211,29 @@ fn deliver(
     drop(guard);
 }
 
+/// Why an event is being ended from outside its handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelCause {
+    /// Its client hung up.
+    Client,
+    /// The runtime is stopping, so nothing it keeps running would finish.
+    Shutdown,
+    /// Its deployment outlived `CELLD_RETIRE_DEADLINE_S`. Ended as a shutdown
+    /// ends it, and the client that still waits is told why.
+    Superseded,
+}
+
 /// End a request whose client has hung up, so its handler stops running.
 fn cancelled(tc: &mut v8::PinScope, entry: &mut InFlight) {
     if entry.reply.is_none() || !take_request_cancellation(entry.request_id) {
         return;
     }
-    let shutdown = take_shutdown_cancellation(entry.request_id);
-    cancel(tc, entry, shutdown);
+    let cause = if take_shutdown_cancellation(entry.request_id) {
+        CancelCause::Shutdown
+    } else {
+        CancelCause::Client
+    };
+    cancel(tc, entry, cause);
 }
 
 /// End a request whose cancellation has already been taken.
@@ -5232,7 +5241,8 @@ fn cancelled(tc: &mut v8::PinScope, entry: &mut InFlight) {
 /// Split from [`cancelled`] because a suspended request observes the
 /// cancellation *outside* the isolate — the flag is host state and costs no
 /// V8 — and only then enters to act on it.
-fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, shutdown: bool) {
+fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, cause: CancelCause) {
+    let shutdown = cause != CancelCause::Client;
     let guard = CurrentGuard::enter(entry.context.clone());
     // The id that names this request to the JS side. A stateless handler is
     // registered by the shell, and only once it suspends, so the shell holds
@@ -5253,7 +5263,15 @@ fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, shutdown: bool) {
         finish_retired_input_gate_context(tc, &entry.context);
     }
     drop(guard);
-    entry.fail_cancelled(anyhow!("The client has disconnected"));
+    // The reason is set here, inside the turn: the write delta it carries
+    // reads the cell's storage, which only a turn installs.
+    entry.fail_cancelled(match cause {
+        CancelCause::Superseded => anyhow!(
+            "this deployment was superseded and its isolate was retired after {}s",
+            crate::generation::retire_deadline().as_secs()
+        ),
+        CancelCause::Client | CancelCause::Shutdown => anyhow!("The client has disconnected"),
+    });
     if shutdown {
         // A lifecycle cancellation can be consumed either between turns or
         // during an operation turn. Keep the background cleanup here so both

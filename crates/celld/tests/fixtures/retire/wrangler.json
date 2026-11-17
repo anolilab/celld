@@ -1,0 +1,8 @@
+{
+  "name": "retire",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "durable_objects": { "bindings": [{ "name": "PIN", "class_name": "Pinned" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Pinned"] }]
+}

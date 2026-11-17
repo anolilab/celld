@@ -30,6 +30,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::futures::Notified;
 
 const REMOTE_ABORT_TTL: Duration = Duration::from_secs(600);
 const REMOTE_COMPLETION_TTL: Duration = Duration::from_secs(60);
@@ -48,6 +49,7 @@ const RECLAIM_RETRY: Duration = Duration::from_millis(10);
 /// blocking run loop's own cap, which exists for the same reason: a client
 /// disconnect is raised on another thread and has nothing to wake this one.
 const CANCELLATION_TICK: Duration = Duration::from_millis(10);
+
 /// Cell fetches that one target can hold before celld refuses excess work.
 ///
 /// The last nonsaturated Queue step in the AWS partition staircase held
@@ -2222,7 +2224,18 @@ async fn drive_worker(
 ) {
     let mut ops = Ops::new();
 
-    let (begun, started) = slot.turn(|worker| worker.turn_begin(job, trace)).await;
+    // Whether the retire deadline binds this event is what it was when the
+    // event began: sampled in the turn, after any queueing for the isolate,
+    // so a request that waited past the deadline is not ended for it, while
+    // work already running when the timer fires, a turn included, is.
+    let mut binds = false;
+    let (begun, started) = slot
+        .turn(|worker| {
+            binds = !slot.deadline_forced();
+            worker.turn_begin(job, trace)
+        })
+        .await;
+    let mut retire = binds.then_some(slot);
     // Nothing is in flight; the reply already carries the error.
     let Some(mut entry) = begun else {
         drop(started);
@@ -2237,7 +2250,8 @@ async fn drive_worker(
     after_turn(&entry);
 
     while !entry.finished() {
-        let started = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await {
+        let wake = wake_with_cross_entry_gate(&mut ops, &mut entry, budget, retire).await;
+        let started = match wake {
             Wake::Op(op, result) => {
                 slot.turn(|worker| worker.turn_deliver(&mut entry, op, result))
                     .await
@@ -2254,15 +2268,12 @@ async fn drive_worker(
                 entry.finish_cross_entry_gates();
                 Vec::new()
             }
-            Wake::Cancelled { shutdown } => {
+            Wake::Cancelled { cause } => {
+                if cause == js::CancelCause::Superseded {
+                    retire = None;
+                }
                 let started = slot
-                    .turn(|worker| {
-                        if shutdown {
-                            worker.turn_cancel_for_shutdown(&mut entry)
-                        } else {
-                            worker.turn_cancel(&mut entry)
-                        }
-                    })
+                    .turn(|worker| worker.turn_cancel_for(&mut entry, cause))
                     .await;
                 entry.cancel_gated_reply();
                 started
@@ -2308,8 +2319,9 @@ enum Wake {
     CancelGatedReply,
     /// A cross-entry claim changed, or subscribing closed a retirement gap.
     CrossEntryGateChanged,
-    /// Its client hung up, or shutdown forced the complete event to retire.
-    Cancelled { shutdown: bool },
+    /// Its client hung up, shutdown forced the complete event to retire, or its
+    /// deployment outlived the retire deadline.
+    Cancelled { cause: js::CancelCause },
     /// It ran past the handler budget without answering.
     Expired,
     /// Nothing outstanding could ever move it.
@@ -2322,10 +2334,74 @@ enum Wake {
     Poll,
 }
 
-fn take_cancellation_wake(request_id: Option<js::RequestId>) -> Option<Wake> {
-    js::take_request_cancellation(request_id).then(|| Wake::Cancelled {
-        shutdown: js::take_shutdown_cancellation(request_id),
-    })
+fn take_cancellation_wake(
+    retire: Option<&crate::pool::Slot>,
+    request_id: Option<js::RequestId>,
+) -> Option<Wake> {
+    js::take_request_cancellation(request_id)
+        .then(|| Wake::Cancelled {
+            cause: if js::take_shutdown_cancellation(request_id) {
+                js::CancelCause::Shutdown
+            } else {
+                js::CancelCause::Client
+            },
+        })
+        .or_else(|| retire_wake(retire))
+}
+
+/// The retire deadline of this isolate's deployment has passed, so end the
+/// event as a shutdown ends it. The timer that raises it runs once per
+/// superseded generation; a driver pays one relaxed load where it already
+/// samples its own cancellation. `retire` is `None` for an event that began
+/// after the deadline, and once the event has been ended.
+fn retire_wake(retire: Option<&crate::pool::Slot>) -> Option<Wake> {
+    retire
+        .is_some_and(crate::pool::Slot::deadline_forced)
+        .then_some(Wake::Cancelled {
+            cause: js::CancelCause::Superseded,
+        })
+}
+
+/// Arm the retire bell for a wait that nothing else bounds, or hand back the
+/// wake when the deadline has already passed. The bell is taken before the
+/// flag is read, so a deadline that lands between the read and the wait is
+/// still heard.
+///
+/// `always` is for the post-answer waits with no budget and no request id to
+/// sample (`waitUntil` and leftover work). They run after the response, off
+/// the latency-critical path, and may have parked long before the deploy that
+/// superseded them, so they take the bell whatever the generation's state: a
+/// wait that parked while it served has no other way to hear the deadline.
+/// That costs the bell's waiter-list lock on its first poll and again on
+/// drop, once per wake.
+///
+/// A wait already bounded by a budget or the cancellation tick passes
+/// `always: false`. It arms the bell only for a superseded generation, so a
+/// serving one pays one relaxed load per pass and nothing else. A wait that
+/// began serving and is bounded ends at its next wake, which reads the
+/// deadline flag.
+fn arm_retire(
+    retire: Option<&crate::pool::Slot>,
+    always: bool,
+) -> Result<Option<Notified<'_>>, Wake> {
+    let Some(slot) = retire.filter(|slot| always || slot.superseded()) else {
+        return Ok(None);
+    };
+    let bell = slot.retire_notified();
+    match retire_wake(retire) {
+        Some(wake) => Err(wake),
+        None => Ok(Some(bell)),
+    }
+}
+
+/// Resolves when the retire deadline of this event's deployment passes. Take
+/// the bell, then check [`retire_wake`], then wait: a deadline between the
+/// last two is still heard. Never resolves for an event that is not eligible.
+async fn retire_bell(bell: Option<Notified<'_>>) {
+    match bell {
+        Some(bell) => bell.await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Wait for whichever comes first, holding no isolate.
@@ -2337,10 +2413,13 @@ async fn wake_with_cross_entry_gate(
     ops: &mut Ops,
     entry: &mut js::InFlight,
     budget: Duration,
+    retire: Option<&crate::pool::Slot>,
 ) -> Wake {
     let wait = entry.prepare_cross_entry_gate_wait();
     match wait
-        .wait(wake(ops, entry, budget), |wake| matches!(wake, Wake::Idle))
+        .wait(wake(ops, entry, budget, retire), |wake| {
+            matches!(wake, Wake::Idle)
+        })
         .await
     {
         js::input_gate_lifecycle::WaitOutcome::StateChanged => Wake::CrossEntryGateChanged,
@@ -2348,7 +2427,12 @@ async fn wake_with_cross_entry_gate(
     }
 }
 
-async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake {
+async fn wake(
+    ops: &mut Ops,
+    entry: &mut js::InFlight,
+    budget: Duration,
+    retire: Option<&crate::pool::Slot>,
+) -> Wake {
     loop {
         // An op this event enqueued from inside another event's turn reaches
         // this driver here rather than through `adopt`, because the turn that
@@ -2371,11 +2455,16 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
             let (gated_reply, context) = entry.gated_reply_and_io_context();
             if let Some(gated_reply) = gated_reply {
                 let Some(request_id) = request_id else {
+                    let retired = match arm_retire(retire, true) {
+                        Ok(bell) => bell,
+                        Err(wake) => return wake,
+                    };
                     let next = if ops.is_empty() {
                         asyncrt::select_biased! {
                             "a completed gated reply wins a tie with an op another turn hands over";
                             completion = gated_reply => Some(Wake::GatedReply(completion)),
                             _ = context.handed_ready() => None,
+                            _ = retire_bell(retired) => None,
                         }
                     } else {
                         asyncrt::select_biased! {
@@ -2383,13 +2472,20 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
                             completion = gated_reply => Some(Wake::GatedReply(completion)),
                             result = ops.next() => result.map(|(op, result)| Wake::Op(op, result)),
                             _ = context.handed_ready() => None,
+                            _ = retire_bell(retired) => None,
                         }
                     };
                     match next {
                         Some(wake) => return wake,
-                        // A hand-off, or an exhausted stream after its final
-                        // completion; take the mailbox before waiting again.
-                        None => continue,
+                        // A hand-off, an exhausted stream after its final
+                        // completion, or the retire deadline; take the
+                        // mailbox before waiting again.
+                        None => {
+                            if let Some(wake) = retire_wake(retire) {
+                                return wake;
+                            }
+                            continue;
+                        }
                     }
                 };
                 // The domain select is declaration-order biased. A reply that
@@ -2424,8 +2520,13 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
                 if let Some(next) = next {
                     return next;
                 }
-                if let Some(cancelled) = take_cancellation_wake(Some(request_id)) {
-                    return if matches!(cancelled, Wake::Cancelled { shutdown: true }) {
+                if let Some(cancelled) = take_cancellation_wake(retire, Some(request_id)) {
+                    return if !matches!(
+                        cancelled,
+                        Wake::Cancelled {
+                            cause: js::CancelCause::Client
+                        }
+                    ) {
                         cancelled
                     } else {
                         Wake::CancelGatedReply
@@ -2438,16 +2539,27 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
             // must still retire the background work before the runtime stops.
             let Some(request_id) = request_id else {
                 let context = entry.io_context();
+                let retired = match arm_retire(retire, true) {
+                    Ok(bell) => bell,
+                    Err(wake) => return wake,
+                };
                 let next = asyncrt::select_biased! {
                     "an operation result wins a tie with an op another turn hands over";
                     result = ops.next() => Some(result),
                     _ = context.handed_ready() => None,
+                    _ = retire_bell(retired) => None,
                 };
                 match next {
                     Some(Some((op, result))) => return Wake::Op(op, result),
                     Some(None) => return Wake::Idle,
-                    // Handed over; the next pass takes it.
-                    None => continue,
+                    // Handed over, or the retire deadline; the next pass
+                    // takes it.
+                    None => {
+                        if let Some(wake) = retire_wake(retire) {
+                            return wake;
+                        }
+                        continue;
+                    }
                 }
             };
             let next = if ops.is_empty() {
@@ -2466,8 +2578,13 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
             if let Some(next) = next {
                 return next;
             }
-            if let Some(cancelled) = take_cancellation_wake(Some(request_id)) {
-                if matches!(cancelled, Wake::Cancelled { shutdown: true }) {
+            if let Some(cancelled) = take_cancellation_wake(retire, Some(request_id)) {
+                if !matches!(
+                    cancelled,
+                    Wake::Cancelled {
+                        cause: js::CancelCause::Client
+                    }
+                ) {
                     return cancelled;
                 }
             }
@@ -2514,26 +2631,37 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
             // Re-read the flag on this path too. A request with nothing
             // outstanding can still have its client hang up, and only the
             // branch below used to look.
-            if let Some(cancelled) = take_cancellation_wake(entry.request_id()) {
+            if let Some(cancelled) = take_cancellation_wake(retire, entry.request_id()) {
                 return cancelled;
             }
             return Wake::Poll;
         }
+        // A request a client can hang up on is sampled every tick. An internal
+        // one waits for its whole budget, so the retire bell stands in.
+        let retired = match arm_retire(retire.filter(|_| !entry.cancellable()), false) {
+            Ok(bell) => bell,
+            Err(wake) => return wake,
+        };
         let next = tokio::time::timeout(capped, async {
             asyncrt::select_biased! {
                 "an operation result wins a tie with an op another turn hands over";
                 result = ops.next() => Some(result),
                 _ = context.handed_ready() => None,
+                _ = retire_bell(retired) => None,
             }
         })
         .await;
         match next {
             Ok(Some(Some((op, result)))) => return Wake::Op(op, result),
             Ok(Some(None)) => return Wake::Idle,
-            // Another turn handed this event an op. The next pass takes it.
-            Ok(None) => continue,
+            // Another turn handed this event an op, or its retire deadline
+            // passed. The next pass takes it.
+            Ok(None) => match retire_wake(retire) {
+                Some(wake) => return wake,
+                None => continue,
+            },
             Err(_) => {
-                if let Some(cancelled) = take_cancellation_wake(entry.request_id()) {
+                if let Some(cancelled) = take_cancellation_wake(retire, entry.request_id()) {
                     return cancelled;
                 }
                 if capped == left {
@@ -3199,6 +3327,7 @@ async fn drive_cell_inner(
         Some(CellJob::WsMessage { started, .. } | CellJob::Alarm { started, .. }) => started.take(),
         _ => None,
     };
+    let mut binds = false;
     let (begun, started, moves) = loop {
         let mut waiting = None;
         let taken = slot
@@ -3209,6 +3338,8 @@ async fn drive_cell_inner(
                     pending = Some(job);
                     return None;
                 }
+                // Sampled as the event begins, not after its first turn.
+                binds = !slot.deadline_forced();
                 let (begun, started) = worker.turn_begin_cell(job, trace);
                 Some((begun, started, worker.take_alarm_moves()))
             })
@@ -3262,9 +3393,10 @@ async fn drive_cell_inner(
         abort_ops(&mut ops, &mut entry);
     }
 
+    let mut retire = binds.then_some(&*slot);
     while !entry.finished() {
-        let (started, moves) = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await
-        {
+        let wake = wake_with_cross_entry_gate(&mut ops, &mut entry, budget, retire).await;
+        let (started, moves) = match wake {
             Wake::Op(op, result) => {
                 slot.turn(|worker| {
                     let started = worker.turn_deliver(&mut entry, op, result);
@@ -3284,14 +3416,13 @@ async fn drive_cell_inner(
                 entry.finish_cross_entry_gates();
                 (Vec::new(), Vec::new())
             }
-            Wake::Cancelled { shutdown } => {
+            Wake::Cancelled { cause } => {
+                if cause == js::CancelCause::Superseded {
+                    retire = None;
+                }
                 let cancelled = slot
                     .turn(|worker| {
-                        let started = if shutdown {
-                            worker.turn_cancel_for_shutdown(&mut entry)
-                        } else {
-                            worker.turn_cancel(&mut entry)
-                        };
+                        let started = worker.turn_cancel_for(&mut entry, cause);
                         (started, worker.take_alarm_moves())
                     })
                     .await;
@@ -3392,5 +3523,38 @@ fn install_container_specs(generation: &Generation) {
     }
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(crate::container::prewarm());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A wait that parked while its generation served has no bell to be woken
+    /// by unless it took one then. The unbounded post-answer waits take it
+    /// always; a bounded wait takes it only once superseded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unbounded_wait_armed_while_serving_hears_the_deadline() {
+        let pool = crate::pool::tests::pool();
+        let slot = crate::pool::tests::grown(&pool);
+        assert!(!slot.superseded());
+        assert!(matches!(arm_retire(Some(&slot), false), Ok(None)));
+        let Ok(Some(bell)) = arm_retire(Some(&slot), true) else {
+            panic!("an unbounded wait arms the bell while serving");
+        };
+
+        // The deploy supersedes the pool, later than the wait parked.
+        pool.retire_all();
+        pool.force_retired();
+
+        tokio::time::timeout(Duration::from_secs(5), retire_bell(Some(bell)))
+            .await
+            .expect("a wait armed before the supersede hears the deadline");
+        assert!(matches!(
+            arm_retire(Some(&slot), true),
+            Err(Wake::Cancelled {
+                cause: js::CancelCause::Superseded
+            })
+        ));
     }
 }

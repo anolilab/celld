@@ -1734,17 +1734,31 @@ impl AppHandle {
         // this is how an operator learns whether a deploy took.
         if let Some(runtime) = &self.runtime {
             let generation = runtime.generation();
+            let draining = runtime.draining_generations();
+            // Superseded generations still holding isolates. The oldest age
+            // is what `CELLD_RETIRE_DEADLINE_S` bounds, so a value that
+            // stays near it names work the deadline keeps ending.
+            let ages = draining
+                .iter()
+                .filter(|generation| generation.id() < crate::cell_runtime::SHADOW_ID_BASE)
+                .filter(|generation| !generation.is_drained())
+                .filter_map(|generation| generation.retired_for_ms())
+                .collect::<Vec<_>>();
             state["deployment"] = serde_json::json!({
+                "retiring": {
+                    "generations": ages.len(),
+                    "oldestAgeMs": ages.iter().max().copied().unwrap_or(0),
+                },
                 "version": generation.version(),
                 "prefix": generation.prefix(),
                 "generation": generation.id(),
-                "draining": runtime
-                    .draining_generations()
+                "draining": draining
                     .into_iter()
                     .map(|generation| {
                         serde_json::json!({
                             "generation": generation.id(),
                             "version": generation.version(),
+                            "retiredForMs": generation.retired_for_ms(),
                             "isolates": generation.isolate_census(),
                         })
                     })

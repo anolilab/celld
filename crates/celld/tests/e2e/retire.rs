@@ -1,0 +1,345 @@
+//! A superseded generation has a hard lifetime.
+//!
+//! A deploy retires the previous generation's isolates, which free once their
+//! last request leaves. A request that never answers, or `waitUntil` work that
+//! never ends, would otherwise hold that heap for as long as the process runs.
+//! `CELLD_RETIRE_DEADLINE_S` ends such work and frees the isolate.
+
+// The test writes a variant into the dev store from the outside.
+#![allow(clippy::disallowed_methods)]
+
+use std::time::Duration;
+
+use celld::deploy::{Options, VarOverrides};
+use serde_json::Value;
+
+use super::harness::{host_runtime, wait_until, Server};
+
+const TOKEN: &str = "e2e-retire-token";
+const DEADLINE_S: &str = "4";
+// The deadline must exceed the maximum age, whose default is 60 seconds.
+const MAX_AGE_S: &str = "1";
+
+async fn state(server: &Server) -> Value {
+    reqwest::Client::new()
+        .get(server.internal_url("/state").await)
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .expect("state")
+        .json()
+        .await
+        .expect("state json")
+}
+
+/// Deploy a variant that answers `v2` and make it the serving generation.
+async fn redeploy(server: &Server) {
+    host_runtime();
+    let directory = tempfile::tempdir().expect("temp dir");
+    for file in ["wrangler.json", "index.js"] {
+        let text = std::fs::read_to_string(server.project_dir().join(file)).expect("fixture file");
+        std::fs::write(
+            directory.path().join(file),
+            text.replace("\"v1\"", "\"v2\""),
+        )
+        .expect("write variant");
+    }
+    let built = celld::deploy::build(&Options {
+        config: Some(directory.path().to_path_buf()),
+        bucket: None,
+        endpoint: None,
+        region: None,
+        dry_run: false,
+        strict: false,
+        json: false,
+        no_activate: false,
+        vars: VarOverrides::None,
+        local_images: true,
+        sourcemap: None,
+        tag: None,
+    })
+    .expect("build the variant");
+    let bucket =
+        celld::dev::open_local_bucket(&server.project_dir().join(".celld/dev/objects.sqlite3"))
+            .expect("open the dev store");
+    celld::deploy::write(&bucket, &built, true)
+        .await
+        .expect("activate the variant");
+    let reloaded = reqwest::Client::new()
+        .post(server.internal_url("/reload").await)
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .expect("reload");
+    assert!(
+        reloaded.status().is_success(),
+        "{:?}",
+        reloaded.text().await
+    );
+}
+
+#[tokio::test]
+async fn a_superseded_generation_is_freed_at_its_deadline_though_its_work_never_ends() {
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_RETIRE_DEADLINE_S", DEADLINE_S),
+            ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
+            // Under the deadline, which must exceed it. The work held here
+            // has answered, so only the retire deadline can end it.
+            ("CELLD_HANDLER_BUDGET_S", "1"),
+        ],
+    )
+    .await;
+    assert_eq!(server.get_text("/version").await, "v1");
+    // `waitUntil` work that outlives its response holds the first
+    // generation's isolate.
+    assert_eq!(server.get_text("/pin").await, "pinned");
+
+    redeploy(&server).await;
+
+    // The new generation serves at once, whatever the old one still holds.
+    assert_eq!(server.get_text("/version").await, "v2");
+    let during = state(&server).await;
+    assert_eq!(
+        during["deployment"]["retiring"]["generations"], 1,
+        "the superseded generation is still pinned: {during}"
+    );
+    assert!(
+        during["deployment"]["draining"][0]["retiredForMs"].is_u64(),
+        "{during}"
+    );
+
+    // The isolate is freed, the generation leaves the list, and the new one
+    // is unaffected.
+    wait_until(
+        "the superseded generation to be freed",
+        Duration::from_secs(60),
+        || async {
+            let state = state(&server).await;
+            state["deployment"]["draining"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+                .then_some(())
+        },
+    )
+    .await;
+    let after = state(&server).await;
+    assert_eq!(after["deployment"]["retiring"]["generations"], 0, "{after}");
+    assert_eq!(after["deployment"]["retiring"]["oldestAgeMs"], 0, "{after}");
+    assert_eq!(server.get_text("/version").await, "v2");
+    assert!(
+        server.log_text().contains("retire_deadline_forced"),
+        "the forced retirement left no log line"
+    );
+}
+
+/// The deadline passes while the event's first turn is still running. It was
+/// running at the deadline, so it is ended, not left to run for ever.
+#[tokio::test]
+async fn an_event_whose_first_turn_spans_the_deadline_is_ended() {
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_RETIRE_DEADLINE_S", DEADLINE_S),
+            ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
+            ("CELLD_HANDLER_BUDGET_S", "1"),
+        ],
+    )
+    .await;
+    assert_eq!(server.get_text("/version").await, "v1");
+    let spinning = tokio::spawn({
+        let url = server.url("/spin");
+        async move {
+            reqwest::Client::new()
+                .get(url)
+                .send()
+                .await
+                .expect("spin")
+                .text()
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    redeploy(&server).await;
+
+    // The event answers after the deadline has passed, and its `waitUntil`
+    // work, which never ends, is ended all the same.
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(60), spinning)
+            .await
+            .expect("the event answered")
+            .expect("spin task")
+            .expect("spin body"),
+        "spun"
+    );
+    wait_until(
+        "the superseded generation to be freed",
+        Duration::from_secs(60),
+        || async {
+            let state = state(&server).await;
+            state["deployment"]["draining"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+                .then_some(())
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wait_until_work_that_never_ends_is_ended_at_the_deadline() {
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_RETIRE_DEADLINE_S", DEADLINE_S),
+            ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
+            ("CELLD_HANDLER_BUDGET_S", "1"),
+        ],
+    )
+    .await;
+    assert_eq!(server.get_text("/pin").await, "pinned");
+
+    redeploy(&server).await;
+
+    wait_until(
+        "the generation held only by waitUntil work to be freed",
+        Duration::from_secs(60),
+        || async {
+            let state = state(&server).await;
+            state["deployment"]["draining"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+                .then_some(())
+        },
+    )
+    .await;
+    assert_eq!(server.get_text("/version").await, "v2");
+}
+
+#[tokio::test]
+async fn an_answered_durable_object_event_with_a_leftover_timer_does_not_pin_a_superseded_generation(
+) {
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_RETIRE_DEADLINE_S", DEADLINE_S),
+            ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
+            ("CELLD_HANDLER_BUDGET_S", "1"),
+        ],
+    )
+    .await;
+    assert_eq!(server.get_text("/do-pin").await, "pinned");
+
+    redeploy(&server).await;
+
+    wait_until(
+        "the generation held by the object's interval to be freed",
+        Duration::from_secs(60),
+        || async {
+            let state = state(&server).await;
+            state["deployment"]["draining"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+                .then_some(())
+        },
+    )
+    .await;
+    // No JavaScript of the retired isolate runs after it is freed: the count
+    // its interval kept stops moving.
+    let before = server.get_text("/do-ticks").await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(server.get_text("/do-ticks").await, before);
+    assert_eq!(server.get_text("/version").await, "v2");
+}
+
+/// Durable Object events still running when the deadline passes are ended by
+/// the timer, inside each object's own storage scope, and the node goes on
+/// serving.
+///
+/// A resident cell is normally moved to the new deployment at the maximum
+/// age, which ends its events first. The handoffs run one at a time, so with
+/// enough objects some are still on the old isolate when the deadline passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_object_events_running_at_the_deadline_are_ended_and_the_node_keeps_serving() {
+    const OBJECTS: usize = 300;
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_RETIRE_DEADLINE_S", "2"),
+            ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
+            ("CELLD_RELEASES", "1"),
+            ("CELLD_HANDLER_BUDGET_S", "1"),
+        ],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    // In batches: the node accepts them faster than it builds the objects.
+    for batch in (0..OBJECTS).collect::<Vec<_>>().chunks(30) {
+        let hung: Vec<_> = batch
+            .iter()
+            .map(|n| {
+                let (client, url) = (client.clone(), server.url(&format!("/do-hang?n={n}")));
+                tokio::spawn(async move { client.get(url).send().await.expect("hang").status() })
+            })
+            .collect();
+        for task in hung {
+            let status = task.await.expect("hang task");
+            assert!(status.is_success(), "{status}");
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    redeploy(&server).await;
+
+    // Let the deadline pass while the handoffs are still going.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // Only what was running at the deadline is ended. An event that starts
+    // afterwards on an object that has not moved yet is left to the swap.
+    for batch in (0..OBJECTS).collect::<Vec<_>>().chunks(30) {
+        let naps: Vec<_> = batch
+            .iter()
+            .map(|n| {
+                let (client, url) = (client.clone(), server.url(&format!("/do-nap?n={n}")));
+                tokio::spawn(async move {
+                    let response = client.get(url).send().await.expect("nap");
+                    (response.status(), response.text().await.unwrap_or_default())
+                })
+            })
+            .collect();
+        for task in naps {
+            let (status, body) = task.await.expect("nap task");
+            assert!(status.is_success(), "{status} {body}");
+            assert_eq!(body, "napped");
+        }
+    }
+
+    // Every object's `waitUntil` work never ends. Held on the old isolate
+    // past the deadline, it is ended, and the generation is freed.
+    wait_until(
+        "the generation held by the objects' work to be freed",
+        Duration::from_secs(60),
+        || async {
+            let state = state(&server).await;
+            state["deployment"]["draining"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+                .then_some(())
+        },
+    )
+    .await;
+    assert!(
+        !server.log_text().contains("panicked"),
+        "{}",
+        server.log_text()
+    );
+
+    assert_eq!(server.get_text("/version").await, "v2");
+}

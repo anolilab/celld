@@ -106,6 +106,25 @@ pub fn max_age() -> std::time::Duration {
     std::time::Duration::from_secs(seconds)
 }
 
+/// How long a superseded deployment's isolates may live,
+/// `CELLD_RETIRE_DEADLINE_S`. Past it, work still running there is ended
+/// and the isolates are freed. The default is the handler budget plus the
+/// longer of a minute and `CELLD_DEPLOY_MAX_AGE_S`: a handler that obeys its
+/// budget is never cut short, a resident cell has been forced onto the new
+/// deployment by then, and what outlives both is `waitUntil` work or a
+/// stream nobody reads.
+pub fn retire_deadline() -> std::time::Duration {
+    static DEADLINE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *DEADLINE.get_or_init(|| {
+        let slack = max_age().as_secs().max(60);
+        let default = crate::js::handler_budget().as_secs().saturating_add(slack);
+        std::time::Duration::from_secs(
+            crate::env_vars::positive_or("CELLD_RETIRE_DEADLINE_S", default)
+                .expect("validated CELLD_RETIRE_DEADLINE_S"),
+        )
+    })
+}
+
 /// The scripts one deployment reaches: the primary script plus every
 /// service-binding target and queue consumer it declares, transitively.
 ///
@@ -347,6 +366,10 @@ pub struct Generation {
     /// See `Manifest::fence_image`; the first script's, they are all the
     /// same image when one celld deployed them.
     pub(crate) fence_image: Option<String>,
+    /// When this generation was superseded, in `asyncrt::mono_ms`.
+    retired_at: std::sync::OnceLock<u64>,
+    /// Held so the retire timer ends when this generation is dropped.
+    retire_timer_stop: std::sync::OnceLock<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Generation {
@@ -437,13 +460,82 @@ impl Generation {
     /// Stop every isolate of this generation from taking new work. Stateless
     /// isolates free as their affiliations drop; cell isolates free as their
     /// cells move to a newer generation.
-    pub(crate) fn retire(&self) {
+    pub(crate) fn retire(self: &Arc<Self>) {
+        let retired_at = crate::asyncrt::mono_ms();
+        let _ = self.retired_at.set(retired_at);
         for service in self.services.values() {
             service.isolates.retire_all();
         }
         for pool in self.cell_isolates.values() {
             pool.retire_all();
         }
+        self.spawn_retire_deadline(retired_at);
+    }
+
+    /// Start the one timer that ends this generation's remaining work at
+    /// `CELLD_RETIRE_DEADLINE_S`. It holds a weak reference and ends as soon
+    /// as the generation is dropped, so a generation that drains sooner
+    /// leaves no sleeping task behind, and it reads the same clock `/state`
+    /// reports.
+    // Spawned on the ambient runtime like the generation's maintenance loop,
+    // and not at all where there is none.
+    #[allow(clippy::disallowed_methods)]
+    fn spawn_retire_deadline(self: &Arc<Self>, retired_at: u64) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        if self.retire_timer_stop.set(stop).is_err() {
+            return;
+        }
+        let deadline = retire_deadline();
+        let generation = Arc::downgrade(self);
+        // From the moment of retiring, not from when the pool locks let the
+        // timer start.
+        let elapsed =
+            std::time::Duration::from_millis(crate::asyncrt::mono_ms().saturating_sub(retired_at));
+        handle.spawn(retire_timer(
+            deadline.saturating_sub(elapsed),
+            stopped,
+            move || {
+                if let Some(generation) = generation.upgrade() {
+                    generation.force_retired(deadline);
+                }
+            },
+        ));
+    }
+
+    /// The retire deadline passed: end the work still running in this
+    /// generation's isolates. Each request driver notices at its next
+    /// cancellation sample and ends as a shutdown ends it, so its
+    /// `waitUntil` work and native operations go and the isolate frees
+    /// through the ordinary reclaim path.
+    fn force_retired(&self, deadline: std::time::Duration) {
+        let requests: usize = self
+            .services
+            .values()
+            .map(|service| service.isolates.force_retired())
+            .chain(self.cell_isolates.values().map(|pool| pool.force_retired()))
+            .sum();
+        if requests > 0 {
+            tracing::warn!(
+                event = "retire_deadline_forced",
+                generation = self.id,
+                version = %self.version,
+                deadline_s = deadline.as_secs(),
+                requests,
+                "superseded deployment outlived its deadline; ending its work"
+            );
+        }
+    }
+
+    /// How long this generation has been superseded, or `None` while it
+    /// serves. A superseded generation that is still listed holds isolates,
+    /// and `CELLD_RETIRE_DEADLINE_S` bounds this age.
+    pub(crate) fn retired_for_ms(&self) -> Option<u64> {
+        self.retired_at
+            .get()
+            .map(|at| crate::asyncrt::mono_ms().saturating_sub(*at))
     }
 
     /// Whether every isolate of this generation has been freed, so the
@@ -688,9 +780,23 @@ impl Generation {
             assets,
             containers: all_containers,
             fence_image,
+            retired_at: std::sync::OnceLock::new(),
+            retire_timer_stop: std::sync::OnceLock::new(),
         })
     }
 }
+/// Sleep `remaining`, then run `fire`, unless `stopped` resolves first. The
+/// sender is dropped with its generation.
+async fn retire_timer(
+    remaining: std::time::Duration,
+    stopped: tokio::sync::oneshot::Receiver<()>,
+    fire: impl FnOnce(),
+) {
+    if crate::asyncrt::timeout(remaining, stopped).await.is_err() {
+        fire();
+    }
+}
+
 /// Claim one class name in a deployment's cell registry.
 ///
 /// A duplicate is an error for a user class, because `start_cell` resolves a
@@ -711,5 +817,50 @@ fn register_cell_class(
         }
         Entry::Occupied(slot) if crate::deploy::is_shared_reserved_class(slot.key()) => Ok(()),
         Entry::Occupied(slot) => Err(duplicate(slot.key())),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod retire_timer_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::retire_timer;
+
+    /// A generation that drops before its deadline must not leave a sleeping
+    /// task behind: the timer ends at once, without firing.
+    #[tokio::test]
+    async fn the_timer_ends_when_its_generation_drops() {
+        crate::asyncrt::install_test_host_runtime();
+        let fired = Arc::new(AtomicBool::new(false));
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(retire_timer(Duration::from_secs(3600), stopped, {
+            let fired = fired.clone();
+            move || fired.store(true, Ordering::SeqCst)
+        }));
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        drop(stop);
+        // An hour has not passed, so only the drop can end it.
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the timer ended")
+            .expect("timer task");
+        assert!(!fired.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn the_timer_fires_at_the_deadline_while_its_generation_lives() {
+        crate::asyncrt::install_test_host_runtime();
+        let fired = Arc::new(AtomicBool::new(false));
+        let (_stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        retire_timer(Duration::from_millis(20), stopped, {
+            let fired = fired.clone();
+            move || fired.store(true, Ordering::SeqCst)
+        })
+        .await;
+        assert!(fired.load(Ordering::SeqCst));
     }
 }
