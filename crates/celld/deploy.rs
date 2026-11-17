@@ -3794,13 +3794,13 @@ mod compatibility_config_tests {
         let error = read(
             "main.py",
             r#"{ "name": "app", "main": "main.py", "compatibility_date": "2026-01-01",
-                 "compatibility_flags": ["cache_option_enabled", "no_global_navigator"] }"#,
+                 "compatibility_flags": ["streaming_tail_worker", "no_global_navigator"] }"#,
         )
         .err()
         .expect("unsupported flags are refused")
         .to_string();
         assert!(
-            error.contains("cache_option_enabled: not supported"),
+            error.contains("streaming_tail_worker: not supported"),
             "{error}"
         );
         assert!(
