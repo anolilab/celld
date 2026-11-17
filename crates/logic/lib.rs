@@ -5552,6 +5552,7 @@ impl State {
             }
             if cell.swapping {
                 cell.recycle = true;
+                cell.last_recycle_mono_ms = Some(self.now_mono_ms);
                 self.recycle_pending.remove(&id);
                 continue;
             }
@@ -5641,8 +5642,21 @@ impl State {
                 .saturating_sub(self.generation_changed_mono_ms)
                 >= self.swap_max_age_ms;
         let in_flight = self.cells.values().filter(|cell| cell.swapping).count();
-        let room = self.config.max_releases.saturating_sub(in_flight);
-        let room = self.nominate_recycles(room);
+        // Recycles have their own room: an unforced generation swap can hold
+        // its slot until the maximum age, and a latched cell must not wait
+        // that long. Recycles are still bounded by `max_releases`, so a
+        // node-wide disk-full does not restart every cell at once.
+        let recycling = self
+            .cells
+            .values()
+            .filter(|cell| cell.swapping && cell.recycle)
+            .count();
+        let recycle_room = self.config.max_releases.saturating_sub(recycling);
+        let nominated_now = recycle_room - self.nominate_recycles(recycle_room);
+        let room = self
+            .config
+            .max_releases
+            .saturating_sub(in_flight + nominated_now);
         let stale: Vec<CellId> = self
             .cells
             .iter()

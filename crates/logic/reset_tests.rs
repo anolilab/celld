@@ -391,6 +391,72 @@ fn a_report_upgrades_an_unforced_swap_to_a_recycle() {
 }
 
 #[test]
+fn a_recycle_is_nominated_while_an_unforced_swap_holds_the_room() {
+    let mut shell = Shell::new(config());
+    let _busy = shell.request("a");
+    let idle = shell.request("b");
+    shell.finish(idle);
+    let now_mono_ms = shell.tick(1);
+    shell.send(Event::GenerationChanged {
+        generation: 1,
+        now_mono_ms,
+        max_age_ms: 3_600_000,
+        eager_classes: Vec::new(),
+    });
+    // The busy cell's unforced swap fills max_releases = 1.
+    assert_eq!(shell.state.swapping(), 1, "the swap did not start");
+    broken(&mut shell, "b");
+    shell.expect("the latched cell's stop", |effect| match effect {
+        Effect::StopRuntime { cell, .. } if cell == "b" => Some(()),
+        _ => None,
+    });
+}
+
+#[test]
+fn an_upgraded_swap_starts_the_recycle_back_off() {
+    let mut shell = Shell::new(config());
+    let busy = shell.request("a");
+    let now_mono_ms = shell.tick(1);
+    shell.send(Event::GenerationChanged {
+        generation: 1,
+        now_mono_ms,
+        max_age_ms: 3_600_000,
+        eager_classes: Vec::new(),
+    });
+    broken(&mut shell, "a");
+    shell.finish(busy);
+    let stop = shell.expect("the stop", |effect| match effect {
+        Effect::StopRuntime { op, cell, .. } if cell == "a" => Some(*op),
+        _ => None,
+    });
+    shell.send(Event::RuntimeStopped { op: stop });
+    // The restart lands on the current generation, so only a recycle can
+    // stop the cell again.
+    let start = shell.expect("the restart", |effect| match effect {
+        Effect::StartRuntime { op, .. } => Some(*op),
+        _ => None,
+    });
+    shell.send(Event::RuntimeStarted {
+        op: start,
+        isolate: None,
+        generation: 1,
+        result: Ok(()),
+    });
+    shell.settle();
+    broken(&mut shell, "a");
+    shell.settle();
+    assert!(
+        shell
+            .take(|effect| match effect {
+                Effect::StopRuntime { cell, .. } if cell == "a" => Some(()),
+                _ => None,
+            })
+            .is_none(),
+        "a restarted twice inside the back-off"
+    );
+}
+
+#[test]
 fn a_recycling_cell_defers_a_due_alarm() {
     let mut shell = Shell::new(config());
     let busy = shell.request("a");
