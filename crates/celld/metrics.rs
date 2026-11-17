@@ -1,23 +1,29 @@
 //! Node metrics in Prometheus text format, served at `GET /metrics` on the
 //! internal listener behind the operator token.
 //!
-//! Two sources feed it. The node state that `/state` reports (cell counts,
-//! handoffs, memory, the storage counters) is read from that snapshot at
-//! scrape time, so those series cost the request path nothing. Requests are
-//! counted here, on the hot path, with plain relaxed atomics: per request,
-//! one increment for the status class, one for the latency bucket and one
-//! for the latency sum, plus one clock read. Nothing allocates.
+//! A scrape reads, and never builds, the `/state` document. The gauges only
+//! the cell actor knows arrive as one small [`Counts`] reply, every field a
+//! counter the state machine already keeps. The storage and claim counters
+//! are process atomics, read here directly.
 //!
-//! Every label value comes from a fixed set in this file or from the phase
-//! names of the cell state machine. No cell id, tenant string or URL path is
-//! ever a label, so the number of series does not grow with the number of
-//! cells.
+//! Requests are counted on the hot path with plain relaxed atomics: per
+//! request one increment for the status class, one for the latency bucket and
+//! one for the latency sum, and two clock reads (the start, and the elapsed
+//! time at the response head). Nothing allocates. The counters are sharded
+//! per thread, each shard on its own cache lines, so cores do not take turns
+//! on one line; a scrape sums the shards.
+//!
+//! Every label value comes from a fixed set in this file. No cell id, tenant
+//! string or URL path is ever a label, so the number of series does not grow
+//! with the number of cells.
 
+use std::convert::Infallible;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use crate::storage_counters;
 
 /// The `Content-Type` of the exposition.
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -52,7 +58,11 @@ impl Listener {
     }
 }
 
-const CLASSES: [&str; 5] = ["1xx", "2xx", "3xx", "4xx", "5xx"];
+/// The status classes, then `dropped`: a request whose service future was
+/// dropped before it produced a response, because the client went away or a
+/// forced drain closed the connection.
+const CLASSES: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "dropped"];
+const DROPPED: usize = CLASSES.len() - 1;
 
 /// Upper bounds of the latency buckets, in microseconds. A request that takes
 /// longer than the last one lands in the `+Inf` bucket.
@@ -79,14 +89,26 @@ impl Requests {
     }
 }
 
-static REQUESTS: [Requests; 3] = [const { Requests::new() }; 3];
+/// One thread's counters for every listener. The alignment keeps two shards
+/// off the same cache line (128 bytes covers the adjacent-line prefetch of
+/// x86 and the line size of Apple silicon).
+#[repr(align(128))]
+struct Shard([Requests; 3]);
 
-/// Count one answered request. The latency runs from the start of handling
-/// to the moment the response head is ready, so it excludes streaming the
-/// body and any time the connection spent idle.
-pub fn record_request(listener: Listener, status: u16, elapsed: Duration) {
-    let requests = &REQUESTS[listener as usize];
-    let class = usize::from((status / 100).clamp(1, 5) - 1);
+const SHARDS: usize = 64;
+
+static REQUESTS: [Shard; SHARDS] = [const { Shard([const { Requests::new() }; 3]) }; SHARDS];
+
+static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// Threads take shards in turn. More threads than shards share one, which
+    /// stays correct: the counters are atomic.
+    static SHARD: usize = NEXT_SHARD.fetch_add(1, Ordering::Relaxed) % SHARDS;
+}
+
+fn record(listener: Listener, class: usize, elapsed: Duration) {
+    let requests = &REQUESTS[SHARD.with(|shard| *shard)].0[listener as usize];
     let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
     let bucket = BOUNDS_US.partition_point(|bound| *bound < micros);
     requests.by_class[class].fetch_add(1, Ordering::Relaxed);
@@ -94,21 +116,108 @@ pub fn record_request(listener: Listener, status: u16, elapsed: Duration) {
     requests.sum_us.fetch_add(micros, Ordering::Relaxed);
 }
 
-/// One metric family: a name, a type and the `/state` fields behind it. A
-/// member with an empty label value has no label.
+/// Count one answered request. The latency runs from the start of handling
+/// to the moment the response head is ready, so it excludes streaming the
+/// body and any time the connection spent idle.
+pub fn record_request(listener: Listener, status: u16, elapsed: Duration) {
+    record(
+        listener,
+        usize::from((status / 100).clamp(1, 5) - 1),
+        elapsed,
+    );
+}
+
+/// Records a request as `dropped` if its future is dropped before it ends.
+struct Unanswered {
+    listener: Listener,
+    started: Instant,
+    answered: bool,
+}
+
+impl Drop for Unanswered {
+    fn drop(&mut self) {
+        if !self.answered {
+            record(self.listener, DROPPED, self.started.elapsed());
+        }
+    }
+}
+
+/// Serve one request and count it: by its status class when it answers, as
+/// `dropped` when the future is dropped first.
+// Connection tasks run on the host runtime, outside the execution domain whose
+// clock the lint points to, so the request clock is the plain monotonic one.
+#[allow(clippy::disallowed_methods)]
+pub async fn observe<B>(
+    listener: Listener,
+    served: impl Future<Output = Result<hyper::Response<B>, Infallible>>,
+) -> Result<hyper::Response<B>, Infallible> {
+    let mut guard = Unanswered {
+        listener,
+        started: Instant::now(),
+        answered: false,
+    };
+    let result = served.await;
+    guard.answered = true;
+    if let Ok(reply) = &result {
+        record_request(listener, reply.status().as_u16(), guard.started.elapsed());
+    }
+    result
+}
+
+/// What the cell actor reports. All of it is read from counters the state
+/// machine keeps, so building it does not depend on the number of cells.
+#[derive(Debug, Default)]
+pub struct Counts {
+    /// As of the last load tick.
+    pub owned_cells: usize,
+    pub resident_cells: usize,
+    pub quiescing: usize,
+    pub evicting: usize,
+    pub releasing: usize,
+    pub adopting: usize,
+    /// Cold starts not yet finished: `activating` plus `activation_waiting`.
+    pub restoring: usize,
+    pub activating: usize,
+    pub activation_waiting: usize,
+    pub capacity_waiting: usize,
+    pub handed_off: u64,
+    pub handoff_failed: u64,
+    pub rebalanced: u64,
+    pub rebalance_failed: u64,
+    pub remote_route_refreshes: u64,
+    pub shedding: bool,
+    pub rss_bytes: u64,
+    pub in_use_bytes: u64,
+    pub cgroup_working_set_bytes: Option<u64>,
+    pub cgroup_current_bytes: Option<u64>,
+    /// The bundle count and the age of the oldest, in milliseconds.
+    pub retained_bundles: (usize, Option<u64>),
+}
+
+/// Everything one scrape reads.
+struct Reading {
+    node: Counts,
+    store: storage_counters::Counts,
+}
+
+type Value = fn(&Reading) -> Option<f64>;
+
+/// One metric family: a name, a type and where each of its values comes from.
+/// A member with an empty label value has no label. A value that is `None` is
+/// left out.
 struct Family {
     name: &'static str,
     kind: &'static str,
     help: &'static str,
     label: &'static str,
-    members: &'static [(&'static str, &'static str)],
+    members: &'static [(&'static str, Value)],
 }
 
 const fn counter(
     name: &'static str,
     help: &'static str,
     label: &'static str,
-    members: &'static [(&'static str, &'static str)],
+    members: &'static [(&'static str, Value)],
 ) -> Family {
     Family {
         name,
@@ -123,7 +232,7 @@ const fn gauge(
     name: &'static str,
     help: &'static str,
     label: &'static str,
-    members: &'static [(&'static str, &'static str)],
+    members: &'static [(&'static str, Value)],
 ) -> Family {
     Family {
         name,
@@ -134,121 +243,144 @@ const fn gauge(
     }
 }
 
-/// Members are `(label value, JSON pointer into the /state snapshot)`.
+#[allow(clippy::cast_precision_loss)]
+fn n(value: impl Into<u64>) -> Option<f64> {
+    Some(value.into() as f64)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn size(value: usize) -> Option<f64> {
+    Some(value as f64)
+}
+
 const FAMILIES: &[Family] = &[
     gauge(
         "celld_owned_cells",
-        "Cells this node owns.",
+        "Cells this node owns, as of the last load sample.",
         "",
-        &[("", "/owned_cells")],
+        &[("", |r| size(r.node.owned_cells))],
     ),
     gauge(
         "celld_resident_cells",
         "Cells that occupy capacity on this node.",
         "",
-        &[("", "/occupied")],
+        &[("", |r| size(r.node.resident_cells))],
+    ),
+    gauge(
+        "celld_cells_restoring",
+        "Cold starts not yet finished: the sum of the activating and activation_waiting states.",
+        "",
+        &[("", |r| size(r.node.restoring))],
     ),
     gauge(
         "celld_cells_in_transition",
-        "Cells in each transitional state, including those waiting for capacity.",
+        "Cells in each transitional state. capacity_waiting is a subset of activating: a cell waiting for capacity already holds its activation slot.",
         "state",
         &[
-            ("quiescing", "/quiescing"),
-            ("evicting", "/evicting"),
-            ("releasing", "/releasing"),
-            ("adopting", "/adopting"),
-            ("restoring", "/restoring"),
-            ("activating", "/activating"),
-            ("activation_waiting", "/activation_waiting"),
-            ("capacity_waiting", "/capacity_waiting"),
+            ("quiescing", |r| size(r.node.quiescing)),
+            ("evicting", |r| size(r.node.evicting)),
+            ("releasing", |r| size(r.node.releasing)),
+            ("adopting", |r| size(r.node.adopting)),
+            ("activating", |r| size(r.node.activating)),
+            ("activation_waiting", |r| size(r.node.activation_waiting)),
+            ("capacity_waiting", |r| size(r.node.capacity_waiting)),
         ],
     ),
     counter(
         "celld_handoffs_total",
         "Graceful handoffs of a cell to another node, by outcome.",
         "outcome",
-        &[("ok", "/handed_off"), ("failed", "/handoff_failed")],
+        &[
+            ("ok", |r| n(r.node.handed_off)),
+            ("failed", |r| n(r.node.handoff_failed)),
+        ],
     ),
     counter(
         "celld_rebalances_total",
         "Cells moved to rebalance the fleet, by outcome.",
         "outcome",
-        &[("ok", "/rebalanced"), ("failed", "/rebalance_failed")],
+        &[
+            ("ok", |r| n(r.node.rebalanced)),
+            ("failed", |r| n(r.node.rebalance_failed)),
+        ],
     ),
     counter(
         "celld_remote_route_refreshes_total",
         "Routes to a remote owner that were looked up again.",
         "",
-        &[("", "/remote_route_refreshes")],
+        &[("", |r| n(r.node.remote_route_refreshes))],
+    ),
+    gauge(
+        "celld_shedding",
+        "1 while the node refuses new cells to protect itself, else 0.",
+        "",
+        &[("", |r| n(u8::from(r.node.shedding)))],
     ),
     gauge(
         "celld_rss_bytes",
         "Resident set size of the process.",
         "",
-        &[("", "/rss_bytes")],
+        &[("", |r| n(r.node.rss_bytes))],
     ),
     gauge(
         "celld_in_use_bytes",
         "Bytes the allocator hands out to the process.",
         "",
-        &[("", "/in_use_bytes")],
+        &[("", |r| n(r.node.in_use_bytes))],
     ),
     gauge(
         "celld_cgroup_working_set_bytes",
         "Working set of the container cgroup, when there is one.",
         "",
-        &[("", "/cgroup_working_set_bytes")],
+        &[("", |r| r.node.cgroup_working_set_bytes.and_then(n))],
     ),
     gauge(
         "celld_cgroup_current_bytes",
         "Memory the container cgroup uses, when there is one.",
         "",
-        &[("", "/cgroup_current_bytes")],
+        &[("", |r| r.node.cgroup_current_bytes.and_then(n))],
     ),
     counter(
         "celld_ids_minted_total",
         "Durable Object ids drawn by newUniqueId.",
         "",
-        &[("", "/storage_counters/ids_minted")],
+        &[("", |r| n(r.store.ids_minted))],
     ),
     counter(
         "celld_claims_total",
         "Claims of a cell's ownership record that the store accepted.",
         "",
-        &[("", "/storage_counters/claims")],
+        &[("", |r| n(r.store.claims))],
     ),
     counter(
         "celld_first_claims_total",
         "Claims that created a cell's ownership record.",
         "",
-        &[("", "/storage_counters/first_claims")],
+        &[("", |r| n(r.store.first_claims))],
     ),
     counter(
         "celld_evictions_total",
         "Cell evictions past the durability barrier, by what they left to restore from.",
         "outcome",
         &[
-            ("snapshot", "/storage_counters/evictions/snapshot"),
-            ("paged", "/storage_counters/evictions/paged"),
-            ("over_budget", "/storage_counters/evictions/over_budget"),
-            (
-                "publish_failed",
-                "/storage_counters/evictions/publish_failed",
-            ),
-            ("empty", "/storage_counters/evictions/empty"),
+            ("snapshot", |r| n(r.store.evictions[0])),
+            ("paged", |r| n(r.store.evictions[1])),
+            ("over_budget", |r| n(r.store.evictions[2])),
+            ("publish_failed", |r| n(r.store.evictions[3])),
+            ("empty", |r| n(r.store.evictions[4])),
         ],
     ),
     counter(
         "celld_minted_untracked_total",
         "First claims of ids this process did not mint and has no record of.",
         "",
-        &[("", "/storage_counters/minted_untracked")],
+        &[("", |r| n(r.store.provenance.minted_untracked))],
     ),
     counter(
         "celld_first_claims_minted_local_total",
         "First claims of ids this process minted.",
         "",
-        &[("", "/storage_counters/first_claims_minted_local")],
+        &[("", |r| n(r.store.provenance.first_claims_minted_local))],
     ),
     counter(
         "celld_first_claims_minted_local_no_ensemble_total",
@@ -256,7 +388,7 @@ const FAMILIES: &[Family] = &[
         "",
         &[(
             "",
-            "/storage_counters/first_claims_minted_local_no_ensemble",
+            |r| n(r.store.provenance.first_claims_minted_local_no_ensemble),
         )],
     ),
     counter(
@@ -264,9 +396,11 @@ const FAMILIES: &[Family] = &[
         "Second claims of a cell, by who held it before.",
         "prior",
         &[
-            ("released", "/storage_counters/second_claims_prior_released"),
-            ("self", "/storage_counters/second_claims_prior_self"),
-            ("other", "/storage_counters/second_claims_prior_other"),
+            ("released", |r| {
+                n(r.store.provenance.second_claims_prior_released)
+            }),
+            ("self", |r| n(r.store.provenance.second_claims_prior_self)),
+            ("other", |r| n(r.store.provenance.second_claims_prior_other)),
         ],
     ),
     counter(
@@ -274,41 +408,77 @@ const FAMILIES: &[Family] = &[
         "Ownership releases, by reason.",
         "reason",
         &[
-            ("drain", "/storage_counters/releases_drain"),
-            ("handoff", "/storage_counters/releases_handoff"),
+            ("drain", |r| n(r.store.provenance.releases_drain)),
+            ("handoff", |r| n(r.store.provenance.releases_handoff)),
         ],
     ),
     counter(
         "celld_preserved_resumes_total",
         "Cells resumed from a preserved ownership record.",
         "",
-        &[("", "/storage_counters/preserved_resumes")],
+        &[("", |r| n(r.store.provenance.preserved_resumes))],
     ),
     gauge(
         "celld_retained_bundles",
         "Node log bundles kept for a replica that has not caught up.",
         "",
-        &[("", "/storage_counters/retained_bundles/count")],
+        &[("", |r| size(r.node.retained_bundles.0))],
+    ),
+    gauge(
+        "celld_retained_bundles_oldest_age_seconds",
+        "Age of the oldest retained node log bundle.",
+        "",
+        &[("", |r| {
+            r.node
+                .retained_bundles
+                .1
+                .map(|ms| ms as f64 / 1000.0)
+        })],
     ),
 ];
 
-/// Render the exposition from the `/state` snapshot and the request counters.
-/// A snapshot that is not JSON, or lacks a field, leaves out the series that
-/// read it; the request series are always present.
-pub fn render(state: &str) -> String {
-    let state: Value = serde_json::from_str(state).unwrap_or(Value::Null);
+const REQUEST_FAMILIES: [&str; 2] = [
+    "celld_http_requests_total",
+    "celld_http_request_duration_seconds",
+];
+
+/// The series a node leaves out when it has nothing to report: the cgroup
+/// figures outside a container, and the age of a bundle when none is kept.
+pub const OPTIONAL_FAMILIES: [&str; 3] = [
+    "celld_cgroup_working_set_bytes",
+    "celld_cgroup_current_bytes",
+    "celld_retained_bundles_oldest_age_seconds",
+];
+
+/// The name of every family the exposition can carry.
+pub fn family_names() -> impl Iterator<Item = &'static str> {
+    FAMILIES
+        .iter()
+        .map(|family| family.name)
+        .chain(REQUEST_FAMILIES)
+}
+
+/// Render the exposition from the actor's counts, the storage counters and
+/// the request counters.
+pub fn render(node: Counts) -> String {
+    render_reading(&Reading {
+        node,
+        store: storage_counters::counts(),
+    })
+}
+
+fn render_reading(reading: &Reading) -> String {
     let mut out = String::with_capacity(8 * 1024);
     for family in FAMILIES {
-        let samples: Vec<(&str, f64)> = family
-            .members
-            .iter()
-            .filter_map(|(label, pointer)| Some((*label, state.pointer(pointer)?.as_f64()?)))
-            .collect();
-        if samples.is_empty() {
-            continue;
-        }
-        header(&mut out, family.name, family.kind, family.help);
-        for (label, value) in samples {
+        let mut written = false;
+        for (label, value) in family.members {
+            let Some(value) = value(reading) else {
+                continue;
+            };
+            if !written {
+                header(&mut out, family.name, family.kind, family.help);
+                written = true;
+            }
             if label.is_empty() {
                 let _ = writeln!(out, "{} {value}", family.name);
             } else {
@@ -320,24 +490,6 @@ pub fn render(state: &str) -> String {
             }
         }
     }
-    shedding(&mut out, &state);
-    phases(&mut out, &state);
-    if let Some(age_ms) = state
-        .pointer("/storage_counters/retained_bundles/oldest_age_ms")
-        .and_then(Value::as_f64)
-    {
-        header(
-            &mut out,
-            "celld_retained_bundles_oldest_age_seconds",
-            "gauge",
-            "Age of the oldest retained node log bundle.",
-        );
-        let _ = writeln!(
-            out,
-            "celld_retained_bundles_oldest_age_seconds {}",
-            age_ms / 1000.0
-        );
-    }
     requests(&mut out);
     out
 }
@@ -347,75 +499,60 @@ fn header(out: &mut String, name: &str, kind: &str, help: &str) {
     let _ = writeln!(out, "# TYPE {name} {kind}");
 }
 
-/// Whether the node is shedding load. The snapshot names the reason; the
-/// reason is not a label, since it is free to grow.
-fn shedding(out: &mut String, state: &Value) {
-    let Some(shedding) = state.get("shedding") else {
-        return;
-    };
-    header(
-        out,
-        "celld_shedding",
-        "gauge",
-        "1 while the node refuses new cells to protect itself, else 0.",
-    );
-    let _ = writeln!(out, "celld_shedding {}", u8::from(!shedding.is_null()));
+/// The request counters of one listener, summed over the shards.
+struct Totals {
+    by_class: [u64; CLASSES.len()],
+    buckets: [u64; BUCKETS],
+    sum_us: u64,
 }
 
-/// The cell census by phase of the cell state machine. The phase names are a
-/// fixed set in the code, not data.
-fn phases(out: &mut String, state: &Value) {
-    let Some(phases) = state.get("phases").and_then(Value::as_object) else {
-        return;
+fn totals(listener: Listener) -> Totals {
+    let mut totals = Totals {
+        by_class: [0; CLASSES.len()],
+        buckets: [0; BUCKETS],
+        sum_us: 0,
     };
-    header(
-        out,
-        "celld_cells_by_phase",
-        "gauge",
-        "Cells in each phase of the cell state machine.",
-    );
-    for (phase, count) in phases {
-        let Some(count) = count.as_u64() else {
-            continue;
-        };
-        let phase: String = phase
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        let _ = writeln!(out, "celld_cells_by_phase{{phase=\"{phase}\"}} {count}");
+    for shard in &REQUESTS {
+        let requests = &shard.0[listener as usize];
+        for (total, count) in totals.by_class.iter_mut().zip(&requests.by_class) {
+            *total += count.load(Ordering::Relaxed);
+        }
+        for (total, count) in totals.buckets.iter_mut().zip(&requests.buckets) {
+            *total += count.load(Ordering::Relaxed);
+        }
+        totals.sum_us += requests.sum_us.load(Ordering::Relaxed);
     }
+    totals
 }
 
 fn requests(out: &mut String) {
+    let totals = Listener::ALL.map(totals);
     header(
         out,
-        "celld_http_requests_total",
+        REQUEST_FAMILIES[0],
         "counter",
-        "Requests answered, by listener and status class.",
+        "Requests answered, by listener and status class. dropped counts requests abandoned before a response, such as a client that disconnected.",
     );
-    for listener in Listener::ALL {
-        let requests = &REQUESTS[listener as usize];
-        for (class, count) in CLASSES.iter().zip(&requests.by_class) {
+    for (listener, totals) in Listener::ALL.iter().zip(&totals) {
+        for (class, count) in CLASSES.iter().zip(totals.by_class) {
             let _ = writeln!(
                 out,
-                "celld_http_requests_total{{listener=\"{}\",class=\"{class}\"}} {}",
+                "celld_http_requests_total{{listener=\"{}\",class=\"{class}\"}} {count}",
                 listener.name(),
-                count.load(Ordering::Relaxed)
             );
         }
     }
     header(
         out,
-        "celld_http_request_duration_seconds",
+        REQUEST_FAMILIES[1],
         "histogram",
-        "Time from the start of handling a request to its response head.",
+        "Time from the start of handling a request to its response head, or to its abandonment.",
     );
-    for listener in Listener::ALL {
-        let requests = &REQUESTS[listener as usize];
+    for (listener, totals) in Listener::ALL.iter().zip(&totals) {
         let name = listener.name();
         let mut cumulative = 0;
-        for (index, bucket) in requests.buckets.iter().enumerate() {
-            cumulative += bucket.load(Ordering::Relaxed);
+        for (index, count) in totals.buckets.iter().enumerate() {
+            cumulative += count;
             let le = BOUNDS_US
                 .get(index)
                 .map_or_else(|| "+Inf".to_owned(), |us| (*us as f64 / 1e6).to_string());
@@ -427,7 +564,7 @@ fn requests(out: &mut String) {
         let _ = writeln!(
             out,
             "celld_http_request_duration_seconds_sum{{listener=\"{name}\"}} {}",
-            requests.sum_us.load(Ordering::Relaxed) as f64 / 1e6
+            totals.sum_us as f64 / 1e6
         );
         let _ = writeln!(
             out,
@@ -442,32 +579,21 @@ mod tests {
 
     use super::*;
 
-    fn state(cells: usize) -> String {
-        let residents: Vec<String> = (0..cells).map(|n| format!("tenant/{n}")).collect();
-        let generations: std::collections::BTreeMap<_, _> =
-            residents.iter().map(|cell| (cell.clone(), 1)).collect();
-        serde_json::json!({
-            "owned_cells": cells,
-            "occupied": cells,
-            "quiescing": 0, "evicting": 1, "releasing": 0, "adopting": 0,
-            "restoring": 2, "activating": 0, "activation_waiting": 0,
-            "capacity_waiting": 3,
-            "phases": { "Resident": cells, "Dormant": 1 },
-            "handed_off": 4, "handoff_failed": 0, "rebalanced": 0, "rebalance_failed": 0,
-            "remote_route_refreshes": 5,
-            "shedding": null,
-            "rss_bytes": 1024, "in_use_bytes": 512,
-            "cgroup_working_set_bytes": null, "cgroup_current_bytes": null,
-            "storage_counters": {
-                "ids_minted": 6, "claims": 7, "first_claims": 8,
-                "evictions": { "snapshot": 9, "paged": 0, "over_budget": 0,
-                               "publish_failed": 1, "empty": 0 },
-                "retained_bundles": { "count": 2, "oldest_age_ms": 1500 },
-            },
-            "residents": residents,
-            "deployment": { "cells": generations },
-        })
-        .to_string()
+    fn counts() -> Counts {
+        Counts {
+            owned_cells: 3,
+            resident_cells: 3,
+            evicting: 1,
+            restoring: 2,
+            activating: 2,
+            capacity_waiting: 3,
+            handed_off: 4,
+            remote_route_refreshes: 5,
+            rss_bytes: 1024,
+            in_use_bytes: 512,
+            retained_bundles: (2, Some(1500)),
+            ..Counts::default()
+        }
     }
 
     /// Every `name{label="value"}` series, without the sample value.
@@ -481,27 +607,29 @@ mod tests {
     }
 
     #[test]
-    fn the_exposition_has_help_type_and_the_state_series() {
+    fn the_exposition_has_help_type_and_the_actor_series() {
         record_request(Listener::Public, 200, Duration::from_millis(3));
-        let text = render(&state(3));
+        let text = render(counts());
         for line in [
-            "# HELP celld_owned_cells Cells this node owns.",
+            "# HELP celld_owned_cells ",
             "# TYPE celld_owned_cells gauge",
             "# TYPE celld_claims_total counter",
             "# TYPE celld_http_request_duration_seconds histogram",
             "celld_owned_cells 3",
+            "celld_cells_restoring 2",
             "celld_cells_in_transition{state=\"capacity_waiting\"} 3",
-            "celld_evictions_total{outcome=\"publish_failed\"} 1",
             "celld_handoffs_total{outcome=\"ok\"} 4",
             "celld_retained_bundles 2",
             "celld_retained_bundles_oldest_age_seconds 1.5",
             "celld_shedding 0",
-            "celld_cells_by_phase{phase=\"Dormant\"} 1",
+            "celld_http_requests_total{listener=\"public\",class=\"dropped\"}",
             "celld_http_request_duration_seconds_bucket{listener=\"peer\",le=\"+Inf\"}",
         ] {
             assert!(text.lines().any(|l| l.starts_with(line)), "{line}\n{text}");
         }
-        // A null field is left out, not reported as zero.
+        // `restoring` is its own gauge: the transition states hold no total.
+        assert!(!text.contains("state=\"restoring\""));
+        // A value the node cannot report is left out, not reported as zero.
         assert!(!text.contains("celld_cgroup_current_bytes "));
         // Every sample line belongs to a family declared with HELP and TYPE.
         let typed: BTreeSet<&str> = text
@@ -519,38 +647,80 @@ mod tests {
     }
 
     #[test]
-    fn requests_land_in_their_class_and_bucket() {
+    fn every_family_is_rendered_when_the_node_reports_everything() {
+        let text = render(Counts {
+            cgroup_working_set_bytes: Some(1),
+            cgroup_current_bytes: Some(2),
+            ..counts()
+        });
+        for name in family_names() {
+            assert!(text.contains(&format!("# TYPE {name} ")), "{name}\n{text}");
+        }
+        let bare = render(Counts::default());
+        for name in family_names().filter(|name| !OPTIONAL_FAMILIES.contains(name)) {
+            assert!(bare.contains(&format!("# TYPE {name} ")), "{name}");
+        }
+    }
+
+    #[test]
+    fn requests_land_in_their_class_and_bucket_across_threads() {
         let read = || {
-            let r = &REQUESTS[Listener::Internal as usize];
-            (
-                r.by_class[4].load(Ordering::Relaxed),
-                r.buckets[BUCKETS - 1].load(Ordering::Relaxed),
-            )
+            let t = totals(Listener::Internal);
+            (t.by_class[4], t.buckets[BUCKETS - 1])
         };
         let (errors, slow) = read();
-        record_request(Listener::Internal, 503, Duration::from_secs(60));
-        assert_eq!(read(), (errors + 1, slow + 1));
+        // Several threads land on different shards; the scrape sums them.
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| record_request(Listener::Internal, 503, Duration::from_secs(60)));
+            }
+        });
+        assert_eq!(read(), (errors + 4, slow + 4));
         // A status outside 100..=599 is clamped, not an index out of range.
         record_request(Listener::Peer, 0, Duration::from_millis(1));
         record_request(Listener::Peer, 999, Duration::from_millis(1));
     }
 
     #[test]
-    fn no_label_value_grows_with_the_number_of_cells() {
-        let few = render(&state(2));
-        let many = render(&state(5_000));
-        assert_eq!(label_sets(&few), label_sets(&many));
-        assert!(
-            !many.contains("tenant/"),
-            "a cell id reached the exposition"
-        );
-        assert_eq!(few.lines().count(), many.lines().count());
+    fn shards_do_not_share_a_cache_line() {
+        assert!(std::mem::align_of::<Shard>() >= 128);
+        assert_eq!(std::mem::size_of::<Shard>() % 128, 0);
+    }
+
+    #[tokio::test]
+    async fn a_request_dropped_before_its_response_is_counted_as_dropped() {
+        let dropped = || totals(Listener::Internal).by_class[DROPPED];
+        let before = dropped();
+        let mut never = Box::pin(observe(
+            Listener::Internal,
+            std::future::pending::<Result<hyper::Response<()>, Infallible>>(),
+        ));
+        // Poll once so the future has started, then abandon it.
+        assert!(futures_poll_once(never.as_mut()));
+        drop(never);
+        assert_eq!(dropped(), before + 1);
+        // A request that answers is counted by its status, not as dropped.
+        let ok_before = totals(Listener::Internal).by_class[1];
+        let reply = hyper::Response::new(());
+        let _ = observe(Listener::Internal, async { Ok(reply) }).await;
+        assert_eq!(totals(Listener::Internal).by_class[1], ok_before + 1);
+        assert_eq!(dropped(), before + 1);
+    }
+
+    fn futures_poll_once<F: Future>(mut future: std::pin::Pin<&mut F>) -> bool {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        future.as_mut().poll(&mut context).is_pending()
     }
 
     #[test]
-    fn a_snapshot_that_is_not_json_still_renders_the_request_series() {
-        let text = render("{\"error\":\"actor_stopped\"");
-        assert!(text.contains("celld_http_requests_total"));
-        assert!(!text.contains("celld_owned_cells"));
+    fn no_label_value_grows_with_the_number_of_cells() {
+        let few = render(counts());
+        let many = render(Counts {
+            owned_cells: 5_000,
+            resident_cells: 5_000,
+            ..counts()
+        });
+        assert_eq!(label_sets(&few), label_sets(&many));
+        assert_eq!(few.lines().count(), many.lines().count());
     }
 }

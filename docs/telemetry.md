@@ -83,10 +83,10 @@ OTLP yet.
 
 | Series | Type | Labels |
 | --- | --- | --- |
-| `celld_owned_cells` | gauge | |
+| `celld_owned_cells` | gauge | as of the last load sample |
 | `celld_resident_cells` | gauge | |
-| `celld_cells_in_transition` | gauge | `state`: `quiescing`, `evicting`, `releasing`, `adopting`, `restoring`, `activating`, `activation_waiting`, `capacity_waiting` |
-| `celld_cells_by_phase` | gauge | `phase`: the phase names in the `/state` `phases` field |
+| `celld_cells_restoring` | gauge | cold starts not yet finished: `activating` plus `activation_waiting` |
+| `celld_cells_in_transition` | gauge | `state`: `quiescing`, `evicting`, `releasing`, `adopting`, `activating`, `activation_waiting`, `capacity_waiting` (a subset of `activating`) |
 | `celld_handoffs_total` | counter | `outcome`: `ok`, `failed` |
 | `celld_rebalances_total` | counter | `outcome`: `ok`, `failed` |
 | `celld_remote_route_refreshes_total` | counter | |
@@ -100,15 +100,26 @@ OTLP yet.
 | `celld_releases_total` | counter | `reason`: `drain`, `handoff` |
 | `celld_minted_untracked_total`, `celld_first_claims_minted_local_total`, `celld_first_claims_minted_local_no_ensemble_total`, `celld_preserved_resumes_total` | counter | |
 | `celld_retained_bundles`, `celld_retained_bundles_oldest_age_seconds` | gauge | |
-| `celld_http_requests_total` | counter | `listener`: `public`, `internal`, `peer`; `class`: `1xx` to `5xx` |
+| `celld_http_requests_total` | counter | `listener`: `public`, `internal`, `peer`; `class`: `1xx` to `5xx`, `dropped` |
 | `celld_http_request_duration_seconds` | histogram | `listener`; buckets from 1 ms to 10 s |
 
-The state series are read from the `/state` snapshot when you scrape. The
-request series are plain atomic counters: a request adds a few relaxed
-increments and one clock read, and allocates nothing. The latency runs from
-the start of handling to the response head, so it excludes the body stream.
+A scrape does not build the `/state` document and does not walk the cells.
+The node answers with a handful of counts it already keeps, and the storage
+counters are read directly. The per-phase cell census stays in `/state`
+(`phases`), where it is built on demand.
+
+The request series are plain atomic counters, kept per thread on separate
+cache lines and summed when you scrape, so concurrent requests do not
+contend. A request adds a few relaxed increments and two clock reads (its
+start, and its elapsed time at the response head), and allocates nothing.
+The latency excludes the body stream. A request whose connection goes away
+before it has a response, or that a forced drain cuts off, counts under
+`class="dropped"`, with its time up to that point.
+
 `public` is the Worker listener, `peer` is the `/peer/` routes of the
-internal listener, and `internal` is the rest of it.
+internal listener, and `internal` is the rest of it. On `peer`, a tunnel
+upgrade counts once, with a `1xx` class, and the calls carried over the
+tunnel are not counted. A WebSocket upgrade on `public` counts once.
 
 ## Query the bucket with DuckDB
 

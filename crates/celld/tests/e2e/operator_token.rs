@@ -296,8 +296,15 @@ async fn metrics_answer_with_the_token_and_refuse_without_it() {
         "text/plain; version=0.0.4; charset=utf-8"
     );
     let text = metrics.text().await.unwrap();
+    // Every family the exposition can carry is there, so a field the node
+    // stops reporting cannot drop a series unnoticed. Without a container
+    // the cgroup figures, and without a retained bundle its age, are absent.
+    for name in celld::metrics::family_names() {
+        if !celld::metrics::OPTIONAL_FAMILIES.contains(&name) {
+            assert!(text.contains(&format!("# TYPE {name} ")), "{name}\n{text}");
+        }
+    }
     assert!(text.contains("# TYPE celld_owned_cells gauge"), "{text}");
-    assert!(text.contains("# TYPE celld_http_request_duration_seconds histogram"));
     // The 401 above was counted on the internal listener.
     let refused = text
         .lines()
