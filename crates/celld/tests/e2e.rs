@@ -24,6 +24,7 @@ mod e2e {
     pub mod harness;
     pub mod invoke;
     pub mod isolates;
+    pub mod loader_isolation;
     pub mod node_crypto;
     pub mod operator_branches;
     pub mod operator_token;
