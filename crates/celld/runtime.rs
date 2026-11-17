@@ -42,6 +42,32 @@ const MAX_ALARM_COMPLETIONS: usize = 65_536;
 /// How often the isolate pool gives back what it no longer needs.
 const REAP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often a superseded generation is checked for having freed its last
+/// isolate, so it leaves the draining list soon after, not up to a
+/// `REAP_INTERVAL` later.
+const DRAIN_POLL: Duration = Duration::from_millis(250);
+
+/// Drop a drained generation from the draining list.
+fn remove_drained(
+    generations: &std::sync::RwLock<crate::cell_runtime::Generations>,
+    generation: &Arc<Generation>,
+) {
+    let mut generations = generations.write().expect("generation lock poisoned");
+    if let Some(index) = generations
+        .draining
+        .iter()
+        .position(|candidate| Arc::ptr_eq(candidate, generation))
+    {
+        generations.draining.remove(index);
+        tracing::info!(
+            event = "deployment_generation_freed",
+            generation = generation.id,
+            version = %generation.version,
+            "application generation freed"
+        );
+    }
+}
+
 /// How long a reclaim waits before it retries when admission holds the pool.
 const RECLAIM_RETRY: Duration = Duration::from_millis(10);
 
@@ -834,6 +860,7 @@ impl RuntimeManager {
         // previous generation and this must not hold the generation lock,
         // which every request reads.
         previous.retire();
+        self.watch_drain(&previous);
         next
     }
 
@@ -866,19 +893,32 @@ impl RuntimeManager {
                 if !generation.is_drained() {
                     continue;
                 }
-                let mut generations = generations.write().expect("generation lock poisoned");
-                if let Some(index) = generations
-                    .draining
-                    .iter()
-                    .position(|candidate| Arc::ptr_eq(candidate, &generation))
-                {
-                    generations.draining.remove(index);
-                    tracing::info!(
-                        event = "deployment_generation_freed",
-                        generation = generation.id,
-                        version = %generation.version,
-                        "application generation freed"
-                    );
+                remove_drained(&generations, &generation);
+            }
+        });
+    }
+
+    /// Spawn the loop that removes a superseded generation from the draining
+    /// list as soon as its last isolate is freed. The maintenance loop of
+    /// `watch_generation` ticks every `REAP_INTERVAL` and would leave a
+    /// generation that freed just after a tick listed, and counted by
+    /// `/state`, for another full interval.
+    fn watch_drain(&self, generation: &Arc<Generation>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let draining = Arc::downgrade(generation);
+        let generations = self.generations.clone();
+        handle.spawn(async move {
+            loop {
+                tokio::time::sleep(DRAIN_POLL).await;
+                let Some(generation) = draining.upgrade() else {
+                    return;
+                };
+                generation.reap_cell_pools();
+                if generation.is_drained() {
+                    remove_drained(&generations, &generation);
+                    return;
                 }
             }
         });
