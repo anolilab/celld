@@ -47,14 +47,15 @@ fn now_ms() -> u64 {
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
-/// The operator token of the fleet, which every internal route asks for when it
-/// is set. It is read from the variable the nodes read it from.
-type Token = Option<String>;
+/// The operator token of the fleet, which every internal route asks for. It is
+/// read the way the celld commands read it: from the variable the nodes read
+/// it from, else from the token file of a node on this machine.
+type Token = Option<celld::operator_token::OperatorToken>;
 
 async fn get(client: &reqwest::Client, token: &Token, url: &str) -> Result<Value, String> {
     let request = client.get(url);
     let request = match token {
-        Some(token) => request.bearer_auth(token),
+        Some(token) => request.header(reqwest::header::AUTHORIZATION, token.bearer()),
         None => request,
     };
     request
@@ -121,7 +122,8 @@ async fn run(dir: &Path, nodes: Vec<String>, days: u64, interval: Duration) {
         .timeout(Duration::from_secs(10))
         .build()
         .expect("build the client");
-    let token = env_text("CELLD_OPERATOR_TOKEN");
+    let token = celld::operator_token::OperatorToken::from_env()
+        .unwrap_or_else(|error| panic!("{error:#}"));
     let mut cursors = record::Cursors::default();
     let end = tokio::time::Instant::now() + Duration::from_secs(days * 86_400);
     let mut ticker = tokio::time::interval(interval);

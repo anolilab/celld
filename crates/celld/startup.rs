@@ -58,6 +58,15 @@ impl Advertise {
         }
     }
 
+    /// Whether peers can only reach this address from the same host. A name
+    /// is resolved by each peer, so only `localhost` counts.
+    pub fn is_loopback(&self) -> bool {
+        match self {
+            Self::Addr(address) => address.ip().is_loopback(),
+            Self::Name { host, .. } => host.eq_ignore_ascii_case("localhost"),
+        }
+    }
+
     pub fn is_public_ip(&self) -> bool {
         matches!(self, Self::Addr(address) if advertise_scope(address.ip()) == "operator-routed network")
     }
@@ -240,9 +249,8 @@ pub async fn bind_internal_listener(
     };
     if advertise.is_public_ip() && !settings.unsafe_public_advertise {
         return Err(anyhow!(
-            "--advertise {advertise} is a public IP address; the internal listener \
-             has an unauthenticated operator API, and peer HTTP carries application \
-             data without built-in TLS. Use a private overlay, or pass \
+            "--advertise {advertise} is a public IP address; peer HTTP carries \
+             application data and the operator token without built-in TLS. Use a private overlay, or pass \
              --unsafe-public-advertise to accept this exposure explicitly"
         ));
     }

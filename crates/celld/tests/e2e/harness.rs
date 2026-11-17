@@ -123,20 +123,24 @@ impl Server {
     /// the file the node generated in its state directory.
     pub async fn internal_get(&self, path: &str) -> reqwest::RequestBuilder {
         let url = self.internal_url(path).await;
-        self.client.get(url).bearer_auth(self.operator_token())
+        let token = self.operator_token().await;
+        self.client
+            .get(url)
+            .header(reqwest::header::AUTHORIZATION, token.bearer())
     }
 
-    /// The operator token of this node. Read after the node announced its
-    /// internal listener, which is after the file exists.
-    pub fn operator_token(&self) -> String {
+    /// The operator token of this node: the variable the test passed, else the
+    /// file the node generated, which exists once the node announced its
+    /// internal listener.
+    pub async fn operator_token(&self) -> celld::operator_token::OperatorToken {
+        use celld::operator_token::OperatorToken;
+        self.internal_url("/").await;
         if let Some((_, token)) = self.env.iter().find(|(k, _)| k == "CELLD_OPERATOR_TOKEN") {
-            return token.clone();
+            return OperatorToken::parse(std::ffi::OsStr::new(token)).expect("a valid token");
         }
-        let file = self.project.join(".celld/dev/operator-token");
-        fs::read_to_string(&file)
-            .unwrap_or_else(|error| panic!("read {}: {error}", file.display()))
-            .trim()
-            .to_string()
+        OperatorToken::from_file(&celld::dev::operator_token_path(&self.project))
+            .expect("read the node's token file")
+            .expect("the node wrote its token file")
     }
 
     pub async fn get_text(&self, path: &str) -> String {
@@ -183,10 +187,7 @@ impl Server {
             .spawn(read_operator_identity(database))
             .await
             .expect("read the operator identity");
-        let token = celld::operator_token::OperatorToken::parse(std::ffi::OsStr::new(
-            &self.operator_token(),
-        ))
-        .expect("the node's operator token");
+        let token = self.operator_token().await;
         let auth = celld::peer_auth::PeerAuth::new(key, "d1")
             .expect("build peer auth")
             .with_operator_token(Some(token));

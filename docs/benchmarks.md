@@ -180,9 +180,10 @@ process's.
 `answers` is the directory's answers beside the claim listing, summed over the
 nodes, with `nodes_counted` and `nodes_unreadable` so that a node whose `/state`
 could not be read is visible: one that does not answer, answers with an error
-status (a node with `CELLD_OPERATOR_TOKEN` set refuses the read with a 401), or
-sends no JSON. A run with an unreadable node is not a complete
-count.
+status (a node refuses a read without its operator token with a 401; the
+bench gives its nodes one and sends it), or sends no JSON. A run with an
+unreadable node is not a complete count, so the bench stops with an error when
+the final read of a node fails.
 
 | Directory answer | LTX not found | LTX found |
 | ---------------- | ------------- | --------- |
@@ -344,8 +345,8 @@ It polls every 5 minutes for 7 days and writes, to `./claim-sample/` (or
 
 Settings: `CELLD_SAMPLE_NODES` (comma-separated base URLs, required),
 `CELLD_SAMPLE_DAYS` (7), `CELLD_SAMPLE_INTERVAL_S` (300), `CELLD_SAMPLE_OUT`
-(`claim-sample`), `CELLD_SAMPLE_SUMMARIZE`, and `CELLD_OPERATOR_TOKEN` when the
-fleet sets one.
+(`claim-sample`), `CELLD_SAMPLE_SUMMARIZE`, and `CELLD_OPERATOR_TOKEN` (or the
+token file of a node on this machine) for the token the fleet asks for.
 
 Counters reset when a process restarts, so they are summed per process
 (`session` and `process_start_ms`). A process that began after the first poll

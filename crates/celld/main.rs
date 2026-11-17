@@ -984,16 +984,9 @@ fn internal_rebalance_switch(paused: bool) -> HttpReply {
 }
 
 /// `POST /invoke`: run one request on a staged version. The listener gate
-/// has already checked the operator token when one is configured; the route
-/// itself refuses on a node without one and checks the fleet signature.
+/// has already checked the operator token; the route checks the fleet
+/// signature.
 async fn internal_invoke(request: Request<Incoming>, app: AppHandle) -> HttpReply {
-    // A node without a token refuses before it buffers a body.
-    if let Some((status, text)) = celld::invoke::refuse_without_token(&app) {
-        return peer_response(response(
-            StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
-            text,
-        ));
-    }
     let method = request.method().clone();
     let path_and_query = request
         .uri()
@@ -1950,7 +1943,6 @@ async fn dispatch_cell_fetch(
     method: String,
     body: celld::js::RequestBody,
     headers: Vec<(String, String)>,
-    operator_ingress: bool,
 ) -> HttpReply {
     let preserve_representation_length = method.eq_ignore_ascii_case("HEAD");
     let (reply, receive) = oneshot::channel();
@@ -1975,7 +1967,8 @@ async fn dispatch_cell_fetch(
         // Cross-node trace propagation is not available here, so a direct-DO
         // ingress starts without a remote parent.
         parent: None,
-        operator_ingress,
+        // The only route here is the signed operator route.
+        operator_ingress: true,
     });
     if !accepted {
         return response(
@@ -3029,8 +3022,6 @@ async fn handle_internal(
                 "POST".to_string(),
                 celld::js::RequestBody::Bytes(body),
                 vec![("content-type".to_string(), "application/json".to_string())],
-                // The signature above is what makes this the operator's call.
-                true,
             )
             .await
         }
@@ -3207,13 +3198,12 @@ fn spawn_shutdown_acceptor(
 /// listener is never gated: it serves the Worker and the health endpoint.
 fn operator_gate(
     surface: HttpSurface,
-    token: Option<&celld::operator_token::OperatorToken>,
+    token: &celld::operator_token::OperatorToken,
     headers: &mut hyper::HeaderMap,
 ) -> Option<HttpReply> {
     if matches!(surface, HttpSurface::Public) {
         return None;
     }
-    let token = token?;
     if token.authorizes(headers) {
         // The credential is for this gate only: the headers can be forwarded
         // to a cell, here or on a remote owner, so the token must not travel
@@ -3264,11 +3254,9 @@ fn serve_http_connection(
                 let service_requests = service_requests.clone();
                 async move {
                     let mut request = request;
-                    if let Some(refusal) = operator_gate(
-                        surface,
-                        app.peer_auth.operator_token(),
-                        request.headers_mut(),
-                    ) {
+                    if let Some(refusal) =
+                        operator_gate(surface, &app.operator_token, request.headers_mut())
+                    {
                         return Ok(refusal);
                     }
                     match surface {
@@ -3640,8 +3628,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let internal_listener = internal.listener;
     // Before anything else starts: a node that cannot authenticate its
     // internal listener must not serve it.
-    let operator_token =
-        celld::operator_token::OperatorToken::for_node(internal_listener.local_addr()?.ip())?;
+    let operator_token = celld::operator_token::OperatorToken::for_node(
+        internal_listener.local_addr()?.ip(),
+        &internal.advertise,
+    )?;
     celld::egress_filter::register_node_addresses(
         &[listener.local_addr()?, internal_listener.local_addr()?],
         &internal.advertise,
@@ -4122,8 +4112,9 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         };
         celld::telemetry::init(config, sink_bucket, node.clone(), settings.region.clone())?;
     }
-    let peer_auth =
-        Arc::new(PeerAuth::new(peer_key, node.clone())?.with_operator_token(Some(operator_token)));
+    let peer_auth = Arc::new(
+        PeerAuth::new(peer_key, node.clone())?.with_operator_token(Some(operator_token.clone())),
+    );
     // Connect-only timeout: a peer request may legitimately run through a
     // restore, but a handshake that never completes provably ran nothing.
     let peer_http = reqwest::Client::builder()
@@ -4195,6 +4186,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         reload: reload_tx.clone(),
         peer_http,
         peer_auth,
+        operator_token,
         advertise: advertise.clone(),
         websockets: websocket_tx,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),

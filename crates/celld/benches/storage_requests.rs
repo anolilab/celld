@@ -316,10 +316,19 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
 async fn read_states(client: &reqwest::Client, nodes: &[Node]) -> Vec<Option<Value>> {
     let mut states = Vec::new();
     for node in nodes {
-        states.push(read_state(client, &format!("{}/state", node.internal)).await);
+        states.push(read_state(client, OPERATOR_TOKEN, &format!("{}/state", node.internal)).await);
     }
+    // A node whose state cannot be read must not pass as a quiet one: the
+    // counters would all read zero.
+    assert!(
+        states.iter().all(Option::is_some),
+        "a node's /state is unreadable (is the operator token {OPERATOR_TOKEN:?} accepted?)"
+    );
     states
 }
+
+/// The operator token of every node this bench starts, and the one it sends.
+const OPERATOR_TOKEN: &str = "bench-operator-token";
 
 /// How often the retained bundles of the nodes are read while a run goes on.
 const RETENTION_SAMPLE: Duration = Duration::from_secs(2);
@@ -349,7 +358,7 @@ fn sample_retention(client: &reqwest::Client, nodes: &[Node]) -> RetentionSample
     let task = tokio::spawn(async move {
         loop {
             for url in &urls {
-                let sample = read_state(&client, url)
+                let sample = read_state(&client, OPERATOR_TOKEN, url)
                     .await
                     .as_ref()
                     .and_then(bundle_sample);
@@ -392,6 +401,10 @@ impl Node {
             .args(["--advertise", &format!("127.0.0.1:{internal}")])
             .env("CELLD_NODE", format!("node-{index}"))
             .env("CELLD_WATCH", home.join("state"))
+            // The internal listener asks for this token, and no node writes
+            // a token file into the developer's own configuration directory.
+            .env("CELLD_OPERATOR_TOKEN", OPERATOR_TOKEN)
+            .env("CELLD_CONFIG_DIR", home.join("config"))
             .envs(env.iter().copied())
             .current_dir(&home)
             .stdin(Stdio::null())

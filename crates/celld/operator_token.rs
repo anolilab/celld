@@ -28,15 +28,18 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use subtle::ConstantTimeEq;
 
+use crate::startup::Advertise;
+
 /// The variable that holds the token.
 pub const ENV: &str = "CELLD_OPERATOR_TOKEN";
 
 /// The variable that names the file a generated token is kept in and read
-/// from. Without it the file is `operator-token` in celld's per-user
+/// from. Without it the file is [`FILE_NAME`] in celld's per-user
 /// configuration directory.
 pub const FILE_ENV: &str = "CELLD_OPERATOR_TOKEN_FILE";
 
-const FILE_NAME: &str = "operator-token";
+/// The name of the token file inside a configuration or state directory.
+pub const FILE_NAME: &str = "operator-token";
 
 const SCHEME: &str = "Bearer";
 
@@ -45,7 +48,7 @@ fn token_file() -> anyhow::Result<PathBuf> {
     match std::env::var_os(FILE_ENV) {
         Some(path) if !path.is_empty() => Ok(PathBuf::from(path)),
         Some(_) => bail!("{FILE_ENV} is set but empty"),
-        None => Ok(crate::control_plane::config_dir()?.join(FILE_NAME)),
+        None => Ok(crate::config_dir::path()?.join(FILE_NAME)),
     }
 }
 
@@ -68,35 +71,44 @@ impl OperatorToken {
     /// node on this machine generated, else none. A set variable that is
     /// empty, has surrounding whitespace or is not a usable header value is an
     /// error and never reads as "unset", and so is a file that holds one: a
-    /// typo must not quietly send no credential.
+    /// typo must not quietly send no credential. The file's location is
+    /// resolved only when the variable is not set.
     pub fn from_env() -> anyhow::Result<Option<Self>> {
-        match Self::from_variable()? {
-            Some(token) => Ok(Some(token)),
-            None => Self::from_file(&token_file()?),
-        }
+        Self::resolve(token_file)
     }
 
-    /// `CELLD_OPERATOR_TOKEN`, else the token file at `path`. `celld dev`
-    /// keeps its node's file in the project's state directory.
+    /// Like [`from_env`](Self::from_env), with the token file at `path`.
+    /// `celld dev` keeps its node's file in the project's state directory.
     pub fn from_env_or_file(path: &Path) -> anyhow::Result<Option<Self>> {
+        Self::resolve(|| Ok(path.to_path_buf()))
+    }
+
+    fn resolve(path: impl FnOnce() -> anyhow::Result<PathBuf>) -> anyhow::Result<Option<Self>> {
         match Self::from_variable()? {
             Some(token) => Ok(Some(token)),
-            None => Self::from_file(path),
+            None => Self::from_file(&path()?),
         }
     }
 
-    fn from_variable() -> anyhow::Result<Option<Self>> {
+    /// `CELLD_OPERATOR_TOKEN` alone, without reading any file. Startup
+    /// validation uses it, so a damaged token file stops only the commands
+    /// that need the file.
+    pub(crate) fn from_variable() -> anyhow::Result<Option<Self>> {
         match std::env::var_os(ENV) {
             None => Ok(None),
-            Some(value) => Self::parse(&value).map(Some),
+            Some(value) => Self::parse(&value)
+                .with_context(|| format!("{ENV} is not usable"))
+                .map(Some),
         }
     }
 
     /// The token a node enforces. `CELLD_OPERATOR_TOKEN` wins. Without it, a
-    /// node bound to a loopback address loads the token file, creating it with
-    /// a random token when it is missing, and a node bound to any other
-    /// address refuses to start.
-    pub fn for_node(internal_bind: IpAddr) -> anyhow::Result<Self> {
+    /// node that binds and advertises only loopback addresses loads the token
+    /// file, creating it with a random token when it is missing. Any other
+    /// node refuses to start: the generated file is only reachable from the
+    /// machine the node runs on, so a peer or a client elsewhere could never
+    /// learn it.
+    pub fn for_node(internal_bind: IpAddr, advertise: &Advertise) -> anyhow::Result<Self> {
         if let Some(token) = Self::from_variable()? {
             return Ok(token);
         }
@@ -105,6 +117,14 @@ impl OperatorToken {
                 "the internal listener is bound to {internal_bind}, which is not a loopback address, \
                  so {ENV} must be set to the shared token of the fleet; every internal request \
                  must carry it as `Authorization: Bearer <token>`"
+            );
+        }
+        if !advertise.is_loopback() {
+            bail!(
+                "this node advertises {advertise}, which is not a loopback address, so peers and \
+                 clients on other machines dial it and {ENV} must be set to the shared token of \
+                 the fleet; every internal request must carry it as \
+                 `Authorization: Bearer <token>`"
             );
         }
         let path = token_file()?;
@@ -118,53 +138,84 @@ impl OperatorToken {
         Ok(token)
     }
 
-    /// Read a token file. A missing file is `None`; one that other users can
-    /// read or that holds an unusable value is an error.
+    /// Read a token file. A missing file is `None`. A symbolic link, a file
+    /// another user owns or can read, and one that holds an unusable value are
+    /// errors: the file is a credential, so it must be the node owner's own.
     #[allow(clippy::disallowed_methods)] // A per-user credential file, not node storage.
-    fn from_file(path: &Path) -> anyhow::Result<Option<Self>> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
+    pub fn from_file(path: &Path) -> anyhow::Result<Option<Self>> {
+        use std::io::Read as _;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = match options.open(path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                bail!(
+                    "{} is a symbolic link; replace it with the token file",
+                    path.display()
+                );
+            }
             Err(error) => {
                 return Err(error).with_context(|| format!("read {}", path.display()));
             }
         };
+        // Checked on the open file, so the file cannot change between the
+        // check and the read.
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("stat {}", path.display()))?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(path)
-                .with_context(|| format!("stat {}", path.display()))?
-                .permissions()
-                .mode();
-            if mode & 0o077 != 0 {
-                bail!(
-                    "{} is readable by other users (mode {:o}); run `chmod 600` on it or delete it",
-                    path.display(),
-                    mode & 0o777
-                );
-            }
+            // SAFETY: `geteuid` takes no arguments and cannot fail.
+            check_private(path, &metadata, unsafe { libc::geteuid() })?;
         }
+        #[cfg(not(unix))]
+        anyhow::ensure!(
+            metadata.is_file(),
+            "{} is not a regular file",
+            path.display()
+        );
+        let mut text = String::new();
+        file.read_to_string(&mut text)
+            .with_context(|| format!("read {}", path.display()))?;
         Self::parse(OsStr::new(text.trim_end_matches(['\r', '\n'])))
             .with_context(|| format!("{} does not hold a usable token", path.display()))
             .map(Some)
     }
 
     /// Load the token file, or write one holding a random token. The file
-    /// appears complete or not at all: it is written under another name and
-    /// linked into place, so two nodes starting together agree on one token.
+    /// appears complete or not at all: it is written and flushed under a
+    /// random name and linked into place, so two nodes starting together agree
+    /// on one token, and a crash leaves at most an unused staging file that no
+    /// later start trips over.
     #[allow(clippy::disallowed_methods)] // A per-user credential file, not node storage.
     fn load_or_create(path: &Path) -> anyhow::Result<Self> {
         if let Some(token) = Self::from_file(path)? {
             return Ok(token);
         }
-        if let Some(parent) = path.parent() {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        if let Some(parent) = parent {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
         }
+        let mut rng = crate::asyncrt::rng("operator_token");
         let mut random = [0_u8; 32];
-        crate::asyncrt::rng("operator_token").fill_bytes(&mut random);
+        rng.fill_bytes(&mut random);
         let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
-        let staging = path.with_extension(format!("{}.new", std::process::id()));
+        let name = path.file_name().unwrap_or(OsStr::new(FILE_NAME));
+        let staging = path.with_file_name(format!(
+            "{}.{:016x}.new",
+            name.to_string_lossy(),
+            rng.next_u64()
+        ));
         {
             use std::io::Write as _;
             let mut options = std::fs::OpenOptions::new();
@@ -178,12 +229,20 @@ impl OperatorToken {
                 .open(&staging)
                 .with_context(|| format!("create {}", staging.display()))?;
             file.write_all(value.as_bytes())
+                .and_then(|()| file.sync_all())
                 .with_context(|| format!("write {}", staging.display()))?;
         }
         let linked = std::fs::hard_link(&staging, path);
         let _ = std::fs::remove_file(&staging);
         match linked {
-            Ok(()) => Self::parse(OsStr::new(&value)),
+            Ok(()) => {
+                // Best effort: the file is complete either way.
+                #[cfg(unix)]
+                if let Some(Ok(directory)) = parent.map(std::fs::File::open) {
+                    let _ = directory.sync_all();
+                }
+                Self::parse(OsStr::new(&value))
+            }
             // Another node won the race; its token is the one in the file.
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 Self::from_file(path)?
@@ -194,22 +253,23 @@ impl OperatorToken {
     }
 
     /// Validate a token. It must be non-empty printable ASCII with no
-    /// whitespace, so it is a valid bearer credential as written.
+    /// whitespace, so it is a valid bearer credential as written. The errors
+    /// do not name the source; the caller adds it.
     pub fn parse(raw: &OsStr) -> anyhow::Result<Self> {
         let Some(value) = raw.to_str() else {
-            bail!("{ENV} must be valid UTF-8");
+            bail!("the token must be valid UTF-8");
         };
         if value.is_empty() {
-            bail!("{ENV} is set but empty; unset it to use the generated token");
+            bail!("the token is empty; remove it to use the generated token");
         }
         if value.trim() != value {
-            bail!("{ENV} must not have leading or trailing whitespace");
+            bail!("the token must not have leading or trailing whitespace");
         }
         if !value.bytes().all(|byte| byte.is_ascii_graphic()) {
-            bail!("{ENV} must contain only printable ASCII characters and no whitespace");
+            bail!("the token must contain only printable ASCII characters and no whitespace");
         }
         let mut bearer = HeaderValue::from_str(&format!("{SCHEME} {value}"))
-            .map_err(|_| anyhow!("{ENV} is not a valid header value"))?;
+            .map_err(|_| anyhow!("the token is not a valid header value"))?;
         bearer.set_sensitive(true);
         Ok(Self {
             bearer,
@@ -242,6 +302,34 @@ impl OperatorToken {
         let presented: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
         presented.ct_eq(&self.digest).into()
     }
+}
+
+/// Refuse a token file that is not the node owner's own private file.
+#[cfg(unix)]
+fn check_private(path: &Path, metadata: &std::fs::Metadata, euid: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{} is not a regular file",
+        path.display()
+    );
+    if metadata.uid() != euid {
+        bail!(
+            "{} is owned by user {}, not by the user running this command ({euid}); \
+             delete it or take it over",
+            path.display(),
+            metadata.uid()
+        );
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        bail!(
+            "{} is readable by other users (mode {:o}); run `chmod 600` on it or delete it",
+            path.display(),
+            mode & 0o777
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -354,12 +442,56 @@ mod tests {
     }
 
     #[test]
-    fn a_non_loopback_bind_needs_the_variable() {
-        // `CELLD_OPERATOR_TOKEN` is not set in a unit test run, and the
-        // check on the bind address comes before any file is touched.
-        if std::env::var_os(ENV).is_none() {
-            let error = OperatorToken::for_node("0.0.0.0".parse().unwrap()).unwrap_err();
-            assert!(format!("{error}").contains(ENV));
-        }
+    fn a_stale_staging_file_does_not_block_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        // What a crashed start left behind, under the name every start in a
+        // container (always pid 1) would have used.
+        std::fs::write(
+            dir.path()
+                .join(format!("{FILE_NAME}.{}.new", std::process::id())),
+            "half",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(format!("{FILE_NAME}.1.new")), "half").unwrap();
+        let token = OperatorToken::load_or_create(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(token.authorizes(&headers(&[&format!("Bearer {text}")])));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symbolic_link_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::write(&real, "fine-token").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join(FILE_NAME);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = OperatorToken::from_file(&link).unwrap_err();
+        assert!(format!("{error:#}").contains("symbolic link"), "{error:#}");
+        // Creating a node's file never writes through a link either.
+        assert!(OperatorToken::load_or_create(&link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_another_user_owns_is_refused() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(&path, "fine-token").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        check_private(&path, &metadata, metadata.uid()).unwrap();
+        let error = check_private(&path, &metadata, metadata.uid() + 1).unwrap_err();
+        assert!(format!("{error:#}").contains("owned by user"), "{error:#}");
+    }
+
+    #[test]
+    fn a_bad_token_names_its_source_not_the_variable_for_a_file() {
+        let error = OperatorToken::parse(OsStr::new("a b")).unwrap_err();
+        assert!(!format!("{error}").contains(ENV), "{error}");
     }
 }

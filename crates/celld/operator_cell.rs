@@ -100,7 +100,7 @@ impl Reachable {
         // The same secret and the same source shape `celld diagnose` uses.
         let auth = match auth {
             Some(auth) => auth,
-            None => crate::peer_auth::PeerAuth::new(
+            None => crate::peer_auth::PeerAuth::for_client(
                 crate::peer_auth::load_existing(bucket).await?,
                 subject.source,
             )?,

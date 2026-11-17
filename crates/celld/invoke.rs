@@ -146,23 +146,6 @@ pub fn shadow_pointer(
     }
 }
 
-/// The refusal a node without an operator token gives, which needs no body.
-/// A running node always has a token, so the listener gate refuses first. The
-/// route still refuses on its own when its handle carries none: a node without
-/// a token runs no staged code for anyone.
-pub fn refuse_without_token(app: &AppHandle) -> Option<(u16, String)> {
-    missing_token(app).map(Refusal::into_reply)
-}
-
-fn missing_token(app: &AppHandle) -> Option<Refusal> {
-    app.peer_auth.operator_token().is_none().then(|| {
-        Refusal::new(
-            403,
-            "invoke requires CELLD_OPERATOR_TOKEN to be set on the node",
-        )
-    })
-}
-
 /// Aborts the staged request when the handler is dropped before it answers,
 /// as when the caller disconnects, so the shadow generation can drain.
 struct AbortOnDrop(Option<std::sync::Arc<crate::runtime::RequestCancellationLifetime>>);
@@ -202,9 +185,6 @@ async fn run(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<InvokeResponse, Refusal> {
-    if let Some(refusal) = missing_token(app) {
-        return Err(refusal);
-    }
     if let Err(error) = app.peer_auth.verify(
         method,
         path_and_query,

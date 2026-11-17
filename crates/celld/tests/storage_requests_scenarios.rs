@@ -222,22 +222,58 @@ async fn node_answering(status: &'static str, body: &'static str) -> String {
 #[tokio::test]
 async fn a_state_that_answers_ok_is_read() {
     let url = node_answering("200 OK", r#"{"cell_directory_answers":null}"#).await;
-    let state = read_state(&reqwest::Client::new(), &url).await;
+    let state = read_state(&reqwest::Client::new(), "bench", &url).await;
     assert_eq!(state, Some(json!({ "cell_directory_answers": null })));
 }
 
 #[tokio::test]
 async fn a_refused_state_read_is_unreadable_not_a_node_without_a_directory() {
     let url = node_answering("401 Unauthorized", r#"{"error":"operator token required"}"#).await;
-    assert_eq!(read_state(&reqwest::Client::new(), &url).await, None);
+    assert_eq!(
+        read_state(&reqwest::Client::new(), "bench", &url).await,
+        None
+    );
     let total = sum_answers(&[None, None]);
     assert_eq!(total["nodes_unreadable"], 2);
+}
+
+/// A node that answers 200 to a request that carries `Authorization: Bearer
+/// <token>` and 401 to any other.
+async fn node_requiring(token: &'static str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = [0_u8; 2048];
+            let read = stream.read(&mut request).await.unwrap_or(0);
+            let head = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            let (status, body) = if head.contains(&format!("authorization: bearer {token}")) {
+                ("200 OK", r#"{"storage_counters":{}}"#)
+            } else {
+                ("401 Unauthorized", r#"{"error":"operator token required"}"#)
+            };
+            let reply = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes()).await;
+        }
+    });
+    format!("http://{address}/state")
+}
+
+#[tokio::test]
+async fn the_state_is_read_with_the_operator_token() {
+    let url = node_requiring("bench").await;
+    let client = reqwest::Client::new();
+    assert!(read_state(&client, "bench", &url).await.is_some());
+    assert_eq!(read_state(&client, "other", &url).await, None);
 }
 
 #[tokio::test]
 async fn a_node_that_does_not_answer_is_unreadable() {
     assert_eq!(
-        read_state(&reqwest::Client::new(), "http://127.0.0.1:1/state").await,
+        read_state(&reqwest::Client::new(), "bench", "http://127.0.0.1:1/state").await,
         None
     );
 }

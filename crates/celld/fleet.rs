@@ -378,7 +378,7 @@ async fn diagnose_checks(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("build peer diagnostic client")?;
-    let auth = crate::peer_auth::PeerAuth::new(
+    let auth = crate::peer_auth::PeerAuth::for_client(
         crate::peer_auth::load_existing(bucket).await?,
         "diagnostic",
     )?;

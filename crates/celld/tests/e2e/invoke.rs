@@ -242,8 +242,7 @@ async fn a_node_with_a_generated_token_serves_invoke_to_a_client_that_reads_it()
     // client takes it from the file in the node's state directory.
     let server = Server::start("invoke", &[]).await;
     let version = stage_variant(&server).await;
-    server.internal_url("/").await;
-    let token = OperatorToken::parse(std::ffi::OsStr::new(&server.operator_token())).unwrap();
+    let token = server.operator_token().await;
     let (status, _) = invoke(
         &server,
         Some(token),
