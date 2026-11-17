@@ -120,17 +120,18 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let database = if command.local {
         // The node `celld dev` runs for this project: its store holds the
         // fleet secret and its lease, and its token file the operator token.
+        // Only the dev token file is read, never `CELLD_OPERATOR_TOKEN`, so a
+        // production token cannot go to the dev target, and only a loopback
+        // lease is used, so a planted lease cannot send the request elsewhere.
         let (store, token) =
             crate::dev::local_node_files(&project.root, command.state_dir.clone())?;
         let bucket = crate::dev::open_local_bucket(&store)?;
         let auth =
             crate::peer_auth::PeerAuth::new(crate::peer_auth::load_existing(&bucket).await?, "d1")?
-                .with_operator_token(crate::operator_token::OperatorToken::from_env_or_file(
-                    &token,
-                )?);
+                .with_operator_token(crate::operator_token::OperatorToken::from_file(&token)?);
         Reachable::open_at(
             &bucket,
-            false,
+            crate::operator_cell::Addresses::Loopback,
             subject,
             format!("/runtime/{scope}"),
             Some(auth),
@@ -775,7 +776,9 @@ bookkeeping table. celld records applied migrations in that table
 `--local` reaches the database of the node `celld dev` runs for PROJECT,
 instead of a fleet's. It reads that node's local state (`--state-dir` or
 `CELLD_DEV_STATE_DIR` if `celld dev` was given one) and needs no bucket. The
-node has to be running. Every subcommand takes it, so
+node has to be running, on this host: only a loopback address is used, and the
+operator token comes from that node's token file, not `CELLD_OPERATOR_TOKEN`.
+Every subcommand takes it, so
 `celld d1 migrations apply DATABASE --local` migrates the development database.
 
 `execute` prints a table, and every message goes to stderr, so its stdout

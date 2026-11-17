@@ -62,6 +62,9 @@ pub(crate) fn local_node_files(
     state_dir: Option<PathBuf>,
 ) -> anyhow::Result<(PathBuf, PathBuf)> {
     let state = DevState::resolve(project, state_dir, std::env::var_os("CELLD_DEV_STATE_DIR"))?;
+    // The same check `celld dev` makes: a state directory reached through a
+    // link, or owned by another user, is refused before anything in it is read.
+    state.ensure_not_redirected("use")?;
     let database = state.path().join("objects.sqlite3");
     anyhow::ensure!(
         database.exists(),
