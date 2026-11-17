@@ -43,13 +43,17 @@ pub fn operator_token_path(project: &Path) -> anyhow::Result<PathBuf> {
 }
 
 /// `operator_token_path` for a node that was given `state_dir` as its
-/// `CELLD_DEV_STATE_DIR` value.
+/// `CELLD_DEV_STATE_DIR` value. The project is resolved the way `run` resolves
+/// it, so a relative path, `..` or a symbolic link finds the same directory.
 #[doc(hidden)]
+#[allow(clippy::disallowed_methods)] // Project resolution uses the operator's host filesystem.
 pub fn operator_token_path_with(
     project: &Path,
     state_dir: Option<OsString>,
 ) -> anyhow::Result<PathBuf> {
-    Ok(DevState::resolve(project, None, state_dir)?
+    let project = std::fs::canonicalize(project)
+        .with_context(|| format!("resolve project directory {}", project.display()))?;
+    Ok(DevState::resolve(&project, None, state_dir)?
         .path()
         .join(crate::operator_token::FILE_NAME))
 }
@@ -1109,6 +1113,7 @@ async fn stop_child(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)] // Tests use the host filesystem.
     use super::*;
 
     fn parse(arguments: &[&str]) -> anyhow::Result<Option<Options>> {
@@ -1234,7 +1239,8 @@ mod tests {
 
     #[test]
     fn clients_find_the_token_where_the_node_with_the_state_directory_keeps_it() {
-        let project = Path::new("/work/app");
+        let directory = tempfile::tempdir().unwrap();
+        let project = &std::fs::canonicalize(directory.path()).unwrap();
         let inside = operator_token_path_with(project, None).unwrap();
         assert_eq!(inside, project.join(".celld/dev/operator-token"));
         let shared = operator_token_path_with(project, Some("/shared".into())).unwrap();
@@ -1246,6 +1252,41 @@ mod tests {
                 .join(crate::operator_token::FILE_NAME)
         );
         assert_ne!(shared, inside);
+    }
+
+    #[test]
+    fn clients_find_the_token_through_links_and_relative_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(directory.path()).unwrap().join("app");
+        std::fs::create_dir(&project).unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&project, &link).unwrap();
+        let state = Some(OsString::from("/shared"));
+        let expected = operator_token_path_with(&project, state.clone()).unwrap();
+        assert_eq!(
+            operator_token_path_with(&link, state.clone()).unwrap(),
+            expected
+        );
+        let dotted = project.join("..").join("app");
+        assert_eq!(
+            operator_token_path_with(&dotted, state.clone()).unwrap(),
+            expected
+        );
+        let relative = pathdiff_from_current(&project);
+        assert_eq!(
+            operator_token_path_with(&relative, state).unwrap(),
+            expected
+        );
+    }
+
+    /// `path` as a relative path from the current directory.
+    fn pathdiff_from_current(path: &Path) -> PathBuf {
+        let current = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let mut relative = PathBuf::new();
+        for _ in current.components().skip(1) {
+            relative.push("..");
+        }
+        relative.join(path.strip_prefix("/").unwrap())
     }
 
     #[test]
