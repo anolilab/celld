@@ -63,7 +63,7 @@ An unsupported feature that does not cause an error is a defect.
 
 ### [Fetch, Request, Response, and Headers](https://developers.cloudflare.com/workers/runtime-apis/fetch/)
 
-- The `cache` request option is unavailable.
+- The `cache` request option accepts only `"no-store"`, as a no-op, with `cache_option_enabled` (on from 2024-11-11); any other mode throws.
 - `clone()` on a `Request` or `Response` with a streaming body tees the body,
   and the original keeps one branch. Both refuse a body that has been read or
   is held by a reader, and `bodyUsed` is `true` once a reader has read from the
@@ -407,8 +407,8 @@ that a Worker may test.
 | `disable_nodejs_tty_module` | **Not applicable** |  | Turns off `enable_nodejs_tty_module`; the stubs stay. |
 | `enable_nodejs_vm_module` | **Partial** |  | `node:vm` loads, and its first call throws. |
 | `disable_nodejs_vm_module` | **Not applicable** |  | Turns off `enable_nodejs_vm_module`; the stubs stay. |
-| `cache_option_enabled` | **Unsupported** | 2024-11-11 | The `cache` request option throws on celld. |
-| `cache_option_disabled` | **Honoured** |  | Turns off `cache_option_enabled`, which celld does not run. |
+| `cache_option_enabled` | **Honoured** | 2024-11-11 | A request accepts `cache: "no-store"`, a no-op because celld has no outbound HTTP cache. Any other mode throws. |
+| `cache_option_disabled` | **Honoured** |  | Turns off `cache_option_enabled`. |
 | `no_nodejs_compat_v2` | **Unsupported** |  | celld has no polyfill-based `nodejs_compat` to fall back to. |
 | `streaming_tail_worker` | **Unsupported** |  | The `tail` handler is unavailable. |
 | `python_workers_314` | **Unsupported** | 2026-09-08, with `python_workers` | celld runs Pyodide 0.28 (Python 3.13). |

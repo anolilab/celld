@@ -268,6 +268,11 @@ pub struct Compat {
     /// `nodejs_compat_do_not_populate_process_env`): `process.env` holds the
     /// Worker's string `vars` and secrets.
     pub populate_process_env: bool,
+    /// `cache_option_enabled` (default on for dates >= 2024-11-11, off with
+    /// `cache_option_disabled`): a `Request` accepts `cache: "no-store"`.
+    /// celld has no outbound HTTP cache, so it is a no-op; any other mode
+    /// throws.
+    pub cache_option: bool,
 }
 
 /// A non-main module the worker's main module may import, tagged by how the

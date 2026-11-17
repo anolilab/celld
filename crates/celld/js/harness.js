@@ -404,11 +404,19 @@ globalThis.Request = class Request {
   constructor(input, init = {}) {
     const prior = input instanceof Request ? input : null;
     const suppliedSignal = init.signal !== undefined;
-    // The cache option needs the cache_option_enabled compat flag,
-    // which Cells does not implement (Workerd's cache-disabled path).
-    if (init.cache !== undefined)
-      throw new Error("The 'cache' field on 'RequestInitializerDict' " +
-        "is not implemented.");
+    // The cache option needs the cache_option_enabled compat flag. celld has
+    // no outbound HTTP cache, so only "no-store" is accepted, as a no-op.
+    if (init.cache !== undefined) {
+      if (!__cell.compat.cacheOption)
+        throw new Error("The 'cache' field on 'RequestInitializerDict' " +
+          "is not implemented.");
+      if (init.cache !== "no-store")
+        throw new TypeError(
+          `Unsupported cache mode: ${init.cache}. Only "no-store" is supported.`);
+      this.cache = "no-store";
+    } else if (prior && prior.cache !== undefined) {
+      this.cache = prior.cache;
+    }
     this.url = prior ? prior.url : String(input);
     {
       // Workers upper-cases every method (the
@@ -6264,7 +6272,10 @@ const __cell = __celld.__cell = {
   namespaceKeys: {},
   node: "",
   deleteAllDeletesAlarm: false,
-  compat: { jsRpc: false, fetcherGetPutDelete: false, queueJsonMessages: false },
+  compat: {
+    jsRpc: false, fetcherGetPutDelete: false, queueJsonMessages: false,
+    cacheOption: false,
+  },
   makeNamespace,
   release: __cellRelease,
 };

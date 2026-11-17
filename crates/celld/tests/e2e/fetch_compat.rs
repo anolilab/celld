@@ -514,3 +514,35 @@ async fn worker_code_cannot_see_the_test_probe() {
     assert_eq!(result["probe"], "undefined", "{result}");
     assert_eq!(result["names"], serde_json::json!([]), "{result}");
 }
+
+#[tokio::test]
+async fn the_cache_option_accepts_only_no_store_and_follows_the_compat_date() {
+    let mut server = Server::start("fetch-compat", &[]).await;
+    let on: Value = server.get_json("/cache").await;
+    assert_eq!(on["flag"], true, "{on}");
+    assert_eq!(on["requestCache"], "no-store", "{on}");
+    assert_eq!(on["cloned"], "no-store", "{on}");
+    let fetched = on["fetchNoStore"].as_str().unwrap();
+    assert!(!fetched.contains("cache"), "{on}");
+    let forced = on["forceCache"].as_str().unwrap();
+    assert!(
+        forced.starts_with("TypeError: Unsupported cache mode: force-cache"),
+        "{on}"
+    );
+
+    server
+        .restart_after(|project| {
+            let path = project.join("wrangler.json");
+            let mut config: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            config["compatibility_date"] = "2024-11-10".into();
+            std::fs::write(path, config.to_string()).unwrap();
+        })
+        .await;
+    let off: Value = server.get_json("/cache").await;
+    assert_eq!(off["flag"], false, "{off}");
+    for key in ["requestCache", "fetchNoStore", "forceCache"] {
+        let message = off[key].as_str().unwrap_or_default();
+        assert!(message.contains("'cache' field"), "{key}: {off}");
+    }
+}

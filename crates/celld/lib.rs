@@ -202,6 +202,7 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
         queue_json_messages: on("queues_json_messages"),
         populate_process_env: (on("nodejs_compat") || on("nodejs_compat_v2"))
             && on("nodejs_compat_populate_process_env"),
+        cache_option: on("cache_option_enabled"),
     }
 }
 

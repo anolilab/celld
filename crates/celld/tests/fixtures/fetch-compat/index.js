@@ -72,6 +72,25 @@ export default {
         return Response.json(failure(error));
       }
     }
+    if (url.pathname === "/cache") {
+      const attempt = async (run) => {
+        try {
+          return await run();
+        } catch (error) {
+          return `${error?.name}: ${error?.message}`;
+        }
+      };
+      // Nothing listens on port 1, so a fetch that gets past the option check
+      // fails to connect, which is not the option's error.
+      const dead = "http://127.0.0.1:1/";
+      return Response.json({
+        requestCache: await attempt(() => new Request(dead, { cache: "no-store" }).cache),
+        fetchNoStore: await attempt(() => fetch(dead, { cache: "no-store" })),
+        forceCache: await attempt(() => fetch(dead, { cache: "force-cache" })),
+        cloned: await attempt(() => new Request(dead, { cache: "no-store" }).clone().cache),
+        flag: globalThis.Cloudflare.compatibilityFlags.cache_option_enabled,
+      });
+    }
     if (url.pathname === "/connect") {
       try {
         const socket = connect(

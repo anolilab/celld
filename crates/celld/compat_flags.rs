@@ -419,10 +419,11 @@ pub static FLAGS: &[Flag] = &[
         "`node:vm` loads, and its first call throws.",
     )
     .opt_out("disable_nodejs_vm_module"),
+    // lib.rs `worker_compat` -> `Compat::cache_option`, read by js/harness.js `Request`.
     row(
         "cache_option_enabled",
-        Unsupported,
-        "The `cache` request option throws on celld.",
+        Honoured,
+        "A request accepts `cache: \"no-store\"`, a no-op because celld has no outbound HTTP cache. Any other mode throws.",
     )
     .since("2024-11-11")
     .opt_out("cache_option_disabled"),
@@ -860,11 +861,11 @@ mod tests {
     #[test]
     fn an_unsupported_flag_is_refused_by_name_with_or_without_strict() {
         for strict in [false, true] {
-            let error = check_flags(&["nodejs_compat", "cache_option_enabled"], strict)
+            let error = check_flags(&["nodejs_compat", "streaming_tail_worker"], strict)
                 .unwrap_err()
                 .to_string();
             assert!(
-                error.contains("cache_option_enabled: not supported"),
+                error.contains("streaming_tail_worker: not supported"),
                 "{error}"
             );
             assert!(!error.contains("nodejs_compat:"), "{error}");
@@ -983,37 +984,45 @@ mod tests {
 
     #[test]
     fn a_date_that_implies_an_unsupported_flag_warns_unless_opted_out() {
-        let date = since("cache_option_enabled");
-        let found = assess(NONE, Some(date), false);
+        let date = since("python_workers_314");
+        let python = ["python_workers"];
+        let found = assess(&python, Some(date), false);
         assert!(found.problems.is_empty(), "{found:?}");
         assert_eq!(found.warnings.len(), 1, "{found:?}");
         assert!(
             found.warnings[0].contains(&format!(
-                "compatibility_date {date} implies `cache_option_enabled` (from {date})"
-            )) && found.warnings[0].contains("`cache_option_disabled`"),
+                "compatibility_date {date} implies `python_workers_314` (from {date})"
+            )) && found.warnings[0].contains("`no_python_workers_314`"),
             "{found:?}"
         );
         assert_eq!(
-            assess(NONE, Some(&day_before(date)), false),
+            assess(&python, Some(&day_before(date)), false),
             Findings::default()
         );
         assert_eq!(
-            assess(&["cache_option_disabled"], Some(date), false),
+            assess(
+                &["python_workers", "no_python_workers_314"],
+                Some(date),
+                false
+            ),
             Findings::default()
         );
-        let strict = assess(NONE, Some(date), true);
+        let strict = assess(&python, Some(date), true);
         assert_eq!(strict.problems.len(), 1, "{strict:?}");
-        assert!(check(NONE, Some(date), true).is_err());
-        check(NONE, Some(date), false).unwrap();
-        // The Python line is implied only for a Python Worker.
-        let python = since("python_workers_314");
-        assert!(assess(NONE, Some(python), false)
-            .warnings
-            .iter()
-            .all(|line| !line.contains("python_workers_314")));
-        assert!(assess(&["python_workers"], Some(python), false)
-            .warnings
-            .iter()
-            .any(|line| line.contains("python_workers_314")));
+        assert!(check(&python, Some(date), true).is_err());
+        check(&python, Some(date), false).unwrap();
+        // The line is implied only for a Python Worker.
+        assert_eq!(assess(NONE, Some(date), false), Findings::default());
+    }
+
+    #[test]
+    fn the_cache_option_follows_its_date_and_opt_out() {
+        let date = since("cache_option_enabled");
+        assert_eq!(date, "2024-11-11");
+        assert!(compat(date, &[]).cache_option);
+        assert!(!compat(&day_before(date), &[]).cache_option);
+        assert!(!compat(date, &["cache_option_disabled"]).cache_option);
+        assert!(compat("2020-01-01", &["cache_option_enabled"]).cache_option);
+        assert_eq!(assess(NONE, Some(date), true), Findings::default());
     }
 }

@@ -34,13 +34,6 @@ fn an_unknown_flag_warns_unless_the_operator_asks_for_strict_flags() {
         "{}",
         warned.stderr
     );
-    assert!(
-        warned.stderr.contains(
-            "compatibility_date 2026-01-01 implies `cache_option_enabled` (from 2024-11-11)"
-        ),
-        "{}",
-        warned.stderr
-    );
 
     let refused = deploy(
         "compat-flags-ok",
