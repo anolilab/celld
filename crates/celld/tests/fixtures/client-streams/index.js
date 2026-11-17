@@ -68,6 +68,17 @@ const throwing = (tag) => {
   return new Response(null, { status: 101, webSocket: client });
 };
 
+// A WebSocket whose message listener throws a value that cannot be printed.
+const unprintable = () => {
+  const [client, server] = Object.values(new WebSocketPair());
+  server.accept();
+  server.addEventListener("message", () => {
+    throw { toString() { throw new Error("no text"); } };
+  });
+  server.addEventListener("message", (event) => server.send(`echo:${event.data}`));
+  return new Response(null, { status: 101, webSocket: client });
+};
+
 // Which close codes `close()` takes: the error name for each code, or "ok".
 const closeCodes = () => {
   const outcome = {};
@@ -115,6 +126,9 @@ export class Streams extends DurableObject {
     }
     if (url.pathname === "/throwing") {
       return throwing("object");
+    }
+    if (url.pathname === "/unprintable") {
+      return unprintable();
     }
     if (url.pathname === "/member") {
       // The member relays answers to the requests this object forwards to it.
@@ -215,6 +229,17 @@ export default {
     }
     if (url.pathname === "/throwing") {
       return throwing("worker");
+    }
+    if (url.pathname === "/dial-open-throws") {
+      // The first open listener throws while this request awaits the socket.
+      const socket = new WebSocket(`ws://127.0.0.1:${url.searchParams.get("port")}/echo`);
+      const opened = new Promise((resolve) => socket.addEventListener("open", resolve));
+      socket.addEventListener("open", () => {
+        throw new Error("open boom");
+      }, { once: true });
+      await opened;
+      socket.close(1000, "done");
+      return new Response("done");
     }
     if (url.pathname === "/sse") {
       return sse(Number(url.searchParams.get("events") ?? "3"));

@@ -3429,7 +3429,9 @@ impl InFlight {
 
     /// Why the event failed, when a sampled trace captured it.
     pub fn failure(&self) -> Option<&str> {
-        self.failure.as_deref()
+        self.failure
+            .as_deref()
+            .or_else(|| self.context.listener_error.get().map(String::as_str))
     }
 
     /// The status a fetch handler answered with, once it has.
@@ -6481,6 +6483,7 @@ ops! { OP_NAMES, install_op_functions,
         "__d1_export" => storage_ops::op_d1_export,
         "__storage_transaction_control" => storage_ops::op_storage_transaction_control,
         "__log" => op_log,
+        "__mark_span_error" => op_mark_span_error,
         "__storage_put" => storage_ops::op_storage_put,
         "__storage_put_many" => storage_ops::op_storage_put_many,
         "__storage_queue_put" => storage_ops::op_storage_queue_put,
@@ -9950,6 +9953,23 @@ fn op_process_exit(
     scope.terminate_execution();
 }
 
+/// `__mark_span_error(message)`: the current event's span ends as an error
+/// although the event itself succeeds. A WebSocket listener's exception is
+/// reported this way, because failing the event would close the socket.
+fn op_mark_span_error(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(context) = current_reaction_or_untracked_io_context(scope) else {
+        return;
+    };
+    let message = args.get(0).to_rust_string_lossy(scope);
+    let _ = context
+        .listener_error
+        .set(crate::telemetry::cap_error(message));
+}
+
 fn op_log(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -10591,6 +10611,10 @@ pub struct IoContext {
     /// Whether this event records console calls for a Dynamic Worker tail.
     tail_reporting: bool,
     tail_logs: Mutex<TailLogCapture>,
+    /// The first exception a WebSocket listener threw during this event. It
+    /// marks the span as an error without failing the event, which would drop
+    /// the frames and close the socket.
+    listener_error: OnceLock<String>,
 }
 
 /// An op enqueued by one event's continuation during another event's turn: the
@@ -10783,6 +10807,7 @@ impl IoContext {
             cpu_turn: Mutex::new(None),
             tail_reporting,
             tail_logs: Mutex::new(TailLogCapture::default()),
+            listener_error: OnceLock::new(),
         })
     }
 
@@ -10825,6 +10850,7 @@ impl IoContext {
             // context is constructed from the report sender in `begin`.
             tail_reporting: false,
             tail_logs: Mutex::new(TailLogCapture::default()),
+            listener_error: OnceLock::new(),
         });
         runtime_state
             .io_contexts

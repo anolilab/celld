@@ -6207,6 +6207,23 @@ const __reportHandlerError = (what, error) => {
     __log("error", `Uncaught exception in ${what}: ${text}`);
   } catch {}
 };
+// Ends the current event's span as an error without failing the event, but
+// only for a frame the host delivered (a message, close or error): a listener
+// that throws while a fetch awaits an outbound socket's `open` must not turn
+// the fetch's span into an error. The text is built apart from the mark, so a
+// value whose formatting throws still marks the span.
+const __markSpanError = (what, error) => {
+  if (!__currentActorEvent()?.frame) return;
+  let text;
+  try {
+    text = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  } catch {
+    text = "(the value could not be printed)";
+  }
+  try {
+    __mark_span_error(`Uncaught exception in ${what}: ${text}`);
+  } catch {}
+};
 // The hook `dispatchEvent` calls when a listener throws. A symbol, so no other
 // EventTarget, a Worker's own subclass included, picks it up by accident.
 const __listenerFailed = Symbol("listenerFailed");
@@ -6235,6 +6252,7 @@ __celld.__wsOpen = async (scope, wsId, protocol) => {
 };
 __celld.__wsMessage = async (scope, wsId, msg) => {
   const actorEvent = __beginActorEvent(scope);
+  actorEvent.frame = true;
   try {
     const inst = await _readyInstance(scope);
     const socket = inst.__celldState._socket(wsId);
@@ -6249,6 +6267,7 @@ __celld.__wsMessage = async (scope, wsId, msg) => {
 };
 __celld.__wsBinary = async (scope, wsId, data) => {
   const actorEvent = __beginActorEvent(scope);
+  actorEvent.frame = true;
   try {
     const inst = await _readyInstance(scope);
     const socket = inst.__celldState._socket(wsId);
@@ -6264,6 +6283,7 @@ __celld.__wsBinary = async (scope, wsId, data) => {
 };
 __celld.__wsClosed = async (scope, wsId, code, reason, wasClean) => {
   const actorEvent = __beginActorEvent(scope);
+  actorEvent.frame = true;
   try {
     const inst = await _readyInstance(scope);
     const socket = inst.__celldState._socket(wsId);
@@ -11284,6 +11304,7 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
   // keeps working.
   [__listenerFailed](error) {
     __reportHandlerError("WebSocket listener", error);
+    __markSpanError("WebSocket listener", error);
   }
   _dispatchMessage(data) {
     if (this._binaryType === "blob" && data instanceof ArrayBuffer) {

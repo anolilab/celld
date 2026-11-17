@@ -178,7 +178,7 @@ impl hyper::rt::Executor<Pin<Box<dyn Future<Output = ()> + Send>>> for Spawn {
 }
 
 /// A WebSocket client library, so framing and masking are the library's.
-async fn client(server: &Server, path: &str) -> WebSocket<TokioIo<Upgraded>> {
+pub(super) async fn client(server: &Server, path: &str) -> WebSocket<TokioIo<Upgraded>> {
     handshake(server, path, None).await.0
 }
 
@@ -392,7 +392,10 @@ async fn a_close_takes_the_codes_an_endpoint_may_send_and_refuses_the_others() {
 }
 
 /// Sends one text frame and returns the next text frame the server sends.
-async fn exchange(socket: &mut WebSocket<TokioIo<Upgraded>>, text: &'static str) -> Option<String> {
+pub(super) async fn exchange(
+    socket: &mut WebSocket<TokioIo<Upgraded>>,
+    text: &'static str,
+) -> Option<String> {
     socket
         .write_frame(Frame::text(Payload::Borrowed(text.as_bytes())))
         .await
@@ -479,7 +482,7 @@ async fn an_exception_in_a_hibernation_handler_is_reported_and_closes_the_socket
 
 /// What the upstream server of a proxied socket saw.
 #[derive(Debug, PartialEq)]
-enum Seen {
+pub(super) enum Seen {
     Text(String),
     Binary(Vec<u8>),
     Close(u16, String),
@@ -495,7 +498,7 @@ enum Seen {
 /// connection ends, `/proto` selects the subprotocol the client offered, and
 /// `/slow` reads nothing for three seconds and then echoes its texts.
 /// Everything it receives is reported on the channel it returns.
-async fn upstream() -> (u16, tokio::sync::mpsc::UnboundedReceiver<Seen>) {
+pub(super) async fn upstream() -> (u16, tokio::sync::mpsc::UnboundedReceiver<Seen>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
