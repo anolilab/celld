@@ -82,6 +82,7 @@ const urlChecks = {
     }
     await throwsCode("ERR_METHOD_NOT_IMPLEMENTED", () => url.domainToASCII("a.com"));
     await throwsCode("ERR_METHOD_NOT_IMPLEMENTED", () => url.urlToHttpOptions(new URL("http://a/")));
+    await throwsCode("ERR_METHOD_NOT_IMPLEMENTED", () => new url.Url());
   },
   parseFailsLoudly: () => throwsCode("ERR_METHOD_NOT_IMPLEMENTED", () => url.parse("http://a/")),
 };
@@ -223,6 +224,27 @@ export default {
         return Response.json(await results(urlChecks));
       case "/fs":
         return Response.json(await results(fsChecks));
+      case "/stream": {
+        // The body is pulled after the handler has returned, in the turn's
+        // closing checkpoints. It must still see the request's `/tmp`.
+        fs.writeFileSync("/tmp/out", "written by the handler");
+        const encoder = new TextEncoder();
+        return new Response(
+          new ReadableStream({
+            pull(controller) {
+              let text;
+              try {
+                fs.writeFileSync("/tmp/from-pull", "x");
+                text = fs.readFileSync("/tmp/out", "utf8") + "|" + fs.readFileSync("/tmp/from-pull", "utf8");
+              } catch (error) {
+                text = error.code;
+              }
+              controller.enqueue(encoder.encode(text));
+              controller.close();
+            },
+          }),
+        );
+      }
       case "/fill":
         return Response.json(fill());
       default:

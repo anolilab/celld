@@ -210,11 +210,14 @@ execution.
   sync, callback, and `fs.promises` forms. It exposes a request-local `/tmp` and
   a read-only `/bundle` that contains the Worker modules. `/tmp` starts empty,
   lives in memory, and is freed when the request ends. One request can hold at
-  most 64 MiB in it, counting file bytes and a small charge for each entry; a
+  most 64 MiB in it, counting the memory each file holds (a file that grows by appends may
+  hold up to twice its length) and a small charge for each entry; a
   write that would pass that fails with `ENOSPC` and changes nothing. Writes
   outside `/tmp` fail with `EPERM`. `/tmp` belongs to a request: code that runs
   with no request, such as module scope while the Worker loads, cannot change
-  it, and those calls fail with `EPERM`; reads there see an empty tree.
+  it, and those calls fail with `EPERM`; reads there see an empty tree. A
+  reaction left behind by a finished cell event has no request either, even
+  when another request's turn runs it.
 - `node:url` provides `URL`, `URLSearchParams`, `fileURLToPath`,
   `pathToFileURL`, and `format` for `URL` objects, with Node.js's POSIX results
   and errors. The legacy API (`parse`, `resolve`, `resolveObject`, `Url`,

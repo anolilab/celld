@@ -164,3 +164,13 @@ async fn module_scope_reads_process_env_but_has_no_tmp() {
     assert!(!seen.visible_to_request);
     assert!(seen.listed.is_empty(), "{:?}", seen.listed);
 }
+
+#[tokio::test]
+async fn a_response_body_pull_sees_the_requests_tmp() {
+    let server = Server::start("node-compat", &[]).await;
+    assert_eq!(
+        server.get_text("/stream").await,
+        "written by the handler|x",
+        "a body pulled after the handler returned lost the request's /tmp"
+    );
+}

@@ -82,3 +82,27 @@ async fn a_cell_that_resumes_during_another_keeps_its_own_tmp() {
         "the releasing cell sees a directory the parked cell created"
     );
 }
+
+#[derive(serde::Deserialize)]
+struct Stale {
+    write: String,
+    sees: bool,
+}
+
+/// A reaction left by a finished event of cell `a` runs while cell `b`'s
+/// request drives the checkpoint. The finished event has no request any more,
+/// so the reaction has no `/tmp`: it must not use `b`'s.
+#[tokio::test]
+async fn a_reaction_of_a_finished_event_does_not_get_the_running_requests_tmp() {
+    let server = Server::start("isolate-sharing", &[]).await;
+    let _: serde_json::Value = server.get_json("/a/arm").await;
+    let stale: Stale = server.get_json("/b/fire").await;
+    assert!(
+        !stale.sees,
+        "the stale reaction read the running request's /tmp"
+    );
+    assert_eq!(
+        stale.write, "EPERM",
+        "the stale reaction wrote into the running request's /tmp"
+    );
+}

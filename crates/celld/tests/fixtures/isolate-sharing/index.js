@@ -10,7 +10,40 @@ const gate = new Promise((resolve) => {
   release = resolve;
 });
 
+// A reaction a finished event left behind: the event that registers it has
+// ended, a later event of another cell settles the promise, and V8 runs the
+// reaction inside that later event's microtask checkpoint.
+let fireStale;
+const staleGate = new Promise((resolve) => {
+  fireStale = resolve;
+});
+let staleOutcome = "did not run";
+
 export class Cell extends DurableObject {
+  // Leaves a reaction on the module-scope promise and returns at once.
+  arm() {
+    staleGate.then(() => {
+      let write;
+      try {
+        fs.writeFileSync("/tmp/stale", "x");
+        write = "written";
+      } catch (error) {
+        write = error.code;
+      }
+      staleOutcome = { write, sees: fs.existsSync("/tmp/planted") };
+    });
+    return { armed: true };
+  }
+
+  // Plants a file in this request's `/tmp`, then lets the stale reaction run
+  // during this request.
+  async fire() {
+    fs.writeFileSync("/tmp/planted", "from the running event");
+    fireStale();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return staleOutcome;
+  }
+
   // Parks until the other cell lets go, then writes to its own `/tmp`.
   async park() {
     parked = true;
@@ -29,9 +62,18 @@ export class Cell extends DurableObject {
 
   fetch(request) {
     const op = new URL(request.url).pathname.split("/")[2];
-    return op === "park" ? this.park().then(Response.json) : op === "release"
-      ? this.release().then(Response.json)
-      : new Response(String(parked));
+    switch (op) {
+      case "park":
+        return this.park().then(Response.json);
+      case "release":
+        return this.release().then(Response.json);
+      case "arm":
+        return Response.json(this.arm());
+      case "fire":
+        return this.fire().then(Response.json);
+      default:
+        return new Response(String(parked));
+    }
   }
 }
 

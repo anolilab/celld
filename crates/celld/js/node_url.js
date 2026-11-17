@@ -39,7 +39,9 @@
       `The "${name}" argument must be of type string or an instance of URL.` +
         describe(value),
     );
-  const notImplemented = (name) => () => {
+  // A plain function, not an arrow, so that `new url.Url()` reaches the throw
+  // instead of failing as "not a constructor".
+  const notImplemented = (name) => function () {
     throw nodeError(
       Error,
       "ERR_METHOD_NOT_IMPLEMENTED",
@@ -98,7 +100,7 @@
       return out;
     });
 
-  const resolve = (path) => {
+  const resolveFilePath = (path) => {
     const absolute = path.startsWith("/") ? path : `${process.cwd()}/${path}`;
     const parts = [];
     for (const part of absolute.split("/")) {
@@ -117,8 +119,8 @@
         'The "path" argument must be of type string.' + describe(filepath),
       );
     }
-    let resolved = resolve(filepath);
-    // `resolve` drops a trailing slash, which names a directory.
+    let resolved = resolveFilePath(filepath);
+    // `resolveFilePath` drops a trailing slash, which names a directory.
     if (filepath.endsWith("/") && !resolved.endsWith("/")) resolved += "/";
     return new URL(`file://${escapePath(resolved)}`);
   };
