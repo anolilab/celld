@@ -2970,6 +2970,9 @@ pub struct InFlight {
     /// the reason, not only that it failed. This also records an output-gate
     /// failure after a successful handler.
     failure: Option<String>,
+    /// The status of the `Response` a fetch handler returned, for the span's
+    /// `http.response.status_code`.
+    response_status: Option<u16>,
     /// The report owed to the loader isolate after this invocation retires.
     tail_report: Option<TailReportState>,
     /// The isolate this entry's ops belong to, so `abandon` can drop their
@@ -3021,6 +3024,9 @@ impl InFlight {
                         })
                         .map_err(|error| fail_in_turn_error(error, positions))
                 });
+                if let Ok(response) = &read {
+                    self.response_status = Some(response.status);
+                }
                 if let Some(report) = &mut self.tail_report {
                     match &read {
                         Ok(response) => report.response_status = Some(response.status),
@@ -3312,6 +3318,11 @@ impl InFlight {
     /// Why the event failed, when a sampled trace captured it.
     pub fn failure(&self) -> Option<&str> {
         self.failure.as_deref()
+    }
+
+    /// The status a fetch handler answered with, once it has.
+    pub fn response_status(&self) -> Option<u16> {
+        self.response_status
     }
 
     pub(crate) fn finish_tail_report(&mut self) {
@@ -4295,6 +4306,7 @@ fn begin<'s>(
                 started: Instant::now(),
                 trace: None,
                 failure: None,
+                response_status: None,
                 tail_report,
             };
             drop(guard);
@@ -4390,6 +4402,7 @@ fn begin_entrypoint_rpc(
                 started: event_started,
                 trace: None,
                 failure: None,
+                response_status: None,
                 tail_report: None,
             };
             drop(guard);
@@ -4630,6 +4643,7 @@ fn begin_queue(
                 started: Instant::now(),
                 trace: None,
                 failure: None,
+                response_status: None,
                 tail_report: None,
             };
             drop(guard);
@@ -4809,6 +4823,7 @@ fn start_cell_event<'s>(
                 started: event_started,
                 trace: None,
                 failure: None,
+                response_status: None,
                 tail_report: None,
             };
             restore_io_context(tc, previous_io_context);
@@ -4864,6 +4879,7 @@ fn start_cell_event<'s>(
                     started: event_started,
                     trace: None,
                     failure: Some(failure),
+                    response_status: None,
                     tail_report: None,
                 }))
             };
@@ -8734,6 +8750,7 @@ fn op_fetch(
             span.parent_span_id = Some(parent.span_id);
             span.parent_remote = Some(false);
             span.url = span_url;
+            span.http_method = Some(method.clone());
             span
         });
         let mut finish = |ok: bool, status: Option<u16>, error: Option<String>| {

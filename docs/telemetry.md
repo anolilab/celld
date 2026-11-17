@@ -37,7 +37,14 @@ collector base URL in `CELLD_OTEL`, or keep `CELLD_OTEL=1` for the bucket.
 celld records a span for each stateless Worker request, each cell event (a
 fetch, an alarm, an RPC, a WebSocket message), each outbound `fetch()`, and
 each cell start. A span carries the request id, the cell, the isolate, the
-queue wait, the outbound URL and status, and the known durability facts.
+queue wait, and the known durability facts.
+
+A span for an HTTP request carries the OpenTelemetry names `http.request.method`
+and `http.response.status_code` (Parquet columns `http_method` and
+`http_status`). That covers the Worker fetch span, the cell fetch span, and the
+outbound `fetch()` span, which also carries `url.full`. The status of a request
+that failed before it had a response is absent. Neither attribute is built for
+a request the sampler skips.
 
 Each `console.log` line becomes a log record with the trace id and span id of
 its handler, across `await`. The record carries the console method's severity

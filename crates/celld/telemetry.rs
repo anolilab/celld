@@ -334,6 +334,7 @@ pub struct Span {
     pub isolate: Option<u64>,
     pub queue_wait_us: Option<i64>,
     pub url: Option<String>,
+    pub http_method: Option<String>,
     pub http_status: Option<u16>,
     /// `Some(true)` for a parent extracted from a caller's traceparent,
     /// `Some(false)` for an in-process parent, `None` for a root.
@@ -411,6 +412,7 @@ impl Span {
             isolate: None,
             queue_wait_us: None,
             url: None,
+            http_method: None,
             http_status: None,
             parent_remote: None,
         }
@@ -435,6 +437,7 @@ impl Event {
                     + LEN(&span.request_id)
                     + LEN(&span.cell)
                     + LEN(&span.url)
+                    + LEN(&span.http_method)
             }
             Event::Log(log) => 40 + log.body.len(),
         }
@@ -1083,6 +1086,7 @@ message celld_span {
   optional int64 isolate;
   optional int64 queue_wait_us;
   optional binary url (STRING);
+  optional binary http_method (STRING);
   optional int32 http_status (INTEGER(16,false));
   optional boolean parent_remote;
 }";
@@ -1173,6 +1177,7 @@ pub fn encode_spans(spans: &[Span], node: &str, region: &str) -> anyhow::Result<
     column!(Int64Type, opt each.clone().map(|s| s.isolate.map(|v| v as i64)).collect::<Vec<_>>());
     column!(Int64Type, opt each.clone().map(|s| s.queue_wait_us).collect::<Vec<_>>());
     column!(ByteArrayType, opt each.clone().map(|s| s.url.as_deref().map(text)).collect::<Vec<_>>());
+    column!(ByteArrayType, opt each.clone().map(|s| s.http_method.as_deref().map(text)).collect::<Vec<_>>());
     column!(Int32Type, opt each.clone().map(|s| s.http_status.map(|v| v as i32)).collect::<Vec<_>>());
     column!(BoolType, opt each.clone().map(|s| s.parent_remote).collect::<Vec<_>>());
 

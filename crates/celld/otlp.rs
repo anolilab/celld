@@ -122,6 +122,9 @@ fn span_message(span: &Span) -> Vec<u8> {
     if let Some(url) = &span.url {
         key_value(&mut out, 9, "url.full", any_string(url));
     }
+    if let Some(method) = &span.http_method {
+        key_value(&mut out, 9, "http.request.method", any_string(method));
+    }
     if let Some(status) = span.http_status {
         key_value(
             &mut out,
@@ -210,4 +213,43 @@ pub fn logs_request(logs: &[Log], node: &str, region: &str, service: &str) -> Ve
     let mut out = Vec::new();
     field_bytes(&mut out, 1, &resource_logs);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::TraceIds;
+    use crate::telemetry::KIND_SERVER;
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    fn span() -> Span {
+        let ids = TraceIds {
+            trace_id: [1; 16],
+            span_id: [2; 8],
+        };
+        Span::new(ids, "celld.fetch", KIND_SERVER)
+    }
+
+    #[test]
+    fn an_http_span_exports_its_method_and_status() {
+        let mut span = span();
+        span.http_method = Some("POST".to_string());
+        span.http_status = Some(503);
+        let body = span_message(&span);
+        assert!(contains(&body, b"http.request.method"));
+        assert!(contains(&body, b"POST"));
+        assert!(contains(&body, b"http.response.status_code"));
+    }
+
+    #[test]
+    fn a_span_without_a_response_exports_no_http_attributes() {
+        let body = span_message(&span());
+        assert!(!contains(&body, b"http.request.method"));
+        assert!(!contains(&body, b"http.response.status_code"));
+    }
 }

@@ -2725,6 +2725,9 @@ struct StatelessTiming {
     remote_parent: Option<crate::telemetry::ParentContext>,
     /// Why the handler failed, read from the entry when it was answered.
     failure: Option<String>,
+    /// Built only for a sampled fetch, so an unsampled request allocates nothing.
+    http_method: Option<String>,
+    http_status: Option<u16>,
     span_name: &'static str,
     span_kind: u8,
 }
@@ -2773,6 +2776,11 @@ impl StatelessTiming {
             trace,
             remote_parent,
             failure: None,
+            http_method: match job {
+                crate::WorkerJob::Fetch { method, .. } if trace.is_some() => Some(method.clone()),
+                _ => None,
+            },
+            http_status: None,
             span_name,
             span_kind,
         }
@@ -2786,6 +2794,7 @@ impl StatelessTiming {
         }
         self.emitted = true;
         self.failure = entry.failure().map(str::to_string);
+        self.http_status = entry.response_status();
         self.emit();
     }
 
@@ -2799,6 +2808,8 @@ impl StatelessTiming {
             span.error = self.failure.clone();
             span.request_id = self.request_id.map(js::request_id_string);
             span.isolate = Some(self.isolate as u64);
+            span.http_method = self.http_method.clone();
+            span.http_status = self.http_status;
             span.parent_span_id = self.remote_parent.map(|parent| parent.span_id);
             span.parent_remote = self.remote_parent.map(|_| true);
             span.queue_wait_us =
@@ -3125,6 +3136,10 @@ async fn drive_worker_on_cell(affiliation: crate::pool::Affiliation, job: crate:
     let trace = crate::telemetry::start_trace_with_parent(remote.as_ref());
     let recording = trace.and_then(crate::telemetry::TraceContext::recording_ids);
     let span_started = recording.map(|_| (Instant::now(), crate::telemetry::now_unix_us()));
+    let http_method = match &job {
+        crate::WorkerJob::Fetch { method, .. } if recording.is_some() => Some(method.clone()),
+        _ => None,
+    };
     drive_worker(
         &slot,
         job,
@@ -3139,6 +3154,8 @@ async fn drive_worker_on_cell(affiliation: crate::pool::Affiliation, job: crate:
                 span.duration_us = started.elapsed().as_micros() as i64;
                 span.ok = entry.finished() && entry.failure().is_none();
                 span.error = entry.failure().map(str::to_string);
+                span.http_method = http_method.clone();
+                span.http_status = entry.response_status();
                 span.parent_span_id = remote.map(|parent| parent.span_id);
                 span.parent_remote = remote.map(|_| true);
                 crate::telemetry::record(span);
@@ -3328,11 +3345,16 @@ async fn drive_cell_inner(
             CellJob::WsMessage { .. } => "celld.ws_message",
             CellJob::WsClosed { .. } => "celld.ws_close",
         };
+        let method = match &job {
+            CellJob::Fetch { method, .. } => Some(method.clone()),
+            _ => None,
+        };
         (
             name,
             job.scope().to_string(),
             Instant::now(),
             crate::telemetry::now_unix_us(),
+            method,
         )
     });
     let mut ops = Ops::new();
@@ -3511,7 +3533,9 @@ async fn drive_cell_inner(
         report_alarm_moves(&report, moves);
         alarm_write = write;
     }
-    if let (Some(ids), Some((name, cell, started, start_unix))) = (recording, span_seed) {
+    if let (Some(ids), Some((name, cell, started, start_unix, http_method))) =
+        (recording, span_seed)
+    {
         let kind = if name == "celld.cell_fetch" {
             crate::telemetry::KIND_SERVER
         } else {
@@ -3523,6 +3547,8 @@ async fn drive_cell_inner(
         span.ok = entry.finished() && entry.failure().is_none();
         span.error = entry.failure().map(str::to_string);
         span.cell = Some(cell);
+        span.http_method = http_method;
+        span.http_status = entry.response_status();
         span.parent_span_id = parent.map(|parent| parent.span_id);
         span.parent_remote = parent.map(|_| false);
         crate::telemetry::record(span);
