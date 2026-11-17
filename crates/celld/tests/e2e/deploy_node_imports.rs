@@ -61,7 +61,13 @@ fn a_prebuilt_entry_is_read_by_esbuild_for_every_import_form() {
         Some(&esbuild),
     );
     assert!(!run.success, "{}", run.stderr);
-    for module in ["node:vm", "node:tty", "node:cluster", "node:dgram"] {
+    for module in [
+        "node:vm",
+        "node:tty",
+        "node:cluster",
+        "node:dgram",
+        "node:readline",
+    ] {
         assert!(run.stderr.contains(module), "{module}: {}", run.stderr);
     }
     assert!(!run.stderr.contains("node:events"), "{}", run.stderr);
@@ -89,7 +95,7 @@ fn a_prebuilt_entry_reports_what_esbuild_parses_as_an_import() {
 }
 
 #[test]
-fn without_esbuild_a_prebuilt_entry_is_scanned_and_strict_does_not_fail() {
+fn without_esbuild_strict_refuses_a_prebuilt_entry() {
     let dir = TempDir::new().unwrap();
     let run = deploy(
         "node-imports-prebuilt",
@@ -97,14 +103,74 @@ fn without_esbuild_a_prebuilt_entry_is_scanned_and_strict_does_not_fail() {
         &["--strict"],
         Some(NO_ESBUILD),
     );
-    assert!(run.success, "{}", run.stderr);
-    assert!(run.stderr.contains("approximate"), "{}", run.stderr);
+    assert!(!run.success, "{}", run.stderr);
     assert!(
-        run.stderr.contains("cannot check --strict without esbuild"),
+        run.stderr
+            .contains("--strict needs esbuild to read a prebuilt entry's imports; install esbuild"),
         "{}",
         run.stderr
     );
+}
+
+#[test]
+fn without_esbuild_a_prebuilt_entry_is_scanned_with_the_alternatives() {
+    let dir = TempDir::new().unwrap();
+    let run = deploy(
+        "node-imports-prebuilt",
+        &dir.path().join("p"),
+        &[],
+        Some(NO_ESBUILD),
+    );
+    assert!(run.success, "{}", run.stderr);
+    assert!(run.stderr.contains("approximate"), "{}", run.stderr);
     for module in ["node:vm", "node:tty", "node:cluster", "node:dgram"] {
         assert!(run.stderr.contains(module), "{module}: {}", run.stderr);
     }
+    assert!(
+        run.stderr
+            .contains("node:readline (use streams over fetch() bodies)"),
+        "{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn an_entry_esbuild_cannot_parse_shows_its_error_not_an_install_hint() {
+    let Some(esbuild) = esbuild() else {
+        eprintln!("skipped: esbuild is not installed");
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let strict = deploy(
+        "node-imports-prebuilt-broken",
+        &dir.path().join("s"),
+        &["--strict"],
+        Some(&esbuild),
+    );
+    assert!(!strict.success, "{}", strict.stderr);
+    assert!(strict.stderr.contains("ERROR"), "{}", strict.stderr);
+    assert!(
+        !strict.stderr.contains("install esbuild"),
+        "{}",
+        strict.stderr
+    );
+
+    let warned = deploy(
+        "node-imports-prebuilt-broken",
+        &dir.path().join("w"),
+        &[],
+        Some(&esbuild),
+    );
+    assert!(warned.success, "{}", warned.stderr);
+    assert!(
+        warned.stderr.contains("esbuild could not parse the entry"),
+        "{}",
+        warned.stderr
+    );
+    assert!(warned.stderr.contains("node:vm"), "{}", warned.stderr);
+    assert!(
+        !warned.stderr.contains("install esbuild"),
+        "{}",
+        warned.stderr
+    );
 }

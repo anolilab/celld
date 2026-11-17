@@ -707,16 +707,13 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                         sourcemap::read_sibling(&root, &path)
                     })
                     .transpose()?;
-                let (imports, approximate) = match node_imports::analyse(&root, &path) {
-                    Some(imports) => (imports, false),
-                    None => (node_imports::scan(&bundle), true),
-                };
+                let (imports, unread) = node_imports::read(&root, &path, &bundle);
                 Ok(BundleOutput {
                     bundle,
                     wasm,
                     map,
                     imports,
-                    approximate,
+                    unread,
                 })
             } else {
                 run_esbuild(&root, entry, &project.bundle, want_map)
@@ -725,7 +722,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .transpose()?;
     let bundled_in = started.elapsed();
     if let Some(output) = &bundle {
-        node_imports::report(&output.imports, options.strict, output.approximate)?;
+        node_imports::report(&output.imports, options.strict, output.unread.as_ref())?;
     }
     let sourcemap = bundle
         .as_ref()
@@ -3230,9 +3227,9 @@ struct BundleOutput {
     /// The specifiers the bundle leaves external. Empty for a build that
     /// does not list them.
     imports: Vec<String>,
-    /// The list was read from the source text, not from esbuild, so it can
-    /// miss an import or name one that is only in a string or comment.
-    approximate: bool,
+    /// Set when the list was read from the source text, not from esbuild, so
+    /// it can miss an import or name one that is only in a string or comment.
+    unread: Option<node_imports::Unread>,
 }
 
 /// Wrangler's default unbundled WASM rule discovers `**/*.wasm` and
@@ -3440,7 +3437,7 @@ fn run_esbuild(
         wasm,
         map,
         imports: node_imports::from_metafile(&metafile)?,
-        approximate: false,
+        unread: None,
     })
 }
 

@@ -251,7 +251,9 @@ unaffected. `celld dev` prints the same warning at startup.
 
 With `no_bundle`, esbuild reads the prebuilt entry's imports without changing
 it. Without esbuild the entry's text is scanned instead; that list is marked
-approximate, and `--strict` warns that it cannot check instead of failing.
+approximate, and `--strict` fails, because the scan can miss an import. If
+esbuild is there but cannot parse the entry, the warning (or the `--strict`
+error) shows esbuild's message.
 
 `celld deploy --sourcemap PATH` writes the entry's source map to `PATH`, for
 an error tracker or a stack-trace decoder. The map is not part of the

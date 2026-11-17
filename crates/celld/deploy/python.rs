@@ -337,7 +337,7 @@ pub fn build(
             wasm,
             map: None,
             imports: Vec::new(),
-            approximate: false,
+            unread: None,
         },
         descriptor,
     ))

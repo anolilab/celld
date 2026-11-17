@@ -24,13 +24,22 @@ pub(super) fn from_metafile(metafile: &Path) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
+/// Why an entry's imports were not read by esbuild.
+pub(super) enum Unread {
+    /// There is no esbuild to run.
+    Missing,
+    /// esbuild ran and could not parse the entry; its error.
+    Failed(String),
+}
+
 /// The imports of an already-bundled entry, read by esbuild with every import
 /// left external, so comments, strings and unusual spacing are parsed the way
 /// the bundler parses them. The output is discarded; the entry deploys as it
-/// is. `None` when esbuild is missing or cannot parse the entry.
-pub(super) fn analyse(root: &Path, entry: &Path) -> Option<Vec<String>> {
+/// is.
+pub(super) fn analyse(root: &Path, entry: &Path) -> Result<Vec<String>, Unread> {
     let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
-    let dir = tempfile::tempdir().ok()?;
+    let failed = |error: &dyn std::fmt::Display| Unread::Failed(error.to_string());
+    let dir = tempfile::tempdir().map_err(|error| failed(&error))?;
     let metafile = dir.path().join("meta.json");
     let output = std::process::Command::new(binary)
         .current_dir(root)
@@ -43,14 +52,35 @@ pub(super) fn analyse(root: &Path, entry: &Path) -> Option<Vec<String>> {
         ])
         .arg(format!("--metafile={}", metafile.display()))
         .arg(format!("--outfile={}", dir.path().join("out.js").display()))
-        .arg("--log-level=silent")
+        .arg("--log-level=error")
         .output()
-        .ok()?;
+        .map_err(|_| Unread::Missing)?;
     if !output.status.success() {
-        return None;
+        return Err(failed(&String::from_utf8_lossy(&output.stderr).trim()));
     }
-    from_metafile(&metafile).ok()
+    from_metafile(&metafile).map_err(|error| failed(&format!("{error:#}")))
 }
+
+/// The imports of a prebuilt entry. esbuild lists the imports it parses, but
+/// not the `__require("x")` helper calls an earlier build left for its
+/// CommonJS dependencies; those are added from a scan for that one call.
+pub(super) fn read(root: &Path, entry: &Path, bundle: &[u8]) -> (Vec<String>, Option<Unread>) {
+    match analyse(root, entry) {
+        Ok(mut imports) => {
+            imports.extend(
+                REQUIRE_HELPER_RE
+                    .captures_iter(&String::from_utf8_lossy(bundle))
+                    .map(|cap| cap[1].to_string()),
+            );
+            (imports, None)
+        }
+        Err(unread) => (scan(bundle), Some(unread)),
+    }
+}
+
+static REQUIRE_HELPER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"\b__require\s*\(\s*["']([^"']+)["']"#).unwrap()
+});
 
 /// A string literal after `from`, `import`, `import(`, `require(` or
 /// `__require(`: static and side-effect imports, re-exports, dynamic
@@ -73,31 +103,27 @@ pub(super) fn scan(bundle: &[u8]) -> Vec<String> {
 /// Importing one is not an error, because bundles name built-ins in code that
 /// never runs; the first call throws. Listing them here moves the discovery
 /// from production to the deploy. `strict` turns the list into a failure.
-pub(super) fn report(imports: &[String], strict: bool, approximate: bool) -> anyhow::Result<()> {
-    let unsupported = unsupported_node_imports(imports.iter().map(String::as_str));
-    if approximate {
-        // Failing on a guess would fail deploys for text that is not an import
-        // and pass ones whose import the guess missed.
-        if strict {
-            note!(
-                "Warning: cannot check --strict without esbuild to read the prebuilt entry's imports; \
-                 install it or set CELLD_ESBUILD"
-            );
+/// `unread` is set when esbuild did not read the imports and the list is a
+/// text scan, which can miss one: `strict` then fails, as it cannot vouch.
+pub(super) fn report(
+    imports: &[String],
+    strict: bool,
+    unread: Option<&Unread>,
+) -> anyhow::Result<()> {
+    if strict {
+        match unread {
+            Some(Unread::Missing) => bail!(
+                "--strict needs esbuild to read a prebuilt entry's imports; install esbuild \
+                 (or set CELLD_ESBUILD) or drop --strict"
+            ),
+            Some(Unread::Failed(error)) => bail!(
+                "--strict needs esbuild to read a prebuilt entry's imports, and it failed:\n\
+                 {error}\nfix the entry or drop --strict"
+            ),
+            None => {}
         }
-        if unsupported.is_empty() {
-            return Ok(());
-        }
-        let list = unsupported
-            .iter()
-            .map(|import| format!("  {}", import.specifier))
-            .collect::<Vec<_>>()
-            .join("\n");
-        note!(
-            "Warning: the prebuilt entry appears to import node: modules that celld does not \
-             implement (the list is approximate, read without esbuild):\n{list}"
-        );
-        return Ok(());
     }
+    let unsupported = unsupported_node_imports(imports.iter().map(String::as_str));
     if unsupported.is_empty() {
         return Ok(());
     }
@@ -109,6 +135,17 @@ pub(super) fn report(imports: &[String], strict: bool, approximate: bool) -> any
         })
         .collect::<Vec<_>>()
         .join("\n");
+    if let Some(unread) = unread {
+        let why = match unread {
+            Unread::Missing => "read without esbuild".to_string(),
+            Unread::Failed(error) => format!("esbuild could not parse the entry: {error}"),
+        };
+        note!(
+            "Warning: the prebuilt entry appears to import node: modules that celld does not \
+             implement (the list is approximate, {why}):\n{list}"
+        );
+        return Ok(());
+    }
     if strict {
         bail!(
             "the bundle imports node: modules that celld does not implement:\n{list}\n\
