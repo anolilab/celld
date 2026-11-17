@@ -35,12 +35,23 @@ pub fn open_local_bucket(database: &Path) -> anyhow::Result<Bucket> {
 }
 
 /// Where the local node of `celld dev` keeps the operator token it generates:
-/// in the state directory of `project`.
+/// in the state directory of `project`. A client has no `--state-dir` flag, so
+/// the `CELLD_DEV_STATE_DIR` value decides, then the project.
 #[doc(hidden)]
-pub fn operator_token_path(project: &Path) -> PathBuf {
-    DevState::for_project(project)
+pub fn operator_token_path(project: &Path) -> anyhow::Result<PathBuf> {
+    operator_token_path_with(project, std::env::var_os("CELLD_DEV_STATE_DIR"))
+}
+
+/// `operator_token_path` for a node that was given `state_dir` as its
+/// `CELLD_DEV_STATE_DIR` value.
+#[doc(hidden)]
+pub fn operator_token_path_with(
+    project: &Path,
+    state_dir: Option<OsString>,
+) -> anyhow::Result<PathBuf> {
+    Ok(DevState::resolve(project, None, state_dir)?
         .path()
-        .join(crate::operator_token::FILE_NAME)
+        .join(crate::operator_token::FILE_NAME))
 }
 
 #[derive(Debug)]
@@ -103,20 +114,18 @@ impl DevState {
         })
     }
 
-    /// The local state inside `project` itself, with no state directory.
-    fn for_project(project: &Path) -> Self {
-        Self {
-            path: project.join(Self::DIRECTORY),
-            shared_root: None,
-        }
-    }
-
     /// Create `<state directory>/<project hash>` private to the user, so
     /// nobody else can swap a link into it. Does nothing without a state
     /// directory.
     fn prepare_shared_root(&self) -> anyhow::Result<()> {
         match &self.shared_root {
-            Some(root) => crate::config_dir::create_private(root),
+            Some(root) => {
+                // `create_private` follows links and only restricts a path it
+                // creates, so a `DIR/<hash>` that another user planted must be
+                // refused before it is used.
+                self.ensure_not_redirected("use")?;
+                crate::config_dir::create_private(root)
+            }
             None => Ok(()),
         }
     }
@@ -125,7 +134,7 @@ impl DevState {
     /// another user owns: `DIR/<hash>`, `.celld` and `.celld/dev`. Missing
     /// levels are fine, and nothing is checked for a project-local state.
     #[allow(clippy::disallowed_methods)] // Local development state is an operator-owned host path.
-    fn ensure_not_redirected(&self) -> anyhow::Result<()> {
+    fn ensure_not_redirected(&self, action: &str) -> anyhow::Result<()> {
         let Some(root) = &self.shared_root else {
             return Ok(());
         };
@@ -143,7 +152,7 @@ impl DevState {
             };
             anyhow::ensure!(
                 !metadata.file_type().is_symlink(),
-                "refusing to discard {}: {} is a symbolic link",
+                "refusing to {action} {}: {} is a symbolic link",
                 self.path.display(),
                 level.display()
             );
@@ -153,7 +162,7 @@ impl DevState {
                 // SAFETY: `geteuid` takes no arguments and cannot fail.
                 anyhow::ensure!(
                     metadata.uid() == unsafe { libc::geteuid() },
-                    "refusing to discard {}: {} is owned by another user",
+                    "refusing to {action} {}: {} is owned by another user",
                     self.path.display(),
                     level.display()
                 );
@@ -182,7 +191,7 @@ impl DevState {
             "refusing to discard {}, which is not a celld dev state directory",
             self.path.display()
         );
-        self.ensure_not_redirected()?;
+        self.ensure_not_redirected("discard")?;
         match std::fs::remove_dir_all(&self.path) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -1205,6 +1214,38 @@ mod tests {
         assert!(!state.discard().unwrap());
         prepare_state(state.path()).unwrap();
         assert!(state.discard().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // Host paths in a temporary directory.
+    fn a_planted_per_project_directory_is_refused_before_it_is_used() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = directory.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let project = Path::new("/work/app");
+        let state = DevState::resolve(project, Some(shared.clone()), None).unwrap();
+        let victim = directory.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::os::unix::fs::symlink(&victim, shared.join(project_hash(project))).unwrap();
+        let error = state.prepare_shared_root().unwrap_err().to_string();
+        assert!(error.contains("symbolic link"), "{error}");
+    }
+
+    #[test]
+    fn clients_find_the_token_where_the_node_with_the_state_directory_keeps_it() {
+        let project = Path::new("/work/app");
+        let inside = operator_token_path_with(project, None).unwrap();
+        assert_eq!(inside, project.join(".celld/dev/operator-token"));
+        let shared = operator_token_path_with(project, Some("/shared".into())).unwrap();
+        assert_eq!(
+            shared,
+            DevState::resolve(project, None, Some("/shared".into()))
+                .unwrap()
+                .path()
+                .join(crate::operator_token::FILE_NAME)
+        );
+        assert_ne!(shared, inside);
     }
 
     #[test]
