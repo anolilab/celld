@@ -26,6 +26,10 @@ export class Cell extends DurableObject {
     const plain = await this.env.CELL.getByName(name).plain();
     return { plain, target: new Probe() };
   }
+  // The `cache` of a Request that crossed the RPC boundary.
+  requestCache(request) {
+    return request.cache ?? null;
+  }
   entries() {
     return globalThis.__celld_stub_entries();
   }
@@ -71,6 +75,41 @@ export default {
       } catch (error) {
         return Response.json(failure(error));
       }
+    }
+    if (url.pathname === "/cache") {
+      const attempt = async (run) => {
+        try {
+          return await run();
+        } catch (error) {
+          return `${error?.name}: ${error?.message}`;
+        }
+      };
+      // Nothing listens on port 1, so a fetch that gets past the option check
+      // fails to connect, which is not the option's error.
+      const dead = "http://127.0.0.1:1/";
+      return Response.json({
+        requestCache: await attempt(() => new Request(dead, { cache: "no-store" }).cache),
+        fetchNoStore: await attempt(() => fetch(dead, { cache: "no-store" })),
+        // A mode that is not a string converts to one, as a string would.
+        objectCache: await attempt(
+          () => new Request(dead, { cache: { toString: () => "no-store" } }).cache),
+        forceCache: await attempt(() => fetch(dead, { cache: "force-cache" })),
+        cloned: await attempt(() => new Request(dead, { cache: "no-store" }).clone().cache),
+        // A data: URL never reaches the Request constructor, but its option
+        // is checked all the same.
+        dataForceCache: await attempt(() => fetch("data:,x", { cache: "force-cache" })),
+        dataNoStore: await attempt(
+          async () => (await fetch("data:,x", { cache: "no-store" })).text()),
+        flag: globalThis.Cloudflare.compatibilityFlags.cache_option_enabled,
+      });
+    }
+    if (url.pathname === "/rpc-cache") {
+      const stub = env.CELL.getByName("rpc-cache");
+      const request = new Request("http://example.test/", { cache: "no-store" });
+      return Response.json({
+        sent: await stub.requestCache(request),
+        plain: await stub.requestCache(new Request("http://example.test/")),
+      });
     }
     if (url.pathname === "/connect") {
       try {

@@ -400,15 +400,26 @@ Object.defineProperty(Response.prototype, "bodyUsed", __bodyUsedAccessor);
 const __HTTP_METHODS = new Set(
   ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]);
 const __FETCH_REDIRECT_MODES = new Set(["follow", "manual", "error"]);
+// The cache option needs the cache_option_enabled compat flag. celld has
+// no outbound HTTP cache, so only "no-store" is accepted, as a no-op.
+function __checkCacheOption(cache) {
+  if (!__cell.compat.cacheOption)
+    throw new Error("The 'cache' field on 'RequestInitializerDict' " +
+      "is not implemented.");
+  if (String(cache) !== "no-store")
+    throw new TypeError(
+      `Unsupported cache mode: ${cache}. Only "no-store" is supported.`);
+}
 globalThis.Request = class Request {
   constructor(input, init = {}) {
     const prior = input instanceof Request ? input : null;
     const suppliedSignal = init.signal !== undefined;
-    // The cache option needs the cache_option_enabled compat flag,
-    // which Cells does not implement (Workerd's cache-disabled path).
-    if (init.cache !== undefined)
-      throw new Error("The 'cache' field on 'RequestInitializerDict' " +
-        "is not implemented.");
+    if (init.cache !== undefined) {
+      __checkCacheOption(init.cache);
+      this.cache = "no-store";
+    } else if (prior && prior.cache !== undefined) {
+      this.cache = prior.cache;
+    }
     this.url = prior ? prior.url : String(input);
     {
       // Workers upper-cases every method (the
@@ -675,6 +686,8 @@ const __dataUrlResponse = (url) => {
 globalThis.fetch = async (input, init) => {
   const rawUrl = typeof input === "string" ? input : input?.url;
   if (typeof rawUrl === "string" && rawUrl.startsWith("data:")) {
+    // The Request constructor is skipped here, so check the option itself.
+    if (init?.cache !== undefined) __checkCacheOption(init.cache);
     return __dataUrlResponse(rawUrl);
   }
   const req = new Request(input, init);
@@ -4522,7 +4535,7 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       if (!allowCapabilities) return v;
       marker = { "__celld$req": v.url, m: v.method,
                  h: [...v.headers], r: v.redirect, c: v.cf,
-                 e: v.encodeResponseBody, b: liftBody(v) };
+                 k: v.cache, e: v.encodeResponseBody, b: liftBody(v) };
     } else if (v instanceof Response) {
       if (!allowCapabilities) return v;
       marker = { "__celld$res": v.status,
@@ -4599,15 +4612,16 @@ const __adoptBody = (target, bytes) => {
 };
 // A non-bytes `b` is a live-stream body marker: revive it and
 // let the constructor adopt it as a streaming body.
+// `cache` is set after construction: the receiver's own compat flags
+// do not decide whether a request that already carries it may cross.
 const __reviveRequest = (marker, url, revive) => {
-  if (!(marker.b instanceof Uint8Array))
-    return new Request(url, { method: marker.m,
-      headers: marker.h, redirect: marker.r, cf: marker.c,
-      encodeResponseBody: marker.e, body: revive(marker.b) });
+  const live = !(marker.b instanceof Uint8Array);
   const req = new Request(url, { method: marker.m,
     headers: marker.h, redirect: marker.r, cf: marker.c,
-    encodeResponseBody: marker.e });
-  __adoptBody(req, marker.b);
+    encodeResponseBody: marker.e,
+    ...(live ? { body: revive(marker.b) } : {}) });
+  if (marker.k !== undefined) req.cache = marker.k;
+  if (!live) __adoptBody(req, marker.b);
   return req;
 };
 const __reviveResponse = (marker, revive) => {
@@ -6264,7 +6278,10 @@ const __cell = __celld.__cell = {
   namespaceKeys: {},
   node: "",
   deleteAllDeletesAlarm: false,
-  compat: { jsRpc: false, fetcherGetPutDelete: false, queueJsonMessages: false },
+  compat: {
+    jsRpc: false, fetcherGetPutDelete: false, queueJsonMessages: false,
+    cacheOption: false,
+  },
   makeNamespace,
   release: __cellRelease,
 };

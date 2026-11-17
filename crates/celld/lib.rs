@@ -29,6 +29,7 @@ pub mod claim_provenance;
 pub mod clean_reload;
 pub mod cli_options;
 pub mod cli_output;
+pub mod compat_flags;
 pub(crate) mod config_dir;
 pub mod container;
 pub mod control_plane;
@@ -90,6 +91,7 @@ pub mod tls_roots;
 pub mod wake;
 pub mod wake_entry;
 pub mod wake_format;
+pub mod workerd_flags;
 pub mod ws_client;
 pub mod ws_registry;
 
@@ -182,49 +184,36 @@ pub enum WorkerJob {
 /// Compatibility switches copied with the JS adapter. These are runtime
 /// semantics, not lifecycle decisions.
 pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
-    let flags = metadata
+    let flags: Vec<&str> = metadata
         .get("compatibility_flags")
-        .and_then(serde_json::Value::as_array);
-    let has_flag = |name: &str| {
-        flags.is_some_and(|flags| {
-            flags
-                .iter()
-                .any(|flag| flag.as_str().is_some_and(|flag| flag == name))
-        })
-    };
+        .and_then(serde_json::Value::as_array)
+        .map(|flags| flags.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
     let date = metadata
         .get("compatibility_date")
         .and_then(serde_json::Value::as_str);
-    let switch = |enable: &str, disable: &str, since: &str| {
-        if has_flag(enable) {
-            return true;
-        }
-        if has_flag(disable) {
-            return false;
-        }
-        date.is_some_and(|date| date >= since)
-    };
+    let on = |name: &str| compat_flags::switch(name, &flags, date);
+    // Stored versions may carry the old names `queue_v8_messages` and
+    // `queue_json_messages`, which an earlier release honoured. Keep these
+    // aliases until no stored version carries them; deploy warns about them.
+    // The opt-out wins over the old JSON alias, as it does over the date.
+    let queue_json_messages =
+        if flags.contains(&"queue_v8_messages") || flags.contains(&"no_queues_json_messages") {
+            false
+        } else {
+            flags.contains(&"queue_json_messages") || on("queues_json_messages")
+        };
     js::Compat {
-        delete_all_deletes_alarm: switch(
-            "delete_all_deletes_alarm",
-            "delete_all_preserves_alarm",
-            "2026-02-24",
-        ),
-        js_rpc: has_flag("js_rpc"),
-        fetcher_get_put_delete: !switch(
-            "fetcher_no_get_put_delete",
-            "fetcher_has_get_put_delete",
-            "2024-03-26",
-        ),
-        sqlite_vec: has_flag("sqlite_vec"),
-        websocket_standard_binary_type: has_flag("websocket_standard_binary_type"),
-        queue_json_messages: switch("queue_json_messages", "queue_v8_messages", "2024-03-18"),
-        populate_process_env: (has_flag("nodejs_compat") || has_flag("nodejs_compat_v2"))
-            && switch(
-                "nodejs_compat_populate_process_env",
-                "nodejs_compat_do_not_populate_process_env",
-                "2025-04-01",
-            ),
+        delete_all_deletes_alarm: on("delete_all_deletes_alarm"),
+        js_rpc: on("js_rpc"),
+        fetcher_get_put_delete: !on("fetcher_no_get_put_delete"),
+        sqlite_vec: on("sqlite_vec"),
+        websocket_standard_binary_type: on("websocket_standard_binary_type"),
+        queue_json_messages,
+        populate_process_env: (on("nodejs_compat")
+            || (on("nodejs_compat_v2") && !flags.contains(&"no_nodejs_compat")))
+            && on("nodejs_compat_populate_process_env"),
+        cache_option: on("cache_option_enabled"),
     }
 }
 

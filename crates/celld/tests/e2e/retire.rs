@@ -57,6 +57,7 @@ async fn redeploy(server: &Server) {
         local_images: true,
         sourcemap: None,
         tag: None,
+        strict_compat_flags: false,
     })
     .expect("build the variant");
     let bucket =

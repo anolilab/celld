@@ -185,6 +185,10 @@ pub struct Options {
     /// Fail the build when the bundle imports a `node:` module celld does
     /// not implement. Without it the imports are listed as a warning.
     pub strict: bool,
+    /// Fail the build on a compatibility flag that celld does not know or only
+    /// partly runs, or on a date that implies one it does not run. Without it
+    /// each is a warning; an unsupported flag always fails the build.
+    pub strict_compat_flags: bool,
     pub json: bool,
     /// Upload the version and validate it, but move no pointer and publish no
     /// queue consumer attachment. `celld activate` selects it later.
@@ -229,7 +233,7 @@ pub fn print_help() {
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --sourcemap PATH       Write the entry's source map to PATH, with its sources\n                         relative to the project. The deployed module does not\n                         change. With `no_bundle`, the map is the file the\n                         entry's own build wrote beside it, <entry>.map\n  --tag TAG              Label the deployment; a `version_metadata` binding\n                         reports it as `tag`. It does not change the version\n  --dry-run              Bundle and print the version without writing\n  --strict               Fail when the bundle imports a node: module celld does\n                         not implement; without it they are listed as a warning\n  --no-activate          Upload and validate the version but select nothing; the\n                         fleet keeps serving what it serves. `celld activate`\n                         selects the version later and `celld discard` removes it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
+OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --sourcemap PATH       Write the entry's source map to PATH, with its sources\n                         relative to the project. The deployed module does not\n                         change. With `no_bundle`, the map is the file the\n                         entry's own build wrote beside it, <entry>.map\n  --tag TAG              Label the deployment; a `version_metadata` binding\n                         reports it as `tag`. It does not change the version\n  --dry-run              Bundle and print the version without writing\n  --strict               Fail when the bundle imports a node: module celld does\n                         not implement; without it they are listed as a warning\n  --strict-compat-flags\n                         Fail on a compatibility flag celld does not know or\n                         does not handle yet, instead of warning\n  --no-activate          Upload and validate the version but select nothing; the\n                         fleet keeps serving what it serves. `celld activate`\n                         selects the version later and `celld discard` removes it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain, from Google\n\
 Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
 account key, managed identity, or workload identity for an az:// bucket.\n\n\
@@ -256,6 +260,7 @@ pub fn options_from_arguments(
         region: None,
         dry_run: false,
         strict: false,
+        strict_compat_flags: false,
         no_activate: false,
         local_images: false,
         json: false,
@@ -269,6 +274,7 @@ pub fn options_from_arguments(
             "--help" | "-h" => return Ok(None),
             "--dry-run" => options.dry_run = true,
             "--strict" => options.strict = true,
+            "--strict-compat-flags" => options.strict_compat_flags = true,
             "--no-activate" => options.no_activate = true,
             "--json" => options.json = true,
             "--config" => {
@@ -319,6 +325,9 @@ struct Project {
     bundle: BundleConfig,
     assets: Option<ProjectAssets>,
     metadata: Value,
+    /// The config's `compatibility_flags` and `compatibility_date`, read once.
+    compatibility_flags: Vec<String>,
+    compatibility_date: Option<String>,
     do_classes: Vec<String>,
     sqlite_classes: Vec<String>,
     crons: Vec<String>,
@@ -601,7 +610,12 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .filter(|path| !path.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    let mut project = read_project(&config_path, &root, &options.vars)?;
+    let mut project = read_project(
+        &config_path,
+        &root,
+        &options.vars,
+        options.strict_compat_flags,
+    )?;
     // Resolve every image before the version is computed: the id is part of
     // the deployment's identity, so a rebuilt image is a new deployment.
     // A fleet deploy builds for the platform the nodes run, which Wrangler
@@ -736,11 +750,11 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         file_count: assets.file_count,
         total_bytes: assets.total_bytes,
     });
-    let sqlite_vec = project
-        .metadata
-        .get("compatibility_flags")
-        .and_then(Value::as_array)
-        .is_some_and(|flags| flags.iter().any(|flag| flag.as_str() == Some("sqlite_vec")));
+    let sqlite_vec = crate::compat_flags::switch(
+        "sqlite_vec",
+        &project.compatibility_flags,
+        project.compatibility_date.as_deref(),
+    );
     let uses_d1 = project.do_classes.iter().any(|class| class == D1_CLASS);
     let python_runtime = project.python.is_some();
     let uses_version_metadata = has_binding_type(&project.metadata, "version_metadata");
@@ -1628,7 +1642,12 @@ pub(crate) fn resolve_config(given: Option<PathBuf>) -> anyhow::Result<PathBuf> 
     )
 }
 
-fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::Result<Project> {
+fn read_project(
+    path: &Path,
+    root: &Path,
+    overrides: &VarOverrides,
+    strict_compat_flags: bool,
+) -> anyhow::Result<Project> {
     let source =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let config: Value = serde_json::from_str(&strip_jsonc(&source))
@@ -1661,6 +1680,18 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
              ASCII letters, digits, or internal hyphens: {script_name:?}"
         );
     }
+    let (compatibility_flags, compatibility_date) = read_compatibility(object)?;
+    // Before anything that rejects a flag for its own reason, so that one error
+    // lists every flag celld does not run and the warnings print.
+    crate::compat_flags::check(
+        &compatibility_flags,
+        compatibility_date.as_deref(),
+        strict_compat_flags,
+        object
+            .get("main")
+            .and_then(Value::as_str)
+            .is_some_and(|main| main.ends_with(".py")),
+    )?;
     let main = object
         .get("main")
         .map(|value| {
@@ -1691,7 +1722,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
         .filter(|main| main.ends_with(".py"))
         .map(|_| {
             python::check_supported_events(object)?;
-            python::python_compat(object)
+            python::python_compat(&compatibility_flags, compatibility_date.as_deref())
         })
         .transpose()?;
     let bundle = read_bundle_config(object)?;
@@ -1714,7 +1745,14 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     }
     let assets = object
         .get("assets")
-        .map(|value| read_asset_project(value, root, object))
+        .map(|value| {
+            read_asset_project(
+                value,
+                root,
+                &compatibility_flags,
+                compatibility_date.as_deref(),
+            )
+        })
         .transpose()?;
     if main.is_none() && assets.is_none() {
         bail!("config has neither `main` nor `assets`");
@@ -2374,6 +2412,8 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
         bundle,
         assets,
         metadata: Value::Object(metadata),
+        compatibility_flags,
+        compatibility_date,
         do_classes,
         sqlite_classes,
         crons,
@@ -2385,6 +2425,38 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
         containers,
         python,
     })
+}
+
+/// The config's `compatibility_flags` and `compatibility_date`.
+fn read_compatibility(
+    object: &Map<String, Value>,
+) -> anyhow::Result<(Vec<String>, Option<String>)> {
+    let flags = match object.get("compatibility_flags") {
+        None => Vec::new(),
+        Some(Value::Array(flags)) => flags
+            .iter()
+            .map(|flag| {
+                flag.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("compatibility flags must be strings"))
+            })
+            .collect::<anyhow::Result<_>>()?,
+        Some(_) => bail!("config `compatibility_flags` must be an array"),
+    };
+    let date = match object.get("compatibility_date") {
+        None => None,
+        Some(Value::String(date)) => {
+            // Dates are compared as text, which orders only the canonical form.
+            let canonical = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .is_ok_and(|parsed| parsed.format("%Y-%m-%d").to_string() == *date);
+            if !canonical {
+                bail!("config `compatibility_date` {date:?} must be a real date as YYYY-MM-DD");
+            }
+            Some(date.clone())
+        }
+        Some(_) => bail!("config `compatibility_date` must be a string"),
+    };
+    Ok((flags, date))
 }
 
 /// The config's `define` and `rules`, as esbuild arguments.
@@ -2836,7 +2908,8 @@ fn read_sqlite_classes(project: &Map<String, Value>) -> anyhow::Result<Vec<Strin
 fn read_asset_project(
     value: &Value,
     root: &Path,
-    project: &Map<String, Value>,
+    compatibility_flags: &[String],
+    compatibility_date: Option<&str>,
 ) -> anyhow::Result<ProjectAssets> {
     let object = value
         .as_object()
@@ -2918,32 +2991,6 @@ fn read_asset_project(
 
     let headers = read_asset_directive(&directory, "_headers")?;
     let redirects = read_asset_directive(&directory, "_redirects")?;
-    let compatibility_date = project
-        .get("compatibility_date")
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("config `compatibility_date` must be a string"))
-        })
-        .transpose()?;
-    let compatibility_flags = project
-        .get("compatibility_flags")
-        .map(|value| {
-            value
-                .as_array()
-                .ok_or_else(|| anyhow!("config `compatibility_flags` must be an array"))?
-                .iter()
-                .map(|flag| {
-                    flag.as_str()
-                        .map(str::to_string)
-                        .ok_or_else(|| anyhow!("compatibility flags must be strings"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
-
     // Retain the Wrangler-shaped upload metadata as well as the normalized
     // index config. Defaults and compatibility settings belong in the index;
     // upload metadata includes only the values Wrangler would send.
@@ -2969,8 +3016,8 @@ fn read_asset_project(
             run_worker_first,
             headers,
             redirects,
-            compatibility_date,
-            compatibility_flags,
+            compatibility_date: compatibility_date.map(str::to_string),
+            compatibility_flags: compatibility_flags.to_vec(),
         },
         raw_metadata: json!({ "config": Value::Object(upload_config) }),
     })
@@ -3634,7 +3681,7 @@ mod version_metadata_config_tests {
         std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
         let path = dir.path().join("wrangler.jsonc");
         std::fs::write(&path, config).unwrap();
-        read_project(&path, dir.path(), &VarOverrides::None)
+        read_project(&path, dir.path(), &VarOverrides::None, false)
     }
 
     fn base(extra: &str) -> String {
@@ -3739,5 +3786,105 @@ mod version_metadata_config_tests {
         .err()
         .expect("a clash is refused");
         assert!(error.to_string().contains("META"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod compatibility_config_tests {
+    use super::*;
+
+    fn read(main: &str, config: &str) -> anyhow::Result<Project> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(main), "").unwrap();
+        let path = dir.path().join("wrangler.jsonc");
+        std::fs::write(&path, config).unwrap();
+        read_project(&path, dir.path(), &VarOverrides::None, false)
+    }
+
+    #[test]
+    fn a_python_entry_lists_every_offending_flag_before_its_own_checks() {
+        let error = read(
+            "main.py",
+            r#"{ "name": "app", "main": "main.py", "compatibility_date": "2026-01-01",
+                 "compatibility_flags": ["streaming_tail_worker", "no_global_navigator"] }"#,
+        )
+        .err()
+        .expect("unsupported flags are refused")
+        .to_string();
+        assert!(
+            error.contains("streaming_tail_worker: not supported"),
+            "{error}"
+        );
+        assert!(
+            error.contains("no_global_navigator: not supported"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_python_flag_is_refused_for_a_javascript_entry_only() {
+        let config = |main: &str| {
+            format!(
+                r#"{{ "name": "app", "main": "{main}", "no_bundle": true,
+                     "compatibility_flags": ["python_workers", "no_such_flag"] }}"#
+            )
+        };
+        let error = read("index.js", &config("index.js"))
+            .err()
+            .expect("a Python flag is refused for JavaScript")
+            .to_string();
+        assert!(
+            error.contains("python_workers: only a Python Worker"),
+            "{error}"
+        );
+        let python = read("main.py", &config("main.py"));
+        assert!(!python
+            .err()
+            .is_some_and(|error| error.to_string().contains("only a Python Worker")),);
+    }
+
+    #[test]
+    fn a_flag_set_with_its_opt_out_is_refused() {
+        let error = read(
+            "index.js",
+            r#"{ "name": "app", "main": "index.js", "no_bundle": true,
+                 "compatibility_flags": ["queues_json_messages", "no_queues_json_messages"] }"#,
+        )
+        .err()
+        .expect("a contradiction is refused")
+        .to_string();
+        assert!(
+            error.contains("queues_json_messages and no_queues_json_messages contradict"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_flags_and_date_are_read_once_and_kept_on_the_project() {
+        let project = read(
+            "index.js",
+            r#"{ "name": "app", "main": "index.js", "no_bundle": true,
+                 "compatibility_date": "2026-01-01", "compatibility_flags": ["nodejs_compat"] }"#,
+        )
+        .unwrap();
+        assert_eq!(project.compatibility_flags, ["nodejs_compat"]);
+        assert_eq!(project.compatibility_date.as_deref(), Some("2026-01-01"));
+        for bad in [
+            r#""compatibility_flags": "nodejs_compat""#,
+            r#""compatibility_flags": [1]"#,
+            r#""compatibility_date": 20260101"#,
+            r#""compatibility_date": "2026-8-4""#,
+            r#""compatibility_date": "9999""#,
+            r#""compatibility_date": "2026-02-30""#,
+            r#""compatibility_date": "2025-02-29""#,
+            r#""compatibility_date": " 2026-08-04""#,
+        ] {
+            let config =
+                format!(r#"{{ "name": "app", "main": "index.js", "no_bundle": true, {bad} }}"#);
+            assert!(read("index.js", &config).is_err(), "{bad}");
+        }
+        let leap = r#"{ "name": "app", "main": "index.js", "no_bundle": true,
+                        "compatibility_date": "2024-02-29" }"#;
+        assert!(read("index.js", leap).is_ok());
     }
 }
