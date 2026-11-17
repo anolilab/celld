@@ -10923,6 +10923,12 @@ thread_local! {
     /// turns. Never set by JS.
     static CURRENT: RefCell<Option<Arc<IoContext>>> =
         const { RefCell::new(None) };
+
+    /// The default context of a thread that has had none installed. Kept apart
+    /// from `CURRENT` so that code can tell an installed request from this
+    /// fallback, which is shared by everything that runs on the thread.
+    static DEFAULT_CONTEXT: RefCell<Option<Arc<IoContext>>> =
+        const { RefCell::new(None) };
 }
 
 /// Install `context` for the duration of a turn, restoring whatever was
@@ -10954,10 +10960,16 @@ impl Drop for CurrentGuard {
 /// Isolation is a property of *installing* a context, so it arrives with the
 /// paths that need it rather than being retrofitted to every caller at once.
 fn current_context() -> Arc<IoContext> {
-    CURRENT.with(|current| {
-        let mut current = current.borrow_mut();
-        current.get_or_insert_with(IoContext::new).clone()
-    })
+    CURRENT
+        .with(|current| current.borrow().clone())
+        .unwrap_or_else(|| {
+            DEFAULT_CONTEXT.with(|default| {
+                default
+                    .borrow_mut()
+                    .get_or_insert_with(IoContext::new)
+                    .clone()
+            })
+        })
 }
 
 fn op_event_begin(
@@ -11029,7 +11041,8 @@ fn op_pending_event_end(
 /// Code that runs with no request (a module evaluating while the isolate
 /// loads) would otherwise fall back to the thread's default context, which is
 /// shared by every script on the thread and never dropped: its `/tmp` would
-/// outlive the script and leak into the next one.
+/// outlive the script and leak into the next one. Only a context a guard
+/// installed counts; the lazily created default never does.
 fn request_context(scope: &mut v8::PinScope) -> Option<Arc<IoContext>> {
     current_reaction_io_context(scope).or_else(|| CURRENT.with(|current| current.borrow().clone()))
 }
@@ -11989,7 +12002,7 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
 
 #[cfg(test)]
 mod request_vfs_tests {
-    use super::{RequestVfs, VfsNode};
+    use super::{current_context, CurrentGuard, IoContext, RequestVfs, VfsNode, CURRENT};
 
     #[test]
     fn appended_files_hold_no_more_memory_than_they_are_charged() {
@@ -12010,5 +12023,53 @@ mod request_vfs_tests {
             .sum();
         assert_eq!(held, 4 * 5000, "capacity must equal the bytes written");
         assert!(held <= vfs.used);
+    }
+
+    #[test]
+    fn the_lazy_default_context_is_never_an_installed_request() {
+        // Module scope runs with no request but may still reach for a context.
+        let default = current_context();
+        assert!(
+            CURRENT.with(|current| current.borrow().is_none()),
+            "creating the default must not install it"
+        );
+        // A request installed by a guard is what counts, and it goes away.
+        let request = IoContext::new();
+        {
+            let _guard = CurrentGuard::enter(request.clone());
+            assert!(CURRENT.with(|current| current.borrow().is_some()));
+        }
+        assert!(CURRENT.with(|current| current.borrow().is_none()));
+        assert!(std::sync::Arc::ptr_eq(&default, &current_context()));
+    }
+
+    #[test]
+    fn one_requests_tmp_is_not_visible_to_another() {
+        let write = |context: &std::sync::Arc<IoContext>, data: &[u8]| {
+            context
+                .vfs
+                .get_or_init(|| std::sync::Mutex::new(RequestVfs::default()))
+                .lock()
+                .unwrap()
+                .write("/tmp/shared.txt", data, false)
+                .unwrap();
+        };
+        let (a, b) = (IoContext::new(), IoContext::new());
+        write(&a, b"from a");
+        assert!(b.vfs.get().is_none(), "B has no tree until it uses /tmp");
+        write(&b, b"from b");
+        let read = |context: &std::sync::Arc<IoContext>| {
+            context
+                .vfs
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .read("/tmp/shared.txt")
+                .unwrap()
+                .to_vec()
+        };
+        assert_eq!(read(&a), b"from a");
+        assert_eq!(read(&b), b"from b");
     }
 }
