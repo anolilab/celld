@@ -221,7 +221,7 @@ impl OperatorToken {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty());
         if let Some(parent) = parent {
-            create_private_dir(parent)?;
+            crate::config_dir::create_private(parent)?;
         }
         #[cfg(unix)]
         {
@@ -327,24 +327,9 @@ impl OperatorToken {
     }
 }
 
-/// Create the directory a token file goes in, private to its owner, along
-/// with any missing parents.
-fn create_private_dir(path: &Path) -> anyhow::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
-    }
-    builder
-        .create(path)
-        .with_context(|| format!("create {}", path.display()))
-}
-
 /// Refuse to create a token in a directory another user could replace the
-/// file in: one that is not the node owner's own, or that group or other
-/// users can write to.
+/// file in: one that is not the node owner's own. The owner's own directory
+/// that group or other users can write to is tightened to 0700.
 #[cfg(unix)]
 #[allow(clippy::disallowed_methods)] // A per-user credential directory, not node storage.
 fn check_directory(path: &Path, euid: u32) -> anyhow::Result<()> {
@@ -361,10 +346,12 @@ fn check_directory(path: &Path, euid: u32) -> anyhow::Result<()> {
     }
     let mode = metadata.permissions().mode();
     if mode & 0o022 != 0 {
-        bail!(
-            "{} can be written by other users (mode {:o}); run `chmod go-w` on it or keep the \
-             token file in another directory",
-            path.display(),
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restrict {}", path.display()))?;
+        tracing::warn!(
+            path = %path.display(),
+            "the token file's directory could be written by other users (mode {:o}); \
+             changed it to 700",
             mode & 0o777
         );
     }
@@ -584,19 +571,55 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_directory_others_can_write_is_refused_for_a_new_token() {
+    fn a_directory_others_can_write_is_tightened_for_a_new_token() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE_NAME);
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
-        let error = OperatorToken::load_or_create(&path).unwrap_err();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        OperatorToken::load_or_create(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_of_another_user_is_refused_and_left_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        let other = unsafe { libc::geteuid() }.wrapping_add(1);
+        let error = check_directory(dir.path(), other).unwrap_err();
         assert!(
-            format!("{error:#}").contains("can be written by other users"),
+            format!("{error:#}").contains("is owned by user"),
             "{error:#}"
         );
-        assert!(!path.exists());
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        OperatorToken::load_or_create(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o775
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_directory_is_created_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: `umask` only swaps the process mask; it is restored below.
+        let old = unsafe { libc::umask(0o002) };
+        let nested = dir.path().join("a").join("b");
+        let created = crate::config_dir::create_private(&nested);
+        unsafe { libc::umask(old) };
+        created.unwrap();
+        for path in [dir.path().join("a"), nested] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
     }
 
     #[test]

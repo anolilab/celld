@@ -470,7 +470,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
 #[allow(clippy::disallowed_methods)] // Local development state is an operator-owned host path.
 fn prepare_state(state: &Path) -> anyhow::Result<()> {
     for directory in [state.to_path_buf(), state.join("runtime")] {
-        std::fs::create_dir_all(&directory)
+        crate::config_dir::create_private(&directory)
             .with_context(|| format!("create local state directory {}", directory.display()))?;
     }
     Ok(())
