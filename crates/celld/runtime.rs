@@ -2352,21 +2352,29 @@ fn retire_wake(retire: Option<&crate::pool::Slot>) -> Option<Wake> {
         })
 }
 
-/// Arm the retire bell for an event that waits with nothing to sample its
-/// cancellation, or hand back the wake when the deadline has already passed.
-/// The bell is taken before the flag is read, so a deadline that lands
-/// between the read and the wait is still heard.
+/// Arm the retire bell for a wait that nothing else bounds, or hand back the
+/// wake when the deadline has already passed. The bell is taken before the
+/// flag is read, so a deadline that lands between the read and the wait is
+/// still heard.
 ///
-/// Only a superseded generation arms it: taking the bell locks the bell's
-/// waiter list on its first poll and again on drop, so a serving generation
-/// pays one relaxed load per pass and nothing else (no lock, no allocation).
-/// Supersede comes at deploy, long before the deadline, so a wait that
-/// begins after it is heard at the deadline. A wait that was already parked
-/// when the generation was superseded has no bell; it ends at its next
-/// natural wake (an operation, a message, its budget), which reads the
+/// `always` is for the post-answer waits with no budget and no request id to
+/// sample (`waitUntil` and leftover work). They run after the response, off
+/// the latency-critical path, and may have parked long before the deploy that
+/// superseded them, so they take the bell whatever the generation's state: a
+/// wait that parked while it served has no other way to hear the deadline.
+/// That costs the bell's waiter-list lock on its first poll and again on
+/// drop, once per wake.
+///
+/// A wait already bounded by a budget or the cancellation tick passes
+/// `always: false`. It arms the bell only for a superseded generation, so a
+/// serving one pays one relaxed load per pass and nothing else. A wait that
+/// began serving and is bounded ends at its next wake, which reads the
 /// deadline flag.
-fn arm_retire(retire: Option<&crate::pool::Slot>) -> Result<Option<Notified<'_>>, Wake> {
-    let Some(slot) = retire.filter(|slot| slot.superseded()) else {
+fn arm_retire(
+    retire: Option<&crate::pool::Slot>,
+    always: bool,
+) -> Result<Option<Notified<'_>>, Wake> {
+    let Some(slot) = retire.filter(|slot| always || slot.superseded()) else {
         return Ok(None);
     };
     let bell = slot.retire_notified();
@@ -2437,7 +2445,7 @@ async fn wake(
             let (gated_reply, context) = entry.gated_reply_and_io_context();
             if let Some(gated_reply) = gated_reply {
                 let Some(request_id) = request_id else {
-                    let retired = match arm_retire(retire) {
+                    let retired = match arm_retire(retire, true) {
                         Ok(bell) => bell,
                         Err(wake) => return wake,
                     };
@@ -2521,7 +2529,7 @@ async fn wake(
             // must still retire the background work before the runtime stops.
             let Some(request_id) = request_id else {
                 let context = entry.io_context();
-                let retired = match arm_retire(retire) {
+                let retired = match arm_retire(retire, true) {
                     Ok(bell) => bell,
                     Err(wake) => return wake,
                 };
@@ -2620,7 +2628,7 @@ async fn wake(
         }
         // A request a client can hang up on is sampled every tick. An internal
         // one waits for its whole budget, so the retire bell stands in.
-        let retired = match arm_retire(retire.filter(|_| !entry.cancellable())) {
+        let retired = match arm_retire(retire.filter(|_| !entry.cancellable()), false) {
             Ok(bell) => bell,
             Err(wake) => return wake,
         };
@@ -3502,5 +3510,38 @@ fn install_container_specs(generation: &Generation) {
     }
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(crate::container::prewarm());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A wait that parked while its generation served has no bell to be woken
+    /// by unless it took one then. The unbounded post-answer waits take it
+    /// always; a bounded wait takes it only once superseded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unbounded_wait_armed_while_serving_hears_the_deadline() {
+        let pool = crate::pool::tests::pool();
+        let slot = crate::pool::tests::grown(&pool);
+        assert!(!slot.superseded());
+        assert!(matches!(arm_retire(Some(&slot), false), Ok(None)));
+        let Ok(Some(bell)) = arm_retire(Some(&slot), true) else {
+            panic!("an unbounded wait arms the bell while serving");
+        };
+
+        // The deploy supersedes the pool, later than the wait parked.
+        pool.retire_all();
+        pool.force_retired();
+
+        tokio::time::timeout(Duration::from_secs(5), retire_bell(Some(bell)))
+            .await
+            .expect("a wait armed before the supersede hears the deadline");
+        assert!(matches!(
+            arm_retire(Some(&slot), true),
+            Err(Wake::Cancelled {
+                cause: js::CancelCause::Superseded
+            })
+        ));
     }
 }

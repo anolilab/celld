@@ -937,10 +937,10 @@ const _: fn() = || {
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn pool() -> Pool {
+    pub(crate) fn pool() -> Pool {
         crate::runtime::init_v8();
         let config = Arc::new(js::WorkerConfig::new(js::WorkerConfigOptions {
             src: "export default { fetch() { return new Response('ok'); } };".to_string(),
@@ -963,6 +963,10 @@ mod tests {
             std::time::Duration::from_secs(1),
             Box::new(move || js::Worker::load_config(config.clone())),
         )
+    }
+
+    pub(crate) fn grown(pool: &Pool) -> Arc<Slot> {
+        pool.grow(None).expect("isolate")
     }
 
     #[tokio::test(flavor = "multi_thread")]
