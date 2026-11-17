@@ -8637,7 +8637,10 @@ fn op_fetch(
             let result = match rx.await {
                 // Global `fetch()` never reads a socket target, so a 101 hands
                 // nothing over and its socket closes with the response.
-                Ok(Ok(response)) => encode_http_response(response, false, &stream_service),
+                Ok(Ok(mut response)) => {
+                    release_websocket(&mut response);
+                    encode_http_response(response, false, &stream_service)
+                }
                 Ok(Err(error)) => Err(format!("{error}")),
                 Err(error) => Err(format!("globalOutbound Fetcher dropped: {error}")),
             };
@@ -9510,19 +9513,26 @@ fn op_do_id(
 /// closes it, a cell's needs the explicit close, and a tunneled cell's parked
 /// peer upgrade is taken out so loaded code cannot strand it.
 fn refuse_unrequested_websocket(response: &mut HttpResponse, upgrade: bool) -> Result<(), String> {
-    use crate::cell_dispatch::{take_tunnel_upgrade, WEBSOCKET_WITHOUT_UPGRADE};
-    if upgrade {
+    use crate::cell_dispatch::WEBSOCKET_WITHOUT_UPGRADE;
+    if upgrade || response.websocket.is_none() {
         return Ok(());
     }
+    release_websocket(response);
+    Err(format!("TypeError: {WEBSOCKET_WITHOUT_UPGRADE}"))
+}
+
+/// Release the socket a response carries, if any: dropping a Worker's socket
+/// closes it, a cell's needs the explicit close, and a tunneled cell's parked
+/// peer upgrade is taken out so nothing strands it.
+fn release_websocket(response: &mut HttpResponse) {
+    use crate::cell_dispatch::{take_tunnel_upgrade, WEBSOCKET_WITHOUT_UPGRADE};
     match response.websocket.take() {
         Some(HttpResponseWebSocket::Cell(target)) => match target.tunnel {
             Some(parked) => drop(take_tunnel_upgrade(parked)),
             None => ws_close(target.id, 1006, WEBSOCKET_WITHOUT_UPGRADE),
         },
-        Some(HttpResponseWebSocket::Worker(_)) => {}
-        None => return Ok(()),
+        Some(HttpResponseWebSocket::Worker(_)) | None => {}
     }
-    Err(format!("TypeError: {WEBSOCKET_WITHOUT_UPGRADE}"))
 }
 
 /// Encode a response for the request `owner`. A cell's WebSocket the response
@@ -11856,7 +11866,10 @@ mod current_context_tests {
 
 #[cfg(test)]
 mod refuse_unrequested_websocket_tests {
-    use super::{refuse_unrequested_websocket, HttpResponse, HttpResponseWebSocket, WsTarget};
+    use super::{
+        refuse_unrequested_websocket, release_websocket, HttpResponse, HttpResponseWebSocket,
+        WsTarget,
+    };
     use crate::cell_dispatch::{park_tunnel_upgrade, take_tunnel_upgrade};
 
     fn tunneled_response() -> (HttpResponse, u64) {
@@ -11888,6 +11901,36 @@ mod refuse_unrequested_websocket_tests {
             take_tunnel_upgrade(parked).is_none(),
             "the parked upgrade survived the refusal"
         );
+    }
+
+    #[test]
+    fn releasing_a_response_closes_a_cell_socket_and_frees_a_parked_upgrade() {
+        let (mut tunneled, parked) = tunneled_response();
+        release_websocket(&mut tunneled);
+        assert!(tunneled.websocket.is_none());
+        assert!(take_tunnel_upgrade(parked).is_none());
+
+        let id = 9_200_001;
+        crate::ws_registry::ws_register_outbound(id, "", None);
+        let mut cell = tunneled_response().0;
+        cell.websocket = Some(HttpResponseWebSocket::Cell(WsTarget {
+            id,
+            scope: String::new(),
+            tunnel: None,
+        }));
+        release_websocket(&mut cell);
+        assert!(cell.websocket.is_none());
+        let registry = crate::ws_registry::ws_registry();
+        let registry = registry.lock().unwrap();
+        assert!(
+            matches!(
+                registry.metadata[&id].pending.as_slice(),
+                [crate::ws_registry::WsOut::Close(1006, _)]
+            ),
+            "the object's socket got no close"
+        );
+        drop(registry);
+        crate::ws_registry::ws_unregister(id);
     }
 
     #[test]

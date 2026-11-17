@@ -429,16 +429,19 @@ enum PullRetention {
 /// left a close is removed now; one whose sender is alive is removed when the
 /// sender drops.
 pub(crate) fn ws_retire_handoff_readers(ids: Vec<u64>) {
+    // The registry lock covers the pull queue's removal and the retention
+    // state together (registry, then pull queues, never the reverse), so a
+    // sender dropping at the same time sees one or the other, not a mix.
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    let pulls = ws_pull();
     for id in ids {
-        let queued = ws_pull().lock().unwrap().contains_key(&id);
-        let registry = ws_registry();
-        let mut registry = registry.lock().unwrap();
+        let mut pull = pulls.lock().unwrap();
         match registry.pull_retention.remove(&id) {
             Some(PullRetention::ClosedUnread) => {
-                drop(registry);
-                ws_pull_unregister(id);
+                pull.remove(&id);
             }
-            _ if queued => {
+            _ if pull.contains_key(&id) => {
                 registry
                     .pull_retention
                     .insert(id, PullRetention::ReaderRetired);
@@ -474,17 +477,22 @@ impl Drop for WorkerWebSocket {
         // it, and that read removes the entry. If the isolate's request
         // already retired, nothing will read it, so it goes now; otherwise
         // the retirement removes it (`ws_retire_handoff_readers`).
+        // The entry is only recorded while a queue is still registered: a
+        // reader that already consumed the close and removed it leaves nothing
+        // to retain.
         let retain = self.inbound.is_closed() && {
             let registry = ws_registry();
             let mut registry = registry.lock().unwrap();
+            let queued = ws_pull().lock().unwrap().contains_key(&self.id);
             let retired =
                 registry.pull_retention.get(&self.id) == Some(&PullRetention::ReaderRetired);
-            if !retired {
+            let retain = queued && !retired;
+            if retain {
                 registry
                     .pull_retention
                     .insert(self.id, PullRetention::ClosedUnread);
             }
-            !retired
+            retain
         };
         if !retain {
             ws_pull_unregister(self.id);
@@ -1636,6 +1644,31 @@ mod parked_worker_tests {
             .is_ok()
             .then_some(())
             .unwrap();
+        drop(socket);
+        assert!(!ws_pull().lock().unwrap().contains_key(&id));
+        assert!(!ws_registry()
+            .lock()
+            .unwrap()
+            .pull_retention
+            .contains_key(&id));
+    }
+
+    #[test]
+    fn a_sender_that_drops_after_its_reader_consumed_the_close_leaves_no_entry() {
+        let id = 9_100_007;
+        let inbound = handed_off(id);
+        let socket = WorkerWebSocket {
+            id,
+            inbound: inbound.clone(),
+        };
+        inbound
+            .send_close(1000, String::new(), true)
+            .is_ok()
+            .then_some(())
+            .unwrap();
+        // The reader consumed the close and its socket was removed.
+        ws_pull_unregister(id);
+        ws_retire_handoff_readers(vec![id]);
         drop(socket);
         assert!(!ws_pull().lock().unwrap().contains_key(&id));
         assert!(!ws_registry()
