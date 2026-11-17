@@ -201,10 +201,9 @@ async fn client(server: &Server, path: &str) -> WebSocket<TokioIo<Upgraded>> {
 }
 
 /// A Worker that closes the socket on the first message the client sends, 300
-/// ms after it opens, ends the connection with that close frame, with or
-/// without a feed of ticks running on the socket. (A handler may close with
-/// 1000 or 3000-4999; `close(1008)` throws in the handler, so the socket stays
-/// open by design.)
+/// ms after it opens, ends the connection with that close frame (1008 as
+/// reported, and an application code), with or without a feed of ticks
+/// running on the socket.
 #[tokio::test]
 async fn a_websocket_the_worker_closes_on_the_first_message_closes_at_the_client() {
     let server = Server::start("client-streams", &[]).await;
@@ -214,7 +213,10 @@ async fn a_websocket_the_worker_closes_on_the_first_message_closes_at_the_client
             "/refuse?feed",
             "/object/refuse",
             "/object/refuse?feed",
+            "/refuse?code=4008",
+            "/object/refuse?feed&code=4008",
         ] {
+            let expected = if path.contains("4008") { 4008 } else { 1008 };
             let mut socket = client(&server, path).await;
             socket.set_auto_close(false);
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -242,7 +244,7 @@ async fn a_websocket_the_worker_closes_on_the_first_message_closes_at_the_client
             .unwrap_or_else(|_| panic!("round {round} {path}: no close frame, no end"));
             assert_eq!(
                 closed,
-                Some((4008, "refused".to_string())),
+                Some((expected, "refused".to_string())),
                 "round {round} {path}"
             );
         }
@@ -317,5 +319,48 @@ async fn many_concurrent_sse_streams_relayed_through_a_member_socket_all_end() {
             assert_eq!(body.matches("data: ").count(), 3, "round {round}: {body}");
         }
         answering.await.expect("member");
+    }
+}
+
+/// A hibernation socket refuses the same codes.
+#[tokio::test]
+async fn a_hibernation_socket_refuses_the_close_codes_that_only_report_a_state() {
+    let server = Server::start("client-streams", &[]).await;
+    let mut stream = connect(&server, "/object/ws-hibernate").await;
+    // A masked text frame "codes" (mask key zero).
+    let mut message = vec![0x81, 0x85, 0, 0, 0, 0];
+    message.extend_from_slice(b"codes");
+    stream.write_all(&message).await.expect("send");
+    let (_, payload) = frame(&mut stream).await.expect("outcome");
+    let outcome: serde_json::Value = serde_json::from_slice(&payload).expect("outcome");
+    for code in [
+        "999", "1004", "1005", "1006", "1015", "1016", "2999", "5000",
+    ] {
+        assert_eq!(outcome[code], "InvalidAccessError", "close({code})");
+    }
+}
+
+/// A handler may close with any code an endpoint can send (1000-1003,
+/// 1007-1014, 3000-4999) and not with the ones that only report a state or are
+/// reserved, on every socket a handler holds.
+#[tokio::test]
+async fn a_close_takes_the_codes_an_endpoint_may_send_and_refuses_the_others() {
+    let server = Server::start("client-streams", &[]).await;
+    for path in ["/close-codes", "/object/close-codes"] {
+        let outcome: serde_json::Value =
+            serde_json::from_str(&server.get_text(path).await).expect("outcome");
+        for (code, name) in outcome.as_object().expect("object") {
+            let allowed = matches!(
+                code.parse::<u16>().unwrap_or(0),
+                1000..=1003 | 1007..=1014 | 3000..=4999
+            );
+            let expected = match code.as_str() {
+                "longReason" => "SyntaxError",
+                _ if allowed => "ok",
+                _ => "InvalidAccessError",
+            };
+            assert_eq!(name, expected, "{path} close({code})");
+        }
+        assert_eq!(outcome.as_object().expect("object").len(), 20, "{path}");
     }
 }
