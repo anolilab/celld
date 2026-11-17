@@ -298,6 +298,29 @@ async fn durable_object_events_running_at_the_deadline_are_ended_and_the_node_ke
 
     redeploy(&server).await;
 
+    // Let the deadline pass while the handoffs are still going.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // Only what was running at the deadline is ended. An event that starts
+    // afterwards on an object that has not moved yet is left to the swap.
+    for batch in (0..OBJECTS).collect::<Vec<_>>().chunks(30) {
+        let naps: Vec<_> = batch
+            .iter()
+            .map(|n| {
+                let (client, url) = (client.clone(), server.url(&format!("/do-nap?n={n}")));
+                tokio::spawn(async move {
+                    let response = client.get(url).send().await.expect("nap");
+                    (response.status(), response.text().await.unwrap_or_default())
+                })
+            })
+            .collect();
+        for task in naps {
+            let (status, body) = task.await.expect("nap task");
+            assert!(status.is_success(), "{status} {body}");
+            assert_eq!(body, "napped");
+        }
+    }
+
     // Every object's `waitUntil` work never ends. Held on the old isolate
     // past the deadline, it is ended, and the generation is freed.
     wait_until(
