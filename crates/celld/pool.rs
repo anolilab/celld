@@ -210,6 +210,11 @@ pub struct Slot {
     /// does. A driver that begins with it set is left alone: the cell it
     /// serves has not swapped yet, and the swap is what ends its event.
     deadline_forced: AtomicBool,
+    /// Set once, by the generation's `retire`, when the deployment this
+    /// isolate belongs to has been superseded. Only a superseded isolate's
+    /// drivers register on the bell below; a serving one reads this flag
+    /// and nothing else.
+    superseded: AtomicBool,
     /// Rung by the pool when the deadline passes, for the events that wait
     /// with nothing to sample a flag. See [`Pool::force_retired`].
     retire_bell: Arc<tokio::sync::Notify>,
@@ -340,6 +345,7 @@ impl Slot {
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
             deadline_forced: AtomicBool::new(false),
+            superseded: AtomicBool::new(false),
             retire_bell: Arc::new(tokio::sync::Notify::new()),
         })
     }
@@ -368,6 +374,12 @@ impl Slot {
     /// Whether the retire deadline of this isolate's deployment has passed.
     pub(crate) fn deadline_forced(&self) -> bool {
         self.deadline_forced.load(Ordering::Relaxed)
+    }
+
+    /// Whether this isolate's deployment has been superseded, which is when
+    /// its drivers start to listen to the bell.
+    pub(crate) fn superseded(&self) -> bool {
+        self.superseded.load(Ordering::Relaxed)
     }
 
     /// A future that resolves once the retire deadline has been raised after
@@ -611,6 +623,7 @@ impl Pool {
             retiring: AtomicBool::new(self.retired.load(Ordering::Relaxed)),
             // An isolate grown after the deadline is past it from the start.
             deadline_forced: AtomicBool::new(self.deadline_forced.load(Ordering::Relaxed)),
+            superseded: AtomicBool::new(self.retired.load(Ordering::Relaxed)),
             retire_bell: self.retire_bell.clone(),
         });
         if let Some(id) = reusable {
@@ -785,6 +798,7 @@ impl Pool {
         let _maintenance = self.maintenance.write().expect("pool poisoned");
         self.retired.store(true, Ordering::Relaxed);
         for slot in self.slots.read().expect("pool poisoned").iter() {
+            slot.superseded.store(true, Ordering::Relaxed);
             if !slot.retiring.swap(true, Ordering::Relaxed) {
                 tracing::info!(isolate = %slot.heap_id, slot = slot.id, "isolate retiring");
             }
@@ -966,5 +980,16 @@ mod tests {
 
         let after = pool.grow(None).expect("second isolate");
         assert!(after.deadline_forced(), "grown after the deadline");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_superseded_pool_has_isolates_that_listen_to_the_bell() {
+        let pool = pool();
+        let serving = pool.grow(None).expect("first isolate");
+        assert!(!serving.superseded(), "a serving isolate reads one flag");
+
+        pool.retire_all();
+        assert!(serving.superseded());
+        assert!(pool.grow(None).expect("second isolate").superseded());
     }
 }

@@ -2356,8 +2356,19 @@ fn retire_wake(retire: Option<&crate::pool::Slot>) -> Option<Wake> {
 /// cancellation, or hand back the wake when the deadline has already passed.
 /// The bell is taken before the flag is read, so a deadline that lands
 /// between the read and the wait is still heard.
+///
+/// Only a superseded generation arms it: taking the bell locks the bell's
+/// waiter list on its first poll and again on drop, so a serving generation
+/// pays one relaxed load per pass and nothing else (no lock, no allocation).
+/// Supersede comes at deploy, long before the deadline, so a wait that
+/// begins after it is heard at the deadline. A wait that was already parked
+/// when the generation was superseded has no bell; it ends at its next
+/// natural wake (an operation, a message, its budget), which reads the
+/// deadline flag.
 fn arm_retire(retire: Option<&crate::pool::Slot>) -> Result<Option<Notified<'_>>, Wake> {
-    let Some(slot) = retire else { return Ok(None) };
+    let Some(slot) = retire.filter(|slot| slot.superseded()) else {
+        return Ok(None);
+    };
     let bell = slot.retire_notified();
     match retire_wake(retire) {
         Some(wake) => Err(wake),
