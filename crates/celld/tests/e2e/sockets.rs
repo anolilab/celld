@@ -87,18 +87,26 @@ impl Tcp {
     }
 }
 
+/// The fixture keeps what a request holds open in module state, which each
+/// isolate has its own copy of. The pool starts another isolate when turns
+/// overlap, and then `/info`, `/steal` or `/release` can land on an isolate
+/// that never saw the held request: the release is a silent no-op and the
+/// held request waits out the handler budget. One isolate keeps every request
+/// of these tests in the same module.
+const ONE_ISOLATE: &[(&str, &str)] = &[("CELLD_MAX_STATELESS_ISOLATES", "1")];
+
 /// Starts a request that holds a socket open until it is released, and waits
 /// until the Worker reports the socket ready. Returns the held socket's id and
 /// the request, which answers with what the socket saw once it is released.
 async fn hold(server: &Server, path: &str) -> (u64, tokio::task::JoinHandle<Value>) {
     let url = server.url(path);
     let request = tokio::spawn(async move {
-        reqwest::get(&url)
-            .await
-            .expect("the held request")
-            .json::<Value>()
-            .await
-            .expect("the held request's body")
+        let response = reqwest::get(&url).await.expect("the held request");
+        let status = response.status();
+        let body = response.text().await.expect("the held request's body");
+        serde_json::from_str(&body).unwrap_or_else(|error| {
+            panic!("the held request's body is not JSON ({error}): {status} {body:?}")
+        })
     });
     let info = server.url("/info?name=a");
     let id = wait_until(
@@ -180,7 +188,7 @@ async fn a_tcp_socket_keeps_working_across_awaits() {
 
 #[tokio::test]
 async fn a_websocket_id_of_another_request_is_refused() {
-    let server = Server::start("sockets", &[]).await;
+    let server = Server::start("sockets", ONE_ISOLATE).await;
     let (id, request) = hold(&server, "/ws/hold?name=a").await;
 
     let stolen: Value = server.get_json("/ws/steal?name=a").await;
@@ -201,7 +209,7 @@ async fn a_websocket_id_of_another_request_is_refused() {
 
 #[tokio::test]
 async fn a_tcp_id_of_another_request_is_refused() {
-    let server = Server::start("sockets", &[]).await;
+    let server = Server::start("sockets", ONE_ISOLATE).await;
     let tcp = Tcp::start().await;
     let (_, request) = hold(&server, &format!("/tcp/hold?name=a&port={}", tcp.port)).await;
 
@@ -245,7 +253,7 @@ async fn client_log(server: &Server) -> Vec<String> {
 
 #[tokio::test]
 async fn an_object_socket_of_another_cell_cannot_be_bound() {
-    let server = Server::start("sockets", &[]).await;
+    let server = Server::start("sockets", ONE_ISOLATE).await;
     let (_, request) = hold_chat(&server).await;
 
     let forged: Value = server.get_json("/ws/forge-bind?name=a").await;
@@ -274,7 +282,7 @@ async fn an_object_socket_of_another_cell_cannot_be_bound() {
 
 #[tokio::test]
 async fn a_response_cannot_return_another_cells_socket() {
-    let server = Server::start("sockets", &[]).await;
+    let server = Server::start("sockets", ONE_ISOLATE).await;
     let (_, request) = hold_chat(&server).await;
 
     let out: Value = server.get_json("/ws/forge-return-selftest?name=a").await;
@@ -290,7 +298,7 @@ async fn a_response_cannot_return_another_cells_socket() {
 
 #[tokio::test]
 async fn a_request_cannot_send_on_an_object_socket() {
-    let server = Server::start("sockets", &[]).await;
+    let server = Server::start("sockets", ONE_ISOLATE).await;
     let (_, request) = hold_chat(&server).await;
 
     let out: Value = server.get_json("/ws/send-on-cell?name=a").await;
