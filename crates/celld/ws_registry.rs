@@ -741,7 +741,11 @@ impl WsRegistry {
             room.close();
         }
         self.owners.remove(&id);
-        if !ws_pull().lock().unwrap().contains_key(&id) {
+        // The owner stays while a queue or a prepared handoff still needs it,
+        // so a connection that ends between preparing and taking over a
+        // handoff does not leave the handoff unclaimable.
+        if !ws_pull().lock().unwrap().contains_key(&id) && !self.upstream_handoffs.contains_key(&id)
+        {
             self.pull_owners.remove(&id);
         }
         self.grants.remove(&(id, None));

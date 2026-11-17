@@ -194,10 +194,11 @@ pub(super) fn ws_close_request_sockets(opened: Vec<u64>) {
         let registry = ws_registry();
         let (handoff, upstream) = {
             let mut registry = registry.lock().unwrap();
-            (
-                registry.worker_handoffs.remove(&id),
-                registry.upstream_handoffs.remove(&id),
-            )
+            let upstream = registry.upstream_handoffs.remove(&id);
+            if upstream.is_some() {
+                registry.pull_owners.remove(&id);
+            }
+            (registry.worker_handoffs.remove(&id), upstream)
         };
         drop(handoff);
         drop(upstream);
@@ -1098,5 +1099,26 @@ mod tests {
         assert!(transfer_upstream_websocket_handoff(&other, id).is_none());
         ws_pull_unregister(id);
         ws_registry().lock().unwrap().upstream_handoffs.remove(&id);
+    }
+
+    /// A connection that ends between preparing a handoff and taking it over
+    /// keeps the handoff's owner, so the opening request can still claim it.
+    #[test]
+    fn a_prepared_handoff_keeps_its_owner_when_the_connection_ends() {
+        let id = 9_200_002;
+        let (_inbound, receiver) = ws_pull_channel();
+        ws_pull_register(id, receiver);
+        ws_set_owner(id, 51);
+        ws_register_outbound(id, "", None);
+        let opener = WsCaller {
+            cell: String::new(),
+            owner: 51,
+        };
+        assert!(prepare_upstream_websocket_handoff(&opener, id));
+        ws_unregister(id);
+        assert!(opened_by(&ws_registry().lock().unwrap(), &opener, id));
+        let mut registry = ws_registry().lock().unwrap();
+        registry.upstream_handoffs.remove(&id);
+        registry.pull_owners.remove(&id);
     }
 }
