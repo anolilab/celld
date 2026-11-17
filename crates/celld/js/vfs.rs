@@ -18,8 +18,9 @@ use super::*;
 pub(super) struct RequestVfs {
     nodes: HashMap<String, VfsNode>,
     /// The names directly inside each directory that has any, so listing a
-    /// directory and removing a tree walk only what they touch. Each name is
-    /// part of the entry's path, which `node_cost` already charges for.
+    /// directory and removing a tree walk only what they touch. An entry's
+    /// parent key and name are copies of parts of its path, which `node_cost`
+    /// charges for.
     children: HashMap<String, std::collections::BTreeSet<String>>,
     /// Charged memory: every entry's cost plus each file's capacity.
     used: usize,
@@ -99,8 +100,11 @@ impl RequestVfs {
         }
     }
 
+    /// The path is held three times: as the node's key, as the parent key of
+    /// the child index, and as the name inside it (each at most the path's
+    /// length), so a deep tree of short components is charged for all three.
     fn node_cost(path: &str) -> usize {
-        path.len() + VFS_NODE_OVERHEAD
+        path.len() * 3 + VFS_NODE_OVERHEAD
     }
 
     /// Add a new entry and list it under its parent.
@@ -572,6 +576,29 @@ mod tests {
             vfs.write("/tmp/big", vec![0; VFS_MAX_BYTES], true),
             Err("ENOSPC")
         );
+    }
+
+    #[test]
+    fn the_child_index_counts_against_the_cap() {
+        let mut vfs = RequestVfs::default();
+        let mut path = String::from("/tmp");
+        // One-character components: every entry's path is a copy of its
+        // parent's key, so the index holds far more than the paths alone.
+        loop {
+            path.push_str("/a");
+            if matches!(vfs.mkdir(&path, false), super::VfsMkdirResult::Error(_)) {
+                break;
+            }
+        }
+        let retained: usize = vfs
+            .nodes
+            .keys()
+            .chain(vfs.children.keys())
+            .map(String::len)
+            .chain(vfs.children.values().flatten().map(String::len))
+            .sum();
+        assert!(retained <= VFS_MAX_BYTES, "retained {retained} bytes");
+        assert!(vfs.used <= VFS_MAX_BYTES);
     }
 
     #[test]

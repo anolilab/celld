@@ -11523,8 +11523,10 @@ const __fsFlags = {
   "ax+": [true, true, false, true, true],
   "xa+": [true, true, false, true, true],
 };
-const __fsWrite = (value, data, options, append) => {
-  const path = __fsPath(value);
+// Validates a write's options and returns them with the flag's mode. The
+// callback forms run this before the operation is deferred, so a bad flag
+// throws from the call as in Node and never reaches the callback.
+const __fsWriteOptions = (options, append) => {
   if (typeof options === "string") options = { encoding: options };
   options = __fsOptions(options, []);
   const flag = options.flag ?? (append ? "a" : "w");
@@ -11541,6 +11543,12 @@ const __fsWrite = (value, data, options, append) => {
     error.code = "ERR_INVALID_ARG_VALUE";
     throw error;
   }
+  return [options, mode];
+};
+const __fsWrite = (value, data, options, append) => {
+  const path = __fsPath(value);
+  let mode;
+  [options, mode] = __fsWriteOptions(options, append);
   const [create, exclusive, truncate, appending, writable] = mode;
   const bytes = __fsBytes(data, options.encoding);
   const kind = __vfs_stat(path)[0];
@@ -11759,7 +11767,7 @@ const __fsMkdir = (value, options, callback) => {
 const __fsWriteFile = (value, data, options, callback) => {
   [options, callback] = __fsCallbackArgs(options, callback);
   __fsErrorOnlyCallback(
-    () => { __fsPath(value); __fsBytes(data); },
+    () => { __fsPath(value); __fsBytes(data); __fsWriteOptions(options, false); },
     () => __fsWriteFileSync(value, data, options),
     callback,
   );
@@ -11767,7 +11775,7 @@ const __fsWriteFile = (value, data, options, callback) => {
 const __fsAppendFile = (value, data, options, callback) => {
   [options, callback] = __fsCallbackArgs(options, callback);
   __fsErrorOnlyCallback(
-    () => { __fsPath(value); __fsBytes(data); },
+    () => { __fsPath(value); __fsBytes(data); __fsWriteOptions(options, true); },
     () => __fsAppendFileSync(value, data, options),
     callback,
   );

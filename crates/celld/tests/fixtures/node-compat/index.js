@@ -77,6 +77,7 @@ const urlChecks = {
   encodedSlash: () => throwsCode("ERR_INVALID_FILE_URL_PATH", () => fileURLToPath("file:///a%2Fb")),
   foreignHost: () => throwsCode("ERR_INVALID_FILE_URL_HOST", () => fileURLToPath("file://host/x")),
   notFile: () => throwsCode("ERR_INVALID_URL_SCHEME", () => fileURLToPath("http://x/y")),
+  invalidUrlString: () => throwsCode("ERR_INVALID_URL", () => fileURLToPath("not a url")),
   notAUrl: () => throwsCode("ERR_INVALID_ARG_TYPE", () => fileURLToPath(5)),
   pathNotAString: () => throwsCode("ERR_INVALID_ARG_TYPE", () => pathToFileURL(5)),
   formatUrl: () =>
@@ -212,6 +213,20 @@ const fsChecks = {
     is(await call((cb) => fs.readdir("/tmp", cb)).then(([code, names]) => [code, names.includes("c.txt")]), [null, true]);
     is(await call((cb) => fs.unlink("/tmp/c.txt", cb)), [null, undefined]);
     is((await call((cb) => fs.unlink("/tmp/c.txt", cb)))[0], "ENOENT");
+  },
+  // A bad flag is an argument error: it throws from the call, or rejects the
+  // promise, and the callback is never told.
+  badWriteFlags: async () => {
+    let called = false;
+    const cb = () => { called = true; };
+    for (const flag of ["rs", "z", ""]) {
+      throwsCodeSync("ERR_INVALID_ARG_VALUE", () => fs.writeFile("/tmp/c.txt", "x", { flag }, cb));
+      throwsCodeSync("ERR_INVALID_ARG_VALUE", () => fs.appendFile("/tmp/c.txt", "x", { flag }, cb));
+      await throwsCode("ERR_INVALID_ARG_VALUE", () => fsp.writeFile("/tmp/c.txt", "x", { flag }));
+      await throwsCode("ERR_INVALID_ARG_VALUE", () => fsp.appendFile("/tmp/c.txt", "x", { flag }));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    is(called, false);
   },
 };
 

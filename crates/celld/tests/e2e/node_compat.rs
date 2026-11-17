@@ -105,13 +105,13 @@ async fn node_process_is_the_global_process() {
 #[tokio::test]
 async fn node_url_matches_node() {
     let server = Server::start("node-compat", &[]).await;
-    assert_all_ok(&server, "/url", 20).await;
+    assert_all_ok(&server, "/url", 21).await;
 }
 
 #[tokio::test]
 async fn tmp_accepts_writes_and_mutations() {
     let server = Server::start("node-compat", &[]).await;
-    assert_all_ok(&server, "/fs", 22).await;
+    assert_all_ok(&server, "/fs", 23).await;
 }
 
 #[derive(serde::Deserialize, PartialEq, Debug)]

@@ -53,8 +53,13 @@
   const isURL = (value) => value instanceof URL;
 
   const fileURLToPath = (path) => {
-    if (typeof path === "string") path = new URL(path);
-    else if (!isURL(path)) throw invalidType("path", path);
+    if (typeof path === "string") {
+      try {
+        path = new URL(path);
+      } catch {
+        throw nodeError(TypeError, "ERR_INVALID_URL", "Invalid URL");
+      }
+    } else if (!isURL(path)) throw invalidType("path", path);
     if (path.protocol !== "file:") {
       throw nodeError(
         TypeError,
