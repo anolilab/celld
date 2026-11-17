@@ -40,6 +40,7 @@ mod e2e {
     pub mod scoping;
     pub mod secrets;
     pub mod sockets;
+    pub mod telemetry_http;
     pub mod version;
     pub mod version_metadata;
     pub mod webcrypto;
