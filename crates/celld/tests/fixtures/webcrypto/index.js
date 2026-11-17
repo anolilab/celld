@@ -417,11 +417,14 @@ const checks = {
         off[off.length - 1] ^= 1;
         equal(await refused(off), "DataError", "point off the curve");
         equal(await refused(raw.slice(0, size - 1)), "DataError", "short point");
-        const rsa = await subtle.importKey("spki", unhex(V["RSA-PSS"].spki), { name: "RSA-PSS", hash: "SHA-256" }, true, ["verify"]);
-        const rsaRaw = await subtle.exportKey("raw", rsa).then(() => "exported", (error) => error.name);
-        equal(rsaRaw, "NotSupportedError", "RSA raw export");
       },
     ]))),
+  // An RSA key has no `raw` form.
+  async "RSA raw export"() {
+    const rsa = await subtle.importKey("spki", unhex(V["RSA-PSS"].spki), { name: "RSA-PSS", hash: "SHA-256" }, true, ["verify"]);
+    const rsaRaw = await subtle.exportKey("raw", rsa).then(() => "exported", (error) => error.name);
+    equal(rsaRaw, "NotSupportedError", "RSA raw export");
+  },
   // Celld reads the uncompressed point only, and says so for a compressed one.
   async "EC compressed raw key"() {
     const compressed = new Uint8Array(33);

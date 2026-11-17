@@ -31,16 +31,20 @@
     "P-521": "P-521", "secp521r1": "P-521",
   };
   const _canonicalEcCurve = (curve) => _EC_CURVES[_curveName(curve)];
-  // Bytes of one coordinate of an EC point, by curve.
-  const _EC_COORDINATE_BYTES = { "P-256": 32, "P-384": 48, "P-521": 66 };
-  const _b64urlEncode = (bytes) =>
-    btoa(String.fromCharCode(...bytes))
-      .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
-  const _b64urlDecode = (text) =>
-    Uint8Array.from(
-      atob(text.replaceAll("-", "+").replaceAll("_", "/")),
-      (char) => char.charCodeAt(0),
-    );
+  // AES key sizes in bytes. Key Wrap also takes 192-bit keys.
+  const _AES_KEY_BYTES = {
+    "AES-GCM": [16, 32], "AES-CBC": [16, 32], "AES-CTR": [16, 32],
+    "AES-KW": [16, 24, 32],
+  };
+  const _aesKeySizes = (name) =>
+    _AES_KEY_BYTES[name].map((bytes) => bytes * 8).join(", ")
+      .replace(/, (\d+)$/, " or $1");
+  // The host reports a refusal Web Crypto names as `Name: message`.
+  const _fromHost = (error) => {
+    const named = /^(?:crypto: )?(NotSupportedError|DataError): ([^]*)$/
+      .exec(String(error?.message ?? error));
+    return named ? new DOMException(named[2], named[1]) : error;
+  };
   // The asymmetric algorithms, as the uppercased name `_algorithmName`
   // produces mapped to the spelling `key.algorithm.name` reports. The
   // uppercased form is for lookup only: echoing it back names an algorithm
@@ -276,17 +280,16 @@
       throw new DOMException(
         `key does not permit ${usage}`, "InvalidAccessError");
     }
-    let result;
+    let out;
     try {
-      result = _extra(wrapping ? "aes-kw-wrap" : "aes-kw-unwrap", {
-        key: Array.from(key.__celldMaterial.bytes),
-        data: Array.from(_toBuf(data)),
-      });
+      out = (wrapping ? _aesEncrypt : _aesDecrypt)(
+        "AES-KW", key.__celldMaterial.bytes, new Uint8Array(),
+        _toBuf(data), new Uint8Array(), 0);
     } catch (error) {
       throw _operationError(String(error?.message ?? error));
     }
-    if (!result.bytes) throw _operationError("AES-KW unwrap failed");
-    return Uint8Array.from(result.bytes).buffer;
+    if (!out) throw _operationError("AES-KW unwrap failed");
+    return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
   }
 
   class SubtleCrypto {
@@ -317,9 +320,10 @@
       }
       if (format === "raw" && _SECRET_KEY_ALGS.has(name)) {
         const raw = _toBuf(keyData).slice();
-        if (name === "AES-KW" && ![16, 24, 32].includes(raw.byteLength)) {
+        // Only Key Wrap checks the size here; the other modes fail at use.
+        if (name === "AES-KW" && !_AES_KEY_BYTES[name].includes(raw.byteLength)) {
           throw new DOMException(
-            "AES-KW keys must be 128, 192 or 256 bits", "DataError");
+            `${name} keys must be ${_aesKeySizes(name)} bits`, "DataError");
         }
         const normalized = name === "HMAC"
           ? { name, hash: { name: _hashName(algorithm?.hash) }, length: raw.byteLength * 8 }
@@ -329,67 +333,33 @@
         );
       }
       // A Secure Curves public key has a `raw` form: the 32-byte point on
-      // its own. It is checked before the asymmetric block below, because
-      // that block reads `raw` bytes as a DER document and can only report a
-      // parse failure for them.
-      if (format === "raw" && _OKP_CURVES[name] !== undefined) {
-        const imported = _extra("asym-key-import", {
-          key: Array.from(_toBuf(keyData)),
-          format: "raw",
-          type: _OKP_CURVES[name],
-          visibility: "public",
-          passphrase: null,
-        });
-        return _makeKey(
-          "public",
-          _keyAlgorithm(name, algorithm, imported.keyType, imported.details),
-          extractable,
-          usages,
-          {
-            bytes: Uint8Array.from(imported.der),
-            keyType: imported.keyType,
-            details: imported.details,
-          },
-        );
-      }
-      // An EC public key's `raw` form is the uncompressed point
-      // `0x04 || X || Y`. It is rebuilt as a JWK, which the host checks
-      // against the curve, so a point that is not on it is a DataError.
-      if (format === "raw" && (name === "ECDSA" || name === "ECDH")) {
-        _checkEcUsages(name, "public", usages);
-        const curve = _canonicalEcCurve(algorithm?.namedCurve);
-        if (curve === undefined) {
-          throw _notSupported(
-            "unsupported EC namedCurve: " + String(algorithm?.namedCurve));
-        }
-        const point = _toBuf(keyData);
-        const size = _EC_COORDINATE_BYTES[curve];
-        if (point[0] === 2 || point[0] === 3) {
-          throw _notSupported(
-            "compressed EC points are not supported; use the uncompressed " +
-              "0x04 form");
-        }
-        if (point.byteLength !== 1 + 2 * size || point[0] !== 4) {
-          throw new DOMException(
-            `a ${curve} raw public key is the ${1 + 2 * size}-byte ` +
-              "uncompressed point", "DataError");
+      // its own. An EC public key's is the uncompressed point
+      // `0x04 || X || Y`. Either is checked before the asymmetric block
+      // below, because that block reads `raw` bytes as a DER document and
+      // can only report a parse failure for them. The host reads the point;
+      // the curve cannot be told from the bytes, so it goes in `type`.
+      const ec = name === "ECDSA" || name === "ECDH";
+      if (format === "raw" && (ec || _OKP_CURVES[name] !== undefined)) {
+        let curve = _OKP_CURVES[name];
+        if (ec) {
+          _checkEcUsages(name, "public", usages);
+          curve = _canonicalEcCurve(algorithm?.namedCurve);
+          if (curve === undefined) {
+            throw _notSupported(
+              "unsupported EC namedCurve: " + String(algorithm?.namedCurve));
+          }
         }
         let imported;
         try {
           imported = _extra("asym-key-import", {
-            key: {
-              kty: "EC", crv: curve,
-              x: _b64urlEncode(point.subarray(1, 1 + size)),
-              y: _b64urlEncode(point.subarray(1 + size)),
-            },
-            format: "jwk",
-            type: null,
+            key: Array.from(_toBuf(keyData)),
+            format: "raw",
+            type: curve,
             visibility: "public",
             passphrase: null,
           });
-        } catch {
-          throw new DOMException(
-            "the point is not on the " + curve + " curve", "DataError");
+        } catch (error) {
+          throw _fromHost(error);
         }
         return _makeKey(
           "public",
@@ -465,38 +435,20 @@
         throw new DOMException(
           "a private key has no raw form", "InvalidAccessError");
       }
-      // The `raw` form of a Secure Curves public key is its 32-byte point.
-      // The branch below answers every `raw` request from the stored bytes,
-      // which for an asymmetric key are its SPKI document -- so without this
-      // arm an X25519 peer key exports as 44 bytes that no counterpart can
-      // read, and nothing reports an error.
+      // The `raw` form of a Secure Curves public key is its 32-byte point,
+      // and an EC public key's is its uncompressed point. The branch below
+      // answers every `raw` request from the stored bytes, which for an
+      // asymmetric key are its SPKI document -- so without this arm an X25519
+      // peer key exports as 44 bytes that no counterpart can read, and
+      // nothing reports an error.
       if (format === "raw" && key?.type === "public" &&
-          (key.__celldMaterial?.keyType === "ed25519" ||
-            key.__celldMaterial?.keyType === "x25519")) {
+          ["ed25519", "x25519", "ec"].includes(key.__celldMaterial?.keyType)) {
         if (!key.extractable) {
           throw new DOMException("key is not extractable", "InvalidAccessError");
         }
         return Uint8Array.from(_extra("asym-key-raw-public", {
           der: Array.from(key.__celldMaterial.bytes),
         }).bytes).buffer;
-      }
-      // Likewise an EC public key's `raw` form is its uncompressed point,
-      // not the SPKI document the stored bytes hold.
-      if (format === "raw" && key?.type === "public" &&
-          key.__celldMaterial?.keyType === "ec") {
-        if (!key.extractable) {
-          throw new DOMException("key is not extractable", "InvalidAccessError");
-        }
-        const jwk = _extra("asym-key-export", {
-          der: Array.from(key.__celldMaterial.bytes),
-          visibility: "public",
-        }).jwk;
-        const x = _b64urlDecode(jwk.x), y = _b64urlDecode(jwk.y);
-        const point = new Uint8Array(1 + x.byteLength + y.byteLength);
-        point[0] = 4;
-        point.set(x, 1);
-        point.set(y, 1 + x.byteLength);
-        return point.buffer;
       }
       // Only a secret key's stored bytes are its `raw` form. An asymmetric
       // key's are a DER document, and an RSA key has no `raw` form at all.
@@ -657,12 +609,9 @@
           );
         }
         byteLength = Number(algorithm?.length || 256) / 8;
-        if (byteLength !== 16 && byteLength !== 32 &&
-            !(name === "AES-KW" && byteLength === 24)) {
+        if (!_AES_KEY_BYTES[name].includes(byteLength)) {
           throw new DOMException(
-            name + " length must be 128 or 256" +
-              (name === "AES-KW" ? " (or 192)" : ""),
-            "OperationError");
+            `${name} length must be ${_aesKeySizes(name)}`, "OperationError");
         }
         const raw = new Uint8Array(byteLength);
         crypto.getRandomValues(raw);

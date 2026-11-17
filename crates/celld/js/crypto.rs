@@ -992,15 +992,6 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             };
             Ok(serde_json::json!({ "ok": ok }))
         }
-        // AES Key Wrap (RFC 3394). `unwrap` is false for wrap. A wrong
-        // key or altered data is `{ "bytes": null }`, which `crypto.js`
-        // turns into the OperationError Web Crypto names.
-        "aes-kw-wrap" | "aes-kw-unwrap" => {
-            let key = crypto_bytes(args, "key")?;
-            let data = crypto_bytes(args, "data")?;
-            let bytes = aes_key_wrap(&key, &data, operation == "aes-kw-wrap")?;
-            Ok(serde_json::json!({ "bytes": bytes }))
-        }
         "rsa-oaep-encrypt" => {
             use rsa::pkcs8::DecodePublicKey;
             let key = crypto_bytes(args, "key")?;
@@ -1068,13 +1059,15 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                     .get("type")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
-                let point: [u8; 32] = key
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| anyhow!("a {curve} raw public key must be 32 bytes"))?;
+                let point = || -> Result<[u8; 32]> {
+                    key.as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow!("a {curve} raw public key must be 32 bytes"))
+                };
                 let der = match curve {
-                    "X25519" => x25519_spki(&point),
+                    "X25519" => x25519_spki(&point()?),
                     "Ed25519" => {
+                        let point = point()?;
                         use ed25519_dalek::pkcs8::EncodePublicKey;
                         // Unlike X25519, an Ed25519 point has to decompress
                         // to a curve point, so a bad one fails here.
@@ -1083,6 +1076,43 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                             .to_public_key_der()?
                             .as_bytes()
                             .to_vec()
+                    }
+                    // An EC public key is the uncompressed point
+                    // `0x04 || X || Y`. A compressed point is a different,
+                    // valid encoding that celld does not read, so it is
+                    // refused by name rather than reported as off the curve.
+                    "P-256" | "P-384" | "P-521" => {
+                        macro_rules! import {
+                            ($c:ident) => {{
+                                use $c::pkcs8::EncodePublicKey;
+                                match key.first() {
+                                    Some(2 | 3) => {
+                                        return Err(anyhow!(
+                                            "NotSupportedError: compressed EC points are not \
+                                             supported; use the uncompressed 0x04 form"
+                                        ))
+                                    }
+                                    Some(4) => {}
+                                    _ => {
+                                        return Err(anyhow!(
+                                            "DataError: a {curve} raw public key is the \
+                                             uncompressed point"
+                                        ))
+                                    }
+                                }
+                                $c::PublicKey::from_sec1_bytes(&key)
+                                    .map_err(|_| {
+                                        anyhow!(
+                                            "DataError: the point is not a valid {curve} \
+                                             point"
+                                        )
+                                    })?
+                                    .to_public_key_der()?
+                                    .as_bytes()
+                                    .to_vec()
+                            }};
+                        }
+                        ec_curve!(curve, import)
                     }
                     other => return Err(anyhow!("cannot import a raw {other} key")),
                 };
@@ -1381,7 +1411,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             }
         }
         // The inverse of the `raw` import above: the 32-byte point inside an
-        // Ed25519 or X25519 SPKI document. Web Crypto's `raw` export of a
+        // Ed25519 or X25519 SPKI document, or an EC key's uncompressed point. Web Crypto's `raw` export of a
         // Secure Curves public key is those bytes, not the document holding
         // them, and a peer that receives 44 bytes of SPKI where it expects a
         // point fails far from here.
@@ -1396,6 +1426,20 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                         .map_err(|_| anyhow!("invalid Ed25519 public key"))?
                         .to_bytes()
                         .to_vec()
+                }
+                "ec" => {
+                    let crv = ec_jwk_crv(&parsed)?;
+                    macro_rules! export {
+                        ($c:ident) => {{
+                            use $c::elliptic_curve::sec1::ToSec1Point;
+                            use $c::pkcs8::DecodePublicKey;
+                            $c::PublicKey::from_public_key_der(&der)?
+                                .to_sec1_point(false)
+                                .as_bytes()
+                                .to_vec()
+                        }};
+                    }
+                    ec_curve!(crv, export)
                 }
                 other => return Err(anyhow!("cannot export a {other} key as raw")),
             };
@@ -1990,6 +2034,9 @@ fn webcrypto_aes_gcm(
 #[derive(Clone, Copy)]
 enum AesMode {
     Gcm,
+    /// RFC 3394 key wrap. Like GCM it reports an integrity failure by
+    /// returning nothing; `encrypting` means wrap.
+    Kw,
     /// GCM reports a failure by returning nothing and the block modes report
     /// a cause, so the two answer to different callers and cannot share one
     /// branch.
@@ -2006,6 +2053,7 @@ impl AesMode {
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
             "AES-GCM" => Self::Gcm,
+            "AES-KW" => Self::Kw,
             "AES-CBC" => Self::Block(AesBlockMode::Cbc),
             "AES-CTR" => Self::Block(AesBlockMode::Ctr),
             _ => return None,
@@ -2083,11 +2131,21 @@ fn webcrypto_aes_block_mode(
     }
 }
 
-/// AES Key Wrap, RFC 3394. Wrapping takes a multiple of 8 bytes, at least 16,
-/// and returns 8 more; unwrapping returns `None` when the integrity register
-/// does not come back as the default IV, which is what a wrong key or altered
-/// data looks like.
-fn aes_key_wrap(key: &[u8], data: &[u8], wrapping: bool) -> Result<Option<Vec<u8>>> {
+/// AES Key Wrap, RFC 3394: takes a multiple of 8 bytes, at least 16, and
+/// returns 8 more.
+fn aes_kw_wrap(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    aes_kw(key, data, true)?.ok_or_else(|| anyhow!("AES-KW wrap failed"))
+}
+
+/// The inverse of [`aes_kw_wrap`]. `None` when the integrity register does not
+/// come back as the default IV, which is what a wrong key or altered data
+/// looks like.
+fn aes_kw_unwrap(key: &[u8], data: &[u8]) -> Result<Option<Vec<u8>>> {
+    aes_kw(key, data, false)
+}
+
+/// The cipher dispatch and the register walk both directions share.
+fn aes_kw(key: &[u8], data: &[u8], wrapping: bool) -> Result<Option<Vec<u8>>> {
     use aes::cipher::consts::U16;
     use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, BlockSizeUser, KeyInit};
     const IV: [u8; 8] = [0xA6; 8];
@@ -2159,82 +2217,10 @@ fn aes_key_wrap(key: &[u8], data: &[u8], wrapping: bool) -> Result<Option<Vec<u8
     }
 }
 
-#[cfg(test)]
-mod aes_kw_tests {
-    use super::aes_key_wrap;
-
-    fn hex(text: &str) -> Vec<u8> {
-        (0..text.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
-            .collect()
-    }
-
-    // RFC 3394 section 4: each case wraps key data under a KEK.
-    const VECTORS: [(&str, &str, &str); 6] = [
-        (
-            "000102030405060708090A0B0C0D0E0F",
-            "00112233445566778899AABBCCDDEEFF",
-            "1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5",
-        ),
-        (
-            "000102030405060708090A0B0C0D0E0F1011121314151617",
-            "00112233445566778899AABBCCDDEEFF",
-            "96778B25AE6CA435F92B5B97C050AED2468AB8A17AD84E5D",
-        ),
-        (
-            "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F",
-            "00112233445566778899AABBCCDDEEFF",
-            "64E8C3F9CE0F5BA263E9777905818A2A93C8191E7D6E8AE7",
-        ),
-        (
-            "000102030405060708090A0B0C0D0E0F1011121314151617",
-            "00112233445566778899AABBCCDDEEFF0001020304050607",
-            "031D33264E15D33268F24EC260743EDCE1C6C7DDEE725A936BA814915C6762D2",
-        ),
-        (
-            "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F",
-            "00112233445566778899AABBCCDDEEFF0001020304050607",
-            "A8F9BC1612C68B3FF6E6F4FBE30E71E4769C8B80A32CB8958CD5D17D6B254DA1",
-        ),
-        (
-            "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F",
-            "00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F",
-            "28C9F404C4B810F4CBCCB35CFB87F8263F5786E2D80ED326CBC7F0E71A99F43BFB988B9B7A02DD21",
-        ),
-    ];
-
-    #[test]
-    fn matches_the_rfc_3394_vectors() {
-        for (kek, data, wrapped) in VECTORS {
-            let (kek, data, wrapped) = (hex(kek), hex(data), hex(wrapped));
-            assert_eq!(
-                aes_key_wrap(&kek, &data, true).unwrap(),
-                Some(wrapped.clone())
-            );
-            assert_eq!(aes_key_wrap(&kek, &wrapped, false).unwrap(), Some(data));
-        }
-    }
-
-    #[test]
-    fn altered_data_or_a_wrong_key_does_not_unwrap() {
-        let (kek, _, wrapped) = VECTORS[0];
-        let mut wrapped = hex(wrapped);
-        wrapped[3] ^= 1;
-        assert_eq!(aes_key_wrap(&hex(kek), &wrapped, false).unwrap(), None);
-    }
-
-    #[test]
-    fn refuses_data_that_is_not_whole_registers() {
-        assert!(aes_key_wrap(&[0; 16], &[0; 15], true).is_err());
-        assert!(aes_key_wrap(&[0; 16], &[0; 8], true).is_err());
-        assert!(aes_key_wrap(&[0; 16], &[0; 16], false).is_err());
-    }
-}
-
 /// `$$aesEncrypt(mode, key, iv, data, additionalData, tagBytes)` and its
 /// decrypt counterpart return a Uint8Array. The last two arguments apply only
-/// to AES-GCM, so one typed-array op pair still serves all three AES modes.
+/// to AES-GCM, so one typed-array op pair still serves every AES mode. AES-KW
+/// is wrap on the encrypt op and unwrap on the decrypt op.
 fn op_webcrypto_aes(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -2272,6 +2258,18 @@ fn op_webcrypto_aes(
                 webcrypto_aes_gcm(&key, &iv, &additional_data, &data, tag_size, encrypting)
             {
                 webcrypto_return_bytes(scope, rv, &out);
+            }
+        }
+        AesMode::Kw => {
+            let out = if encrypting {
+                aes_kw_wrap(&key, &data).map(Some)
+            } else {
+                aes_kw_unwrap(&key, &data)
+            };
+            match out {
+                Ok(Some(out)) => webcrypto_return_bytes(scope, rv, &out),
+                Ok(None) => {}
+                Err(error) => throw(scope, error),
             }
         }
         AesMode::Block(block) => {
@@ -2385,6 +2383,76 @@ mod scrypt_tests {
             scrypt_kdf(b"", b"", 1 << 20, 8, 1, u64::MAX, 16),
             Err(ScryptRefusal::MemoryLimit)
         );
+    }
+}
+
+#[cfg(test)]
+mod aes_kw_tests {
+    use super::{aes_kw_unwrap, aes_kw_wrap};
+
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // RFC 3394 section 4: each case wraps key data under a KEK.
+    const VECTORS: [(&str, &str, &str); 6] = [
+        (
+            "000102030405060708090A0B0C0D0E0F",
+            "00112233445566778899AABBCCDDEEFF",
+            "1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5",
+        ),
+        (
+            "000102030405060708090A0B0C0D0E0F1011121314151617",
+            "00112233445566778899AABBCCDDEEFF",
+            "96778B25AE6CA435F92B5B97C050AED2468AB8A17AD84E5D",
+        ),
+        (
+            "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F",
+            "00112233445566778899AABBCCDDEEFF",
+            "64E8C3F9CE0F5BA263E9777905818A2A93C8191E7D6E8AE7",
+        ),
+        (
+            "000102030405060708090A0B0C0D0E0F1011121314151617",
+            "00112233445566778899AABBCCDDEEFF0001020304050607",
+            "031D33264E15D33268F24EC260743EDCE1C6C7DDEE725A936BA814915C6762D2",
+        ),
+        (
+            "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F",
+            "00112233445566778899AABBCCDDEEFF0001020304050607",
+            "A8F9BC1612C68B3FF6E6F4FBE30E71E4769C8B80A32CB8958CD5D17D6B254DA1",
+        ),
+        (
+            "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F",
+            "00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F",
+            "28C9F404C4B810F4CBCCB35CFB87F8263F5786E2D80ED326CBC7F0E71A99F43BFB988B9B7A02DD21",
+        ),
+    ];
+
+    #[test]
+    fn matches_the_rfc_3394_vectors() {
+        for (kek, data, wrapped) in VECTORS {
+            let (kek, data, wrapped) = (hex(kek), hex(data), hex(wrapped));
+            assert_eq!(aes_kw_wrap(&kek, &data).unwrap(), wrapped);
+            assert_eq!(aes_kw_unwrap(&kek, &wrapped).unwrap(), Some(data));
+        }
+    }
+
+    #[test]
+    fn altered_data_or_a_wrong_key_does_not_unwrap() {
+        let (kek, _, wrapped) = VECTORS[0];
+        let mut wrapped = hex(wrapped);
+        wrapped[3] ^= 1;
+        assert_eq!(aes_kw_unwrap(&hex(kek), &wrapped).unwrap(), None);
+    }
+
+    #[test]
+    fn refuses_data_that_is_not_whole_registers() {
+        assert!(aes_kw_wrap(&[0; 16], &[0; 15]).is_err());
+        assert!(aes_kw_wrap(&[0; 16], &[0; 8]).is_err());
+        assert!(aes_kw_unwrap(&[0; 16], &[0; 16]).is_err());
     }
 }
 

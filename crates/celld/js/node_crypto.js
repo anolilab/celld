@@ -1040,17 +1040,21 @@
     sha384: "SHA-384", "sha-384": "SHA-384",
     sha512: "SHA-512", "sha-512": "SHA-512",
   };
-  // Sign options come beside the key as an object; a key that is already a
-  // KeyObject or CryptoKey sits in its `key` property.
-  function keyOf(key) {
-    const inner = key?.key;
-    return inner !== undefined && (isKeyObject(inner) || inner instanceof CryptoKey) &&
-      !isKeyObject(key) && !(key instanceof CryptoKey)
-      ? inner
-      : key;
+  // Sign options come beside the key as an object: `padding`, `saltLength`
+  // and `dsaEncoding` are read off it, and a key that is already a KeyObject
+  // or CryptoKey sits in its `key` property. Anything else is the key itself,
+  // with no options. Parsed once, here, so the key and the options cannot
+  // disagree about which shape was given.
+  function splitKeyArgument(argument) {
+    const isOptions = argument !== null && typeof argument === "object" &&
+      !isKeyObject(argument) && !(argument instanceof CryptoKey) &&
+      !isArrayBufferView(argument) && !isAnyArrayBuffer(argument);
+    if (!isOptions) return { key: argument, options: {} };
+    const inner = argument.key;
+    const wrapped = isKeyObject(inner) || inner instanceof CryptoKey;
+    return { key: wrapped ? inner : argument, options: argument };
   }
   function signingKey(key, want, name) {
-    key = keyOf(key);
     const object = isKeyObject(key)
       ? key
       : (key instanceof CryptoKey ? KeyObject.from(key) : createPrivateKey(key));
@@ -1079,47 +1083,51 @@
       throw ERR_METHOD_NOT_IMPLEMENTED(`sign with ${algorithm}`);
     return hash;
   }
-  const HASH_BYTES = { "SHA-256": 32, "SHA-384": 48, "SHA-512": 64 };
   // The `padding`, `saltLength` and `dsaEncoding` options Node reads off a
   // key given as an object. Each one that changes the signature is either
   // honoured or refused: ignoring one would return a signature of a
   // different scheme than the caller asked for.
-  function signOptions(key) {
-    const plain = key !== null && typeof key === "object" &&
-      !isKeyObject(key) && !(key instanceof CryptoKey) &&
-      !isArrayBufferView(key) && !isAnyArrayBuffer(key);
-    return plain ? key : {};
-  }
-  // RSA: PKCS#1 v1.5 unless PSS padding is asked for. The salt length
+  //
+  // RSA: PKCS#1 v1.5 unless PSS padding is asked for. The PSS salt length
   // follows Node: -1 is the digest length, -2 (the default) is the largest
   // the modulus allows when signing and is read off the signature when
-  // verifying.
-  function rsaPss(options, material, hash, signing) {
+  // verifying, which is `saltLength: null`.
+  function rsaScheme(options, material, hash, signing) {
     const { padding } = options;
     // `saltLength` only means something to PSS, so PKCS#1 v1.5 ignores it.
     if (padding === undefined || padding === constants.RSA_PKCS1_PADDING)
-      return null;
+      return { scheme: "pkcs1" };
     if (padding !== constants.RSA_PKCS1_PSS_PADDING)
       throw ERR_METHOD_NOT_IMPLEMENTED(
         `${signing ? "sign" : "verify"} with RSA padding ${padding}`);
     const { saltLength = constants.RSA_PSS_SALTLEN_MAX_SIGN } = options;
     validateInt32(saltLength, "options.saltLength", -2);
-    const digest = HASH_BYTES[hash];
-    if (saltLength === -1) return digest;
+    const digest = digestInfo(hash)[1];
+    if (saltLength === -1) return { scheme: "pss", saltLength: digest };
     if (saltLength === -2) {
-      if (!signing) return null;
-      return Math.ceil((material.details.modulusLength - 1) / 8) - digest - 2;
+      return {
+        scheme: "pss",
+        saltLength: signing
+          ? Math.ceil((material.details.modulusLength - 1) / 8) - digest - 2
+          : null,
+      };
     }
-    return saltLength;
+    return { scheme: "pss", saltLength };
   }
+  // ECDSA signatures are DER unless `dsaEncoding` asks for r||s; each
+  // encoding has its own sign and verify op.
+  const EC_OPS = {
+    "der": { sign: "ec-sign-der", verify: "ec-verify-der" },
+    "ieee-p1363": { sign: "ecdsa-sign", verify: "ecdsa-verify" },
+  };
   function ecEncoding(options) {
     const { dsaEncoding = "der" } = options;
     if (dsaEncoding !== "der" && dsaEncoding !== "ieee-p1363")
       throw ERR_INVALID_ARG_VALUE("options.dsaEncoding", dsaEncoding);
-    return dsaEncoding === "der" ? "ec-sign-der" : "ecdsa-sign";
+    return dsaEncoding;
   }
-  function sign(algorithm, data, key) {
-    const options = signOptions(key);
+  function sign(algorithm, data, argument) {
+    const { key, options } = splitKeyArgument(argument);
     const material = signingKey(key, "private", "key");
     const hash = signHash(algorithm, material.keyType);
     const input = Array.from(asU8(data));
@@ -1129,23 +1137,28 @@
         return Buffer.from(
           keyOp("ed25519-sign", { key: der, data: input }).bytes);
       case "rsa": {
-        const saltLength = rsaPss(options, material, hash, true);
-        return Buffer.from(saltLength === null
-          ? keyOp("rsa-pkcs1-sign", { key: der, data: input, hash }).bytes
-          : keyOp("rsa-pss-sign",
-            { key: der, data: input, hash, saltLength }).bytes);
+        const rsa = rsaScheme(options, material, hash, true);
+        switch (rsa.scheme) {
+          case "pss":
+            return Buffer.from(keyOp("rsa-pss-sign", {
+              key: der, data: input, hash, saltLength: rsa.saltLength,
+            }).bytes);
+          case "pkcs1":
+            return Buffer.from(
+              keyOp("rsa-pkcs1-sign", { key: der, data: input, hash }).bytes);
+        }
       }
       case "ec":
         return Buffer.from(
-          keyOp(ecEncoding(options), { key: der, data: input, hash }).bytes);
+          keyOp(EC_OPS[ecEncoding(options)].sign,
+            { key: der, data: input, hash }).bytes);
       default:
         throw ERR_METHOD_NOT_IMPLEMENTED(`sign with ${material.keyType}`);
     }
   }
-  function verify(algorithm, data, key, signature) {
-    const options = signOptions(key);
+  function verify(algorithm, data, argument, signature) {
+    const { key: target, options } = splitKeyArgument(argument);
     // Node accepts a private key here and verifies with its public half.
-    const target = keyOf(key);
     let material = signingKey(
       isKeyObject(target) && target.type === "private" ? createPublicKey(target) : target,
       "public",
@@ -1159,18 +1172,22 @@
       case "ed25519":
         return keyOp("ed25519-verify", { key: der, data: input, signature: sig }).ok;
       case "rsa": {
-        const saltLength = rsaPss(options, material, hash, false);
-        return options.padding === constants.RSA_PKCS1_PSS_PADDING
-          ? keyOp("rsa-pss-verify",
-            { key: der, data: input, signature: sig, hash, saltLength }).ok
-          : keyOp("rsa-pkcs1-verify",
-            { key: der, data: input, signature: sig, hash }).ok;
+        const rsa = rsaScheme(options, material, hash, false);
+        switch (rsa.scheme) {
+          case "pss":
+            return keyOp("rsa-pss-verify", {
+              key: der, data: input, signature: sig, hash,
+              saltLength: rsa.saltLength,
+            }).ok;
+          case "pkcs1":
+            return keyOp("rsa-pkcs1-verify",
+              { key: der, data: input, signature: sig, hash }).ok;
+        }
       }
       case "ec":
-        return keyOp(
-          ecEncoding(options) === "ec-sign-der" ? "ec-verify-der" : "ecdsa-verify", {
-            key: der, data: input, signature: sig, hash,
-          }).ok;
+        return keyOp(EC_OPS[ecEncoding(options)].verify, {
+          key: der, data: input, signature: sig, hash,
+        }).ok;
       default:
         throw ERR_METHOD_NOT_IMPLEMENTED(`verify with ${material.keyType}`);
     }
