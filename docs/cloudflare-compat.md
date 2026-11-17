@@ -138,8 +138,10 @@ The `tail` and `email` handlers are unavailable.
 - An exception in a WebSocket `message`, `close` or `error` listener is logged
   with its stack as a console error. The other listeners still run and the
   socket stays open. An exception in `webSocketMessage`, `webSocketClose` or
-  `webSocketError` is logged the same way, and still fails the event and closes
-  the socket with 1011.
+  `webSocketError` is logged the same way and fails the event. A failing
+  `webSocketMessage` closes the socket with 1011; `webSocketClose` and
+  `webSocketError` run while the socket is already closing, so their failure is
+  only reported.
 - A response with a WebSocket to a request without `Upgrade: websocket` fails,
   as in workerd. A Durable Object's `stub.fetch()` call then rejects, and an
   HTTP client receives status 500. The server end of the socket receives a close
