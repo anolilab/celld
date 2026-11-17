@@ -26,6 +26,10 @@ export class Cell extends DurableObject {
     const plain = await this.env.CELL.getByName(name).plain();
     return { plain, target: new Probe() };
   }
+  // The `cache` of a Request that crossed the RPC boundary.
+  requestCache(request) {
+    return request.cache ?? null;
+  }
   entries() {
     return globalThis.__celld_stub_entries();
   }
@@ -92,6 +96,14 @@ export default {
         forceCache: await attempt(() => fetch(dead, { cache: "force-cache" })),
         cloned: await attempt(() => new Request(dead, { cache: "no-store" }).clone().cache),
         flag: globalThis.Cloudflare.compatibilityFlags.cache_option_enabled,
+      });
+    }
+    if (url.pathname === "/rpc-cache") {
+      const stub = env.CELL.getByName("rpc-cache");
+      const request = new Request("http://example.test/", { cache: "no-store" });
+      return Response.json({
+        sent: await stub.requestCache(request),
+        plain: await stub.requestCache(new Request("http://example.test/")),
       });
     }
     if (url.pathname === "/connect") {

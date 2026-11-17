@@ -547,3 +547,11 @@ async fn the_cache_option_accepts_only_no_store_and_follows_the_compat_date() {
         assert!(message.contains("'cache' field"), "{key}: {off}");
     }
 }
+
+#[tokio::test]
+async fn a_request_keeps_its_cache_mode_across_rpc() {
+    let server = Server::start("fetch-compat", &[]).await;
+    let result: Value = server.get_json("/rpc-cache").await;
+    assert_eq!(result["sent"], "no-store", "{result}");
+    assert_eq!(result["plain"], Value::Null, "{result}");
+}

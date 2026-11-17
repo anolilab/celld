@@ -174,7 +174,7 @@ pub static FLAGS: &[Flag] = &[
     row(
         "nodejs_compat_v2",
         Honoured,
-        "Counts as `nodejs_compat` for `process.env`. celld provides the `node:` modules without it.",
+        "Counts as `nodejs_compat` for `process.env`, unless `no_nodejs_compat` is set. celld provides the `node:` modules without it.",
     ),
     row(
         "nodejs_compat_populate_process_env",
@@ -197,7 +197,7 @@ pub static FLAGS: &[Flag] = &[
     row(
         "python_workers_20250116",
         AlwaysOn,
-        "Pyodide 0.28, the only line celld runs.",
+        "Pyodide 0.28, the only line celld runs. celld applies this whatever the date.",
     )
     .since("2025-09-29")
     .needs("python_workers")
@@ -206,7 +206,7 @@ pub static FLAGS: &[Flag] = &[
     row(
         "enable_python_external_sdk",
         AlwaysOn,
-        "The vendored Workers SDK, the only one celld runs.",
+        "The vendored Workers SDK, the only one celld runs. celld applies this whatever the date.",
     )
     .since("2026-04-21")
     .needs("python_workers")
@@ -215,7 +215,7 @@ pub static FLAGS: &[Flag] = &[
     row(
         "python_no_global_handlers",
         AlwaysOn,
-        "Handlers are `Default` entrypoint classes, the only form celld runs.",
+        "Handlers are `Default` entrypoint classes, the only form celld runs. celld applies this whatever the date.",
     )
     .since("2025-08-14")
     .needs("python_workers")
@@ -224,7 +224,7 @@ pub static FLAGS: &[Flag] = &[
     row(
         "python_workers_force_new_vendor_path",
         AlwaysOn,
-        "Vendored packages come from `python_modules`, the only path celld uses.",
+        "Vendored packages come from `python_modules`, the only path celld uses. celld applies this whatever the date.",
     )
     .since("2025-08-11")
     .needs("python_workers")
@@ -262,33 +262,33 @@ pub static FLAGS: &[Flag] = &[
     row(
         "upper_case_all_http_methods",
         AlwaysOn,
-        "`Request` upper-cases every method.",
+        "`Request` upper-cases every method. celld applies this whatever the date.",
     )
     .since("2024-10-14")
     .opt_out("no_upper_case_all_http_methods"),
     row(
         "capture_async_api_throws",
         AlwaysOn,
-        "An async API reports an error as a rejected promise.",
+        "An async API reports an error as a rejected promise. celld applies this whatever the date.",
     )
     .since("2022-10-31")
     .opt_out("do_not_capture_async_api_throws"),
     // js/harness.js sets `globalThis.navigator`.
-    row("global_navigator", AlwaysOn, "`navigator` is a global.")
+    row("global_navigator", AlwaysOn, "`navigator` is a global. celld applies this whatever the date.")
         .since("2022-03-21")
         .opt_out("no_global_navigator"),
     // js/streams.js and js/writable_stream.js export the standard constructors.
     row(
         "streams_enable_constructors",
         AlwaysOn,
-        "`ReadableStream` and `WritableStream` have their standard constructors.",
+        "`ReadableStream` and `WritableStream` have their standard constructors. celld applies this whatever the date.",
     )
     .since("2022-11-30")
     .opt_out("streams_disable_constructors"),
     row(
         "transformstream_enable_standard_constructor",
         AlwaysOn,
-        "`TransformStream` has its standard constructor.",
+        "`TransformStream` has its standard constructor. celld applies this whatever the date.",
     )
     .since("2022-11-30")
     .opt_out("transformstream_disable_standard_constructor"),
@@ -296,7 +296,7 @@ pub static FLAGS: &[Flag] = &[
     row(
         "formdata_parser_supports_files",
         AlwaysOn,
-        "`formData()` returns a `File` for a file part.",
+        "`formData()` returns a `File` for a file part. celld applies this whatever the date.",
     )
     .since("2021-11-03")
     .opt_out("formdata_parser_converts_files_to_strings"),
@@ -304,7 +304,7 @@ pub static FLAGS: &[Flag] = &[
     row(
         "http_headers_getsetcookie",
         AlwaysOn,
-        "`Headers.getSetCookie()` exists.",
+        "`Headers.getSetCookie()` exists. celld applies this whatever the date.",
     )
     .since("2023-03-01")
     .opt_out("no_http_headers_getsetcookie"),
@@ -312,7 +312,7 @@ pub static FLAGS: &[Flag] = &[
     row(
         "url_standard",
         AlwaysOn,
-        "`URL` follows the WHATWG URL standard.",
+        "`URL` follows the WHATWG URL standard. celld applies this whatever the date.",
     )
     .since("2022-10-31")
     .opt_out("url_original"),
@@ -320,7 +320,7 @@ pub static FLAGS: &[Flag] = &[
     row(
         "fetch_refuses_unknown_protocols",
         AlwaysOn,
-        "`fetch()` rejects a URL with a scheme other than `http` and `https`.",
+        "`fetch()` rejects a URL with a scheme other than `http` and `https`. celld applies this whatever the date.",
     )
     .since("2021-11-10")
     .opt_out("fetch_treats_unknown_protocols_as_http"),
@@ -349,7 +349,7 @@ pub static FLAGS: &[Flag] = &[
     row(
         "enable_ctx_exports",
         AlwaysOn,
-        "`ctx.exports` is available.",
+        "`ctx.exports` is available. celld applies this whatever the date.",
     )
     .since("2025-11-17")
     .opt_out("disable_ctx_exports"),
@@ -364,7 +364,7 @@ pub static FLAGS: &[Flag] = &[
     row(
         "r2_list_honor_include",
         AlwaysOn,
-        "An R2 listing honours `include`.",
+        "An R2 listing honours `include`. celld applies this whatever the date.",
     )
     .since("2022-08-04"),
     // docs/cloudflare-compat.md "TCP sockets": `connect()` is always available.
@@ -896,6 +896,11 @@ mod tests {
         assert!(compat("2026-08-03", &["nodejs_compat"]).populate_process_env);
         assert!(compat("2026-08-03", &["nodejs_compat_v2"]).populate_process_env);
         assert!(!compat(date, &["nodejs_compat_do_not_populate_process_env"]).populate_process_env);
+        // The opt-out also ends the v2 spelling, for a stored version that sets both.
+        assert!(
+            !compat("2026-08-03", &["nodejs_compat_v2", "no_nodejs_compat"]).populate_process_env
+        );
+        assert!(!compat(date, &["nodejs_compat_v2", "no_nodejs_compat"]).populate_process_env);
     }
 
     fn check_flags(flags: &[&str], strict: bool) -> anyhow::Result<()> {

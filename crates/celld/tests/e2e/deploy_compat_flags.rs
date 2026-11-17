@@ -80,7 +80,12 @@ fn an_unsupported_flag_fails_the_deploy_without_strict_flags() {
     );
     assert!(!run.success, "{}", run.stderr);
     assert!(
-        run.stderr.contains("cache_option_enabled: not supported"),
+        run.stderr.contains("streaming_tail_worker: not supported"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("Warning:") && run.stderr.contains("mystery_flag"),
         "{}",
         run.stderr
     );

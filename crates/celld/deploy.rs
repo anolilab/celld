@@ -2445,7 +2445,15 @@ fn read_compatibility(
     };
     let date = match object.get("compatibility_date") {
         None => None,
-        Some(Value::String(date)) => Some(date.clone()),
+        Some(Value::String(date)) => {
+            // Dates are compared as text, which orders only the canonical form.
+            let canonical = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .is_ok_and(|parsed| parsed.format("%Y-%m-%d").to_string() == *date);
+            if !canonical {
+                bail!("config `compatibility_date` {date:?} must be a real date as YYYY-MM-DD");
+            }
+            Some(date.clone())
+        }
         Some(_) => bail!("config `compatibility_date` must be a string"),
     };
     Ok((flags, date))
@@ -3865,10 +3873,18 @@ mod compatibility_config_tests {
             r#""compatibility_flags": "nodejs_compat""#,
             r#""compatibility_flags": [1]"#,
             r#""compatibility_date": 20260101"#,
+            r#""compatibility_date": "2026-8-4""#,
+            r#""compatibility_date": "9999""#,
+            r#""compatibility_date": "2026-02-30""#,
+            r#""compatibility_date": "2025-02-29""#,
+            r#""compatibility_date": " 2026-08-04""#,
         ] {
             let config =
                 format!(r#"{{ "name": "app", "main": "index.js", "no_bundle": true, {bad} }}"#);
             assert!(read("index.js", &config).is_err(), "{bad}");
         }
+        let leap = r#"{ "name": "app", "main": "index.js", "no_bundle": true,
+                        "compatibility_date": "2024-02-29" }"#;
+        assert!(read("index.js", leap).is_ok());
     }
 }

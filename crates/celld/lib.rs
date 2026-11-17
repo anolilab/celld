@@ -208,7 +208,8 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
         sqlite_vec: on("sqlite_vec"),
         websocket_standard_binary_type: on("websocket_standard_binary_type"),
         queue_json_messages,
-        populate_process_env: (on("nodejs_compat") || on("nodejs_compat_v2"))
+        populate_process_env: (on("nodejs_compat")
+            || (on("nodejs_compat_v2") && !flags.contains(&"no_nodejs_compat")))
             && on("nodejs_compat_populate_process_env"),
         cache_option: on("cache_option_enabled"),
     }

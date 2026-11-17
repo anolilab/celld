@@ -4530,7 +4530,7 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       if (!allowCapabilities) return v;
       marker = { "__celld$req": v.url, m: v.method,
                  h: [...v.headers], r: v.redirect, c: v.cf,
-                 e: v.encodeResponseBody, b: liftBody(v) };
+                 k: v.cache, e: v.encodeResponseBody, b: liftBody(v) };
     } else if (v instanceof Response) {
       if (!allowCapabilities) return v;
       marker = { "__celld$res": v.status,
@@ -4607,15 +4607,16 @@ const __adoptBody = (target, bytes) => {
 };
 // A non-bytes `b` is a live-stream body marker: revive it and
 // let the constructor adopt it as a streaming body.
+// `cache` is set after construction: the receiver's own compat flags
+// do not decide whether a request that already carries it may cross.
 const __reviveRequest = (marker, url, revive) => {
-  if (!(marker.b instanceof Uint8Array))
-    return new Request(url, { method: marker.m,
-      headers: marker.h, redirect: marker.r, cf: marker.c,
-      encodeResponseBody: marker.e, body: revive(marker.b) });
+  const live = !(marker.b instanceof Uint8Array);
   const req = new Request(url, { method: marker.m,
     headers: marker.h, redirect: marker.r, cf: marker.c,
-    encodeResponseBody: marker.e });
-  __adoptBody(req, marker.b);
+    encodeResponseBody: marker.e,
+    ...(live ? { body: revive(marker.b) } : {}) });
+  if (marker.k !== undefined) req.cache = marker.k;
+  if (!live) __adoptBody(req, marker.b);
   return req;
 };
 const __reviveResponse = (marker, revive) => {
