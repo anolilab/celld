@@ -15,7 +15,7 @@
 use anyhow::Context as _;
 use rusqlite::{Connection, OptionalExtension};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -269,6 +269,51 @@ fn sql_statement_caches<T>(f: impl FnOnce(&RefCell<HashMap<String, SqlStatementC
 
 fn sql_critical_errors<T>(f: impl FnOnce(&RefCell<HashMap<String, String>>) -> T) -> T {
     cells(|c| f(&c.sql_critical_errors))
+}
+
+/// Cells whose SQL latched a critical error, by the root cell that must be
+/// recycled to clear it. Unlike the per-isolate map above, the actor thread
+/// can read this one, so it learns of the latch without entering an isolate.
+static BROKEN_CELLS: std::sync::Mutex<BTreeMap<String, String>> =
+    std::sync::Mutex::new(BTreeMap::new());
+static BROKEN_CELL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn broken_cells<T>(f: impl FnOnce(&mut BTreeMap<String, String>) -> T) -> T {
+    let mut broken = BROKEN_CELLS.lock().unwrap_or_else(|p| p.into_inner());
+    let result = f(&mut broken);
+    BROKEN_CELL_COUNT.store(broken.len(), std::sync::atomic::Ordering::Release);
+    result
+}
+
+/// Latch `error` for `scope`: every later call on the cell fails with it
+/// until the cell's storage is closed and opened again.
+fn latch_sql_critical_error(scope: &str, error: String) {
+    sql_critical_errors(|errors| {
+        errors
+            .borrow_mut()
+            .entry(scope.to_string())
+            .or_insert(error);
+    });
+    // A facet's scope is `<root>/facets/<h>` (`engine_api::facet_cell`); this
+    // runs inside a write that holds the connection map, so read the root off
+    // the name instead of the map.
+    let root = scope.split_once("/facets/").map_or(scope, |(root, _)| root);
+    broken_cells(|broken| broken.insert(scope.to_string(), root.to_string()));
+}
+
+fn clear_sql_critical_error(scope: &str) {
+    sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
+    if BROKEN_CELL_COUNT.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        broken_cells(|broken| broken.remove(scope));
+    }
+}
+
+/// Did SQL on `cell` (or one of its facets) latch a critical error that only
+/// a fresh instance of the cell clears? Readable from any thread; the check
+/// is one atomic load while no cell is broken.
+pub fn cell_needs_recycle(cell: &str) -> bool {
+    BROKEN_CELL_COUNT.load(std::sync::atomic::Ordering::Acquire) > 0
+        && broken_cells(|broken| broken.values().any(|root| root == cell))
 }
 
 /// The heap memory one cell can hold in cached SQL statements. The budget
@@ -820,7 +865,7 @@ fn finish_open(
     close_sync_list_cursors(scope);
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
-    sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
+    clear_sql_critical_error(scope);
     dbs(|d| {
         d.borrow_mut().insert(
             scope.to_string(),
@@ -857,7 +902,7 @@ pub fn close(scope: &str) {
     close_sync_list_cursors(scope);
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
-    sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
+    clear_sql_critical_error(scope);
     cells(|c| c.schema_cookies.borrow_mut().remove(scope));
     dbs(|d| d.borrow_mut().remove(scope));
     active_alarms(|alarms| alarms.borrow_mut().remove(scope));
@@ -2756,12 +2801,7 @@ impl D1TransactionOperation {
 }
 
 fn d1_poison_transaction(scope: &str, error: String) {
-    sql_critical_errors(|errors| {
-        errors
-            .borrow_mut()
-            .entry(scope.to_string())
-            .or_insert(error);
-    });
+    latch_sql_critical_error(scope, error);
 }
 
 fn d1_rollback_after_commit_failure(
@@ -2851,12 +2891,7 @@ fn d1_critical_transaction_failure(
         // A D1 call owns its transaction bracket and cannot hand an open or
         // ambiguous one back to application code. Fail closed even when
         // SQLite did not re-enable autocommit after the control failure.
-        sql_critical_errors(|errors| {
-            errors
-                .borrow_mut()
-                .entry(scope.to_string())
-                .or_insert_with(|| error.clone());
-        });
+        latch_sql_critical_error(scope, error.clone());
     }
     error
 }
@@ -3495,12 +3530,7 @@ fn record_sqlite_operation_failure(
     );
     let now_autocommit = unsafe { rusqlite::ffi::sqlite3_get_autocommit(database) != 0 };
     if celld_logic::sqlite::poisons_actor(result_code, started_in_transaction, now_autocommit) {
-        sql_critical_errors(|errors| {
-            errors
-                .borrow_mut()
-                .entry(scope.to_string())
-                .or_insert_with(|| error.to_string());
-        });
+        latch_sql_critical_error(scope, error.to_string());
     }
 }
 
@@ -4033,4 +4063,80 @@ pub fn bump_alarm_with_policy(scope: &str, now_ms: i64, counts_against_limit: bo
         }
     });
     publish_alarm(scope);
+}
+
+#[cfg(test)]
+mod recycle_tests {
+    use super::*;
+
+    fn limit_pages(scope: &str, pages: Option<i64>) {
+        with_mut(scope, |c| {
+            without_sql_authorizer(c, |c| {
+                c.pragma_update(None, "max_page_count", pages.unwrap_or(0x3fff_ffff))
+            })
+        })
+        .expect("db open")
+        .expect("set limit");
+    }
+
+    fn page_count(scope: &str) -> i64 {
+        with_mut(scope, |c| {
+            without_sql_authorizer(c, |c| {
+                c.query_row("PRAGMA page_count", [], |row| row.get(0))
+            })
+        })
+        .expect("db open")
+        .expect("page count")
+    }
+
+    /// A transaction destroyed by a full disk latches the cell and marks it
+    /// for recycling; reopening the database (what the recycle does) clears
+    /// the latch, and nothing committed before the failure is lost.
+    #[test]
+    fn a_full_disk_latches_until_the_cell_reopens() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("cell.sqlite")
+            .to_string_lossy()
+            .into_owned();
+        let scope = "full-cell";
+        open(scope, &path).unwrap();
+        put_serialized(scope, "kept", b"acknowledged").unwrap();
+        assert!(!cell_needs_recycle(scope));
+
+        // Room for the committed data and a little more, then none.
+        limit_pages(scope, Some(page_count(scope) + 2));
+        transaction_control(scope, "start", false, "").unwrap();
+        let big = vec![7u8; 64 * 1024];
+        let mut failure = None;
+        for i in 0..64 {
+            if let Err(error) = put_serialized(scope, &format!("lost-{i}"), &big) {
+                failure = Some(error);
+                break;
+            }
+        }
+        let failure = failure.expect("the limit never produced a full error");
+        assert!(failure.to_string().contains("full"), "{failure:#}");
+        assert!(
+            sql_critical_error(scope).is_some(),
+            "the cell did not latch"
+        );
+        assert!(cell_needs_recycle(scope));
+        assert!(put_serialized(scope, "late", b"x").is_err());
+
+        // The recycle closes the storage and opens it again at the same file,
+        // after space returned.
+        close(scope);
+        assert!(!cell_needs_recycle(scope));
+        open(scope, &path).unwrap();
+        assert!(sql_critical_error(scope).is_none());
+        put_serialized(scope, "after", b"fresh").unwrap();
+        assert!(get_stored(scope, "lost-0").unwrap().is_none());
+        assert!(get_stored(scope, "kept").unwrap().is_some());
+        assert!(get_stored(scope, "after").unwrap().is_some());
+        close(scope);
+    }
 }

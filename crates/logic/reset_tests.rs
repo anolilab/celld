@@ -197,3 +197,34 @@ fn a_regular_socket_event_still_runs_on_a_quiescing_cell() {
         }
     )));
 }
+
+#[test]
+fn a_cell_whose_sql_latched_restarts_at_the_same_epoch_once_idle() {
+    let mut shell = Shell::new(config());
+    let busy = shell.request("a");
+    shell.send(Event::RuntimeBroken { cell: "a".into() });
+    assert!(shell.state.swapping() > 0, "the cell was not nominated");
+
+    // The failing request is still running, so the cell waits for it and
+    // sends new requests to the restarted runtime.
+    assert!(
+        shell
+            .take(|effect| matches!(effect, Effect::StopRuntime { .. }).then_some(()))
+            .is_none(),
+        "the runtime stopped under a running request"
+    );
+    shell.finish(busy);
+    let stop = shell.expect("the same-epoch stop", |effect| match effect {
+        Effect::StopRuntime {
+            op,
+            cause: StopCause::Swap,
+            ..
+        } => Some(*op),
+        _ => None,
+    });
+    shell.send(Event::RuntimeStopped { op: stop });
+    shell.expect("a restart at the same epoch", |effect| match effect {
+        Effect::StartRuntime { cell, epoch: 1, .. } if cell == "a" => Some(()),
+        _ => None,
+    });
+}

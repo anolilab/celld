@@ -2844,6 +2844,9 @@ impl Actor {
                 alarm,
                 alarm_covered,
             } => {
+                // A cell whose SQL latched a critical error is recycled once
+                // this activity is gone; one atomic load when none is.
+                let broken = crate::storage::cell_needs_recycle(&cell).then(|| cell.clone());
                 // Observe the alarm before releasing the activity. The core
                 // reports whether that observation cancels an eviction proof.
                 self.drive(
@@ -2857,6 +2860,10 @@ impl Actor {
                     out,
                 );
                 self.drive(Event::ActivityFinished { request }, out);
+                // After the activity ends, so the cell can reach its safe point.
+                if let Some(cell) = broken {
+                    self.drive(Event::RuntimeBroken { cell }, out);
+                }
             }
             Message::WebSocketOpened {
                 cell,

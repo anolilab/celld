@@ -5472,6 +5472,28 @@ impl State {
         self.swap_eager_classes = eager_classes.iter().cloned().collect();
     }
 
+    /// Nominate a resident cell for a same-epoch restart because its runtime
+    /// latched a SQL critical error. The nomination is the swap's own: the
+    /// cell quiesces, `pump_swap` stops the runtime at a safe point, and the
+    /// restart reopens the database, which clears the latch. Nothing the
+    /// cell acknowledged is touched: the destroyed transaction was never
+    /// committed, and the swap skips no durability proof the output gate owes.
+    fn runtime_broken(&mut self, id: &str) {
+        let Some(cell) = self.cells.get_mut(id) else {
+            return;
+        };
+        if !matches!(cell.phase, Phase::Resident { .. })
+            || cell.swapping
+            || cell.quiescing
+            || cell.releasing.is_some()
+        {
+            return;
+        }
+        cell.swapping = true;
+        cell.quiescing = true;
+        self.quiescing_cells.insert(id.to_string());
+    }
+
     /// Whether this cell's class was named eager by the last announcement, so
     /// its swap does not wait for the maximum age.
     ///
@@ -5519,18 +5541,17 @@ impl State {
     /// a Cloudflare deployment does to every object unconditionally. The
     /// hibernatable sockets survive either way.
     fn pump_swap(&mut self, effects: &mut Vec<Effect>) {
-        if self.current_generation == 0
-            || self.draining
-            || self.fenced
-            || !self.node_authoritative()
-        {
+        if self.draining || self.fenced || !self.node_authoritative() {
             return;
         }
         let current = self.current_generation;
-        let forced_by_age = self
-            .now_mono_ms
-            .saturating_sub(self.generation_changed_mono_ms)
-            >= self.swap_max_age_ms;
+        // Before any announcement every cell reads as stale and nothing ages,
+        // so only a cell nominated for another reason (`runtime_broken`) moves.
+        let forced_by_age = current != 0
+            && self
+                .now_mono_ms
+                .saturating_sub(self.generation_changed_mono_ms)
+                >= self.swap_max_age_ms;
         let in_flight = self.cells.values().filter(|cell| cell.swapping).count();
         let room = self.config.max_releases.saturating_sub(in_flight);
         let stale: Vec<CellId> = self
@@ -5541,6 +5562,7 @@ impl State {
                     && !cell.swapping
                     && !cell.quiescing
                     && cell.releasing.is_none()
+                    && current != 0
                     && cell.generation != current
             })
             .map(|(id, _)| id.clone())
@@ -7182,6 +7204,7 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
             eager_classes,
             ..
         } => state.generation_changed(generation, max_age_ms, &eager_classes),
+        Event::RuntimeBroken { cell } => state.runtime_broken(&cell),
         Event::Published { op, result } => state.published(op, result, &mut effects),
         Event::DurabilityChecked { op, result } => state.durability_checked(
             op,

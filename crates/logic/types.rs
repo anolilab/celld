@@ -853,6 +853,14 @@ pub enum Event {
         max_age_ms: u64,
         eager_classes: Vec<String>,
     },
+    /// The runtime reports that a SQL critical error (disk full, I/O error,
+    /// out of memory) destroyed a transaction and latched the cell: every
+    /// later call on this instance fails. The cell restarts at the same epoch
+    /// on a fresh instance at its next safe point, as a generation swap does,
+    /// so it serves again once the fault clears, without a restore.
+    RuntimeBroken {
+        cell: CellId,
+    },
     Published {
         op: OpId,
         result: Result<(), Failure>,
