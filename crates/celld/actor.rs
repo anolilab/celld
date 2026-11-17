@@ -3535,6 +3535,14 @@ impl Actor {
                 } else {
                     "shutdown_quiesce"
                 };
+                // A cell that stays on this node is moved to a new deployment
+                // (or restarted); one that leaves is handed off at shutdown.
+                // The client is told which, and may retry either.
+                let cause = if keep_hibernatable {
+                    crate::js::CancelCause::Moved
+                } else {
+                    crate::js::CancelCause::Shutdown
+                };
                 for request in requests {
                     if let Some((request_id, _)) =
                         self.drain_pins.cancel_core_request(request, cancellation)
@@ -3543,7 +3551,7 @@ impl Actor {
                         // waitUntil work settles. Cancel every pinned phase,
                         // or that background work can outlive the donor.
                         if let (Some(runtime), Some(request_id)) = (&self.host, request_id) {
-                            runtime.abort_activity(request_id);
+                            runtime.abort_activity(request_id, cause);
                         }
                     }
                 }

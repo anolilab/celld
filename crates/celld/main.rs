@@ -1664,6 +1664,28 @@ fn cell_overload_error(error: &anyhow::Error) -> bool {
     })
 }
 
+/// A request ended by a Durable Object move or a node shutdown: the client is
+/// still connected, and asking again reaches the object's new home.
+fn retryable_cancel_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains(celld::js::CANCEL_RETRYABLE_ERROR_MARKER)
+    })
+}
+
+fn retryable_cancel_response() -> HttpReply {
+    let mut refused = response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{\"error\":\"request ended because its Durable Object moved or the node is stopping; retry it\"}",
+    );
+    refused.headers_mut().insert(
+        hyper::header::RETRY_AFTER,
+        hyper::header::HeaderValue::from_static("1"),
+    );
+    refused
+}
+
 fn cell_overload_response() -> HttpReply {
     let mut refused = response(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -1985,6 +2007,7 @@ async fn dispatch_cell_fetch(
             response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
         }
         Ok(Err(error)) if cell_overload_error(&error) => cell_overload_response(),
+        Ok(Err(error)) if retryable_cancel_error(&error) => retryable_cancel_response(),
         Ok(Err(error)) => match error.downcast_ref::<RoutedRequestError>() {
             Some(error) => response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2342,6 +2365,7 @@ pub(crate) async fn dispatch_forwarded_rpc(
                 .expect("RPC clone response"),
         ),
         Err(error) if cell_overload_error(&error) => peer_response(cell_overload_response()),
+        Err(error) if retryable_cancel_error(&error) => peer_response(retryable_cancel_response()),
         Err(error) => peer_response(response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("RPC failed: {error:#}"),
@@ -2412,6 +2436,7 @@ async fn handle_ingress(
             response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
         }
         Err(error) if cell_overload_error(&error) => cell_overload_response(),
+        Err(error) if retryable_cancel_error(&error) => retryable_cancel_response(),
         Err(error) => match error.downcast_ref::<celld::pool::AdmitError>() {
             // Saturation is not a failure of the request. Answering it now
             // lets the caller retry or shed; holding the connection until its

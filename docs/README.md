@@ -286,7 +286,8 @@ call from a request that already runs in the object does not wait, so that
 request can finish on the old code. After
 `CELLD_DEPLOY_MAX_AGE_S` seconds (default 60; 0 forces at once), celld
 forces the move: it cancels the running work and closes regular WebSockets
-with code 1012, as Cloudflare does. During the move, a request on one
+with code 1012, as Cloudflare does. A request cancelled this way answers
+`503` with `Retry-After: 1` and a body that names the move; ask again. During the move, a request on one
 deployment can call a Durable Object on the other, so two adjacent
 versions must accept each other's calls. `/state` reports the deployment
 of each resident object.

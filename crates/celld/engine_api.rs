@@ -229,6 +229,14 @@ pub struct CellOverloaded;
 pub const CELL_OVERLOAD_ERROR_MARKER: &str =
     "celld-internal-cell-overload-7ec38c64-12d7-4ddc-9e77-b63f9dc14130";
 
+/// Carried by the error that ends a request because its Durable Object moved
+/// or the node is stopping. Like [`CELL_OVERLOAD_ERROR_MARKER`] it survives
+/// the V8 promise boundary, so the public ingress can answer 503 with
+/// `Retry-After` for a request the client may retry.
+#[doc(hidden)]
+pub const CANCEL_RETRYABLE_ERROR_MARKER: &str =
+    "celld-internal-retryable-cancel-3b9a51d0-6e2c-4f7a-8c14-a0d5e7b92f68";
+
 impl std::fmt::Display for CellOverloaded {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
