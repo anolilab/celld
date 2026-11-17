@@ -53,6 +53,21 @@ const refuse = (feed, code) => {
   return new Response(null, { status: 101, webSocket: client });
 };
 
+// A WebSocket whose first message listener and close listener throw: the
+// second message listener must still answer, and so must later messages.
+const throwing = (tag) => {
+  const [client, server] = Object.values(new WebSocketPair());
+  server.accept();
+  server.addEventListener("message", () => {
+    throw new Error(`message boom ${tag}`);
+  });
+  server.addEventListener("message", (event) => server.send(`echo:${event.data}`));
+  server.addEventListener("close", () => {
+    throw new Error(`close boom ${tag}`);
+  });
+  return new Response(null, { status: 101, webSocket: client });
+};
+
 // Which close codes `close()` takes: the error name for each code, or "ok".
 const closeCodes = () => {
   const outcome = {};
@@ -92,6 +107,9 @@ export class Streams extends DurableObject {
     if (url.pathname === "/close-codes") {
       return closeCodes();
     }
+    if (url.pathname === "/throwing") {
+      return throwing("object");
+    }
     if (url.pathname === "/member") {
       // The member relays answers to the requests this object forwards to it.
       const [client, server] = Object.values(new WebSocketPair());
@@ -123,6 +141,9 @@ export class Streams extends DurableObject {
     if (url.pathname === "/ws-close") {
       return socket(url.searchParams.get("when"));
     }
+    if (url.pathname === "/written") {
+      return new Response((await this.ctx.storage.get("written")) ?? "none");
+    }
     if (url.pathname === "/close-all") {
       for (const ws of this.ctx.getWebSockets()) ws.close(4001, "done");
       return new Response("closed");
@@ -138,6 +159,17 @@ export class Streams extends DurableObject {
   // The object closes the socket from its message handler, in the way the
   // message names.
   async webSocketMessage(ws, message) {
+    if (message === "throw") {
+      throw new Error("hibernation boom");
+    }
+    if (message === "throw-write") {
+      await this.ctx.storage.put("written", "yes");
+      throw new Error("hibernation write boom");
+    }
+    if (message === "echo") {
+      ws.send("echoed");
+      return;
+    }
     if (message === "codes") {
       // The hibernation socket takes the same codes; only the refused ones are
       // tried here, because a taken one closes the socket.
@@ -174,6 +206,9 @@ export default {
     }
     if (url.pathname === "/close-codes") {
       return closeCodes();
+    }
+    if (url.pathname === "/throwing") {
+      return throwing("worker");
     }
     if (url.pathname === "/sse") {
       return sse(Number(url.searchParams.get("events") ?? "3"));
