@@ -70,6 +70,19 @@ pub fn set_gate_tx(tx: tokio::sync::mpsc::UnboundedSender<GateReq>) {
     let _ = GATE_TX.set(tx);
 }
 
+/// Root cells whose SQL latched a critical error, for the actor to restart.
+static BROKEN_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<String>> = OnceLock::new();
+pub fn set_broken_tx(tx: tokio::sync::mpsc::UnboundedSender<String>) {
+    let _ = BROKEN_TX.set(tx);
+}
+/// Tell the actor that `cell`'s runtime holds a latched SQL error. A process
+/// with no actor (a tool or a test) has nobody to tell.
+pub(crate) fn report_runtime_broken(cell: String) {
+    if let Some(tx) = BROKEN_TX.get() {
+        let _ = tx.send(cell);
+    }
+}
+
 /// A service-binding call: `env.NAME.fetch()`. Unlike a Durable Object call
 /// there is no identity to resolve — any isolate running `script` will do — so
 /// the runtime hands this straight to that script's stateless isolate pool.

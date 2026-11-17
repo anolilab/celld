@@ -185,13 +185,18 @@ An unfinished SQL write cursor can return rows before SQLite commits. Outside an
 explicit transaction, the application must consume those rows before output or
 `storage.sync()`; celld rejects output while a write cursor is unfinished.
 
-A full disk, an I/O error, or an out-of-memory error can make SQLite discard a
-whole transaction. That request fails and none of the transaction's writes are
-acknowledged. The cell then fails every call until it restarts, so it cannot
-serve state that disagrees with its database. celld restarts it on its own, at
-the same epoch and without a restore, once the failed request has ended. The
-next request runs on the restarted cell and succeeds when the fault is gone;
-writes acknowledged earlier are unchanged.
+A full disk, an I/O error, an out-of-memory error, or an interrupt can make
+SQLite discard a whole transaction, in a request, an alarm handler, a facet, or
+work that outlives the response. The discarded transaction may or may not have
+reached the disk, but celld never acknowledges it. The cell then fails every
+call until it restarts, so it cannot serve state that disagrees with its
+database. celld restarts it on its own, at the same epoch and without a
+restore: it cancels the cell's running work, waits for any write still
+awaiting its proof, then reopens the database. The next request runs on the
+restarted cell and succeeds once the fault is gone; writes acknowledged earlier
+are unchanged. A node-wide fault restarts a bounded number of cells at a time,
+and a cell is not restarted again within five seconds; its requests fail with
+the same error meanwhile.
 
 ### The ensemble needs two nodes
 

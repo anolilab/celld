@@ -141,6 +141,10 @@ pub struct Claim {
 /// not about to start answering.
 pub const MAX_ACQUIRE_RECONCILES: u32 = 3;
 
+/// A cell whose runtime was recycled for a latched SQL error is not recycled
+/// again for this long; its requests fail with the latch error meanwhile.
+const RECYCLE_BACKOFF_MS: u64 = 5_000;
+
 /// The two local upper bounds on reusing an observed remote lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RemoteLeaseDeadline {
@@ -484,6 +488,11 @@ struct Cell {
     swapping: bool,
     /// A forced swap already cancelled this cell's activity. It asks once.
     swap_cancelled: bool,
+    /// The swap is a recycle (`runtime_broken`): the instance is unusable, so
+    /// its activity is cancelled at once rather than waited out.
+    recycle: bool,
+    /// When this cell was last nominated for a recycle.
+    last_recycle_mono_ms: Option<u64>,
     /// The queue deadline now watching this cell, if it is parked. A timer
     /// carrying any other generation has been outlived and expires nothing.
     queued_generation: Option<u64>,
@@ -633,6 +642,8 @@ impl Default for Cell {
             generation: 0,
             swapping: false,
             swap_cancelled: false,
+            recycle: false,
+            last_recycle_mono_ms: None,
             queued_generation: None,
             eviction_refused_mono_ms: None,
             last_used_mono_ms: 0,
@@ -685,6 +696,9 @@ pub struct State {
     /// The set is bounded by `max_releases`, so an actor event can promote an
     /// idle reservation without walking the complete resident table.
     quiescing_cells: BTreeSet<CellId>,
+    /// Cells whose runtime reported an unusable instance and wait for the
+    /// pump to nominate them, within its room and the per-cell back-off.
+    recycle_pending: BTreeSet<CellId>,
     /// Cells whose owner-record release is in flight. This index makes both
     /// drain pacing and the 50 ms shell status poll independent of fleet size.
     releasing_cells: BTreeSet<CellId>,
@@ -878,6 +892,7 @@ impl State {
             draining: false,
             drain_handoff_ceiling: 0,
             quiescing_cells: BTreeSet::new(),
+            recycle_pending: BTreeSet::new(),
             releasing_cells: BTreeSet::new(),
             adopting_cells: BTreeSet::new(),
             current_generation: 0,
@@ -5120,6 +5135,7 @@ impl State {
                 // generation `runtime_started` recorded.
                 cell.swapping = false;
                 cell.swap_cancelled = false;
+                cell.recycle = false;
                 self.finish_requests(&id, &mut cell, Ok(Route::Local), effects);
             }
             Err(_) => {
@@ -5472,26 +5488,56 @@ impl State {
         self.swap_eager_classes = eager_classes.iter().cloned().collect();
     }
 
-    /// Nominate a resident cell for a same-epoch restart because its runtime
-    /// latched a SQL critical error. The nomination is the swap's own: the
-    /// cell quiesces, `pump_swap` stops the runtime at a safe point, and the
-    /// restart reopens the database, which clears the latch. Nothing the
-    /// cell acknowledged is touched: the destroyed transaction was never
-    /// committed, and the swap skips no durability proof the output gate owes.
+    /// A cell's runtime reports that SQL latched a critical error: a full
+    /// disk, an I/O or memory failure, or an interrupt discarded a
+    /// transaction, and every later call on this instance fails. The
+    /// destroyed transaction may or may not have reached the disk, but it was
+    /// never acknowledged, and the instance can hold state that disagrees
+    /// with the database.
+    ///
+    /// The report is queued; `pump_swap` nominates the cell for the swap's
+    /// own same-epoch restart, which reopens the database and clears the
+    /// latch. No restore happens and no durability proof is skipped.
     fn runtime_broken(&mut self, id: &str) {
-        let Some(cell) = self.cells.get_mut(id) else {
-            return;
-        };
-        if !matches!(cell.phase, Phase::Resident { .. })
-            || cell.swapping
-            || cell.quiescing
-            || cell.releasing.is_some()
-        {
-            return;
+        if self.cells.contains_key(id) {
+            self.recycle_pending.insert(id.to_string());
         }
-        cell.swapping = true;
-        cell.quiescing = true;
-        self.quiescing_cells.insert(id.to_string());
+    }
+
+    /// Nominate queued recycles, within the swap room and the per-cell
+    /// back-off. A report for a cell that is no longer resident, or already
+    /// leaving or swapping, is dropped: that stop closes the database and
+    /// clears the latch. Returns the room left.
+    fn nominate_recycles(&mut self, mut room: usize) -> usize {
+        let pending: Vec<CellId> = self.recycle_pending.iter().cloned().collect();
+        for id in pending {
+            let Some(cell) = self.cells.get_mut(&id) else {
+                self.recycle_pending.remove(&id);
+                continue;
+            };
+            if !matches!(cell.phase, Phase::Resident { .. })
+                || cell.swapping
+                || cell.quiescing
+                || cell.releasing.is_some()
+            {
+                self.recycle_pending.remove(&id);
+                continue;
+            }
+            let backing_off = cell
+                .last_recycle_mono_ms
+                .is_some_and(|last| self.now_mono_ms.saturating_sub(last) < RECYCLE_BACKOFF_MS);
+            if room == 0 || backing_off {
+                continue;
+            }
+            room -= 1;
+            cell.swapping = true;
+            cell.quiescing = true;
+            cell.recycle = true;
+            cell.last_recycle_mono_ms = Some(self.now_mono_ms);
+            self.quiescing_cells.insert(id.clone());
+            self.recycle_pending.remove(&id);
+        }
+        room
     }
 
     /// Whether this cell's class was named eager by the last announcement, so
@@ -5544,9 +5590,16 @@ impl State {
         if self.draining || self.fenced || !self.node_authoritative() {
             return;
         }
+        // Before the first announcement only a recycle moves a cell.
+        if self.current_generation == 0
+            && self.recycle_pending.is_empty()
+            && self.quiescing_cells.is_empty()
+        {
+            return;
+        }
         let current = self.current_generation;
         // Before any announcement every cell reads as stale and nothing ages,
-        // so only a cell nominated for another reason (`runtime_broken`) moves.
+        // so only a recycle moves a cell.
         let forced_by_age = current != 0
             && self
                 .now_mono_ms
@@ -5554,6 +5607,7 @@ impl State {
                 >= self.swap_max_age_ms;
         let in_flight = self.cells.values().filter(|cell| cell.swapping).count();
         let room = self.config.max_releases.saturating_sub(in_flight);
+        let room = self.nominate_recycles(room);
         let stale: Vec<CellId> = self
             .cells
             .iter()
@@ -5589,7 +5643,7 @@ impl State {
                     Some(AlarmState::Firing { op, .. }) => Some(op),
                     _ => None,
                 };
-                if !(forced_by_age || eager) || cell.swap_cancelled {
+                if !(forced_by_age || eager || cell.recycle) || cell.swap_cancelled {
                     continue;
                 }
                 let requests = self
@@ -7025,6 +7079,7 @@ fn event_mono_ms(event: &Event) -> Option<u64> {
         | Event::AlarmBegun { now_mono_ms, .. }
         | Event::AlarmFinished { now_mono_ms, .. }
         | Event::LoadSampled { now_mono_ms, .. }
+        | Event::RuntimeBroken { now_mono_ms, .. }
         | Event::GenerationChanged { now_mono_ms, .. } => Some(*now_mono_ms),
         _ => None,
     }
@@ -7204,7 +7259,7 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
             eager_classes,
             ..
         } => state.generation_changed(generation, max_age_ms, &eager_classes),
-        Event::RuntimeBroken { cell } => state.runtime_broken(&cell),
+        Event::RuntimeBroken { cell, .. } => state.runtime_broken(&cell),
         Event::Published { op, result } => state.published(op, result, &mut effects),
         Event::DurabilityChecked { op, result } => state.durability_checked(
             op,
@@ -7361,6 +7416,7 @@ fn set_phase(occupied: &mut usize, cell: &mut Cell, phase: Phase) {
     ) {
         cell.swapping = false;
         cell.swap_cancelled = false;
+        cell.recycle = false;
     }
     match (
         phase_occupies_capacity(&cell.phase),

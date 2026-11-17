@@ -198,15 +198,27 @@ fn a_regular_socket_event_still_runs_on_a_quiescing_cell() {
     )));
 }
 
+fn broken(shell: &mut Shell, cell: &str) -> Vec<Effect> {
+    let now_mono_ms = shell.now;
+    shell.send(Event::RuntimeBroken {
+        cell: cell.into(),
+        now_mono_ms,
+    })
+}
+
 #[test]
 fn a_cell_whose_sql_latched_restarts_at_the_same_epoch_once_idle() {
     let mut shell = Shell::new(config());
     let busy = shell.request("a");
-    shell.send(Event::RuntimeBroken { cell: "a".into() });
+    broken(&mut shell, "a");
     assert!(shell.state.swapping() > 0, "the cell was not nominated");
 
-    // The failing request is still running, so the cell waits for it and
-    // sends new requests to the restarted runtime.
+    // The failing request's activity is cancelled at once, and the runtime
+    // waits for it to end before it stops.
+    shell.expect("the activity cancelled", |effect| match effect {
+        Effect::CancelCellActivity { cell, .. } if cell == "a" => Some(()),
+        _ => None,
+    });
     assert!(
         shell
             .take(|effect| matches!(effect, Effect::StopRuntime { .. }).then_some(()))
@@ -227,4 +239,81 @@ fn a_cell_whose_sql_latched_restarts_at_the_same_epoch_once_idle() {
         Effect::StartRuntime { cell, epoch: 1, .. } if cell == "a" => Some(()),
         _ => None,
     });
+}
+
+#[test]
+fn a_broken_cell_holding_a_socket_is_forced_before_any_generation_exists() {
+    let mut shell = Shell::new(config());
+    let _request = shell.request("a");
+    shell.send(Event::WebSocketOpened {
+        cell: "a".into(),
+        websocket: 7,
+        kind: WebSocketKind::Regular,
+    });
+    assert_eq!(shell.state.current_generation(), 0);
+    broken(&mut shell, "a");
+    let cancelled = shell.expect("the activity cancelled", |effect| match effect {
+        Effect::CancelCellActivity {
+            cell, websockets, ..
+        } if cell == "a" => Some(websockets.clone()),
+        _ => None,
+    });
+    assert_eq!(cancelled, vec![7]);
+}
+
+#[test]
+fn a_broken_cell_never_stops_across_a_pending_proof() {
+    let mut shell = Shell::new(config());
+    let request = shell.request("a");
+    shell.send(Event::Output {
+        request,
+        channel: Channel::Response,
+        position: Some(7),
+        observed: None,
+        epoch: None,
+    });
+    broken(&mut shell, "a");
+    shell.finish(request);
+    assert!(
+        shell
+            .take(|effect| matches!(effect, Effect::StopRuntime { .. }).then_some(()))
+            .is_none(),
+        "the runtime stopped with a write unproven"
+    );
+}
+
+#[test]
+fn recycles_respect_the_swap_room_and_back_off() {
+    let mut shell = Shell::new(config());
+    let a = shell.request("a");
+    let b = shell.request("b");
+    shell.finish(a);
+    shell.finish(b);
+    broken(&mut shell, "a");
+    broken(&mut shell, "b");
+    assert_eq!(shell.state.swapping(), 1, "both cells swap at once");
+
+    // `a` restarts; its second report inside the window waits.
+    let stop = shell.expect("the first stop", |effect| match effect {
+        Effect::StopRuntime { op, cell, .. } if cell == "a" => Some(*op),
+        _ => None,
+    });
+    shell.send(Event::RuntimeStopped { op: stop });
+    shell.settle();
+    assert_eq!(shell.state.swapping(), 1, "b should take the room");
+    broken(&mut shell, "a");
+    shell.settle();
+    assert!(matches!(
+        shell.state.phase("a"),
+        Some(Phase::Resident { .. })
+    ));
+    assert!(
+        shell
+            .take(|effect| match effect {
+                Effect::StopRuntime { cell, .. } if cell == "a" => Some(()),
+                _ => None,
+            })
+            .is_none(),
+        "a restarted twice inside the back-off"
+    );
 }

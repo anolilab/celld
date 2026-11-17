@@ -72,6 +72,7 @@ pub(crate) use crate::engine_api::BARE_NODE_BUILTINS;
 pub use crate::engine_api::CELL_OVERLOAD_ERROR_MARKER;
 pub(crate) use crate::host_channels::outbound_ws_tx;
 pub use crate::host_channels::set_asset_call_tx;
+pub use crate::host_channels::set_broken_tx;
 pub use crate::host_channels::set_facet_tx;
 pub use crate::host_channels::set_gate_tx;
 pub use crate::host_channels::set_kv_blob_store;

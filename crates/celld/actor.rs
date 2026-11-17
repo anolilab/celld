@@ -505,6 +505,10 @@ pub enum Message {
     /// bounded by the drain deadline, so a wedged store still cannot hold
     /// the exit hostage.
     ReleaseAll,
+    /// SQL on `cell` latched a critical error: restart the cell.
+    RuntimeBroken {
+        cell: String,
+    },
     /// Give up to `cells` idle cells to the fleet. The balancing loop sends
     /// this after it has confirmed from the leases that this node is the
     /// densest and a peer has room.
@@ -2727,6 +2731,13 @@ impl Actor {
                 crate::claim_provenance::drain_started();
                 self.drive(Event::ReleaseAll, out);
             }
+            Message::RuntimeBroken { cell } => self.drive(
+                Event::RuntimeBroken {
+                    cell,
+                    now_mono_ms: crate::asyncrt::mono_ms(),
+                },
+                out,
+            ),
             Message::Rebalance { .. } if self.preserving => {}
             Message::Rebalance { cells } => self.drive(Event::Rebalance { cells }, out),
             Message::GenerationChanged {
@@ -2844,9 +2855,6 @@ impl Actor {
                 alarm,
                 alarm_covered,
             } => {
-                // A cell whose SQL latched a critical error is recycled once
-                // this activity is gone; one atomic load when none is.
-                let broken = crate::storage::cell_needs_recycle(&cell).then(|| cell.clone());
                 // Observe the alarm before releasing the activity. The core
                 // reports whether that observation cancels an eviction proof.
                 self.drive(
@@ -2860,10 +2868,6 @@ impl Actor {
                     out,
                 );
                 self.drive(Event::ActivityFinished { request }, out);
-                // After the activity ends, so the cell can reach its safe point.
-                if let Some(cell) = broken {
-                    self.drive(Event::RuntimeBroken { cell }, out);
-                }
             }
             Message::WebSocketOpened {
                 cell,

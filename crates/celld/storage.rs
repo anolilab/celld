@@ -15,7 +15,7 @@
 use anyhow::Context as _;
 use rusqlite::{Connection, OptionalExtension};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,6 +70,9 @@ pub struct Cells {
     sql_cursors: RefCell<HashMap<u64, SqlCursor>>,
     sql_statement_caches: RefCell<HashMap<String, SqlStatementCache>>,
     sql_critical_errors: RefCell<HashMap<String, String>>,
+    /// The root cell each open database belongs to. A facet's own scope names
+    /// no root, and the connection map is borrowed while a write latches.
+    roots: RefCell<HashMap<String, String>>,
     /// The schema cookie last read for a cell, and what it was read against.
     schema_cookies: RefCell<HashMap<String, SchemaCookie>>,
 }
@@ -271,49 +274,23 @@ fn sql_critical_errors<T>(f: impl FnOnce(&RefCell<HashMap<String, String>>) -> T
     cells(|c| f(&c.sql_critical_errors))
 }
 
-/// Cells whose SQL latched a critical error, by the root cell that must be
-/// recycled to clear it. Unlike the per-isolate map above, the actor thread
-/// can read this one, so it learns of the latch without entering an isolate.
-static BROKEN_CELLS: std::sync::Mutex<BTreeMap<String, String>> =
-    std::sync::Mutex::new(BTreeMap::new());
-static BROKEN_CELL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-fn broken_cells<T>(f: impl FnOnce(&mut BTreeMap<String, String>) -> T) -> T {
-    let mut broken = BROKEN_CELLS.lock().unwrap_or_else(|p| p.into_inner());
-    let result = f(&mut broken);
-    BROKEN_CELL_COUNT.store(broken.len(), std::sync::atomic::Ordering::Release);
-    result
-}
-
 /// Latch `error` for `scope`: every later call on the cell fails with it
-/// until the cell's storage is closed and opened again.
+/// until the cell's storage is closed and opened again. The first latch tells
+/// the actor, so it restarts the root cell (a facet shares its root's
+/// runtime) and the latch cannot outlive the instance that raised it.
 fn latch_sql_critical_error(scope: &str, error: String) {
-    sql_critical_errors(|errors| {
-        errors
-            .borrow_mut()
-            .entry(scope.to_string())
-            .or_insert(error);
+    let first = sql_critical_errors(|errors| {
+        let mut errors = errors.borrow_mut();
+        let first = !errors.contains_key(scope);
+        errors.entry(scope.to_string()).or_insert(error);
+        first
     });
-    // A facet's scope is `<root>/facets/<h>` (`engine_api::facet_cell`); this
-    // runs inside a write that holds the connection map, so read the root off
-    // the name instead of the map.
-    let root = scope.split_once("/facets/").map_or(scope, |(root, _)| root);
-    broken_cells(|broken| broken.insert(scope.to_string(), root.to_string()));
-}
-
-fn clear_sql_critical_error(scope: &str) {
-    sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
-    if BROKEN_CELL_COUNT.load(std::sync::atomic::Ordering::Acquire) > 0 {
-        broken_cells(|broken| broken.remove(scope));
+    if first {
+        // Not `dbs`: this can run inside a write that holds that map.
+        let root =
+            cells(|c| c.roots.borrow().get(scope).cloned()).unwrap_or_else(|| scope.to_string());
+        crate::host_channels::report_runtime_broken(root);
     }
-}
-
-/// Did SQL on `cell` (or one of its facets) latch a critical error that only
-/// a fresh instance of the cell clears? Readable from any thread; the check
-/// is one atomic load while no cell is broken.
-pub fn cell_needs_recycle(cell: &str) -> bool {
-    BROKEN_CELL_COUNT.load(std::sync::atomic::Ordering::Acquire) > 0
-        && broken_cells(|broken| broken.values().any(|root| root == cell))
 }
 
 /// The heap memory one cell can hold in cached SQL statements. The budget
@@ -865,7 +842,13 @@ fn finish_open(
     close_sync_list_cursors(scope);
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
-    clear_sql_critical_error(scope);
+    sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
+    let root = match &backing {
+        StorageBacking::File { root_scope, .. } | StorageBacking::Embedded { root_scope, .. } => {
+            root_scope.clone()
+        }
+    };
+    cells(|c| c.roots.borrow_mut().insert(scope.to_string(), root));
     dbs(|d| {
         d.borrow_mut().insert(
             scope.to_string(),
@@ -902,7 +885,8 @@ pub fn close(scope: &str) {
     close_sync_list_cursors(scope);
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
-    clear_sql_critical_error(scope);
+    sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
+    cells(|c| c.roots.borrow_mut().remove(scope));
     cells(|c| c.schema_cookies.borrow_mut().remove(scope));
     dbs(|d| d.borrow_mut().remove(scope));
     active_alarms(|alarms| alarms.borrow_mut().remove(scope));
@@ -4069,11 +4053,34 @@ pub fn bump_alarm_with_policy(scope: &str, now_ms: i64, counts_against_limit: bo
 mod recycle_tests {
     use super::*;
 
-    fn limit_pages(scope: &str, pages: Option<i64>) {
+    /// The reports the actor would receive, shared by every test of the
+    /// process (the channel is installed once). Tests use distinct scopes.
+    type Reports = (tokio::sync::mpsc::UnboundedReceiver<String>, Vec<String>);
+
+    fn reports() -> &'static std::sync::Mutex<Reports> {
+        static REPORTS: std::sync::OnceLock<std::sync::Mutex<Reports>> = std::sync::OnceLock::new();
+        REPORTS.get_or_init(|| {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            crate::host_channels::set_broken_tx(tx);
+            std::sync::Mutex::new((rx, Vec::new()))
+        })
+    }
+
+    /// Take the reports that named `cell`, keeping other tests' reports.
+    fn reported(cell: &str) -> usize {
+        let mut guard = reports().lock().unwrap();
+        let (rx, held) = &mut *guard;
+        while let Ok(reported) = rx.try_recv() {
+            held.push(reported);
+        }
+        let before = held.len();
+        held.retain(|reported| reported != cell);
+        before - held.len()
+    }
+
+    fn limit_pages(scope: &str, pages: i64) {
         with_mut(scope, |c| {
-            without_sql_authorizer(c, |c| {
-                c.pragma_update(None, "max_page_count", pages.unwrap_or(0x3fff_ffff))
-            })
+            without_sql_authorizer(c, |c| c.pragma_update(None, "max_page_count", pages))
         })
         .expect("db open")
         .expect("set limit");
@@ -4089,48 +4096,48 @@ mod recycle_tests {
         .expect("page count")
     }
 
-    /// A transaction destroyed by a full disk latches the cell and marks it
-    /// for recycling; reopening the database (what the recycle does) clears
-    /// the latch, and nothing committed before the failure is lost.
-    #[test]
-    fn a_full_disk_latches_until_the_cell_reopens() {
-        let cells = Cells::default();
-        let _installed = cells.install();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir
-            .path()
-            .join("cell.sqlite")
-            .to_string_lossy()
-            .into_owned();
-        let scope = "full-cell";
-        open(scope, &path).unwrap();
-        put_serialized(scope, "kept", b"acknowledged").unwrap();
-        assert!(!cell_needs_recycle(scope));
-
-        // Room for the committed data and a little more, then none.
-        limit_pages(scope, Some(page_count(scope) + 2));
+    /// Open a transaction on a database with no room left, and write until
+    /// SQLite reports a full disk and discards it.
+    fn fill_until_full(scope: &str) {
+        limit_pages(scope, page_count(scope) + 2);
         transaction_control(scope, "start", false, "").unwrap();
         let big = vec![7u8; 64 * 1024];
-        let mut failure = None;
-        for i in 0..64 {
-            if let Err(error) = put_serialized(scope, &format!("lost-{i}"), &big) {
-                failure = Some(error);
-                break;
-            }
-        }
-        let failure = failure.expect("the limit never produced a full error");
+        let failure = (0..64)
+            .find_map(|i| put_serialized(scope, &format!("lost-{i}"), &big).err())
+            .expect("the limit never produced a full error");
         assert!(failure.to_string().contains("full"), "{failure:#}");
         assert!(
             sql_critical_error(scope).is_some(),
             "the cell did not latch"
         );
-        assert!(cell_needs_recycle(scope));
-        assert!(put_serialized(scope, "late", b"x").is_err());
+    }
 
-        // The recycle closes the storage and opens it again at the same file,
-        // after space returned.
+    fn open_in(dir: &tempfile::TempDir, name: &str, scope: &str) -> String {
+        let path = dir.path().join(name).to_string_lossy().into_owned();
+        open(scope, &path).unwrap();
+        path
+    }
+
+    /// A transaction destroyed by a full disk latches the cell and tells the
+    /// actor once; reopening the database (what the restart does) clears the
+    /// latch, and nothing committed before the failure is lost.
+    #[test]
+    fn a_full_disk_latches_and_reports_until_the_cell_reopens() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let _ = reports();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "full-cell";
+        let path = open_in(&dir, "cell.sqlite", scope);
+        put_serialized(scope, "kept", b"acknowledged").unwrap();
+        assert_eq!(reported(scope), 0);
+
+        fill_until_full(scope);
+        assert_eq!(reported(scope), 1, "the actor was not told exactly once");
+        assert!(put_serialized(scope, "late", b"x").is_err());
+        assert_eq!(reported(scope), 0, "a second failure told the actor again");
+
         close(scope);
-        assert!(!cell_needs_recycle(scope));
         open(scope, &path).unwrap();
         assert!(sql_critical_error(scope).is_none());
         put_serialized(scope, "after", b"fresh").unwrap();
@@ -4138,5 +4145,34 @@ mod recycle_tests {
         assert!(get_stored(scope, "kept").unwrap().is_some());
         assert!(get_stored(scope, "after").unwrap().is_some());
         close(scope);
+    }
+
+    /// A facet's scope is `<class>:<hex>` and names no root, so the report
+    /// must carry the root cell the facet runs in.
+    #[test]
+    fn a_facet_latch_reports_its_root_cell() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let _ = reports();
+        let dir = tempfile::tempdir().unwrap();
+        let root = "facet-root-cell";
+        let root_path = open_in(&dir, "root.sqlite", root);
+        let parent = StorageIdentity {
+            root_path,
+            root_scope: root.to_string(),
+            facet_path: Vec::new(),
+            epoch: 1,
+            root_position: 0,
+            root_observed: None,
+        };
+        let facet = "Child:00ff00ff";
+        let facet_path = dir.path().join("facet.sqlite");
+        open_embedded(facet, &parent, "child", &facet_path, false).unwrap();
+
+        fill_until_full(facet);
+        assert_eq!(reported(facet), 0, "the report named the facet");
+        assert_eq!(reported(root), 1, "the root cell was not reported once");
+        close(facet);
+        close(root);
     }
 }
