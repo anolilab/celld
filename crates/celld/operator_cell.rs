@@ -261,6 +261,7 @@ impl Reachable {
                     continue;
                 }
                 Err(error) if error.is_connect() && self.unreachable.is_some() => {
+                    refused.push(format!("{url}: {error}"));
                     bail!(
                         "{}{}",
                         self.unreachable.as_deref().unwrap_or_default(),
@@ -454,6 +455,10 @@ mod unreachable_tests {
         assert!(
             error.to_string().starts_with("start `celld dev` first"),
             "{error}"
+        );
+        assert!(
+            error.to_string().contains(&format!("127.0.0.1:{port}")),
+            "the refused address is named: {error}"
         );
     }
 }

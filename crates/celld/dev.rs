@@ -201,21 +201,21 @@ impl DevState {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-                if self.shared_root.is_some() {
-                    // SAFETY: `geteuid` takes no arguments and cannot fail.
-                    anyhow::ensure!(
-                        metadata.uid() == unsafe { libc::geteuid() },
-                        "refusing to {action} {}: {} is owned by another user",
-                        self.path.display(),
-                        level.display()
-                    );
-                }
+                // The owner of what the level points to, so a project that
+                // links `.celld` to a directory it owns is fine and one that
+                // links it to another user's directory is refused.
+                let resolved = std::fs::metadata(&level)
+                    .with_context(|| format!("inspect {}", level.display()))?;
+                // SAFETY: `geteuid` takes no arguments and cannot fail.
+                anyhow::ensure!(
+                    resolved.uid() == unsafe { libc::geteuid() },
+                    "refusing to {action} {}: {} is owned by another user",
+                    self.path.display(),
+                    level.display()
+                );
                 // The mode of what the level points to, so a project that
                 // links `.celld` elsewhere is judged by that directory.
-                let mode = std::fs::metadata(&level)
-                    .with_context(|| format!("inspect {}", level.display()))?
-                    .permissions()
-                    .mode();
+                let mode = resolved.permissions().mode();
                 anyhow::ensure!(
                     mode & 0o022 == 0,
                     "refusing to {action} {}: {} can be written to by other users; \
@@ -1333,6 +1333,33 @@ mod tests {
                 std::fs::set_permissions(level, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // Host paths in a temporary directory.
+    fn a_project_local_state_that_another_user_owns_is_refused() {
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(directory.path()).unwrap();
+        // `/usr` is owned by root and not writable by others, so only the
+        // owner check can refuse it.
+        std::os::unix::fs::symlink("/usr", project.join(".celld")).unwrap();
+        let state = DevState::resolve(&project, None, None).unwrap();
+        let error = state.ensure_not_redirected("use").unwrap_err().to_string();
+        assert!(error.contains("owned by another user"), "{error}");
+
+        // A link to a directory the user owns is still fine.
+        std::fs::remove_file(project.join(".celld")).unwrap();
+        let own = project.join("own");
+        std::fs::create_dir(&own).unwrap();
+        std::fs::set_permissions(&own, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        std::os::unix::fs::symlink(&own, project.join(".celld")).unwrap();
+        state.ensure_not_redirected("use").unwrap();
     }
 
     #[test]
