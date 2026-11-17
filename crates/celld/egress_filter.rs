@@ -33,8 +33,10 @@
 //! No exception opens a listener of this node: an address of the node (what its
 //! listeners bind, what it advertises, what an operator pinned, and loopback)
 //! on a port celld listens on or advertises is always refused. Another port of
-//! those addresses follows the exceptions. When the port is not known, as for
-//! the name lookup of `fetch()`, any address of the node counts as a listener;
+//! those addresses follows the exceptions, and so does the advertised hostname
+//! on those ports. When the port is not known, as for the name lookup of
+//! `fetch()`, any address of the node counts as a listener, unless
+//! [`Filter::check_url`] resolved the name with its port;
 //! name the destination as an IP literal, or with a `host:port` entry, to reach
 //! a service of the host on another port.
 //!
@@ -51,7 +53,8 @@ use crate::startup::Advertise;
 use anyhow::{anyhow, bail, Context};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub const MODE_ENV: &str = "CELLD_EGRESS";
 pub const ALLOW_ENV: &str = "CELLD_EGRESS_ALLOW";
@@ -296,6 +299,14 @@ impl Refused {
         ))
     }
 
+    /// The name this node advertises, on a port it listens on.
+    fn own_name(host: &str) -> Self {
+        Self(format!(
+            "egress refused: {host} is {} ({MODE_ENV}=public)",
+            Class::Own.describe()
+        ))
+    }
+
     /// A node address refused with the port unknown: say how to name the port.
     fn own_port_unknown(ip: IpAddr) -> Self {
         Self(format!(
@@ -342,7 +353,23 @@ pub struct Filter {
     container_endpoint: fn(SocketAddr) -> bool,
     /// How an address relates to this node.
     node_endpoint: fn(SocketAddr) -> NodeEndpoint,
+    /// Whether a hostname on a port is the name this node advertises.
+    node_name: fn(&str, u16) -> bool,
+    /// Addresses a name resolved to when its URL was checked with its port,
+    /// which the port-less resolver of `fetch()` may then keep.
+    approved: Arc<Mutex<Vec<Approval>>>,
 }
+
+/// An address that [`Filter::check_url`] found permitted for a name on the
+/// port of its request.
+struct Approval {
+    name: String,
+    ip: IpAddr,
+    at: Instant,
+}
+
+/// How long the resolver of `fetch()` may use what a URL check approved.
+const APPROVAL_TTL: Duration = Duration::from_secs(10);
 
 impl std::fmt::Debug for Filter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -362,6 +389,10 @@ fn not_the_node(_: SocketAddr) -> NodeEndpoint {
     NodeEndpoint::Elsewhere
 }
 
+fn not_a_node_name(_: &str, _: u16) -> bool {
+    false
+}
+
 impl Filter {
     /// A public-only policy with no exceptions, no container endpoints and no
     /// node addresses.
@@ -372,6 +403,8 @@ impl Filter {
             literals: Vec::new(),
             container_endpoint: no_container,
             node_endpoint: not_the_node,
+            node_name: not_a_node_name,
+            approved: Arc::default(),
         }
     }
 
@@ -421,6 +454,13 @@ impl Filter {
         self
     }
 
+    /// Refuse the name the node advertises on a port it listens on.
+    #[must_use]
+    pub fn with_node_name(mut self, check: fn(&str, u16) -> bool) -> Self {
+        self.node_name = check;
+        self
+    }
+
     /// Whether `addr` may be dialed, by address alone.
     fn permits(&self, addr: SocketAddr) -> Result<(), Refused> {
         self.permits_on(addr, addr.port())
@@ -452,7 +492,10 @@ impl Filter {
         if class == Class::Public
             || self.ranges.iter().any(|range| range.contains(ip))
             || self.literals.contains(&SocketAddr::new(ip, addr.port()))
-            || (self.container_endpoint)(SocketAddr::new(ip, addr.port()))
+            || (self.container_endpoint)(SocketAddr::new(
+                ip,
+                if port == 0 { addr.port() } else { port },
+            ))
         {
             return if listener {
                 Err(Refused::own_port_unknown(addr.ip()))
@@ -484,6 +527,11 @@ impl Filter {
         if let Ok(ip) = bare.parse::<IpAddr>() {
             return self.permits(SocketAddr::new(ip, port));
         }
+        // The advertised name is the node, whatever it resolves to now: its
+        // lookup at startup may have failed or may answer differently later.
+        if (self.node_name)(&bare.trim_end_matches('.').to_ascii_lowercase(), port) {
+            return Err(Refused::own_name(bare));
+        }
         match self.name_ports(bare) {
             Some(ports) if !ports.contains(&port) => Err(Refused(format!(
                 "egress refused: {bare} is only allowed on port {} ({ALLOW_ENV})",
@@ -498,6 +546,11 @@ impl Filter {
     }
 
     /// Check a URL's destination: the first request, and each redirect hop.
+    ///
+    /// The resolver of `fetch()` does not know the port, so a hostname is also
+    /// resolved here when the port decides the outcome: a port the node listens
+    /// on, a port a container publishes, or a name this check approved a moment
+    /// ago. That lookup blocks, and the others are cheap.
     pub fn check_url(&self, url: &url::Url) -> Result<(), Refused> {
         let Some(host) = url.host_str() else {
             return Ok(());
@@ -505,7 +558,52 @@ impl Filter {
         let Some(port) = url.port_or_known_default() else {
             return Ok(());
         };
-        self.check_host(host, port)
+        self.check_host(host, port)?;
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        if bare.parse::<IpAddr>().is_ok() || !self.port_decides(bare, port) {
+            return Ok(());
+        }
+        let resolved = std::net::ToSocketAddrs::to_socket_addrs(&(bare, port))
+            .map_err(|error| Refused(format!("egress: could not resolve {bare}: {error}")))?;
+        let kept = self.filter_resolved(bare, port, resolved.collect())?;
+        self.approve(bare, &kept);
+        Ok(())
+    }
+
+    /// Whether a name on `port` needs the exact-port decision of
+    /// [`Self::filter_resolved`] on top of the port-less one.
+    fn port_decides(&self, name: &str, port: u16) -> bool {
+        (self.node_endpoint)(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))
+            == NodeEndpoint::Listener
+            || (self.container_endpoint)(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port))
+            || self.approved.lock().unwrap().iter().any(|approval| {
+                approval.at.elapsed() < APPROVAL_TTL && approval.name == name_key(name)
+            })
+    }
+
+    // Egress is node infrastructure, outside the execution boundary.
+    #[allow(clippy::disallowed_methods)]
+    fn approve(&self, name: &str, kept: &[SocketAddr]) {
+        let name = name_key(name);
+        let mut approved = self.approved.lock().unwrap();
+        approved.retain(|approval| {
+            approval.at.elapsed() < APPROVAL_TTL
+                && !(approval.name == name && kept.iter().any(|a| canonical(a.ip()) == approval.ip))
+        });
+        approved.extend(kept.iter().map(|addr| Approval {
+            name: name.clone(),
+            ip: canonical(addr.ip()),
+            at: Instant::now(),
+        }));
+    }
+
+    fn is_approved(&self, name: &str, ip: IpAddr) -> bool {
+        let ip = canonical(ip);
+        self.approved.lock().unwrap().iter().any(|approval| {
+            approval.at.elapsed() < APPROVAL_TTL
+                && approval.name == name_key(name)
+                && approval.ip == ip
+        })
     }
 
     /// Resolve `host` and return only the addresses a Worker may dial, in
@@ -533,12 +631,14 @@ impl Filter {
         let mut first_refusal = None;
         if let Some(ports) = self.name_ports(name) {
             // A hostname with an exception keeps every address, except one
-            // that is a listener of the node on a port it may be dialed on.
+            // that is a listener of the node on the port it is dialed on. With
+            // the port unknown, only an address that is a listener on every
+            // allowed port goes; `check_url` decides the port of the request.
             let dialed: Vec<u16> = if port == 0 { ports.clone() } else { vec![port] };
             let kept: Vec<SocketAddr> = resolved
                 .into_iter()
                 .filter(|addr| {
-                    let listener = dialed.iter().any(|port| {
+                    let listener = dialed.iter().all(|port| {
                         let at = SocketAddr::new(canonical(addr.ip()), *port);
                         (self.node_endpoint)(at) == NodeEndpoint::Listener
                     });
@@ -557,11 +657,14 @@ impl Filter {
                     SocketAddr::new(addr.ip(), if addr.port() == 0 { port } else { addr.port() });
                 // A `host:port` exception for an IP applies to a request that
                 // names the IP, never to a name that resolves to it, so a name
-                // needs a range. The listener check differs: `connect()` knows
-                // its port, while `fetch()` resolves without one and treats
-                // every address of the node as a listener.
+                // needs a range. The port decides a listener and a published
+                // container port: `connect()` knows it, while `fetch()`
+                // resolves without one and treats every address of the node as
+                // a listener, keeping only what `check_url` approved for the
+                // port of its request.
                 match self.permits_on(SocketAddr::new(addr.ip(), 0), port) {
                     Ok(()) => Some(dialed),
+                    Err(_) if port == 0 && self.is_approved(name, addr.ip()) => Some(dialed),
                     Err(refusal) => {
                         first_refusal.get_or_insert(refusal);
                         None
@@ -586,6 +689,10 @@ impl Filter {
         }
         Ok(kept)
     }
+}
+
+fn name_key(name: &str) -> String {
+    name.trim_end_matches('.').to_ascii_lowercase()
 }
 
 fn validate_hostname(host: &str) -> anyhow::Result<()> {
@@ -682,7 +789,8 @@ fn from_settings(mode: Option<&str>, allow: Option<&str>) -> anyhow::Result<Opti
         None | Some("public") => {
             let filter = Filter::public()
                 .with_container_endpoints(crate::container::is_endpoint)
-                .with_node_endpoints(node_endpoint);
+                .with_node_endpoints(node_endpoint)
+                .with_node_name(node_name);
             match allow {
                 Some(text) => filter
                     .with_exceptions(text)
@@ -713,6 +821,8 @@ fn dev_mode_for(mode_set: bool, allow_set: bool) -> Option<&'static str> {
 struct NodeAddrs {
     addrs: Vec<IpAddr>,
     listener_ports: Vec<u16>,
+    /// The advertised hostname, lower-case without a trailing dot.
+    name: Option<String>,
 }
 
 /// How long startup waits for the advertised name to resolve.
@@ -760,7 +870,22 @@ impl NodeAddrs {
         Self {
             addrs,
             listener_ports,
+            name: None,
         }
+    }
+
+    /// Record the advertised hostname and its port, which stay known when the
+    /// name does not resolve.
+    fn with_name(mut self, host: &str, port: u16) -> Self {
+        self.name = Some(name_key(host));
+        if let Err(at) = self.listener_ports.binary_search(&port) {
+            self.listener_ports.insert(at, port);
+        }
+        self
+    }
+
+    fn is_listener_name(&self, host: &str, port: u16) -> bool {
+        self.name.as_deref() == Some(host) && self.listener_ports.contains(&port)
     }
 
     fn endpoint(&self, addr: SocketAddr) -> NodeEndpoint {
@@ -798,6 +923,13 @@ pub fn node_endpoint(addr: SocketAddr) -> NodeEndpoint {
     }
 }
 
+/// Whether `host` (lower-case, no trailing dot) is the name the node advertises
+/// and `port` is one of its listener ports.
+pub fn node_name(host: &str, port: u16) -> bool {
+    NODE.get()
+        .is_some_and(|node| node.is_listener_name(host, port))
+}
+
 /// Tell the policy which addresses are the node's own, once its listeners are
 /// bound: what they bind, what the node advertises and what an operator pinned
 /// in `CELLD_FENCE_NODE_ADDRS`. The addresses and the listener ports come from
@@ -807,7 +939,9 @@ pub fn node_endpoint(addr: SocketAddr) -> NodeEndpoint {
 ///
 /// A peer resolves an advertised name from its own network, so celld never
 /// does. The egress filter resolves it here, once, because a Worker on this
-/// node that dials the name connects to the node itself.
+/// node that dials the name connects to the node itself. The name is also kept
+/// and refused on the node's listener ports, so a lookup that failed here, or
+/// that answers differently later, does not open the node to its own name.
 pub async fn register_node_addresses(listeners: &[SocketAddr], advertise: &Advertise) {
     if active().is_none() {
         return;
@@ -821,7 +955,7 @@ pub async fn register_node_addresses(listeners: &[SocketAddr], advertise: &Adver
                 Err(_) => {
                     tracing::warn!(
                         host,
-                        "resolving the advertised name timed out, so a Worker is not stopped from dialing the address it names"
+                        "resolving the advertised name timed out, so a Worker is stopped from dialing the name but not the address it names"
                     );
                     Vec::new()
                 }
@@ -829,19 +963,22 @@ pub async fn register_node_addresses(listeners: &[SocketAddr], advertise: &Adver
                     tracing::warn!(
                         host,
                         %error,
-                        "could not resolve the advertised name, so a Worker is not stopped from dialing the address it names"
+                        "could not resolve the advertised name, so a Worker is stopped from dialing the name but not the address it names"
                     );
                     Vec::new()
                 }
             }
         }
     };
-    let node = NodeAddrs::new(
+    let mut node = NodeAddrs::new(
         listeners,
         advertised,
         crate::node_addrs::pinned_from_env(),
         crate::node_addrs::interfaces,
     );
+    if let Advertise::Name { host, port } = advertise {
+        node = node.with_name(host, *port);
+    }
     let _ = NODE.set(node);
 }
 
@@ -1026,6 +1163,157 @@ mod tests {
         assert!(filter
             .filter_resolved("db.internal", 5432, vec![sock("10.0.0.5:0")])
             .is_ok());
+    }
+
+    /// A node that advertises `node.example:9000` and whose lookup failed.
+    fn advertised(host: &str, port: u16) -> bool {
+        NodeAddrs::new(&[sock("0.0.0.0:8081")], Vec::new(), Vec::new(), Vec::new)
+            .with_name("Node.Example.", 9000)
+            .is_listener_name(host, port)
+    }
+
+    #[test]
+    fn the_advertised_name_is_refused_on_listener_ports_even_when_it_did_not_resolve() {
+        let filter = Filter::public().with_node_name(advertised);
+        for host in ["node.example", "NODE.example", "node.example."] {
+            for port in [8081, 9000] {
+                let refusal = filter.check_host(host, port).unwrap_err().to_string();
+                assert!(refusal.contains("own address"), "{host}:{port}: {refusal}");
+            }
+            // Another port of the name is an ordinary destination.
+            assert!(filter.check_host(host, 443).is_ok(), "{host}");
+        }
+        assert!(filter.check_host("other.example", 9000).is_ok());
+        // An exception for the name does not open its listener.
+        let allowed = filter
+            .with_exceptions("node.example:9000 node.example:443")
+            .unwrap();
+        assert!(allowed.check_host("node.example", 9000).is_err());
+        assert!(allowed.check_host("node.example", 443).is_ok());
+        let url = url::Url::parse("https://node.example:9000/").unwrap();
+        assert!(allowed.check_url(&url).is_err());
+    }
+
+    #[test]
+    fn a_host_with_a_listener_rule_and_another_rule_is_fetched_on_the_other_port() {
+        // 127.0.0.1 is the node's own; 8082 is a listener, 5432 is not.
+        let filter = on_node("db.internal:8082 db.internal:5432");
+        let own = vec![sock("127.0.0.1:0")];
+        // The fetch resolver has no port: it keeps what some allowed port may use.
+        assert_eq!(
+            filter
+                .filter_resolved("db.internal", 0, own.clone())
+                .unwrap(),
+            [sock("127.0.0.1:0")]
+        );
+        assert!(filter
+            .filter_resolved("db.internal", 5432, own.clone())
+            .is_ok());
+        assert!(filter.filter_resolved("db.internal", 8082, own).is_err());
+        // The URL check, which knows the port, resolves a name on a listener
+        // port and refuses it there only.
+        let filter = on_node("localhost:8082 localhost:5432");
+        let fetch = |port: u16| {
+            filter.check_url(&url::Url::parse(&format!("http://localhost:{port}/")).unwrap())
+        };
+        assert!(fetch(8082).is_err());
+        assert!(fetch(5432).is_ok());
+    }
+
+    fn published(addr: SocketAddr) -> bool {
+        addr == sock("127.0.0.1:49153")
+    }
+
+    #[test]
+    fn a_name_for_a_published_container_port_is_allowed_on_that_port_only() {
+        let filter = Filter::public().with_container_endpoints(published);
+        let loopback = vec![sock("127.0.0.1:0")];
+        // `connect()` and WebSockets know the port.
+        assert!(filter
+            .filter_resolved("app.test", 49153, loopback.clone())
+            .is_ok());
+        assert!(filter
+            .filter_resolved("app.test", 49154, loopback.clone())
+            .is_err());
+        // `fetch()`: the resolver refuses without the port, the URL check
+        // approves the name on the published port, and the resolver then keeps
+        // what the check approved.
+        assert!(filter
+            .filter_resolved("localhost", 0, loopback.clone())
+            .is_err());
+        let url = |port: u16| url::Url::parse(&format!("http://localhost:{port}/")).unwrap();
+        assert!(filter.check_url(&url(49153)).is_ok());
+        assert!(filter
+            .filter_resolved("localhost", 0, loopback.clone())
+            .is_ok());
+        // The approval is not a way to another port of the same name.
+        assert!(filter.check_url(&url(49154)).is_err());
+        assert!(filter.check_url(&url(80)).is_err());
+    }
+
+    static LISTENER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+    /// Loopback, with one listener port.
+    fn loopback_listener(addr: SocketAddr) -> NodeEndpoint {
+        if !addr.ip().is_loopback() && !addr.ip().is_unspecified() {
+            NodeEndpoint::Elsewhere
+        } else if addr.port() == LISTENER.load(std::sync::atomic::Ordering::SeqCst) {
+            NodeEndpoint::Listener
+        } else {
+            NodeEndpoint::Address
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_listener_port_is_refused_for_a_name_with_another_rule_too() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_port = listener.local_addr().unwrap().port();
+        LISTENER.store(listener_port, std::sync::atomic::Ordering::SeqCst);
+        let hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = hit.clone();
+        tokio::spawn(async move {
+            while listener.accept().await.is_ok() {
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let public = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = public.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = public.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    let reply = format!(
+                        "HTTP/1.1 302 Found\r\nlocation: http://localhost:{listener_port}/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        // `localhost` is allowed on the listener port and on another one.
+        let filter = Arc::new(
+            Filter::public()
+                .with_node_endpoints(loopback_listener)
+                .with_exceptions(&format!(
+                    "127.0.0.1:{port} localhost:{listener_port} localhost:5432"
+                ))
+                .unwrap(),
+        );
+        let client = guard(reqwest::Client::builder(), Some(&filter))
+            .redirect(redirect_policy(filter.clone(), default_redirect_limit))
+            .build()
+            .unwrap();
+        let error = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("egress refused"), "{error:?}");
+        assert!(
+            !hit.load(std::sync::atomic::Ordering::SeqCst),
+            "the redirect must not reach the listener"
+        );
     }
 
     #[test]
