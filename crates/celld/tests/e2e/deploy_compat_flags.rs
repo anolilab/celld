@@ -5,47 +5,53 @@ use tempfile::TempDir;
 use super::harness::{deploy, esbuild};
 
 #[test]
-fn an_unknown_flag_fails_the_deploy_unless_the_operator_allows_it() {
+fn an_unknown_flag_warns_unless_the_operator_asks_for_strict_flags() {
     let Some(esbuild) = esbuild() else {
         eprintln!("skipped: esbuild is not installed");
         return;
     };
     let dir = TempDir::new().unwrap();
 
-    let refused = deploy(
+    let warned = deploy(
         "compat-flags-ok",
         &dir.path().join("a"),
         &[],
         Some(&esbuild),
     );
-    assert!(!refused.success, "{}", refused.stderr);
+    assert!(warned.success, "{}", warned.stderr);
+    assert!(warned.stderr.contains("mystery_flag"), "{}", warned.stderr);
+    assert!(warned.stderr.contains("does not know"), "{}", warned.stderr);
     assert!(
-        refused.stderr.contains("mystery_flag"),
+        warned.stderr.contains("webgpu") && warned.stderr.contains("does not handle"),
         "{}",
-        refused.stderr
-    );
-    assert!(
-        refused.stderr.contains("--allow-unknown-compat-flags"),
-        "{}",
-        refused.stderr
+        warned.stderr
     );
 
-    let allowed = deploy(
+    let refused = deploy(
         "compat-flags-ok",
         &dir.path().join("b"),
-        &["--allow-unknown-compat-flags"],
+        &["--strict-compat-flags"],
         Some(&esbuild),
     );
-    assert!(allowed.success, "{}", allowed.stderr);
+    assert!(!refused.success, "{}", refused.stderr);
     assert!(
-        allowed.stderr.contains("mystery_flag"),
+        refused
+            .stderr
+            .contains("mystery_flag: not a flag celld knows"),
         "{}",
-        allowed.stderr
+        refused.stderr
+    );
+    assert!(
+        refused
+            .stderr
+            .contains("webgpu: celld does not handle this workerd flag yet"),
+        "{}",
+        refused.stderr
     );
 }
 
 #[test]
-fn an_unsupported_flag_fails_the_deploy_even_when_unknown_flags_are_allowed() {
+fn an_unsupported_flag_fails_the_deploy_without_strict_flags() {
     let Some(esbuild) = esbuild() else {
         eprintln!("skipped: esbuild is not installed");
         return;
@@ -54,7 +60,7 @@ fn an_unsupported_flag_fails_the_deploy_even_when_unknown_flags_are_allowed() {
     let run = deploy(
         "compat-flags-bad",
         &dir.path().join("a"),
-        &["--allow-unknown-compat-flags"],
+        &[],
         Some(&esbuild),
     );
     assert!(!run.success, "{}", run.stderr);

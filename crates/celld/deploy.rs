@@ -187,7 +187,7 @@ pub struct Options {
     pub strict: bool,
     /// Accept a compatibility flag that celld does not know, with a warning.
     /// Without it an unknown flag fails the build, like an unsupported one.
-    pub allow_unknown_compat_flags: bool,
+    pub strict_compat_flags: bool,
     pub json: bool,
     /// Upload the version and validate it, but move no pointer and publish no
     /// queue consumer attachment. `celld activate` selects it later.
@@ -232,7 +232,7 @@ pub fn print_help() {
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --sourcemap PATH       Write the entry's source map to PATH, with its sources\n                         relative to the project. The deployed module does not\n                         change. With `no_bundle`, the map is the file the\n                         entry's own build wrote beside it, <entry>.map\n  --tag TAG              Label the deployment; a `version_metadata` binding\n                         reports it as `tag`. It does not change the version\n  --dry-run              Bundle and print the version without writing\n  --strict               Fail when the bundle imports a node: module celld does\n                         not implement; without it they are listed as a warning\n  --allow-unknown-compat-flags\n                         Warn about a compatibility flag celld does not know\n                         instead of failing; an unsupported flag still fails\n  --no-activate          Upload and validate the version but select nothing; the\n                         fleet keeps serving what it serves. `celld activate`\n                         selects the version later and `celld discard` removes it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
+OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --sourcemap PATH       Write the entry's source map to PATH, with its sources\n                         relative to the project. The deployed module does not\n                         change. With `no_bundle`, the map is the file the\n                         entry's own build wrote beside it, <entry>.map\n  --tag TAG              Label the deployment; a `version_metadata` binding\n                         reports it as `tag`. It does not change the version\n  --dry-run              Bundle and print the version without writing\n  --strict               Fail when the bundle imports a node: module celld does\n                         not implement; without it they are listed as a warning\n  --strict-compat-flags\n                         Fail on a compatibility flag celld does not know or\n                         does not handle yet, instead of warning\n  --no-activate          Upload and validate the version but select nothing; the\n                         fleet keeps serving what it serves. `celld activate`\n                         selects the version later and `celld discard` removes it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain, from Google\n\
 Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
 account key, managed identity, or workload identity for an az:// bucket.\n\n\
@@ -259,7 +259,7 @@ pub fn options_from_arguments(
         region: None,
         dry_run: false,
         strict: false,
-        allow_unknown_compat_flags: false,
+        strict_compat_flags: false,
         no_activate: false,
         local_images: false,
         json: false,
@@ -273,7 +273,7 @@ pub fn options_from_arguments(
             "--help" | "-h" => return Ok(None),
             "--dry-run" => options.dry_run = true,
             "--strict" => options.strict = true,
-            "--allow-unknown-compat-flags" => options.allow_unknown_compat_flags = true,
+            "--strict-compat-flags" => options.strict_compat_flags = true,
             "--no-activate" => options.no_activate = true,
             "--json" => options.json = true,
             "--config" => {
@@ -607,7 +607,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let mut project = read_project(&config_path, &root, &options.vars)?;
-    crate::compat_flags::check_metadata(&project.metadata, options.allow_unknown_compat_flags)?;
+    crate::compat_flags::check_metadata(&project.metadata, options.strict_compat_flags)?;
     // Resolve every image before the version is computed: the id is part of
     // the deployment's identity, so a rebuilt image is a new deployment.
     // A fleet deploy builds for the platform the nodes run, which Wrangler

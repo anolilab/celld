@@ -91,6 +91,7 @@ pub mod tls_roots;
 pub mod wake;
 pub mod wake_entry;
 pub mod wake_format;
+pub mod workerd_flags;
 pub mod ws_client;
 pub mod ws_registry;
 
@@ -219,8 +220,13 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
         ),
         sqlite_vec: has_flag("sqlite_vec"),
         websocket_standard_binary_type: has_flag("websocket_standard_binary_type"),
-        queue_json_messages: switch("queue_json_messages", "queue_v8_messages", "2024-03-18"),
-        populate_process_env: (has_flag("nodejs_compat") || has_flag("nodejs_compat_v2"))
+        queue_json_messages: switch(
+            "queues_json_messages",
+            "no_queues_json_messages",
+            "2024-03-18",
+        ),
+        populate_process_env: (switch("nodejs_compat", "no_nodejs_compat", "2026-08-04")
+            || has_flag("nodejs_compat_v2"))
             && switch(
                 "nodejs_compat_populate_process_env",
                 "nodejs_compat_do_not_populate_process_env",

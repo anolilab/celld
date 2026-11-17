@@ -244,9 +244,8 @@ A node verifies the SHA-256 digest of each module before it builds a
 deployment.
 
 `celld deploy` and `celld dev` fail when `compatibility_flags` holds a flag
-that celld does not support, or one it does not know, and name each.
-`--allow-unknown-compat-flags` accepts an unknown flag with a warning, never an
-unsupported one. The
+that celld does not support, and name each. A flag celld does not know or does
+not handle yet is a warning; `--strict-compat-flags` makes it an error. The
 [compatibility flags table](cloudflare-compat.md#compatibility-flags) gives the
 status of each known flag.
 

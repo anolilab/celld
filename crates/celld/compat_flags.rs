@@ -5,12 +5,16 @@
 //! costs anything at runtime, and `docs/cloudflare-compat.md` carries a copy
 //! of it that a unit test keeps in sync.
 //!
-//! A flag that is not in the table is refused like an unsupported one: a flag
-//! celld does not know cannot be shown to behave as the operator expects.
+//! A flag that is not in the table is a warning: celld runs without it. With
+//! `--strict-compat-flags` it is an error, because a flag celld does not handle
+//! cannot be shown to behave as the operator expects. An `Unsupported` flag is
+//! always an error. A name in `workerd_flags::UNCLASSIFIED` is a real workerd
+//! flag that celld has not classified yet; the warning says so.
 
 use anyhow::bail;
 
 use crate::note;
+use crate::workerd_flags;
 
 /// What celld does with one flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,13 +104,6 @@ pub static FLAGS: &[Flag] = &[
         None,
         "A stub keeps the `get()`, `put()` and `delete()` helpers; turns off `fetcher_no_get_put_delete`.",
     ),
-    // lib.rs `worker_compat` -> `Compat::sqlite_vec`.
-    row(
-        "sqlite_vec",
-        Honoured,
-        None,
-        "SQLite-backed Durable Objects get the sqlite-vec extension.",
-    ),
     // lib.rs `worker_compat` -> `Compat::websocket_standard_binary_type`.
     row(
         "websocket_standard_binary_type",
@@ -116,29 +113,35 @@ pub static FLAGS: &[Flag] = &[
     ),
     // lib.rs `worker_compat` -> `Compat::queue_json_messages`.
     row(
-        "queue_json_messages",
+        "queues_json_messages",
         Honoured,
         Some("2024-03-18"),
         "A queue message body defaults to JSON instead of V8 structured clone.",
     ),
     row(
-        "queue_v8_messages",
+        "no_queues_json_messages",
         Honoured,
         None,
-        "A queue message body defaults to V8 structured clone; turns off `queue_json_messages`.",
+        "A queue message body defaults to V8 structured clone; turns off `queues_json_messages`.",
     ),
     // lib.rs `worker_compat` -> `Compat::populate_process_env` (nodejs_compat gate).
     // The `node:` modules do not depend on the flag: celld provides them always.
     row(
         "nodejs_compat",
         Honoured,
-        None,
+        Some("2026-08-04"),
         "Lets `process.env` hold the Worker's vars. celld provides the `node:` modules without it.",
+    ),
+    row(
+        "no_nodejs_compat",
+        Honoured,
+        None,
+        "Turns off `nodejs_compat` for a date that implies it.",
     ),
     row(
         "nodejs_compat_v2",
         Honoured,
-        None,
+        Some("2026-08-04"),
         "The same as `nodejs_compat`.",
     ),
     row(
@@ -492,15 +495,13 @@ pub fn lookup(name: &str) -> Option<&'static Flag> {
 
 /// Refuse a config whose flags celld does not run as written.
 ///
-/// Every offending flag is listed in one error. With `allow_unknown`, a flag
-/// that is not in the table is reported as a warning instead; an `Unsupported`
+/// Every offending flag is listed in one error. A flag that is not in the table
+/// is reported as a warning; with `strict` it is an error. An `Unsupported`
 /// flag is always refused.
-pub fn check<'a>(
-    flags: impl IntoIterator<Item = &'a str>,
-    allow_unknown: bool,
-) -> anyhow::Result<()> {
+pub fn check<'a>(flags: impl IntoIterator<Item = &'a str>, strict: bool) -> anyhow::Result<()> {
     let mut problems = Vec::new();
     let mut unknown = Vec::new();
+    let mut unclassified = Vec::new();
     for name in flags {
         match lookup(name) {
             Some(Flag {
@@ -509,38 +510,49 @@ pub fn check<'a>(
                 ..
             }) => problems.push(format!("  {name}: not supported ({note})")),
             Some(_) => {}
+            None if workerd_flags::UNCLASSIFIED.binary_search(&name).is_ok() => {
+                unclassified.push(name);
+            }
             None => unknown.push(name),
         }
     }
-    if !allow_unknown {
+    if strict {
         problems.extend(
             unknown
                 .iter()
                 .map(|name| format!("  {name}: not a flag celld knows")),
         );
-    } else if !unknown.is_empty() {
-        note!(
-            "Warning: celld does not know these compatibility flags and runs without them: {}",
-            unknown.join(", ")
+        problems.extend(
+            unclassified
+                .iter()
+                .map(|name| format!("  {name}: celld does not handle this workerd flag yet")),
         );
+    } else {
+        if !unknown.is_empty() {
+            note!(
+                "Warning: celld does not know these compatibility flags and runs without them: {}",
+                unknown.join(", ")
+            );
+        }
+        if !unclassified.is_empty() {
+            note!(
+                "Warning: celld does not handle these workerd compatibility flags yet and runs without them: {}",
+                unclassified.join(", ")
+            );
+        }
     }
     if problems.is_empty() {
         return Ok(());
     }
-    let hint = if unknown.is_empty() || allow_unknown {
-        ""
-    } else {
-        "\npass --allow-unknown-compat-flags to deploy a flag celld does not know"
-    };
     bail!(
-        "`compatibility_flags` holds flags celld does not run:\n{}{hint}\n\
+        "`compatibility_flags` holds flags celld does not run:\n{}\n\
          see docs/cloudflare-compat.md for each flag's status",
         problems.join("\n")
     )
 }
 
 /// The `compatibility_flags` of a worker's metadata, checked by [`check`].
-pub fn check_metadata(metadata: &serde_json::Value, allow_unknown: bool) -> anyhow::Result<()> {
+pub fn check_metadata(metadata: &serde_json::Value, strict: bool) -> anyhow::Result<()> {
     let Some(flags) = metadata.get("compatibility_flags") else {
         return Ok(());
     };
@@ -554,7 +566,7 @@ pub fn check_metadata(metadata: &serde_json::Value, allow_unknown: bool) -> anyh
                 .ok_or_else(|| anyhow::anyhow!("compatibility flags must be strings"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    check(names, allow_unknown)
+    check(names, strict)
 }
 
 /// The markdown table that `docs/cloudflare-compat.md` carries between its
@@ -571,6 +583,10 @@ pub fn render_table() -> String {
             flag.note
         ));
     }
+    table.push_str(&format!(
+        "\n{} more workerd flags are not classified yet; each warns like an unknown flag.\n",
+        workerd_flags::UNCLASSIFIED.len()
+    ));
     table
 }
 
@@ -649,11 +665,11 @@ mod tests {
         assert!(compat(date, &["fetcher_has_get_put_delete"]).fetcher_get_put_delete);
         assert!(!compat("2020-01-01", &["fetcher_no_get_put_delete"]).fetcher_get_put_delete);
 
-        let date = since("queue_json_messages");
+        let date = since("queues_json_messages");
         assert!(compat(date, &[]).queue_json_messages);
         assert!(!compat(&day_before(date), &[]).queue_json_messages);
-        assert!(!compat(date, &["queue_v8_messages"]).queue_json_messages);
-        assert!(compat("2020-01-01", &["queue_json_messages"]).queue_json_messages);
+        assert!(!compat(date, &["no_queues_json_messages"]).queue_json_messages);
+        assert!(compat("2020-01-01", &["queues_json_messages"]).queue_json_messages);
 
         let date = since("nodejs_compat_populate_process_env");
         let node = ["nodejs_compat"];
@@ -678,14 +694,14 @@ mod tests {
 
     #[test]
     fn a_supported_known_flag_passes() {
-        check(["nodejs_compat", "global_navigator", "experimental"], false).unwrap();
-        check([], false).unwrap();
+        check(["nodejs_compat", "global_navigator", "experimental"], true).unwrap();
+        check([], true).unwrap();
     }
 
     #[test]
-    fn an_unsupported_flag_is_refused_by_name_even_when_unknown_flags_are_allowed() {
-        for allow in [false, true] {
-            let error = check(["nodejs_compat", "cache_option_enabled"], allow)
+    fn an_unsupported_flag_is_refused_by_name_with_or_without_strict() {
+        for strict in [false, true] {
+            let error = check(["nodejs_compat", "cache_option_enabled"], strict)
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -697,19 +713,64 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_flag_is_refused_unless_allowed() {
-        let error = check(["no_such_flag"], false).unwrap_err().to_string();
+    fn an_unknown_flag_warns_and_is_an_error_when_strict() {
+        check(["no_such_flag"], false).unwrap();
+        let error = check(["no_such_flag"], true).unwrap_err().to_string();
         assert!(
             error.contains("no_such_flag: not a flag celld knows"),
             "{error}"
         );
-        assert!(error.contains("--allow-unknown-compat-flags"), "{error}");
-        check(["no_such_flag"], true).unwrap();
+    }
+
+    #[test]
+    fn a_workerd_flag_celld_has_not_classified_says_so() {
+        check(["webgpu", "enable_nodejs_cluster_module"], false).unwrap();
+        let error = check(["webgpu", "no_such_flag"], true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("webgpu: celld does not handle this workerd flag yet"),
+            "{error}"
+        );
+        assert!(
+            error.contains("no_such_flag: not a flag celld knows"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_unclassified_names_are_sorted_and_not_in_the_table() {
+        let names = workerd_flags::UNCLASSIFIED;
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]), "unsorted");
+        for name in names {
+            assert!(lookup(name).is_none(), "{name} is classified");
+        }
+    }
+
+    #[test]
+    fn a_flag_with_no_workerd_counterpart_is_not_in_the_table() {
+        for name in ["queue_json_messages", "queue_v8_messages", "sqlite_vec"] {
+            assert!(lookup(name).is_none(), "{name}");
+        }
+    }
+
+    /// `nodejs_compat` is implied by the date workerd gives it, and
+    /// `no_nodejs_compat` opts out; `process.env` follows it.
+    #[test]
+    fn nodejs_compat_is_implied_by_its_date() {
+        let date = since("nodejs_compat");
+        assert_eq!(date, "2026-08-04");
+        assert!(compat(date, &[]).populate_process_env);
+        assert!(!compat(&day_before(date), &[]).populate_process_env);
+        assert!(!compat(date, &["no_nodejs_compat"]).populate_process_env);
+        assert!(compat("2026-08-03", &["nodejs_compat"]).populate_process_env);
+        assert!(compat("2026-08-03", &["nodejs_compat_v2"]).populate_process_env);
+        assert!(!compat(date, &["nodejs_compat_do_not_populate_process_env"]).populate_process_env);
     }
 
     #[test]
     fn every_offending_flag_is_listed_once() {
-        let error = check(["no_global_navigator", "mystery", "url_original"], false)
+        let error = check(["no_global_navigator", "mystery", "url_original"], true)
             .unwrap_err()
             .to_string();
         for name in ["no_global_navigator", "mystery", "url_original"] {
@@ -719,13 +780,13 @@ mod tests {
 
     #[test]
     fn metadata_without_flags_passes_and_malformed_flags_fail() {
-        check_metadata(&json!({}), false).unwrap();
-        check_metadata(&json!({"compatibility_flags": ["nodejs_compat"]}), false).unwrap();
-        assert!(check_metadata(&json!({"compatibility_flags": "nodejs_compat"}), false).is_err());
-        assert!(check_metadata(&json!({"compatibility_flags": [1]}), false).is_err());
+        check_metadata(&json!({}), true).unwrap();
+        check_metadata(&json!({"compatibility_flags": ["nodejs_compat"]}), true).unwrap();
+        assert!(check_metadata(&json!({"compatibility_flags": "nodejs_compat"}), true).is_err());
+        assert!(check_metadata(&json!({"compatibility_flags": [1]}), true).is_err());
         assert!(check_metadata(
             &json!({"compatibility_flags": ["cache_option_enabled"]}),
-            true
+            false
         )
         .is_err());
     }

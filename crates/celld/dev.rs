@@ -213,7 +213,7 @@ fn project_hash(project: &Path) -> String {
 struct StackOptions {
     listener: SocketAddr,
     logs: bool,
-    allow_unknown_compat_flags: bool,
+    strict_compat_flags: bool,
     watch: bool,
     watch_ignores: Vec<Pattern>,
 }
@@ -445,7 +445,7 @@ impl ShutdownSignals {
 pub fn print_help() -> anyhow::Result<()> {
     crate::cli_output::Output::new(crate::cli_output::Format::Text).help(
         &format!("celld dev — run an application with persistent local storage\n\n\
-USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--state-dir DIR] [--logs] [--allow-unknown-compat-flags] [--no-watch] [--clean]\n\n\
+USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--state-dir DIR] [--logs] [--strict-compat-flags] [--no-watch] [--clean]\n\n\
 PROJECT is a directory or a Wrangler config. It defaults to the current\n\
 directory. celld stores all local state in PROJECT/.celld/dev, and it keeps\n\
 that state across a restart. --state-dir DIR, or CELLD_DEV_STATE_DIR, keeps it\n\
@@ -456,7 +456,7 @@ A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
 as for wrangler dev. Without one, .env and then .env.local supply them, and\n\
 an entry of these files that cannot be a binding is skipped with a warning.\n\
 The entries override the vars of the config.\n\n\
-OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port, or 0 for a free one (default: {DEFAULT_PORT})\n  --state-dir DIR        Keep the local state in DIR/<project hash>/.celld/dev\n  --clean                Delete the local state before the server starts\n  --logs                 Show the node warning and information logs\n  --allow-unknown-compat-flags\n                         Warn about a compatibility flag celld does not know\n                         instead of failing\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
+OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port, or 0 for a free one (default: {DEFAULT_PORT})\n  --state-dir DIR        Keep the local state in DIR/<project hash>/.celld/dev\n  --clean                Delete the local state before the server starts\n  --logs                 Show the node warning and information logs\n  --strict-compat-flags\n                         Fail on a compatibility flag celld does not know or\n                         does not handle yet, instead of warning\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
 }
@@ -468,7 +468,7 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
     let mut port = DEFAULT_PORT;
     let mut clean = false;
     let mut logs = false;
-    let mut allow_unknown_compat_flags = false;
+    let mut strict_compat_flags = false;
     let mut watch = true;
     let mut watch_ignores = Vec::new();
     let mut arguments = arguments.into_iter();
@@ -477,7 +477,7 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
             "--help" | "-h" => return Ok(None),
             "--clean" => clean = true,
             "--logs" => logs = true,
-            "--allow-unknown-compat-flags" => allow_unknown_compat_flags = true,
+            "--strict-compat-flags" => strict_compat_flags = true,
             "--no-watch" => watch = false,
             "--watch-ignore" => {
                 let value = arguments
@@ -519,7 +519,7 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
         stack: StackOptions {
             listener: SocketAddr::new(host, port),
             logs,
-            allow_unknown_compat_flags,
+            strict_compat_flags,
             watch,
             watch_ignores,
         },
@@ -713,7 +713,7 @@ async fn deploy_project(
     config: &Path,
     store: &Store,
     logs: bool,
-    allow_unknown_compat_flags: bool,
+    strict_compat_flags: bool,
 ) -> anyhow::Result<()> {
     let bucket = open_local_bucket(&store.database)?;
     let built = deploy::build(&deploy::Options {
@@ -723,7 +723,7 @@ async fn deploy_project(
         region: None,
         dry_run: false,
         strict: false,
-        allow_unknown_compat_flags,
+        strict_compat_flags,
         no_activate: false,
         json: false,
         vars: read_dev_vars(config)?,
@@ -760,13 +760,7 @@ async fn run_stack(
         .transpose()?;
 
     console.progress("building the application");
-    deploy_project(
-        config,
-        store,
-        options.logs,
-        options.allow_unknown_compat_flags,
-    )
-    .await?;
+    deploy_project(config, store, options.logs, options.strict_compat_flags).await?;
     let mut running = start_node(
         state,
         options.listener,
@@ -795,13 +789,8 @@ async fn run_stack(
             }
             NodeEvent::Reload => {
                 console.progress("change detected; rebuilding the application");
-                if let Err(error) = deploy_project(
-                    config,
-                    store,
-                    options.logs,
-                    options.allow_unknown_compat_flags,
-                )
-                .await
+                if let Err(error) =
+                    deploy_project(config, store, options.logs, options.strict_compat_flags).await
                 {
                     console.failure(&format!("reload failed: {error:#}"));
                     continue;

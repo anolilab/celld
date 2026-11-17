@@ -302,11 +302,12 @@ below when they build, so a flag costs nothing at runtime.
 - **Unsupported**: celld does not implement the flag. The build fails and
   names it.
 
-A flag that is not in the table also fails the build, because celld cannot
-show that it behaves as the config expects. `--allow-unknown-compat-flags`
-(on `celld deploy` and `celld dev`) accepts such a flag with a warning; it
-never accepts an unsupported one. The static-assets navigation flags are in the
-table. A Dynamic Worker's `compatibilityFlags` are not checked.
+A flag that is not in the table is a warning: celld runs without it. A name
+that is a real workerd flag gets "celld does not handle this workerd flag yet",
+any other name "celld does not know". `--strict-compat-flags` (on `celld deploy`
+and `celld dev`) turns both into an error; an unsupported flag is always one.
+The static-assets navigation flags are in the table. A Dynamic Worker's
+`compatibilityFlags` are not checked.
 
 `Cloudflare.compatibilityFlags` reports a subset: the flags celld applies and
 that a Worker may test.
@@ -319,12 +320,12 @@ that a Worker may test.
 | `js_rpc` | **Honoured** |  | RPC on a Durable Object class that does not extend `DurableObject`. |
 | `fetcher_no_get_put_delete` | **Honoured** | 2024-03-26 | A stub has no `get()`, `put()` or `delete()` helper. |
 | `fetcher_has_get_put_delete` | **Honoured** |  | A stub keeps the `get()`, `put()` and `delete()` helpers; turns off `fetcher_no_get_put_delete`. |
-| `sqlite_vec` | **Honoured** |  | SQLite-backed Durable Objects get the sqlite-vec extension. |
 | `websocket_standard_binary_type` | **Honoured** |  | A WebSocket's `binaryType` defaults to `blob`. celld has no date default for it. |
-| `queue_json_messages` | **Honoured** | 2024-03-18 | A queue message body defaults to JSON instead of V8 structured clone. |
-| `queue_v8_messages` | **Honoured** |  | A queue message body defaults to V8 structured clone; turns off `queue_json_messages`. |
-| `nodejs_compat` | **Honoured** |  | Lets `process.env` hold the Worker's vars. celld provides the `node:` modules without it. |
-| `nodejs_compat_v2` | **Honoured** |  | The same as `nodejs_compat`. |
+| `queues_json_messages` | **Honoured** | 2024-03-18 | A queue message body defaults to JSON instead of V8 structured clone. |
+| `no_queues_json_messages` | **Honoured** |  | A queue message body defaults to V8 structured clone; turns off `queues_json_messages`. |
+| `nodejs_compat` | **Honoured** | 2026-08-04 | Lets `process.env` hold the Worker's vars. celld provides the `node:` modules without it. |
+| `no_nodejs_compat` | **Honoured** |  | Turns off `nodejs_compat` for a date that implies it. |
+| `nodejs_compat_v2` | **Honoured** | 2026-08-04 | The same as `nodejs_compat`. |
 | `nodejs_compat_populate_process_env` | **Honoured** | 2025-04-01 | With `nodejs_compat`, `process.env` holds the Worker's text vars and secrets. |
 | `nodejs_compat_do_not_populate_process_env` | **Honoured** |  | `process.env` stays empty; turns off `nodejs_compat_populate_process_env`. |
 | `assets_navigation_prefers_asset_serving` | **Honoured** | 2025-04-01 | A browser navigation request is served from the assets before the Worker runs. |
@@ -379,6 +380,8 @@ that a Worker may test.
 | `no_python_workers_20250116` | **Unsupported** |  | celld runs only Pyodide 0.28. |
 | `disable_python_external_sdk` | **Unsupported** |  | celld runs only the vendored Workers SDK. |
 | `disable_python_no_global_handlers` | **Unsupported** |  | celld runs only `Default` entrypoint classes. |
+
+286 more workerd flags are not classified yet; each warns like an unknown flag.
 <!-- compat-flags:end -->
 
 ## Wrangler configuration
