@@ -255,7 +255,8 @@ fn each_shell_mutant_breaks_an_invariant_its_control_keeps() {
 }
 
 /// The window of today's design that the model finds: a record lost while a
-/// first claim that read it as absent is still in flight.
+/// first claim that read it as absent is in flight, or before any row reached
+/// the bucket.
 #[test]
 fn a_stalled_first_claim_lands_over_a_lost_record() {
     let cfg = ModelConfig {

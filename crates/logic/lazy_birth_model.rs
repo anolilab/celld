@@ -452,11 +452,6 @@ fn fresh_proc(mode: Mode) -> Proc {
     }
 }
 
-fn cell_tag(world: &World, cfg: &LazyConfig) -> Tag {
-    let _ = world;
-    cfg.minter
-}
-
 impl Lazy {
     pub(crate) fn new(cfg: LazyConfig) -> Self {
         Self { cfg }
@@ -678,9 +673,6 @@ impl Lazy {
                 "a4_epoch1_foreign",
                 format!("writer {} wrote a record at epoch 1 of cell {c}", rec.by),
             );
-        }
-        if matches!(actor, Actor::S(_)) && rec.epoch == 1 {
-            // Counted by a10 already.
         }
         // A claim over a cell whose newest record is gone.
         let standard = matches!(purp, Purp::MStd(_) | Purp::TPlain) && guard == Guard::Absent;
@@ -2022,7 +2014,6 @@ impl Lazy {
         if !applied {
             if res.is_err() && !self.d().retry_with_new_nonce && t.tries < 1 {
                 // The body is sent again as it was.
-                t.tries += 0;
                 w.tk[ii].task = Some(t.clone());
                 let plan = t.plan.expect("plan");
                 self.taker_execute(w, i, t, plan, labels);
@@ -2696,8 +2687,6 @@ impl Model for Lazy {
             next_wr: 0,
             stall_now: false,
         };
-        let _ = cell_tag(&w, &self.cfg);
-        w.g.next_w = 0;
         w.g.ignore = self.cfg.ignore.clone();
         w
     }
@@ -3019,7 +3008,15 @@ impl Model for Lazy {
             Act::ClaimLater(c) => {
                 let k = self.active_k(&w, *c);
                 let ki = usize::from(k) - 1;
-                if let (Cs::Leaving { e, .. }, Some(rec)) = (w.ps[ki].cs[*c], w.s.own[*c].clone()) {
+                let own = w.s.own[*c].clone();
+                if let (Cs::Leaving { e, n, .. }, Some(rec)) = (w.ps[ki].cs[*c], own) {
+                    // The session's compare-and-swap rests on its own leave record.
+                    if rec.form != Form::Leave || rec.leave != n {
+                        return Step {
+                            world: w,
+                            labels: l,
+                        };
+                    }
                     let new = plain_rec(k, e + 1);
                     self.apply(
                         &mut w,

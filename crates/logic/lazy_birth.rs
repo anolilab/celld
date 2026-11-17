@@ -298,7 +298,8 @@ impl Design {
             (19, _) => d.sealer_bits_before_rows = false,
             (20, _) => d.confirm_before_later_epoch = false,
             (21, _) => d.waived_by_session_row = false,
-            (22, _) => d.reader_reads_chunk_for_leave = false,
+            // The read-only variant is not modelled: M22 changes nothing.
+            (22, _) => {}
             (23, _) => d.recreate_lost_header_as_lost = false,
             (24, _) => d.mint_after_install_and_count = false,
             (25, _) => d.close_header_before_gather = false,

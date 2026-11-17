@@ -50,7 +50,7 @@ pub(crate) trait Model {
     fn init(&self) -> Self::World;
     fn actions(&self, world: &Self::World) -> Vec<Self::Action>;
     fn apply(&self, world: &Self::World, action: &Self::Action) -> Step<Self::World>;
-    /// Invariants over a world, with the action that led to it.
+    /// Invariants over a world.
     fn check(&self, world: &Self::World) -> Vec<Violation>;
 }
 
@@ -85,6 +85,8 @@ pub(crate) struct Report {
     /// The bound that stopped the run, if any. `None` means every reachable
     /// world within the model's own bounds was visited.
     pub bound_hit: Option<Bound>,
+    /// The run stopped at its first violation, so worlds are left unvisited.
+    pub stopped_early: bool,
     /// The shortest trace of each invariant that failed.
     pub violations: BTreeMap<&'static str, Counterexample>,
     pub labels: BTreeMap<&'static str, usize>,
@@ -102,7 +104,7 @@ impl Report {
     }
 
     pub(crate) fn complete(&self) -> bool {
-        self.bound_hit.is_none()
+        self.bound_hit.is_none() && !self.stopped_early
     }
 
     /// One line a log can carry for a run.
@@ -113,6 +115,7 @@ impl Report {
             self.transitions,
             self.depth,
             match self.bound_hit {
+                None if self.stopped_early => "none (stopped at the first violation)".to_string(),
                 None => "none (exhaustive)".to_string(),
                 Some(bound) => format!("{bound:?}"),
             },
@@ -179,6 +182,7 @@ pub(crate) fn explore<M: Model>(model: &M, limits: Limits) -> Report {
         transitions: 0,
         depth: 0,
         bound_hit: None,
+        stopped_early: false,
         violations: BTreeMap::new(),
         labels: BTreeMap::new(),
         elapsed: Duration::ZERO,
@@ -209,6 +213,7 @@ pub(crate) fn explore<M: Model>(model: &M, limits: Limits) -> Report {
     let mut depth = 0;
     'levels: while !frontier.is_empty() {
         if !report.violations.is_empty() && limits.stop_at_first {
+            report.stopped_early = true;
             break;
         }
         if depth >= limits.max_depth {
@@ -233,6 +238,7 @@ pub(crate) fn explore<M: Model>(model: &M, limits: Limits) -> Report {
                 let violating = !violations.is_empty();
                 record(&mut report, &parents, next_fp, violations);
                 if violating && limits.stop_at_first {
+                    report.stopped_early = true;
                     break 'levels;
                 }
                 // A world that broke an invariant is not expanded: what

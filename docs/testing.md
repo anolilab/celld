@@ -122,11 +122,23 @@ mutants, each removing one rule, must each break an invariant that their
 control keeps, so a pass cannot come from a checker that cannot fail.
 
 The model finds one window in today's design, pinned as an expected
-counterexample: a first claim that read a record as absent can land after the
-record was created and lost. A longer configuration runs with
+counterexample: after a record is lost, a first claim lands over the cell if
+its claimer read the record as absent, either before the record existed or
+before any row reached the bucket. The shell refuses an absent record only
+when the bucket already holds rows. `lazy_birth_model.rs` explores a proposed change to how a cell is born: the
+node that minted an id grants the first epoch without writing an ownership
+record, and the grant is sealed into its session record. It is an abstract
+protocol model, because the decision core knows nothing of tagged ids, and its
+rules are pure functions of a `Design` value of knobs in `lazy_birth.rs`. Two
+earlier revisions of the design are knob sets, and each failure recorded
+against them is found as a counterexample and printed. Each mutant flips one
+knob and runs beside a control in the same configuration; the survivors and
+the reason for each are listed at the top of `lazy_birth_tests.rs`. The
+runtime does not contain this design.
+
+A longer configuration runs with
 `CELLD_EXPLORE=large cargo test -p celld-logic --lib explore_large -- --ignored
---nocapture`. What the model leaves out is listed at the top of
-`ownership_model.rs`.
+--nocapture`. What each model leaves out is listed at the top of its file.
 
 ## Simulation: the protocol under adversarial schedules
 

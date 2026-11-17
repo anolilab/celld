@@ -28,7 +28,7 @@
 //! | `stale_ack` | a write is acknowledged at an epoch below the record's |
 //! | `lost_ack` | a restore misses a write acknowledged at a lower epoch |
 //! | `new_over_data` | a first claim applies over rows its claimer could see |
-//! | `stalled_create_over_lost_record` | a first claim that read the record as absent lands after the record was created and lost (the one window of today's design the model finds) |
+//! | `stalled_create_over_lost_record` | a first claim lands over a cell whose record was created and then lost, because its claimer read the record as absent either before the record existed (a stalled claim) or after the loss while the bucket held no rows yet (the documented caveat). The one window of today's design the model finds |
 //! | `core_panic` | the decision core refused an event it was sent |
 //!
 //! # What the model leaves out
@@ -320,7 +320,6 @@ pub(crate) struct World {
 #[derive(Clone, Debug)]
 pub(crate) enum Action {
     Request(Node),
-    /// Answer the effect the node is waiting on.
     /// Prove a write durable by the fleet, by the bucket, or fail the proof.
     Prove(Node, OpId, Option<ProofSource>),
     /// Let a conditional write reach the store.
@@ -991,8 +990,10 @@ impl Ownership {
                                 format!("a first claim at epoch {epoch} was made over rows"),
                             ));
                         } else if Self::has_data(world) || !world.ghost.claimed.is_empty() {
-                            // The record was lost after this claim read it as
-                            // absent: the window of a stalled first claim.
+                            // A record existed and is gone, and the claimer saw
+                            // no rows: it read the record before it existed
+                            // (a stalled claim), or after a loss that left no
+                            // rows in the bucket (the documented caveat).
                             world.ghost.violations.push(Violation::new(
                                 STALLED_CREATE,
                                 format!(
@@ -1048,9 +1049,7 @@ impl Ownership {
             }
         };
         if wr.answered {
-            if wr.node < world.procs.len() {
-                world.writes.remove(index);
-            }
+            world.writes.remove(index);
             labels.push("late_landing");
         } else {
             world.writes[index].landed = Some(outcome);

@@ -13,8 +13,8 @@
 //!
 //! Mutants that this model does not kill, and why:
 //!
-//! - M3: needs a stale compare-and-swap that holds the token of a record whose
-//!   body a later record repeats. No actor repeats a body within the budgets.
+//! - M3: the nonce in a body matters only on a store whose token is a hash of
+//!   the body, and every scenario here uses a token that is new for every write.
 //! - M6, the sweep of a dead sealed session: it runs after the seal, when the
 //!   sealed chunk already holds every mark, so its missing guard changes nothing.
 //! - M7: the header of a predecessor left open stalls its readers (a liveness
@@ -652,6 +652,7 @@ const MUTANTS: &[(&str, &str, &[&str])] = &[
     ("M10", "r1", &["a7_taken_leave", "epoch_two_claims"]),
     ("M11", "r1", &["a7_taken_leave", "epoch_two_claims"]),
     ("M13", "r1", &["a10_sealer_wrote"]),
+    ("M14", "bits", &["a8_sealed_chunk_incomplete"]),
     ("M15", "r3", &["a5_claim_over_gap"]),
     ("M16", "r3_read", &["a5_claim_over_gap"]),
     ("M17", "r4a_chunk", &["a8_sealed_chunk_incomplete"]),
@@ -699,6 +700,7 @@ fn each_mutant_breaks_an_invariant_its_control_keeps() {
 #[test]
 fn the_carried_set_is_what_invariant_eleven_asks_for() {
     let r = run_design("M30f0 in q3", "q3", "M30f0", &[], false, CAP);
+    assert!(!r.violations.is_empty());
     assert!(r.violations.keys().all(|n| *n == "a11_resume"));
 }
 
@@ -736,10 +738,14 @@ fn finding_a_stalled_first_record_puts_two_writers_in_one_prefix() {
         found(
             "finding F-B on revision 3",
             &r,
-            &["a6_stalled_first_record", "a2_prefix_two_writers"]
+            &["a6_stalled_first_record"]
         ),
         "the stalled first record did not reach two writers"
     );
+    // Two writers in one prefix are also reached without the stalled write: a
+    // lost record before the first writer has an object in the bucket gives the
+    // same outcome, under the window of the standard path.
+    assert!(r.violations.contains_key("a2_prefix_two_writers"));
     // Today's rule, which puts the first record of every cell at epoch 1, gives the same
     // two acting writers in two prefixes.
     let today = run_design(
@@ -786,6 +792,12 @@ fn explore_large() {
             3_000_000,
         );
         r.print_violations();
+        // The window of the standard path is the one the model reports and
+        // does not fail; the findings have tests of their own.
+        assert!(
+            scn == "stalled_std" || r.passed_except(&["a6_standard_window"]),
+            "control {scn} fails"
+        );
     }
     let r = run_design(
         "R2 on revision 1",
@@ -795,11 +807,11 @@ fn explore_large() {
         false,
         3_000_000,
     );
-    found(
+    assert!(found(
         "R2 on revision 1",
         &r,
         &["a5_claim_over_gap", "epoch_two_claims"],
-    );
+    ));
     let r = run_design(
         "R4 on revision 1, two writers",
         "r4a",
@@ -808,11 +820,11 @@ fn explore_large() {
         false,
         3_000_000,
     );
-    found(
+    assert!(found(
         "R4 on revision 1, two writers",
         &r,
         &["a5_claim_over_gap", "epoch_two_claims"],
-    );
+    ));
     check_mutants(
         &[
             ("M2", "waived", &["a4_epoch1_foreign"]),
