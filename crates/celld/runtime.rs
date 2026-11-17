@@ -1135,6 +1135,10 @@ impl RuntimeManager {
                     // Keep it registered until the final capture proves the
                     // stopped database position present in the bucket.
                     runtime.swap_out_cell(&cell.id, cell.epoch).await?;
+                    // A clone in flight finishes before its facets close, and
+                    // its streams are listed after it.
+                    runtime.facets.stopping(&cell.id, cell.epoch);
+                    runtime.facets.settled(&cell.id).await;
                     for facet in runtime.facets.stopping(&cell.id, cell.epoch) {
                         replication.close_for_reload(&facet, cell.epoch).await?;
                         runtime.facets.stopped(&cell.id, cell.epoch, &facet);

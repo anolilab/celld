@@ -77,14 +77,28 @@ loopback class without properties supplies an empty object.
 - `ctx.facets.delete(name)` stops the facet and removes its database and the
   database of every facet below it.
 - `ctx.facets.clone(source, target)` stops `target`, removes its database and
-  the database of every facet below it, and copies the committed state of the
-  `source` database into a new one. The source keeps running, and a
-  transaction it has not committed is not copied. The call resolves when the
-  copy is durable on the stream of the target, and the next `get(target)`
-  starts from it. The source and the target must differ, and the facets below
-  the source are not copied. The copy reads and writes the whole database, so
-  its cost is proportional to the size of the source. It adds no request on the
-  root object's stream; the target's stream ships the copy as one write.
+  the database of every facet below it, and copies the database of `source`
+  into a new one. The copy is the committed state of the source at the moment
+  of the clone: the source keeps running, and a transaction it has not
+  committed is not copied. The call resolves when the copy is durable on the
+  stream of the target and everything the source had committed is durable on
+  its own stream, so the copy never holds a write that the source can still
+  lose. The next `get(target)` starts from the copy. The source and the target
+  must differ, and the facets below the source are not copied. The copy reads
+  and writes the whole database, so its cost is proportional to the size of
+  the source. It adds no request on the root object's stream; the target's
+  stream ships the copy as one write.
+- A clone refuses a source database above 16 MiB, because the copy is one
+  write that must reach the bucket within the durability wait. The refusal
+  leaves the target as it was, stopped, and the name usable.
+- A clone that fails part way leaves the database of `target` empty
+  and the name stays blocked until the root object restarts, as after
+  a failed `delete()`. Calling `clone()` or `delete()` on the target again
+  replaces the unknown state.
+- Writes to the source during a clone wait for the copy, which holds a read
+  transaction on the source while it reads at most 16 MiB; they do not fail.
+  A `delete()` or `clone()` of any facet of the root waits for a clone in
+  flight.
 
 No name reaches a facet from outside its root object, so external traffic
 must go through the supervisor. Use a separate Durable Object, addressed with
@@ -106,7 +120,8 @@ without its root object. A socket that the facet accepts or opens keeps the root
 cell resident until it closes. The client end of a `101` response from another
 Durable Object does not. `getWebSockets()` returns the sockets of that facet.
 
-`ctx.facets.abort()` and `ctx.facets.delete()` close the sockets of each stopped
+`ctx.facets.abort()`, `ctx.facets.delete()` and `ctx.facets.clone()` (for the
+target and the facets below it) close the sockets of each stopped
 facet with code `1001`, and the facet receives no close event. workerd drops the
 connection instead, so its client sees `1006`. A drain, an ownership move, or a
 generation swap closes a facet socket with `1012`, and an output gate failure
@@ -125,6 +140,7 @@ closes it with `1011`.
   socket closes.
 - A facet stub is not awaitable, and a pipelined property path is unavailable,
   so a call must name one method.
+- `ctx.facets.clone()` refuses a source database above 16 MiB.
 
 The [Cloudflare compatibility](../cloudflare-compat.md#services)
 page lists the runtime APIs and the unsupported services.

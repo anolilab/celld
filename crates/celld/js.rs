@@ -8316,6 +8316,31 @@ fn op_facet_abort(
     rv.set(promise_for(scope, async_id));
 }
 
+/// Without a host loop a facet is a file beside the root's database, named
+/// `<root file>.<facet>.sqlite`, and a facet below it appends `-facets-<hash>`
+/// to that name. Remove the database of the facet at `path` and of every facet
+/// below it.
+fn remove_facet_files(path: &std::path::Path) {
+    let (Some(directory), Some(own)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let own = own.to_string_lossy();
+    let below = format!("{}-facets-", own.strip_suffix(".sqlite").unwrap_or(&own));
+    let Ok(entries) = asyncrt::fs().read_dir(directory) else {
+        return;
+    };
+    for entry in entries {
+        let file = entry.file_name.to_string_lossy();
+        let database = file
+            .strip_suffix("-wal")
+            .or_else(|| file.strip_suffix("-shm"))
+            .unwrap_or(&file);
+        if database == own || (database.starts_with(&below) && database.ends_with(".sqlite")) {
+            let _ = asyncrt::fs().remove_file(&entry.path);
+        }
+    }
+}
+
 fn op_facet_delete(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -8338,11 +8363,7 @@ fn op_facet_delete(
     let async_id = asyncrt::enqueue(async move {
         let Some(sender) = FACET_TX.get() else {
             let path = open_facet_file(&parent, names.last().unwrap()).await?;
-            for suffix in ["", "-wal", "-shm"] {
-                let mut file = path.clone().into_os_string();
-                file.push(suffix);
-                let _ = asyncrt::fs().remove_file(std::path::Path::new(&file));
-            }
+            remove_facet_files(&path);
             return Ok(Vec::new());
         };
         let (reply, receive) = tokio::sync::oneshot::channel();
@@ -8362,6 +8383,17 @@ fn op_facet_delete(
         Ok(Vec::new())
     });
     rv.set(promise_for(scope, async_id));
+}
+
+/// The prefix of the error of a clone that was refused before it touched the
+/// target, which the harness tells from a clone that failed part way.
+const FACET_CLONE_REFUSED: &str = "facet clone refused";
+
+fn clone_error(error: anyhow::Error) -> String {
+    match error.downcast_ref::<crate::facet_streams::CloneRefused>() {
+        Some(refused) => format!("{FACET_CLONE_REFUSED}: {refused}"),
+        None => format!("clone facet storage: {error:#}"),
+    }
 }
 
 /// `__facet_clone(parentScope, source, target)` — replace the facet `target`
@@ -8394,18 +8426,22 @@ fn op_facet_clone(
     let (source, target) = (path(source), path(target));
     let async_id = asyncrt::enqueue(async move {
         let Some(sender) = FACET_TX.get() else {
+            // A source that was never opened has no file: its copy is empty.
             let from = open_facet_file(&parent, source.last().unwrap()).await?;
             let to = open_facet_file(&parent, target.last().unwrap()).await?;
-            for suffix in ["", "-wal", "-shm"] {
-                let mut file = to.clone().into_os_string();
-                file.push(suffix);
-                let _ = asyncrt::fs().remove_file(std::path::Path::new(&file));
+            let copy = asyncrt::fs().metadata(&from).is_ok();
+            if copy {
+                crate::facet_streams::ensure_clonable(&from).map_err(clone_error)?;
             }
-            crate::facet_streams::copy_database(from, to)
-                .await
-                .map_err(|error| format!("clone facet storage: {error:#}"))?;
+            remove_facet_files(&to);
+            if copy {
+                crate::facet_streams::copy_database(from, to)
+                    .await
+                    .map_err(clone_error)?;
+            }
             return Ok(Vec::new());
         };
+        let source_stream = crate::engine_api::facet_cell(&parent.root_scope, &source);
         let stream = crate::engine_api::facet_cell(&parent.root_scope, &target);
         let epoch = parent.epoch;
         let (reply, receive) = tokio::sync::oneshot::channel();
@@ -8422,10 +8458,15 @@ fn op_facet_clone(
         receive
             .await
             .map_err(|_| "the facet clone was dropped".to_string())?
-            .map_err(|error| format!("clone facet storage: {error:#}"))?;
-        prove_facet(stream, epoch)
-            .await
-            .map_err(|refusal| format!("clone facet storage: {refusal}"))?;
+            .map_err(clone_error)?;
+        // The copy holds whatever the source had committed, durable or not.
+        // Prove the source too, so a crash cannot leave the copy with a
+        // write that the source lost.
+        for stream in [source_stream, stream] {
+            prove_facet(stream, epoch)
+                .await
+                .map_err(|refusal| format!("clone facet storage: {refusal}"))?;
+        }
         Ok(Vec::new())
     });
     rv.set(promise_for(scope, async_id));
@@ -12339,5 +12380,40 @@ mod response_status_tests {
         assert_eq!(sendable_status(599), 599);
         assert_eq!(sendable_status(99), 500);
         assert_eq!(sendable_status(1000), 500);
+    }
+}
+
+#[cfg(test)]
+mod facet_file_tests {
+    use super::remove_facet_files;
+
+    /// Without a host loop a facet's database is a file beside the root's:
+    /// removing a facet takes the facets below it and leaves a sibling whose
+    /// name only starts the same.
+    #[test]
+    fn removing_a_facet_removes_the_facets_below_it() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let file = |name: &str| directory.path().join(format!("root.sqlite.{name}.sqlite"));
+        for name in ["facets-a", "facets-a-facets-b", "facets-a2", "facets-c"] {
+            std::fs::write(file(name), b"x").unwrap();
+            std::fs::write(format!("{}-wal", file(name).display()), b"x").unwrap();
+        }
+        remove_facet_files(&file("facets-a"));
+        let mut left: Vec<String> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "root.sqlite.facets-a2.sqlite",
+                "root.sqlite.facets-a2.sqlite-wal",
+                "root.sqlite.facets-c.sqlite",
+                "root.sqlite.facets-c.sqlite-wal",
+            ]
+        );
     }
 }

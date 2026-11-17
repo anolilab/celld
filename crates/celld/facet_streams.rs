@@ -37,6 +37,10 @@ struct FacetRoot {
     /// Serializes the root's first opens: two activations of one stream
     /// would unlink the file the first one's connection writes.
     opening: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes the root's deletes and clones, which replace a facet's
+    /// files. Two of them on one facet would each delete what the other
+    /// copied, and a stop waits for the one in flight before it snapshots.
+    replacing: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The facet streams of every resident root on this node.
@@ -54,6 +58,7 @@ impl FacetStreams {
                 streams: BTreeSet::new(),
                 stopping: false,
                 opening: Arc::default(),
+                replacing: Arc::default(),
             },
         );
     }
@@ -157,6 +162,39 @@ impl FacetStreams {
         epoch: u64,
         names: &[String],
     ) -> anyhow::Result<()> {
+        let replacing = self.replacing(root)?;
+        let _replacing = replacing.lock().await;
+        self.delete_locked(replication, local, root, epoch, names)
+            .await
+    }
+
+    /// Wait for the delete or clone in flight on a root, which a root that
+    /// began to stop (`stopping`) answers last: its copy writes a facet's
+    /// database, which the stop snapshots and evicts.
+    pub(crate) async fn settled(&self, root: &str) {
+        if let Ok(replacing) = self.replacing(root) {
+            drop(replacing.lock().await);
+        }
+    }
+
+    /// The root's replace lock, which every delete and clone holds.
+    fn replacing(&self, root: &str) -> anyhow::Result<Arc<tokio::sync::Mutex<()>>> {
+        self.0
+            .lock()
+            .expect("facet streams poisoned")
+            .get(root)
+            .map(|entry| entry.replacing.clone())
+            .ok_or_else(|| anyhow!("{root} is not resident"))
+    }
+
+    async fn delete_locked(
+        &self,
+        replication: Option<&Replication>,
+        local: impl Fn(&str) -> PathBuf,
+        root: &str,
+        epoch: u64,
+        names: &[String],
+    ) -> anyhow::Result<()> {
         let facet = crate::engine_api::facet_cell(root, names);
         let below = format!("{facet}/");
         let doomed: Vec<String> = {
@@ -204,7 +242,8 @@ impl FacetStreams {
     /// target's stream that the caller proves before it answers. The source
     /// keeps running: it is read through a second connection, and a
     /// transaction it has not committed is not copied. Facets below either
-    /// facet are not copied; the target's own are deleted with it.
+    /// facet are not copied; the target's own are deleted with it. A source
+    /// above `CLONE_MAX_BYTES` is refused before the target is touched.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn clone_facet(
         &self,
@@ -216,10 +255,19 @@ impl FacetStreams {
         source: &[String],
         target: &[String],
     ) -> anyhow::Result<()> {
+        let replacing = self.replacing(root)?;
+        let _replacing = replacing.lock().await;
         let from = self
             .open(replication, &db_path, root, epoch, source)
             .await?;
-        self.delete(replication, local, root, epoch, target).await?;
+        crate::asyncrt::blocking({
+            let from = from.clone();
+            move || ensure_clonable(&from)
+        })
+        .await
+        .map_err(|error| anyhow!("facet size check panicked: {error}"))??;
+        self.delete_locked(replication, local, root, epoch, target)
+            .await?;
         let to = self
             .open(replication, &db_path, root, epoch, target)
             .await?;
@@ -266,6 +314,8 @@ impl FacetStreams {
         FF: std::future::Future<Output = anyhow::Result<()>>,
     {
         self.stopping(root, epoch);
+        // None starts after `stopping`, since each opens its facets.
+        self.settled(root).await;
         if root_resident {
             if let Err(error) = stop_root().await {
                 self.resume(root, epoch);
@@ -340,27 +390,254 @@ impl FacetStreams {
     }
 }
 
+/// The largest source database a clone copies. The copy is one write
+/// transaction, so the replicator ships it as one segment, and the caller
+/// waits for the proof that the segment reached the bucket, which has a
+/// deadline of 10 s by default (`CELLD_LTX_DURABILITY_TIMEOUT_SECS`). A debug
+/// build proved 28 MiB in 9 s, so 16 MiB keeps a margin of two for a slow
+/// store. A segment is also capped at 64 MiB after base64 encoding
+/// (`node_log::STREAM_FRAME_CAP`), which this stays far below.
+pub(crate) const CLONE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// How many times a busy backup step is retried, 5 ms apart, before the
+/// clone fails: about ten seconds.
+const CLONE_BUSY_ATTEMPTS: u32 = 2_000;
+
+/// A source database that is too large to clone, as opposed to a clone that
+/// failed: the target is untouched.
+#[derive(Debug)]
+pub(crate) struct CloneRefused(pub String);
+
+impl std::fmt::Display for CloneRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CloneRefused {}
+
+pub(crate) fn ensure_clonable(path: &std::path::Path) -> anyhow::Result<()> {
+    let source =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("open facet database {}", path.display()))?;
+    ensure_clonable_size(&source)
+}
+
+fn ensure_clonable_size(source: &rusqlite::Connection) -> anyhow::Result<()> {
+    let pages: u64 = source.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let page_size: u64 = source.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let bytes = pages * page_size;
+    if bytes > CLONE_MAX_BYTES {
+        return Err(CloneRefused(format!(
+            "the facet database is {bytes} bytes, and a clone copies at most {CLONE_MAX_BYTES}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// Copy the committed pages of the database at `from` over the one at `to`,
 /// in one write transaction of `to`. A source with a writer of its own is
-/// read as of one moment: the copy is a single backup step.
+/// read as of one moment: the copy is a single backup step, so it holds a
+/// read transaction on the source for the time it takes to read at most
+/// `CLONE_MAX_BYTES`. A source writer does not wait for it, and the
+/// replicator's checkpoint waits for it only for that time.
+///
+/// Both connections are plain: a facet's database is restored with
+/// `allow_paged = false` (see `FacetStreams::open`), so no fault-in VFS is
+/// needed to read the source.
 pub(crate) async fn copy_database(from: PathBuf, to: PathBuf) -> anyhow::Result<()> {
+    copy_database_within(from, to, CLONE_BUSY_ATTEMPTS).await
+}
+
+async fn copy_database_within(from: PathBuf, to: PathBuf, attempts: u32) -> anyhow::Result<()> {
     crate::asyncrt::blocking(move || {
         let source = rusqlite::Connection::open_with_flags(
             &from,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .with_context(|| format!("open facet database {}", from.display()))?;
+        // The source may have grown since `ensure_clonable`, and the target is
+        // gone by now, so this is a failed clone, not a refused one.
+        ensure_clonable_size(&source).map_err(|error| anyhow!("{error:#}"))?;
         let mut destination = rusqlite::Connection::open(&to)
             .with_context(|| format!("open facet database {}", to.display()))?;
+        // A busy step returns at once and is retried below, so the attempts
+        // bound the wait. The default five second busy timeout would make
+        // each attempt wait that long.
+        source.busy_timeout(std::time::Duration::ZERO)?;
+        destination.busy_timeout(std::time::Duration::ZERO)?;
         let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
-        loop {
+        for _ in 0..attempts {
             match backup.step(-1)? {
                 rusqlite::backup::StepResult::Done => return Ok(()),
-                // A lock held for a moment by the source's writer.
+                // A lock held for a moment by a writer.
                 _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
         }
+        anyhow::bail!("the facet copy stayed busy")
     })
     .await
     .map_err(|error| anyhow!("facet copy panicked: {error}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::FutureExt as _;
+    use rusqlite::Connection;
+
+    fn database(path: &std::path::Path, rows: u32) -> Connection {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        connection
+            .execute_batch("CREATE TABLE t (v INTEGER);")
+            .unwrap();
+        for row in 0..rows {
+            connection
+                .execute("INSERT INTO t VALUES (?)", [row])
+                .unwrap();
+        }
+        connection
+    }
+
+    fn rows(path: &std::path::Path) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_copy_holds_what_the_source_committed_and_nothing_else() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let (from, to) = (directory.path().join("from"), directory.path().join("to"));
+        let source = database(&from, 3);
+        // A write transaction that has not committed is not copied, and does
+        // not stop the copy.
+        source
+            .execute_batch("BEGIN; INSERT INTO t VALUES (99);")
+            .unwrap();
+        database(&to, 7);
+        copy_database(from.clone(), to.clone()).await.unwrap();
+        assert_eq!(rows(&to), 3);
+        // The source commits after the copy: the copy does not see it.
+        source.execute_batch("COMMIT;").unwrap();
+        assert_eq!(rows(&from), 4);
+        assert_eq!(rows(&to), 3);
+    }
+
+    #[tokio::test]
+    async fn a_source_above_the_budget_is_refused_and_the_target_is_kept() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let (from, to) = (directory.path().join("from"), directory.path().join("to"));
+        let source = database(&from, 0);
+        source.execute_batch("CREATE TABLE big (b BLOB);").unwrap();
+        for _ in 0..=CLONE_MAX_BYTES / (1024 * 1024) {
+            source
+                .execute("INSERT INTO big VALUES (zeroblob(1048576))", [])
+                .unwrap();
+        }
+        database(&to, 7);
+        let error = ensure_clonable(&from).unwrap_err();
+        assert!(error.downcast_ref::<CloneRefused>().is_some(), "{error:#}");
+        // Past that check the target is gone, so a source that grew since is
+        // an ordinary failure of the copy, not a refusal.
+        let error = copy_database(from, to.clone()).await.unwrap_err();
+        assert!(error.downcast_ref::<CloneRefused>().is_none(), "{error:#}");
+        assert_eq!(rows(&to), 7);
+    }
+
+    #[tokio::test]
+    async fn a_copy_into_a_database_that_stays_locked_fails() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let (from, to) = (directory.path().join("from"), directory.path().join("to"));
+        database(&from, 3);
+        let target = database(&to, 7);
+        // A writer of the target holds its write lock for the whole copy.
+        target
+            .execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (1);")
+            .unwrap();
+        let error = copy_database_within(from, to.clone(), 20)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("busy"), "{error:#}");
+        target.execute_batch("COMMIT;").unwrap();
+        assert_eq!(rows(&to), 8);
+    }
+
+    /// A restored root that has no replicator: facets are files.
+    fn streams() -> (FacetStreams, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let streams = FacetStreams::default();
+        streams.register(
+            "root",
+            &celld_logic::RestoreSpec {
+                epoch: 1,
+                fresh: true,
+                took_over: false,
+                resume: None,
+                prior: None,
+            },
+        );
+        (streams, directory)
+    }
+
+    #[tokio::test]
+    async fn a_refused_clone_leaves_the_target_as_it_was() {
+        crate::asyncrt::install_test_host_runtime();
+        let (streams, directory) = streams();
+        let path = |cell: &str, _: u64| directory.path().join(cell.replace('/', "_"));
+        let local = |cell: &str| directory.path().join(cell.replace('/', "_"));
+        let (source, target) = (vec!["a".to_string()], vec!["b".to_string()]);
+        let from = path(&crate::engine_api::facet_cell("root", &source), 1);
+        let to = path(&crate::engine_api::facet_cell("root", &target), 1);
+        let big = database(&from, 0);
+        big.execute_batch("CREATE TABLE big (b BLOB);").unwrap();
+        for _ in 0..=CLONE_MAX_BYTES / (1024 * 1024) {
+            big.execute("INSERT INTO big VALUES (zeroblob(1048576))", [])
+                .unwrap();
+        }
+        database(&to, 7);
+        let error = streams
+            .clone_facet(None, path, local, "root", 1, &source, &target)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<CloneRefused>().is_some(), "{error:#}");
+        assert_eq!(rows(&to), 7);
+    }
+
+    #[tokio::test]
+    async fn a_delete_a_clone_and_a_stop_wait_for_a_replace_in_flight() {
+        crate::asyncrt::install_test_host_runtime();
+        let (streams, directory) = streams();
+        let path = |cell: &str, _: u64| directory.path().join(cell.replace('/', "_"));
+        let local = |cell: &str| directory.path().join(cell.replace('/', "_"));
+        let names = vec!["a".to_string()];
+        let replacing = streams.replacing("root").unwrap();
+        let held = replacing.lock().await;
+        assert!(streams
+            .delete(None, local, "root", 1, &names)
+            .now_or_never()
+            .is_none());
+        assert!(streams
+            .clone_facet(None, path, local, "root", 1, &names, &["b".to_string()])
+            .now_or_never()
+            .is_none());
+        let mut stop = Box::pin(streams.stop_root(
+            "root",
+            1,
+            false,
+            || async { Ok(()) },
+            |_| async { Ok(()) },
+        ));
+        assert!(stop.as_mut().now_or_never().is_none());
+        drop(held);
+        stop.await.unwrap();
+    }
 }
