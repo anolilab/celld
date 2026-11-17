@@ -1248,6 +1248,7 @@ mod tests {
         assert_ne!(shared, inside);
     }
 
+    #[cfg(unix)]
     #[test]
     fn clients_find_the_token_through_links_and_relative_paths() {
         let directory = tempfile::tempdir().unwrap();
