@@ -6061,11 +6061,14 @@ const __wsCheckClose = (code, reason) => {
       `WebSocket close code ${code} is not permitted`,
       "InvalidAccessError");
   }
-  if (new TextEncoder().encode(String(reason)).length > 123) {
+  const text = String(reason);
+  if (new TextEncoder().encode(text).length > 123) {
     throw new DOMException(
       "WebSocket close reason must not exceed 123 bytes",
       "SyntaxError");
   }
+  // Callers send what was checked, so a code given as "1008" goes out as 1008.
+  return [wanted, text];
 };
 // WebSocket: the host holds the socket; these deliver events into the DO.
 // `ws` is a lightweight stub whose send/close route back to the host task
@@ -6082,7 +6085,7 @@ const __wsStub = __celld.__wsStub = (wsId) => ({
       __ws_send(wsId, String(data));
   },
   close: (code = 1000, reason = "") => {
-    __wsCheckClose(code, reason);
+    [code, reason] = __wsCheckClose(code, reason);
     __ws_close(wsId, code, reason);
   },
 });
@@ -10971,7 +10974,7 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     }
   }
   close(code = 1000, reason = "") {
-    __wsCheckClose(code, reason);
+    [code, reason] = __wsCheckClose(code, reason);
     // Outbound sockets follow the WebSocket spec: closing a closed socket is a
     // no-op. Inbound sockets must NOT take that shortcut -- a Durable Object
     // answers a peer-initiated close from inside `webSocketClose`, by which

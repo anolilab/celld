@@ -361,6 +361,18 @@ async fn a_close_takes_the_codes_an_endpoint_may_send_and_refuses_the_others() {
             };
             assert_eq!(name, expected, "{path} close({code})");
         }
-        assert_eq!(outcome.as_object().expect("object").len(), 20, "{path}");
+        let mut keys: Vec<&str> = outcome
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let mut wanted: Vec<&str> = "999 1000 1001 1002 1003 1004 1005 1006 1007 1008 1009 1010 \
+                                     1011 1012 1013 1014 1015 1016 2999 3000 4999 5000 longReason"
+            .split_whitespace()
+            .collect();
+        wanted.sort_unstable();
+        assert_eq!(keys, wanted, "{path}");
     }
 }
