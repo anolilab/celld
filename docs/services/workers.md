@@ -40,6 +40,44 @@ workerd, so a main module that exports a string or a number fails to start.
 celld runs many requests in one isolate and retires isolates at any time, so
 a Worker must keep its state in a binding, not in module scope.
 
+## Version metadata
+
+A `version_metadata` entry in `wrangler.jsonc` names a binding that describes
+the deployment the Worker runs under:
+
+```jsonc
+{ "version_metadata": { "binding": "CF_VERSION_METADATA" } }
+```
+
+`env.CF_VERSION_METADATA` is a frozen object with three strings:
+
+- `id` is a UUID-shaped string derived from the deployment's version, the hash
+  of the bundle and the configuration, and from its cron schedules. Every node that serves the same bundle
+  and configuration reports the same `id`, and any change reports a new one.
+- `tag` is the label given with `celld deploy --tag`, or `""` when there is
+  none. The tag is not part of the version, so the same bundle with another tag
+  keeps its `id`.
+- `timestamp` is the ISO-8601 UTC time at which `celld deploy` first built the
+  deployment. It is not part of the version either.
+
+A version's manifest is written once. Deploying the same bundle and
+configuration again, with another `--tag` or later, changes neither the `tag`
+nor the `timestamp`: they stay those of the first deploy, so every node reports
+the same values. `celld deploy` says so when it finds the version already
+deployed. A deployment that declares the binding requires the
+`version-metadata-v1` feature, so a node that predates it refuses the
+deployment instead of serving a Worker without the binding.
+
+A cron-only change keeps the version but gives the binding a new `id`. The
+manifest is updated in the bucket; a node that already serves the version does
+not read it again, so it keeps the old schedule and `id` until it reloads the
+version or restarts. A binding cannot be named `__proto__`.
+
+`celld dev` fills the binding too: `tag` is `""`, and `timestamp` is the time of
+the build that produced the running version. The values are fixed when the
+deployment loads, so reading them costs nothing per request. A
+`wrangler.toml` is not supported, so the declaration is JSON or JSONC.
+
 ## Differences from Cloudflare
 
 - celld does not manage a custom domain or terminate TLS.

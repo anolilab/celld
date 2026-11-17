@@ -50,8 +50,61 @@ pub struct Manifest {
     pub fence_image: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_features: Vec<String>,
+    /// The label `celld deploy --tag` gave this deployment. Like `created_at`
+    /// it is not an input of `version`: the same bundle with another tag is
+    /// the same version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// When `celld deploy` built this deployment, as an ISO-8601 UTC string.
+    /// Not an input of `version`. Absent from a manifest an older celld wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
     /// wrangler's raw metadata, retained verbatim for anything we don't yet model.
     pub raw_metadata: serde_json::Value,
+}
+
+impl Manifest {
+    /// What the `version_metadata` binding named `binding` reports for this
+    /// deployment.
+    pub fn version_metadata(&self, binding: &str) -> crate::engine_api::VersionMetadata {
+        crate::engine_api::VersionMetadata {
+            binding: binding.to_string(),
+            id: version_metadata_id(&self.version, &self.crons),
+            tag: self.tag.clone().unwrap_or_default(),
+            // A manifest from before `created_at` existed has no creation time.
+            timestamp: self
+                .created_at
+                .clone()
+                .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string()),
+        }
+    }
+}
+
+/// The `version_metadata` binding's `id`: a version 8 UUID that is a pure
+/// function of the deployment `version` and its cron schedules, so every node
+/// serving the same bundle and config reports the same one and any change
+/// reports another. The schedules are named here because the version hash
+/// leaves them out; they are taken sorted, so their order does not matter.
+pub fn version_metadata_id(version: &str, crons: &[String]) -> String {
+    let mut crons: Vec<&str> = crons.iter().map(String::as_str).collect();
+    crons.sort_unstable();
+    let crons = serde_json::to_string(&crons).expect("strings serialize");
+    let digest = Sha256::digest(format!("celld:version_metadata:{version}:{crons}"));
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // UUID version 8 (RFC 9562, custom) and the RFC variant, so a validator
+    // that checks them passes.
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = crate::control_plane::hex(&bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
 }
 
 fn legacy_manifest_schema_version() -> u32 {
@@ -75,6 +128,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_WASM_V1,
     FEATURE_WORKFLOWS_V1,
     FEATURE_PYTHON_WORKERS_V1,
+    FEATURE_VERSION_METADATA_V1,
 ];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
@@ -107,6 +161,10 @@ pub const FEATURE_WASM_V1: &str = "wasm-v1";
 /// whose body streams do not report `ReadableStream` as their constructor
 /// fails those requests with a Python `TypeError`.
 pub const FEATURE_PYTHON_WORKERS_V1: &str = "python-workers-v1";
+/// A deployment with a `version_metadata` binding. Required because a node
+/// without it would build an `env` missing the binding, and the application
+/// would fail only when it first reads `env.<name>.id`.
+pub const FEATURE_VERSION_METADATA_V1: &str = "version-metadata-v1";
 /// A deployment with `workflows` bindings. Required because a build without
 /// the reserved workflow cell would load the manifest, build an `env` missing
 /// the binding, and fail only when the application first calls `create()` —
@@ -544,4 +602,40 @@ pub fn deployment_version(
         hasher.update(index);
     }
     crate::control_plane::hex(&hasher.finalize())[..16].to_string()
+}
+
+#[cfg(test)]
+mod version_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn the_id_is_a_version_8_uuid_with_the_rfc_variant() {
+        let id = version_metadata_id("abc123", &[]);
+        let groups: Vec<&str> = id.split('-').collect();
+        assert_eq!(
+            groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
+            [8, 4, 4, 4, 12]
+        );
+        assert!(groups[2].starts_with('8'), "{id}");
+        assert!(
+            matches!(groups[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'),
+            "{id}"
+        );
+        assert_eq!(id, version_metadata_id("abc123", &[]));
+        assert_ne!(id, version_metadata_id("abc124", &[]));
+    }
+
+    #[test]
+    fn the_id_changes_with_the_cron_schedules_but_not_their_order() {
+        let a = "0 * * * *".to_string();
+        let b = "*/5 * * * *".to_string();
+        let none = version_metadata_id("v", &[]);
+        let one = version_metadata_id("v", std::slice::from_ref(&a));
+        assert_ne!(none, one);
+        assert_ne!(one, version_metadata_id("v", std::slice::from_ref(&b)));
+        assert_eq!(
+            version_metadata_id("v", &[a.clone(), b.clone()]),
+            version_metadata_id("v", &[b, a])
+        );
+    }
 }

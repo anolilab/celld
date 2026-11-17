@@ -619,6 +619,12 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         for (name, value) in vars {
             lines.push_str(&format!("e[{:?}] = {:?};\n", name, value));
         }
+        if let Some(metadata) = &config.version_metadata {
+            lines.push_str(&format!(
+                "e[{:?}] = Object.freeze({{ id: {:?}, tag: {:?}, timestamp: {:?} }});\n",
+                metadata.binding, metadata.id, metadata.tag, metadata.timestamp
+            ));
+        }
         if let Some(name) = asset_binding {
             lines.push_str(&format!(
                 "e[{:?}] = __celld.__makeAssetsBinding({:?});\n",

@@ -1904,12 +1904,7 @@ pub async fn apply_deployment(
             )
             .await?;
     }
-    bucket
-        .put(
-            &format!("{}/manifest.json", deployment.pointer.prefix),
-            serde_json::to_vec_pretty(&deployment.manifest)?,
-        )
-        .await?;
+    crate::deploy::write_manifest(bucket, &deployment.pointer.prefix, &deployment.manifest).await?;
     // A producer can run in a different script, so the manifest is not a
     // discoverable consumer index. Publish the same fleet-wide attachment as
     // `celld deploy`, after its exact deployment prefix is complete.

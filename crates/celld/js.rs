@@ -1642,6 +1642,8 @@ pub struct WorkerConfig {
     /// binding gets a cache of its own, so a name loaded through one loader
     /// is a different Worker from the same name loaded through another.
     loader_bindings: Vec<String>,
+    /// The deployment's `version_metadata` binding, if its config declares one.
+    version_metadata: Option<crate::engine_api::VersionMetadata>,
     /// Ambient outbound authority. Loaded workers may be denied.
     egress: EgressPolicy,
     /// Structured-clone values and host-minted service routes that a loaded
@@ -1783,6 +1785,7 @@ impl WorkerConfig {
             services: Vec::new(),
             asset_binding: None,
             loader_bindings: Vec::new(),
+            version_metadata: None,
             egress: EgressPolicy::Allow,
             loader_env: None,
             resource_limits: None,
@@ -1885,6 +1888,15 @@ impl WorkerConfig {
     /// Give this Worker the deployment's cron trigger expressions.
     pub fn with_crons(mut self, crons: Vec<String>) -> Self {
         self.crons = crons;
+        self
+    }
+
+    /// Give this Worker its `version_metadata` binding.
+    pub fn with_version_metadata(
+        mut self,
+        metadata: Option<crate::engine_api::VersionMetadata>,
+    ) -> Self {
+        self.version_metadata = metadata;
         self
     }
 

@@ -617,6 +617,7 @@ impl Generation {
                 script_name: script,
                 asset_binding,
                 loader_bindings,
+                version_metadata,
                 assets: resolver,
                 services,
                 crons,
@@ -635,6 +636,7 @@ impl Generation {
                     .with_services(services)
                     .with_asset_binding(asset_binding)
                     .with_loaders(loader_bindings)
+                    .with_version_metadata(version_metadata)
                     .with_queue_consumers(queue_catalog.clone())
                     .with_crons(if is_primary { crons } else { Vec::new() })
                     .with_containers(containers)

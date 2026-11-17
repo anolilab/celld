@@ -68,6 +68,11 @@ The node that owns the reserved cell runs the occurrence, and that node can
 change. A `triggers.crons` entry in a service-binding target never runs, and
 celld logs a warning when it loads such a target.
 
+Changing only `triggers.crons` and deploying again updates the version's
+manifest in the bucket, because the schedules are not part of the version. A
+node that already serves the version does not read the manifest again, so it
+keeps the old schedule until it reloads the version or restarts.
+
 ## Differences from Cloudflare
 
 - celld rejects a descending range such as `SAT-SUN` and a list that contains

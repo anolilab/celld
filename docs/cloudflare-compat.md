@@ -22,6 +22,7 @@ An unsupported feature that does not cause an error is a defect.
 | [Static assets](services/static-assets.md) | **Yes** |
 | [Cron Triggers](services/cron-triggers.md) | **Yes** |
 | [Dynamic Workers](services/dynamic-workers.md) | **Yes** |
+| [Version metadata](services/workers.md#version-metadata) | **Yes** |
 | [KV](services/kv.md) | **Yes** |
 | [Queues](services/queues.md) | **Yes** |
 | [D1](services/d1.md) | **Yes** |
@@ -257,7 +258,7 @@ The accepted top-level keys:
 - `assets`, `services`, `triggers`, and `vars`
 - `d1_databases`, `kv_namespaces`, `queues`, `workflows`, and
   `r2_buckets`
-- `worker_loaders` and `containers`
+- `worker_loaders`, `version_metadata`, and `containers`
 - `define` and `rules`
 
 Any other top-level key, including `routes`, stops the deployment.

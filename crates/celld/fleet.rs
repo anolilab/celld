@@ -611,7 +611,7 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     validate_bucket(&store).await?;
     crate::wake_format::ensure_ready(&store).await?;
     let started = std::time::Instant::now();
-    deploy::write(&store, &built, !options.no_activate).await?;
+    let manifest_write = deploy::write(&store, &built, !options.no_activate).await?;
     let location = format!(
         "{}://{}/{}{}",
         store.scheme(),
@@ -625,6 +625,15 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
         started.elapsed().as_secs_f64()
     );
     note!("  {location}");
+    match manifest_write {
+        deploy::ManifestWrite::Created => {}
+        deploy::ManifestWrite::Updated => note!(
+            "This version was already deployed; its manifest is updated and keeps its first tag and timestamp. A node that already serves the version keeps its old cron schedule until it reloads the version or restarts."
+        ),
+        deploy::ManifestWrite::Unchanged => {
+            note!("This version was already deployed; it keeps its first tag and timestamp.")
+        }
+    }
     out.row(&Deployed {
         worker: built.script_name.clone(),
         version: built.version.clone(),
@@ -923,6 +932,9 @@ async fn load_worker_at_pointer(
     let loader_bindings = bindings(&manifest, "worker_loader")
         .filter_map(|binding| binding.get("name")?.as_str().map(str::to_string))
         .collect();
+    let version_metadata = bindings(&manifest, "version_metadata")
+        .find_map(|binding| binding.get("name")?.as_str())
+        .map(|binding| manifest.version_metadata(binding));
     let services = service_bindings(&manifest);
     let vars = worker_vars(&manifest);
     let compat = crate::worker_compat(&manifest.raw_metadata);
@@ -980,6 +992,7 @@ async fn load_worker_at_pointer(
         prefix,
         asset_binding,
         loader_bindings,
+        version_metadata,
         assets,
         services,
         crons,
@@ -998,6 +1011,8 @@ pub struct LoadedDeployment {
     /// `worker_loaders` config. A script reaches no loader that it does not
     /// declare, and each loader keeps a cache of its own loaded Workers.
     pub loader_bindings: Vec<String>,
+    /// The deployment's `version_metadata` binding, if it declares one.
+    pub version_metadata: Option<crate::engine_api::VersionMetadata>,
     pub assets: Option<crate::assets::AssetResolver>,
     pub services: Vec<(String, String, Option<String>)>,
     /// `triggers.crons` from the manifest, driving the reserved cron cell.

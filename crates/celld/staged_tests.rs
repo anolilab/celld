@@ -53,6 +53,8 @@ fn built(script: &str, version: &str, services: &[(&str, &str)]) -> Built {
         containers: Vec::new(),
         fence_image: None,
         required_features: Vec::new(),
+        tag: None,
+        created_at: None,
         raw_metadata: serde_json::json!({ "bindings": bindings }),
     };
     Built {
@@ -515,4 +517,81 @@ async fn a_staged_queue_consumer_loads_as_a_shadow_but_not_as_a_deployment() {
         .await
         .expect("a shadow ignores the attachment");
     assert_eq!(graph.primary.version, "v2");
+}
+
+#[tokio::test]
+async fn redeploying_a_version_keeps_the_first_manifest() {
+    let fleet = fleet();
+    let mut first = built("worker", "v1", &[]);
+    first.manifest.tag = Some("first".to_string());
+    first.manifest.created_at = Some("2026-01-01T00:00:00.000Z".to_string());
+    let mut second = built("worker", "v1", &[]);
+    second.manifest.tag = Some("second".to_string());
+    second.manifest.created_at = Some("2026-02-02T00:00:00.000Z".to_string());
+
+    use crate::deploy::ManifestWrite;
+    assert_eq!(
+        crate::deploy::write(&fleet.bucket, &first, true)
+            .await
+            .unwrap(),
+        ManifestWrite::Created
+    );
+    assert_eq!(
+        crate::deploy::write(&fleet.bucket, &second, true)
+            .await
+            .unwrap(),
+        ManifestWrite::Unchanged
+    );
+
+    let (body, _) = fleet
+        .bucket
+        .get("deploy/worker/v1/manifest.json")
+        .await
+        .unwrap()
+        .expect("the manifest exists");
+    let kept: Manifest = serde_json::from_slice(&body).unwrap();
+    assert_eq!(kept.tag.as_deref(), Some("first"));
+    assert_eq!(kept.created_at.as_deref(), Some("2026-01-01T00:00:00.000Z"));
+}
+
+#[tokio::test]
+async fn a_cron_only_redeploy_updates_the_schedule_and_keeps_the_first_tag() {
+    use crate::deploy::ManifestWrite;
+    let fleet = fleet();
+    let mut first = built("worker", "v1", &[]);
+    first.manifest.tag = Some("first".to_string());
+    first.manifest.created_at = Some("2026-01-01T00:00:00.000Z".to_string());
+    first.manifest.crons = vec!["0 * * * *".to_string()];
+    let mut second = built("worker", "v1", &[]);
+    second.manifest.tag = Some("second".to_string());
+    second.manifest.created_at = Some("2026-02-02T00:00:00.000Z".to_string());
+    second.manifest.crons = vec!["*/5 * * * *".to_string()];
+
+    crate::deploy::write(&fleet.bucket, &first, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::deploy::write(&fleet.bucket, &second, true)
+            .await
+            .unwrap(),
+        ManifestWrite::Updated
+    );
+
+    let (body, _) = fleet
+        .bucket
+        .get("deploy/worker/v1/manifest.json")
+        .await
+        .unwrap()
+        .expect("the manifest exists");
+    let kept: Manifest = serde_json::from_slice(&body).unwrap();
+    assert_eq!(kept.crons, vec!["*/5 * * * *".to_string()]);
+    assert_eq!(kept.tag.as_deref(), Some("first"));
+    assert_eq!(kept.created_at.as_deref(), Some("2026-01-01T00:00:00.000Z"));
+    // The schedule is part of the configuration, so the binding reports a new
+    // id for it; the tag and timestamp stay the first deploy's.
+    let before = first.manifest.version_metadata("META");
+    let after = kept.version_metadata("META");
+    assert_ne!(before.id, after.id);
+    assert_eq!(before.tag, after.tag);
+    assert_eq!(before.timestamp, after.timestamp);
 }

@@ -20,7 +20,8 @@ use crate::protocol::{
     QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1,
     FEATURE_CONTAINER_IMAGES_V1, FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_KV_V1,
     FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1,
-    FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1, QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+    FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -58,6 +59,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "workflows",
     "r2_buckets",
     "worker_loaders",
+    "version_metadata",
     "containers",
     "no_bundle",
     "define",
@@ -216,6 +218,10 @@ pub struct Options {
     /// Where to write the entry's source map, with `sources` relative to the
     /// project. The map stays out of the deployment.
     pub sourcemap: Option<PathBuf>,
+    /// A label for the deployment, which a `version_metadata` binding reports
+    /// as `tag`. It is not part of the version: the same bundle with another
+    /// tag keeps its id.
+    pub tag: Option<String>,
 }
 
 /// Local Worker variables, tagged with the kind of file that supplied them.
@@ -241,7 +247,7 @@ pub fn print_help() {
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --sourcemap PATH       Write the entry's source map to PATH, with its sources\n                         relative to the project. The deployed module does not\n                         change. With `no_bundle`, the map is the file the\n                         entry's own build wrote beside it, <entry>.map\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate the version but select nothing; the\n                         fleet keeps serving what it serves. `celld activate`\n                         selects the version later and `celld discard` removes it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
+OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --sourcemap PATH       Write the entry's source map to PATH, with its sources\n                         relative to the project. The deployed module does not\n                         change. With `no_bundle`, the map is the file the\n                         entry's own build wrote beside it, <entry>.map\n  --tag TAG              Label the deployment; a `version_metadata` binding\n                         reports it as `tag`. It does not change the version\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate the version but select nothing; the\n                         fleet keeps serving what it serves. `celld activate`\n                         selects the version later and `celld discard` removes it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain, from Google\n\
 Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
 account key, managed identity, or workload identity for an az:// bucket.\n\n\
@@ -272,6 +278,7 @@ pub fn options_from_arguments(
         json: false,
         vars: VarOverrides::None,
         sourcemap: None,
+        tag: None,
     };
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -299,6 +306,9 @@ pub fn options_from_arguments(
                 options.sourcemap = Some(PathBuf::from(
                     arguments.next().context("--sourcemap requires a value")?,
                 ));
+            }
+            "--tag" => {
+                options.tag = Some(arguments.next().context("--tag requires a value")?);
             }
             other if other.starts_with('-') => {
                 bail!("unknown argument for `celld deploy`: {other}")
@@ -569,6 +579,10 @@ impl Built {
                         format!("env.{name} (Worker Loader)"),
                         "Dynamic Workers".to_string(),
                     )),
+                    Some("version_metadata") => Some((
+                        format!("env.{name} (Version Metadata)"),
+                        "Deployment id, tag and timestamp".to_string(),
+                    )),
                     Some("plain_text") => Some((
                         format!("env.{name} (Text)"),
                         "Environment Variable".to_string(),
@@ -735,6 +749,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .is_some_and(|flags| flags.iter().any(|flag| flag.as_str() == Some("sqlite_vec")));
     let uses_d1 = project.do_classes.iter().any(|class| class == D1_CLASS);
     let python_runtime = project.python.is_some();
+    let uses_version_metadata = has_binding_type(&project.metadata, "version_metadata");
     let manifest = Manifest {
         schema_version: if asset_reference.is_some() { 2 } else { 1 },
         version: version.clone(),
@@ -756,6 +771,11 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         containers: container_specs.clone(),
         fence_image: fence_image.clone(),
         queue_consumers: project.queue_consumers,
+        tag: options.tag.clone(),
+        created_at: Some(
+            chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        ),
         // Each capability the manifest depends on is named here, so a node
         // that predates it rejects the deployment up front instead of
         // partially deserializing the manifest and failing at worker load.
@@ -797,6 +817,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             if python_runtime {
                 features.push(FEATURE_PYTHON_WORKERS_V1.to_string());
             }
+            if uses_version_metadata {
+                features.push(FEATURE_VERSION_METADATA_V1.to_string());
+            }
             features
         },
         raw_metadata: project.metadata,
@@ -814,6 +837,18 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         upload_images: !options.local_images,
         sourcemap,
     })
+}
+
+/// Whether the project's `bindings` has an entry of `kind`.
+fn has_binding_type(metadata: &Value, kind: &str) -> bool {
+    metadata
+        .get("bindings")
+        .and_then(Value::as_array)
+        .is_some_and(|bindings| {
+            bindings
+                .iter()
+                .any(|binding| binding.get("type").and_then(Value::as_str) == Some(kind))
+        })
 }
 
 /// Whether `image` names a Dockerfile in the project rather than an image
@@ -974,7 +1009,12 @@ async fn ensure_image_tar(bucket: &Bucket, image: &str) -> anyhow::Result<()> {
 /// Upload a deployment. With `activate` it also becomes the serving one:
 /// queue consumers attach to it and the pointers move. Without it the version
 /// is complete and validated but inert, and only `celld activate` can select it.
-pub async fn write(bucket: &Bucket, built: &Built, activate: bool) -> anyhow::Result<()> {
+/// Returns what happened to the manifest, see [`write_manifest`].
+pub async fn write(
+    bucket: &Bucket,
+    built: &Built,
+    activate: bool,
+) -> anyhow::Result<ManifestWrite> {
     // Read every attachment before uploading immutable deployment objects.
     // A competing consumer is a deploy refusal, so it must not leave a new
     // version in the bucket that an operator can mistake for a published one.
@@ -1012,15 +1052,10 @@ pub async fn write(bucket: &Bucket, built: &Built, activate: bool) -> anyhow::Re
             )
             .await?;
     }
-    bucket
-        .put(
-            &format!("{}/manifest.json", built.prefix),
-            serde_json::to_vec_pretty(&built.manifest)?,
-        )
-        .await?;
+    let manifest = write_manifest(bucket, &built.prefix, &built.manifest).await?;
 
     if !activate {
-        return Ok(());
+        return Ok(manifest);
     }
 
     // An attachment names this exact immutable prefix. Publish it only after
@@ -1067,7 +1102,87 @@ pub async fn write(bucket: &Bucket, built: &Built, activate: bool) -> anyhow::Re
         rollout: Rollout { percent: 100 },
         components,
     };
-    write_fleet_pointer(bucket, current.map(|(_, token)| token), &pointer).await
+    write_fleet_pointer(bucket, current.map(|(_, token)| token), &pointer).await?;
+    Ok(manifest)
+}
+
+/// What [`write_manifest`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestWrite {
+    /// First deploy of this version.
+    Created,
+    /// The version was deployed before and something outside its hash (the
+    /// cron schedules) changed; the manifest now has the new content under
+    /// the first deploy's tag and time.
+    Updated,
+    /// The version was deployed before with this same manifest; nothing written.
+    Unchanged,
+}
+
+const MANIFEST_WRITE_ATTEMPTS: usize = 5;
+
+/// Write a version's manifest. The first deploy creates it. A later deploy of
+/// the same version keeps the first one's `tag` and `created_at`, so every
+/// node reports the same metadata for a version, but still replaces anything
+/// else that differs: the cron schedules are not an input of the version
+/// hash, so a cron-only redeploy lands here. The replacement is conditional
+/// on the manifest that was read, and is retried when a concurrent deploy
+/// changed it first.
+pub(crate) async fn write_manifest(
+    bucket: &Bucket,
+    prefix: &str,
+    manifest: &Manifest,
+) -> anyhow::Result<ManifestWrite> {
+    const FIRST: [&str; 2] = ["tag", "created_at"];
+    let key = format!("{prefix}/manifest.json");
+    let body = serde_json::to_vec_pretty(manifest)?;
+    if bucket.put_cas(&key, body, None).await?.is_some() {
+        return Ok(ManifestWrite::Created);
+    }
+    let wanted = serde_json::to_value(manifest)?;
+    for _ in 0..MANIFEST_WRITE_ATTEMPTS {
+        let Some((existing_body, token)) = bucket.get(&key).await? else {
+            // Deleted between the two requests: create it again.
+            if bucket
+                .put_cas(&key, serde_json::to_vec_pretty(manifest)?, None)
+                .await?
+                .is_some()
+            {
+                return Ok(ManifestWrite::Created);
+            }
+            continue;
+        };
+        let existing = serde_json::from_slice::<Value>(&existing_body).unwrap_or(Value::Null);
+        let strip = |value: &Value| {
+            let mut value = value.clone();
+            if let Some(object) = value.as_object_mut() {
+                for field in FIRST {
+                    object.remove(field);
+                }
+            }
+            value
+        };
+        if strip(&existing) == strip(&wanted) {
+            return Ok(ManifestWrite::Unchanged);
+        }
+        let mut next = wanted.clone();
+        if let Some(object) = next.as_object_mut() {
+            for field in FIRST {
+                match existing.get(field) {
+                    Some(value) => object.insert(field.to_string(), value.clone()),
+                    None => object.remove(field),
+                };
+            }
+        }
+        if bucket
+            .put_cas(&key, serde_json::to_vec_pretty(&next)?, Some(&token))
+            .await?
+            .is_some()
+        {
+            return Ok(ManifestWrite::Updated);
+        }
+    }
+    bail!("could not update {key}: it kept changing under concurrent deploys")
 }
 
 /// The fleet pointer and the token a conditional write must present, or
@@ -2080,6 +2195,32 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             "name": binding,
         }));
     }
+    // `version_metadata` names one env binding that reports the deployment's
+    // id, tag and creation time. The values come from the manifest at load
+    // time; the config carries only the name.
+    let mut declared_version_metadata = false;
+    match object.get("version_metadata") {
+        None => {}
+        Some(Value::Object(metadata)) => {
+            if let Some(key) = metadata.keys().find(|key| key.as_str() != "binding") {
+                bail!("`version_metadata` sets `{key}`, which is not a supported option");
+            }
+            let binding = match metadata.get("binding") {
+                None => bail!("`version_metadata` has no `binding` name"),
+                Some(Value::String(binding)) => binding.as_str(),
+                Some(_) => bail!("`version_metadata` `binding` must be a string"),
+            };
+            if !valid_binding(binding) {
+                bail!("invalid version_metadata binding name: {binding:?}");
+            }
+            declared_version_metadata = true;
+            bindings.push(json!({
+                "type": "version_metadata",
+                "name": binding,
+            }));
+        }
+        Some(_) => bail!("config `version_metadata` must be an object with a `binding` name"),
+    }
     let mut vars = BTreeMap::new();
     match object.get("vars") {
         None => {}
@@ -2144,6 +2285,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             || !sqlite_classes.is_empty()
             || service_count > 0
             || declared_vars
+            || declared_version_metadata
             || !r2_binding_names.is_empty()
             || !worker_loaders.is_empty())
     {
@@ -2165,6 +2307,11 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     for binding in &bindings {
         let name = binding.get("name").and_then(Value::as_str).unwrap_or("");
         let kind = binding.get("type").and_then(Value::as_str).unwrap_or("");
+        // `e["__proto__"] = x` sets the object's prototype and installs no
+        // binding, so the name cannot be an own property of `env`.
+        if name == "__proto__" {
+            bail!("a {kind} binding cannot be named `__proto__`");
+        }
         if let Some(previous) = binding_names.insert(name, kind) {
             bail!(
                 "binding name {name:?} is declared by both a {previous} and a {kind} \
@@ -3431,5 +3578,122 @@ mod container_image_tests {
         ] {
             assert!(read(value.clone()).is_err(), "{value}");
         }
+    }
+}
+
+#[cfg(test)]
+mod version_metadata_config_tests {
+    use super::*;
+
+    fn read(config: &str) -> anyhow::Result<Project> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
+        let path = dir.path().join("wrangler.jsonc");
+        std::fs::write(&path, config).unwrap();
+        read_project(&path, dir.path(), &VarOverrides::None)
+    }
+
+    fn base(extra: &str) -> String {
+        format!(r#"{{ "name": "app", "main": "index.js", "no_bundle": true, {extra} }}"#)
+    }
+
+    #[test]
+    fn the_binding_becomes_a_version_metadata_entry() {
+        let project = read(&base(
+            r#""version_metadata": { "binding": "CF_VERSION_METADATA" }"#,
+        ))
+        .unwrap();
+        assert!(project.metadata["bindings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({ "type": "version_metadata", "name": "CF_VERSION_METADATA" })));
+    }
+
+    #[test]
+    fn jsonc_comments_and_trailing_commas_are_accepted() {
+        let project = read(
+            r#"{
+              // the running build
+              "name": "app", "main": "index.js", "no_bundle": true,
+              "version_metadata": { "binding": "META", },
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(project.metadata["bindings"][0]["name"], "META");
+    }
+
+    #[test]
+    fn a_malformed_declaration_is_refused() {
+        for extra in [
+            r#""version_metadata": "META""#,
+            r#""version_metadata": {}"#,
+            r#""version_metadata": { "binding": 1 }"#,
+            r#""version_metadata": { "binding": "not valid" }"#,
+            r#""version_metadata": { "binding": "META", "id": "x" }"#,
+        ] {
+            assert!(read(&base(extra)).is_err(), "{extra}");
+        }
+    }
+
+    fn build_with(extra: &str) -> Built {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
+        let path = dir.path().join("wrangler.jsonc");
+        std::fs::write(&path, base(extra)).unwrap();
+        let options = options_from_arguments([
+            "--config".to_string(),
+            path.display().to_string(),
+            "--dry-run".to_string(),
+            "--tag".to_string(),
+            "v7".to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+        build(&options).unwrap()
+    }
+
+    #[test]
+    fn a_declared_binding_requires_the_feature_an_older_node_lacks() {
+        let built = build_with(r#""version_metadata": { "binding": "META" }"#);
+        assert!(built
+            .manifest
+            .required_features
+            .contains(&FEATURE_VERSION_METADATA_V1.to_string()));
+        assert_eq!(built.manifest.tag.as_deref(), Some("v7"));
+        assert!(built
+            .bindings()
+            .iter()
+            .any(|(binding, _)| binding == "env.META (Version Metadata)"));
+        crate::protocol::validate_required_features(&built.manifest.required_features).unwrap();
+    }
+
+    #[test]
+    fn a_project_without_the_binding_does_not_require_it() {
+        let built = build_with(r#""vars": { "A": "b" }"#);
+        assert!(!built
+            .manifest
+            .required_features
+            .contains(&FEATURE_VERSION_METADATA_V1.to_string()));
+    }
+
+    #[test]
+    fn no_binding_may_be_named_proto() {
+        for extra in [
+            r#""vars": { "__proto__": "x" }"#,
+            r#""version_metadata": { "binding": "__proto__" }"#,
+        ] {
+            let error = read(&base(extra)).err().expect("the name is refused");
+            assert!(error.to_string().contains("__proto__"), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_name_must_be_unique_among_bindings() {
+        let error = read(&base(
+            r#""vars": { "META": "x" }, "version_metadata": { "binding": "META" }"#,
+        ))
+        .err()
+        .expect("a clash is refused");
+        assert!(error.to_string().contains("META"), "{error}");
     }
 }
