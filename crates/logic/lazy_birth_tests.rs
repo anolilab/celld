@@ -448,6 +448,43 @@ fn resume_std(d: Design) -> LazyConfig {
     c
 }
 
+/// The session hands a waived id to a peer, the peer's record is lost while
+/// the session lives, and the next request reaches the session.
+fn handoff_reclaim(d: Design) -> LazyConfig {
+    let mut c = LazyConfig::base(d);
+    c.fresh_reads = true;
+    c.early_handoff = true;
+    c.no_ensemble = true;
+    c.b.mints = 1;
+    c.b.handoffs = 1;
+    c.b.takes = 1;
+    c.b.writes = 2;
+    c.b.losses = 1;
+    c.b.reclaims = 1;
+    c.b.bproofs = 1;
+    c
+}
+
+/// A preserved restart over a lazy cell, with a lost record and a peer that
+/// goes on as soon as the predecessor's header is sealed.
+fn q2_final(d: Design) -> LazyConfig {
+    let mut c = q2(d);
+    c.sealed_header_final = true;
+    c.b.losses = 1;
+    c
+}
+
+/// Two preserved restarts over a cell with a plain record, with a lost
+/// record and a peer that goes on beside the successors.
+fn q3_final(d: Design) -> LazyConfig {
+    let mut c = q3(d);
+    c.sealed_header_final = true;
+    c.b.losses = 1;
+    c.b.takes = 1;
+    c.b.writes = 2;
+    c
+}
+
 /// The record of a placed id is lost while the session lives, and the next
 /// request reaches the session.
 fn placed_reclaim(d: Design) -> LazyConfig {
@@ -618,6 +655,9 @@ fn scenario(name: &str) -> Build {
         "handoff_std" => handoff_std,
         "handoff_shadow" => handoff_shadow,
         "resume_std" => resume_std,
+        "handoff_reclaim" => handoff_reclaim,
+        "q2_final" => q2_final,
+        "q3_final" => q3_final,
         "broad" => broad,
         "broad_large" => broad_large,
         other => panic!("no scenario {other}"),
@@ -971,6 +1011,7 @@ fn each_mutant_breaks_an_invariant_its_control_keeps() {
 fn a_session_that_claims_twice_or_acts_on_a_late_record_is_a_second_writer() {
     for (m, scn) in [
         ("M38", "placed_reclaim"),
+        ("M38", "handoff_reclaim"),
         ("M39", "late_std"),
         ("M41", "resume_std"),
     ] {
@@ -1046,7 +1087,9 @@ const STANDARD_PATH: &[&str] = &[
     "placed_shadow",
     "placed_reclaim",
     "handoff_std",
+    "handoff_reclaim",
     "resume_std",
+    "q2_final",
 ];
 
 fn run_unfiltered(name: &str, scn: &str, design: &str, cap: usize) -> Report {
@@ -1130,6 +1173,7 @@ fn explore_large() {
         "placed_stall",
         "placed_reclaim",
         "handoff_shadow",
+        "q3_final",
     ] {
         // Every invariant is reported here. The window of the standard path
         // is the one the model reports and does not fail.
@@ -1149,6 +1193,20 @@ fn explore_large() {
             "control {scn} hit a bound"
         );
     }
+    // A granted cell of a shadow session carried over two preserved restarts:
+    // on revision 3 a peer that finds its record lost claims it beside the
+    // successor.
+    let r = run_unfiltered(
+        "a lost record beside a successor, on revision 3",
+        "q3_final",
+        "rev3",
+        3_000_000,
+    );
+    assert!(found(
+        "a lost record beside a successor, on revision 3",
+        &r,
+        TWO_WRITERS
+    ));
     let r = run_design(
         "R2 on revision 1",
         "r2",

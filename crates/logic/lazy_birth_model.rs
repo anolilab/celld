@@ -372,7 +372,8 @@ pub(crate) enum Act {
     Mint(Cell, u8),
     /// The session waives an id and places it on a peer.
     Place(Cell),
-    /// The session decides again about an id it placed, and claims it.
+    /// The session decides again about an id it placed, or claimed and
+    /// released, and claims it.
     Reclaim(Cell),
     /// The session reads its header after a bundle write.
     Confirm(u8),
@@ -2923,12 +2924,14 @@ impl Model for Lazy {
                     }
                 }
             }
-            // The session decides again about an id it placed. The design
-            // places it again, which is a claim of a peer; without the rule
-            // the session claims the id itself.
+            // The session decides again about an id it placed, or about one
+            // it claimed and released, and finds no record. The design places
+            // the first again, which is a claim of a peer, and refuses the
+            // second; without the rule the session claims the id itself.
             if w.b.reclaims > 0 && !self.d().session_claims_once && self.can_mint(w, k) {
                 for c in 0..CELLS {
-                    if p.placed[c] && p.cs[c] == Cs::Waived && w.s.own[c].is_none() {
+                    let placed = p.placed[c] && p.cs[c] == Cs::Waived;
+                    if (placed || p.cs[c] == Cs::Released) && w.s.own[c].is_none() {
                         a.push(Act::Reclaim(c));
                     }
                 }
@@ -3243,7 +3246,7 @@ impl Model for Lazy {
             Act::Reclaim(c) => {
                 let k = self.cfg.minter;
                 w.b.reclaims -= 1;
-                l.push("session_claims_a_placed_id");
+                l.push("session_claims_again");
                 self.std_put(&mut w, k, *c, &mut l);
             }
             Act::Confirm(k) => {
