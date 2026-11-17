@@ -148,6 +148,19 @@ pub async fn serve(
             registry.pass_now.notify_one();
             reply(200, serde_json::json!({ "queued": job }))
         }
+        ("POST", "/__registry/cover") => {
+            // The backstop for one cell, as a first per-cell write would run it:
+            // look the cell up, queue it, request a pass and wait for coverage.
+            let Some(scope) = body.get("scope").and_then(|scope| scope.as_str()) else {
+                return reply(400, serde_json::json!({ "error": "scope" }));
+            };
+            let started = crate::asyncrt::mono_ms();
+            let ok = registry.ensure_covered(scope).await.is_ok();
+            reply(
+                200,
+                serde_json::json!({ "ok": ok, "ms": crate::asyncrt::mono_ms().saturating_sub(started) }),
+            )
+        }
         ("POST", "/__registry/hold") => {
             let on = body.get("on").and_then(|on| on.as_bool()).unwrap_or(false);
             let holds = &registry.holds;

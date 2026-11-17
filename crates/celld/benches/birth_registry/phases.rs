@@ -534,9 +534,22 @@ async fn load_phase(cfg: Cfg) {
     let mut counters_before: Option<Vec<Value>> = None;
     let mut next_merge = [seconds * 0.25, seconds * 0.5];
     let mut merge_at = 0;
+    let mut probes = 0_usize;
     while !load.is_finished() {
         tokio::time::sleep(Duration::from_secs(15)).await;
         rig.observe(started.elapsed().as_secs() % 60 < 15).await;
+        if cfg.name == "real" {
+            // The backstop's wait, which no real birth causes here: one first write
+            // for a cell the registry has not seen, on a node in turn.
+            let node = probes % cfg.nodes;
+            probes += 1;
+            probe::jpost(
+                &rig.fleet.client,
+                &format!("{}/__registry/cover", rig.fleet.ep.internal(node)),
+                json!({ "scope": format!("Agent:cover-probe-{}-{probes}", rig.run) }),
+            )
+            .await;
+        }
         if tally_before.is_none() && started.elapsed() >= warm {
             tally_before = Some((rig.fleet.proxy.take(), Instant::now()));
             counters_before = Some(gather(&rig.fleet, &rig.nodes(), false).await.0);
