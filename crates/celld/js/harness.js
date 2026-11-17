@@ -9533,10 +9533,12 @@ const __WorkflowCell = (() => {
       this._wfDriver.finished = true;
       this._wfDriver.clearStall();
       this._wfDriving = undefined;
+      // A fenced drive never settles, so wake whoever waits on it.
+      this._wfFence?.();
     }
     if (this._wfDriving !== undefined) {
       this._wfNudge = Date.now();
-      await this._wfDriving.catch(() => {});
+      await Promise.race([this._wfDriving.catch(() => {}), this._wfFenced]);
       if (this._wfNudge !== undefined) {
         this._wfNudge = undefined;
         const meta = await storage.get("__wf.meta");
@@ -9596,6 +9598,7 @@ const __WorkflowCell = (() => {
     const token = {};
     this._wfDriveToken = token;
     this._wfDriveStartedMs = Date.now();
+    this._wfFenced = new Promise((release) => { this._wfFence = release; });
     const driving = this._drive(meta, token);
     this._wfDriving = driving;
     try {
