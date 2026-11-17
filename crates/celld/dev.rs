@@ -190,14 +190,15 @@ impl DevState {
     #[allow(clippy::disallowed_methods)] // Local development state is an operator-owned host path.
     fn tighten(&self) {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        // A shared state directory is only checked, never tightened: another
+        // user who can write next to it could swap a level for a link between
+        // the check and the chmod. celld creates its levels private, so a
+        // loose one there is refused. A project-local level is judged by its
+        // target, and whoever can swap links in the project owns it anyway.
+        if self.shared_root.is_some() {
+            return;
+        }
         for level in self.levels() {
-            // A link planted in a shared directory is refused later, never
-            // followed here; a project-local link is judged by its target.
-            if self.shared_root.is_some()
-                && std::fs::symlink_metadata(&level).is_ok_and(|m| m.file_type().is_symlink())
-            {
-                continue;
-            }
             let Ok(resolved) = std::fs::metadata(&level) else {
                 continue;
             };

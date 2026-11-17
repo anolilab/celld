@@ -73,10 +73,11 @@ setting that turns it off. A node takes the token from `CELLD_OPERATOR_TOKEN`:
   directory and `.celld/dev`) with mode 0700 and tightens the configuration
   directory when group or other users can write to it. `celld dev` and
   `celld d1 --local` refuse a directory that is not private. `celld dev` first
-  sets mode 0700 on a `.celld` or `.celld/dev` of its own that group or others
-  can write to, and refuses it only if it stays loose (a filesystem that keeps
-  no modes, such as a Windows drive under WSL: use `--state-dir` on another
-  one). `celld d1 --local` sends a credential, so it never tightens: it
+  sets mode 0700 on a `.celld` or `.celld/dev` of its own in the project that
+  group or others can write to, and refuses it only if it stays loose (a
+  filesystem that keeps no modes, such as a Windows drive under WSL: use
+  `--state-dir` on another one). A `--state-dir` directory is never tightened,
+  only checked. `celld d1 --local` sends a credential, so it never tightens: it
   refuses a loose one, and any directory that another user owns.
 - With it unset and the internal listener bound to, or the node advertising,
   any other address, the node refuses to start. A generated file cannot reach
