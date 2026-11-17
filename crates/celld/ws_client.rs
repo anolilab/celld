@@ -80,15 +80,13 @@ pub struct Connection {
     pub headers: HeaderMap,
 }
 
-/// Mozilla's roots, the same set the previous client compiled in. Deliberately
+/// Mozilla's roots and `CELLD_EXTRA_CA_CERTS`, the same set the previous client compiled in. Deliberately
 /// not the platform store: a downloaded celld should reach `wss://` on a host
 /// that has no `/etc/ssl/certs`.
 fn tls_config() -> &'static tokio_rustls::TlsConnector {
     static CONFIG: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
     CONFIG.get_or_init(|| {
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
+        let roots = crate::tls_roots::root_store().expect("validated CELLD_EXTRA_CA_CERTS");
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();

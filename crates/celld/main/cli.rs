@@ -377,6 +377,8 @@ TUNING:
                                   ignores HTTP_PROXY for Worker fetch()
   CELLD_EGRESS_ALLOW              CIDR and host:port exceptions to
                                   the public policy, comma separated
+  CELLD_EXTRA_CA_CERTS            PEM file of extra roots that Worker fetch(),
+                                  connect() and wss:// trust (refuses a bad file)
   CELLD_RECOVERY_RETRY_MS         Dead-owner recovery retry backoff (default: 1000)
   CELLD_RECOVERY_RETRIES          Recovery retries before a request fails (default: 240)
   CELLD_LOCAL_CACHE_MAX_BYTES     Hibernated SQLite cache limit (default: 2 GiB; 0 disables)

@@ -1694,6 +1694,44 @@ pub(crate) async fn response_stream_close(
     Ok(())
 }
 
+/// A response `Content-Encoding` that `fetch()` decodes for the Worker: `gzip`
+/// and `br`, matched exactly. Any other value, including a list of codings,
+/// reaches the Worker as sent.
+#[derive(Clone, Copy)]
+pub(crate) enum ResponseEncoding {
+    Gzip,
+    Brotli,
+}
+
+impl ResponseEncoding {
+    pub(crate) fn of(headers: &reqwest::header::HeaderMap) -> Option<Self> {
+        match headers.get(reqwest::header::CONTENT_ENCODING)?.as_bytes() {
+            b"gzip" => Some(Self::Gzip),
+            b"br" => Some(Self::Brotli),
+            _ => None,
+        }
+    }
+
+    /// The decoded body, read from the connection as the Worker pulls it.
+    pub(crate) fn decode(self, response: reqwest::Response) -> HttpChunkStream {
+        use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder};
+        let body = tokio_util::io::StreamReader::new(
+            response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(std::io::Error::other)),
+        );
+        let decoded: Pin<Box<dyn tokio::io::AsyncRead + Send>> = match self {
+            Self::Gzip => Box::pin(GzipDecoder::new(body)),
+            Self::Brotli => Box::pin(BrotliDecoder::new(body)),
+        };
+        Box::pin(tokio_util::io::ReaderStream::new(decoded).map(|chunk| {
+            chunk
+                .map(|bytes| bytes.to_vec())
+                .map_err(|error| format!("response stream: {error}"))
+        }))
+    }
+}
+
 /// Move a host response source into a directly-polled stream. No pump task is
 /// needed: the eventual HTTP or JS consumer supplies the backpressure.
 fn http_chunk_stream(source: HttpStreamSource) -> HttpChunkStream {

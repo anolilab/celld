@@ -56,6 +56,7 @@ aes-gcm.workspace = true
 cbc.workspace = true
 ctr.workspace = true
 anyhow.workspace = true
+async-compression.workspace = true
 axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
@@ -126,5 +127,6 @@ libc.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 lz4_flex.workspace = true
 tempfile.workspace = true

@@ -21,6 +21,7 @@ mod e2e {
     pub mod egress;
     pub mod facets;
     pub mod fake_engine;
+    pub mod fetch_compat;
     pub mod harness;
     pub mod invoke;
     pub mod isolates;

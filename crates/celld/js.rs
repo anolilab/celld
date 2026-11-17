@@ -579,27 +579,32 @@ thread_local! {
     // One outbound HTTP client per JS thread — building it per fetch rebuilds
     // the TLS stack every call (async-op-hazards.md).
     static HTTP: reqwest::Client = match crate::egress_filter::active() {
-        None => reqwest::Client::new(),
-        Some(filter) => crate::egress_filter::guard(reqwest::Client::builder(), Some(&filter))
-            .redirect(crate::egress_filter::redirect_policy(
-                filter,
-                crate::egress_filter::default_redirect_limit,
-            ))
+        None => crate::tls_roots::apply(reqwest::Client::builder())
             .build()
             .unwrap(),
+        Some(filter) => crate::tls_roots::apply(crate::egress_filter::guard(
+            reqwest::Client::builder(),
+            Some(&filter),
+        ))
+        .redirect(crate::egress_filter::redirect_policy(
+            filter,
+            crate::egress_filter::default_redirect_limit,
+        ))
+        .build()
+        .unwrap(),
     };
-    static HTTP_MANUAL: reqwest::Client = crate::egress_filter::guard(
+    static HTTP_MANUAL: reqwest::Client = crate::tls_roots::apply(crate::egress_filter::guard(
         reqwest::Client::builder(),
         crate::egress_filter::active().as_ref(),
-    )
+    ))
     .redirect(reqwest::redirect::Policy::none()).build().unwrap();
     // A separate policy stops an `error` request before reqwest can replay it
     // at the destination. Inspecting the final response would be too late:
     // the method, body, and credentials could already have left the process.
-    static HTTP_ERROR: reqwest::Client = crate::egress_filter::guard(
+    static HTTP_ERROR: reqwest::Client = crate::tls_roots::apply(crate::egress_filter::guard(
         reqwest::Client::builder(),
         crate::egress_filter::active().as_ref(),
-    )
+    ))
     .redirect(reqwest::redirect::Policy::custom(|attempt| {
         attempt.error("fetch redirect mode is error")
     })).build().unwrap();
@@ -8558,6 +8563,8 @@ fn op_fetch(
     // An absent argument is `false`, so a direct caller gets the uncancellable
     // request it asked for.
     let cancellable = args.get(6).boolean_value(scope);
+    // `encodeResponseBody: "manual"`: the Worker gets the encoded bytes.
+    let manual_encoding = args.get(7).boolean_value(scope);
     let mut body_guard = match body.as_ref().and_then(RequestBody::stream_id) {
         Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
             Some(guard) => guard,
@@ -8776,9 +8783,23 @@ fn op_fetch(
         match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
+                // A gzip or brotli body is decoded as it streams, unless the
+                // Worker asked for the encoded bytes. An unencoded response
+                // takes no extra step.
+                let encoding = if manual_encoding {
+                    None
+                } else {
+                    crate::http_streams::ResponseEncoding::of(resp.headers())
+                };
                 let headers = resp
                     .headers()
                     .iter()
+                    // The decoded body is neither encoded nor the length
+                    // the server announced.
+                    .filter(|(name, _)| {
+                        encoding.is_none()
+                            || !matches!(name.as_str(), "content-encoding" | "content-length")
+                    })
                     .map(|(name, value)| {
                         (
                             name.as_str().to_string(),
@@ -8788,9 +8809,11 @@ fn op_fetch(
                         )
                     })
                     .collect::<Vec<_>>();
-                let Some(stream_id) =
-                    stream_service.register_source(HttpStreamSource::Response(resp))
-                else {
+                let source = match encoding {
+                    Some(encoding) => HttpStreamSource::Stream(encoding.decode(resp)),
+                    None => HttpStreamSource::Response(resp),
+                };
+                let Some(stream_id) = stream_service.register_source(source) else {
                     let error = format!("fetch: {HTTP_STREAM_REGISTRATION_CLOSED}");
                     finish(false, Some(status), Some(error.clone()));
                     return Err(error);
@@ -10262,26 +10285,29 @@ impl IoContext {
             .get_or_init(|| {
                 let context = Arc::downgrade(self);
                 let filter = crate::egress_filter::active();
-                crate::egress_filter::guard(reqwest::Client::builder(), filter.as_ref())
-                    .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                        // Each hop is checked before it is counted or followed.
-                        if let Some(filter) = &filter {
-                            if let Err(refused) = filter.check_url(attempt.url()) {
-                                return attempt.error(refused);
-                            }
+                crate::tls_roots::apply(crate::egress_filter::guard(
+                    reqwest::Client::builder(),
+                    filter.as_ref(),
+                ))
+                .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                    // Each hop is checked before it is counted or followed.
+                    if let Some(filter) = &filter {
+                        if let Err(refused) = filter.check_url(attempt.url()) {
+                            return attempt.error(refused);
                         }
-                        if attempt.previous().len() >= 10 {
-                            return attempt.error("too many redirects");
+                    }
+                    if attempt.previous().len() >= 10 {
+                        return attempt.error("too many redirects");
+                    }
+                    if let Some(context) = context.upgrade() {
+                        if let Err(error) = context.charge_subrequest() {
+                            return attempt.error(RedirectSubrequestLimit(error));
                         }
-                        if let Some(context) = context.upgrade() {
-                            if let Err(error) = context.charge_subrequest() {
-                                return attempt.error(RedirectSubrequestLimit(error));
-                            }
-                        }
-                        attempt.follow()
-                    }))
-                    .build()
-                    .expect("build the redirect-counting HTTP client")
+                    }
+                    attempt.follow()
+                }))
+                .build()
+                .expect("build the redirect-counting HTTP client")
             })
             .clone()
     }

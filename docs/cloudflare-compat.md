@@ -71,6 +71,18 @@ An unsupported feature that does not cause an error is a defect.
   cannot prove the geolocation, colo, or TLS metadata.
 - celld removes `Content-Length` from a Worker response, except for a `HEAD`
   response.
+- `fetch()` decodes a response body whose `Content-Encoding` is exactly `gzip`
+  or `br`, as it streams, and does so by default. With
+  `encodeResponseBody: "manual"` the Worker reads the encoded bytes and
+  `Content-Encoding` and `Content-Length` stay. celld sends no `Accept-Encoding`
+  of its own. Unlike workerd, celld drops `Content-Encoding` and
+  `Content-Length` from a response it decodes, because it does not encode a
+  Worker response again. A Worker that forwards the response to its client
+  therefore sends the decoded body, with no `Content-Encoding`. celld decodes
+  `br` whatever the compatibility date is, and does not decode `deflate`.
+- A plain object or array that an RPC call returns has a non-enumerable
+  `Symbol.dispose`, as in workerd. It releases nothing, and one function serves
+  every result.
 - A remote Durable Object call cannot retry after request-body transmission
   starts because celld keeps no replay copy.
 - A remote Durable Object call waits for a rejected owner generation to change
@@ -257,7 +269,9 @@ celld provides an always-miss cache because it has no shared edge cache.
 
 - A socket cannot outlive its event. A Durable Object must reconnect during a
   later event.
-- celld verifies a TLS server against its bundled Mozilla root store.
+- celld verifies a TLS server, for `connect()` with `secureTransport` or
+  `startTls()` and for `fetch()`, against its bundled Mozilla root store and the
+  certificates in the PEM file that `CELLD_EXTRA_CA_CERTS` names.
 - celld does not block the destination ports that Cloudflare blocks. The fleet
   network controls the egress policy.
 
