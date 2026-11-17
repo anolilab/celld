@@ -61,6 +61,10 @@ struct Options {
 #[derive(Debug)]
 struct DevState {
     path: PathBuf,
+    /// `<state directory>/<project hash>`, when a state directory is in use.
+    /// The directory is shared, so another user may have write access to it
+    /// and `discard` must not follow a link planted at this level.
+    shared_root: Option<PathBuf>,
 }
 
 impl DevState {
@@ -84,15 +88,78 @@ impl DevState {
                 env.map(PathBuf::from)
                     .filter(|directory| !directory.as_os_str().is_empty())
             });
-        let parent = match directory {
-            Some(directory) => std::path::absolute(&directory)
-                .with_context(|| format!("resolve state directory {}", directory.display()))?
-                .join(project_hash(project)),
-            None => project.to_path_buf(),
+        let shared_root = match directory {
+            Some(directory) => Some(
+                std::path::absolute(&directory)
+                    .with_context(|| format!("resolve state directory {}", directory.display()))?
+                    .join(project_hash(project)),
+            ),
+            None => None,
         };
+        let parent = shared_root.as_deref().unwrap_or(project);
         Ok(Self {
             path: parent.join(Self::DIRECTORY),
+            shared_root,
         })
+    }
+
+    /// The local state inside `project` itself, with no state directory.
+    fn for_project(project: &Path) -> Self {
+        Self {
+            path: project.join(Self::DIRECTORY),
+            shared_root: None,
+        }
+    }
+
+    /// Create `<state directory>/<project hash>` private to the user, so
+    /// nobody else can swap a link into it. Does nothing without a state
+    /// directory.
+    fn prepare_shared_root(&self) -> anyhow::Result<()> {
+        match &self.shared_root {
+            Some(root) => crate::config_dir::create_private(root),
+            None => Ok(()),
+        }
+    }
+
+    /// Refuse a state directory that is reached through a link or that
+    /// another user owns: `DIR/<hash>`, `.celld` and `.celld/dev`. Missing
+    /// levels are fine, and nothing is checked for a project-local state.
+    #[allow(clippy::disallowed_methods)] // Local development state is an operator-owned host path.
+    fn ensure_not_redirected(&self) -> anyhow::Result<()> {
+        let Some(root) = &self.shared_root else {
+            return Ok(());
+        };
+        for level in [
+            root.clone(),
+            root.join(".celld"),
+            root.join(Self::DIRECTORY),
+        ] {
+            let metadata = match std::fs::symlink_metadata(&level) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("inspect {}", level.display()));
+                }
+            };
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "refusing to discard {}: {} is a symbolic link",
+                self.path.display(),
+                level.display()
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                // SAFETY: `geteuid` takes no arguments and cannot fail.
+                anyhow::ensure!(
+                    metadata.uid() == unsafe { libc::geteuid() },
+                    "refusing to discard {}: {} is owned by another user",
+                    self.path.display(),
+                    level.display()
+                );
+            }
+        }
+        Ok(())
     }
 
     fn path(&self) -> &Path {
@@ -115,6 +182,7 @@ impl DevState {
             "refusing to discard {}, which is not a celld dev state directory",
             self.path.display()
         );
+        self.ensure_not_redirected()?;
         match std::fs::remove_dir_all(&self.path) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -462,6 +530,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     console.header();
     console.detail("Project", &config.display().to_string());
     console.detail("State", &state.path().display().to_string());
+    state.prepare_shared_root()?;
     // The delete runs before the directory is recreated, and the console names
     // the outcome. A developer who reaches for this flag is already unsure
     // which state the run uses, so a silent delete would answer nothing.
@@ -1097,6 +1166,45 @@ mod tests {
         assert_ne!(one, two);
         assert!(one.starts_with("/shared") && one.ends_with(".celld/dev"));
         assert!(!one.starts_with(&two) && !two.starts_with(&one));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // Host paths in a temporary directory.
+    fn clean_refuses_a_state_directory_reached_through_a_link() {
+        let directory = tempfile::tempdir().unwrap();
+        let victim = directory.path().join("victim");
+        std::fs::create_dir_all(victim.join(".celld/dev")).unwrap();
+        std::fs::write(victim.join(".celld/dev/keep"), "data").unwrap();
+        let shared = directory.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let project = Path::new("/work/app");
+        let state = DevState::resolve(project, Some(shared.clone()), None).unwrap();
+        std::os::unix::fs::symlink(&victim, shared.join(project_hash(project))).unwrap();
+        let error = state.discard().unwrap_err().to_string();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert!(victim.join(".celld/dev/keep").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // Host paths in a temporary directory.
+    fn the_per_project_directory_is_private_and_a_real_one_is_cleaned() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let state = DevState::resolve(
+            Path::new("/work/app"),
+            Some(directory.path().join("shared")),
+            None,
+        )
+        .unwrap();
+        state.prepare_shared_root().unwrap();
+        let root = state.shared_root.clone().unwrap();
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert!(!state.discard().unwrap());
+        prepare_state(state.path()).unwrap();
+        assert!(state.discard().unwrap());
     }
 
     #[test]
