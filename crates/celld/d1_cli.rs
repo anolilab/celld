@@ -676,6 +676,11 @@ impl Command {
         if state_dir.is_some() && !local {
             bail!("--state-dir belongs to --local");
         }
+        if local && unsafe_public_advertise {
+            bail!(
+                "--local only reaches a node on this host, and takes no --unsafe-public-advertise"
+            );
+        }
         if !exporting && (!tables.is_empty() || no_schema || no_data || output.is_some()) {
             bail!("--table, --no-schema, --no-data and --output belong to `celld d1 export`");
         }

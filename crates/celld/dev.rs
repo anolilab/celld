@@ -193,12 +193,17 @@ impl DevState {
         // A shared state directory is only checked, never tightened: another
         // user who can write next to it could swap a level for a link between
         // the check and the chmod. celld creates its levels private, so a
-        // loose one there is refused. A project-local level is judged by its
-        // target, and whoever can swap links in the project owns it anyway.
+        // loose one there is refused. A project-local level is tightened only
+        // when it is a real directory, never through a link.
         if self.shared_root.is_some() {
             return;
         }
         for level in self.levels() {
+            // A level that is a link may point at a directory shared with
+            // others; it is checked, never chmod-ed, and refused if loose.
+            if std::fs::symlink_metadata(&level).is_ok_and(|m| m.file_type().is_symlink()) {
+                continue;
+            }
             let Ok(resolved) = std::fs::metadata(&level) else {
                 continue;
             };
