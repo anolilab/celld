@@ -132,7 +132,10 @@ The `tail` and `email` handlers are unavailable.
   contain valid UTF-8.
 - AES-KW (RFC 3394) wraps and unwraps with 128-, 192- and 256-bit keys through
   `wrapKey()` and `unwrapKey()`. It has no `encrypt()` or `decrypt()`, as in
-  the specification.
+  the specification. Its usages are `wrapKey` and `unwrapKey` only (a
+  `SyntaxError` otherwise), and `generateKey()` and `deriveKey()` require a
+  `length` of 128, 192 or 256 (a `TypeError` when missing, an `OperationError`
+  otherwise).
 - A secret key cannot use `jwk` with `exportKey()` or `wrapKey()`.
 - An EC public key uses its uncompressed point (`0x04 || X || Y`) for the
   `raw` format, for ECDSA and ECDH on P-256, P-384 and P-521. `importKey()`
@@ -141,7 +144,8 @@ The `tail` and `email` handlers are unavailable.
 - RSA-PSS `sign()` and `verify()` require `saltLength` (an unsigned long; a
   missing, negative or non-finite value is a `TypeError`). `verify()` checks the
   length it is given, and `sign()` throws `OperationError` for a length the
-  modulus cannot hold.
+  modulus cannot hold, `InvalidAccessError` for a key that is not an RSA
+  private key, and `NotSupportedError` for a hash it has no PSS for.
 - A key is used only with the algorithm and usage it was made for: `encrypt()`,
   `decrypt()`, `wrapKey()` and `unwrapKey()` throw `InvalidAccessError`
   otherwise. `exportKey()` checks extractability first, and `raw` of a private
@@ -173,7 +177,8 @@ execution.
   generation.
 - `crypto.sign()` and `crypto.verify()` honour `padding` with
   `RSA_PKCS1_PSS_PADDING` and `saltLength` (ignored without PSS padding, and a
-  length the key cannot hold throws), and `dsaEncoding` with `der` or
+  length the key cannot hold throws, as does the default length for a key too
+  small for the digest), and `dsaEncoding` with `der` or
   `ieee-p1363`. A padding other than PKCS#1 v1.5 and PSS throws instead of
   signing another way.
 - `scrypt()` and `scryptSync()` take Node.js's parameters (`N`, `r`, `p`,

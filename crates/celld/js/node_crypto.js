@@ -1057,7 +1057,11 @@
   function signingKey(key, want, name) {
     const object = isKeyObject(key)
       ? key
-      : (key instanceof CryptoKey ? KeyObject.from(key) : createPrivateKey(key));
+      : (key instanceof CryptoKey
+        ? KeyObject.from(key)
+        // Node reads a PEM or DER given to verify() as a public key, and a
+        // private one yields its public half.
+        : (want === "public" ? createPublicKey(key) : createPrivateKey(key)));
     if (object.type !== want) {
       throw ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE(object.type, want);
     }
@@ -1105,12 +1109,12 @@
     const digest = digestInfo(hash)[1];
     if (saltLength === -1) return { scheme: "pss", saltLength: digest };
     if (saltLength === -2) {
-      return {
-        scheme: "pss",
-        saltLength: signing
-          ? Math.ceil((material.details.modulusLength - 1) / 8) - digest - 2
-          : null,
-      };
+      if (!signing) return { scheme: "pss", saltLength: null };
+      const max = Math.ceil((material.details.modulusLength - 1) / 8) - digest - 2;
+      if (max < 0)
+        throw new Error(
+          `the ${material.details.modulusLength}-bit RSA key is too small for PSS with a ${digest * 8}-bit digest`);
+      return { scheme: "pss", saltLength: max };
     }
     return { scheme: "pss", saltLength };
   }

@@ -39,9 +39,31 @@
   const _aesKeySizes = (name) =>
     _AES_KEY_BYTES[name].map((bytes) => bytes * 8).join(", ")
       .replace(/, (\d+)$/, " or $1");
+  // Key Wrap keys exist to wrap and unwrap, and Web Crypto refuses any other
+  // usage when one is imported or generated.
+  const _checkKwUsages = (usages) => {
+    if (!Array.from(usages || []).every(
+      (usage) => usage === "wrapKey" || usage === "unwrapKey")) {
+      throw new DOMException(
+        "AES-KW keys can only be used for: wrapKey, unwrapKey",
+        "SyntaxError");
+    }
+  };
+  // Key Wrap has no default size: `length` is required, and is 128, 192 or
+  // 256 bits.
+  const _kwLength = (length) => {
+    if (length === undefined || length === null) {
+      throw new TypeError("AES-KW requires a length");
+    }
+    const bits = Number(length);
+    if (!_AES_KEY_BYTES["AES-KW"].includes(bits / 8)) {
+      throw _operationError(`AES-KW length must be ${_aesKeySizes("AES-KW")}`);
+    }
+    return bits;
+  };
   // The host reports a refusal Web Crypto names as `Name: message`.
   const _fromHost = (error) => {
-    const named = /^(?:crypto: )?(NotSupportedError|DataError): ([^]*)$/
+    const named = /^(?:crypto: )?(NotSupportedError|DataError|OperationError|InvalidAccessError): ([^]*)$/
       .exec(String(error?.message ?? error));
     return named ? new DOMException(named[2], named[1]) : error;
   };
@@ -320,6 +342,7 @@
       }
       if (format === "raw" && _SECRET_KEY_ALGS.has(name)) {
         const raw = _toBuf(keyData).slice();
+        if (name === "AES-KW") _checkKwUsages(usages);
         // Only Key Wrap checks the size here; the other modes fail at use.
         if (name === "AES-KW" && !_AES_KEY_BYTES[name].includes(raw.byteLength)) {
           throw new DOMException(
@@ -570,7 +593,7 @@
       const name = _algorithmName(derived);
       // An HMAC key with no stated length defaults to its hash's block
       // size, which is what the spec's getKeyLength returns.
-      const length = derived?.length ??
+      const length = name === "AES-KW" ? _kwLength(derived?.length) : derived?.length ??
         (name === "AES-GCM" || name === "AES-CBC" || name === "AES-CTR"
           ? 256
           : name === "HMAC"
@@ -608,7 +631,12 @@
             { bytes: raw },
           );
         }
-        byteLength = Number(algorithm?.length || 256) / 8;
+        if (name === "AES-KW") {
+          _checkKwUsages(usages);
+          byteLength = _kwLength(algorithm?.length) / 8;
+        } else {
+          byteLength = Number(algorithm?.length || 256) / 8;
+        }
         if (!_AES_KEY_BYTES[name].includes(byteLength)) {
           throw new DOMException(
             `${name} length must be ${_aesKeySizes(name)}`, "OperationError");
@@ -736,9 +764,7 @@
           saltLength,
         });
       } catch (error) {
-        // A salt the key cannot hold is the only failure the caller causes.
-        if (name !== "RSA-PSS") throw error;
-        throw _operationError(String(error?.message ?? error));
+        throw _fromHost(error);
       }
       return Uint8Array.from(result.bytes).buffer;
     }

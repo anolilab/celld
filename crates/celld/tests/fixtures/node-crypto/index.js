@@ -379,6 +379,18 @@ const checks = {
       try { crypto.sign("sha256", message, { key: KEYS.rsa.private, ...pss(saltLength) }); } catch { threw = true; }
       equal(threw, true, `PSS saltLength ${saltLength} throws`);
     }
+    // A PEM public key given beside the options verifies, and so does a
+    // private PEM, which yields its public half.
+    const publicPem = pub.export({ type: "spki", format: "pem" });
+    equal(crypto.verify("sha256", message, { key: publicPem, padding: PSS_PADDING }, own), true, "PSS verify with a public PEM");
+    equal(crypto.verify("sha256", message, { key: KEYS.rsa.private, padding: PSS_PADDING }, own), true, "PSS verify with a private PEM");
+    equal(crypto.verify("sha256", message, publicPem, plain), true, "PKCS#1 v1.5 verify with a bare public PEM");
+    // A key too small for the digest says so, rather than asking for a saltLength.
+    // A 512-bit key, which cannot be generated here, so it is a fixed PEM.
+    const small = "-----BEGIN PRIVATE KEY-----\nMIIBVgIBADANBgkqhkiG9w0BAQEFAASCAUAwggE8AgEAAkEAxSOGbv8MDw+B2Atg\nPszhkYGRTxBivAxCUsH5rp85YsOVdI/Nyit33G60L6493m5wP6DymdpW7OAIU6dL\n610+DQIDAQABAkEAqBfPhAtS8/CMDXQ9v66g05oAFcNp/OATGU+unzfDDbMo/3Js\ncCEuWM6REReDmdgxB75xyzK7rcX6dlsCUP4dfQIhAPNyqJeyaWnc4pkYhbD0K2n5\n1Hcl7zY3RvOsXi3udYgfAiEAz02eY8AvrgOFAW7UfflppO/c9U3iG6duFK8afwMq\nZFMCIQC/b2dRupMYEwEBIH5osui8sh83/lWIDZm2ndGFTuGPQwIhAIOWQXQQCjPr\nCAJg14EfUG/h0d/kECJ9pOJ8Q9VbrQ0BAiAeINXa8l0bZh/I40B5DL0Hhu33SJPW\nekFyoCah657ncg==\n-----END PRIVATE KEY-----\n";
+    let tooSmall;
+    try { crypto.sign("sha512", message, { key: small, padding: PSS_PADDING }); } catch (error) { tooSmall = error.message; }
+    equal(/too small/.test(tooSmall), true, `512-bit key with sha512 PSS: ${tooSmall}`);
     // ECDSA signatures are DER unless IEEE P1363 is asked for.
     for (const [curve, size] of [["p256", 32], ["p384", 48], ["p521", 66]]) {
       const key = crypto.createPublicKey(KEYS[curve].private);

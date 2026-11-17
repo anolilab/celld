@@ -137,6 +137,24 @@ const V = {
     "pkcs8": "302e020100300506032b656e04220420f0df55bb4ae320cfd4f5f3a37c67cbd156f058b9a2b226903b313cba26f96d74",
     "peer": "302a300506032b656e03210000164085139c6b1d451f6eabf3d62ae066e143f8f7c4b1ce95ba1ad62e923c67",
     "shared": "0c1a33f52050e9b4b645e98e0c45cf591cfffc6b1fdf330dfcc47e732285ad12"
+  },
+  "AES-KW": {
+    "128": {
+      "kek": "808182838485868788898a8b8c8d8e8f",
+      "wrapped": "978e0b2d9409e9e9eae6513a532970b01ed665b73e844ee0"
+    },
+    "192": {
+      "kek": "808182838485868788898a8b8c8d8e8f9091929394959697",
+      "wrapped": "3eb5a80f3d4694a13f57f5d26ce420fbf995910fbeab97f6"
+    },
+    "256": {
+      "kek": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+      "wrapped": "fe1743aa34fb4ce9d87ba9f0dcb4d7db2699c0d85e633025"
+    },
+    "jwk": {
+      "kek": "808182838485868788898a8b8c8d8e8f",
+      "wrapped": "d50f91d24bb4a00016ee15ba6dff2e50600efd4b5c5cb7e6d64081fbe114af3a1f8ba96be66297029f3a57d08d851417bf5d04c30fc8b71af3d25602cf965e088e10ec17a7bf607ecc29847ef90f11bb3bc4511965d9f244c7ce46ceb1ea4497708800043c80d6d36929e69c847c5b00875b612d045037042b3bd5850fe2f86b21a9e155256eeba4"
+    }
   }
 };
 // END VECTORS
@@ -332,6 +350,13 @@ const checks = {
     for (const saltLength of [223, 1e6, 4e9]) {
       equal(await outcome(subtle.sign({ name: "RSA-PSS", saltLength }, priv, message)), "OperationError", `sign with saltLength ${saltLength}`);
     }
+    // Only the salt is the caller's to fix as an OperationError: a key that is
+    // not an RSA private key is an InvalidAccessError, and a hash the host has
+    // no PSS for is a NotSupportedError.
+    const ec = await subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+    equal(await outcome(subtle.sign({ name: "RSA-PSS", saltLength: 32 }, ec.privateKey, message)), "InvalidAccessError", "sign with an EC key");
+    const sha1 = await subtle.importKey("pkcs8", unhex(vector.pkcs8), { name: "RSA-PSS", hash: "SHA-1" }, false, ["sign"]);
+    equal(await outcome(subtle.sign({ name: "RSA-PSS", saltLength: 20 }, sha1, message)), "NotSupportedError", "sign with SHA-1");
   },
   // A key is used only with the algorithm and usage it was made for.
   async "AES key use"() {
@@ -450,6 +475,27 @@ const checks = {
       const back = await subtle.unwrapKey("raw", unhex(wrapped), wrapping, "AES-KW", "AES-CBC", true, ["encrypt"]);
       equal(hex(await subtle.exportKey("raw", back)), hex(keyData), "unwrapped key");
     }
+    // Node's wrapped keys: each size, and a public key as a JWK, which Web Crypto pads with
+    // spaces. Wrapping a raw key is deterministic, so celld's output must match, and
+    // celld must unwrap what Node made.
+    const publicKey = await subtle.importKey("spki", unhex(V.Ed25519.spki), "Ed25519", true, ["verify"]);
+    for (const [size, vector] of Object.entries(V["AES-KW"])) {
+      const jwk = size === "jwk";
+      const own = await kek(vector.kek);
+      const sealed = await subtle.wrapKey(jwk ? "jwk" : "raw", jwk ? publicKey : target, own, "AES-KW");
+      // A JWK's members and their order are each library's own, so its wrapped bytes are
+      // not comparable: celld must unwrap Node's, and its own must come back, with the
+      // padding a JWK needs to fill whole 8-byte registers.
+      if (jwk) {
+        equal(sealed.byteLength % 8, 0, "wrapped JWK is whole registers");
+        const back = await subtle.unwrapKey("jwk", sealed, own, "AES-KW", "Ed25519", true, ["verify"]);
+        equal(hex(await subtle.exportKey("spki", back)), V.Ed25519.spki, "own JWK round trip");
+      } else equal(hex(sealed), vector.wrapped, `Node wrap, ${size}`);
+      const opened = jwk
+        ? await subtle.unwrapKey("jwk", unhex(vector.wrapped), own, "AES-KW", "Ed25519", true, ["verify"])
+        : await subtle.unwrapKey("raw", unhex(vector.wrapped), own, "AES-KW", "AES-CBC", true, ["encrypt"]);
+      equal(hex(await subtle.exportKey(jwk ? "spki" : "raw", opened)), jwk ? V.Ed25519.spki : hex(keyData), `Node unwrap, ${size}`);
+    }
     const wrapping = await kek("000102030405060708090a0b0c0d0e0f");
     const outcome = (promise) => promise.then(() => "ok", (error) => error.name);
     const altered = new Uint8Array(unhex("1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5"));
@@ -459,6 +505,22 @@ const checks = {
     equal(await outcome(subtle.unwrapKey("raw", unhex("1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5"), wrapOnly, "AES-KW", "AES-CBC", true, ["encrypt"])), "InvalidAccessError", "unwrap without the usage");
     equal(await outcome(subtle.encrypt({ name: "AES-KW" }, wrapping, keyData)), "NotSupportedError", "AES-KW has no encrypt");
     equal(await outcome(subtle.importKey("raw", new Uint8Array(15), "AES-KW", true, unwrapUsages)), "DataError", "a 120-bit key");
+    // Only wrapKey and unwrapKey are usages of a Key Wrap key, and its size is never defaulted.
+    equal(await outcome(subtle.importKey("raw", unhex("000102030405060708090a0b0c0d0e0f"), "AES-KW", true, ["encrypt"])), "SyntaxError", "import with encrypt");
+    equal(await outcome(subtle.generateKey({ name: "AES-KW", length: 128 }, true, ["wrapKey", "decrypt"])), "SyntaxError", "generate with decrypt");
+    equal(await outcome(subtle.generateKey({ name: "AES-KW" }, true, unwrapUsages)), "TypeError", "generate without a length");
+    equal(await outcome(subtle.generateKey({ name: "AES-KW", length: 64 }, true, unwrapUsages)), "OperationError", "generate with a 64-bit length");
+    // A derived Key Wrap key needs its size too, whatever the base algorithm.
+    const hkdf = await subtle.importKey("raw", unhex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"), "HKDF", false, ["deriveKey"]);
+    const hkdfParams = { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(4), info: new Uint8Array(4) };
+    const ecdhPair = await subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveKey"]);
+    const ecdhParams = { name: "ECDH", public: ecdhPair.publicKey };
+    for (const [params, base] of [[hkdfParams, hkdf], [ecdhParams, ecdhPair.privateKey]]) {
+      equal(await outcome(subtle.deriveKey(params, base, { name: "AES-KW" }, true, unwrapUsages)), "TypeError", `${params.name} derive without a length`);
+      equal(await outcome(subtle.deriveKey(params, base, { name: "AES-KW", length: 100 }, true, unwrapUsages)), "OperationError", `${params.name} derive with a 100-bit length`);
+      const derived = await subtle.deriveKey(params, base, { name: "AES-KW", length: 128 }, true, unwrapUsages);
+      equal(derived.algorithm.length, 128, `${params.name} derived length`);
+    }
     const generated = await subtle.generateKey({ name: "AES-KW", length: 256 }, true, unwrapUsages);
     const sealed = await subtle.wrapKey("raw", target, generated, "AES-KW");
     equal(sealed.byteLength, 24, "wrapped length");

@@ -105,6 +105,21 @@ const xa = await pair({ name: "X25519" }, ["deriveBits"]);
 const xb = await pair({ name: "X25519" }, ["deriveBits"]);
 out.X25519 = { pkcs8: xa.pkcs8, peer: xb.spki, shared: hex(await subtle.deriveBits({ name: "X25519", public: xb.keys.publicKey }, xa.keys.privateKey, 256)) };
 
+// AES-KW is deterministic: the same key wraps the same key to the same
+// bytes, so the wrapped values are compared exactly for each key size. A
+// public key as a JWK is stored too, padded with spaces to whole 8-byte
+// registers: its members come in the library's own order, so the fixture
+// unwraps it rather than comparing bytes.
+out["AES-KW"] = {};
+const kwTarget = await subtle.importKey("raw", Uint8Array.from({ length: 16 }, (_, i) => 0x11 * i), "AES-CBC", true, ["encrypt"]);
+const kwPublic = await subtle.importKey("spki", Buffer.from(out.Ed25519.spki, "hex"), "Ed25519", true, ["verify"]);
+for (const size of [16, 24, 32, "jwk"]) {
+  const kek = Uint8Array.from({ length: size === "jwk" ? 16 : size }, (_, i) => 0x80 + i);
+  const wrapping = await subtle.importKey("raw", kek, "AES-KW", false, ["wrapKey"]);
+  const format = size === "jwk" ? "jwk" : "raw";
+  out["AES-KW"][size === "jwk" ? "jwk" : size * 8] = { kek: hex(kek), wrapped: hex(await subtle.wrapKey(format, size === "jwk" ? kwPublic : kwTarget, wrapping, "AES-KW")) };
+}
+
 // The fixture is one file because a `no_bundle` deploy ships only its main
 // module, so the vectors live in index.js between the markers.
 import { readFileSync, writeFileSync } from "node:fs";

@@ -45,12 +45,12 @@ fn pss_max_salt_len(modulus_bits: u32, hash: &str) -> Result<u64> {
         "SHA-256" => 32,
         "SHA-384" => 48,
         "SHA-512" => 64,
-        other => return Err(anyhow!("unsupported RSA hash {other}")),
+        other => return Err(anyhow!("NotSupportedError: unsupported RSA hash {other}")),
     };
     let em_len = u64::from(modulus_bits.saturating_sub(1)).div_ceil(8);
     em_len
         .checked_sub(hash_len + 2)
-        .ok_or_else(|| anyhow!("RSA key is too small for {hash} PSS"))
+        .ok_or_else(|| anyhow!("OperationError: RSA key is too small for {hash} PSS"))
 }
 
 /// The OS RNG in the `rand_core` 0.10 shape the RustCrypto crates take.
@@ -925,13 +925,13 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("SHA-256");
             let key = rsa::PrivateKey::from_pkcs8_der(&key)
-                .map_err(|_| anyhow!("invalid RSA private key"))?;
+                .map_err(|_| anyhow!("InvalidAccessError: invalid RSA private key"))?;
             // A salt the modulus cannot hold is refused before the signer
             // allocates it or asserts on it.
             let max = pss_max_salt_len(key.n().bit_width(), hash)?;
             if salt_len > max {
                 return Err(anyhow!(
-                    "RSA-PSS saltLength {salt_len} is larger than the {max} this key allows"
+                    "OperationError: RSA-PSS saltLength {salt_len} is larger than the {max} this key allows"
                 ));
             }
             let salt_len = salt_len as usize;
