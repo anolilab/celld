@@ -53,9 +53,16 @@ Sleeps that complete at once count toward that progress like steps do.
 
 One attempt of a step ends after at most 90% of the budget, even when its
 `timeout` is longer. It then fails like any timed-out attempt, and its retries
-apply. An attempt never outlives its turn: a step that would get less than its
-full timeout in the current turn starts in a fresh one. Keep a single step
-shorter than that, or split it.
+apply. An attempt never outlives its turn: it gets at most what is left of the turn.
+A turn that has run something starts the next step only while at least half the
+budget (or the step's `timeout`, if that is shorter) remains, so quick steps
+with the default timeout share a turn, and a step that would get less starts in
+a fresh one. Consuming an event counts as progress like running a step. Keep a
+single step shorter than the budget, or split it.
+
+Turn age and the age of a stale drive are measured with the isolate's clock,
+which is the wall clock sampled at the last I/O; the isolate has no monotonic
+clock. A large clock jump can therefore end a turn early or late.
 
 A new turn replays the finished steps first. The replay alone must fit in half
 the budget, so a run of many thousands of steps can outgrow it.

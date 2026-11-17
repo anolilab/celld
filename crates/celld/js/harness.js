@@ -8947,19 +8947,25 @@ const __wfMakeStep = (driver) => {
       // An attempt must end before its handler does. The handler's expiry
       // would cancel it without recording a failure, so the step would run
       // again unchanged. A timeout records the failure instead and the retry
-      // policy applies. The cap is what is left of 90% of the budget; a step
-      // that would not get its full timeout starts in a fresh turn instead.
-      const wanted = Math.min(
-        __wfDuration(timeout, `the timeout of step ${JSON.stringify(name)}`),
-        Math.floor(__cell.handlerBudgetMs * 0.9),
+      // policy applies. The attempt gets the least of its timeout, 90% of the
+      // budget, and what is left of that. A turn that has run something
+      // hands over instead when less than the smaller of the timeout and half
+      // the budget is left, so a step with the default timeout still runs in
+      // the current turn while half the budget remains.
+      const userTimeout = __wfDuration(
+        timeout,
+        `the timeout of step ${JSON.stringify(name)}`,
       );
-      const remaining = Math.floor(__cell.handlerBudgetMs * 0.9) -
-        (Date.now() - driver.startedMs);
-      if (driver.executed > 0 && remaining < wanted) {
+      const cap = Math.floor(__cell.handlerBudgetMs * 0.9);
+      const remaining = cap - (Date.now() - driver.startedMs);
+      if (
+        driver.executed > 0 &&
+        remaining < Math.min(userTimeout, Math.floor(__cell.handlerBudgetMs / 2))
+      ) {
         return { block: Date.now(), kind: "yield" };
       }
       driver.executed += 1;
-      const timeoutMs = Math.max(1, Math.min(wanted, remaining));
+      const timeoutMs = Math.max(1, Math.min(userTimeout, cap, remaining));
       // Upstream omits a dynamic delay from the step context. Copying the
       // config verbatim would expose the callback to itself as retry policy,
       // while callers expect only the serializable limit and backoff fields.
@@ -9193,6 +9199,8 @@ const __wfMakeStep = (driver) => {
             // A crash can therefore expose both or neither, so an
             // acknowledged event cannot disappear between them.
             storage.kv.delete(eventKey);
+            // Consuming an event is progress; replaying a completed one is not.
+            driver.executed += 1;
             /*__CELLD_TEST_WORKFLOW_EVENT_CONSUMED__*/
             storage.kv.put(key, {
               kind: "event",

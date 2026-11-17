@@ -63,7 +63,7 @@ export class Undo extends WorkflowEntrypoint {
 export class Late extends WorkflowEntrypoint {
   async run(event, step) {
     await step.do("first", async () => {
-      await sleep(500);
+      await sleep(900);
     });
     return await step.do(
       "second",
@@ -92,6 +92,40 @@ export class Naps extends WorkflowEntrypoint {
       await count(this.env, "naps", `/max?value=${Date.now() - started}`);
     }
     return { done: event.payload.steps };
+  }
+}
+
+// Quick steps with the default timeout. Each turn counts itself, so a test can
+// see how many turns the steps took: they must share turns, not take one each.
+export class Quick extends WorkflowEntrypoint {
+  async run(event, step) {
+    await count(this.env, "quick", "/inc");
+    for (let i = 1; i <= event.payload.steps; i++) {
+      await step.do(`step ${i}`, async () => i);
+    }
+    return { done: event.payload.steps };
+  }
+}
+
+// An event consumed in a turn, then a long stretch in run(), then a step that
+// needs 600 ms. The consumed event is progress, so the step must wait for a
+// fresh turn instead of starting with the 300 ms left in this one.
+export class Evt extends WorkflowEntrypoint {
+  async run(event, step) {
+    await step.waitForEvent("go", { type: "poke", timeout: "1 minute" });
+    const seen = (globalThis.__evtSeen ??= new Set());
+    if (!seen.has(event.instanceId)) {
+      seen.add(event.instanceId);
+      await sleep(1500);
+    }
+    return await step.do(
+      "after",
+      { retries: { limit: 0, delay: 1 } },
+      async () => {
+        await sleep(600);
+        return "ok";
+      },
+    );
   }
 }
 
@@ -147,6 +181,8 @@ export default {
       late: env.LATE,
       naps: env.NAPS,
       fence: env.FENCE,
+      quick: env.QUICK,
+      evt: env.EVT,
     }[url.searchParams.get("flow")] ?? env.SLOW;
     if (url.pathname === "/count") {
       return Response.json({ n: await count(env, url.searchParams.get("key")) });

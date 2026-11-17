@@ -33,6 +33,16 @@
       "binding": "FENCE",
       "name": "fence",
       "class_name": "Fence"
+    },
+    {
+      "binding": "QUICK",
+      "name": "quick",
+      "class_name": "Quick"
+    },
+    {
+      "binding": "EVT",
+      "name": "evt",
+      "class_name": "Evt"
     }
   ],
   "durable_objects": {

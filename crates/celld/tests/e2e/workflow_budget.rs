@@ -89,7 +89,8 @@ async fn count(server: &Server, key: &str) -> u64 {
 #[tokio::test]
 async fn a_step_that_cannot_get_its_full_timeout_starts_in_a_fresh_turn() {
     let server = Server::start("workflow-budget", &[BUDGET]).await;
-    // The second step wants 1.7 s but only about 1.3 s of the 1.8 s cap is left.
+    // The second step wants 1.7 s but only about 0.9 s of the 1.8 s cap is left,
+    // less than half the budget.
     server.get_text("/start?flow=late").await;
 
     let done = finished(&server, "late").await;
@@ -138,4 +139,33 @@ async fn a_fenced_drive_cannot_overwrite_the_record_of_its_replacement() {
     assert_eq!(done["output"]["value"], "ok", "{done}");
     // The fenced drive's retry record would send the replay back into the step.
     assert_eq!(count(&server, "fence").await, 2);
+}
+
+#[tokio::test]
+async fn quick_steps_with_the_default_timeout_share_a_turn() {
+    let server = Server::start("workflow-budget", &[BUDGET]).await;
+    server.get_text("/start?flow=quick&steps=8").await;
+
+    let done = finished(&server, "quick").await;
+
+    assert_eq!(done["status"], "complete", "{done}");
+    assert_eq!(done["output"]["done"], 8, "{done}");
+    // Each step used to hand over at once, as the default timeout is longer
+    // than the cap: one turn per step.
+    let turns = count(&server, "quick").await;
+    assert!(turns <= 2, "eight quick steps took {turns} turns");
+}
+
+#[tokio::test]
+async fn a_consumed_event_counts_as_progress_for_the_turn() {
+    let server = Server::start("workflow-budget", &[BUDGET]).await;
+    server.get_text("/start?flow=evt").await;
+    server.get_text("/poke?flow=evt").await;
+
+    let done = finished(&server, "evt").await;
+
+    // Without the progress the step started with the 300 ms left of the turn,
+    // timed out, and had no retries.
+    assert_eq!(done["status"], "complete", "{done}");
+    assert_eq!(done["output"], "ok", "{done}");
 }
