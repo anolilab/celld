@@ -33,6 +33,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: nightly-${{ matrix.toolchain }}
+      - run: .github/scripts/install-esbuild.sh
       - run: cargo +${{ matrix.toolchain }} test --workspace --locked
       - run: cargo +${{ matrix.toolchain }} clippy --workspace --all-targets --locked -- -D warnings
 

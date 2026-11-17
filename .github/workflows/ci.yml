@@ -73,6 +73,7 @@ jobs:
           docker run -d --name rustfs -p 9000:9000 rustfs/rustfs:1.0.5
           timeout 60 sh -c 'until aws s3 ls >/dev/null 2>&1; do sleep 1; done'
           aws s3 mb s3://contract
+      - run: .github/scripts/install-esbuild.sh
       - run: cargo test --workspace --locked
         env:
           CELLD_STORE_CONTRACT_BUCKET: s3://contract

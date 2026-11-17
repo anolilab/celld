@@ -585,14 +585,21 @@ pub fn deploy(fixture: &str, project: &Path, extra: &[&str], esbuild: Option<&st
 }
 
 /// The esbuild a test may use: `CELLD_ESBUILD`, or `esbuild` on the path.
+/// A test without one skips locally, but under CI a missing esbuild fails the
+/// test, because a skip there would pass without running anything.
 pub fn esbuild() -> Option<String> {
     let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
-    Command::new(&binary)
+    let found = Command::new(&binary)
         .arg("--version")
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .map(|_| binary)
+        .map(|_| binary);
+    assert!(
+        found.is_some() || std::env::var_os("CI").is_none(),
+        "esbuild is required under CI: set CELLD_ESBUILD"
+    );
+    found
 }
 
 /// A loopback server standing in for an internal service. It counts the
