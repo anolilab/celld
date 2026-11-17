@@ -6239,6 +6239,7 @@ ops! { OP_NAMES, install_op_functions,
         "__heap_limit_excessively_exceeded" =>
             op_heap_limit_excessively_exceeded,
         "__heap_over_admission_share" => op_heap_over_admission_share,
+        "__test_probes" => op_test_probes,
         "__ws_send" => websocket::op_ws_send,
         "__ws_send_binary" => websocket::op_ws_send_binary,
         "__ws_close" => websocket::op_ws_close,
@@ -9660,6 +9661,17 @@ fn op_heap_limit_excessively_exceeded(
     rv.set(v8::Boolean::new(scope, exceeded).into());
 }
 /// Whether this isolate is too close to its heap limit to retain more state.
+/// Whether the node was started with `CELLD_TEST_PROBES`, which lets the
+/// harness show a test-only global. A Worker cannot set the node's environment.
+fn op_test_probes(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let on = std::env::var_os("CELLD_TEST_PROBES").is_some();
+    rv.set(v8::Boolean::new(scope, on).into());
+}
+
 fn op_heap_over_admission_share(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,

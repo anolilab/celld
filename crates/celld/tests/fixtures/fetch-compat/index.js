@@ -126,6 +126,13 @@ export default {
       for (const result of results) result[Symbol.dispose]?.();
       return Response.json({ stubOnly: held[0], withPlain: held[1] });
     }
+    if (url.pathname === "/probe") {
+      return Response.json({
+        probe: typeof globalThis.__celld_stub_entries,
+        names: Object.getOwnPropertyNames(globalThis).filter((name) =>
+          name.startsWith("__celld")),
+      });
+    }
     return new Response("not found", { status: 404 });
   },
 };

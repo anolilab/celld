@@ -83,17 +83,30 @@ impl Origin {
                     let mut request_line = head.split_whitespace();
                     let method = request_line.next().unwrap_or("GET").to_string();
                     let path = request_line.next().unwrap_or("/").to_string();
-                    seen.lock().unwrap().push(
-                        head.lines()
-                            .find_map(|line| line.strip_prefix("accept-encoding: "))
-                            .map(str::to_string),
-                    );
+                    seen.lock().unwrap().push(head.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("accept-encoding")
+                            .then(|| value.trim().to_string())
+                    }));
                     let mut answer = match path.as_str() {
                         "/gzip" => reply(Some("gzip"), gzipped.clone()),
                         "/br" => reply(Some("br"), brotlied),
                         "/zstd" => reply(Some("zstd"), b"not really zstd".to_vec()),
                         "/members" => reply(Some("gzip"), members),
                         "/bomb" => reply(Some("br"), bomb),
+                        // A coding name is not case sensitive.
+                        "/mixed-case" => reply(Some("GZip"), gzipped.clone()),
+                        // Not gzip at all, from the first byte.
+                        "/corrupt" => reply(Some("gzip"), b"this is not gzip".to_vec()),
+                        // Announces 100 bytes and closes before sending any.
+                        "/cut" => Reply {
+                            body: Vec::new(),
+                            headers: vec![
+                                ("content-encoding", "gzip".into()),
+                                ("content-length", "100".into()),
+                            ],
+                            ..reply(None, Vec::new())
+                        },
                         "/empty" => reply(Some("gzip"), Vec::new()),
                         // Two header lines are a list of codings, not one.
                         "/twice" => {
@@ -108,6 +121,11 @@ impl Origin {
                         },
                         "/204" => Reply {
                             status: "204 No Content",
+                            headers: vec![("content-encoding", "gzip".into())],
+                            body: Vec::new(),
+                        },
+                        "/205" => Reply {
+                            status: "205 Reset Content",
                             headers: vec![("content-encoding", "gzip".into())],
                             body: Vec::new(),
                         },
@@ -422,6 +440,49 @@ async fn a_gzip_body_of_several_members_is_decoded_whole() {
 }
 
 #[tokio::test]
+async fn a_coding_name_is_matched_without_regard_to_case() {
+    let origin = Origin::start().await;
+    let port = origin.port;
+    let server = Server::start("fetch-compat", &[]).await;
+    let result = fetch(
+        &server,
+        &format!("http://127.0.0.1:{port}/mixed-case"),
+        None,
+    )
+    .await;
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["text"], BODY, "{result}");
+    assert_eq!(result["contentEncoding"], Value::Null, "{result}");
+}
+
+#[tokio::test]
+async fn a_205_keeps_its_headers_and_reads_as_empty() {
+    let origin = Origin::start().await;
+    let port = origin.port;
+    let server = Server::start("fetch-compat", &[]).await;
+    let result = fetch(&server, &format!("http://127.0.0.1:{port}/205"), None).await;
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["status"], 205, "{result}");
+    assert_eq!(result["contentEncoding"], "gzip", "{result}");
+    assert_eq!(result["size"], 0, "{result}");
+}
+
+#[tokio::test]
+async fn a_body_that_fails_before_its_first_byte_is_an_error_not_an_empty_body() {
+    let origin = Origin::start().await;
+    let port = origin.port;
+    let server = Server::start("fetch-compat", &[]).await;
+    for path in ["cut", "corrupt"] {
+        let result = fetch(&server, &format!("http://127.0.0.1:{port}/{path}"), None).await;
+        assert_eq!(result["ok"], false, "{path}: {result}");
+    }
+    // A body that really is empty still reads as empty.
+    let result = fetch(&server, &format!("http://127.0.0.1:{port}/empty"), None).await;
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["size"], 0, "{result}");
+}
+
+#[tokio::test]
 async fn a_body_that_expands_without_bound_ends_with_an_error() {
     let origin = Origin::start().await;
     let port = origin.port;
@@ -439,9 +500,17 @@ async fn a_body_that_expands_without_bound_ends_with_an_error() {
 
 #[tokio::test]
 async fn forwarding_a_plain_result_beside_a_stub_holds_no_entry_for_it() {
-    let server = Server::start("fetch-compat", &[]).await;
+    let server = Server::start("fetch-compat", &[("CELLD_TEST_PROBES", "1")]).await;
     let result: Value = server.get_json("/forward").await;
     // The no-op disposer on a plain result releases nothing, so forwarding the
     // result adds nothing to what the stub alone holds.
     assert_eq!(result["withPlain"], result["stubOnly"], "{result}");
+}
+
+#[tokio::test]
+async fn worker_code_cannot_see_the_test_probe() {
+    let server = Server::start("fetch-compat", &[]).await;
+    let result: Value = server.get_json("/probe").await;
+    assert_eq!(result["probe"], "undefined", "{result}");
+    assert_eq!(result["names"], serde_json::json!([]), "{result}");
 }

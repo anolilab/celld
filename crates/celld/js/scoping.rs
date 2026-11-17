@@ -212,6 +212,7 @@ pub(super) fn own_cell_arg(
 const NOT_CELL_SCOPED: &[&str] = &[
     "__heap_limit_excessively_exceeded",
     "__heap_over_admission_share",
+    "__test_probes",
     "__ws_send",
     "__ws_send_binary",
     "__ws_close",

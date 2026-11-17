@@ -4136,8 +4136,9 @@ const __ctxAbortCurrent =
 // running its target, the handle's for the serialize-elsewhere
 // check.
 const __stubEntries = new Map();
-// How many stubs and disposers the isolate holds; the RPC tests read it.
-globalThis.__celld_stub_entries = () => __stubEntries.size;
+// How many stubs and disposers the isolate holds. Only a node started with
+// `CELLD_TEST_PROBES` in its environment, which a Worker cannot set, shows it.
+if (__test_probes()) globalThis.__celld_stub_entries = () => __stubEntries.size;
 const __stubMeta = new WeakMap();
 // Keep the Durable Object brand outside the user-visible object. Reading a
 // string property here would invoke an inherited getter before validation can

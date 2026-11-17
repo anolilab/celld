@@ -3,7 +3,7 @@
 use crate::engine_api::HttpChunkStream;
 use futures_util::StreamExt as _;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Decoded bytes read before the expansion check starts. A small body may
@@ -19,8 +19,8 @@ const MAX_EXPANSION: u64 = 1024;
 const DECODED_CHUNK_BYTES: usize = 64 * 1024;
 
 /// A response `Content-Encoding` that `fetch()` decodes for the Worker: a
-/// single `gzip` or `br` value, matched exactly. Any other value, including a
-/// list of codings, reaches the Worker as sent.
+/// single `gzip` or `br` value, matched without regard to case (RFC 9110). Any
+/// other value, including a list of codings, reaches the Worker as sent.
 #[derive(Clone, Copy)]
 pub(crate) enum ResponseEncoding {
     Gzip,
@@ -28,23 +28,27 @@ pub(crate) enum ResponseEncoding {
 }
 
 impl ResponseEncoding {
-    /// The coding to decode, if any. A response to `HEAD`, a `204` and a `304`
-    /// have no body to decode, and keep their headers.
+    /// The coding to decode, if any. A response to `HEAD`, an informational
+    /// status, a `204`, a `205` and a `304` have no body to decode, and keep
+    /// their headers.
     pub(crate) fn of(
         method: &reqwest::Method,
         status: reqwest::StatusCode,
         headers: &reqwest::header::HeaderMap,
     ) -> Option<Self> {
         if method == reqwest::Method::HEAD
+            || status.is_informational()
             || status == reqwest::StatusCode::NO_CONTENT
+            || status == reqwest::StatusCode::RESET_CONTENT
             || status == reqwest::StatusCode::NOT_MODIFIED
         {
             return None;
         }
         let mut values = headers.get_all(reqwest::header::CONTENT_ENCODING).iter();
-        match (values.next()?.as_bytes(), values.next()) {
-            (b"gzip", None) => Some(Self::Gzip),
-            (b"br", None) => Some(Self::Brotli),
+        let (first, second) = (values.next()?.as_bytes(), values.next());
+        match second {
+            None if first.eq_ignore_ascii_case(b"gzip") => Some(Self::Gzip),
+            None if first.eq_ignore_ascii_case(b"br") => Some(Self::Brotli),
             _ => None,
         }
     }
@@ -54,12 +58,19 @@ impl ResponseEncoding {
         use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder};
         let encoded = Arc::new(AtomicU64::new(0));
         let counted = encoded.clone();
+        // Set when the connection fails, to tell that from a body that is
+        // empty: both leave no encoded bytes behind.
+        let broken = Arc::new(AtomicBool::new(false));
+        let failed = broken.clone();
         let body = tokio_util::io::StreamReader::new(response.bytes_stream().map(move |chunk| {
             chunk
                 .inspect(|bytes| {
                     counted.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 })
-                .map_err(std::io::Error::other)
+                .map_err(|error| {
+                    failed.store(true, Ordering::Relaxed);
+                    std::io::Error::other(error)
+                })
         }));
         let decoded: Pin<Box<dyn tokio::io::AsyncRead + Send>> = match self {
             Self::Gzip => {
@@ -93,8 +104,14 @@ impl ResponseEncoding {
                                 }
                             }
                             // A body with no bytes at all has nothing to
-                            // decode, and reads as empty.
-                            Err(_) if encoded.load(Ordering::Relaxed) == 0 => None,
+                            // decode, and reads as empty. A connection that
+                            // failed before the first byte is an error.
+                            Err(_)
+                                if encoded.load(Ordering::Relaxed) == 0
+                                    && !broken.load(Ordering::Relaxed) =>
+                            {
+                                None
+                            }
                             Err(error) => {
                                 *finished = true;
                                 Some(Err(format!("response stream: {error}")))
