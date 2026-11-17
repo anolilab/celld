@@ -138,6 +138,10 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         let auth = crate::peer_auth::load_existing(&bucket)
             .await
             .map_err(|error| not_running(&format!("{error:#}")))?;
+        // The node proves it holds the key its lease names, with the fleet secret,
+        // before the token goes to the address in its lease: a lease outlives
+        // its node, and another local user may have bound the port since.
+        let proof = crate::peer_auth::PeerAuth::new(auth, "d1")?;
         let auth = crate::peer_auth::PeerAuth::new(auth, "d1")?.with_operator_token(Some(token));
         Reachable::open_at(
             &bucket,
@@ -149,6 +153,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         .await
         .map_err(|error| not_running(&format!("{error:#}")))?
         .when_unreachable(not_running(&"the node does not answer").to_string())
+        .proving_the_node(proof)?
     } else {
         let storage = command.fleet.clone().resolve("celld d1")?;
         Reachable::open(

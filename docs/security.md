@@ -40,8 +40,8 @@ path, so an operator request cannot become an application request.
 The internal listener has three request groups, and all three require the
 trusted private network:
 
-- Every route requires the [operator token](#require-an-operator-token),
-  which is on by default.
+- Every route but the signed probe requires the
+  [operator token](#require-an-operator-token), which is on by default.
 - `/peer/tunnel` opens a tunnel for cell fetch, RPC, and WebSocket calls. The
   establishment request carries the fleet HMAC, a clock limit, and replay
   protection. The calls inside the tunnel are plain, unsigned HTTP.
@@ -91,12 +91,20 @@ setting that turns it off. A node takes the token from `CELLD_OPERATOR_TOKEN`:
   file in `.celld/dev` and sets `CELLD_OPERATOR_TOKEN_FILE` for the node. Its
   node never takes `CELLD_OPERATOR_TOKEN`, so a token the shell holds for a
   fleet does not become the development token. `celld dev` and
-  `celld d1 --local` read that file.
+  `celld d1 --local` read that file. A node's lease outlives the node, so
+  `celld d1 --local` first sends the signed probe, without the token, to the
+  address in the lease. It sends the token only when the answer is signed with
+  the probe key the lease names, which only that node process holds. Another
+  user who has bound the port since the node stopped gets the probe and no
+  token, and the command says to start `celld dev`.
 
 The check runs before routing, so each route answers 401 without the token:
 the operator routes, the peer routes, the `/runtime/<SCOPE>` route, and a
-path celld does not serve. No route is exempt. Use the public health endpoint,
-`/.well-known/celld/health`, for probes. The public listener does not check
+path celld does not serve. One route is exempt: the signed probe
+`/peer/probe` on the internal listener, because a client that holds the token
+uses it to check the node before sending the token (see below). The probe still
+demands the fleet HMAC and answers with nothing secret. Use the public health
+endpoint, `/.well-known/celld/health`, for probes. The public listener does not check
 the token. Peer routes still verify the fleet HMAC after the token.
 
 ```sh

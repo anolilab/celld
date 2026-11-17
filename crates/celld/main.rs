@@ -3332,10 +3332,17 @@ fn spawn_shutdown_acceptor(
 /// listener is never gated: it serves the Worker and the health endpoint.
 fn operator_gate(
     surface: HttpSurface,
+    probe: bool,
     token: &celld::operator_token::OperatorToken,
     headers: &mut hyper::HeaderMap,
 ) -> Option<HttpReply> {
     if matches!(surface, HttpSurface::Public) {
+        return None;
+    }
+    // The signed probe is how a client that holds the token checks that an
+    // address still belongs to the node before it sends the token there. The
+    // handler demands the fleet signature and answers with nothing secret.
+    if matches!(surface, HttpSurface::Internal) && probe {
         return None;
     }
     if token.authorizes(headers) {
@@ -3389,8 +3396,9 @@ fn serve_http_connection(
                 let listener = surface.listener(request.uri().path());
                 celld::metrics::observe(listener, async move {
                     let mut request = request;
+                    let probe = request.uri().path() == "/peer/probe";
                     if let Some(refusal) =
-                        operator_gate(surface, &app.operator_token, request.headers_mut())
+                        operator_gate(surface, probe, &app.operator_token, request.headers_mut())
                     {
                         return Ok(refusal);
                     }

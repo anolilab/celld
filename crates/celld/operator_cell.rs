@@ -23,6 +23,9 @@ use serde_json::Value;
 
 use crate::bucket::Bucket;
 
+/// How long a node may take to answer the identity probe before a request.
+const PROOF_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// What a command is reaching, for the operator reading the error.
 pub(crate) struct Subject {
     /// The resource as an operator names it: "database", "namespace".
@@ -83,6 +86,8 @@ pub(crate) struct Entrance {
     node: String,
     url: String,
     path: String,
+    /// The lease the address came from, which carries the node's probe key.
+    lease: crate::ownership_store::NodeLeaseWire,
 }
 
 /// A database resolved to the nodes that can carry SQL to it.
@@ -100,6 +105,9 @@ pub(crate) struct Reachable {
     /// What to say when no entrance accepts a connection, for a caller that
     /// knows why (a node it expects on this host that is not running).
     unreachable: Option<String>,
+    /// Credentials, without the operator token, for the signed probe a caller
+    /// that sends the token to a node it did not choose by address needs first.
+    proof: Option<(reqwest::Client, crate::peer_auth::PeerAuth)>,
 }
 
 impl Reachable {
@@ -164,14 +172,36 @@ impl Reachable {
             subject,
             entrances: nodes
                 .into_iter()
-                .map(|(node, addr)| Entrance {
-                    node,
-                    url: format!("http://{addr}{path}"),
+                .map(|lease| Entrance {
+                    node: lease.node.clone(),
+                    url: format!("http://{}{path}", lease.addr),
                     path: path.clone(),
+                    lease,
                 })
                 .collect(),
             unreachable: None,
+            proof: None,
         })
+    }
+
+    /// Send the operator token only to a node that proves its identity first.
+    /// A lease outlives its node, so its address can by now belong to another
+    /// process, and the signed probe is answered only by the process that
+    /// holds the leased key and the fleet secret. `proof` is signed with the
+    /// fleet secret and carries no token, because the first request goes to
+    /// the address that is not yet trusted.
+    pub(crate) fn proving_the_node(
+        mut self,
+        proof: crate::peer_auth::PeerAuth,
+    ) -> anyhow::Result<Self> {
+        // Its own short budget: a listener that accepts and never answers must
+        // not hold the command for the length of a migration.
+        let http = reqwest::Client::builder()
+            .timeout(PROOF_TIMEOUT)
+            .build()
+            .context("build the identity probe client")?;
+        self.proof = Some((http, proof));
+        Ok(self)
     }
 
     /// Answer a connection refused by every entrance with `message` rather
@@ -244,6 +274,29 @@ impl Reachable {
         for (index, entrance) in self.entrances.iter().enumerate() {
             let last = index + 1 == self.entrances.len();
             let url = &entrance.url;
+            if let Some((http, proof)) = &self.proof {
+                if let Err(error) = crate::peer_probe::probe(http, &entrance.lease, proof).await {
+                    refused.push(format!("{url}: {error:#}"));
+                    let refused_connection = error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<reqwest::Error>()
+                            .is_some_and(reqwest::Error::is_connect)
+                    });
+                    if refused_connection && !last {
+                        continue;
+                    }
+                    // The probe carries no token, so a listener that is not
+                    // the node has seen no credential.
+                    match &self.unreachable {
+                        Some(message) => bail!("{message}{}", report(&refused)),
+                        None => bail!(
+                            "the {} at {url} did not prove it is the node{}",
+                            self.subject.noun,
+                            report(&refused)
+                        ),
+                    }
+                }
+            }
             let request = self
                 .auth
                 .sign(
@@ -307,7 +360,7 @@ async fn live_nodes(
     bucket: &Bucket,
     addresses: Addresses,
     source: &str,
-) -> anyhow::Result<Vec<(String, String)>> {
+) -> anyhow::Result<Vec<crate::ownership_store::NodeLeaseWire>> {
     let nodes = crate::fleet::node_lease_ids(bucket).await?;
     if nodes.is_empty() {
         bail!("no node leases in the bucket; celld {source} needs a running fleet");
@@ -337,7 +390,7 @@ async fn live_nodes(
             refused.push(format!("{node}: {why}"));
             continue;
         }
-        reachable.push((node.clone(), lease.addr.clone()));
+        reachable.push(lease);
     }
     if reachable.is_empty() {
         bail!(
@@ -358,9 +411,62 @@ pub(crate) fn report(refused: &[String]) -> String {
 }
 
 #[cfg(test)]
+fn lease(node: &str, addr: &str) -> crate::ownership_store::NodeLeaseWire {
+    serde_json::from_value(serde_json::json!({
+        "node": node,
+        "expires_ms": 0,
+        "addr": addr,
+        "probe_public_key":
+            "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+        "peer_protocol": crate::peer_auth::PROTOCOL_VERSION,
+    }))
+    .expect("a lease needs only a node and an expiry")
+}
+
+#[cfg(test)]
 mod operator_token_tests {
     use super::*;
     use crate::operator_token::OperatorToken;
+
+    /// A listener that is not the node the lease names gets the identity probe
+    /// and nothing else: the operator token never leaves the client.
+    #[tokio::test]
+    async fn a_listener_that_does_not_prove_the_node_gets_no_token() {
+        let stub = crate::test_stub::Recorder::start().await;
+        let token = OperatorToken::parse(std::ffi::OsStr::new("tok-7")).unwrap();
+        let auth = crate::peer_auth::PeerAuth::new([7; 32], "d1-cli")
+            .unwrap()
+            .with_operator_token(Some(token));
+        let path = "/runtime/scope".to_string();
+        let reachable = Reachable {
+            http: reqwest::Client::new(),
+            auth,
+            entrances: vec![Entrance {
+                node: "node-b".to_string(),
+                url: format!("http://{}{path}", stub.addr()),
+                path,
+                lease: lease("node-b", &stub.addr()),
+            }],
+            subject: Subject {
+                noun: "database",
+                source: "d1-cli",
+                timeout: Duration::from_secs(5),
+            },
+            unreachable: Some("start `celld dev` first".to_string()),
+            proof: None,
+        }
+        .proving_the_node(crate::peer_auth::PeerAuth::new([7; 32], "d1-cli").unwrap())
+        .unwrap();
+        let error = reachable.call(serde_json::json!({})).await.unwrap_err();
+        assert!(
+            error.to_string().starts_with("start `celld dev` first"),
+            "{error}"
+        );
+        let heads = stub.heads();
+        assert_eq!(heads.len(), 1, "only the probe is sent: {heads:?}");
+        assert!(heads[0].starts_with("GET /peer/probe"), "{}", heads[0]);
+        assert_eq!(stub.authorizations(), vec![None]);
+    }
 
     #[tokio::test]
     async fn an_operator_call_carries_the_operator_token() {
@@ -377,6 +483,7 @@ mod operator_token_tests {
                 node: "node-b".to_string(),
                 url: format!("http://{}{path}", stub.addr()),
                 path,
+                lease: lease("node-b", &stub.addr()),
             }],
             subject: Subject {
                 noun: "database",
@@ -384,6 +491,7 @@ mod operator_token_tests {
                 timeout: Duration::from_secs(5),
             },
             unreachable: None,
+            proof: None,
         };
         let _ = reachable.call(serde_json::json!({})).await;
         assert_eq!(
@@ -442,6 +550,7 @@ mod unreachable_tests {
                 node: "node-b".to_string(),
                 url: format!("http://127.0.0.1:{port}{path}"),
                 path,
+                lease: lease("node-b", &format!("127.0.0.1:{port}")),
             }],
             subject: Subject {
                 noun: "database",
@@ -449,6 +558,7 @@ mod unreachable_tests {
                 timeout: Duration::from_secs(5),
             },
             unreachable: None,
+            proof: None,
         }
         .when_unreachable("start `celld dev` first".to_string());
         let error = reachable.call(serde_json::json!({})).await.unwrap_err();
