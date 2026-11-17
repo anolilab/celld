@@ -82,7 +82,7 @@ fn units(result: &Value) -> Option<Value> {
         "lists_per_pass": get("LIST seg") / passes.max(1.0),
         "writes_per_delta": (get("PUT delta") + get("PUT root")) / get("PUT delta").max(1.0),
         "delta_gets_per_node_per_delta": get("GET delta") / (nodes * get("PUT delta")).max(1.0),
-        "segment_delete_batches_per_pass": get("BATCH_DELETE seg") / passes.max(1.0),
+        "segment_deletes_per_segment": get("BATCH_DELETE seg") / get("PUT seg").max(1.0),
         "run_puts_per_spill": (get("PUT run") - merges) / spills.max(1.0),
         "run_gets_per_spill": (get("GET run") - lookup_run_gets - 2.0 * merges) / spills.max(1.0),
         "passes_per_s": passes / window,
@@ -121,7 +121,7 @@ pub async fn report() {
         let seg_gets = mean("segment_gets_per_segment");
         let a_per_pass = mean("lists_per_pass") + mean("writes_per_delta");
         let delta_gets = mean("delta_gets_per_node_per_delta");
-        let delete_batches = mean("segment_delete_batches_per_pass");
+        let seg_deletes = mean("segment_deletes_per_segment");
         let run_puts = mean("run_puts_per_spill");
         let run_gets = mean("run_gets_per_spill");
         let passes_per_s = mean("passes_per_s");
@@ -133,25 +133,36 @@ pub async fn report() {
             "segments": { "a": NODES * months_windows * seg_puts },
             "compactor_reads": { "b": NODES * months_windows * seg_puts * seg_gets },
             "passes": { "a": passes * a_per_pass },
-            "segment_delete_batches": { "a": passes * delete_batches },
             "node_delta_reads": { "b": NODES * passes * delta_gets },
             "spills": { "a": spills * run_puts, "b": spills * run_gets },
             "base_merges": { "a": 0.5e6 },
             "audit_list": { "a": AGENTS / 256.0 },
             "sampler": { "a": 0.04e6, "b": 2.1e6 },
         });
+        let deletes = json!({
+            "segments": { "a": NODES * months_windows * seg_puts * seg_deletes },
+            "deltas": { "a": passes },
+            "runs": { "a": spills * run_puts },
+        });
         let (mut a, mut b) = (0.0, 0.0);
         for (_, line) in lines.as_object().unwrap() {
             a += line["a"].as_f64().unwrap_or(0.0);
             b += line["b"].as_f64().unwrap_or(0.0);
         }
+        let delete_requests: f64 = deletes
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|line| line["a"].as_f64().unwrap_or(0.0))
+            .sum();
         let bytes_per_cell = steady
             .as_ref()
             .and_then(|s| s["storage"]["run_bytes_per_cell"].as_f64())
             .unwrap_or(69.0);
         let storage_gb = bytes_per_cell * 5.26e9 / 1e9;
         let storage = storage_gb * 0.023;
-        let total = a * PRICE_A + b * PRICE_B + storage;
+        let total_deletes_free = a * PRICE_A + b * PRICE_B + storage;
+        let total = total_deletes_free + delete_requests * PRICE_A;
         let table = [
             ("lookup_gets_per_agent", 3.0),
             ("segment_puts_per_node_per_window", 1.0),
@@ -168,12 +179,14 @@ pub async fn report() {
             })
             .collect();
         let all_within = within.iter().all(|row| row["within_15_pct"] == true);
-        projection = json!({ "lines": lines, "class_a": a, "class_b": b, "storage_usd": storage, "usd_per_month": total, "units": within });
+        projection = json!({ "lines": lines, "deletes": deletes, "class_a": a, "class_b": b, "delete_requests": delete_requests, "storage_usd": storage,
+                             "usd_per_month_deletes_free": total_deletes_free, "usd_per_month_deletes_class_a": total, "units": within });
         gates.add(
             "G-k",
-            json!({ "usd_per_month": total, "class_a_per_month": a, "class_b_per_month": b, "storage_usd": storage, "units": within,
-                    "plan_table_usd": 735 }),
-            "<= $800 per month; each per-unit count within 15 % of the cost table (extrapolated: 438M agents, 100 nodes, W=10 s, P=5 s, M=15 min, from per-unit counts at 2 and 4 nodes; base merges, audit LIST, sampler and storage analytic)",
+            json!({ "usd_per_month_deletes_counted_class_a_as_the_bench_does": total, "usd_per_month_if_deletes_are_free": total_deletes_free,
+                    "class_a_per_month_without_deletes": a, "delete_requests_per_month": delete_requests, "class_b_per_month": b, "storage_usd": storage,
+                    "segment_deletes_per_segment": seg_deletes, "units": within, "plan_table_usd": 735 }),
+            "<= $800 per month; each per-unit count within 15 % of the cost table (extrapolated: 438M agents, 100 nodes, W=10 s, P=5 s, M=15 min, from per-unit counts at 2 and 4 nodes; base merges, audit LIST, sampler and storage analytic; every DeleteObjects counted as class A, as storage_requests classes it)",
             Some(total <= 800.0 && all_within),
         );
     } else {
