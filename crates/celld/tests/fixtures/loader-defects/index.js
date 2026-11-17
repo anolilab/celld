@@ -121,6 +121,19 @@ export class Relay extends DurableObject {
   }
 }
 
+// A Durable Object that answers with a socket of its own, and keeps what its
+// end observed for `/own-state`.
+export class Own extends DurableObject {
+  closes = [];
+  fetch(request) {
+    if (new URL(request.url).pathname === "/state") return Response.json(this.closes);
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+    server.addEventListener("close", (event) => this.closes.push(event.code));
+    return new Response(null, { status: 101, webSocket: client });
+  }
+}
+
 // Loaded code whose `fetch()` is answered with a 101 it has no use for.
 const UPGRADED_CODE = `
   export default {
@@ -304,6 +317,33 @@ export default {
       await new Promise((resolve) => setTimeout(resolve, 300));
       const loaded = await (await worker.getEntrypoint().fetch("http://loaded/state")).json();
       return Response.json({ caller, loaded });
+    }
+    // A Durable Object answers a plain fetch with a socket of its own.
+    if (url.pathname === "/own-plain") {
+      const stub = env.OWN.get(env.OWN.idFromName("own"));
+      let threw = null;
+      try {
+        await stub.fetch("http://own/");
+      } catch (error) {
+        threw = String(error);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const closes = await (await stub.fetch("http://own/state")).json();
+      return Response.json({ threw, closes });
+    }
+    // The loaded Worker answers a plain fetch with a 101, which nobody asked for.
+    if (url.pathname === "/socket-plain") {
+      const worker = load(env, "socket", SOCKET_CODE);
+      let threw = null;
+      let status = null;
+      try {
+        status = (await worker.getEntrypoint().fetch("http://loaded/")).status;
+      } catch (error) {
+        threw = String(error);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const loaded = await (await worker.getEntrypoint().fetch("http://loaded/state")).json();
+      return Response.json({ threw, status, loaded });
     }
     // The caller is handed a socket and never accepts it, while the loaded
     // Worker keeps sending.

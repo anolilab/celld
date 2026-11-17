@@ -13,6 +13,10 @@
       {
         "name": "RELAY",
         "class_name": "Relay"
+      },
+      {
+        "name": "OWN",
+        "class_name": "Own"
       }
     ]
   },
@@ -20,7 +24,8 @@
     {
       "tag": "v1",
       "new_sqlite_classes": [
-        "Relay"
+        "Relay",
+        "Own"
       ]
     }
   ]

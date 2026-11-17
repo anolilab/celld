@@ -7280,6 +7280,9 @@ fn op_loader_fetch(
                 )
             }
         };
+    // The headers move into the child job, so ask now whether the caller's
+    // fetch wants an upgrade; a socket may only answer one that does.
+    let upgrade = crate::cell_dispatch::requests_websocket_upgrade(&headers);
     let want_tail_report = args.get(9).boolean_value(scope);
     // The caller's AbortSignal cancels through the registry that
     // `__do_call_cancel` already reads, as a service-binding call does. Only a
@@ -7371,6 +7374,24 @@ fn op_loader_fetch(
         // context. That context owns an unread body tail through its
         // waitUntil work.
         body_guard.disarm();
+        use crate::cell_dispatch::WEBSOCKET_WITHOUT_UPGRADE;
+        let mut response = response;
+        if !upgrade {
+            // A socket answers only a fetch that asked to upgrade. Dropping a
+            // Worker's socket closes it, and a cell's needs the explicit close.
+            match response.websocket.take() {
+                Some(HttpResponseWebSocket::Cell(target)) => {
+                    if target.tunnel.is_none() {
+                        ws_close(target.id, 1006, WEBSOCKET_WITHOUT_UPGRADE);
+                    }
+                    return Err(format!("TypeError: {WEBSOCKET_WITHOUT_UPGRADE}"));
+                }
+                Some(HttpResponseWebSocket::Worker(_)) => {
+                    return Err(format!("TypeError: {WEBSOCKET_WITHOUT_UPGRADE}"));
+                }
+                None => {}
+            }
+        }
         // A loaded worker can answer with an upgrade, and the caller may bind
         // or return its socket, so the grant names this request as its owner.
         encode_granted_response(ws_owner, response, &stream_service)
@@ -10159,6 +10180,10 @@ pub struct IoContext {
     /// a service-binding dispatch or a Durable Object call gets a context of
     /// its own rather than a frame inside this one.
     sockets: Mutex<Vec<u64>>,
+    /// Worker sockets this request opened and returned in a response. The
+    /// response owns them, but their pull queues are read by this request's
+    /// isolate, so retirement is the last point a queue can have a reader.
+    handed_off_sockets: Mutex<Vec<u64>>,
     /// HTMLRewriter instances this request created. Each holds a parked
     /// parser thread; freeing them at retirement is what reclaims the
     /// thread when a transform is abandoned unread — nothing else can,
@@ -10418,6 +10443,7 @@ impl IoContext {
             events: Mutex::new(IoEventState::default()),
             vfs: OnceLock::new(),
             sockets: Mutex::new(Vec::new()),
+            handed_off_sockets: Mutex::new(Vec::new()),
             rewriters: Mutex::new(Vec::new()),
             tcp_sockets: Mutex::new(Vec::new()),
             allocated_sockets: Mutex::new(HashSet::new()),
@@ -10453,6 +10479,7 @@ impl IoContext {
             events: Mutex::new(IoEventState::default()),
             vfs: OnceLock::new(),
             sockets: Mutex::new(Vec::new()),
+            handed_off_sockets: Mutex::new(Vec::new()),
             rewriters: Mutex::new(Vec::new()),
             tcp_sockets: Mutex::new(Vec::new()),
             allocated_sockets: Mutex::new(HashSet::new()),
@@ -10787,6 +10814,10 @@ impl Drop for IoContext {
         let _ = abandon_context_input_gates(self);
         ws_revoke_grants(self.owner_id());
         self.close_sockets();
+        // Only the context's end is final for a returned socket: its pump
+        // keeps reading after the request has answered.
+        let handed_off = std::mem::take(self.handed_off_sockets.get_mut().unwrap());
+        ws_retire_handoff_readers(handed_off);
         let mut claims = self
             .body_streams
             .get_mut()

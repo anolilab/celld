@@ -108,11 +108,13 @@ pub(super) fn transfer_worker_websocket_handoff(
     drop(registry);
     // The response now owns cleanup. Transfer the frame channel and request
     // ownership together so request retirement cannot close a returned socket.
-    current_context()
+    let context = current_context();
+    context
         .sockets
         .lock()
         .unwrap()
         .retain(|opened| *opened != id);
+    context.handed_off_sockets.lock().unwrap().push(id);
     Some(WorkerWebSocket { id, inbound })
 }
 

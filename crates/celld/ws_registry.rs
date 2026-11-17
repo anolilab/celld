@@ -410,6 +410,42 @@ pub fn ws_pull_register(id: u64, rx: WsPullReceiver) {
 
 pub fn ws_pull_unregister(id: u64) {
     ws_pull().lock().unwrap().remove(&id);
+    ws_registry().lock().unwrap().pull_retention.remove(&id);
+}
+
+/// Where a handed-off Worker socket's pull queue stands once one of its two
+/// owners is gone. The queue belongs to the isolate that opened the socket
+/// (its reader) and to the [`WorkerWebSocket`] that carries the sender.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PullRetention {
+    /// The sender is gone and left a close for the reader to consume.
+    ClosedUnread,
+    /// The reader's request context retired; the sender is still alive.
+    ReaderRetired,
+}
+
+/// The request context that opened the handed-off sockets `ids` retired, so
+/// no isolate can read their queues any more. A queue whose sender already
+/// left a close is removed now; one whose sender is alive is removed when the
+/// sender drops.
+pub(crate) fn ws_retire_handoff_readers(ids: Vec<u64>) {
+    for id in ids {
+        let queued = ws_pull().lock().unwrap().contains_key(&id);
+        let registry = ws_registry();
+        let mut registry = registry.lock().unwrap();
+        match registry.pull_retention.remove(&id) {
+            Some(PullRetention::ClosedUnread) => {
+                drop(registry);
+                ws_pull_unregister(id);
+            }
+            _ if queued => {
+                registry
+                    .pull_retention
+                    .insert(id, PullRetention::ReaderRetired);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The frame channel that a top-level Worker transfers with its 101 response.
@@ -435,8 +471,22 @@ impl WorkerWebSocket {
 impl Drop for WorkerWebSocket {
     fn drop(&mut self) {
         // A queue that already holds its close stays for the isolate to read
-        // it; that read removes the entry.
-        if !self.inbound.is_closed() {
+        // it, and that read removes the entry. If the isolate's request
+        // already retired, nothing will read it, so it goes now; otherwise
+        // the retirement removes it (`ws_retire_handoff_readers`).
+        let retain = self.inbound.is_closed() && {
+            let registry = ws_registry();
+            let mut registry = registry.lock().unwrap();
+            let retired =
+                registry.pull_retention.get(&self.id) == Some(&PullRetention::ReaderRetired);
+            if !retired {
+                registry
+                    .pull_retention
+                    .insert(self.id, PullRetention::ClosedUnread);
+            }
+            !retired
+        };
+        if !retain {
             ws_pull_unregister(self.id);
         }
         ws_unregister(self.id);
@@ -521,6 +571,8 @@ pub struct WsRegistry {
     /// request it was handed to, keyed by the Worker end's id. That request
     /// either binds a client end to it or returns it, and takes it out here.
     parked_workers: HashMap<u64, ParkedWorker>,
+    /// Pull queues a handed-off socket left registered for their reader.
+    pull_retention: HashMap<u64, PullRetention>,
 }
 
 /// A parked Worker socket and the frames its Worker sent while nobody held
@@ -868,7 +920,14 @@ pub(crate) fn ws_revoke_grants(owner: u64) {
         .filter_map(|id| registry.parked_workers.remove(id))
         .collect();
     drop(registry);
+    // A discarded socket's close has no reader (its request is the one that
+    // was refused it), so its queue goes with it, including the close that a
+    // buffer overflow queued.
+    let ids: Vec<u64> = unclaimed.iter().map(|parked| parked.socket.id).collect();
     drop(unclaimed);
+    for id in ids {
+        ws_pull_unregister(id);
+    }
 }
 
 /// Hand `owner` the socket a stateless Worker answered an upgrade with. The
@@ -1506,5 +1565,83 @@ mod parked_worker_tests {
         drop(registry);
         ws_revoke_grants(7_004);
         assert!(!ws_target_granted(&target, 7_004));
+        // The overflow close nobody will read is gone with the socket.
+        assert!(!ws_pull().lock().unwrap().contains_key(&id));
+    }
+
+    #[test]
+    fn a_revoked_parked_socket_leaves_no_pull_queue() {
+        let id = 9_100_004;
+        let (inbound, receiver) = ws_pull_channel();
+        ws_pull_register(id, receiver);
+        ws_register_outbound(id, "", None);
+        let sender = inbound.clone();
+        ws_park_worker(WorkerWebSocket { id, inbound }, 7_005);
+        sender
+            .send_close(1001, "gone".into(), true)
+            .is_ok()
+            .then_some(())
+            .unwrap();
+        ws_revoke_grants(7_005);
+        assert!(!ws_pull().lock().unwrap().contains_key(&id));
+        assert!(!ws_registry()
+            .lock()
+            .unwrap()
+            .pull_retention
+            .contains_key(&id));
+    }
+
+    /// A handed-off socket whose sender dropped with a close queued.
+    fn handed_off(id: u64) -> WsPullSender {
+        let (inbound, receiver) = ws_pull_channel();
+        ws_pull_register(id, receiver);
+        ws_register_outbound(id, "", None);
+        inbound
+    }
+
+    #[test]
+    fn retiring_the_reader_clears_a_closed_queue_the_sender_left() {
+        let id = 9_100_005;
+        let inbound = handed_off(id);
+        inbound
+            .send_close(1000, String::new(), true)
+            .is_ok()
+            .then_some(())
+            .unwrap();
+        drop(WorkerWebSocket { id, inbound });
+        assert!(
+            ws_pull().lock().unwrap().contains_key(&id),
+            "kept for its reader"
+        );
+        ws_retire_handoff_readers(vec![id]);
+        assert!(!ws_pull().lock().unwrap().contains_key(&id));
+        assert!(!ws_registry()
+            .lock()
+            .unwrap()
+            .pull_retention
+            .contains_key(&id));
+    }
+
+    #[test]
+    fn a_sender_that_drops_after_the_reader_retired_clears_its_queue() {
+        let id = 9_100_006;
+        let inbound = handed_off(id);
+        let socket = WorkerWebSocket {
+            id,
+            inbound: inbound.clone(),
+        };
+        ws_retire_handoff_readers(vec![id]);
+        inbound
+            .send_close(1000, String::new(), true)
+            .is_ok()
+            .then_some(())
+            .unwrap();
+        drop(socket);
+        assert!(!ws_pull().lock().unwrap().contains_key(&id));
+        assert!(!ws_registry()
+            .lock()
+            .unwrap()
+            .pull_retention
+            .contains_key(&id));
     }
 }
