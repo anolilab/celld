@@ -237,15 +237,27 @@ async fn a_request_without_the_operator_token_or_the_fleet_signature_is_refused(
 }
 
 #[tokio::test]
-async fn a_node_without_an_operator_token_refuses_invoke() {
+async fn a_node_with_a_generated_token_serves_invoke_to_a_client_that_reads_it() {
+    // No variable is set anywhere: the node generated its token, and the
+    // client takes it from the file in the node's state directory.
     let server = Server::start("invoke", &[]).await;
     let version = stage_variant(&server).await;
-    // A correct signature is not enough on a node that was never given a token.
+    server.internal_url("/").await;
+    let token = OperatorToken::parse(std::ffi::OsStr::new(&server.operator_token())).unwrap();
+    let (status, _) = invoke(
+        &server,
+        Some(token),
+        &request(&version, "GET", "/peek", b""),
+    )
+    .await
+    .expect("the generated token and the fleet signature");
+    assert_eq!(status, 200);
+    // A signed request without the token is refused, whatever the default.
     let error = invoke(&server, None, &request(&version, "GET", "/peek", b""))
         .await
         .expect_err("refused");
     assert!(
-        format!("{error:#}").contains("requires CELLD_OPERATOR_TOKEN"),
+        format!("{error:#}").contains("operator token required"),
         "{error:#}"
     );
 }

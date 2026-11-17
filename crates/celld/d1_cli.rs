@@ -16,8 +16,7 @@
 //!
 //! The route is authenticated. A D1 database holds application data and
 //! answers arbitrary SQL, and its scope is an HMAC over the database identity
-//! rather than a secret, so the unauthenticated `/do/` route
-//! refuses a D1 scope and sends the caller here.
+//! rather than a secret, so this signed route is the only way in.
 
 use std::path::PathBuf;
 

@@ -344,8 +344,8 @@ The command prints the response body on standard output and the status and
 headers on standard error; `--json` prints one object with the base64 body.
 `-X`, `-H`, `-d` and `--data-file` set the method, a header and the body.
 `--header-env NAME=VAR` reads a header value from the environment so a secret
-never appears in the process list. The node needs `CELLD_OPERATOR_TOKEN`, and
-the command needs the same value; the request is also signed with the fleet
+never appears in the process list. The command needs the node's operator token, from
+`CELLD_OPERATOR_TOKEN` or the token file of a node on this machine; the request is also signed with the fleet
 secret. The staged version runs with its own declared variables and service
 bindings against the fleet's real data. Durable Object, D1, KV and queue cells
 run the serving version's code, so a version that adds a class or a first
@@ -764,7 +764,8 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_ADDR` | The public Worker listener. The same as `--listen` |
 | `CELLD_INTERNAL_ADDR` | The peer and operator listener. The same as `--internal-listen` |
 | `CELLD_ADVERTISE` | The internal address that peers can reach. The same as `--advertise` |
-| `CELLD_OPERATOR_TOKEN` | When set, every request to the internal listener must send `Authorization: Bearer <token>`, and every celld command that calls it sends the token. Set the same value on every node and in each operator command. celld refuses an empty value, whitespace, or non-printable characters. Unset: no token. See [Require an operator token](security.md#require-an-operator-token) |
+| `CELLD_OPERATOR_TOKEN` | Every request to the internal listener must send `Authorization: Bearer <token>`, and every celld command that calls it sends the token. Set the same value on every node and in each operator command. celld refuses an empty value, whitespace, or non-printable characters. Unset: a node whose internal listener binds only loopback generates a token into a file that only its owner can read and logs the file's path; a node bound to another address refuses to start. See [Require an operator token](security.md#require-an-operator-token) |
+| `CELLD_OPERATOR_TOKEN_FILE` | The path of the file a node keeps its generated operator token in, and that the celld commands read when `CELLD_OPERATOR_TOKEN` is unset. Default: `operator-token` in the celld configuration directory (`CELLD_CONFIG_DIR`, else `$XDG_CONFIG_HOME/celld`, else `~/.config/celld`); `celld dev` uses `.celld/dev/operator-token`. celld refuses a file that other users can read |
 | `CELLD_UNSAFE_PUBLIC_ADVERTISE` | Set to `1` to permit a literal public IP in `CELLD_ADVERTISE`. It does not resolve a DNS name or restrict the internal listener |
 | `CELLD_EGRESS` | `public` (default; `open` for `celld dev` unless set) or `open`. `public` refuses a Worker's `fetch()`, `connect()` and outbound WebSocket dials to loopback, private, link-local, CGNAT, unique-local, unspecified, multicast and reserved addresses, the metadata addresses, IPv4 addresses carried in IPv6 and the node's own addresses, on the resolved address and on every redirect hop. `open` turns the check off. `public` also stops a Worker's `fetch()` from using `HTTP_PROXY` or `ALL_PROXY`, so a node whose only route out is a proxy needs `open` (a breaking change from the old default). See [Limit Worker egress](security.md#limit-worker-egress) |
 | `CELLD_EGRESS_ALLOW` | Exceptions to `CELLD_EGRESS=public`, separated by commas: CIDR ranges and `host:port` destinations. Setting it with `CELLD_EGRESS=open` is an error |

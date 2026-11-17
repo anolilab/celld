@@ -2499,8 +2499,9 @@ fn options_from_env() -> anyhow::Result<ConnectOptions> {
     })
 }
 
-fn config_path() -> anyhow::Result<PathBuf> {
-    let base = if let Some(path) = std::env::var_os("CELLD_CONFIG_DIR") {
+/// The per-user directory celld keeps its local files in.
+pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
+    Ok(if let Some(path) = std::env::var_os("CELLD_CONFIG_DIR") {
         PathBuf::from(path)
     } else if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
         PathBuf::from(path).join("celld")
@@ -2508,8 +2509,11 @@ fn config_path() -> anyhow::Result<PathBuf> {
         PathBuf::from(path).join(".config").join("celld")
     } else {
         std::env::current_dir()?.join(".celld")
-    };
-    Ok(base.join("cloud.json"))
+    })
+}
+
+fn config_path() -> anyhow::Result<PathBuf> {
+    Ok(config_dir()?.join("cloud.json"))
 }
 
 fn load_or_create_config(path: &Path, options: &ConnectOptions) -> anyhow::Result<CloudConfig> {

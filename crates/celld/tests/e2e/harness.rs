@@ -118,6 +118,27 @@ impl Server {
         format!("http://{address}{path}")
     }
 
+    /// A GET to the node's internal listener, carrying the operator token the
+    /// way the in-tree clients do: from the variable the test passed, else from
+    /// the file the node generated in its state directory.
+    pub async fn internal_get(&self, path: &str) -> reqwest::RequestBuilder {
+        let url = self.internal_url(path).await;
+        self.client.get(url).bearer_auth(self.operator_token())
+    }
+
+    /// The operator token of this node. Read after the node announced its
+    /// internal listener, which is after the file exists.
+    pub fn operator_token(&self) -> String {
+        if let Some((_, token)) = self.env.iter().find(|(k, _)| k == "CELLD_OPERATOR_TOKEN") {
+            return token.clone();
+        }
+        let file = self.project.join(".celld/dev/operator-token");
+        fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("read {}: {error}", file.display()))
+            .trim()
+            .to_string()
+    }
+
     pub async fn get_text(&self, path: &str) -> String {
         self.get(path)
             .await
@@ -162,7 +183,13 @@ impl Server {
             .spawn(read_operator_identity(database))
             .await
             .expect("read the operator identity");
-        let auth = celld::peer_auth::PeerAuth::new(key, "d1").expect("build peer auth");
+        let token = celld::operator_token::OperatorToken::parse(std::ffi::OsStr::new(
+            &self.operator_token(),
+        ))
+        .expect("the node's operator token");
+        let auth = celld::peer_auth::PeerAuth::new(key, "d1")
+            .expect("build peer auth")
+            .with_operator_token(Some(token));
         let path = format!("/runtime/{scope}");
         let payload = serde_json::to_vec(body).expect("encode the request");
         let request = auth

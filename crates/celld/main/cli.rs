@@ -354,7 +354,12 @@ TUNING:
   CELLD_OPERATOR_TOKEN            Bearer token every internal-listener request
                                   must send; the celld commands that call it
                                   send it too. Same value on every node
-                                  (default: unset, no token)
+                                  (default: a loopback node generates one in
+                                  a private file and logs its path; any other
+                                  bind refuses to start without it)
+  CELLD_OPERATOR_TOKEN_FILE       Where the generated token is kept and read
+                                  (default: operator-token in the celld
+                                  config directory)
   CELLD_TTL_MS                    Node lease lifetime (default: 10000)
   CELLD_OPERATION_DEADLINE_MS     Non-restore operation deadline (default: 15000)
   CELLD_SHUTDOWN_TOTAL_MS         Complete process stop bound (default: {shutdown_total_ms})

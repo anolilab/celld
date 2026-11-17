@@ -127,8 +127,9 @@ fn folded(project: &Path) -> bool {
 }
 
 async fn answers(server: &Server) -> Value {
-    let state: Value = reqwest::Client::new()
-        .get(server.internal_url("/state").await)
+    let state: Value = server
+        .internal_get("/state")
+        .await
         .send()
         .await
         .expect("read the node state")

@@ -6,8 +6,8 @@
 //! `celld invoke SCRIPT=VERSION [PATH]`: send one HTTP request to a staged
 //! version on one node and print the answer.
 //!
-//! The command needs `CELLD_OPERATOR_TOKEN`, which the node must also have,
-//! and the fleet secret in the bucket. A secret header never goes on the
+//! The command needs the node's operator token, from `CELLD_OPERATOR_TOKEN` or
+//! the token file of a node on this machine, and the fleet secret in the bucket. A secret header never goes on the
 //! command line: `--header-env NAME=VAR` reads the value of `VAR` from the
 //! environment of this process, so it appears in neither argv nor the process
 //! list, and an unset variable stops the command without printing anything
@@ -240,8 +240,9 @@ new one. A request that writes through a cell writes real data.
 
 PATH is the path and query to request; it defaults to /.
 
-The command needs CELLD_OPERATOR_TOKEN in its environment, and the node must
-have the same token. Without a token on the node, invoke is refused.
+The command needs the token of the node: CELLD_OPERATOR_TOKEN in its
+environment, or, for a node on this machine that generated its own, the token
+file that node logged.
 
 OPTIONS:
   -X, --request METHOD   Request method (default: GET, or POST with a body)
@@ -281,7 +282,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let auth = PeerAuth::new(crate::peer_auth::load_existing(&bucket).await?, "invoke")?;
     if auth.operator_token().is_none() {
         bail!(
-            "celld invoke requires {}, set to the token of the node",
+            "celld invoke requires {}, set to the token of the node, or the token file of a node on this machine",
             crate::operator_token::ENV
         );
     }

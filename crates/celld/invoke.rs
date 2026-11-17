@@ -14,9 +14,9 @@
 //! request that calls one reaches a real object. Service bindings resolve
 //! through the serving selection, with the staged script in place.
 //!
-//! The route is operator-only. It exists only where `CELLD_OPERATOR_TOKEN` is
-//! set, and the request must also carry the fleet's HMAC signature, so
-//! neither a leaked token nor a leaked fleet secret alone runs code.
+//! The route is operator-only. The request must carry the node's operator
+//! token and the fleet's HMAC signature, so neither a leaked token nor a
+//! leaked fleet secret alone runs code.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -147,9 +147,9 @@ pub fn shadow_pointer(
 }
 
 /// The refusal a node without an operator token gives, which needs no body.
-/// The listener gate lets everything through when no token is configured, so
-/// the route refuses on its own: a node that was never given a token runs no
-/// staged code for anyone.
+/// A running node always has a token, so the listener gate refuses first. The
+/// route still refuses on its own when its handle carries none: a node without
+/// a token runs no staged code for anyone.
 pub fn refuse_without_token(app: &AppHandle) -> Option<(u16, String)> {
     missing_token(app).map(Refusal::into_reply)
 }

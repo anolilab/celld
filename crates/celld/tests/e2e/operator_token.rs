@@ -1,6 +1,8 @@
 //! `CELLD_OPERATOR_TOKEN`: every route of the internal listener answers 401
 //! without the token, and the node keeps serving.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::BTreeSet;
 
 use super::harness::{client, run_expecting_exit, Server};
@@ -78,7 +80,6 @@ fn the_route_scan_finds_the_known_routes() {
         "/peer/log/seal",
         "/peer/log/append",
         "/peer/log/stream",
-        "/do/x",
         "/cell/x",
         "/evict/x",
         "/runtime/x",
@@ -147,14 +148,73 @@ async fn the_token_opens_the_internal_listener() {
 }
 
 #[tokio::test]
-async fn without_a_token_the_listener_stays_open() {
+async fn every_internal_route_requires_a_token_when_none_is_configured() {
+    // No variable: the node generated a token of its own.
     let server = Server::start("do-ids", &[]).await;
-    let state = client()
+    let client = client();
+    let mut paths = internal_routes();
+    paths.insert("/no/such/route".to_string());
+    for path in &paths {
+        for method in [reqwest::Method::GET, reqwest::Method::POST] {
+            let url = server.internal_url(path).await;
+            let response = client
+                .request(method.clone(), &url)
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("{method} {path}: {error}"));
+            assert_eq!(
+                response.status().as_u16(),
+                401,
+                "{method} {path} must be refused without a token"
+            );
+        }
+    }
+    assert_eq!(server.get_text("/__ready").await, "ready");
+}
+
+#[tokio::test]
+async fn the_generated_token_opens_the_listener_and_is_kept_private() {
+    let server = Server::start("do-ids", &[]).await;
+    let state = server.internal_get("/state").await.send().await.unwrap();
+    assert_eq!(state.status().as_u16(), 200);
+    let wrong = client()
         .get(server.internal_url("/state").await)
+        .bearer_auth("not-the-token")
         .send()
         .await
         .unwrap();
-    assert_eq!(state.status().as_u16(), 200);
+    assert_eq!(wrong.status().as_u16(), 401);
+    // The token never reaches the log.
+    assert!(!server.log_text().contains(&server.operator_token()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(server.project_dir().join(".celld/dev/operator-token"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+#[test]
+fn a_non_loopback_internal_bind_refuses_to_start_without_a_token() {
+    let refused = std::process::Command::new(env!("CARGO_BIN_EXE_celld"))
+        .args(["--no-control-plane", "--listen", "127.0.0.1:0"])
+        .args([
+            "--internal-listen",
+            "0.0.0.0:0",
+            "--advertise",
+            "10.0.0.1:9000",
+        ])
+        .env_remove("CELLD_OPERATOR_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run celld");
+    assert!(!refused.status.success());
+    let text = String::from_utf8_lossy(&refused.stderr);
+    assert!(text.contains("CELLD_OPERATOR_TOKEN"), "{text}");
+    assert!(text.contains("not a loopback address"), "{text}");
 }
 
 #[test]

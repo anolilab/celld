@@ -1940,8 +1940,7 @@ fn request_url(parts: &hyper::http::request::Parts, trust_forwarded_headers: boo
 ///
 /// Going through `dispatch_do_call` also inherits the redispatch policy and
 /// the cancellation channel, so a client that hangs up reaches the owner
-/// rather than only the node it connected to. `/do/` and `/runtime/` share this:
-/// they differ in what they authenticate, not in how they reach a cell.
+/// rather than only the node it connected to.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_cell_fetch(
     app: &AppHandle,
@@ -2908,7 +2907,6 @@ async fn handle_internal(
 ) -> Result<HttpReply, Infallible> {
     let path = request.uri().path().to_string();
     let draining = app.is_draining();
-    let do_scope = path.strip_prefix("/do/");
     let cell_scope = path.strip_prefix("/cell/");
     let evict_scope = path.strip_prefix("/evict/");
     let result = match path.as_str() {
@@ -2963,21 +2961,12 @@ async fn handle_internal(
                 ))
             }
         }
-        // The operator CLIs' way in (`celld d1`, queues, workflows): the same
-        // forwarding dispatch `/do/` uses, with the fleet authentication
-        // `/do/` does not have. A runtime class holds application data and
-        // answers an operator protocol — arbitrary SQL for D1 — so it must
-        // not be reachable from an unauthenticated route; `/do/` refuses a
-        // reserved scope below and sends the caller here.
-        //
-        // It is one route rather than one per class on purpose. D1's design
-        // page records what writing the second by hand would cost: the
-        // refusal on the *other* route has to be widened in the same change,
-        // and gating only the new route "would have left the hole open".
-        // With one entrance and one refusal, a class added to
-        // `RESERVED_CLASSES` inherits both. (The pre-v5 `/__d1/` alias died
-        // with the v0.4.0 stop-the-world upgrade; the CLI in this tree sends
-        // `/runtime/`.)
+        // The operator CLIs' way in (`celld d1`, queues, workflows), with the
+        // fleet authentication on top of the operator token. A runtime class
+        // holds application data and answers an operator protocol — arbitrary
+        // SQL for D1 — so a request must be signed to reach it. It is one
+        // route rather than one per class on purpose: a class added to
+        // `RESERVED_CLASSES` inherits the entrance and its refusal.
         _ if path.starts_with("/runtime/") && app.runtime.is_some() => {
             let scope = path
                 .strip_prefix("/runtime/")
@@ -2986,15 +2975,13 @@ async fn handle_internal(
             if !celld_logic::cell::valid_cell_scope(&scope) {
                 return Ok(peer_response(malformed_scope()));
             }
-            // The mirror of `/do/`'s refusal: that route serves every ordinary
-            // Durable Object and no reserved one, this route serves the
-            // reserved ones and nothing else. Without the check, a signed
-            // request could drive a user's Durable Object through a route
-            // whose only contract is an operator protocol.
+            // This route serves the reserved classes and nothing else. Without
+            // the check, a signed request could drive a user's Durable Object
+            // through a route whose only contract is an operator protocol.
             if !celld::deploy::is_reserved_scope(&scope) {
                 return Ok(peer_response(response(
                     StatusCode::FORBIDDEN,
-                    "{\"error\":\"only a runtime class is served on /runtime/; use /do/ for a Durable Object\"}",
+                    "{\"error\":\"only a runtime class is served on /runtime/\"}",
                 )));
             }
             let operator_query = request.uri().query().map(str::to_owned);
@@ -3046,48 +3033,6 @@ async fn handle_internal(
                 true,
             )
             .await
-        }
-        _ if do_scope.is_some() && app.runtime.is_some() => {
-            let runtime = app.runtime.as_ref().expect("checked runtime");
-            let scope = do_scope.expect("checked prefix");
-            let cell = match runtime.cell_scope(scope) {
-                Ok(cell) => cell,
-                Err(error) => {
-                    return Ok(response(StatusCode::BAD_REQUEST, format!("{error:#}")));
-                }
-            };
-            // This route has no authentication, so it must reach no reserved
-            // class at all. A reserved cell's whole fetch surface is an
-            // operator protocol — arbitrary SQL for D1, create/terminate/
-            // events for a workflow — and its scope is an HMAC over names that
-            // sit in the project's config rather than a secret.
-            //
-            // One question, not one per class. Two hand-written refusals stood
-            // here before, and a third reserved class would have needed a third
-            // that nothing forces anyone to write. `is_reserved_scope` closes
-            // the door for every class in `RESERVED_CLASSES`; the hint below
-            // is the only part that is per-class, and a class without one still
-            // gets refused.
-            if let Some(class) = celld::deploy::reserved_class_of(&cell) {
-                let hint = celld::deploy::operator_hint(class);
-                return Ok(response(
-                    StatusCode::FORBIDDEN,
-                    format!(
-                        "{{\"error\":\"{class} is a runtime class and is not reachable over /do/; {hint}\"}}"
-                    ),
-                ));
-            }
-            let (url, method, body, headers) = match ingress_payload(
-                request,
-                app.trust_forwarded_headers,
-                app.max_request_body_bytes,
-            )
-            .await
-            {
-                Ok(payload) => payload,
-                Err(response) => return Ok(*response),
-            };
-            dispatch_cell_fetch(&app, cell, None, url, method, body, headers, false).await
         }
         _ if cell_scope.is_some() => {
             let cell = cell_scope.expect("checked prefix");
@@ -3270,9 +3215,9 @@ fn operator_gate(
     }
     let token = token?;
     if token.authorizes(headers) {
-        // The credential is for this gate only. `/do/<ID>` forwards the
-        // request headers to a Durable Object, here or on a remote owner, so
-        // the token must not travel with them.
+        // The credential is for this gate only: the headers can be forwarded
+        // to a cell, here or on a remote owner, so the token must not travel
+        // with them.
         headers.remove(hyper::header::AUTHORIZATION);
         return None;
     }
@@ -3693,6 +3638,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let listen = ingress.listen.to_string();
     let listener = ingress.listener;
     let internal_listener = internal.listener;
+    // Before anything else starts: a node that cannot authenticate its
+    // internal listener must not serve it.
+    let operator_token =
+        celld::operator_token::OperatorToken::for_node(internal_listener.local_addr()?.ip())?;
     celld::egress_filter::register_node_addresses(
         &[listener.local_addr()?, internal_listener.local_addr()?],
         &internal.advertise,
@@ -4173,7 +4122,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         };
         celld::telemetry::init(config, sink_bucket, node.clone(), settings.region.clone())?;
     }
-    let peer_auth = Arc::new(PeerAuth::new(peer_key, node.clone())?);
+    let peer_auth =
+        Arc::new(PeerAuth::new(peer_key, node.clone())?.with_operator_token(Some(operator_token)));
     // Connect-only timeout: a peer request may legitimately run through a
     // restore, but a handshake that never completes provably ran nothing.
     let peer_http = reqwest::Client::builder()

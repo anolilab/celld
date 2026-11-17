@@ -25,6 +25,8 @@ use tokio::sync::{mpsc, oneshot};
 
 pub const DEFAULT_PORT: u16 = 9876;
 const BUCKET: &str = "celld-dev";
+/// The operator token the local node generates, in the state directory.
+const TOKEN_FILE: &str = "operator-token";
 
 /// The narrow bridge used by the supervised binary process. The public fleet
 /// parser never receives this path, so no regular subcommand can select it.
@@ -671,6 +673,8 @@ struct RunningNode {
     /// request was for port 0.
     listener: SocketAddr,
     internal: String,
+    /// Where the node keeps the operator token it generated.
+    token_file: PathBuf,
     output: tokio::task::JoinHandle<()>,
 }
 
@@ -691,6 +695,7 @@ async fn start_node(
 ) -> anyhow::Result<RunningNode> {
     let executable = std::env::current_exe().context("locate the celld executable")?;
     let listen = listener.to_string();
+    let token_file = state.join(TOKEN_FILE);
     let mut command = Command::new(executable);
     // The supervisor owns the child's complete storage and listener topology.
     // Inherited fleet settings can otherwise override that private topology or
@@ -725,6 +730,7 @@ async fn start_node(
         ])
         .env("CELLD_INTERNAL_DEV_STORE", &store.database)
         .env("CELLD_WATCH", state.join("runtime"))
+        .env(crate::operator_token::FILE_ENV, &token_file)
         .env("CELLD_NODE", format!("dev-{}", &project_hash[..12]))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -799,7 +805,7 @@ async fn start_node(
     let internal = match tokio::time::timeout(Duration::from_secs(30), internal_rx).await {
         Ok(Ok(internal)) => internal,
         result => {
-            stop_child(&mut child, None).await;
+            stop_child(&mut child, None, &token_file).await;
             let _ = output.await;
             match result {
                 Err(_) => bail!("the local node did not announce its operator listener"),
@@ -816,13 +822,13 @@ async fn start_node(
     let listener = match listener_rx.await {
         Ok(address) => address,
         Err(_) => {
-            stop_child(&mut child, Some(&internal)).await;
+            stop_child(&mut child, Some(&internal), &token_file).await;
             let _ = output.await;
             bail!("the local node exited before it announced its listener");
         }
     };
     if let Err(error) = wait_for_node(&mut child, listener).await {
-        stop_child(&mut child, Some(&internal)).await;
+        stop_child(&mut child, Some(&internal), &token_file).await;
         let _ = output.await;
         return Err(error);
     }
@@ -831,6 +837,7 @@ async fn start_node(
         child,
         listener,
         internal,
+        token_file,
         output,
     })
 }
@@ -908,13 +915,19 @@ async fn wait_for_project_change(watcher: Option<&mut ProjectWatcher>) -> anyhow
 }
 
 async fn stop_running_node(mut running: RunningNode) {
-    stop_child(&mut running.child, Some(&running.internal)).await;
+    stop_child(
+        &mut running.child,
+        Some(&running.internal),
+        &running.token_file,
+    )
+    .await;
     let _ = running.output.await;
 }
 
 /// The same-node preserve request to the node's internal listener. The node
-/// inherits `CELLD_OPERATOR_TOKEN` from this process, so the request carries
-/// it too.
+/// takes its token from `CELLD_OPERATOR_TOKEN` in this process's environment,
+/// or generates one in the state directory, so the request carries whichever
+/// it has.
 fn shutdown_request(
     client: &reqwest::Client,
     internal: &str,
@@ -928,21 +941,23 @@ fn shutdown_request(
 }
 
 #[allow(clippy::disallowed_methods)] // Shutdown deadlines govern a real child process.
-async fn stop_child(child: &mut Child, internal: Option<&str>) {
+async fn stop_child(child: &mut Child, internal: Option<&str>, token_file: &Path) {
     let requested = if let Some(internal) = internal {
         match reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
         {
-            Ok(client) => match crate::operator_token::OperatorToken::from_env() {
-                Ok(token) => shutdown_request(&client, internal, token.as_ref())
-                    .send()
-                    .await
-                    .is_ok_and(|response| response.status().is_success()),
-                // An invalid token is refused at startup, so this is not
-                // reachable in practice. Never send the request without it.
-                Err(_) => false,
-            },
+            Ok(client) => {
+                match crate::operator_token::OperatorToken::from_env_or_file(token_file) {
+                    Ok(token) => shutdown_request(&client, internal, token.as_ref())
+                        .send()
+                        .await
+                        .is_ok_and(|response| response.status().is_success()),
+                    // An invalid token is refused at startup, so this is not
+                    // reachable in practice. Never send the request without it.
+                    Err(_) => false,
+                }
+            }
             Err(_) => false,
         }
     } else {

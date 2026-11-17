@@ -156,34 +156,12 @@ pub fn reserved_class_of(scope: &str) -> Option<&str> {
 
 /// Whether a cell scope names any runtime-supplied class.
 ///
-/// This is what the unauthenticated `/do/` route refuses, and it is deliberately
-/// one question rather than one question per class. `/do/` used to ask
-/// one predicate per class, so every reserved class added a
-/// third, a fourth, and a place to forget one — and a forgotten refusal is not
-/// a missing feature, it is an unauthenticated route onto a cell whose whole
-/// surface is an operator protocol. Adding a class to `RESERVED_CLASSES` now
-/// closes that door with no new code.
+/// The operator route refuses every scope this does not name, and it is
+/// deliberately one question rather than one question per class: a forgotten
+/// per-class check is a route onto a cell whose whole surface is an operator
+/// protocol. Adding a class to `RESERVED_CLASSES` needs no new code.
 pub fn is_reserved_scope(scope: &str) -> bool {
     reserved_class_of(scope).is_some()
-}
-
-/// What to tell an operator who reached a reserved class on the wrong route.
-///
-/// A hint, never a gate. The refusal is `is_reserved_scope`, which cannot be
-/// forgotten; this only decides how helpful the message is, so a class with no
-/// entry here is still refused and simply gets the general answer.
-pub fn operator_hint(class: &str) -> &'static str {
-    if class == D1_CLASS {
-        "use `celld d1`"
-    } else if class == KV_CLASS {
-        "use `celld kv`"
-    } else if class == QUEUE_CLASS {
-        "use `celld queue`"
-    } else if is_workflow_class(class) {
-        "use the workflow binding"
-    } else {
-        "reach it through its binding"
-    }
 }
 
 const MAX_ASSET_FILES: usize = 20_000;
