@@ -341,7 +341,6 @@ impl Ownership {
         match self {
             Self::Memory(memory) => {
                 let mut memory = memory.lock().await;
-                let first = matches!(guard, CasGuard::Absent);
                 let allowed = match guard {
                     CasGuard::Absent => !memory.owners.contains_key(cell),
                     CasGuard::Match(expected) => memory
@@ -350,7 +349,6 @@ impl Ownership {
                         .is_some_and(|owner| owner.etag == expected),
                 };
                 if allowed {
-                    crate::storage_counters::claim_applied(first);
                     let etag = format!("e{}", memory.next_etag);
                     memory.next_etag += 1;
                     let node = memory.node.clone();
@@ -2374,6 +2372,8 @@ impl Actor {
         let ttl_ms = crate::env_vars::positive_or("CELLD_TTL_MS", 10_000)?;
         let operation_deadline_ms = operation_deadline_ms()?;
         let resume_dormant_local = crate::env_vars::flag("CELLD_RESUME_DORMANT_LOCAL", false)?;
+        let generation = std::env::var("CELLD_TEST_GENERATION").unwrap_or(process_generation);
+        crate::claim_provenance::start(format!("{node}/{generation}"), now_ms())?;
         let lease_spec = NodeLeaseSpec {
             // Startup has already resolved the environment and CLI settings
             // into this validated internal address. Reading the environment
@@ -2381,7 +2381,7 @@ impl Actor {
             // publish an address that the bound listener did not validate.
             addr: advertise,
             peer_protocol: peer_auth::PROTOCOL_VERSION,
-            generation: std::env::var("CELLD_TEST_GENERATION").unwrap_or(process_generation),
+            generation,
             resume_generation,
             ttl_ms,
         };
@@ -2694,7 +2694,10 @@ impl Actor {
                 self.pending_workers.insert(request, reply);
                 self.drive(Event::WorkerRequest { request }, out);
             }
-            Message::ReleaseAll => self.drive(Event::ReleaseAll, out),
+            Message::ReleaseAll => {
+                crate::claim_provenance::drain_started();
+                self.drive(Event::ReleaseAll, out);
+            }
             Message::Rebalance { .. } if self.preserving => {}
             Message::Rebalance { cells } => self.drive(Event::Rebalance { cells }, out),
             Message::GenerationChanged {
@@ -3243,18 +3246,31 @@ impl Actor {
                 guard,
                 epoch,
                 takeover,
+                prior,
             } => {
                 self.route_effect_started(&cell);
+                let first = matches!(guard, CasGuard::Absent);
                 if let Some(timing) = self.route_timings.get_mut(&cell) {
-                    timing
-                        .fresh
-                        .get_or_insert(!takeover && matches!(guard, CasGuard::Absent));
+                    timing.fresh.get_or_insert(!takeover && first);
                 }
+                // Only a first claim is told apart by the ensemble, so the
+                // other claims skip the lock.
+                let ensemble = first && self.ensemble_active();
                 let ownership = self.ownership.clone();
                 let timing_cell = cell.clone();
                 out.spawn_scoped(async move {
                     let started = crate::asyncrt::mono_ms();
                     let result = ownership.cas_owner(&cell, guard, epoch).await;
+                    if matches!(result, Ok(CasOutcome::Applied)) {
+                        crate::storage_counters::claim_applied(&crate::claim_provenance::Claimed {
+                            cell: &cell,
+                            epoch,
+                            first,
+                            takeover,
+                            prior,
+                            ensemble,
+                        });
+                    }
                     CompletedEffect::timed(
                         Event::OwnerCasCompleted { op, result },
                         timing_cell,
@@ -3266,7 +3282,12 @@ impl Actor {
             Effect::ReconcileWakeEntry { cell, alarm } => {
                 self.schedule_wake_maintenance(cell, alarm);
             }
-            Effect::ReleaseOwner { op, cell, epoch } => {
+            Effect::ReleaseOwner {
+                op,
+                cell,
+                epoch,
+                reason,
+            } => {
                 if self.handoff_timings.contains_key(&cell) {
                     self.handoff_phase_ops.insert(
                         op,
@@ -3280,6 +3301,9 @@ impl Actor {
                 let ownership = self.ownership.clone();
                 out.spawn_scoped(async move {
                     let result = ownership.release_owner(&cell, epoch).await;
+                    if matches!(result, Ok(CasOutcome::Applied)) {
+                        crate::claim_provenance::release_applied(&cell, epoch, reason);
+                    }
                     CompletedEffect::plain(Event::OwnerReleased { op, result })
                 });
             }
@@ -3562,20 +3586,28 @@ impl Actor {
                     // arm's seeded DST schedule stable (see `StepOutput::spawn_detached`).
                     out.spawn_detached(async move {
                         let started = crate::asyncrt::mono_ms();
-                        let result = runtime.restore_cell(&cell, &spec).await.map_err(|error| {
-                            if expected_resume_fallback(&spec, &error) {
-                                tracing::info!(
-                                    event = "dormant_resume_unavailable",
-                                    %cell,
-                                    epoch = spec.epoch,
-                                    reason = %error,
-                                    "the kept database could not be reopened at its epoch"
-                                );
-                            } else {
-                                eprintln!("celld restore failed for {cell}: {error:#}");
-                            }
-                            Failure::Definite
-                        });
+                        let result = runtime
+                            .restore_cell(&cell, &spec)
+                            .await
+                            .inspect(|_| {
+                                if spec.resume == Some(celld_logic::ResumeFrom::Handoff) {
+                                    crate::claim_provenance::preserved_resume(&cell, spec.epoch);
+                                }
+                            })
+                            .map_err(|error| {
+                                if expected_resume_fallback(&spec, &error) {
+                                    tracing::info!(
+                                        event = "dormant_resume_unavailable",
+                                        %cell,
+                                        epoch = spec.epoch,
+                                        reason = %error,
+                                        "the kept database could not be reopened at its epoch"
+                                    );
+                                } else {
+                                    eprintln!("celld restore failed for {cell}: {error:#}");
+                                }
+                                Failure::Definite
+                            });
                         CompletedEffect::timed(
                             Event::RestoreCompleted { op, result },
                             timing_cell,
@@ -4207,6 +4239,15 @@ impl Actor {
             self.publishes,
             self.stops
         )
+    }
+
+    /// Whether this node has an active fleet ensemble. No node log means none.
+    fn ensemble_active(&self) -> bool {
+        self.node_log
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|log| log.ensemble_active())
     }
 
     /// The process's storage counters, with the node log's retained bundles.

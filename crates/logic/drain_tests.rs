@@ -336,3 +336,34 @@ fn a_swap_whose_restart_fails_during_a_drain_keeps_the_record() {
         Some(Phase::Dormant { .. })
     ));
 }
+
+#[test]
+fn a_release_names_its_reason() {
+    let mut shell = Shell::new(config());
+    let request = shell.request("a");
+    shell.finish(request);
+    shell.send(Event::Evict { cell: "a".into() });
+    shell.finish_eviction("a");
+
+    shell.send(Event::Rebalance { cells: 1 });
+    let balancing = shell.expect("the balancing release", |effect| match effect {
+        Effect::ReleaseOwner { reason, op, .. } => Some((*reason, *op)),
+        _ => None,
+    });
+    assert_eq!(balancing.0, ReleaseReason::Handoff);
+    shell.send(Event::OwnerReleased {
+        op: balancing.1,
+        result: Ok(CasOutcome::Applied),
+    });
+
+    let request = shell.request("b");
+    shell.finish(request);
+    shell.send(Event::Evict { cell: "b".into() });
+    shell.finish_eviction("b");
+    shell.send(Event::ReleaseAll);
+    let drain = shell.expect("the drain's release", |effect| match effect {
+        Effect::ReleaseOwner { reason, cell, .. } if cell == "b" => Some(*reason),
+        _ => None,
+    });
+    assert_eq!(drain, ReleaseReason::Drain);
+}

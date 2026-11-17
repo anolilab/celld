@@ -287,6 +287,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_MAX_RSS_MB",
         "CELLD_READY_FLEET_GATE_MS",
         "CELLD_REBALANCE_INTERVAL_MS",
+        "CELLD_STEP0_SAMPLE",
     ] {
         optional::<u64>(name)?;
     }

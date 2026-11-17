@@ -258,6 +258,133 @@ Each scenario of the JSON also carries:
   the reads of a node that gave no sample, so the percentiles cover only the
   rest. Percentiles are nearest-rank.
 
+### Ownership-claim provenance
+
+Whether a cell's first claim could be granted by the session that minted its
+id, and whether the agent comes back after that session is gone, are questions
+about a fleet, not a bench. These counters and a sampler answer them from a
+running fleet. They only count: they make no bucket request, add no key and
+change no record, lease or id.
+
+The key of an id is the first 8 bytes of its 16-byte payload, written as 16 hex
+digits. At a mint it comes from the bytes drawn; at a claim or a release it comes
+from the cell scope, whose text after the last `:` must be 64 hex digits. A
+scope of another shape has no key and is counted only by the counters that
+exist without one. Ordinary ids, D1, KV and facet scopes all have this shape,
+so all of them get keys; only an id that `newUniqueId` drew can be in the
+minted set. An id is *sampled* when its key is a multiple of `CELLD_STEP0_SAMPLE`
+(default 64; `0` turns the rings off, one samples every id). The exact counters
+do not depend on it.
+
+New fields under `storage_counters` in `/state`, per process, from its start:
+
+| Field | Meaning |
+| --- | --- |
+| `session`, `process_start_ms` | the process: `<node>/<generation>` and its wall-clock start. A change of either is a restart |
+| `drain_started_ms` | wall-clock time at which the process began to drain; `null` before |
+| `step0_sample` | the sampling divisor in force |
+| `minted_untracked` | keys pushed out of the minted set because it was full (at most 1,000,000 keys, oldest first) |
+| `first_claims_minted_local` | first claims that the store accepted for an id this process minted and had not yet claimed. A lower bound of the minted share: an id minted here and first used through another node is missed |
+| `first_claims_minted_local_no_ensemble` | the part of the line above made while the node had no active fleet ensemble, which a grant could not serve |
+| `second_claims_prior_released`, `_self`, `_other` | accepted claims at epoch 2, by whom the record they replaced named: no node, this node (a restart of it), another node |
+| `releases_drain`, `releases_handoff` | releases that the store accepted while the node was draining, and while it was not (a balancing move) |
+| `preserved_resumes` | cells that the successor of a preserved restart (`POST /shutdown?handoff=preserve`) reopened at their epoch without a claim. It counts the restore that follows the node-level lease handoff, so a cell whose database could not be reopened is not counted |
+
+A claim or release is counted where its store answer is `Applied`; a claim whose
+answer was ambiguous and that the core settles by a read is not counted, as
+before. The core names the prior owner of a claim and the reason of a release,
+because only it knows them, and the shell counts.
+
+`/state/step0` carries `{session, process_start_ms, drain_started_ms,
+step0_sample, rings}` under the access rule of `/state` (the operator token,
+when set). Each of the five rings holds up to 4,096 entries and a `next_seq`
+that only grows, so a reader sees how many entries it missed:
+
+| Ring | Entry | Written with |
+| --- | --- | --- |
+| `mints` | `{seq, key, t_ms}` | a mint |
+| `first_claims` | `{seq, key, t_ms, minted_local, ensemble}` | `first_claims` |
+| `second_claims` | `{seq, key, t_ms, prior, takeover}` | the three `second_claims_*` |
+| `releases` | `{seq, key, t_ms, epoch, reason}` | the two `releases_*` |
+| `resumes` | `{seq, key, t_ms, epoch}` | `preserved_resumes` |
+
+`t_ms` is wall-clock time. At the default divisor and 1.67 new agents a second
+on a node a ring holds more than 40 hours.
+
+**Cost.** A mint takes the minted-set lock once, and the ring lock too when the
+key is sampled. A first claim takes the minted-set lock once (and the ring lock
+when sampled) and reads the node log's shipper under its lock. A second claim or
+a release adds one relaxed atomic, and the ring lock when sampled. Every other
+claim is unchanged. Nothing is allocated before the first mint or sampled
+entry, and the sets and rings are bounded. The `storage_requests` request counts
+per agent do not move.
+
+#### The sampler
+
+`claim_sample` polls `/state` and `/state/step0` of every node at a fixed
+interval and summarizes what it read. One command, from a machine that can reach
+the nodes' internal addresses:
+
+```sh
+CELLD_SAMPLE_NODES=http://10.0.0.1:8081,http://10.0.0.2:8081 \
+  cargo bench -p celld --bench claim_sample --profile lab
+```
+
+It polls every 5 minutes for 7 days and writes, to `./claim-sample/` (or
+`CELLD_SAMPLE_OUT`):
+
+- `samples.jsonl`: one line per poll of one node: its counters and the ring
+  entries that no earlier line of the same process carries, or the error of a
+  node that did not answer. A node that is down is logged and polled again at the
+  next interval.
+- `summary.md` and `summary.json`: the summary, also printed. They are written
+  when the run ends or on Ctrl-C, and from the log alone with
+  `CELLD_SAMPLE_SUMMARIZE=1`, which does not poll. A run that finds a log in
+  its directory appends to it, and entries logged twice count once.
+
+Settings: `CELLD_SAMPLE_NODES` (comma-separated base URLs, required),
+`CELLD_SAMPLE_DAYS` (7), `CELLD_SAMPLE_INTERVAL_S` (300), `CELLD_SAMPLE_OUT`
+(`claim-sample`), `CELLD_SAMPLE_SUMMARIZE`, and `CELLD_OPERATOR_TOKEN` when the
+fleet sets one.
+
+Counters reset when a process restarts, so they are summed per process
+(`session` and `process_start_ms`). A process that began after the first poll
+counts everything it reports; one that was already running counts the difference
+between its last poll and its first. Whatever a process counted after its last
+poll is lost. A ring that turned over between two polls shows as a gap, and
+fails the gate.
+
+The summary reports:
+
+- **The gate**: at least 7 days of window, every node answered and reports the
+  counters, no ring gap, the rings on, and `minted_untracked` at most 1% of
+  `ids_minted` (above that `first_claims_minted_local` is too low, and the
+  ring estimate of m is used alone).
+- **m**, three ways. `m_upper` is `ids_minted / first_claims`, **an upper
+  bound**: it counts an id that is never used. `m_local` is
+  `first_claims_minted_local / first_claims`, a lower bound. `m` is the share of
+  the sampled first claims whose id was minted by a process that was still
+  running at the claim and whose node had a fleet ensemble, which a grant needs; it is the estimate the dollar figures use.
+- **The return shares**, of the sampled agents counted in m: `r_n`, the share
+  whose first second claim came from another process than the one that bore it
+  when that process did not release the cell in a drain; `r_d`, the same after a
+  drain; the share left while the session lived (a balancing move); the
+  in-session wakes; and `r_p`, the share a preserved restart carried over in its
+  first epoch. They are lower bounds, since an agent born late in the window has
+  had little time to return, so they are also given for the agents born in the
+  first two days, with the distribution of the delay.
+- **The volume**: first claims in the window and a month's worth (30 days).
+- **Sessions and drains** per node-week, the length of ended sessions, drain
+  releases a month and the share of evictions that were empty.
+- **Net dollars a month** of three variants of a session-granted first claim:
+  `A-set` is `m × (2,900 − 2,365 r_n) − 44`, `A-reg` is
+  `m × (2,900 − 5,600 r_n − 3,240 r_d)`, and reads only is
+  `m × (701 − 175 r_n) − 44`, with the terms in `m` scaled by the volume against
+  438M agents a month and the 44 by the number of nodes against 100. They are at
+  the measured volume, at 438M, and with `r_n` = 1. **The constants are the
+  cost model's, not measurements** (`Model` in
+  `benches/claim_sample/summary.rs`, the only place they are written).
+
 ### Classifying keys
 
 The split between "per agent" and "shared" depends on how a store lays out its

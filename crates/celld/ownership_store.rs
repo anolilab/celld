@@ -1012,7 +1012,6 @@ impl BucketOwnership {
         };
         match self.bucket.put_cas(&key, body, etag).await? {
             Some(_) => {
-                crate::storage_counters::claim_applied(matches!(guard, CasGuard::Absent));
                 // A create-only write is the cell's first claim, at epoch one:
                 // the record exists, and LTX can follow. Queueing the
                 // registration now lets the cell's first LTX write find its

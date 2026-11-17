@@ -40,6 +40,11 @@ name = "runtime_latency"
 path = "benches/runtime_latency.rs"
 harness = false
 
+[[bench]]
+name = "claim_sample"
+path = "benches/claim_sample.rs"
+harness = false
+
 [lints.clippy]
 disallowed_macros = "forbid"
 

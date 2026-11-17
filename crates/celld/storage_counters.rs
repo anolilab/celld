@@ -6,6 +6,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::claim_provenance::{self, Claimed};
+
 static IDS_MINTED: AtomicU64 = AtomicU64::new(0);
 static CLAIMS: AtomicU64 = AtomicU64::new(0);
 static FIRST_CLAIMS: AtomicU64 = AtomicU64::new(0);
@@ -42,17 +44,19 @@ impl EvictionOutcome {
 
 /// A Durable Object id that `newUniqueId` drew, as opposed to one derived from
 /// a name.
-pub(crate) fn id_minted() {
+pub(crate) fn id_minted(id: &[u8; 32]) {
     IDS_MINTED.fetch_add(1, Ordering::Relaxed);
+    claim_provenance::minted(id);
 }
 
 /// A claim of a cell's record that the store accepted. `first` is the
 /// create-only write of epoch one.
-pub(crate) fn claim_applied(first: bool) {
+pub(crate) fn claim_applied(claim: &Claimed<'_>) {
     CLAIMS.fetch_add(1, Ordering::Relaxed);
-    if first {
+    if claim.first {
         FIRST_CLAIMS.fetch_add(1, Ordering::Relaxed);
     }
+    claim_provenance::claim_applied(claim);
 }
 
 pub(crate) fn evicted(outcome: EvictionOutcome) {
@@ -61,7 +65,7 @@ pub(crate) fn evicted(outcome: EvictionOutcome) {
 
 pub(crate) fn to_json() -> serde_json::Value {
     let count = |slot: usize| EVICTIONS[slot].load(Ordering::Relaxed);
-    serde_json::json!({
+    let mut counters = serde_json::json!({
         "ids_minted": IDS_MINTED.load(Ordering::Relaxed),
         "claims": CLAIMS.load(Ordering::Relaxed),
         "first_claims": FIRST_CLAIMS.load(Ordering::Relaxed),
@@ -72,5 +76,10 @@ pub(crate) fn to_json() -> serde_json::Value {
             "publish_failed": count(EvictionOutcome::PublishFailed.slot()),
             "empty": count(EvictionOutcome::Empty.slot()),
         },
-    })
+    });
+    counters
+        .as_object_mut()
+        .expect("an object")
+        .extend(claim_provenance::counters_json());
+    counters
 }

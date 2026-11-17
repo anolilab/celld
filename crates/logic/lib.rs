@@ -2169,6 +2169,24 @@ impl State {
         }
     }
 
+    /// What a claim's prior owner was, for the executor's claim counts.
+    fn claim_prior(&self, prior: Option<&str>) -> ClaimPrior {
+        match prior {
+            None => ClaimPrior::Released,
+            Some(node) if node == self.node => ClaimPrior::ThisNode,
+            Some(_) => ClaimPrior::OtherNode,
+        }
+    }
+
+    /// Why a release issued now is issued, for the executor's release counts.
+    fn release_reason(&self) -> ReleaseReason {
+        if self.draining {
+            ReleaseReason::Drain
+        } else {
+            ReleaseReason::Handoff
+        }
+    }
+
     /// A leaving node can still discover a live successor, but it must not
     /// acquire somebody else's or an unowned cell just to hand it off again.
     /// Keep this check at claim admission as well as before recovery and
@@ -2231,6 +2249,7 @@ impl State {
                     guard: claim.guard,
                     epoch: claim.epoch,
                     takeover: claim.takeover,
+                    prior: self.claim_prior(claim.prior.as_deref()),
                 });
             }
             Activation::Restore(spec) => {
@@ -5319,6 +5338,7 @@ impl State {
                         op,
                         cell: id.clone(),
                         epoch,
+                        reason: self.release_reason(),
                     });
                 }
             }
@@ -5857,6 +5877,7 @@ impl State {
                 op,
                 cell: id,
                 epoch,
+                reason: self.release_reason(),
             });
             in_flight += 1;
         }
@@ -5979,6 +6000,7 @@ impl State {
             op,
             cell: id.to_string(),
             epoch,
+            reason: self.release_reason(),
         });
     }
 

@@ -9308,7 +9308,7 @@ fn op_do_id(
                 throw_durable_object_id_error(scope, "secure random generation failed");
                 return;
             }
-            crate::storage_counters::id_minted();
+            crate::storage_counters::id_minted(&id);
         }
         "validate" => {
             let Some(decoded) = decode_durable_object_id(&input) else {
