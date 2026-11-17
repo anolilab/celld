@@ -45,6 +45,7 @@ pub fn operator_token_path(project: &Path) -> PathBuf {
 #[derive(Debug)]
 struct Options {
     project: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
     clean: bool,
     stack: StackOptions,
 }
@@ -337,23 +338,25 @@ impl ShutdownSignals {
 pub fn print_help() -> anyhow::Result<()> {
     crate::cli_output::Output::new(crate::cli_output::Format::Text).help(
         &format!("celld dev — run an application with persistent local storage\n\n\
-USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--logs] [--no-watch] [--clean]\n\n\
+USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--state-dir DIR] [--logs] [--no-watch] [--clean]\n\n\
 PROJECT is a directory or a Wrangler config. It defaults to the current\n\
 directory. celld stores all local state in PROJECT/.celld/dev, and it keeps\n\
-that state across a restart. A configuration change does not migrate the\n\
+that state across a restart. --state-dir DIR, or CELLD_DEV_STATE_DIR, keeps it\n\
+in DIR/.celld/dev instead. A configuration change does not migrate the\n\
 state, so a cell can keep a value that the new configuration rejects. Use\n\
 --clean to start from an empty local state.\n\n\
 A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
 as for wrangler dev. Without one, .env and then .env.local supply them, and\n\
 an entry of these files that cannot be a binding is skipped with a warning.\n\
 The entries override the vars of the config.\n\n\
-OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port, or 0 for a free one (default: {DEFAULT_PORT})\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
+OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port, or 0 for a free one (default: {DEFAULT_PORT})\n  --state-dir DIR        Keep the local state in DIR/.celld/dev, outside the project\n  --clean                Delete the local state before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
 }
 
 fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Options>> {
     let mut project = None;
+    let mut state_dir = None;
     let mut host = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut port = DEFAULT_PORT;
     let mut clean = false;
@@ -375,6 +378,10 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
                     Pattern::new(&value)
                         .with_context(|| format!("invalid --watch-ignore pattern {value:?}"))?,
                 );
+            }
+            "--state-dir" => {
+                let value = arguments.next().context("--state-dir requires a value")?;
+                state_dir = Some(PathBuf::from(value));
             }
             "--host" => {
                 let value = arguments.next().context("--host requires a value")?;
@@ -398,6 +405,7 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
     }
     Ok(Some(Options {
         project,
+        state_dir,
         clean,
         stack: StackOptions {
             listener: SocketAddr::new(host, port),
@@ -420,7 +428,18 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let project = config
         .parent()
         .context("the Wrangler config has no project directory")?;
-    let state = DevState::for_project(project);
+    // The state directory replaces the project as the parent of `.celld/dev`,
+    // so `--clean` keeps deleting only a directory of that name.
+    let state_root = match options
+        .state_dir
+        .or_else(|| std::env::var_os("CELLD_DEV_STATE_DIR").map(PathBuf::from))
+        .filter(|directory| !directory.as_os_str().is_empty())
+    {
+        Some(directory) => std::path::absolute(&directory)
+            .with_context(|| format!("resolve --state-dir {}", directory.display()))?,
+        None => project.to_path_buf(),
+    };
+    let state = DevState::for_project(&state_root);
     let console = Console::new();
     console.header();
     console.detail("Project", &config.display().to_string());
@@ -1010,6 +1029,15 @@ mod tests {
     fn port_zero_asks_for_a_free_port() {
         let options = parse(&["--port", "0"]).unwrap().unwrap();
         assert_eq!(options.stack.listener.port(), 0);
+    }
+
+    #[test]
+    fn the_state_directory_moves_the_parent_of_the_local_state() {
+        let options = parse(&["--state-dir", "/var/celld"]).unwrap().unwrap();
+        assert_eq!(options.state_dir, Some(PathBuf::from("/var/celld")));
+        assert!(parse(&["--state-dir"]).is_err());
+        let state = DevState::for_project(Path::new("/var/celld"));
+        assert_eq!(state.path(), Path::new("/var/celld/.celld/dev"));
     }
 
     #[test]

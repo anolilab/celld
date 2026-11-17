@@ -372,7 +372,8 @@ is `http://127.0.0.1:9876` by default.
 | `--port PORT` | The Worker listener port. `0` picks a free port, named on the `ready` line and kept across rebuilds |
 | `--host ADDR` | The Worker listener interface. The operator listener stays on loopback |
 | `--logs` | Show the node warning and information logs |
-| `--clean` | Delete `.celld/dev` before the start |
+| `--state-dir DIR` | Keep the local state in `DIR/.celld/dev` instead of the project. `CELLD_DEV_STATE_DIR` sets the same; the flag wins |
+| `--clean` | Delete the local state (`.celld/dev`) before the start |
 | `--watch-ignore GLOB` | Ignore one more project-relative glob. Repeatable. Not valid with `--no-watch` |
 | `--no-watch` | Disable automatic builds and restarts |
 
