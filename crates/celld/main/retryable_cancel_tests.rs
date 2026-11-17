@@ -40,7 +40,7 @@ async fn a_context_wrapped_cancel_still_reports_its_cause() {
 
 #[tokio::test]
 async fn a_forwarded_cancel_reaches_the_originating_ingress_as_503() {
-    let owner = retryable_cancel_response(&cancel(
+    let owner = peer_retryable_cancel_response(&cancel(
         "this Durable Object was moved to a new deployment and its request was ended; retry it",
     ));
     assert!(is_retryable_cancel_reply(owner.status(), owner.headers()));
@@ -71,4 +71,18 @@ fn only_a_marked_503_is_a_forwarded_cancel() {
         StatusCode::SERVICE_UNAVAILABLE,
         &hyper::HeaderMap::new()
     ));
+}
+
+#[tokio::test]
+async fn a_public_reply_carries_neither_the_peer_marker_nor_the_workers_stack() {
+    let error = anyhow::anyhow!(
+        "rejected: Error: this Durable Object was moved to a new deployment and its request \
+         was ended; retry it ({MARKER})\n    at handler (worker.js:12:5)"
+    );
+    let reply = retryable_cancel_response(&error);
+    assert!(!reply.headers().contains_key(RETRYABLE_CANCEL_HEADER));
+    let body = body_text(reply).await;
+    assert!(body.contains("was moved to a new deployment"), "{body}");
+    assert!(!body.contains("worker.js"), "{body}");
+    assert!(!body.contains("rejected"), "{body}");
 }

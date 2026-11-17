@@ -1688,21 +1688,24 @@ fn retryable_cancel_error(error: &anyhow::Error) -> bool {
 const RETRYABLE_CANCEL_HEADER: &str = "x-celld-retryable-cancel";
 
 /// The cause text of a retryable cancel, without the internal marker.
-fn retryable_cancel_text(error: &anyhow::Error) -> String {
+/// The public sentence for a retryable cancel. It is chosen from the cause,
+/// never copied from the error text, which can carry a Worker's stack.
+fn retryable_cancel_text(error: &anyhow::Error) -> &'static str {
     let marker = celld::js::CANCEL_RETRYABLE_ERROR_MARKER;
-    error
+    let text = error
         .chain()
         .map(|cause| cause.to_string())
         .find(|text| text.contains(marker))
-        .map_or_else(
-            || "request ended; retry it".to_string(),
-            |text| {
-                text.replace(&format!("({marker})"), "")
-                    .replace(marker, "")
-                    .trim()
-                    .to_string()
-            },
-        )
+        .unwrap_or_default();
+    if text.contains("was moved to a new deployment") {
+        "this Durable Object was moved to a new deployment and its request was ended; retry it"
+    } else if text.contains("restarted after a storage error") {
+        "this Durable Object restarted after a storage error and its request was ended; retry it"
+    } else if text.contains("node is shutting down") {
+        "this node is shutting down and its request was ended; retry it"
+    } else {
+        "this request was ended; retry it"
+    }
 }
 
 fn retryable_cancel_response(error: &anyhow::Error) -> HttpReply {
@@ -1714,6 +1717,13 @@ fn retryable_cancel_response(error: &anyhow::Error) -> HttpReply {
         hyper::header::RETRY_AFTER,
         hyper::header::HeaderValue::from_static("1"),
     );
+    refused
+}
+
+/// The same 503 for a peer that forwarded the request, marked so that peer
+/// can tell it from an overload. Public clients never see the marker.
+fn peer_retryable_cancel_response(error: &anyhow::Error) -> HttpReply {
+    let mut refused = retryable_cancel_response(error);
     refused.headers_mut().insert(
         hyper::header::HeaderName::from_static(RETRYABLE_CANCEL_HEADER),
         hyper::header::HeaderValue::from_static("1"),
@@ -2416,7 +2426,7 @@ pub(crate) async fn dispatch_forwarded_rpc(
         ),
         Err(error) if cell_overload_error(&error) => peer_response(cell_overload_response()),
         Err(error) if retryable_cancel_error(&error) => {
-            peer_response(retryable_cancel_response(&error))
+            peer_response(peer_retryable_cancel_response(&error))
         }
         Err(error) => peer_response(response(
             StatusCode::INTERNAL_SERVER_ERROR,
