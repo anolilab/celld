@@ -521,23 +521,75 @@ impl Drop for WorkerWebSocket {
 
 /// A socket that a Worker's `fetch()` upgraded and then answered with. The
 /// connection is host-owned already: its task reads the upstream into
-/// `pull` and writes whatever is emitted to `id`. The client takes the
+/// `pull` and writes whatever is emitted to it. The client takes the
 /// isolate's place on both, so a frame crosses in one queue hop each way.
 pub struct UpstreamWebSocket {
     id: u64,
     pull: Option<WsPullReceiver>,
+    link: Arc<UpstreamLink>,
+}
+
+/// The way to the connection of a returned socket. It holds the connector's
+/// own sender, so a frame needs no registry lookup, and it is empty once the
+/// connection has ended.
+pub struct UpstreamLink {
+    outbound: Option<tokio::sync::mpsc::UnboundedSender<WsOut>>,
+    room: Option<Arc<WsRoom>>,
+}
+
+impl UpstreamLink {
+    /// Send a frame to the upstream once there is room for it. A frame for a
+    /// connection that has ended is discarded: its close is still queued for
+    /// the client to read.
+    pub async fn send(&self, out: WsOut) {
+        let (Some(room), Some(outbound)) = (&self.room, &self.outbound) else {
+            return;
+        };
+        if room.reserve(ws_out_bytes(&out)).await {
+            let _ = outbound.send(out);
+        }
+    }
+
+    /// Queue a close behind the frames already sent.
+    pub fn close(&self, code: u16, reason: &str) {
+        if let Some(outbound) = &self.outbound {
+            let _ = outbound.send(WsOut::Close(code, reason.to_string()));
+        }
+    }
+}
+
+/// How long a closed client's queue is read on, so the connector can finish
+/// writing the close it was given even while the upstream keeps sending.
+const UPSTREAM_CLOSE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Read and discard what the upstream still sends until its connection ends.
+/// The connector stops writing as soon as it can no longer deliver a frame to
+/// the queue, and skips a close it has not written yet.
+pub async fn ws_pull_drain(pull: &mut WsPullReceiver) {
+    let _ = asyncrt::timeout(UPSTREAM_CLOSE_DRAIN, async {
+        while pull.recv().await.is_some() {}
+    })
+    .await;
 }
 
 impl UpstreamWebSocket {
-    pub(crate) fn new(id: u64, pull: WsPullReceiver) -> Self {
+    pub(crate) fn new(id: u64, handoff: UpstreamHandoff) -> Self {
         Self {
             id,
-            pull: Some(pull),
+            pull: Some(handoff.pull),
+            link: Arc::new(UpstreamLink {
+                outbound: handoff.outbound,
+                room: handoff.room,
+            }),
         }
     }
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    pub fn link(&self) -> Arc<UpstreamLink> {
+        self.link.clone()
     }
 
     /// The frames the upstream sent, for the client to read. Taken once.
@@ -550,8 +602,19 @@ impl Drop for UpstreamWebSocket {
     fn drop(&mut self) {
         // A response that never reached a client (refused, or dropped before
         // the upgrade) must not leave the upstream connection open.
-        ws_close_open(self.id, 1001, "request ended");
+        self.link.close(1001, "request ended");
+        if let Some(mut pull) = self.pull.take() {
+            asyncrt::spawn(async move { ws_pull_drain(&mut pull).await }).detach();
+        }
     }
+}
+
+/// What a request keeps of a returned outbound socket until its response
+/// claims it.
+pub(crate) struct UpstreamHandoff {
+    pub(crate) pull: WsPullReceiver,
+    pub(crate) outbound: Option<tokio::sync::mpsc::UnboundedSender<WsOut>>,
+    pub(crate) room: Option<Arc<WsRoom>>,
 }
 
 pub enum WsIn {
@@ -621,13 +684,13 @@ pub struct WsRegistry {
     pub(crate) worker_handoffs: HashMap<u64, WsPullSender>,
     /// The pull queue of an outbound socket a Worker is returning, taken from
     /// the isolate until the response claims it.
-    pub(crate) upstream_handoffs: HashMap<u64, WsPullReceiver>,
+    pub(crate) upstream_handoffs: HashMap<u64, UpstreamHandoff>,
     /// Room towards the connection of each socket that has a connector.
-    rooms: HashMap<u64, Arc<WsRoom>>,
+    pub(crate) rooms: HashMap<u64, Arc<WsRoom>>,
     /// The request that owns a Worker socket (one with no cell scope), keyed
     /// by socket id. Recorded by the host where the isolate opens the socket,
     /// never taken from an argument the script supplies.
-    owners: HashMap<u64, u64>,
+    pub(crate) owners: HashMap<u64, u64>,
     /// The request a cell's socket was handed to as a response target, and
     /// the whole target it was handed, keyed by the cell end's id and tunnel.
     /// Only that request can bind to it or return it, and only as handed: the
@@ -717,12 +780,7 @@ impl WsRegistry {
         if parked.overflowed {
             return Some(false);
         }
-        parked.buffered += size_of::<WsOut>()
-            + match out {
-                WsOut::Text(text) => text.len(),
-                WsOut::Binary(bytes) => bytes.len(),
-                WsOut::Close(_, reason) => reason.len(),
-            };
+        parked.buffered += ws_out_bytes(out);
         parked.overflowed = parked.buffered > PARKED_WS_BUFFER_MAX_BYTES;
         parked.overflowed.then_some(true)
     }
@@ -1525,19 +1583,20 @@ pub fn ws_emit_batch(frames: impl Into<WsBatch>) {
 /// first and waits while the queue is full, which stops reading the client and
 /// lets the client's own connection push back. The connector gives the room
 /// back as it takes each frame off the channel.
+///
+/// A connector that nobody sends to pays one atomic load per frame: the room
+/// counts nothing until the first reservation.
 #[derive(Default)]
 pub struct WsRoom {
-    state: std::sync::Mutex<WsRoomState>,
+    queued: std::sync::atomic::AtomicUsize,
+    counting: std::sync::atomic::AtomicBool,
+    closed: std::sync::atomic::AtomicBool,
+    waiting: std::sync::atomic::AtomicUsize,
     freed: tokio::sync::Notify,
 }
 
-#[derive(Default)]
-struct WsRoomState {
-    queued: usize,
-    closed: bool,
-}
-
-/// What a frame is charged against a socket's room.
+/// What a frame is charged against a socket's room, and a parked socket's
+/// buffer.
 pub fn ws_out_bytes(out: &WsOut) -> usize {
     size_of::<WsOut>()
         + match out {
@@ -1547,43 +1606,77 @@ pub fn ws_out_bytes(out: &WsOut) -> usize {
         }
 }
 
+/// Counts a task that waits for room, so a release only wakes when needed.
+struct WsRoomWaiter<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for WsRoomWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl WsRoom {
+    fn try_take(&self, bytes: usize) -> bool {
+        self.queued
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |queued| {
+                (queued == 0 || queued + bytes <= WS_PULL_QUEUE_MAX_BYTES).then(|| queued + bytes)
+            })
+            .is_ok()
+    }
+
     /// Wait for room for `bytes`. One frame larger than the cap is admitted
     /// alone, into an empty queue. False once the connection is gone.
     pub async fn reserve(&self, bytes: usize) -> bool {
+        self.counting.store(true, Ordering::SeqCst);
+        if self.closed.load(Ordering::SeqCst) {
+            return false;
+        }
+        if self.try_take(bytes) {
+            return true;
+        }
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        let _waiter = WsRoomWaiter(&self.waiting);
         loop {
             let freed = self.freed.notified();
             tokio::pin!(freed);
             freed.as_mut().enable();
-            {
-                let mut state = self.state.lock().unwrap();
-                if state.closed {
-                    return false;
-                }
-                if state.queued == 0 || state.queued + bytes <= WS_PULL_QUEUE_MAX_BYTES {
-                    state.queued += bytes;
-                    return true;
-                }
+            if self.closed.load(Ordering::SeqCst) {
+                return false;
+            }
+            if self.try_take(bytes) {
+                return true;
             }
             freed.await;
         }
     }
 
-    /// Frames the Worker's own isolate queued were never reserved, so this
-    /// never goes below zero.
+    /// Frames queued before the first reservation were never reserved, so
+    /// this never goes below zero.
     pub fn release(&self, bytes: usize) {
-        let mut state = self.state.lock().unwrap();
-        state.queued = state.queued.saturating_sub(bytes);
-        drop(state);
-        self.freed.notify_waiters();
+        if !self.counting.load(Ordering::Relaxed) {
+            return;
+        }
+        let _ = self
+            .queued
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |queued| {
+                Some(queued.saturating_sub(bytes))
+            });
+        if self.waiting.load(Ordering::SeqCst) > 0 {
+            self.freed.notify_waiters();
+        }
+    }
+
+    /// Whether a client has sent to this connection.
+    pub fn is_counting(&self) -> bool {
+        self.counting.load(Ordering::Relaxed)
     }
 
     pub fn queued(&self) -> usize {
-        self.state.lock().unwrap().queued
+        self.queued.load(Ordering::SeqCst)
     }
 
     pub fn close(&self) {
-        self.state.lock().unwrap().closed = true;
+        self.closed.store(true, Ordering::SeqCst);
         self.freed.notify_waiters();
     }
 }
@@ -1597,29 +1690,6 @@ pub fn ws_room(id: u64) -> Arc<WsRoom> {
         .entry(id)
         .or_default()
         .clone()
-}
-
-/// The room of a connection that is still registered.
-pub fn ws_room_of(id: u64) -> Option<Arc<WsRoom>> {
-    ws_registry().lock().unwrap().rooms.get(&id).cloned()
-}
-
-/// Send a frame to the connection behind socket `id`. False when it has no
-/// connection left, which is how a pipe learns the other end is gone.
-pub fn ws_send(id: u64, out: WsOut) -> bool {
-    let registry = ws_registry();
-    let mut registry = registry.lock().unwrap();
-    let open = registry.outputs.contains_key(&id);
-    if open {
-        registry.emit(id, out);
-    }
-    open
-}
-
-/// Close socket `id` if its connection is still there. A socket whose remote
-/// already hung up has nothing to close, and that is not worth a warning.
-pub fn ws_close_open(id: u64, code: u16, reason: &str) -> bool {
-    ws_send(id, WsOut::Close(code, reason.to_string()))
 }
 
 /// Close one socket. A forced generation swap closes the regular and

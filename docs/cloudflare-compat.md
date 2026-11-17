@@ -154,10 +154,16 @@ The `tail` and `email` handlers are unavailable.
   event with code 1006.
 - A Worker that returns the response of a `fetch()` that upgraded (for example
   `return fetch(request)` to a WebSocket server) connects its client to that
-  socket. Frames pass both ways, and a close passes with its code and reason;
-  the subprotocol the server chose reaches the client. A Worker that accepts
-  the socket itself keeps it as its own. Returning such a socket from a Durable
-  Object or through a service binding is not supported.
+  socket. Frames pass both ways, and a close passes with its code and reason,
+  also when the server has already ended or is busy sending. The subprotocol
+  the server chose reaches the client when the client offered it. The socket
+  belongs to the client from then on: `accept()`, `send()` and `close()` on it
+  throw an `InvalidStateError`. A client that sends faster than the server
+  reads is held back, and a write the server does not take for 60 seconds ends
+  the connection. A Worker that accepts the socket itself keeps it as its own.
+  Returning such a socket from a Durable Object makes the call fail with a
+  `TypeError` and closes the socket; returning it through a service binding
+  also fails the call.
 - A Durable Object's `stub.fetch()` call rejects when the handler fails, on the
   owner node and on any other node.
 

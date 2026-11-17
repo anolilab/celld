@@ -95,11 +95,12 @@ fn prepare_worker_websocket_handoff(id: u64, owner: u64) {
 
 /// Take an outbound socket's pull queue away from the isolate, for a response
 /// that returns the socket. False when the caller does not own the socket or
-/// the isolate already reads it.
+/// the isolate already reads it. A connection that already ended still has its
+/// frames and close queued, and the client gets them.
 fn prepare_upstream_websocket_handoff(caller: &WsCaller, id: u64) -> bool {
     let shared = ws_registry();
     let mut registry = shared.lock().unwrap();
-    if !registry.may_use(caller, id) || !registry.outputs.contains_key(&id) {
+    if !registry.may_use(caller, id) {
         return false;
     }
     let Some(queue) = ws_pull().lock().unwrap().remove(&id) else {
@@ -109,7 +110,12 @@ fn prepare_upstream_websocket_handoff(caller: &WsCaller, id: u64) -> bool {
     // the socket; then it keeps reading and the socket is not ours to move.
     match Arc::try_unwrap(queue) {
         Ok(queue) => {
-            registry.upstream_handoffs.insert(id, queue.into_inner());
+            let handoff = UpstreamHandoff {
+                pull: queue.into_inner(),
+                outbound: registry.outputs.get(&id).cloned(),
+                room: registry.rooms.get(&id).cloned(),
+            };
+            registry.upstream_handoffs.insert(id, handoff);
             true
         }
         Err(queue) => {
@@ -128,7 +134,10 @@ pub(super) fn transfer_upstream_websocket_handoff(
     if !registry.may_use(caller, id) {
         return None;
     }
-    let pull = registry.upstream_handoffs.remove(&id)?;
+    let handoff = registry.upstream_handoffs.remove(&id)?;
+    // The Worker no longer owns the socket: its own frames would mix with the
+    // client's and skip the room, so every op on this id refuses it.
+    registry.owners.remove(&id);
     drop(registry);
     // The response owns the socket from here, so the request's end must not
     // close it.
@@ -137,7 +146,7 @@ pub(super) fn transfer_upstream_websocket_handoff(
         .lock()
         .unwrap()
         .retain(|opened| *opened != id);
-    Some(UpstreamWebSocket::new(id, pull))
+    Some(UpstreamWebSocket::new(id, handoff))
 }
 
 pub(super) fn transfer_worker_websocket_handoff(
