@@ -5401,6 +5401,8 @@ impl Worker {
             // read Cloudflare.compatibilityFlags at module scope.
             inject_compatibility_flags(scope, compat)?;
             inject_storage_compatibility(scope, compat)?;
+            // Before the module evaluates, so module scope reads it.
+            populate_process_env(scope, &config)?;
 
             let module = match compile_module(scope, &config.main_module_name, src) {
                 Some(m) => m,
@@ -10099,6 +10101,9 @@ impl RequestVfs {
                     unreachable!("the node was a file a moment ago");
                 };
                 if append {
+                    // `used` counts length, memory follows capacity: grow by
+                    // exactly what is added, not by the Vec's doubling.
+                    bytes.reserve_exact(data.len());
                     bytes.extend_from_slice(data);
                 } else {
                     *bytes = data.to_vec();
@@ -11019,15 +11024,40 @@ fn op_pending_event_end(
     }
 }
 
-/// Run `f` on the current request's virtual `/tmp` tree.
-fn with_vfs<R>(scope: &mut v8::PinScope, f: impl FnOnce(&mut RequestVfs) -> R) -> R {
-    let context = event_context(scope);
+/// The context a request installed, never a default one.
+///
+/// Code that runs with no request (a module evaluating while the isolate
+/// loads) would otherwise fall back to the thread's default context, which is
+/// shared by every script on the thread and never dropped: its `/tmp` would
+/// outlive the script and leak into the next one.
+fn request_context(scope: &mut v8::PinScope) -> Option<Arc<IoContext>> {
+    current_reaction_io_context(scope).or_else(|| CURRENT.with(|current| current.borrow().clone()))
+}
+
+/// The error code for a `/tmp` change with no request; the harness words it.
+const VFS_NO_REQUEST: &str = "ENOREQUEST";
+
+/// Run `f` on the current request's virtual `/tmp` tree. Without a request
+/// there is no tree to change: `None`.
+fn with_vfs<R>(scope: &mut v8::PinScope, f: impl FnOnce(&mut RequestVfs) -> R) -> Option<R> {
+    let context = request_context(scope)?;
     let mut vfs = context
         .vfs
         .get_or_init(|| Mutex::new(RequestVfs::default()))
         .lock()
         .unwrap();
-    f(&mut vfs)
+    Some(f(&mut vfs))
+}
+
+/// Like `with_vfs` for a change: no request answers `ENOREQUEST`.
+fn with_vfs_mut(
+    scope: &mut v8::PinScope,
+    f: impl FnOnce(&mut RequestVfs) -> Result<(), &'static str>,
+) -> &'static str {
+    with_vfs(scope, f)
+        .unwrap_or(Err(VFS_NO_REQUEST))
+        .err()
+        .unwrap_or("")
 }
 
 /// Create one directory in the current request's virtual `/tmp` tree.
@@ -11042,7 +11072,8 @@ fn op_vfs_mkdir(
 ) {
     let path = args.get(0).to_rust_string_lossy(scope);
     let recursive = args.get(1).boolean_value(scope);
-    let result = with_vfs(scope, |vfs| vfs.mkdir(&path, recursive));
+    let result = with_vfs(scope, |vfs| vfs.mkdir(&path, recursive))
+        .unwrap_or(VfsMkdirResult::Error(VFS_NO_REQUEST));
     let result = match result {
         VfsMkdirResult::Created(Some(path)) => path,
         VfsMkdirResult::Created(None) => String::new(),
@@ -11066,9 +11097,7 @@ fn op_vfs_write(
         view.copy_contents(&mut data);
     }
     let append = args.get(2).boolean_value(scope);
-    let code = with_vfs(scope, |vfs| vfs.write(&path, &data, append))
-        .err()
-        .unwrap_or("");
+    let code = with_vfs_mut(scope, |vfs| vfs.write(&path, &data, append));
     rv.set(v8::String::new(scope, code).unwrap().into());
 }
 
@@ -11080,7 +11109,10 @@ fn op_vfs_readdir(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let path = args.get(0).to_rust_string_lossy(scope);
-    match with_vfs(scope, |vfs| vfs.readdir(&path)) {
+    // With no request the tree is empty, as a request that wrote nothing.
+    match with_vfs(scope, |vfs| vfs.readdir(&path))
+        .unwrap_or_else(|| RequestVfs::default().readdir(&path))
+    {
         Ok(names) => {
             let array = v8::Array::new(scope, names.len() as i32);
             for (index, name) in names.iter().enumerate() {
@@ -11102,9 +11134,7 @@ fn op_vfs_remove(
 ) {
     let path = args.get(0).to_rust_string_lossy(scope);
     let recursive = args.get(1).boolean_value(scope);
-    let code = with_vfs(scope, |vfs| vfs.remove(&path, recursive))
-        .err()
-        .unwrap_or("");
+    let code = with_vfs_mut(scope, |vfs| vfs.remove(&path, recursive));
     rv.set(v8::String::new(scope, code).unwrap().into());
 }
 
@@ -11122,7 +11152,9 @@ fn op_vfs_stat(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let path = args.get(0).to_rust_string_lossy(scope);
-    let (kind, size) = match with_vfs(scope, |vfs| vfs.stat(&path)) {
+    let tree =
+        with_vfs(scope, |vfs| vfs.stat(&path)).unwrap_or_else(|| RequestVfs::default().stat(&path));
+    let (kind, size) = match tree {
         Some(VfsStat::Directory { writable }) => (if writable { 2 } else { 1 }, 0),
         Some(VfsStat::File(size)) => (4, size),
         // Only a path the writable tree does not claim can be a bundle path,
@@ -11165,7 +11197,7 @@ fn op_vfs_read_file(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let path = args.get(0).to_rust_string_lossy(scope);
-    if let Some(bytes) = with_vfs(scope, |vfs| vfs.read(&path).map(<[u8]>::to_vec)) {
+    if let Some(bytes) = with_vfs(scope, |vfs| vfs.read(&path).map(<[u8]>::to_vec)).flatten() {
         let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
         rv.set(v8::ArrayBuffer::with_backing_store(scope, &store).into());
         return;
@@ -11758,8 +11790,8 @@ use bootstrap::{
     adopt_cell, adopt_embedded_cell, begin_event_context, build_env, end_event_context,
     harness_env, inject_compatibility_flags, inject_containers, inject_crons, inject_kv_limits,
     inject_namespace_keys, inject_queue_config, inject_routing, inject_storage_compatibility,
-    inject_workflows, install_harness, install_prelude, populate_cf_exports, register_class,
-    register_entrypoints, validate_workflow_classes, EmbeddedStartup,
+    inject_workflows, install_harness, install_prelude, populate_cf_exports, populate_process_env,
+    register_class, register_entrypoints, validate_workflow_classes, EmbeddedStartup,
 };
 use modules::{
     compile_module, host_import_module_dynamically, install_lazy_globals, op_builtin_module,
@@ -11953,4 +11985,30 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
         write_position: None,
         observed_position: None,
     })
+}
+
+#[cfg(test)]
+mod request_vfs_tests {
+    use super::{RequestVfs, VfsNode};
+
+    #[test]
+    fn appended_files_hold_no_more_memory_than_they_are_charged() {
+        let mut vfs = RequestVfs::default();
+        for index in 0..4 {
+            let path = format!("/tmp/f{index}");
+            for _ in 0..5000 {
+                vfs.write(&path, b"x", true).unwrap();
+            }
+        }
+        let held: usize = vfs
+            .nodes
+            .values()
+            .map(|node| match node {
+                VfsNode::File(bytes) => bytes.capacity(),
+                VfsNode::Directory { .. } => 0,
+            })
+            .sum();
+        assert_eq!(held, 4 * 5000, "capacity must equal the bytes written");
+        assert!(held <= vfs.used);
+    }
 }

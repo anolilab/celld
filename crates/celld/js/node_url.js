@@ -2,7 +2,9 @@
 //
 // `URL` and `URLSearchParams` are the globals. `fileURLToPath` and
 // `pathToFileURL` follow Node's POSIX behaviour, including its error codes.
-// The legacy `parse` and string `format` are not implemented and fail on use.
+// The legacy API (`parse`, `resolve`, `Url`, `format` of a string or a legacy
+// object, the domain and HTTP-option helpers) is not implemented and throws
+// ERR_METHOD_NOT_IMPLEMENTED when used.
 //
 // Injected lazily, so an isolate that never imports node:url pays nothing.
 (() => {
@@ -121,44 +123,6 @@
     return new URL(`file://${escapePath(resolved)}`);
   };
 
-  // Legacy objects: `{ protocol, auth, host | hostname, port, pathname,
-  // search | query, hash }`, which is what the legacy `format` accepts.
-  const formatLegacy = (object) => {
-    let protocol = object.protocol || "";
-    if (protocol && !protocol.endsWith(":")) protocol += ":";
-    let host = "";
-    if (object.host) host = object.host;
-    else if (object.hostname) {
-      host = object.hostname.includes(":") && !object.hostname.startsWith("[")
-        ? `[${object.hostname}]`
-        : object.hostname;
-      if (object.port) host += `:${object.port}`;
-    }
-    const auth = object.auth
-      ? `${encodeURIComponent(object.auth).replace(/%3A/i, ":")}@`
-      : "";
-    let pathname = object.pathname || "";
-    let search = object.search || "";
-    if (!search && object.query && typeof object.query === "object") {
-      const query = new URLSearchParams(object.query).toString();
-      if (query) search = `?${query}`;
-    } else if (!search && typeof object.query === "string" && object.query) {
-      search = `?${object.query}`;
-    }
-    if (search && !search.startsWith("?")) search = `?${search}`;
-    let hash = object.hash || "";
-    if (hash && !hash.startsWith("#")) hash = `#${hash}`;
-    const slashed = object.slashes ||
-      /^(?:https?|ftp|gopher|file|wss?):$/.test(protocol);
-    if (host || slashed) {
-      if (host || protocol === "file:") host = `//${auth}${host}`;
-      if (pathname && !pathname.startsWith("/")) pathname = `/${pathname}`;
-    }
-    pathname = pathname.replace(/[?#]/g, encodeURIComponent);
-    search = search.replace("#", "%23");
-    return protocol + host + pathname + search + hash;
-  };
-
   const format = (value, options) => {
     if (isURL(value) && typeof value.searchParams === "object") {
       if (options !== undefined && (options === null ||
@@ -182,15 +146,15 @@
       return url.href;
     }
     if (typeof value === "string") return notImplemented("format(string)")();
-    if (value === null || typeof value !== "object") {
-      throw nodeError(
-        TypeError,
-        "ERR_INVALID_ARG_TYPE",
-        'The "urlObject" argument must be of type object or string.' +
-          describe(value),
-      );
+    if (value !== null && typeof value === "object") {
+      return notImplemented("format(legacy object)")();
     }
-    return formatLegacy(value);
+    throw nodeError(
+      TypeError,
+      "ERR_INVALID_ARG_TYPE",
+      'The "urlObject" argument must be of type object or string.' +
+        describe(value),
+    );
   };
 
   __celld.__urlModule = {
@@ -200,5 +164,11 @@
     pathToFileURL,
     format,
     parse: notImplemented("parse"),
+    resolve: notImplemented("resolve"),
+    resolveObject: notImplemented("resolveObject"),
+    domainToASCII: notImplemented("domainToASCII"),
+    domainToUnicode: notImplemented("domainToUnicode"),
+    urlToHttpOptions: notImplemented("urlToHttpOptions"),
+    Url: notImplemented("Url"),
   };
 })();

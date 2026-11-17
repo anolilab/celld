@@ -11364,7 +11364,14 @@ const __fsPath = (value) => {
   return "/" + parts.join("/");
 };
 const __fsError = (code, syscall, path) => {
-  const e = new Error(`${code}: ${syscall} '${path}'`);
+  // A change to `/tmp` with no request, such as at module scope: there is no
+  // request-local tree to put it in.
+  const noRequest = code === "ENOREQUEST";
+  if (noRequest) code = "EPERM";
+  const e = new Error(
+    `${code}: ${syscall} '${path}'` +
+      (noRequest ? " (there is no request-local /tmp outside a request)" : ""),
+  );
   e.errno = {
     EPERM: -1, ENOENT: -2, EEXIST: -17, ENOTDIR: -20, EISDIR: -21, ENOSPC: -28,
   }[code];

@@ -212,17 +212,21 @@ execution.
   lives in memory, and is freed when the request ends. One request can hold at
   most 64 MiB in it, counting file bytes and a small charge for each entry; a
   write that would pass that fails with `ENOSPC` and changes nothing. Writes
-  outside `/tmp` fail with `EPERM`.
+  outside `/tmp` fail with `EPERM`. `/tmp` belongs to a request: code that runs
+  with no request, such as module scope while the Worker loads, cannot change
+  it, and those calls fail with `EPERM`; reads there see an empty tree.
 - `node:url` provides `URL`, `URLSearchParams`, `fileURLToPath`,
-  `pathToFileURL`, and `format` for URL objects and legacy URL objects, with
-  Node.js's POSIX results and errors. The legacy `parse()` and `format()` of a
-  string throw `ERR_METHOD_NOT_IMPLEMENTED`.
+  `pathToFileURL`, and `format` for `URL` objects, with Node.js's POSIX results
+  and errors. The legacy API (`parse`, `resolve`, `resolveObject`, `Url`,
+  `domainToASCII`, `domainToUnicode`, `urlToHttpOptions`, and `format` of a
+  string or a legacy object) throws `ERR_METHOD_NOT_IMPLEMENTED`.
 - With `nodejs_compat`, `process.env` holds the Worker's string `vars` and
   secrets when the compatibility date is 2025-04-01 or later, or the
   `nodejs_compat_populate_process_env` flag is set, unless
   `nodejs_compat_do_not_populate_process_env` is set. Otherwise it is an empty
   object. A name that is not set is `undefined`, and bindings that are not text
-  are not listed. `node:process` and `process` are the global `process`.
+  are not listed. It is filled before the main module evaluates, so module scope
+  reads it. `node:process` and `process` are the global `process`.
 - The global `process` matches workerd for each field that it defines, such
   as `process.execPath`, `process.argv`, and `process.title`. Other fields,
   such as `process.kill` and `process.features`, are undefined.

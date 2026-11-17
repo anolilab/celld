@@ -544,6 +544,28 @@ pub(super) fn inject_compatibility_flags(scope: &mut v8::PinScope, compat: Compa
     Ok(())
 }
 
+/// Fill `process.env` with the Worker's text bindings, when the compatibility
+/// settings ask for it. It runs before the main module evaluates, so module
+/// scope reads the values; it runs once per isolate load, so a request reads a
+/// plain property and no per-request work is added.
+pub(super) fn populate_process_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Result<()> {
+    if !config.compat.populate_process_env || config.vars.is_empty() {
+        return Ok(());
+    }
+    let mut src = String::new();
+    for (name, value) in &config.vars {
+        // JSON, not Rust's `{:?}`: values are arbitrary text, and Debug writes
+        // some characters as `\u{..}`, which is not JavaScript.
+        src.push_str(&format!(
+            "globalThis.process.env[{}] = {};\n",
+            serde_json::to_string(name)?,
+            serde_json::to_string(value)?
+        ));
+    }
+    run_internal_snippet(scope, &src).ok_or_else(|| anyhow!("process.env install failed"))?;
+    Ok(())
+}
+
 pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Result<()> {
     let script_name = config.script_name.as_str();
     let bindings = config.bindings.as_slice();
@@ -624,16 +646,6 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 "e[{:?}] = Object.freeze({{ id: {:?}, tag: {:?}, timestamp: {:?} }});\n",
                 metadata.binding, metadata.id, metadata.tag, metadata.timestamp
             ));
-        }
-        // Text bindings only, written once while the isolate loads: a request
-        // reads a plain property and no per-request work is added.
-        if config.compat.populate_process_env {
-            for (name, value) in vars {
-                lines.push_str(&format!(
-                    "globalThis.process.env[{:?}] = {:?};\n",
-                    name, value
-                ));
-            }
         }
         if let Some(name) = asset_binding {
             lines.push_str(&format!(

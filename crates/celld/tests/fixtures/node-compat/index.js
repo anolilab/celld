@@ -74,13 +74,30 @@ const urlChecks = {
       url.format(new URL("http://u:p@a.com/x?y#z"), { auth: false, fragment: false, search: false }),
       "http://a.com/x",
     ),
-  formatObject: () =>
-    is(
-      url.format({ protocol: "https", host: "a.com:8", pathname: "/x y", query: { a: 1 }, hash: "h", auth: "u:p" }),
-      "https://u:p@a.com:8/x y?a=1#h",
-    ),
+  formatLegacyObject: () =>
+    throwsCode("ERR_METHOD_NOT_IMPLEMENTED", () => url.format({ protocol: "http", host: "a.com", query: { a: 1 } })),
+  legacyNamesStayExported: async () => {
+    for (const name of ["resolve", "resolveObject", "domainToASCII", "domainToUnicode", "urlToHttpOptions", "Url"]) {
+      is(typeof url[name], "function");
+    }
+    await throwsCode("ERR_METHOD_NOT_IMPLEMENTED", () => url.domainToASCII("a.com"));
+    await throwsCode("ERR_METHOD_NOT_IMPLEMENTED", () => url.urlToHttpOptions(new URL("http://a/")));
+  },
   parseFailsLoudly: () => throwsCode("ERR_METHOD_NOT_IMPLEMENTED", () => url.parse("http://a/")),
 };
+
+// What module scope sees, before any request: `process.env` is filled, and
+// there is no request, so no `/tmp` to write to.
+const atModuleScope = (() => {
+  let tmp;
+  try {
+    fs.writeFileSync("/tmp/module.txt", "from module scope");
+    tmp = "written";
+  } catch (error) {
+    tmp = error.code;
+  }
+  return { greeting: process.env.GREETING, tmp };
+})();
 
 const fsChecks = {
   writeAndRead: () => {
@@ -193,6 +210,12 @@ export default {
           unset: process.env.NOT_SET === undefined,
           keys: Object.keys(process.env).sort(),
           values: Object.fromEntries(Object.entries(process.env)),
+        });
+      case "/module":
+        return Response.json({
+          ...atModuleScope,
+          visibleToRequest: fs.existsSync("/tmp/module.txt"),
+          listed: fs.readdirSync("/tmp"),
         });
       case "/process":
         return Response.json(await results(processChecks));

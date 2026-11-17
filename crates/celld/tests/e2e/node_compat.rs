@@ -105,7 +105,7 @@ async fn node_process_is_the_global_process() {
 #[tokio::test]
 async fn node_url_matches_node() {
     let server = Server::start("node-compat", &[]).await;
-    assert_all_ok(&server, "/url", 17).await;
+    assert_all_ok(&server, "/url", 18).await;
 }
 
 #[tokio::test]
@@ -140,4 +140,27 @@ async fn tmp_is_capped_per_request_and_freed_with_it() {
     // The next request starts empty, so it fills to the same point.
     let second: Fill = server.get_json("/fill").await;
     assert_eq!(first, second, "the first request's files outlived it");
+}
+
+#[derive(serde::Deserialize)]
+struct ModuleScope {
+    greeting: Option<String>,
+    tmp: String,
+    #[serde(rename = "visibleToRequest")]
+    visible_to_request: bool,
+    listed: Vec<String>,
+}
+
+#[tokio::test]
+async fn module_scope_reads_process_env_but_has_no_tmp() {
+    let server = Server::start("node-compat", &[]).await;
+    let seen: ModuleScope = server.get_json("/module").await;
+    assert_eq!(
+        seen.greeting.as_deref(),
+        Some("hello"),
+        "process.env was empty while the module evaluated"
+    );
+    assert_eq!(seen.tmp, "EPERM", "module scope must not get a /tmp");
+    assert!(!seen.visible_to_request);
+    assert!(seen.listed.is_empty(), "{:?}", seen.listed);
 }
