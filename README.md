@@ -400,13 +400,7 @@ is not necessary.
 
 ## Contributions
 
-Pull requests are welcome. Keep a change focused, say what defect or behaviour
-it addresses, and add a test that fails without it. CI runs formatting, clippy,
-the unit and end-to-end tests, and the builds on every pull request; see
-[testing](docs/testing.md) for how to run them locally.
-
-Unless you state otherwise, a contribution that you submit is licensed under
-the Apache License 2.0, as section 5 of the licence provides.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the [roadmap](docs/roadmap.md).
 
 ## License
 
