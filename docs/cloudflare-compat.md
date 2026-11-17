@@ -321,6 +321,7 @@ that a Worker may test.
 | `fetcher_no_get_put_delete` | **Honoured** | 2024-03-26 | A stub has no `get()`, `put()` or `delete()` helper. |
 | `fetcher_has_get_put_delete` | **Honoured** |  | A stub keeps the `get()`, `put()` and `delete()` helpers; turns off `fetcher_no_get_put_delete`. |
 | `websocket_standard_binary_type` | **Honoured** |  | A WebSocket's `binaryType` defaults to `blob`. celld has no date default for it. |
+| `sqlite_vec` | **Honoured** |  | celld only: loads the sqlite-vec extension into Durable Object SQLite. |
 | `queues_json_messages` | **Honoured** | 2024-03-18 | A queue message body defaults to JSON instead of V8 structured clone. |
 | `no_queues_json_messages` | **Honoured** |  | A queue message body defaults to V8 structured clone; turns off `queues_json_messages`. |
 | `nodejs_compat` | **Honoured** | 2026-08-04 | Lets `process.env` hold the Worker's vars. celld provides the `node:` modules without it. |

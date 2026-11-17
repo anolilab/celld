@@ -111,6 +111,13 @@ pub static FLAGS: &[Flag] = &[
         None,
         "A WebSocket's `binaryType` defaults to `blob`. celld has no date default for it.",
     ),
+    // lib.rs `worker_compat` -> `Compat::sqlite_vec`. A celld flag, not a workerd one.
+    row(
+        "sqlite_vec",
+        Honoured,
+        None,
+        "celld only: loads the sqlite-vec extension into Durable Object SQLite.",
+    ),
     // lib.rs `worker_compat` -> `Compat::queue_json_messages`.
     row(
         "queues_json_messages",
@@ -748,10 +755,18 @@ mod tests {
     }
 
     #[test]
-    fn a_flag_with_no_workerd_counterpart_is_not_in_the_table() {
-        for name in ["queue_json_messages", "queue_v8_messages", "sqlite_vec"] {
+    fn misspelled_queue_flags_are_not_in_the_table() {
+        for name in ["queue_json_messages", "queue_v8_messages"] {
             assert!(lookup(name).is_none(), "{name}");
         }
+    }
+
+    #[test]
+    fn the_celld_sqlite_vec_flag_stays_honoured() {
+        assert!(matches!(
+            lookup("sqlite_vec").map(|flag| flag.status),
+            Some(Honoured)
+        ));
     }
 
     /// `nodejs_compat` is implied by the date workerd gives it, and
