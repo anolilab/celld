@@ -564,12 +564,19 @@ pub(super) fn op_ws_next(
         let Some(queue) = queue else {
             return Ok(WsPull::Close(1006, "socket is not registered".into(), false).encode());
         };
-        let mut queue = queue.lock().await;
-        Ok(queue
+        let frame = queue
+            .lock()
+            .await
             .recv()
             .await
-            .unwrap_or_else(|| WsPull::Close(1006, String::new(), false))
-            .encode())
+            .unwrap_or_else(|| WsPull::Close(1006, String::new(), false));
+        // The host leaves a queue holding its close in place, so a read that
+        // starts later still gets that close; the read that consumes it
+        // removes the entry.
+        if matches!(frame, WsPull::Close(..)) {
+            ws_pull_unregister(id);
+        }
+        Ok(frame.encode())
     });
     rv.set(promise_for(scope, async_id));
 }

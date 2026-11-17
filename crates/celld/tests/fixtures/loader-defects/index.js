@@ -268,6 +268,43 @@ export default {
       const loaded = await (await worker.getEntrypoint().fetch("http://loaded/state")).json();
       return Response.json({ caller, loaded });
     }
+    // The caller sends a message and closes in the same turn, so the loaded
+    // Worker's isolate has not read either yet when the close is forwarded.
+    if (url.pathname === "/socket-close-unread") {
+      const worker = load(env, "socket", SOCKET_CODE);
+      const response = await worker.getEntrypoint().fetch("http://loaded/", {
+        headers: { Upgrade: "websocket" },
+      });
+      const socket = response.webSocket;
+      socket.accept();
+      socket.send("hi");
+      socket.close(3001, "from caller");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const loaded = await (await worker.getEntrypoint().fetch("http://loaded/state")).json();
+      return Response.json({ loaded });
+    }
+    // The caller sends far more than the loaded Worker's queue holds, in one
+    // turn, so the Worker reads none of it while it is sent.
+    if (url.pathname === "/socket-caller-flood") {
+      const worker = load(env, "socket", SOCKET_CODE);
+      const response = await worker.getEntrypoint().fetch("http://loaded/", {
+        headers: { Upgrade: "websocket" },
+      });
+      const socket = response.webSocket;
+      socket.accept();
+      const closed = new Promise((resolve) =>
+        socket.addEventListener("close", (event) => resolve(event.code)),
+      );
+      const chunk = "x".repeat(64 * 1024);
+      for (let sent = 0; sent < 200; sent++) socket.send(chunk);
+      const caller = await Promise.race([
+        closed,
+        new Promise((resolve) => setTimeout(() => resolve("timeout"), 3000)),
+      ]);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const loaded = await (await worker.getEntrypoint().fetch("http://loaded/state")).json();
+      return Response.json({ caller, loaded });
+    }
     // The caller is handed a socket and never accepts it, while the loaded
     // Worker keeps sending.
     if (url.pathname === "/socket-flood") {

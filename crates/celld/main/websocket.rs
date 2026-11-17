@@ -472,6 +472,70 @@ async fn forward_data(sink: &celld::js::WsPullSender, frame: celld::js::WsOut) -
     }
 }
 
+/// One direction of a pipe: the frames an end sent that the end it faces has
+/// not yet made room for.
+///
+/// The pipe keeps reading what an end sends even while the other end's queue is
+/// full, so the host registry's unbounded channel never holds more than the
+/// pipe has taken out of it. What waits here is capped by a byte budget, and an
+/// end that exceeds it is closed. A close the end sent waits here too, behind
+/// the data it followed.
+struct Lane {
+    waiting: std::collections::VecDeque<celld::js::WsPull>,
+    bytes: usize,
+    end: Option<(u16, String)>,
+}
+
+impl Lane {
+    fn new() -> Self {
+        Self {
+            waiting: std::collections::VecDeque::new(),
+            bytes: 0,
+            end: None,
+        }
+    }
+
+    /// Hold one frame. False when it overflows the budget. One frame larger
+    /// than the budget is held alone, as the queue it waits for admits it.
+    fn hold(&mut self, frame: celld::js::WsOut) -> bool {
+        let frame = match frame {
+            celld::js::WsOut::Text(text) => celld::js::WsPull::Text(text),
+            celld::js::WsOut::Binary(bytes) => celld::js::WsPull::Binary(bytes),
+            celld::js::WsOut::Close(code, reason) => {
+                self.end = Some((code, reason));
+                return true;
+            }
+        };
+        let size = frame.queue_bytes();
+        if self.bytes > 0 && self.bytes + size > celld::js::WS_PULL_QUEUE_MAX_BYTES {
+            return false;
+        }
+        self.bytes += size;
+        self.waiting.push_back(frame);
+        true
+    }
+
+    /// The size of the frame next in line, if any.
+    fn front_bytes(&self) -> Option<usize> {
+        self.waiting.front().map(celld::js::WsPull::queue_bytes)
+    }
+
+    /// Pass the frame next in line to its queue, in the room already reserved.
+    /// False when that end stopped reading.
+    fn flush(&mut self, sink: &celld::js::WsPullSender, permit: celld::js::WsPullPermit) -> bool {
+        let Some(frame) = self.waiting.pop_front() else {
+            return true;
+        };
+        self.bytes -= frame.queue_bytes();
+        sink.send_reserved(frame, permit).is_ok()
+    }
+
+    /// The end has closed and everything it sent before has been passed on.
+    fn finished(&self) -> bool {
+        self.end.is_some() && self.waiting.is_empty()
+    }
+}
+
 /// Carry frames between a stateless Worker's socket and a client end another
 /// isolate in this process kept. The Worker end answered an upgrade as a
 /// top-level Worker does, so its frames use the channels it prepared for an
@@ -479,8 +543,13 @@ async fn forward_data(sink: &celld::js::WsPullSender, frame: celld::js::WsOut) -
 ///
 /// The task ends when either side closes, and it unregisters the client end.
 /// Dropping the Worker's socket unregisters its own. Both ends are told how it
-/// ended: the close one end sent is echoed to the other, and a pipe that fails
-/// closes both with 1011.
+/// ended: the close one end sent is echoed to the other once the data it sent
+/// before has been passed on, and a pipe that fails closes both with 1011. An
+/// end that sends more than a queue's budget while the other end does not read
+/// is closed with 1009.
+///
+/// The close is queued and its entry is left for the isolate to read, which
+/// removes it, so an isolate that was not already waiting still reads the code.
 async fn worker_websocket_pipe(
     id: u64,
     worker: celld::js::WorkerWebSocket,
@@ -496,33 +565,54 @@ async fn worker_websocket_pipe(
         protocol: None,
         declined: None,
     }));
+    let mut to_worker = Lane::new();
+    let mut to_caller = Lane::new();
     let mut closing = (1011, "WebSocket pipe failed".to_string());
+    // Nobody reads the caller's queue once its request retired.
+    let mut caller_gone = false;
     loop {
+        if let Some(end) = to_worker.end.as_ref().filter(|_| to_worker.finished()) {
+            closing = end.clone();
+            break;
+        }
+        if let Some(end) = to_caller.end.as_ref().filter(|_| to_caller.finished()) {
+            closing = end.clone();
+            break;
+        }
+        let (to_worker_front, to_caller_front) = (to_worker.front_bytes(), to_caller.front_bytes());
         celld::asyncrt::select! {
-            frame = from_caller.recv() => match frame {
-                Some(celld::js::WsOut::Close(code, reason)) => {
-                    closing = (code, reason);
-                    break;
-                }
+            frame = from_caller.recv(), if to_worker.end.is_none() => match frame {
                 Some(frame) => {
-                    if !forward_data(&inbound, frame).await { break; }
+                    if !to_worker.hold(frame) {
+                        closing = (1009, "WebSocket buffer is full".into());
+                        break;
+                    }
                 }
                 // The caller's request retired and took its socket with it.
                 None => {
-                    closing = (1001, "request ended".into());
-                    break;
+                    caller_gone = true;
+                    to_worker.end = Some((1001, "request ended".into()));
                 }
             },
-            frame = from_worker.recv() => match frame {
-                Some(celld::js::WsOut::Close(code, reason)) => {
-                    closing = (code, reason);
-                    break;
-                }
+            frame = from_worker.recv(), if to_caller.end.is_none() => match frame {
                 Some(frame) => {
-                    if !forward_data(&pull, frame).await { break; }
+                    if !to_caller.hold(frame) {
+                        closing = (1009, "WebSocket buffer is full".into());
+                        break;
+                    }
                 }
                 None => break,
             },
+            permit = async { inbound.reserve(to_worker_front.unwrap_or(0)).await },
+                if to_worker_front.is_some() => {
+                    let kept = permit.is_some_and(|permit| to_worker.flush(&inbound, permit));
+                    if !kept { break; }
+                },
+            permit = async { pull.reserve(to_caller_front.unwrap_or(0)).await },
+                if to_caller_front.is_some() => {
+                    let kept = permit.is_some_and(|permit| to_caller.flush(&pull, permit));
+                    if !kept { break; }
+                },
         }
     }
     // The first close on a queue is the only one, so an end that already
@@ -531,7 +621,9 @@ async fn worker_websocket_pipe(
     let _ = inbound.send_close(code, reason.clone(), true);
     let _ = pull.send_close(code, reason, true);
     celld::js::ws_unregister(id);
-    celld::js::ws_pull_unregister(id);
+    if caller_gone {
+        celld::js::ws_pull_unregister(id);
+    }
     Ok(())
 }
 

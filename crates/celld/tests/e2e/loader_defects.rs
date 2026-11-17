@@ -149,6 +149,26 @@ async fn a_loaded_worker_cannot_fill_a_socket_the_caller_never_accepts() {
 }
 
 #[tokio::test]
+async fn a_close_sent_before_the_loaded_worker_reads_keeps_its_code() {
+    let server = Server::start("loader-defects", ONE_ISOLATE).await;
+    let out: Value = server.get_json("/socket-close-unread").await;
+    let closes = out["loaded"]["closes"].as_array().expect("closes");
+    assert_eq!(closes.len(), 1, "{out}");
+    assert_eq!(closes[0]["code"], 3001, "{out}");
+    assert_eq!(closes[0]["wasClean"], true, "{out}");
+}
+
+#[tokio::test]
+async fn a_caller_cannot_fill_a_socket_the_loaded_worker_does_not_read() {
+    let server = Server::start("loader-defects", ONE_ISOLATE).await;
+    let out: Value = server.get_json("/socket-caller-flood").await;
+    assert_eq!(out["caller"], 1009, "the caller was not cut off: {out}");
+    let received = out["loaded"]["received"].as_u64().expect("received");
+    // 200 frames of 64 KiB were sent, and about 2 MiB fit between the queues.
+    assert!(received < 100, "the pipe buffered the flood: {out}");
+}
+
+#[tokio::test]
 async fn a_service_call_nobody_waits_for_aborts_its_target() {
     let server = Server::start("loader-defects", ONE_ISOLATE).await;
     assert_eq!(server.get_text("/outbound-drop").await, "answered");

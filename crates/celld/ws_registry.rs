@@ -204,7 +204,7 @@ pub enum WsPull {
 
 /// Maximum charged bytes for non-terminal frames in one isolate-polled
 /// WebSocket input queue.
-pub(crate) const WS_PULL_QUEUE_MAX_BYTES: usize = 1024 * 1024;
+pub const WS_PULL_QUEUE_MAX_BYTES: usize = 1024 * 1024;
 
 /// Tags for the byte frame `__ws_next` resolves with. A tagged buffer keeps a
 /// binary message on its fast path instead of base64 through a JSON envelope.
@@ -236,6 +236,9 @@ impl WsPull {
         framed
     }
 }
+
+/// Room in a pull queue for one data frame, from `WsPullSender::reserve`.
+pub struct WsPullPermit(tokio::sync::OwnedSemaphorePermit);
 
 struct WsPullCharge {
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -281,7 +284,7 @@ pub fn ws_pull_channel() -> (WsPullSender, WsPullReceiver) {
 }
 
 impl WsPull {
-    fn queue_bytes(&self) -> usize {
+    pub fn queue_bytes(&self) -> usize {
         let payload = match self {
             Self::Open(protocol) | Self::Text(protocol) => protocol.len(),
             Self::Binary(bytes) => bytes.len(),
@@ -304,16 +307,32 @@ impl WsPullSender {
             }
             frame => frame,
         };
-        let bytes = frame.queue_bytes();
+        match self.reserve(frame.queue_bytes()).await {
+            Some(permit) => self.send_reserved(frame, permit),
+            None => Err(frame),
+        }
+    }
+
+    /// Wait for room for a data frame of `bytes`, which `queue_bytes` gives.
+    /// Holds nothing but the room, so a caller can race it against other work
+    /// and keep the frame until the room is its own. `None` once the queue
+    /// ended.
+    pub async fn reserve(&self, bytes: usize) -> Option<WsPullPermit> {
         // One message can exceed this queue limit until the separate incoming
         // message limit rejects it. Reserving the complete budget admits that
         // message only into an empty queue and prevents a second message from
         // increasing its retained peak.
         let permit_bytes = bytes.min(WS_PULL_QUEUE_MAX_BYTES) as u32;
-        let permit = match self.capacity.clone().acquire_many_owned(permit_bytes).await {
-            Ok(permit) => permit,
-            Err(_) => return Err(frame),
-        };
+        self.capacity
+            .clone()
+            .acquire_many_owned(permit_bytes)
+            .await
+            .ok()
+            .map(WsPullPermit)
+    }
+
+    /// Queue a data frame in the room `reserve` gave it.
+    pub fn send_reserved(&self, frame: WsPull, permit: WsPullPermit) -> Result<(), WsPull> {
         // The terminal sender closes the semaphore before it queues the close.
         // A data sender can already own a permit at that point, so this lock
         // either orders that data before the close or rejects it after the
@@ -328,7 +347,7 @@ impl WsPullSender {
             .send(QueuedWsPull {
                 frame,
                 _charge: WsPullCharge {
-                    _permit: Some(permit),
+                    _permit: Some(permit.0),
                 },
             })
             .map_err(|error| error.0.frame)
@@ -415,7 +434,11 @@ impl WorkerWebSocket {
 
 impl Drop for WorkerWebSocket {
     fn drop(&mut self) {
-        ws_pull_unregister(self.id);
+        // A queue that already holds its close stays for the isolate to read
+        // it; that read removes the entry.
+        if !self.inbound.is_closed() {
+            ws_pull_unregister(self.id);
+        }
         ws_unregister(self.id);
     }
 }
