@@ -341,7 +341,7 @@ fn own_unicast_addrs(addrs: Vec<std::net::IpAddr>) -> Vec<std::net::IpAddr> {
 }
 
 /// The addresses of this process's own network interfaces.
-fn node_interface_addrs() -> Vec<std::net::IpAddr> {
+pub(crate) fn node_interface_addrs() -> Vec<std::net::IpAddr> {
     let Ok(interfaces) = nix::ifaddrs::getifaddrs() else {
         return Vec::new();
     };

@@ -1,11 +1,13 @@
 //! The network egress filter for Worker traffic.
 //!
-//! `CELLD_EGRESS=public` refuses a Worker's `fetch()`, `connect()` and
-//! outbound WebSocket dials to any address that is not on the public
-//! internet: loopback, private, link-local, CGNAT, unique-local,
+//! The default, `CELLD_EGRESS=public`, refuses a Worker's `fetch()`,
+//! `connect()` and outbound WebSocket dials to any address that is not on the
+//! public internet: loopback, private, link-local, CGNAT, unique-local,
 //! unspecified, multicast, reserved and documentation ranges, the cloud
 //! metadata addresses, and IPv4 forms carried inside IPv6 (mapped,
-//! translated and tunneled). The default, `open`, changes nothing.
+//! translated and tunneled). It also refuses the node's own addresses, the
+//! ones its listeners bind and advertise, even when they are public.
+//! `CELLD_EGRESS=open` changes nothing; `celld dev` defaults to it.
 //!
 //! The check runs on the address celld connects to, never on the hostname:
 //!
@@ -32,7 +34,7 @@
 //! permitted, because `getTcpPort()` reaches a container on its private or
 //! published loopback address.
 //!
-//! Setting `CELLD_EGRESS=public` also stops Worker `fetch()` from using a
+//! The public policy also stops Worker `fetch()` from using a
 //! `HTTP_PROXY`-style proxy, because a proxy would receive the name and
 //! resolve it where this filter cannot see.
 
@@ -301,6 +303,9 @@ pub struct Filter {
     literals: Vec<SocketAddr>,
     /// Whether an address is a running container's endpoint.
     container_endpoint: fn(SocketAddr) -> bool,
+    /// The node's own addresses, set once its listeners are bound. A public
+    /// one is refused like a private one.
+    own: Arc<OnceLock<Vec<IpAddr>>>,
 }
 
 impl std::fmt::Debug for Filter {
@@ -325,7 +330,20 @@ impl Filter {
             names: HashMap::new(),
             literals: Vec::new(),
             container_endpoint: no_container,
+            own: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Record the node's own addresses. Only the first call counts.
+    pub fn set_own_addresses(&self, addresses: impl IntoIterator<Item = IpAddr>) {
+        let mut own: Vec<IpAddr> = addresses.into_iter().map(canonical).collect();
+        own.sort();
+        own.dedup();
+        let _ = self.own.set(own);
+    }
+
+    fn is_own(&self, ip: IpAddr) -> bool {
+        self.own.get().is_some_and(|own| own.contains(&ip))
     }
 
     /// Parse the text of `CELLD_EGRESS_ALLOW` into a policy.
@@ -371,12 +389,19 @@ impl Filter {
     fn permits(&self, addr: SocketAddr) -> Result<(), Refused> {
         let ip = canonical(addr.ip());
         let class = classify(ip);
-        if class == Class::Public
+        let own = class == Class::Public && self.is_own(ip);
+        if (class == Class::Public && !own)
             || self.ranges.iter().any(|range| range.contains(ip))
             || self.literals.contains(&SocketAddr::new(ip, addr.port()))
             || (self.container_endpoint)(SocketAddr::new(ip, addr.port()))
         {
             return Ok(());
+        }
+        if own {
+            return Err(Refused(format!(
+                "egress refused: {} is this node's own address ({MODE_ENV}=public)",
+                addr.ip()
+            )));
         }
         // Report the class of the address as written, so an embedded
         // loopback reads as the loopback it is.
@@ -551,22 +576,26 @@ pub fn default_redirect_limit(
 }
 
 /// `CELLD_EGRESS` and `CELLD_EGRESS_ALLOW`, validated. `None` is the open
-/// policy.
+/// policy, which only `CELLD_EGRESS=open` selects; unset means `public`.
 pub fn from_env() -> anyhow::Result<Option<Filter>> {
     let mode = crate::env_vars::value(MODE_ENV)?;
     let allow = crate::env_vars::value(ALLOW_ENV)?;
-    match mode.as_deref() {
-        None | Some("open") => {
+    from_settings(mode.as_deref(), allow.as_deref())
+}
+
+fn from_settings(mode: Option<&str>, allow: Option<&str>) -> anyhow::Result<Option<Filter>> {
+    match mode {
+        Some("open") => {
             if allow.is_some() {
-                bail!("{ALLOW_ENV} has no effect unless {MODE_ENV}=public");
+                bail!("{ALLOW_ENV} has no effect with {MODE_ENV}=open");
             }
             Ok(None)
         }
-        Some("public") => {
+        None | Some("public") => {
             let filter = Filter::public().with_container_endpoints(crate::container::is_endpoint);
             match allow {
                 Some(text) => filter
-                    .with_exceptions(&text)
+                    .with_exceptions(text)
                     .map(Some)
                     .with_context(|| format!("invalid {ALLOW_ENV}")),
                 None => Ok(Some(filter)),
@@ -574,6 +603,27 @@ pub fn from_env() -> anyhow::Result<Option<Filter>> {
         }
         Some(other) => bail!("{MODE_ENV} must be open or public, not {other:?}"),
     }
+}
+
+/// Tell the policy which addresses are the node's own: what its listeners
+/// bind (every interface address for a wildcard bind) and what it advertises
+/// (a hostname is resolved once). Called once, after the listeners are bound.
+pub async fn register_node_addresses(listeners: &[SocketAddr], advertise: &str) {
+    let Some(filter) = active() else {
+        return;
+    };
+    let mut own = Vec::new();
+    for listener in listeners {
+        if listener.ip().is_unspecified() {
+            own.extend(crate::container::node_interface_addrs());
+        } else {
+            own.push(listener.ip());
+        }
+    }
+    if let Ok(resolved) = tokio::net::lookup_host(advertise).await {
+        own.extend(resolved.map(|addr| addr.ip()));
+    }
+    filter.set_own_addresses(own);
 }
 
 /// The node's policy, read from the environment once. `None` means open.
@@ -601,6 +651,40 @@ mod tests {
 
     fn sock(text: &str) -> SocketAddr {
         text.parse().unwrap()
+    }
+
+    #[test]
+    fn an_unset_mode_is_public_and_open_is_explicit() {
+        assert!(from_settings(None, None).unwrap().is_some());
+        assert!(from_settings(Some("public"), None).unwrap().is_some());
+        assert!(from_settings(Some("open"), None).unwrap().is_none());
+        assert!(from_settings(None, Some("10.0.0.0/8")).unwrap().is_some());
+        assert!(from_settings(Some("open"), Some("10.0.0.0/8")).is_err());
+        assert!(from_settings(Some("other"), None).is_err());
+    }
+
+    #[test]
+    fn the_nodes_own_public_address_is_refused() {
+        let filter = Filter::public();
+        let own = ip("93.184.216.34");
+        // Before the listeners are bound nothing is the node's own.
+        assert!(filter.permits(SocketAddr::new(own, 8787)).is_ok());
+        filter.set_own_addresses([own, ip("::ffff:203.0.113.9")]);
+        let refusal = filter.permits(SocketAddr::new(own, 8787)).unwrap_err();
+        assert!(refusal.to_string().contains("own address"), "{refusal}");
+        // Any port, and a name that resolves to it.
+        assert!(filter.permits(SocketAddr::new(own, 1)).is_err());
+        assert!(filter
+            .filter_resolved("self.example", 443, vec![SocketAddr::new(own, 0)])
+            .is_err());
+        // Other public addresses are unaffected.
+        assert!(filter.permits(sock("8.8.8.8:8787")).is_ok());
+        // An exception still lets an operator hairpin.
+        let allowed = Filter::public()
+            .with_exceptions("93.184.216.34/32")
+            .unwrap();
+        allowed.set_own_addresses([own]);
+        assert!(allowed.permits(SocketAddr::new(own, 8787)).is_ok());
     }
 
     #[test]

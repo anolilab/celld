@@ -372,10 +372,11 @@ TUNING:
   CELLD_STEP0_SAMPLE              Sample one claimed id in this many into the
                                   rings of /state/step0 (default: 64; 0 off)
   CELLD_EGRESS                    `public` refuses Worker fetch(), connect() and
-                                  WebSocket dials to non-public addresses
-                                  (default: open)
+                                  WebSocket dials to non-public and the node's
+                                  own addresses; `open` allows all
+                                  (default: public; `celld dev`: open)
   CELLD_EGRESS_ALLOW              CIDR and host:port exceptions to
-                                  CELLD_EGRESS=public, comma separated
+                                  the public policy, comma separated
   CELLD_RECOVERY_RETRY_MS         Dead-owner recovery retry backoff (default: 1000)
   CELLD_RECOVERY_RETRIES          Recovery retries before a request fails (default: 240)
   CELLD_LOCAL_CACHE_MAX_BYTES     Hibernated SQLite cache limit (default: 2 GiB; 0 disables)
