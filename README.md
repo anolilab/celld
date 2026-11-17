@@ -152,7 +152,10 @@ Worker port, or `--port 0` to let the system pick a free one; the `ready` line
 names the address in use, and a rebuild keeps it. Use `celld dev --host IP` to select a different interface. A
 non-loopback IP exposes the Worker listener to the network, and the internal
 operator listener stays on loopback. The command keeps the application state
-in `.celld/dev`, so a later invocation uses the same durable data.
+in `.celld/dev`, so a later invocation uses the same durable data. Use
+`--state-dir DIR` (or `CELLD_DEV_STATE_DIR`) to keep it outside the project
+directory, in `DIR/<project hash>/.celld/dev`. Several projects can share one
+`DIR`; each keeps its own state, and `--clean` removes only its own.
 
 The state also survives a configuration change, and celld does not migrate it,
 so an object can keep a value that the new configuration rejects. The failure

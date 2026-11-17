@@ -179,7 +179,7 @@ async fn the_generated_token_opens_the_listener_and_is_kept_private() {
         .unwrap();
     assert_eq!(wrong.status().as_u16(), 401);
     // The token never reaches the log.
-    let file = celld::dev::operator_token_path(server.project_dir());
+    let file = celld::dev::operator_token_path_with(server.project_dir(), None).unwrap();
     let value = std::fs::read_to_string(&file).unwrap();
     assert!(!server.log_text().contains(value.trim()));
     #[cfg(unix)]

@@ -14,6 +14,7 @@ use notify::{RecursiveMode, Watcher as _};
 use nu_ansi_term::{Color, Style};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::IsTerminal as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -33,18 +34,28 @@ pub fn open_local_bucket(database: &Path) -> anyhow::Result<Bucket> {
     Bucket::open_dev(database)
 }
 
-/// Where the local node of `celld dev` keeps the operator token it generates:
-/// in the state directory of `project`.
+/// Where the local node of `celld dev` keeps the operator token it generates,
+/// for a node that was given `state_dir` as its `CELLD_DEV_STATE_DIR` value
+/// (`None` keeps it in the project). The project is resolved the way `run`
+/// resolves it, so a relative path, `..` or a symbolic link finds the same
+/// directory.
 #[doc(hidden)]
-pub fn operator_token_path(project: &Path) -> PathBuf {
-    DevState::for_project(project)
+#[allow(clippy::disallowed_methods)] // Project resolution uses the operator's host filesystem.
+pub fn operator_token_path_with(
+    project: &Path,
+    state_dir: Option<OsString>,
+) -> anyhow::Result<PathBuf> {
+    let project = std::fs::canonicalize(project)
+        .with_context(|| format!("resolve project directory {}", project.display()))?;
+    Ok(DevState::resolve(&project, None, state_dir)?
         .path()
-        .join(crate::operator_token::FILE_NAME)
+        .join(crate::operator_token::FILE_NAME))
 }
 
 #[derive(Debug)]
 struct Options {
     project: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
     clean: bool,
     stack: StackOptions,
 }
@@ -52,25 +63,110 @@ struct Options {
 /// The local state directory of one project.
 ///
 /// `--clean` deletes this directory and everything below it. The path is
-/// private and the only constructor takes the project directory that `run`
-/// resolved, so a command-line value can never become the target of the
-/// delete. A newtype carries that rule instead of a comment, because a
-/// `PathBuf` field would let a later caller pass any path and lose nothing at
-/// compile time.
+/// private and always ends in `.celld/dev`: `resolve` builds it from the
+/// project, or from a state directory plus the hash of the project, and
+/// `discard` refuses any path without that suffix, so a command-line value
+/// can only choose where the directory lives and never what is deleted.
 #[derive(Debug)]
 struct DevState {
     path: PathBuf,
+    /// `<state directory>/<project hash>`, when a state directory is in use.
+    /// The directory is shared, so another user may have write access to it
+    /// and `discard` must not follow a link planted at this level.
+    shared_root: Option<PathBuf>,
 }
 
 impl DevState {
-    /// The project-relative location of the local state, and also the suffix
+    /// The location of the local state below its parent, and also the suffix
     /// that `discard` requires before it deletes.
     const DIRECTORY: &'static str = ".celld/dev";
 
-    fn for_project(project: &Path) -> Self {
-        Self {
-            path: project.join(Self::DIRECTORY),
+    /// Choose the local state of `project`: the `--state-dir` flag wins, then
+    /// the `CELLD_DEV_STATE_DIR` value, then the project itself. An empty
+    /// value counts as absent. A state directory is shared by projects, so
+    /// each one gets its own `<hash>/.celld/dev` below it, and `--clean` in
+    /// one project leaves the others alone.
+    fn resolve(
+        project: &Path,
+        flag: Option<PathBuf>,
+        env: Option<OsString>,
+    ) -> anyhow::Result<Self> {
+        let directory = flag
+            .filter(|directory| !directory.as_os_str().is_empty())
+            .or_else(|| {
+                env.map(PathBuf::from)
+                    .filter(|directory| !directory.as_os_str().is_empty())
+            });
+        let shared_root = match directory {
+            Some(directory) => Some(
+                std::path::absolute(&directory)
+                    .with_context(|| format!("resolve state directory {}", directory.display()))?
+                    .join(project_hash(project)),
+            ),
+            None => None,
+        };
+        let parent = shared_root.as_deref().unwrap_or(project);
+        Ok(Self {
+            path: parent.join(Self::DIRECTORY),
+            shared_root,
+        })
+    }
+
+    /// Create `<state directory>/<project hash>` private to the user, so
+    /// nobody else can swap a link into it. Does nothing without a state
+    /// directory.
+    fn prepare_shared_root(&self) -> anyhow::Result<()> {
+        match &self.shared_root {
+            Some(root) => {
+                // `create_private` follows links and only restricts a path it
+                // creates, so a `DIR/<hash>` that another user planted must be
+                // refused before it is used.
+                self.ensure_not_redirected("use")?;
+                crate::config_dir::create_private(root)
+            }
+            None => Ok(()),
         }
+    }
+
+    /// Refuse a state directory that is reached through a link or that
+    /// another user owns: `DIR/<hash>`, `.celld` and `.celld/dev`. Missing
+    /// levels are fine, and nothing is checked for a project-local state.
+    #[allow(clippy::disallowed_methods)] // Local development state is an operator-owned host path.
+    fn ensure_not_redirected(&self, action: &str) -> anyhow::Result<()> {
+        let Some(root) = &self.shared_root else {
+            return Ok(());
+        };
+        for level in [
+            root.clone(),
+            root.join(".celld"),
+            root.join(Self::DIRECTORY),
+        ] {
+            let metadata = match std::fs::symlink_metadata(&level) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("inspect {}", level.display()));
+                }
+            };
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "refusing to {action} {}: {} is a symbolic link",
+                self.path.display(),
+                level.display()
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                // SAFETY: `geteuid` takes no arguments and cannot fail.
+                anyhow::ensure!(
+                    metadata.uid() == unsafe { libc::geteuid() },
+                    "refusing to {action} {}: {} is owned by another user",
+                    self.path.display(),
+                    level.display()
+                );
+            }
+        }
+        Ok(())
     }
 
     fn path(&self) -> &Path {
@@ -93,6 +189,7 @@ impl DevState {
             "refusing to discard {}, which is not a celld dev state directory",
             self.path.display()
         );
+        self.ensure_not_redirected("discard")?;
         match std::fs::remove_dir_all(&self.path) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -100,6 +197,10 @@ impl DevState {
                 .with_context(|| format!("discard local state directory {}", self.path.display())),
         }
     }
+}
+
+fn project_hash(project: &Path) -> String {
+    crate::control_plane::hex(&Sha256::digest(project.as_os_str().as_encoded_bytes()))
 }
 
 #[derive(Debug)]
@@ -337,23 +438,25 @@ impl ShutdownSignals {
 pub fn print_help() -> anyhow::Result<()> {
     crate::cli_output::Output::new(crate::cli_output::Format::Text).help(
         &format!("celld dev — run an application with persistent local storage\n\n\
-USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--logs] [--no-watch] [--clean]\n\n\
+USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--state-dir DIR] [--logs] [--no-watch] [--clean]\n\n\
 PROJECT is a directory or a Wrangler config. It defaults to the current\n\
 directory. celld stores all local state in PROJECT/.celld/dev, and it keeps\n\
-that state across a restart. A configuration change does not migrate the\n\
+that state across a restart. --state-dir DIR, or CELLD_DEV_STATE_DIR, keeps it\n\
+in DIR/<project hash>/.celld/dev instead. A configuration change does not migrate the\n\
 state, so a cell can keep a value that the new configuration rejects. Use\n\
 --clean to start from an empty local state.\n\n\
 A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
 as for wrangler dev. Without one, .env and then .env.local supply them, and\n\
 an entry of these files that cannot be a binding is skipped with a warning.\n\
 The entries override the vars of the config.\n\n\
-OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port, or 0 for a free one (default: {DEFAULT_PORT})\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
+OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port, or 0 for a free one (default: {DEFAULT_PORT})\n  --state-dir DIR        Keep the local state in DIR/<project hash>/.celld/dev\n  --clean                Delete the local state before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
 }
 
 fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Options>> {
     let mut project = None;
+    let mut state_dir = None;
     let mut host = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut port = DEFAULT_PORT;
     let mut clean = false;
@@ -375,6 +478,10 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
                     Pattern::new(&value)
                         .with_context(|| format!("invalid --watch-ignore pattern {value:?}"))?,
                 );
+            }
+            "--state-dir" => {
+                let value = arguments.next().context("--state-dir requires a value")?;
+                state_dir = Some(PathBuf::from(value));
             }
             "--host" => {
                 let value = arguments.next().context("--host requires a value")?;
@@ -398,6 +505,7 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
     }
     Ok(Some(Options {
         project,
+        state_dir,
         clean,
         stack: StackOptions {
             listener: SocketAddr::new(host, port),
@@ -420,11 +528,16 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let project = config
         .parent()
         .context("the Wrangler config has no project directory")?;
-    let state = DevState::for_project(project);
+    let state = DevState::resolve(
+        project,
+        options.state_dir,
+        std::env::var_os("CELLD_DEV_STATE_DIR"),
+    )?;
     let console = Console::new();
     console.header();
     console.detail("Project", &config.display().to_string());
     console.detail("State", &state.path().display().to_string());
+    state.prepare_shared_root()?;
     // The delete runs before the directory is recreated, and the console names
     // the outcome. A developer who reaches for this flag is already unsure
     // which state the run uses, so a silent delete would answer nothing.
@@ -453,8 +566,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         );
     }
 
-    let project_hash =
-        crate::control_plane::hex(&Sha256::digest(project.as_os_str().as_encoded_bytes()));
+    let project_hash = project_hash(project);
     let store = open_store(state.path(), &console).await?;
     run_stack(
         &config,
@@ -995,6 +1107,7 @@ async fn stop_child(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)] // Tests use the host filesystem.
     use super::*;
 
     fn parse(arguments: &[&str]) -> anyhow::Result<Option<Options>> {
@@ -1010,6 +1123,172 @@ mod tests {
     fn port_zero_asks_for_a_free_port() {
         let options = parse(&["--port", "0"]).unwrap().unwrap();
         assert_eq!(options.stack.listener.port(), 0);
+    }
+
+    #[test]
+    fn the_state_directory_moves_the_parent_of_the_local_state() {
+        let options = parse(&["--state-dir", "/var/celld"]).unwrap().unwrap();
+        assert_eq!(options.state_dir, Some(PathBuf::from("/var/celld")));
+        assert!(parse(&["--state-dir"]).is_err());
+    }
+
+    fn resolved(flag: Option<&str>, env: Option<&str>) -> PathBuf {
+        DevState::resolve(
+            Path::new("/work/app"),
+            flag.map(PathBuf::from),
+            env.map(OsString::from),
+        )
+        .unwrap()
+        .path()
+        .to_path_buf()
+    }
+
+    #[test]
+    fn the_state_defaults_to_the_project() {
+        assert_eq!(resolved(None, None), Path::new("/work/app/.celld/dev"));
+        assert_eq!(
+            resolved(Some(""), Some("")),
+            Path::new("/work/app/.celld/dev")
+        );
+    }
+
+    #[test]
+    fn the_flag_wins_over_the_environment_and_an_empty_flag_falls_back() {
+        let hash = project_hash(Path::new("/work/app"));
+        let expected = |root: &str| Path::new(root).join(&hash).join(".celld/dev");
+        assert_eq!(resolved(Some("/a"), Some("/b")), expected("/a"));
+        assert_eq!(resolved(None, Some("/b")), expected("/b"));
+        assert_eq!(resolved(Some(""), Some("/b")), expected("/b"));
+        assert_eq!(resolved(Some("/a"), Some("")), expected("/a"));
+    }
+
+    #[test]
+    fn projects_that_share_a_state_directory_get_their_own_state() {
+        let state = |project: &str| {
+            DevState::resolve(Path::new(project), Some(PathBuf::from("/shared")), None)
+                .unwrap()
+                .path()
+                .to_path_buf()
+        };
+        let (one, two) = (state("/work/one"), state("/work/two"));
+        assert_ne!(one, two);
+        assert!(one.starts_with("/shared") && one.ends_with(".celld/dev"));
+        assert!(!one.starts_with(&two) && !two.starts_with(&one));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // Host paths in a temporary directory.
+    fn clean_refuses_a_state_directory_reached_through_a_link() {
+        let directory = tempfile::tempdir().unwrap();
+        let victim = directory.path().join("victim");
+        std::fs::create_dir_all(victim.join(".celld/dev")).unwrap();
+        std::fs::write(victim.join(".celld/dev/keep"), "data").unwrap();
+        let shared = directory.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let project = Path::new("/work/app");
+        let state = DevState::resolve(project, Some(shared.clone()), None).unwrap();
+        std::os::unix::fs::symlink(&victim, shared.join(project_hash(project))).unwrap();
+        let error = state.discard().unwrap_err().to_string();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert!(victim.join(".celld/dev/keep").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // Host paths in a temporary directory.
+    fn the_per_project_directory_is_private_and_a_real_one_is_cleaned() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let state = DevState::resolve(
+            Path::new("/work/app"),
+            Some(directory.path().join("shared")),
+            None,
+        )
+        .unwrap();
+        state.prepare_shared_root().unwrap();
+        let root = state.shared_root.clone().unwrap();
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert!(!state.discard().unwrap());
+        prepare_state(state.path()).unwrap();
+        assert!(state.discard().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // Host paths in a temporary directory.
+    fn a_planted_per_project_directory_is_refused_before_it_is_used() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = directory.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let project = Path::new("/work/app");
+        let state = DevState::resolve(project, Some(shared.clone()), None).unwrap();
+        let victim = directory.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::os::unix::fs::symlink(&victim, shared.join(project_hash(project))).unwrap();
+        let error = state.prepare_shared_root().unwrap_err().to_string();
+        assert!(error.contains("symbolic link"), "{error}");
+    }
+
+    #[test]
+    fn clients_find_the_token_where_the_node_with_the_state_directory_keeps_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = &std::fs::canonicalize(directory.path()).unwrap();
+        let inside = operator_token_path_with(project, None).unwrap();
+        assert_eq!(inside, project.join(".celld/dev/operator-token"));
+        let shared = operator_token_path_with(project, Some("/shared".into())).unwrap();
+        assert_eq!(
+            shared,
+            DevState::resolve(project, None, Some("/shared".into()))
+                .unwrap()
+                .path()
+                .join(crate::operator_token::FILE_NAME)
+        );
+        assert_ne!(shared, inside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clients_find_the_token_through_links_and_relative_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(directory.path()).unwrap().join("app");
+        std::fs::create_dir(&project).unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&project, &link).unwrap();
+        let state = Some(OsString::from("/shared"));
+        let expected = operator_token_path_with(&project, state.clone()).unwrap();
+        assert_eq!(
+            operator_token_path_with(&link, state.clone()).unwrap(),
+            expected
+        );
+        let dotted = project.join("..").join("app");
+        assert_eq!(
+            operator_token_path_with(&dotted, state.clone()).unwrap(),
+            expected
+        );
+        let relative = pathdiff_from_current(&project);
+        assert_eq!(
+            operator_token_path_with(&relative, state).unwrap(),
+            expected
+        );
+    }
+
+    /// `path` as a relative path from the current directory.
+    fn pathdiff_from_current(path: &Path) -> PathBuf {
+        let current = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let mut relative = PathBuf::new();
+        for _ in current.components().skip(1) {
+            relative.push("..");
+        }
+        relative.join(path.strip_prefix("/").unwrap())
+    }
+
+    #[test]
+    fn a_relative_state_directory_becomes_absolute() {
+        let path = resolved(Some("state"), None);
+        assert!(path.is_absolute(), "{}", path.display());
+        assert!(path.ends_with(".celld/dev"));
     }
 
     #[test]

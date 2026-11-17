@@ -138,7 +138,14 @@ impl Server {
         if let Some((_, token)) = self.env.iter().find(|(k, _)| k == "CELLD_OPERATOR_TOKEN") {
             return OperatorToken::parse(std::ffi::OsStr::new(token)).expect("a valid token");
         }
-        OperatorToken::from_file(&celld::dev::operator_token_path(&self.project))
+        let state_dir = self
+            .env
+            .iter()
+            .find(|(k, _)| k == "CELLD_DEV_STATE_DIR")
+            .map(|(_, v)| v.into());
+        let path = celld::dev::operator_token_path_with(&self.project, state_dir)
+            .expect("resolve the token path");
+        OperatorToken::from_file(&path)
             .expect("read the node's token file")
             .expect("the node wrote its token file")
     }
@@ -483,6 +490,8 @@ fn spawn(project: &Path, env: &[(String, String)], log: &Path) -> Child {
         // A token in the runner's environment would gate every test node;
         // a test that wants one passes it in `env`.
         .env_remove("CELLD_OPERATOR_TOKEN")
+        // Likewise a state directory would move the node's state and token.
+        .env_remove("CELLD_DEV_STATE_DIR")
         .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(log.try_clone().expect("clone log handle"))
