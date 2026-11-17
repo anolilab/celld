@@ -33,18 +33,30 @@ env:
 
 jobs:
   build-celld:
-    name: Build celld ${{ matrix.target }}
+    name: Build celld ${{ matrix.artifact }}
     if: github.event_name != 'release'
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
+            artifact: x86_64-unknown-linux-gnu
           - runner: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
+            artifact: aarch64-unknown-linux-gnu
+          # jemalloc fixes its page size when it is built, and it aborts on
+          # a kernel whose pages are larger than that size, so the default
+          # build (4 KiB) cannot run on a 16 KiB kernel. This build uses
+          # 64 KiB (lg 16), which is at least as large as the pages of every
+          # aarch64 kernel (4, 16 and 64 KiB). The default build keeps
+          # 4 KiB pages so 4 KiB kernels keep the smaller memory footprint.
+          - runner: ubuntu-22.04-arm
+            artifact: aarch64-unknown-linux-gnu-64k-pages
+            jemalloc_lg_page: "16"
           - runner: macos-15
-            target: aarch64-apple-darwin
+            artifact: aarch64-apple-darwin
+          # Intel Mac; V8 publishes a prebuilt static library for this target.
+          - runner: macos-15-intel
+            artifact: x86_64-apple-darwin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -55,7 +67,14 @@ jobs:
           set -euo pipefail
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
+          if [ -n "${{ matrix.jemalloc_lg_page }}" ]; then
+            export JEMALLOC_SYS_WITH_LG_PAGE="${{ matrix.jemalloc_lg_page }}"
+          fi
           cargo build --release --locked
+          if [ -n "${{ matrix.jemalloc_lg_page }}" ]; then
+            grep -q "LG_PAGE ${{ matrix.jemalloc_lg_page }}\$" \
+              target/release/build/tikv-jemalloc-sys-*/out/build/include/jemalloc/internal/jemalloc_internal_defs.h
+          fi
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/celld/Cargo.toml | head -1)
           target/release/celld --version | grep -F "$version"
 
@@ -66,12 +85,12 @@ jobs:
           # -n omits name and timestamp so the envelope is reproducible
           # whenever the binary is.
           gzip -9 -n -c target/release/celld \
-            > "out/celld-${{ matrix.target }}.gz"
+            > "out/celld-${{ matrix.artifact }}.gz"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: celld-${{ matrix.target }}
-          path: out/celld-${{ matrix.target }}.gz
+          name: celld-${{ matrix.artifact }}
+          path: out/celld-${{ matrix.artifact }}.gz
           if-no-files-found: error
 
   # The Dockerfile must build and its test stage pass before anything can
@@ -106,12 +125,16 @@ jobs:
             --build-arg "CELLD_VERSION=$version" \
             --cache-from "type=registry,ref=$IMAGE:buildcache-amd64" \
             .
+          # The ARM64 image is built only after the release is published, so
+          # check its esbuild pin here.
+          docker buildx build --platform linux/arm64 --target esbuild .
 
   draft-release:
     name: Attest and draft the release
     if: github.event_name != 'release'
     needs:
       - build-celld
+      - container-check
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
@@ -138,7 +161,9 @@ jobs:
           for target in \
             x86_64-unknown-linux-gnu \
             aarch64-unknown-linux-gnu \
-            aarch64-apple-darwin; do
+            aarch64-unknown-linux-gnu-64k-pages \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin; do
             test -f "celld-$target.gz"
           done
 

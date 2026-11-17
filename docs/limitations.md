@@ -42,5 +42,5 @@ APIs, and Wrangler configuration.
 
 ## Platforms
 
-- The installer supplies binaries for Linux x86-64, Linux ARM64, and Apple
-  Silicon. Windows is not supported.
+- [Install](../README.md#install) lists the platforms the release workflow
+  builds. The ARM64 container image uses 4 KiB pages. Windows is not supported.
