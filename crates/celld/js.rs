@@ -5358,10 +5358,13 @@ pub enum CancelCause {
     Client,
     /// The runtime is stopping, so nothing it keeps running would finish.
     Shutdown,
-    /// Its Durable Object is moved to a new deployment, or restarted, and the
-    /// move reached its maximum age. Ended as a shutdown ends it, and the
-    /// client, which is still connected, is told to retry.
+    /// Its Durable Object is moved to a new deployment and the move reached
+    /// its maximum age. Ended as a shutdown ends it, and the client, which is
+    /// still connected, is told to retry.
     Moved,
+    /// Its Durable Object restarts because its SQL latched an error. Ended
+    /// and answered as a move is.
+    Restarted,
     /// Its deployment outlived `CELLD_RETIRE_DEADLINE_S`. Ended as a shutdown
     /// ends it, and the client that still waits is told why.
     Superseded,
@@ -5376,6 +5379,11 @@ fn cancel_error(cause: CancelCause) -> anyhow::Error {
         ),
         CancelCause::Moved => anyhow!(
             "this Durable Object was moved to a new deployment and its request was ended; \
+             retry it ({})",
+            crate::engine_api::CANCEL_RETRYABLE_ERROR_MARKER
+        ),
+        CancelCause::Restarted => anyhow!(
+            "this Durable Object restarted after a storage error and its request was ended; \
              retry it ({})",
             crate::engine_api::CANCEL_RETRYABLE_ERROR_MARKER
         ),
@@ -12207,6 +12215,15 @@ mod response_status_tests {
             Ok(GatedReplyCompletion::Sent { failure: Some(_) })
         ));
         assert_eq!(status_after_gate(Some(200), &sent), Some(503));
+    }
+
+    #[test]
+    fn a_restart_after_a_storage_error_says_so_and_answers_503() {
+        let (reply, completion) = cancel_pending_gate(CancelCause::Restarted);
+        let reply = reply.unwrap_err();
+        assert!(reply.contains("restarted after a storage error"), "{reply}");
+        assert!(reply.contains(crate::engine_api::CANCEL_RETRYABLE_ERROR_MARKER));
+        assert_eq!(status_after_gate(Some(200), &Ok(completion)), Some(503));
     }
 
     #[test]

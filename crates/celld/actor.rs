@@ -3535,10 +3535,12 @@ impl Actor {
                 } else {
                     "shutdown_quiesce"
                 };
-                // A cell that stays on this node is moved to a new deployment
-                // (or restarted); one that leaves is handed off at shutdown.
-                // The client is told which, and may retry either.
-                let cause = if keep_hibernatable {
+                // A cell that stays on this node is restarted or moved to a new
+                // deployment; one that leaves is handed off at shutdown. The
+                // client is told which, and may retry any of them.
+                let cause = if recycle {
+                    crate::js::CancelCause::Restarted
+                } else if keep_hibernatable {
                     crate::js::CancelCause::Moved
                 } else {
                     crate::js::CancelCause::Shutdown
