@@ -4375,3 +4375,7 @@ mod operator_token_tests;
 #[cfg(test)]
 #[path = "actor/resume_fallback_tests.rs"]
 mod resume_fallback_tests;
+
+#[cfg(test)]
+#[path = "actor/lost_record_claim_tests.rs"]
+mod lost_record_claim_tests;
