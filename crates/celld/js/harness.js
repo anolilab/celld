@@ -6106,9 +6106,21 @@ const __wsStub = __celld.__wsStub = (wsId) => ({
 // An exception a socket's listener throws is reported as a console error with
 // its stack, and the socket stays open: failing the event would drop the frames
 // the other listeners sent and close the socket.
+//
+// Reporting never throws: a value whose formatting throws must not stop the
+// other listeners or replace the exception a handler rethrows.
 const __reportHandlerError = (what, error) => {
-  console.error(`Uncaught exception in ${what}:`, error);
+  try {
+    console.error(`Uncaught exception in ${what}:`, error);
+  } catch {
+    try {
+      console.error(`Uncaught exception in ${what} (the value could not be printed)`);
+    } catch {}
+  }
 };
+// The hook `dispatchEvent` calls when a listener throws. A symbol, so no other
+// EventTarget, a Worker's own subclass included, picks it up by accident.
+const __listenerFailed = Symbol("listenerFailed");
 // Runs a hibernation handler. What it throws is reported with its stack and
 // then fails the event as before.
 const __runSocketHandler = async (name, handler) => {
@@ -10199,8 +10211,8 @@ if (!globalThis.EventTarget) {
             item.callback.call(this, event);
           else item.callback.handleEvent(event);
         } catch (error) {
-          if (typeof this._listenerFailed !== "function") throw error;
-          this._listenerFailed(error);
+          if (typeof this[__listenerFailed] !== "function") throw error;
+          this[__listenerFailed](error);
         }
       }
       const handler = this["on" + event.type];
@@ -10211,8 +10223,8 @@ if (!globalThis.EventTarget) {
         try {
           handler.call(this, event);
         } catch (error) {
-          if (typeof this._listenerFailed !== "function") throw error;
-          this._listenerFailed(error);
+          if (typeof this[__listenerFailed] !== "function") throw error;
+          this[__listenerFailed](error);
         }
       }
       event._end();
@@ -11075,7 +11087,7 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
   deserializeAttachment() { return this._attachment; }
   // A listener that throws is reported and the rest still run, so the socket
   // keeps working.
-  _listenerFailed(error) {
+  [__listenerFailed](error) {
     __reportHandlerError("WebSocket listener", error);
   }
   _dispatchMessage(data) {
