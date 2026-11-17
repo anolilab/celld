@@ -247,7 +247,7 @@ async fn probe_storage(out: &mut Output, bucket: &Bucket, read_only: bool) -> an
         Ok(()) => {
             out.row(&Check::ok(
                 "bucket conditional write",
-                "create, reject-create, update, reject-stale",
+                "create, reject-create, update, reject-stale, one racing create, one racing update",
             ))?;
             Ok(())
         }
