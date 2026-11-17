@@ -1687,6 +1687,10 @@ fn read_project(
         &compatibility_flags,
         compatibility_date.as_deref(),
         strict_compat_flags,
+        object
+            .get("main")
+            .and_then(Value::as_str)
+            .is_some_and(|main| main.ends_with(".py")),
     )?;
     let main = object
         .get("main")
@@ -3807,6 +3811,28 @@ mod compatibility_config_tests {
             error.contains("no_global_navigator: not supported"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_python_flag_is_refused_for_a_javascript_entry_only() {
+        let config = |main: &str| {
+            format!(
+                r#"{{ "name": "app", "main": "{main}", "no_bundle": true,
+                     "compatibility_flags": ["python_workers", "no_such_flag"] }}"#
+            )
+        };
+        let error = read("index.js", &config("index.js"))
+            .err()
+            .expect("a Python flag is refused for JavaScript")
+            .to_string();
+        assert!(
+            error.contains("python_workers: only a Python Worker"),
+            "{error}"
+        );
+        let python = read("main.py", &config("main.py"));
+        assert!(!python
+            .err()
+            .is_some_and(|error| error.to_string().contains("only a Python Worker")),);
     }
 
     #[test]

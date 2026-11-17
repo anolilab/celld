@@ -193,13 +193,21 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
         .get("compatibility_date")
         .and_then(serde_json::Value::as_str);
     let on = |name: &str| compat_flags::switch(name, &flags, date);
+    // Stored versions may carry the old names `queue_v8_messages` and
+    // `queue_json_messages`, which an earlier release honoured. Keep these
+    // aliases until no stored version carries them; deploy warns about them.
+    let queue_json_messages = if flags.contains(&"queue_v8_messages") {
+        false
+    } else {
+        flags.contains(&"queue_json_messages") || on("queues_json_messages")
+    };
     js::Compat {
         delete_all_deletes_alarm: on("delete_all_deletes_alarm"),
         js_rpc: on("js_rpc"),
         fetcher_get_put_delete: !on("fetcher_no_get_put_delete"),
         sqlite_vec: on("sqlite_vec"),
         websocket_standard_binary_type: on("websocket_standard_binary_type"),
-        queue_json_messages: on("queues_json_messages"),
+        queue_json_messages,
         populate_process_env: (on("nodejs_compat") || on("nodejs_compat_v2"))
             && on("nodejs_compat_populate_process_env"),
         cache_option: on("cache_option_enabled"),

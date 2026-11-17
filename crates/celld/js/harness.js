@@ -410,7 +410,7 @@ globalThis.Request = class Request {
       if (!__cell.compat.cacheOption)
         throw new Error("The 'cache' field on 'RequestInitializerDict' " +
           "is not implemented.");
-      if (init.cache !== "no-store")
+      if (String(init.cache) !== "no-store")
         throw new TypeError(
           `Unsupported cache mode: ${init.cache}. Only "no-store" is supported.`);
       this.cache = "no-store";

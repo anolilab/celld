@@ -16,7 +16,8 @@
 //! A flag that is not in the table is a warning: celld runs without it. With
 //! `--strict-compat-flags` it is an error, because a flag celld does not handle
 //! cannot be shown to behave as the operator expects. An `Unsupported` flag is
-//! always an error. A `Partial` flag warns, and is an error under
+//! always an error, and so is a Python-only flag for an entry that is not a
+//! `.py` file. A `Partial` flag warns, and is an error under
 //! `--strict-compat-flags`. A compatibility date that implies an `Unsupported`
 //! or `Partial` flag warns the same way. A name in `workerd_flags::UNCLASSIFIED`
 //! is a real workerd flag that celld has not classified yet; the warning says
@@ -67,6 +68,9 @@ pub struct Flag {
     pub needs: Option<&'static str>,
     /// The flag that turns the behaviour off.
     pub opt_out: Option<&'static str>,
+    /// The flag only means something for a Python Worker, so a config whose
+    /// entry is not a `.py` file is refused when it sets it.
+    pub python_only: bool,
     /// What the flag does on celld, in the words of the documentation.
     pub note: &'static str,
 }
@@ -79,8 +83,14 @@ impl Flag {
             since: None,
             needs: None,
             opt_out: None,
+            python_only: false,
             note,
         }
+    }
+
+    const fn python_only(mut self) -> Self {
+        self.python_only = true;
+        self
     }
 
     const fn since(mut self, date: &'static str) -> Self {
@@ -183,7 +193,7 @@ pub static FLAGS: &[Flag] = &[
     .since("2025-04-01")
     .opt_out("assets_navigation_has_no_effect"),
     // deploy/python.rs `python_compat`, which reads these for a Python entry.
-    row("python_workers", Honoured, "Required for a Python entry."),
+    row("python_workers", Honoured, "Required for a Python entry.").python_only(),
     row(
         "python_workers_20250116",
         AlwaysOn,
@@ -191,6 +201,7 @@ pub static FLAGS: &[Flag] = &[
     )
     .since("2025-09-29")
     .needs("python_workers")
+    .python_only()
     .opt_out("no_python_workers_20250116"),
     row(
         "enable_python_external_sdk",
@@ -199,6 +210,7 @@ pub static FLAGS: &[Flag] = &[
     )
     .since("2026-04-21")
     .needs("python_workers")
+    .python_only()
     .opt_out("disable_python_external_sdk"),
     row(
         "python_no_global_handlers",
@@ -207,6 +219,7 @@ pub static FLAGS: &[Flag] = &[
     )
     .since("2025-08-14")
     .needs("python_workers")
+    .python_only()
     .opt_out("disable_python_no_global_handlers"),
     row(
         "python_workers_force_new_vendor_path",
@@ -214,7 +227,8 @@ pub static FLAGS: &[Flag] = &[
         "Vendored packages come from `python_modules`, the only path celld uses.",
     )
     .since("2025-08-11")
-    .needs("python_workers"),
+    .needs("python_workers")
+    .python_only(),
     row(
         "python_process_pth_files",
         Honoured,
@@ -222,6 +236,7 @@ pub static FLAGS: &[Flag] = &[
     )
     .since("2026-05-26")
     .needs("python_workers")
+    .python_only()
     .opt_out("disable_python_process_pth_files"),
     row(
         "python_request_headers_preserve_commas",
@@ -230,6 +245,7 @@ pub static FLAGS: &[Flag] = &[
     )
     .since("2026-02-17")
     .needs("python_workers")
+    .python_only()
     .opt_out("disable_python_request_headers_preserve_commas"),
     row(
         "python_workflows_implicit_dependencies",
@@ -238,6 +254,7 @@ pub static FLAGS: &[Flag] = &[
     )
     .since("2026-02-25")
     .needs("python_workers")
+    .python_only()
     .opt_out("no_python_workflows_implicit_dependencies"),
     // js/bootstrap.rs `inject_compatibility_flags` reports both; js/harness.js
     // `Request` upper-cases the method; the async stream methods return a
@@ -444,18 +461,21 @@ pub static FLAGS: &[Flag] = &[
     )
     .since("2026-09-08")
     .needs("python_workers")
+    .python_only()
     .opt_out("no_python_workers_314"),
     row(
         "python_workers_20260610",
         Unsupported,
         "celld runs Pyodide 0.28 (Python 3.13).",
     )
+    .python_only()
     .opt_out("no_python_workers_20260610"),
     row(
         "python_workers_development",
         Unsupported,
         "celld runs Pyodide 0.28 (Python 3.13).",
-    ),
+    )
+    .python_only(),
 ];
 
 /// A table row or the opt-out derived from one, as a flag name sees it.
@@ -465,6 +485,7 @@ pub struct Entry {
     pub status: Status,
     pub since: Option<&'static str>,
     pub needs: Option<&'static str>,
+    pub python_only: bool,
     pub note: String,
     /// For a derived opt-out, the flag it turns off.
     pub opt_out_of: Option<&'static str>,
@@ -478,6 +499,7 @@ pub fn entries() -> impl Iterator<Item = Entry> {
             status: flag.status,
             since: flag.since,
             needs: flag.needs,
+            python_only: flag.python_only,
             note: flag.note.to_string(),
             opt_out_of: None,
         };
@@ -507,6 +529,7 @@ pub fn entries() -> impl Iterator<Item = Entry> {
                 status,
                 since: None,
                 needs: None,
+                python_only: flag.python_only,
                 note,
                 opt_out_of: Some(target),
             }
@@ -521,18 +544,20 @@ pub fn lookup(name: &str) -> Option<Entry> {
 }
 
 /// Whether a behaviour is on for a config: the flag turns it on, its opt-out
-/// turns it off, and otherwise the row's date decides. `name` must be a row of
+/// turns it off and wins over the flag, and otherwise the row's date decides. `name` must be a row of
 /// [`FLAGS`], which every caller in celld names with a literal.
 pub fn switch(name: &str, flags: &[impl AsRef<str>], date: Option<&str>) -> bool {
     let has = |wanted: &str| flags.iter().any(|flag| flag.as_ref() == wanted);
     let row = FLAGS.iter().find(|flag| flag.name == name);
     debug_assert!(row.is_some(), "{name} is not a row of compat_flags::FLAGS");
-    if has(name) {
-        return true;
-    }
-    let Some(row) = row else { return false };
+    let Some(row) = row else { return has(name) };
+    // The opt-out wins. A deploy refuses a config that sets both, but an asset
+    // index stored before that check can carry both.
     if row.opt_out.is_some_and(has) {
         return false;
+    }
+    if has(name) {
+        return true;
     }
     match (date, row.since) {
         (Some(date), Some(since)) => date >= since,
@@ -548,7 +573,17 @@ struct Findings {
     problems: Vec<String>,
 }
 
-fn assess(flags: &[impl AsRef<str>], date: Option<&str>, strict: bool) -> Findings {
+/// What to say about an old queue flag name that never was a workerd flag.
+fn renamed(name: &str) -> &'static str {
+    match name {
+        "queue_json_messages" | "queue_v8_messages" => {
+            " (did you mean `queues_json_messages` / `no_queues_json_messages`?)"
+        }
+        _ => "",
+    }
+}
+
+fn assess(flags: &[impl AsRef<str>], date: Option<&str>, strict: bool, python: bool) -> Findings {
     let names: Vec<&str> = flags.iter().map(AsRef::as_ref).collect();
     let has = |name: &str| names.contains(&name);
     let mut found = Findings::default();
@@ -563,6 +598,11 @@ fn assess(flags: &[impl AsRef<str>], date: Option<&str>, strict: bool) -> Findin
             }
             continue;
         };
+        if entry.python_only && !python {
+            found.problems.push(format!(
+                "  {name}: only a Python Worker (a `main` ending in `.py`) can use this flag"
+            ));
+        }
         match entry.status {
             Unsupported => found
                 .problems
@@ -618,7 +658,7 @@ fn assess(flags: &[impl AsRef<str>], date: Option<&str>, strict: bool) -> Findin
         found.problems.extend(
             unknown
                 .iter()
-                .map(|name| format!("  {name}: not a flag celld knows")),
+                .map(|name| format!("  {name}: not a flag celld knows{}", renamed(name))),
         );
         found.problems.extend(
             unclassified
@@ -629,7 +669,11 @@ fn assess(flags: &[impl AsRef<str>], date: Option<&str>, strict: bool) -> Findin
         if !unknown.is_empty() {
             found.warnings.push(format!(
                 "Warning: celld does not know these compatibility flags and runs without them: {}",
-                unknown.join(", ")
+                unknown
+                    .iter()
+                    .map(|name| format!("{name}{}", renamed(name)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         if !unclassified.is_empty() {
@@ -646,11 +690,17 @@ fn assess(flags: &[impl AsRef<str>], date: Option<&str>, strict: bool) -> Findin
 ///
 /// Every offending flag is listed in one error. A flag that is not in the table
 /// is reported as a warning; with `strict` it is an error. An `Unsupported`
-/// flag, and a flag set together with its opt-out, are always refused. A
+/// flag, a flag set together with its opt-out, and a Python-only flag for an
+/// entry that is not a Python Worker (`python`), are always refused. A
 /// `Partial` flag, and a date that implies an `Unsupported` or `Partial` flag
 /// that the config does not opt out of, warn; with `strict` they are errors.
-pub fn check(flags: &[impl AsRef<str>], date: Option<&str>, strict: bool) -> anyhow::Result<()> {
-    let found = assess(flags, date, strict);
+pub fn check(
+    flags: &[impl AsRef<str>],
+    date: Option<&str>,
+    strict: bool,
+    python: bool,
+) -> anyhow::Result<()> {
+    let found = assess(flags, date, strict, python);
     for line in &found.warnings {
         note!("{line}");
     }
@@ -849,7 +899,7 @@ mod tests {
     }
 
     fn check_flags(flags: &[&str], strict: bool) -> anyhow::Result<()> {
-        check(flags, None, strict)
+        check(flags, None, strict, true)
     }
 
     #[test]
@@ -966,7 +1016,7 @@ mod tests {
 
     #[test]
     fn a_partial_flag_warns_and_is_an_error_when_strict() {
-        let found = assess(&["enable_nodejs_vm_module"], None, false);
+        let found = assess(&["enable_nodejs_vm_module"], None, false, true);
         assert!(found.problems.is_empty(), "{found:?}");
         assert!(
             found.warnings[0].contains("enable_nodejs_vm_module: only partly supported"),
@@ -986,7 +1036,7 @@ mod tests {
     fn a_date_that_implies_an_unsupported_flag_warns_unless_opted_out() {
         let date = since("python_workers_314");
         let python = ["python_workers"];
-        let found = assess(&python, Some(date), false);
+        let found = assess(&python, Some(date), false, true);
         assert!(found.problems.is_empty(), "{found:?}");
         assert_eq!(found.warnings.len(), 1, "{found:?}");
         assert!(
@@ -996,23 +1046,97 @@ mod tests {
             "{found:?}"
         );
         assert_eq!(
-            assess(&python, Some(&day_before(date)), false),
+            assess(&python, Some(&day_before(date)), false, true),
             Findings::default()
         );
         assert_eq!(
             assess(
                 &["python_workers", "no_python_workers_314"],
                 Some(date),
-                false
+                false,
+                true
             ),
             Findings::default()
         );
-        let strict = assess(&python, Some(date), true);
+        let strict = assess(&python, Some(date), true, true);
         assert_eq!(strict.problems.len(), 1, "{strict:?}");
-        assert!(check(&python, Some(date), true).is_err());
-        check(&python, Some(date), false).unwrap();
+        assert!(check(&python, Some(date), true, true).is_err());
+        check(&python, Some(date), false, true).unwrap();
         // The line is implied only for a Python Worker.
-        assert_eq!(assess(NONE, Some(date), false), Findings::default());
+        assert_eq!(assess(NONE, Some(date), false, true), Findings::default());
+    }
+
+    /// A flag that only a Python Worker reads is refused for any other entry,
+    /// with every other bad flag in the same error, in both modes.
+    #[test]
+    fn a_python_flag_is_refused_for_an_entry_that_is_not_python() {
+        let python_rows = FLAGS.iter().filter(|flag| flag.python_only).count();
+        assert!(python_rows > 5, "{python_rows}");
+        for strict in [false, true] {
+            let error = check(
+                &[
+                    "python_workers",
+                    "disable_python_process_pth_files",
+                    "streaming_tail_worker",
+                    "nodejs_compat",
+                ],
+                None,
+                strict,
+                false,
+            )
+            .unwrap_err()
+            .to_string();
+            for name in [
+                "python_workers: only a Python Worker",
+                "disable_python_process_pth_files: only a Python Worker",
+                "streaming_tail_worker: not supported",
+            ] {
+                assert_eq!(error.matches(name).count(), 1, "{name}: {error}");
+            }
+            assert!(!error.contains("nodejs_compat:"), "{error}");
+            check(
+                &["python_workers", "disable_python_process_pth_files"],
+                None,
+                strict,
+                true,
+            )
+            .unwrap();
+        }
+    }
+
+    /// The opt-out wins in `switch`, as the old assets code had it, for a
+    /// stored index that carries both flags.
+    #[test]
+    fn the_opt_out_wins_over_the_flag_in_switch() {
+        let both = [
+            "assets_navigation_prefers_asset_serving",
+            "assets_navigation_has_no_effect",
+        ];
+        assert!(!switch(both[0], &both, Some("2020-01-01")));
+        assert!(!switch(both[0], &both, Some("2026-01-01")));
+        assert!(switch(both[0], &both[..1], Some("2020-01-01")));
+    }
+
+    /// An earlier release honoured these names, so a stored version that
+    /// carries one keeps its queue encoding; deploy points at the new name.
+    #[test]
+    fn the_old_queue_flag_names_still_pick_the_encoding() {
+        let date = since("queues_json_messages");
+        assert!(!compat(date, &["queue_v8_messages"]).queue_json_messages);
+        assert!(compat("2020-01-01", &["queue_json_messages"]).queue_json_messages);
+        assert!(!compat(&day_before(date), &[]).queue_json_messages);
+        let found = assess(&["queue_v8_messages"], None, false, true);
+        assert!(
+            found.warnings[0].contains("did you mean `queues_json_messages`"),
+            "{found:?}"
+        );
+        let error = check(&["queue_json_messages"], None, true, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("did you mean `queues_json_messages`"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1023,6 +1147,6 @@ mod tests {
         assert!(!compat(&day_before(date), &[]).cache_option);
         assert!(!compat(date, &["cache_option_disabled"]).cache_option);
         assert!(compat("2020-01-01", &["cache_option_enabled"]).cache_option);
-        assert_eq!(assess(NONE, Some(date), true), Findings::default());
+        assert_eq!(assess(NONE, Some(date), true, true), Findings::default());
     }
 }

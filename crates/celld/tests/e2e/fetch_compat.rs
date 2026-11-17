@@ -522,6 +522,7 @@ async fn the_cache_option_accepts_only_no_store_and_follows_the_compat_date() {
     assert_eq!(on["flag"], true, "{on}");
     assert_eq!(on["requestCache"], "no-store", "{on}");
     assert_eq!(on["cloned"], "no-store", "{on}");
+    assert_eq!(on["objectCache"], "no-store", "{on}");
     let fetched = on["fetchNoStore"].as_str().unwrap();
     assert!(!fetched.contains("cache"), "{on}");
     let forced = on["forceCache"].as_str().unwrap();

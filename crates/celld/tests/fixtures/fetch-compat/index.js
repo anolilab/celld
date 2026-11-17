@@ -86,6 +86,9 @@ export default {
       return Response.json({
         requestCache: await attempt(() => new Request(dead, { cache: "no-store" }).cache),
         fetchNoStore: await attempt(() => fetch(dead, { cache: "no-store" })),
+        // A mode that is not a string converts to one, as a string would.
+        objectCache: await attempt(
+          () => new Request(dead, { cache: { toString: () => "no-store" } }).cache),
         forceCache: await attempt(() => fetch(dead, { cache: "force-cache" })),
         cloned: await attempt(() => new Request(dead, { cache: "no-store" }).clone().cache),
         flag: globalThis.Cloudflare.compatibilityFlags.cache_option_enabled,

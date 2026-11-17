@@ -311,7 +311,8 @@ below when they build, so a flag costs nothing at runtime.
 A compatibility date on or after the "implied from" date of an unsupported or
 partial flag implies that flag. The build warns, naming the flag and its date,
 unless the config sets the opt-out. A flag set together with its opt-out is
-refused as contradictory.
+refused as contradictory. A `python_*` flag, `python_workers` and their opt-outs
+are refused when the entry is not a `.py` file.
 
 A flag that is not in the table is a warning: celld runs without it. A name
 that is a real workerd flag gets "celld does not handle this workerd flag yet",
