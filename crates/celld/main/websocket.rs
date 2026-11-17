@@ -715,6 +715,23 @@ impl ObjectEnd for ObjectSocket {
     }
 }
 
+/// Wait for `work` while reading and dropping what the object sends, so an
+/// object that keeps sending during its close handler cannot fill its queue.
+async fn discard_while<T>(
+    work: impl std::future::Future<Output = T>,
+    from_cell: &mut mpsc::UnboundedReceiver<celld::js::WsOut>,
+) -> T {
+    let mut work = std::pin::pin!(work);
+    loop {
+        celld::asyncrt::select! {
+            result = &mut work => return result,
+            frame = from_cell.recv() => if frame.is_none() {
+                return work.await;
+            },
+        }
+    }
+}
+
 async fn pipe_to_object(
     cell: impl ObjectEnd,
     id: u64,
@@ -857,8 +874,14 @@ async fn pipe_to_object(
     // The cell's handler may wait on a gate that never opens, so hearing of
     // the end is bounded by the handler budget too.
     if let Some((code, reason)) = cell_close {
-        let _ =
-            celld::asyncrt::timeout(celld::js::handler_budget(), cell.closed(code, reason)).await;
+        // The object keeps its registration, because its close handler may
+        // still send, but nobody reads what it sends, so it is dropped as it
+        // comes instead of piling up in the unbounded channel.
+        let _ = discard_while(
+            celld::asyncrt::timeout(celld::js::handler_budget(), cell.closed(code, reason)),
+            &mut from_cell,
+        )
+        .await;
     }
     cell.release();
     celld::js::ws_unregister(cell.id());
@@ -1723,6 +1746,29 @@ mod pipe_tests {
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .is_ok()
+    }
+
+    #[tokio::test]
+    async fn an_object_that_keeps_sending_during_its_close_handler_is_read() {
+        let (tx, mut from_cell) = mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let work = {
+            let release = release.clone();
+            async move { release.notified().await }
+        };
+        let task = tokio::spawn(async move {
+            discard_while(work, &mut from_cell).await;
+            from_cell
+        });
+        for _ in 0..64 {
+            tx.send(celld::js::WsOut::Text("x".into())).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The handler is still running, and the frames are already gone.
+        assert!(!task.is_finished());
+        release.notify_one();
+        let from_cell = task.await.unwrap();
+        assert!(from_cell.is_empty(), "the object's frames piled up");
     }
 
     #[tokio::test]
