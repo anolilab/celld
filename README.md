@@ -67,8 +67,22 @@ lists each gap in the services above.
 
 ## Install
 
-This repository does not publish release binaries or container images yet. Build
-`celld` from source with the Rust toolchain pinned in
+This repository does not publish release binaries or container images yet. The
+release workflow builds these targets:
+
+| Platform | Release asset |
+| --- | --- |
+| Linux x86-64 | `celld-x86_64-unknown-linux-gnu.gz` |
+| Linux ARM64, 4 KiB pages | `celld-aarch64-unknown-linux-gnu.gz` |
+| Linux ARM64, 16 KiB or 64 KiB pages | `celld-aarch64-unknown-linux-gnu-64k-pages.gz` |
+| macOS Apple Silicon | `celld-aarch64-apple-darwin.gz` |
+| macOS Intel | `celld-x86_64-apple-darwin.gz` |
+
+On Linux ARM64, use the `-64k-pages` asset when `getconf PAGESIZE` prints
+`16384` or `65536`; the default asset aborts there. On a 4 KiB kernel the
+default asset uses less memory, so prefer it. Windows is not supported.
+
+Build `celld` from source with the Rust toolchain pinned in
 [`rust-toolchain.toml`](rust-toolchain.toml):
 
 ```sh
@@ -83,7 +97,8 @@ Worker projects deployed with `celld deploy` need
 
 ## Container
 
-The [`Dockerfile`](Dockerfile) builds an image that contains the `celld` binary:
+The [`Dockerfile`](Dockerfile) builds an image that contains the `celld` binary
+and a pinned `esbuild`, so `celld deploy` and `celld dev` run inside it:
 
 ```sh
 docker build -t celld .

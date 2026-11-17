@@ -33,6 +33,28 @@ RUN --mount=type=cache,id=celld-cargo-registry,target=/usr/local/cargo/registry,
     cargo test --profile "${CELLD_PROFILE}" --locked && \
     cargo clippy --profile "${CELLD_PROFILE}" --all-targets --locked -- -D warnings
 
+# `celld deploy` and `celld dev` bundle Worker code with esbuild, so the image
+# carries a pinned one. The download is checked against a pinned SHA-256.
+FROM debian:bookworm-slim AS esbuild
+ARG TARGETARCH
+ARG ESBUILD_VERSION=0.28.2
+ARG ESBUILD_SHA256_AMD64=9573bb2233aab0f9ea7647d5cca9726113cc1768de61d66b17267f4db84488f6
+ARG ESBUILD_SHA256_ARM64=a96dbfa41d3ef5dbd1ef22b1c10d5187be9267e86093a870f06402a7ec931596
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+      amd64) package=linux-x64; sha256="${ESBUILD_SHA256_AMD64}" ;; \
+      arm64) package=linux-arm64; sha256="${ESBUILD_SHA256_ARM64}" ;; \
+      *) echo "unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/esbuild.tgz \
+      "https://registry.npmjs.org/@esbuild/${package}/-/${package}-${ESBUILD_VERSION}.tgz"; \
+    echo "${sha256}  /tmp/esbuild.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/esbuild.tgz -C /tmp package/bin/esbuild; \
+    install -m 755 /tmp/package/bin/esbuild /usr/local/bin/esbuild
+
 FROM debian:bookworm-slim
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
@@ -44,4 +66,5 @@ LABEL org.opencontainers.image.title="celld" \
       org.opencontainers.image.version="${CELLD_VERSION}"
 COPY LICENSE NOTICE /usr/share/doc/celld/
 COPY --from=test /out/celld /usr/local/bin/celld
+COPY --from=esbuild /usr/local/bin/esbuild /usr/local/bin/esbuild
 ENTRYPOINT ["/usr/local/bin/celld"]

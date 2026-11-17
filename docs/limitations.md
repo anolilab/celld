@@ -42,5 +42,6 @@ APIs, and Wrangler configuration.
 
 ## Platforms
 
-- The installer supplies binaries for Linux x86-64, Linux ARM64, and Apple
-  Silicon. Windows is not supported.
+- Releases supply binaries for Linux x86-64, Linux ARM64, Apple Silicon, and
+  Intel macOS. Linux ARM64 has a separate `-64k-pages` binary for kernels with
+  16 KiB or 64 KiB pages. Windows is not supported.
