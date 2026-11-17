@@ -2719,6 +2719,30 @@ impl TailReportState {
         self.failure = Some(TailException::new(message));
     }
 
+    /// Record the failure a settled reply gate carries, unless the handler
+    /// already failed: its error is the cause the report should name.
+    fn record_gate_failure(
+        &mut self,
+        completion: &Result<GatedReplyCompletion, tokio::sync::oneshot::error::RecvError>,
+    ) {
+        if let Ok(
+            GatedReplyCompletion::Sent {
+                failure: Some(failure),
+            }
+            | GatedReplyCompletion::CallerClosed {
+                failure: Some(failure),
+            }
+            | GatedReplyCompletion::Cancelled {
+                failure: Some(failure),
+            },
+        ) = completion
+        {
+            if self.failure.is_none() {
+                self.record_failure(failure.clone());
+            }
+        }
+    }
+
     fn finish(self, context: &IoContext, response_status: Option<u16>) {
         let outcome = if self.failure.is_some() {
             "exception"
@@ -3322,6 +3346,9 @@ impl InFlight {
     ) {
         self.gated_reply = None;
         self.response_status = status_after_gate(self.response_status, &completion);
+        if let Some(report) = &mut self.tail_report {
+            report.record_gate_failure(&completion);
+        }
         if self.trace.is_some_and(|trace| trace.sampled) {
             match completion {
                 Ok(GatedReplyCompletion::Sent {
@@ -12060,6 +12087,44 @@ mod response_status_tests {
         });
         assert_eq!(status_after_gate(Some(200), &failed), Some(500));
         assert_eq!(status_after_gate(None, &failed), None);
+    }
+
+    fn tail_report() -> TailReportState {
+        TailReportState {
+            reply: tokio::sync::oneshot::channel().0,
+            script_name: "worker".to_string(),
+            event_timestamp: 0,
+            url: "http://example.test/".to_string(),
+            method: "GET".to_string(),
+            headers: serde_json::Map::new(),
+            failure: None,
+        }
+    }
+
+    #[test]
+    fn a_failed_gate_makes_the_tail_report_an_exception() {
+        let mut report = tail_report();
+        report.record_gate_failure(&Ok(GatedReplyCompletion::Sent {
+            failure: Some("gate".to_string()),
+        }));
+        assert_eq!(report.failure.expect("recorded").message, "gate");
+    }
+
+    #[test]
+    fn a_gate_failure_keeps_the_handlers_own_failure() {
+        let mut report = tail_report();
+        report.record_failure("handler".to_string());
+        report.record_gate_failure(&Ok(GatedReplyCompletion::Sent {
+            failure: Some("gate".to_string()),
+        }));
+        assert_eq!(report.failure.expect("kept").message, "handler");
+    }
+
+    #[test]
+    fn a_clean_gate_leaves_the_tail_report_ok() {
+        let mut report = tail_report();
+        report.record_gate_failure(&Ok(GatedReplyCompletion::Sent { failure: None }));
+        assert!(report.failure.is_none());
     }
 
     #[test]
