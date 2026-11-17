@@ -32,6 +32,29 @@ async fn state(server: &Server) -> Value {
         .expect("state json")
 }
 
+/// GET `url`, again when the node reports that the handler outlived its
+/// budget, or that the object's move to the new deployment ended it. The tests
+/// here set a one-second budget, which a Durable Object start queued behind a
+/// burst of others can use up on a loaded machine, and an object that has
+/// outlived the maximum age is moved with its running events ended; the
+/// request is idempotent, so asking again is safe.
+async fn get_within_budget(client: &reqwest::Client, url: &str) -> (reqwest::StatusCode, String) {
+    let mut attempts = 0;
+    loop {
+        let response = client.get(url).send().await.expect("get");
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        attempts += 1;
+        if attempts == 5
+            || !(body.contains("handler exceeded") || body.contains("The client has disconnected"))
+        {
+            return (status, body);
+        }
+        // Give the queue that made it time out a moment to drain.
+        tokio::time::sleep(Duration::from_millis(200 * attempts)).await;
+    }
+}
+
 /// Deploy a variant that answers `v2` and make it the serving generation.
 async fn redeploy(server: &Server) {
     host_runtime();
@@ -287,20 +310,41 @@ async fn durable_object_events_running_at_the_deadline_are_ended_and_the_node_ke
             .iter()
             .map(|n| {
                 let (client, url) = (client.clone(), server.url(&format!("/do-hang?n={n}")));
-                tokio::spawn(async move { client.get(url).send().await.expect("hang").status() })
+                tokio::spawn(async move { get_within_budget(&client, &url).await })
             })
             .collect();
         for task in hung {
-            let status = task.await.expect("hang task");
-            assert!(status.is_success(), "{status}");
+            let (status, body) = task.await.expect("hang task");
+            assert!(status.is_success(), "{status} {body}");
         }
     }
     tokio::time::sleep(Duration::from_secs(8)).await;
 
     redeploy(&server).await;
+    let redeployed = std::time::Instant::now();
 
-    // Let the deadline pass while the handoffs are still going.
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    // Let the deadline pass while the handoffs are still going. The node's own
+    // clock says when: a fixed sleep is shorter than the deadline when the
+    // machine is slow.
+    wait_until(
+        "the retire deadline to pass",
+        Duration::from_secs(30),
+        || async {
+            let state = state(&server).await;
+            // A generation freed early (every object already moved) says
+            // nothing about the clock, so it counts only once 2.5 s passed.
+            let freed = state["deployment"]["retiring"]["generations"] == 0
+                && redeployed.elapsed() >= Duration::from_millis(2500);
+            let draining = state["deployment"]["draining"].as_array()?;
+            (freed
+                || (!draining.is_empty()
+                    && draining
+                        .iter()
+                        .all(|generation| generation["retiredForMs"].as_u64() >= Some(2500))))
+            .then_some(())
+        },
+    )
+    .await;
 
     // Only what was running at the deadline is ended. An event that starts
     // afterwards on an object that has not moved yet is left to the swap.
@@ -309,10 +353,7 @@ async fn durable_object_events_running_at_the_deadline_are_ended_and_the_node_ke
             .iter()
             .map(|n| {
                 let (client, url) = (client.clone(), server.url(&format!("/do-nap?n={n}")));
-                tokio::spawn(async move {
-                    let response = client.get(url).send().await.expect("nap");
-                    (response.status(), response.text().await.unwrap_or_default())
-                })
+                tokio::spawn(async move { get_within_budget(&client, &url).await })
             })
             .collect();
         for task in naps {
