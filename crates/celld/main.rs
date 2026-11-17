@@ -4354,8 +4354,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     {
         let tx = app.tx.clone();
         tokio::spawn(async move {
-            while let Some(cell) = broken_rx.recv().await {
-                let _ = tx.send(Message::RuntimeBroken { cell });
+            while let Some((cell, instance)) = broken_rx.recv().await {
+                let _ = tx.send(Message::RuntimeBroken { cell, instance });
             }
         });
     }

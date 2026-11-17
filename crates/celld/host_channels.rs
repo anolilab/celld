@@ -71,15 +71,15 @@ pub fn set_gate_tx(tx: tokio::sync::mpsc::UnboundedSender<GateReq>) {
 }
 
 /// Root cells whose SQL latched a critical error, for the actor to restart.
-static BROKEN_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<String>> = OnceLock::new();
-pub fn set_broken_tx(tx: tokio::sync::mpsc::UnboundedSender<String>) {
+static BROKEN_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<(String, u64)>> = OnceLock::new();
+pub fn set_broken_tx(tx: tokio::sync::mpsc::UnboundedSender<(String, u64)>) {
     let _ = BROKEN_TX.set(tx);
 }
-/// Tell the actor that `cell`'s runtime holds a latched SQL error. A process
+/// Tell the actor that instance `instance` of `cell` holds a latched SQL error. A process
 /// with no actor (a tool or a test) has nobody to tell.
-pub(crate) fn report_runtime_broken(cell: String) {
+pub(crate) fn report_runtime_broken(cell: String, instance: u64) {
     if let Some(tx) = BROKEN_TX.get() {
-        let _ = tx.send(cell);
+        let _ = tx.send((cell, instance));
     }
 }
 

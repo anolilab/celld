@@ -317,3 +317,114 @@ fn recycles_respect_the_swap_room_and_back_off() {
         "a restarted twice inside the back-off"
     );
 }
+
+#[test]
+fn a_report_queued_while_the_cell_ensures_durability_survives_a_cancelled_eviction() {
+    let mut shell = Shell::new(config());
+    let busy = shell.request("a");
+    shell.finish(busy);
+    // Recycle once, then report again inside the back-off window.
+    broken(&mut shell, "a");
+    let stop = shell.expect("the first stop", |effect| match effect {
+        Effect::StopRuntime { op, .. } => Some(*op),
+        _ => None,
+    });
+    shell.send(Event::RuntimeStopped { op: stop });
+    shell.settle();
+    broken(&mut shell, "a");
+    // An eviction begins and a request cancels it before the window ends.
+    shell.send(Event::Evict { cell: "a".into() });
+    assert!(
+        matches!(
+            shell.state.phase("a"),
+            Some(Phase::EnsuringDurability { .. })
+        ),
+        "the eviction did not begin"
+    );
+    let _ = shell.request("a");
+    shell.settle();
+    assert!(matches!(
+        shell.state.phase("a"),
+        Some(Phase::Resident { .. })
+    ));
+    // The report outlived the cancelled eviction: once the window passes the
+    // cell recycles.
+    shell.tick(RECYCLE_BACKOFF_MS + 1);
+    broken_pump(&mut shell);
+    assert!(shell.state.swapping() > 0, "the report was dropped");
+}
+
+fn broken_pump(shell: &mut Shell) {
+    // Any event runs the pump.
+    let now_mono_ms = shell.now;
+    shell.send(Event::GenerationChanged {
+        generation: 0,
+        now_mono_ms,
+        max_age_ms: 0,
+        eager_classes: Vec::new(),
+    });
+}
+
+#[test]
+fn a_report_upgrades_an_unforced_swap_to_a_recycle() {
+    let mut shell = Shell::new(config());
+    let _busy = shell.request("a");
+    let now_mono_ms = shell.tick(1);
+    shell.send(Event::GenerationChanged {
+        generation: 1,
+        now_mono_ms,
+        max_age_ms: 3_600_000,
+        eager_classes: Vec::new(),
+    });
+    assert!(shell
+        .take(|e| matches!(e, Effect::CancelCellActivity { .. }).then_some(()))
+        .is_none());
+    broken(&mut shell, "a");
+    shell.expect("the activity cancelled", |effect| match effect {
+        Effect::CancelCellActivity {
+            cell,
+            recycle: true,
+            ..
+        } if cell == "a" => Some(()),
+        _ => None,
+    });
+}
+
+#[test]
+fn a_recycling_cell_defers_a_due_alarm() {
+    let mut shell = Shell::new(config());
+    let busy = shell.request("a");
+    let due = shell.now + 5_000;
+    let (now_ms, now_mono_ms) = (shell.now, shell.now);
+    shell.send(Event::AlarmObserved {
+        cell: "a".into(),
+        alarm: wake::AlarmSnapshot::without_wake(Some(due as i64)),
+        covered: true,
+        now_ms,
+        now_mono_ms,
+    });
+    let generation = shell.expect("an alarm timer", |effect| match effect {
+        Effect::ScheduleTimer {
+            timer: Timer::CellAlarm { generation, .. },
+            ..
+        } => Some(*generation),
+        _ => None,
+    });
+    broken(&mut shell, "a");
+    let now = shell.tick(5_000);
+    let effects = shell.send(Event::TimerFired {
+        timer: Timer::CellAlarm {
+            cell: "a".into(),
+            generation,
+        },
+        now_ms: now,
+        now_mono_ms: now,
+    });
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::FireAlarm { .. })),
+        "an alarm fired on the broken instance: {effects:?}"
+    );
+    let _ = busy;
+}

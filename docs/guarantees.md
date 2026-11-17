@@ -198,6 +198,11 @@ are unchanged. A node-wide fault restarts a bounded number of cells at a time,
 and a cell is not restarted again within five seconds; its requests fail with
 the same error meanwhile.
 
+If the restart itself fails because the fault persists (the database cannot
+reopen), the requests waiting on it fail with a runtime failure and the cell
+stays on this node, idle, with its record and local database. A later request
+starts it again, and that succeeds once the fault is gone.
+
 ### The ensemble needs two nodes
 
 A node never counts itself as a follower, and one follower is enough, therefore

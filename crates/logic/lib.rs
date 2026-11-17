@@ -3361,8 +3361,10 @@ impl State {
             // (the `@cloudflare/containers` class sleeps for minutes inside
             // its alarm), which `begin_eviction` refuses until the deadline.
             // The alarm stays armed and covered for the successor; the
-            // timer below keeps it live should the cell stay after all.
-            Phase::Resident { .. } if self.draining && cell.quiescing => {
+            // timer below keeps it live should the cell stay after all. A
+            // recycled cell defers the same way: its instance is unusable,
+            // and the restart reads the armed alarm from storage.
+            Phase::Resident { .. } if (self.draining && cell.quiescing) || cell.recycle => {
                 effects.push(Effect::ScheduleTimer {
                     timer: Timer::CellAlarm {
                         cell: id.to_string(),
@@ -5505,9 +5507,12 @@ impl State {
     }
 
     /// Nominate queued recycles, within the swap room and the per-cell
-    /// back-off. A report for a cell that is no longer resident, or already
-    /// leaving or swapping, is dropped: that stop closes the database and
-    /// clears the latch. Returns the room left.
+    /// back-off. A report stays queued while the cell still holds the
+    /// latched instance and may return to serving it (a cell leaving for an
+    /// eviction that can be cancelled, a quiesce that can end); it is dropped
+    /// once the instance is gone, since that stop closed the database and
+    /// cleared the latch. A cell already on an unforced swap is upgraded to a
+    /// recycle, so its activity is cancelled. Returns the room left.
     fn nominate_recycles(&mut self, mut room: usize) -> usize {
         let pending: Vec<CellId> = self.recycle_pending.iter().cloned().collect();
         for id in pending {
@@ -5515,12 +5520,20 @@ impl State {
                 self.recycle_pending.remove(&id);
                 continue;
             };
-            if !matches!(cell.phase, Phase::Resident { .. })
-                || cell.swapping
-                || cell.quiescing
-                || cell.releasing.is_some()
-            {
+            match cell.phase {
+                Phase::EnsuringDurability { .. } => continue,
+                Phase::Resident { .. } => {}
+                _ => {
+                    self.recycle_pending.remove(&id);
+                    continue;
+                }
+            }
+            if cell.swapping {
+                cell.recycle = true;
                 self.recycle_pending.remove(&id);
+                continue;
+            }
+            if cell.quiescing || cell.releasing.is_some() {
                 continue;
             }
             let backing_off = cell
@@ -5643,7 +5656,8 @@ impl State {
                     Some(AlarmState::Firing { op, .. }) => Some(op),
                     _ => None,
                 };
-                if !(forced_by_age || eager || cell.recycle) || cell.swap_cancelled {
+                let recycle = cell.recycle;
+                if !(forced_by_age || eager || recycle) || cell.swap_cancelled {
                     continue;
                 }
                 let requests = self
@@ -5668,6 +5682,7 @@ impl State {
                     websockets,
                     alarm,
                     keep_hibernatable: true,
+                    recycle,
                 });
                 continue;
             }
@@ -6034,6 +6049,7 @@ impl State {
                 websockets,
                 alarm,
                 keep_hibernatable: false,
+                recycle: false,
             });
             in_flight += 1;
             let _ = self.begin_eviction(&id, true, effects);
@@ -6086,6 +6102,7 @@ impl State {
                 websockets,
                 alarm: None,
                 keep_hibernatable: false,
+                recycle: false,
             });
         }
         effects.push(Effect::ReleaseOwner {

@@ -1194,6 +1194,9 @@ pub enum Effect {
         /// and auto-response pair survive. A shutdown handoff lists every
         /// socket and forgets the pair, because the cell is leaving.
         keep_hibernatable: bool,
+        /// The cell restarts because its SQL latched an error, not because a
+        /// handoff or deployment moves it: there is no handoff to time.
+        recycle: bool,
     },
     Restore {
         op: OpId,

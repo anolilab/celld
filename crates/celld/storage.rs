@@ -289,8 +289,25 @@ fn latch_sql_critical_error(scope: &str, error: String) {
         // Not `dbs`: this can run inside a write that holds that map.
         let root =
             cells(|c| c.roots.borrow().get(scope).cloned()).unwrap_or_else(|| scope.to_string());
-        crate::host_channels::report_runtime_broken(root);
+        let instance = instance_token(&root).unwrap_or(0);
+        crate::host_channels::report_runtime_broken(root, instance);
     }
+}
+
+static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+static INSTANCES: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn instances<T>(f: impl FnOnce(&mut std::collections::BTreeMap<String, u64>) -> T) -> T {
+    f(&mut INSTANCES.lock().unwrap_or_else(|p| p.into_inner()))
+}
+
+/// The identity of the open instance of root cell `root`: new at every open,
+/// gone at close. A report about a latch carries it, so a report that
+/// outlives the instance it was raised on (a second scope of the same
+/// instance, or one queued across a restart) cannot recycle its successor.
+pub(crate) fn instance_token(root: &str) -> Option<u64> {
+    instances(|open| open.get(root).copied())
 }
 
 /// The heap memory one cell can hold in cached SQL statements. The budget
@@ -849,6 +866,14 @@ fn finish_open(
         }
     };
     cells(|c| c.roots.borrow_mut().insert(scope.to_string(), root));
+    if matches!(backing, StorageBacking::File { .. }) {
+        instances(|open| {
+            open.insert(
+                scope.to_string(),
+                NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            )
+        });
+    }
     dbs(|d| {
         d.borrow_mut().insert(
             scope.to_string(),
@@ -887,6 +912,7 @@ pub fn close(scope: &str) {
     close_sql_statement_cache(scope);
     sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
     cells(|c| c.roots.borrow_mut().remove(scope));
+    instances(|open| open.remove(scope));
     cells(|c| c.schema_cookies.borrow_mut().remove(scope));
     dbs(|d| d.borrow_mut().remove(scope));
     active_alarms(|alarms| alarms.borrow_mut().remove(scope));
@@ -4055,7 +4081,10 @@ mod recycle_tests {
 
     /// The reports the actor would receive, shared by every test of the
     /// process (the channel is installed once). Tests use distinct scopes.
-    type Reports = (tokio::sync::mpsc::UnboundedReceiver<String>, Vec<String>);
+    type Reports = (
+        tokio::sync::mpsc::UnboundedReceiver<(String, u64)>,
+        Vec<(String, u64)>,
+    );
 
     fn reports() -> &'static std::sync::Mutex<Reports> {
         static REPORTS: std::sync::OnceLock<std::sync::Mutex<Reports>> = std::sync::OnceLock::new();
@@ -4066,16 +4095,21 @@ mod recycle_tests {
         })
     }
 
-    /// Take the reports that named `cell`, keeping other tests' reports.
-    fn reported(cell: &str) -> usize {
+    /// Take the reports that named `cell`, keeping other tests' reports, and
+    /// answer the instances they named.
+    fn reported(cell: &str) -> Vec<u64> {
         let mut guard = reports().lock().unwrap();
         let (rx, held) = &mut *guard;
         while let Ok(reported) = rx.try_recv() {
             held.push(reported);
         }
-        let before = held.len();
-        held.retain(|reported| reported != cell);
-        before - held.len()
+        let taken = held
+            .iter()
+            .filter(|(reported, _)| reported == cell)
+            .map(|(_, instance)| *instance)
+            .collect();
+        held.retain(|(reported, _)| reported != cell);
+        taken
     }
 
     fn limit_pages(scope: &str, pages: i64) {
@@ -4130,15 +4164,29 @@ mod recycle_tests {
         let scope = "full-cell";
         let path = open_in(&dir, "cell.sqlite", scope);
         put_serialized(scope, "kept", b"acknowledged").unwrap();
-        assert_eq!(reported(scope), 0);
+        assert!(reported(scope).is_empty());
+        let instance = instance_token(scope).expect("an open root has an instance");
 
         fill_until_full(scope);
-        assert_eq!(reported(scope), 1, "the actor was not told exactly once");
+        assert_eq!(
+            reported(scope),
+            vec![instance],
+            "the actor was not told once"
+        );
         assert!(put_serialized(scope, "late", b"x").is_err());
-        assert_eq!(reported(scope), 0, "a second failure told the actor again");
+        assert!(
+            reported(scope).is_empty(),
+            "a second failure told the actor again"
+        );
 
         close(scope);
+        assert_eq!(instance_token(scope), None);
         open(scope, &path).unwrap();
+        assert_ne!(
+            instance_token(scope),
+            Some(instance),
+            "a restart kept the instance a stale report names"
+        );
         assert!(sql_critical_error(scope).is_none());
         put_serialized(scope, "after", b"fresh").unwrap();
         assert!(get_stored(scope, "lost-0").unwrap().is_none());
@@ -4170,8 +4218,12 @@ mod recycle_tests {
         open_embedded(facet, &parent, "child", &facet_path, false).unwrap();
 
         fill_until_full(facet);
-        assert_eq!(reported(facet), 0, "the report named the facet");
-        assert_eq!(reported(root), 1, "the root cell was not reported once");
+        assert!(reported(facet).is_empty(), "the report named the facet");
+        assert_eq!(
+            reported(root),
+            vec![instance_token(root).unwrap()],
+            "the root cell was not reported once"
+        );
         close(facet);
         close(root);
     }
