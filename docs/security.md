@@ -134,6 +134,20 @@ The token is the second barrier there. Under `CELLD_EGRESS=open`, which `celld
 dev` uses by default, a Worker can dial the node's own addresses, and the token
 is the only barrier.
 
+## Keep the secrets key
+
+Worker secrets are encrypted under one key that the bucket never holds; see
+[Secrets](services/workers.md#secrets). The key is 32 random bytes in base64, in
+`CELLD_SECRETS_KEY` or in the file `CELLD_SECRETS_KEY_FILE` names. Give every
+node and every `celld secret put` the same key, and keep it in your secret
+manager: a lost key cannot be recovered, and the values must be put again.
+
+A node reads and parses the key once per process and clears its copy of the
+decoded bytes and of the file text from memory when it is done with them; the
+key stays in memory while the node runs. A key file may be a symbolic link,
+because a mounted secret is one. celld reads at most 4 KiB from it, and logs a
+warning, without refusing, when other users can read it.
+
 ## Limit Worker egress
 
 A Worker's `fetch()` and sockets start on the node, so without a limit they

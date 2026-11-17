@@ -28,6 +28,7 @@ An unsupported feature that does not cause an error is a defect.
 | [D1](services/d1.md) | **Yes** |
 | [Workflows](services/workflows.md) | **Yes** |
 | [R2](services/r2.md) | **Yes** |
+| [Worker secrets](services/workers.md#secrets) | **Partial** — `celld secret` stores them encrypted under a secrets key; no key rotation yet, and a change reaches a node at its next deployment load |
 | Workers AI | **No** |
 | Vectorize | **No** |
 | Hyperdrive | **No** |
@@ -95,6 +96,8 @@ An unsupported feature that does not cause an error is a defect.
 ### [Bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/)
 
 Only the binding types in the [services table](#services) are available.
+A secret is a string binding like a `vars` entry; `celld dev` reads it from
+`.dev.vars` and a fleet reads it from `celld secret`.
 
 ### [Context](https://developers.cloudflare.com/workers/runtime-apis/context/)
 

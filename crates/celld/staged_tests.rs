@@ -595,3 +595,42 @@ async fn a_cron_only_redeploy_updates_the_schedule_and_keeps_the_first_tag() {
     assert_eq!(before.tag, after.tag);
     assert_eq!(before.timestamp, after.timestamp);
 }
+
+#[tokio::test]
+async fn activation_refuses_a_version_whose_binding_a_secret_now_uses() {
+    let fleet = fleet();
+    deploy(&fleet, "back", "v1", &[], true).await;
+    deploy(&fleet, "front", "v1", &[("API_TOKEN", "back")], true).await;
+    deploy(&fleet, "front", "v2", &[], true).await;
+    // The secret name is free in the deployment that serves, so `put` accepts it.
+    let key = crate::secrets::SecretsKey::parse(&base64_key()).unwrap();
+    crate::secrets::put(
+        &fleet.bucket,
+        &key,
+        "front",
+        "API_TOKEN",
+        "value",
+        &std::collections::BTreeSet::new(),
+    )
+    .await
+    .unwrap();
+    let (before, token_before) = fleet_pointer(&fleet).await;
+
+    // Rolling back to the version that binds the name would shadow the secret.
+    let error = activate(&fleet.bucket, &[target("front", "v1")], None)
+        .await
+        .expect_err("the rollback clashes with the secret");
+    assert!(
+        format!("{error:#}").contains("secret API_TOKEN"),
+        "{error:#}"
+    );
+    let (after, token_after) = fleet_pointer(&fleet).await;
+    assert_eq!(token_before, token_after, "the fleet pointer moved");
+    assert_eq!(before.version, after.version);
+    assert_eq!(named_pointer(&fleet, "front").await.version, "v2");
+}
+
+fn base64_key() -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode([5u8; 32])
+}

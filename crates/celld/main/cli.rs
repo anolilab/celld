@@ -44,6 +44,7 @@ pub(crate) enum Action {
     D1(Vec<String>),
     Kv(Vec<String>),
     Queue(Vec<String>),
+    Secret(Vec<String>),
     R2(Vec<String>),
     Connect(Vec<String>),
     Credentials(Vec<String>),
@@ -83,6 +84,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             "d1" => return Ok(Action::D1(arguments)),
             "kv" => return Ok(Action::Kv(arguments)),
             "queue" => return Ok(Action::Queue(arguments)),
+            "secret" => return Ok(Action::Secret(arguments)),
             "r2" => return Ok(Action::R2(arguments)),
             "connect" => return Ok(Action::Connect(arguments)),
             "credentials" => return Ok(Action::Credentials(arguments)),
@@ -285,6 +287,7 @@ USAGE:
   celld d1 execute DATABASE --batch --json [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] < statements.json
   celld kv get|put|delete|list|info NAMESPACE --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld queue info|peek|purge|pause|resume|redrive QUEUE --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  celld secret put|list|delete [NAME] [--script SCRIPT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld r2 get|head|put|delete|list BUCKET [KEY] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld diagnose --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS] [--peer NODE_ID]...
 
@@ -363,6 +366,12 @@ TUNING:
                                   other users (default: operator-token in the
                                   celld config directory; celld dev keeps its
                                   node's in .celld/dev)
+  CELLD_SECRETS_KEY               Key for Worker secrets: 32 bytes in base64.
+                                  A node decrypts a deployment's secrets with
+                                  it; `celld secret put` encrypts with it. Same
+                                  value on every node
+  CELLD_SECRETS_KEY_FILE          File that holds the secrets key, in place of
+                                  CELLD_SECRETS_KEY (a symbolic link is fine)
   CELLD_TTL_MS                    Node lease lifetime (default: 10000)
   CELLD_OPERATION_DEADLINE_MS     Non-restore operation deadline (default: 15000)
   CELLD_SHUTDOWN_TOTAL_MS         Complete process stop bound (default: {shutdown_total_ms})

@@ -34,6 +34,7 @@ mod e2e {
     pub mod rpc_streams;
     pub mod runtime_pool;
     pub mod scoping;
+    pub mod secrets;
     pub mod sockets;
     pub mod version;
     pub mod version_metadata;

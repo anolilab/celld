@@ -112,6 +112,7 @@ pkcs8 = { version = "0.11", features = ["std", "pkcs5", "encryption"] }
 # StaticSecret that a stored key needs; the ephemeral default cannot be
 # serialized. The feature follows deno's ext/node_crypto.
 x25519-dalek = { version = "3", features = ["static_secrets"] }
+zeroize = "1.9"
 # DSA, for reading legacy keys. Signing with DSA is not offered; the suite
 # only parses these. `hazmat` exposes `SigningKey`, which reading one needs.
 dsa = { version = "0.7", features = ["hazmat"] }

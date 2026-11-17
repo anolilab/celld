@@ -78,6 +78,64 @@ the build that produced the running version. The values are fixed when the
 deployment loads, so reading them costs nothing per request. A
 `wrangler.toml` is not supported, so the declaration is JSON or JSONC.
 
+## Secrets
+
+A secret is a string binding that a Worker reads as `env.NAME`, and that no
+config file or log holds.
+
+- In `celld dev`, put the secret in `.dev.vars` (see
+  [Develop an application locally](../README.md#develop-an-application-locally)).
+- In production, use `celld secret`. `celld deploy` never reads `.dev.vars`.
+
+```sh
+export CELLD_SECRETS_KEY="$(openssl rand -base64 32)"   # once, for the fleet
+printf %s "$STRIPE_KEY" | celld secret put STRIPE_KEY --script billing --bucket s3://my-cells-bucket
+celld secret list --script billing --bucket s3://my-cells-bucket
+celld secret delete STRIPE_KEY --script billing --bucket s3://my-cells-bucket
+```
+
+`--script` defaults to the `name` of the Wrangler config in the working
+directory. The value comes from standard input, never from an argument, without
+its final line break. It is at most 5 KiB. `list` prints names only.
+
+`celld secret put` encrypts the value with AES-256-GCM under the secrets key
+before it leaves the command. Give every node and every `celld secret put` the
+same key; see [Keep the secrets key](../security.md#keep-the-secrets-key). A
+`put` under a key other than the one that sealed the script's existing secrets
+is refused.
+
+The encrypted values of a script are one object, `deploy/<script>/secrets.json`.
+Each value has its own random nonce and carries the id of its key. The
+encryption binds a value to its script and name, so a value copied under another
+name or into another script does not open. Two operators who put different names
+at the same time both keep their entries.
+
+A script holds at most 128 secrets, and the encoded object is at most 64 KiB, so
+a node's read and decrypt at each load stays small. `celld secret put` refuses
+the entry that would pass either limit, and a node refuses to load an object
+over either; delete secrets to get back under them. Replacing an existing secret
+is always allowed while the object stays under 64 KiB. Because each sealed
+value is about a third larger than its text, the size limit is reached first
+when values are long.
+
+A node reads the object when it loads a deployment, decrypts it once, and adds
+each secret to `env` as a string. That is one bucket request per deployment
+load and nothing per request. A node whose script has secrets and that has no
+key does not load the deployment and says why; a node that already serves keeps
+serving. A secret changes on a node at its next load of the deployment: a
+deploy, `POST /reload`, or a restart, and not on the poll.
+
+A secret cannot have the name of a variable or binding of the Worker, or be
+named `__proto__`. `celld secret put` refuses a name that the deployment the
+fleet serves uses; it does not look at staged or retained versions.
+`celld deploy` and `celld activate` refuse a version whose bindings use the
+name of a stored secret, so a rollback to an older version cannot shadow a
+secret. A secret's value does not appear in a log, in `/state`, in an error
+message, or in the output of `celld deploy`.
+
+Key rotation is not part of this release. To change the key, delete the
+script's secrets, give the new key to every node, and put them again.
+
 ## Differences from Cloudflare
 
 - celld does not manage a custom domain or terminate TLS.

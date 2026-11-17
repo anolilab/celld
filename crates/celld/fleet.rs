@@ -936,7 +936,17 @@ async fn load_worker_at_pointer(
         .find_map(|binding| binding.get("name")?.as_str())
         .map(|binding| manifest.version_metadata(binding));
     let services = service_bindings(&manifest);
-    let vars = worker_vars(&manifest);
+    let mut vars = worker_vars(&manifest);
+    // Secrets are decrypted here, once per deployment load, and join the vars
+    // as string bindings: one bucket read, nothing per request.
+    vars.extend(
+        crate::secrets::load(
+            bucket,
+            &manifest,
+            crate::secrets::SecretsKey::from_environment,
+        )
+        .await?,
+    );
     let compat = crate::worker_compat(&manifest.raw_metadata);
     let assets = match &manifest.assets {
         Some(reference) => Some(

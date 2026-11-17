@@ -297,6 +297,9 @@ pub fn validate() -> anyhow::Result<()> {
     // The variable alone: a damaged token file must not stop `--version`,
     // `deploy` or any command that never reads it.
     crate::operator_token::OperatorToken::from_variable()?;
+    // A malformed secrets key stops the node now, not at its first deployment
+    // load. The file is read at load, like the operator token file above.
+    crate::secrets::SecretsKey::from_variable()?;
     crate::egress_filter::from_env()?;
     crate::tls_roots::extra()?;
     crate::container::FenceNodeNetns::from_env()?;
