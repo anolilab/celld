@@ -4085,6 +4085,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         .filter(|name| !name.is_empty())
                         .map(str::to_string)
                         .collect(),
+                    version_metadata: None,
                     assets: None,
                     services: Vec::new(),
                     crons,

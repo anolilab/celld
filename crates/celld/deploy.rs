@@ -58,6 +58,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "workflows",
     "r2_buckets",
     "worker_loaders",
+    "version_metadata",
     "containers",
     "no_bundle",
     "define",
@@ -216,6 +217,10 @@ pub struct Options {
     /// Where to write the entry's source map, with `sources` relative to the
     /// project. The map stays out of the deployment.
     pub sourcemap: Option<PathBuf>,
+    /// A label for the deployment, which a `version_metadata` binding reports
+    /// as `tag`. It is not part of the version: the same bundle with another
+    /// tag keeps its id.
+    pub tag: Option<String>,
 }
 
 /// Local Worker variables, tagged with the kind of file that supplied them.
@@ -241,7 +246,7 @@ pub fn print_help() {
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --sourcemap PATH       Write the entry's source map to PATH, with its sources\n                         relative to the project. The deployed module does not\n                         change. With `no_bundle`, the map is the file the\n                         entry's own build wrote beside it, <entry>.map\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate the version but select nothing; the\n                         fleet keeps serving what it serves. `celld activate`\n                         selects the version later and `celld discard` removes it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
+OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --sourcemap PATH       Write the entry's source map to PATH, with its sources\n                         relative to the project. The deployed module does not\n                         change. With `no_bundle`, the map is the file the\n                         entry's own build wrote beside it, <entry>.map\n  --tag TAG              Label the deployment; a `version_metadata` binding\n                         reports it as `tag`. It does not change the version\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate the version but select nothing; the\n                         fleet keeps serving what it serves. `celld activate`\n                         selects the version later and `celld discard` removes it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain, from Google\n\
 Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
 account key, managed identity, or workload identity for an az:// bucket.\n\n\
@@ -272,6 +277,7 @@ pub fn options_from_arguments(
         json: false,
         vars: VarOverrides::None,
         sourcemap: None,
+        tag: None,
     };
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -299,6 +305,9 @@ pub fn options_from_arguments(
                 options.sourcemap = Some(PathBuf::from(
                     arguments.next().context("--sourcemap requires a value")?,
                 ));
+            }
+            "--tag" => {
+                options.tag = Some(arguments.next().context("--tag requires a value")?);
             }
             other if other.starts_with('-') => {
                 bail!("unknown argument for `celld deploy`: {other}")
@@ -759,6 +768,11 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         // Each capability the manifest depends on is named here, so a node
         // that predates it rejects the deployment up front instead of
         // partially deserializing the manifest and failing at worker load.
+        tag: options.tag.clone(),
+        created_at: Some(
+            chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        ),
         required_features: {
             let mut features = Vec::new();
             if built_assets.is_some() {
@@ -2080,6 +2094,32 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             "name": binding,
         }));
     }
+    // `version_metadata` names one env binding that reports the deployment's
+    // id, tag and creation time. The values come from the manifest at load
+    // time; the config carries only the name.
+    let mut declared_version_metadata = false;
+    match object.get("version_metadata") {
+        None => {}
+        Some(Value::Object(metadata)) => {
+            if let Some(key) = metadata.keys().find(|key| key.as_str() != "binding") {
+                bail!("`version_metadata` sets `{key}`, which is not a supported option");
+            }
+            let binding = match metadata.get("binding") {
+                None => bail!("`version_metadata` has no `binding` name"),
+                Some(Value::String(binding)) => binding.as_str(),
+                Some(_) => bail!("`version_metadata` `binding` must be a string"),
+            };
+            if !valid_binding(binding) {
+                bail!("invalid version_metadata binding name: {binding:?}");
+            }
+            declared_version_metadata = true;
+            bindings.push(json!({
+                "type": "version_metadata",
+                "name": binding,
+            }));
+        }
+        Some(_) => bail!("config `version_metadata` must be an object with a `binding` name"),
+    }
     let mut vars = BTreeMap::new();
     match object.get("vars") {
         None => {}
@@ -2144,6 +2184,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             || !sqlite_classes.is_empty()
             || service_count > 0
             || declared_vars
+            || declared_version_metadata
             || !r2_binding_names.is_empty()
             || !worker_loaders.is_empty())
     {
@@ -3431,5 +3472,70 @@ mod container_image_tests {
         ] {
             assert!(read(value.clone()).is_err(), "{value}");
         }
+    }
+}
+
+#[cfg(test)]
+mod version_metadata_config_tests {
+    use super::*;
+
+    fn read(config: &str) -> anyhow::Result<Project> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
+        let path = dir.path().join("wrangler.jsonc");
+        std::fs::write(&path, config).unwrap();
+        read_project(&path, dir.path(), &VarOverrides::None)
+    }
+
+    fn base(extra: &str) -> String {
+        format!(r#"{{ "name": "app", "main": "index.js", "no_bundle": true, {extra} }}"#)
+    }
+
+    #[test]
+    fn the_binding_becomes_a_version_metadata_entry() {
+        let project = read(&base(
+            r#""version_metadata": { "binding": "CF_VERSION_METADATA" }"#,
+        ))
+        .unwrap();
+        assert!(project.metadata["bindings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({ "type": "version_metadata", "name": "CF_VERSION_METADATA" })));
+    }
+
+    #[test]
+    fn jsonc_comments_and_trailing_commas_are_accepted() {
+        let project = read(
+            r#"{
+              // the running build
+              "name": "app", "main": "index.js", "no_bundle": true,
+              "version_metadata": { "binding": "META", },
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(project.metadata["bindings"][0]["name"], "META");
+    }
+
+    #[test]
+    fn a_malformed_declaration_is_refused() {
+        for extra in [
+            r#""version_metadata": "META""#,
+            r#""version_metadata": {}"#,
+            r#""version_metadata": { "binding": 1 }"#,
+            r#""version_metadata": { "binding": "not valid" }"#,
+            r#""version_metadata": { "binding": "META", "id": "x" }"#,
+        ] {
+            assert!(read(&base(extra)).is_err(), "{extra}");
+        }
+    }
+
+    #[test]
+    fn the_name_must_be_unique_among_bindings() {
+        let error = read(&base(
+            r#""vars": { "META": "x" }, "version_metadata": { "binding": "META" }"#,
+        ))
+        .err()
+        .expect("a clash is refused");
+        assert!(error.to_string().contains("META"), "{error}");
     }
 }

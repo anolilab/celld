@@ -53,6 +53,8 @@ fn built(script: &str, version: &str, services: &[(&str, &str)]) -> Built {
         containers: Vec::new(),
         fence_image: None,
         required_features: Vec::new(),
+        tag: None,
+        created_at: None,
         raw_metadata: serde_json::json!({ "bindings": bindings }),
     };
     Built {

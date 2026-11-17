@@ -77,7 +77,12 @@ An unsupported feature that does not cause an error is a defect.
 
 ### [Bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/)
 
-Only the binding types in the [services table](#services) are available.
+Only the binding types in the [services table](#services) are available, and
+the [version metadata](services/workers.md#version-metadata) binding.
+
+| binding | status |
+| --- | --- |
+| `version_metadata` | **Yes** — `id`, `tag` and `timestamp` of the deployment |
 
 ### [Context](https://developers.cloudflare.com/workers/runtime-apis/context/)
 
@@ -257,7 +262,7 @@ The accepted top-level keys:
 - `assets`, `services`, `triggers`, and `vars`
 - `d1_databases`, `kv_namespaces`, `queues`, `workflows`, and
   `r2_buckets`
-- `worker_loaders` and `containers`
+- `worker_loaders`, `version_metadata`, and `containers`
 - `define` and `rules`
 
 Any other top-level key, including `routes`, stops the deployment.

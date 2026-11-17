@@ -32,5 +32,6 @@ mod e2e {
     pub mod scoping;
     pub mod sockets;
     pub mod version;
+    pub mod version_metadata;
     pub mod webcrypto;
 }

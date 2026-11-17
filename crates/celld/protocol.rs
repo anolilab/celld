@@ -50,8 +50,38 @@ pub struct Manifest {
     pub fence_image: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_features: Vec<String>,
+    /// The label `celld deploy --tag` gave this deployment. Like `created_at`
+    /// it is not an input of `version`: the same bundle with another tag is
+    /// the same version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// When `celld deploy` built this deployment, as an ISO-8601 UTC string.
+    /// Not an input of `version`. Absent from a manifest an older celld wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
     /// wrangler's raw metadata, retained verbatim for anything we don't yet model.
     pub raw_metadata: serde_json::Value,
+}
+
+/// The `version_metadata` binding's `id`: a UUID-shaped string that is a pure
+/// function of the deployment `version`, so every node serving the same
+/// bundle and config reports the same one and any change reports another.
+pub fn version_metadata_id(version: &str) -> String {
+    let digest = Sha256::digest(format!("celld:version_metadata:{version}"));
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // Name-based UUID (version 5) markers, so a validator that checks them passes.
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = crate::control_plane::hex(&bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
 }
 
 fn legacy_manifest_schema_version() -> u32 {

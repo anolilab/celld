@@ -297,6 +297,17 @@ pub struct QueueBinding {
     pub delivery_delay: u32,
 }
 
+/// The `version_metadata` binding of a deployment: the `env` name and the
+/// values it reports. They are fixed for the deployment, so the binding is one
+/// frozen object and costs nothing per request.
+#[derive(Clone, Debug)]
+pub struct VersionMetadata {
+    pub binding: String,
+    pub id: String,
+    pub tag: String,
+    pub timestamp: String,
+}
+
 pub struct WorkerConfigOptions {
     pub src: String,
     pub script_name: String,

@@ -40,6 +40,31 @@ workerd, so a main module that exports a string or a number fails to start.
 celld runs many requests in one isolate and retires isolates at any time, so
 a Worker must keep its state in a binding, not in module scope.
 
+## Version metadata
+
+A `version_metadata` entry in `wrangler.jsonc` names a binding that describes
+the deployment the Worker runs under:
+
+```jsonc
+{ "version_metadata": { "binding": "CF_VERSION_METADATA" } }
+```
+
+`env.CF_VERSION_METADATA` is a frozen object with three strings:
+
+- `id` is a UUID-shaped string derived from the deployment's version, the hash
+  of the bundle and the configuration. Every node that serves the same bundle
+  and configuration reports the same `id`, and any change reports a new one.
+- `tag` is the label given with `celld deploy --tag`, or `""` when there is
+  none. The tag is not part of the version, so the same bundle with another tag
+  keeps its `id`.
+- `timestamp` is the ISO-8601 UTC time at which `celld deploy` built the
+  deployment. It is not part of the version either.
+
+`celld dev` fills the binding too: `tag` is `""`, and `timestamp` is the time of
+the build that produced the running version. The values are fixed when the
+deployment loads, so reading them costs nothing per request. A
+`wrangler.toml` is not supported, so the declaration is JSON or JSONC.
+
 ## Differences from Cloudflare
 
 - celld does not manage a custom domain or terminate TLS.
