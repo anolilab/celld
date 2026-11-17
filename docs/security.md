@@ -70,9 +70,16 @@ setting that turns it off. A node takes the token from `CELLD_OPERATOR_TOKEN`:
   `CELLD_OPERATOR_TOKEN_FILE`. A later start reuses the file. celld refuses a
   token file that is a symbolic link, that another user owns, or that other
   users can read. celld creates its own directories (the configuration
-  directory and `.celld/dev`) with mode 0700 and tightens one of them that group
-  or other users can write to. It refuses any other directory they can write
-  to, and one that another user owns, and leaves it unchanged.
+  directory and `.celld/dev`) with mode 0700 and tightens the configuration
+  directory when group or other users can write to it. `celld dev` and
+  `celld d1 --local` refuse a directory that is not private. `celld dev` first
+  sets mode 0700 on a `.celld` or `.celld/dev` of its own in the project (a
+  real directory, never through a link) that
+  group or others can write to, and refuses it only if it stays loose (a
+  filesystem that keeps no modes, such as a Windows drive under WSL: use
+  `--state-dir` on another one). A `--state-dir` directory is never tightened,
+  only checked. `celld d1 --local` sends a credential, so it never tightens: it
+  refuses a loose one, and any directory that another user owns.
 - With it unset and the internal listener bound to, or the node advertising,
   any other address, the node refuses to start. A generated file cannot reach
   the other machines, so a fleet needs one shared value.
@@ -81,8 +88,10 @@ setting that turns it off. A node takes the token from `CELLD_OPERATOR_TOKEN`:
   as different users or with different `CELLD_CONFIG_DIR` values must set
   `CELLD_OPERATOR_TOKEN`, or their calls to each other are refused.
 - `celld dev` is the exception to the file's location: it keeps its node's
-  file in `.celld/dev` and sets `CELLD_OPERATOR_TOKEN_FILE` for the node. Only
-  `celld dev` itself reads that file.
+  file in `.celld/dev` and sets `CELLD_OPERATOR_TOKEN_FILE` for the node. Its
+  node never takes `CELLD_OPERATOR_TOKEN`, so a token the shell holds for a
+  fleet does not become the development token. `celld dev` and
+  `celld d1 --local` read that file.
 
 The check runs before routing, so each route answers 401 without the token:
 the operator routes, the peer routes, the `/runtime/<SCOPE>` route, and a

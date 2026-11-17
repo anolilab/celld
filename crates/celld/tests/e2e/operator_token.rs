@@ -269,6 +269,22 @@ fn a_damaged_token_file_stops_only_the_commands_that_need_it() {
     }
 }
 
+#[tokio::test]
+async fn dev_keeps_its_own_token_whatever_its_environment_holds() {
+    // A fleet's token in the shell must not become the token of the node: the
+    // node's token is the file in its state directory.
+    let server = Server::start_with_ambient_token("do-ids", TOKEN).await;
+    let ambient = client()
+        .get(server.internal_url("/state").await)
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ambient.status().as_u16(), 401);
+    let own = server.internal_get("/state").await.send().await.unwrap();
+    assert_eq!(own.status().as_u16(), 200);
+}
+
 #[test]
 fn an_unusable_token_stops_startup() {
     for bad in ["", " tok", "tok ", "to ken"] {

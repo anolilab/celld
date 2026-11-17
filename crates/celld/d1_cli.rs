@@ -111,24 +111,59 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             )
         })?;
     let scope = crate::js::d1_cell_scope(&declaration.database_identity);
-    let storage = command.fleet.clone().resolve("celld d1")?;
-    let database = Reachable::open(
-        Fleet {
-            bucket: &storage.bucket,
-            endpoint: storage.endpoint.as_deref(),
-            region: &storage.region,
-            unsafe_public_advertise: command.unsafe_public_advertise,
-        },
-        Subject {
-            noun: "database",
-            source: "d1",
-            // A migration on a large table is not a diagnostic ping.
-            timeout: std::time::Duration::from_secs(120),
-        },
-        scope,
-        None,
-    )
-    .await?;
+    let subject = Subject {
+        noun: "database",
+        source: "d1",
+        // A migration on a large table is not a diagnostic ping.
+        timeout: std::time::Duration::from_secs(120),
+    };
+    let database = if command.local {
+        // The node `celld dev` runs for this project: its store holds the
+        // fleet secret and its lease, and its token file the operator token.
+        // Only the dev token file is read, never `CELLD_OPERATOR_TOKEN`, so a
+        // production token cannot go to the dev target, and only a loopback
+        // lease is used, so a planted lease cannot send the request elsewhere.
+        let (store, token) =
+            crate::dev::local_node_files(&project.root, command.state_dir.clone())?;
+        let state = store.parent().unwrap_or(&store).display().to_string();
+        let not_running = |why: &dyn std::fmt::Display| {
+            anyhow!(
+                "no running `celld dev` node for this project (local state in {state}): {why}\n\
+                 start `celld dev` for this project first"
+            )
+        };
+        let token = crate::operator_token::OperatorToken::from_file(&token)?
+            .ok_or_else(|| not_running(&"the node's token file is missing"))?;
+        let bucket = crate::dev::open_local_bucket(&store)?;
+        let auth = crate::peer_auth::load_existing(&bucket)
+            .await
+            .map_err(|error| not_running(&format!("{error:#}")))?;
+        let auth = crate::peer_auth::PeerAuth::new(auth, "d1")?.with_operator_token(Some(token));
+        Reachable::open_at(
+            &bucket,
+            crate::operator_cell::Addresses::Loopback,
+            subject,
+            format!("/runtime/{scope}"),
+            Some(auth),
+        )
+        .await
+        .map_err(|error| not_running(&format!("{error:#}")))?
+        .when_unreachable(not_running(&"the node does not answer").to_string())
+    } else {
+        let storage = command.fleet.clone().resolve("celld d1")?;
+        Reachable::open(
+            Fleet {
+                bucket: &storage.bucket,
+                endpoint: storage.endpoint.as_deref(),
+                region: &storage.region,
+                unsafe_public_advertise: command.unsafe_public_advertise,
+            },
+            subject,
+            scope,
+            None,
+        )
+        .await?
+    };
 
     let mut out = Output::new(if command.json {
         Format::Json
@@ -549,6 +584,9 @@ struct Command {
     database: String,
     project: Option<PathBuf>,
     fleet: FleetFlags,
+    /// Reach the node `celld dev` runs for the project, not a fleet.
+    local: bool,
+    state_dir: Option<PathBuf>,
     json: bool,
     unsafe_public_advertise: bool,
 }
@@ -592,6 +630,8 @@ impl Command {
         let mut fleet = FleetFlags::default();
         let mut json = false;
         let mut batch = false;
+        let mut local = false;
+        let mut state_dir = None;
         let mut unsafe_public_advertise = false;
         let mut tables: Vec<String> = Vec::new();
         let mut no_schema = false;
@@ -608,6 +648,8 @@ impl Command {
                 "--file" => file = Some(PathBuf::from(value("--file")?)),
                 "--json" => json = true,
                 "--batch" => batch = true,
+                "--local" => local = true,
+                "--state-dir" => state_dir = Some(PathBuf::from(value("--state-dir")?)),
                 "--table" => tables.push(value("--table")?),
                 "--no-schema" => no_schema = true,
                 "--no-data" => no_data = true,
@@ -627,6 +669,17 @@ impl Command {
                     project = Some(PathBuf::from(other));
                 }
             }
+        }
+        if local && fleet != FleetFlags::default() {
+            bail!("--local reaches the node `celld dev` runs, and takes no --bucket, --endpoint or --region");
+        }
+        if state_dir.is_some() && !local {
+            bail!("--state-dir belongs to --local");
+        }
+        if local && unsafe_public_advertise {
+            bail!(
+                "--local only reaches a node on this host, and takes no --unsafe-public-advertise"
+            );
         }
         if !exporting && (!tables.is_empty() || no_schema || no_data || output.is_some()) {
             bail!("--table, --no-schema, --no-data and --output belong to `celld d1 export`");
@@ -691,7 +744,14 @@ impl Command {
             project,
             // Resolution is deferred to `run`, so the missing-bucket message
             // is the one every command shares.
-            fleet: fleet.with_environment(),
+            // Under --local the bucket variables are not read at all.
+            fleet: if local {
+                fleet
+            } else {
+                fleet.with_environment()
+            },
+            local,
+            state_dir,
             json,
             unsafe_public_advertise,
         }))
@@ -709,6 +769,7 @@ USAGE:
                   [--output PATH] [PROJECT] --bucket NAME
   celld d1 migrations apply DATABASE [PROJECT] --bucket NAME
   celld d1 migrations list  DATABASE [PROJECT] --bucket NAME
+  celld d1 ... DATABASE --local [--state-dir DIR] [PROJECT]
 
 DATABASE is a `database_name` the project declares in `d1_databases`. PROJECT
 is the directory holding wrangler.jsonc, and defaults to the working directory.
@@ -728,6 +789,16 @@ d1_databases entry moves the directory, and `migrations_table` renames the
 bookkeeping table. celld records applied migrations in that table
 (`d1_migrations` by default), the same table and columns
 `wrangler d1 migrations` uses.
+
+`--local` reaches the database of the node `celld dev` runs for PROJECT,
+instead of a fleet's. It reads that node's local state (`--state-dir` or
+`CELLD_DEV_STATE_DIR` if `celld dev` was given one) and needs no bucket. The
+node has to be running, on this host: only a loopback address is used, and the
+operator token comes from that node's token file, not `CELLD_OPERATOR_TOKEN`.
+With `celld dev` stopped, or with a state directory that group or other users can
+write to, the command refuses and names the directory.
+Every subcommand takes it, so
+`celld d1 migrations apply DATABASE --local` migrates the development database.
 
 `execute` prints a table, and every message goes to stderr, so its stdout
 carries only result rows. Pass --json for one JSON object per row.
@@ -764,6 +835,8 @@ OPTIONS:
   --no-data           With `export`: the schema only
   --output PATH       With `export`: write the SQL to a file, not to stdout
 {FLEET_HELP}
+  --local             Use the node `celld dev` runs for PROJECT; takes no bucket
+  --state-dir DIR     With --local: the state directory given to `celld dev`
   --unsafe-public-advertise
                       Permit a node whose advertised address is a public IP
   -h, --help          Show this help"#

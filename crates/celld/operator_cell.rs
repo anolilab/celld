@@ -43,6 +43,42 @@ pub(crate) struct Fleet<'a> {
     pub(crate) unsafe_public_advertise: bool,
 }
 
+/// Which node addresses a client may send signed requests to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Addresses {
+    /// Private and overlay addresses; a public one is refused.
+    Private,
+    /// Any address, for an operator who passed `--unsafe-public-advertise`.
+    Public,
+    /// Only this host: a lease read from a local store may have been written
+    /// by someone else, and the request carries credentials.
+    Loopback,
+}
+
+impl Addresses {
+    pub(crate) fn fleet(unsafe_public_advertise: bool) -> Self {
+        if unsafe_public_advertise {
+            Self::Public
+        } else {
+            Self::Private
+        }
+    }
+
+    /// Why a lease's address may not be used, or nothing when it may.
+    fn refusal(self, advertise: &crate::startup::Advertise, addr: &str) -> Option<String> {
+        match self {
+            Self::Loopback if !advertise.is_loopback() => Some(format!(
+                "{addr} is not a loopback address; --local only reaches a node on this host"
+            )),
+            Self::Private if advertise.is_public_ip() => Some(format!(
+                "public advertise address {addr}; use a private overlay or \
+                 --unsafe-public-advertise"
+            )),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) struct Entrance {
     node: String,
     url: String,
@@ -61,6 +97,9 @@ pub(crate) struct Reachable {
     /// even when the cell moves between calls.
     entrances: Vec<Entrance>,
     subject: Subject,
+    /// What to say when no entrance accepts a connection, for a caller that
+    /// knows why (a node it expects on this host that is not running).
+    unreachable: Option<String>,
 }
 
 impl Reachable {
@@ -83,7 +122,14 @@ impl Reachable {
                     .finish(),
             );
         }
-        Self::open_at(&bucket, fleet.unsafe_public_advertise, subject, path, None).await
+        Self::open_at(
+            &bucket,
+            Addresses::fleet(fleet.unsafe_public_advertise),
+            subject,
+            path,
+            None,
+        )
+        .await
     }
 
     /// Reach a route of the internal listener on any live node of the fleet in
@@ -91,12 +137,12 @@ impl Reachable {
     /// environment, for a caller that holds its own.
     pub(crate) async fn open_at(
         bucket: &Bucket,
-        unsafe_public_advertise: bool,
+        addresses: Addresses,
         subject: Subject,
         path: String,
         auth: Option<crate::peer_auth::PeerAuth>,
     ) -> anyhow::Result<Self> {
-        let nodes = live_nodes(bucket, unsafe_public_advertise, subject.source).await?;
+        let nodes = live_nodes(bucket, addresses, subject.source).await?;
         // The same secret and the same source shape `celld diagnose` uses.
         let auth = match auth {
             Some(auth) => auth,
@@ -124,7 +170,15 @@ impl Reachable {
                     path: path.clone(),
                 })
                 .collect(),
+            unreachable: None,
         })
+    }
+
+    /// Answer a connection refused by every entrance with `message` rather
+    /// than the transport error.
+    pub(crate) fn when_unreachable(mut self, message: String) -> Self {
+        self.unreachable = Some(message);
+        self
     }
 
     /// A lease outlives the node that wrote it, and a node that drains keeps
@@ -206,6 +260,14 @@ impl Reachable {
                     refused.push(format!("{url}: {error}"));
                     continue;
                 }
+                Err(error) if error.is_connect() && self.unreachable.is_some() => {
+                    refused.push(format!("{url}: {error}"));
+                    bail!(
+                        "{}{}",
+                        self.unreachable.as_deref().unwrap_or_default(),
+                        report(&refused)
+                    );
+                }
                 Err(error) => {
                     return Err(anyhow::Error::new(error)).with_context(|| {
                         format!(
@@ -243,7 +305,7 @@ impl Reachable {
 
 async fn live_nodes(
     bucket: &Bucket,
-    unsafe_public_advertise: bool,
+    addresses: Addresses,
     source: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let nodes = crate::fleet::node_lease_ids(bucket).await?;
@@ -271,12 +333,8 @@ async fn live_nodes(
                 continue;
             }
         };
-        if advertise.is_public_ip() && !unsafe_public_advertise {
-            refused.push(format!(
-                "{node}: public advertise address {}; use a private overlay or \
-                 --unsafe-public-advertise",
-                lease.addr
-            ));
+        if let Some(why) = addresses.refusal(&advertise, &lease.addr) {
+            refused.push(format!("{node}: {why}"));
             continue;
         }
         reachable.push((node.clone(), lease.addr.clone()));
@@ -325,11 +383,82 @@ mod operator_token_tests {
                 source: "d1-cli",
                 timeout: Duration::from_secs(5),
             },
+            unreachable: None,
         };
         let _ = reachable.call(serde_json::json!({})).await;
         assert_eq!(
             stub.authorizations(),
             vec![Some("Bearer tok-6".to_string())]
+        );
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::Addresses;
+    use crate::startup::parse_advertise;
+
+    fn refused(addresses: Addresses, addr: &str) -> bool {
+        addresses
+            .refusal(&parse_advertise(addr).unwrap(), addr)
+            .is_some()
+    }
+
+    #[test]
+    fn a_local_client_only_reaches_this_host() {
+        for addr in ["127.0.0.1:9001", "[::1]:9001", "localhost:9001"] {
+            assert!(!refused(Addresses::Loopback, addr), "{addr}");
+        }
+        for addr in ["10.0.0.5:9001", "8.8.8.8:9001", "node.internal:9001"] {
+            assert!(refused(Addresses::Loopback, addr), "{addr}");
+        }
+    }
+
+    #[test]
+    fn a_fleet_client_refuses_a_public_address_unless_allowed() {
+        assert!(!refused(Addresses::Private, "10.0.0.5:9001"));
+        assert!(refused(Addresses::Private, "8.8.8.8:9001"));
+        assert!(!refused(Addresses::Public, "8.8.8.8:9001"));
+    }
+}
+
+#[cfg(test)]
+mod unreachable_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_refused_connection_gets_the_callers_message() {
+        // A port nobody listens on: bind, note the port, drop the listener.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let path = "/runtime/scope".to_string();
+        let reachable = Reachable {
+            http: reqwest::Client::new(),
+            auth: crate::peer_auth::PeerAuth::new([6; 32], "d1-cli").unwrap(),
+            entrances: vec![Entrance {
+                node: "node-b".to_string(),
+                url: format!("http://127.0.0.1:{port}{path}"),
+                path,
+            }],
+            subject: Subject {
+                noun: "database",
+                source: "d1-cli",
+                timeout: Duration::from_secs(5),
+            },
+            unreachable: None,
+        }
+        .when_unreachable("start `celld dev` first".to_string());
+        let error = reachable.call(serde_json::json!({})).await.unwrap_err();
+        assert!(
+            error.to_string().starts_with("start `celld dev` first"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(&format!("127.0.0.1:{port}")),
+            "the refused address is named: {error}"
         );
     }
 }

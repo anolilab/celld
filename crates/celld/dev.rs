@@ -52,6 +52,31 @@ pub fn operator_token_path_with(
         .join(crate::operator_token::FILE_NAME))
 }
 
+/// The dev store and the operator token file of the node that `celld dev`
+/// runs for `project` (a canonical directory), for a command that reaches that
+/// node: the same state directory `run` resolves from `state_dir` and
+/// `CELLD_DEV_STATE_DIR`.
+#[allow(clippy::disallowed_methods)] // Local development state is an operator-owned host path.
+pub(crate) fn local_node_files(
+    project: &Path,
+    state_dir: Option<PathBuf>,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let state = DevState::resolve(project, state_dir, std::env::var_os("CELLD_DEV_STATE_DIR"))?;
+    // The same check `celld dev` makes: a state directory reached through a
+    // link, or owned by another user, is refused before anything in it is read.
+    state.ensure_not_redirected("use")?;
+    let database = state.path().join("objects.sqlite3");
+    anyhow::ensure!(
+        database.exists(),
+        "no local state at {}; start `celld dev` for this project first",
+        state.path().display()
+    );
+    Ok((
+        database,
+        state.path().join(crate::operator_token::FILE_NAME),
+    ))
+}
+
 #[derive(Debug)]
 struct Options {
     project: Option<PathBuf>,
@@ -113,11 +138,12 @@ impl DevState {
     }
 
     /// Create `<state directory>/<project hash>` private to the user, so
-    /// nobody else can swap a link into it. Does nothing without a state
-    /// directory.
+    /// nobody else can swap a link into it. Without a state directory, only
+    /// check the project-local state.
     fn prepare_shared_root(&self) -> anyhow::Result<()> {
         match &self.shared_root {
             Some(root) => {
+                self.tighten();
                 // `create_private` follows links and only restricts a path it
                 // creates, so a `DIR/<hash>` that another user planted must be
                 // refused before it is used.
@@ -130,23 +156,79 @@ impl DevState {
                 // and nobody else can create the levels below it.
                 self.ensure_not_redirected("use")
             }
-            None => Ok(()),
+            None => {
+                self.tighten();
+                self.ensure_not_redirected("use")
+            }
         }
     }
 
-    /// Refuse a state directory that is reached through a link or that
-    /// another user owns: `DIR/<hash>`, `.celld` and `.celld/dev`. Missing
-    /// levels are fine, and nothing is checked for a project-local state.
+    /// The directories that make up this state, outermost first.
+    fn levels(&self) -> Vec<PathBuf> {
+        match &self.shared_root {
+            Some(root) => vec![
+                root.clone(),
+                root.join(".celld"),
+                root.join(Self::DIRECTORY),
+            ],
+            None => self
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .into_iter()
+                .chain([self.path.clone()])
+                .collect(),
+        }
+    }
+
+    /// Set mode 0700 on every level that the user owns and others can write
+    /// to, so `celld dev` repairs a directory it created or someone loosened
+    /// instead of refusing it. A filesystem that keeps no modes ignores this,
+    /// and `ensure_not_redirected` then refuses with that hint. Only `celld
+    /// dev` tightens: a command that sends the token never does.
+    #[cfg(unix)]
+    #[allow(clippy::disallowed_methods)] // Local development state is an operator-owned host path.
+    fn tighten(&self) {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        // A shared state directory is only checked, never tightened: another
+        // user who can write next to it could swap a level for a link between
+        // the check and the chmod. celld creates its levels private, so a
+        // loose one there is refused. A project-local level is tightened only
+        // when it is a real directory, never through a link.
+        if self.shared_root.is_some() {
+            return;
+        }
+        for level in self.levels() {
+            // A level that is a link may point at a directory shared with
+            // others; it is checked, never chmod-ed, and refused if loose.
+            if std::fs::symlink_metadata(&level).is_ok_and(|m| m.file_type().is_symlink()) {
+                continue;
+            }
+            let Ok(resolved) = std::fs::metadata(&level) else {
+                continue;
+            };
+            // SAFETY: `geteuid` takes no arguments and cannot fail.
+            if resolved.uid() == unsafe { libc::geteuid() }
+                && resolved.permissions().mode() & 0o022 != 0
+            {
+                let _ = std::fs::set_permissions(&level, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn tighten(&self) {}
+
+    /// Refuse a state directory that is reached through a link, that another
+    /// user owns, or that group or other users can write to: `DIR/<hash>`,
+    /// `.celld` and `.celld/dev`, or the last two for a project-local state.
+    /// Missing levels are fine. Whoever can write there can replace the store
+    /// and the token file, which is what a command that sends the token to the
+    /// node of the store has to rule out. `celld dev` creates every level
+    /// private to the user, so this refuses only a directory someone loosened.
     #[allow(clippy::disallowed_methods)] // Local development state is an operator-owned host path.
     fn ensure_not_redirected(&self, action: &str) -> anyhow::Result<()> {
-        let Some(root) = &self.shared_root else {
-            return Ok(());
-        };
-        for level in [
-            root.clone(),
-            root.join(".celld"),
-            root.join(Self::DIRECTORY),
-        ] {
+        for level in self.levels() {
             let metadata = match std::fs::symlink_metadata(&level) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -154,20 +236,39 @@ impl DevState {
                     return Err(error).with_context(|| format!("inspect {}", level.display()));
                 }
             };
-            anyhow::ensure!(
-                !metadata.file_type().is_symlink(),
-                "refusing to {action} {}: {} is a symbolic link",
-                self.path.display(),
-                level.display()
-            );
+            if self.shared_root.is_some() {
+                anyhow::ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "refusing to {action} {}: {} is a symbolic link",
+                    self.path.display(),
+                    level.display()
+                );
+            }
             #[cfg(unix)]
             {
-                use std::os::unix::fs::MetadataExt as _;
+                use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+                // The owner of what the level points to, so a project that
+                // links `.celld` to a directory it owns is fine and one that
+                // links it to another user's directory is refused.
+                let resolved = std::fs::metadata(&level)
+                    .with_context(|| format!("inspect {}", level.display()))?;
                 // SAFETY: `geteuid` takes no arguments and cannot fail.
                 anyhow::ensure!(
-                    metadata.uid() == unsafe { libc::geteuid() },
+                    resolved.uid() == unsafe { libc::geteuid() },
                     "refusing to {action} {}: {} is owned by another user",
                     self.path.display(),
+                    level.display()
+                );
+                // The mode of what the level points to, so a project that
+                // links `.celld` elsewhere is judged by that directory.
+                let mode = resolved.permissions().mode();
+                anyhow::ensure!(
+                    mode & 0o022 == 0,
+                    "refusing to {action} {}: {} can be written to by other users; \
+                     run `chmod go-w {}`. If the filesystem does not keep permissions \
+                     (a Windows drive under WSL, vfat, CIFS), use --state-dir on one that does",
+                    self.path.display(),
+                    level.display(),
                     level.display()
                 );
             }
@@ -195,6 +296,7 @@ impl DevState {
             "refusing to discard {}, which is not a celld dev state directory",
             self.path.display()
         );
+        self.tighten();
         self.ensure_not_redirected("discard")?;
         match std::fs::remove_dir_all(&self.path) {
             Ok(()) => Ok(true),
@@ -845,6 +947,10 @@ async fn start_node(
         "CELLD_BUCKET",
         "CELLD_CLOUD",
         "CELLD_INTERNAL_ADDR",
+        // The node of `celld dev` keeps its own token in the state directory,
+        // where `celld d1 --local` reads it; a token the shell holds for a
+        // fleet is not this node's and would leave that file missing or stale.
+        crate::operator_token::ENV,
         "CELLD_TEST_BUCKET",
         "CELLD_TRUST_FORWARDED_HEADERS",
         "CELLD_UNSAFE_PUBLIC_ADVERTISE",
@@ -955,8 +1061,8 @@ async fn start_node(
     };
 
     // The node writes its token file before it announces the listener, so the
-    // file is there now.
-    let token = match crate::operator_token::OperatorToken::from_env_or_file(&token_file) {
+    // file is there now. Only the file: the node ignores the variable.
+    let token = match crate::operator_token::OperatorToken::from_file(&token_file) {
         Ok(token) => token,
         Err(error) => {
             stop_child(&mut child, None, None).await;
@@ -1247,6 +1353,91 @@ mod tests {
         std::os::unix::fs::symlink(&victim, shared.join(project_hash(project))).unwrap();
         let error = state.prepare_shared_root().unwrap_err().to_string();
         assert!(error.contains("symbolic link"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // Host paths in a temporary directory.
+    fn a_state_directory_others_can_write_to_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(directory.path()).unwrap();
+        let shared = project.join("shared");
+        for state_dir in [None, Some(shared)] {
+            let state = DevState::resolve(&project, state_dir, None).unwrap();
+            state.prepare_shared_root().unwrap();
+            prepare_state(state.path()).unwrap();
+            state.ensure_not_redirected("use").unwrap();
+            let levels = [state.path().parent().unwrap(), state.path()];
+            for level in levels.into_iter().chain(state.shared_root.as_deref()) {
+                for mode in [0o770, 0o707] {
+                    std::fs::set_permissions(level, std::fs::Permissions::from_mode(mode)).unwrap();
+                    let error = state.ensure_not_redirected("use").unwrap_err().to_string();
+                    assert!(
+                        error.contains("can be written to by other users"),
+                        "{error}"
+                    );
+                }
+                std::fs::set_permissions(level, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // Host paths in a temporary directory.
+    fn celld_dev_tightens_a_loose_state_but_a_command_that_sends_the_token_refuses_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(directory.path()).unwrap();
+        let state = DevState::resolve(&project, None, None).unwrap();
+        std::fs::create_dir_all(state.path()).unwrap();
+        for level in [state.path().parent().unwrap(), state.path()] {
+            std::fs::set_permissions(level, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        std::fs::write(state.path().join("objects.sqlite3"), b"").unwrap();
+        let error = local_node_files(&project, None).unwrap_err().to_string();
+        assert!(
+            error.contains("can be written to by other users"),
+            "{error}"
+        );
+        state.prepare_shared_root().unwrap();
+        state.ensure_not_redirected("use").unwrap();
+        let mode = std::fs::metadata(state.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // `--clean` tightens the same way.
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(state.discard().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // Host paths in a temporary directory.
+    fn a_project_local_state_that_another_user_owns_is_refused() {
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(directory.path()).unwrap();
+        // `/usr` is owned by root and not writable by others, so only the
+        // owner check can refuse it.
+        std::os::unix::fs::symlink("/usr", project.join(".celld")).unwrap();
+        let state = DevState::resolve(&project, None, None).unwrap();
+        let error = state.ensure_not_redirected("use").unwrap_err().to_string();
+        assert!(error.contains("owned by another user"), "{error}");
+
+        // A link to a directory the user owns is still fine.
+        std::fs::remove_file(project.join(".celld")).unwrap();
+        let own = project.join("own");
+        std::fs::create_dir(&own).unwrap();
+        std::fs::set_permissions(&own, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        std::os::unix::fs::symlink(&own, project.join(".celld")).unwrap();
+        state.ensure_not_redirected("use").unwrap();
     }
 
     #[test]

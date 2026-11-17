@@ -208,7 +208,7 @@ pub async fn invoke(
     };
     let reachable = Reachable::open_at(
         bucket,
-        unsafe_public_advertise,
+        crate::operator_cell::Addresses::fleet(unsafe_public_advertise),
         subject,
         crate::invoke::PATH.to_string(),
         Some(auth),

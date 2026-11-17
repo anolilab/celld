@@ -1467,6 +1467,9 @@ async fn cas_pointer(
 /// What `celld d1` needs out of a project: the declared databases, so a name
 /// the project never declared fails here instead of creating an empty one.
 pub struct D1Project {
+    /// The directory holding the config, resolved as `celld dev` resolves it,
+    /// so `--local` finds the same local state.
+    pub root: PathBuf,
     /// One entry per declaration, in config order.
     pub databases: Vec<D1Declaration>,
 }
@@ -1513,7 +1516,15 @@ pub fn read_script_name(given: Option<PathBuf>) -> anyhow::Result<String> {
 /// deployed, and a project that fails to build must still be migratable.
 pub fn read_d1_project(given: Option<PathBuf>) -> anyhow::Result<D1Project> {
     let (path, config) = read_config(given)?;
-    let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    // The config itself is resolved, not only its directory, as `celld dev`
+    // does: the project is where a link points, so its migrations and its
+    // local state are too.
+    let path = std::fs::canonicalize(&path)
+        .with_context(|| format!("resolve Wrangler config {}", path.display()))?;
+    let root = path
+        .parent()
+        .context("the Wrangler config has no project directory")?
+        .to_path_buf();
     let object = config
         .as_object()
         .ok_or_else(|| anyhow!("{} is not a JSON object", path.display()))?;
@@ -1612,7 +1623,10 @@ pub fn read_d1_project(given: Option<PathBuf>) -> anyhow::Result<D1Project> {
         }
         unique.push(declaration);
     }
-    Ok(D1Project { databases: unique })
+    Ok(D1Project {
+        root,
+        databases: unique,
+    })
 }
 
 /// A path may name the config itself or the directory holding it; with no
@@ -3886,5 +3900,32 @@ mod compatibility_config_tests {
         let leap = r#"{ "name": "app", "main": "index.js", "no_bundle": true,
                         "compatibility_date": "2024-02-29" }"#;
         assert!(read("index.js", leap).is_ok());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod d1_project_root_tests {
+    use super::*;
+
+    #[test]
+    fn a_linked_config_has_the_project_root_of_its_target() {
+        let target = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let config = target.path().join("wrangler.jsonc");
+        std::fs::write(
+            &config,
+            r#"{"name": "app", "d1_databases": [{"binding": "DB", "database_name": "ledger"}]}"#,
+        )
+        .unwrap();
+        let link = elsewhere.path().join("wrangler.jsonc");
+        std::os::unix::fs::symlink(&config, &link).unwrap();
+
+        let project = read_d1_project(Some(link)).unwrap();
+        let target = std::fs::canonicalize(target.path()).unwrap();
+        assert_eq!(project.root, target);
+        assert!(project
+            .databases
+            .iter()
+            .all(|d| d.migrations_dir.starts_with(&target)));
     }
 }
