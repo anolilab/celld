@@ -622,6 +622,8 @@ pub struct WsRegistry {
     /// The pull queue of an outbound socket a Worker is returning, taken from
     /// the isolate until the response claims it.
     pub(crate) upstream_handoffs: HashMap<u64, WsPullReceiver>,
+    /// Room towards the connection of each socket that has a connector.
+    rooms: HashMap<u64, Arc<WsRoom>>,
     /// The request that owns a Worker socket (one with no cell scope), keyed
     /// by socket id. Recorded by the host where the isolate opens the socket,
     /// never taken from an argument the script supplies.
@@ -665,6 +667,9 @@ impl WsRegistry {
 
     fn unregister(&mut self, id: u64) -> Option<WsMeta> {
         self.outputs.remove(&id);
+        if let Some(room) = self.rooms.remove(&id) {
+            room.close();
+        }
         self.owners.remove(&id);
         self.grants.remove(&(id, None));
         self.metadata.remove(&id)
@@ -1510,6 +1515,93 @@ fn emit_frames(
 /// barrier release cannot overtake an earlier frame on the same socket.
 pub fn ws_emit_batch(frames: impl Into<WsBatch>) {
     frames.into().release(Ok(()));
+}
+
+/// How many bytes a client may have queued towards one upstream connection.
+///
+/// The connector writes what is emitted to its socket from an unbounded
+/// channel, so a client that sends faster than the upstream reads would grow
+/// that channel without end. The task that reads the client reserves room here
+/// first and waits while the queue is full, which stops reading the client and
+/// lets the client's own connection push back. The connector gives the room
+/// back as it takes each frame off the channel.
+#[derive(Default)]
+pub struct WsRoom {
+    state: std::sync::Mutex<WsRoomState>,
+    freed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct WsRoomState {
+    queued: usize,
+    closed: bool,
+}
+
+/// What a frame is charged against a socket's room.
+pub fn ws_out_bytes(out: &WsOut) -> usize {
+    size_of::<WsOut>()
+        + match out {
+            WsOut::Text(text) => text.len(),
+            WsOut::Binary(bytes) => bytes.len(),
+            WsOut::Close(_, reason) => reason.len(),
+        }
+}
+
+impl WsRoom {
+    /// Wait for room for `bytes`. One frame larger than the cap is admitted
+    /// alone, into an empty queue. False once the connection is gone.
+    pub async fn reserve(&self, bytes: usize) -> bool {
+        loop {
+            let freed = self.freed.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            {
+                let mut state = self.state.lock().unwrap();
+                if state.closed {
+                    return false;
+                }
+                if state.queued == 0 || state.queued + bytes <= WS_PULL_QUEUE_MAX_BYTES {
+                    state.queued += bytes;
+                    return true;
+                }
+            }
+            freed.await;
+        }
+    }
+
+    /// Frames the Worker's own isolate queued were never reserved, so this
+    /// never goes below zero.
+    pub fn release(&self, bytes: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.queued = state.queued.saturating_sub(bytes);
+        drop(state);
+        self.freed.notify_waiters();
+    }
+
+    pub fn queued(&self) -> usize {
+        self.state.lock().unwrap().queued
+    }
+
+    pub fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.freed.notify_waiters();
+    }
+}
+
+/// The room of socket `id`'s connection, created by the connector that owns it.
+pub fn ws_room(id: u64) -> Arc<WsRoom> {
+    ws_registry()
+        .lock()
+        .unwrap()
+        .rooms
+        .entry(id)
+        .or_default()
+        .clone()
+}
+
+/// The room of a connection that is still registered.
+pub fn ws_room_of(id: u64) -> Option<Arc<WsRoom>> {
+    ws_registry().lock().unwrap().rooms.get(&id).cloned()
 }
 
 /// Send a frame to the connection behind socket `id`. False when it has no

@@ -496,6 +496,10 @@ async fn upstream() -> (u16, tokio::sync::mpsc::UnboundedReceiver<Seen>) {
                         tokio::spawn(async move {
                             let mut socket = upgrade.await.expect("upgraded");
                             socket.set_auto_close(false);
+                            if route == "/stall" {
+                                // Never reads: the connection backs up behind it.
+                                std::future::pending::<()>().await;
+                            }
                             if route == "/first" {
                                 socket
                                     .write_frame(Frame::text(Payload::Borrowed(b"from upstream")))
@@ -681,5 +685,33 @@ async fn a_returned_fetch_socket_is_refused_for_a_client_that_did_not_upgrade() 
     assert!(
         matches!(ended, Seen::Ended | Seen::Close(..)),
         "the upstream connection was left open: {ended:?}"
+    );
+}
+
+/// A client that floods a socket whose upstream does not read is held back: the
+/// Worker stops reading it, so its writes stall instead of piling up in the
+/// node's memory. The queue bound itself is covered by the unit test of
+/// `WsRoom`.
+#[tokio::test]
+async fn a_client_flooding_a_returned_fetch_socket_stalls_while_the_upstream_does_not_read() {
+    let server = Server::start("client-streams", &[]).await;
+    let (port, _seen) = upstream().await;
+    let mut socket = client(&server, &format!("/ext?port={port}&to=stall")).await;
+    socket.set_auto_close(false);
+    let chunk = vec![7_u8; 64 * 1024];
+    let mut stalled = false;
+    for _ in 0..2000 {
+        let write = socket.write_frame(Frame::binary(Payload::Borrowed(&chunk)));
+        if tokio::time::timeout(Duration::from_secs(2), write)
+            .await
+            .is_err()
+        {
+            stalled = true;
+            break;
+        }
+    }
+    assert!(
+        stalled,
+        "128 MiB went into a socket whose upstream reads nothing"
     );
 }

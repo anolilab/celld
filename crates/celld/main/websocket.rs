@@ -1020,9 +1020,15 @@ pub(crate) async fn outbound_websocket_task(
         return Ok(());
     }
 
-    let (outbound, mut outputs) = mpsc::unbounded_channel();
+    let (outbound, outputs) = mpsc::unbounded_channel();
     sink.register(id);
     celld::js::ws_register(id, outbound);
+    // The room a returned socket's client reserves before it sends. Frames
+    // are released as they leave the channel.
+    let mut outputs = Accounted {
+        room: celld::js::ws_room(id),
+        frames: outputs,
+    };
     if let Err(error) = sink
         .open(id, protocol.as_deref().unwrap_or_default().to_string())
         .await
@@ -1142,6 +1148,27 @@ trait Outputs {
 impl Outputs for mpsc::UnboundedReceiver<celld::js::WsOut> {
     fn recv(&mut self) -> impl std::future::Future<Output = Option<celld::js::WsOut>> + Send {
         mpsc::UnboundedReceiver::recv(self)
+    }
+}
+
+/// The connector's channel, giving back the room a client reserved for each
+/// frame as the frame leaves the channel.
+struct Accounted {
+    frames: mpsc::UnboundedReceiver<celld::js::WsOut>,
+    room: std::sync::Arc<celld::js::WsRoom>,
+}
+
+impl Outputs for Accounted {
+    async fn recv(&mut self) -> Option<celld::js::WsOut> {
+        let out = self.frames.recv().await?;
+        self.room.release(celld::js::ws_out_bytes(&out));
+        Some(out)
+    }
+}
+
+impl Drop for Accounted {
+    fn drop(&mut self) {
+        self.room.close();
     }
 }
 
@@ -1362,13 +1389,23 @@ async fn upstream_websocket_task<S>(
     let Some(mut frames) = upstream.take_pull() else {
         return;
     };
+    let room = celld::js::ws_room_of(id);
     let (close, writer) = pump_cell_socket(socket, &mut frames, true, move |data| {
         let frame = match data {
             celld::js::WsIn::Text(text) => celld::js::WsOut::Text(text),
             celld::js::WsIn::Binary(bytes) => celld::js::WsOut::Binary(bytes),
         };
-        let sent = celld::js::ws_send(id, frame);
+        let room = room.clone();
         async move {
+            // Waiting here stops the read of the client, whose own connection
+            // then pushes back, while the upstream does not take frames.
+            let sent = match room {
+                Some(room) => {
+                    room.reserve(celld::js::ws_out_bytes(&frame)).await
+                        && celld::js::ws_send(id, frame)
+                }
+                None => false,
+            };
             sent.then_some(())
                 .ok_or_else(|| anyhow::anyhow!("upstream WebSocket closed"))
         }
@@ -2050,5 +2087,40 @@ mod pipe_tests {
             );
             assert_eq!(got, want);
         }
+    }
+
+    /// A client that sends faster than the upstream reads waits for room
+    /// instead of growing the queue, and goes on as the connector drains it.
+    #[tokio::test]
+    async fn a_client_is_held_while_the_upstream_queue_is_full() {
+        let room = std::sync::Arc::new(celld::js::WsRoom::default());
+        let frame = celld::js::WsOut::Binary(vec![0; 64 * 1024]);
+        let size = celld::js::ws_out_bytes(&frame);
+        let mut held = 0;
+        while tokio::time::timeout(Duration::from_millis(100), room.reserve(size))
+            .await
+            .is_ok()
+        {
+            held += 1;
+            assert!(held < 1000, "the room never filled");
+        }
+        assert!(room.queued() <= celld::js::WS_PULL_QUEUE_MAX_BYTES);
+        assert!(held * size + size > celld::js::WS_PULL_QUEUE_MAX_BYTES);
+        let waiting = tokio::spawn({
+            let room = room.clone();
+            async move { room.reserve(size).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+        room.release(size);
+        assert!(waiting.await.unwrap());
+        assert!(room.queued() <= celld::js::WS_PULL_QUEUE_MAX_BYTES);
+        let gone = tokio::spawn({
+            let room = room.clone();
+            async move { room.reserve(size).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        room.close();
+        assert!(!gone.await.unwrap(), "a closed room refuses");
     }
 }
