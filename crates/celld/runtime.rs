@@ -1459,6 +1459,10 @@ impl RuntimeManager {
         // the facet's eviction unlinked.
         crate::js::release_root_facets(cell, epoch, crate::js::RootRelease::Stop).await;
         let Some(replication) = &self.replication else {
+            // Without replication no `stop_root` waits for a clone in flight,
+            // so wait here: a clone still writing would otherwise leave its
+            // target empty or write into a file the next start already uses.
+            self.facets.settled(cell).await;
             self.facets.forget(cell, epoch);
             return Ok(());
         };
