@@ -423,7 +423,10 @@ pub fn ws_output_registered(id: u64) -> bool {
 
 pub fn ws_pull_unregister(id: u64) {
     ws_pull().lock().unwrap().remove(&id);
-    ws_registry().lock().unwrap().pull_retention.remove(&id);
+    let shared = ws_registry();
+    let mut registry = shared.lock().unwrap();
+    registry.pull_retention.remove(&id);
+    registry.pull_owners.remove(&id);
 }
 
 /// Where a handed-off Worker socket's pull queue stands once one of its two
@@ -702,6 +705,10 @@ pub struct WsRegistry {
     parked_workers: HashMap<u64, ParkedWorker>,
     /// Pull queues a handed-off socket left registered for their reader.
     pull_retention: HashMap<u64, PullRetention>,
+    /// The request that opened each socket, kept while its pull queue exists:
+    /// the queue outlives the socket's registration, and whoever takes it over
+    /// must be the request that opened the socket.
+    pub(crate) pull_owners: HashMap<u64, u64>,
 }
 
 /// A parked Worker socket and the frames its Worker sent while nobody held
@@ -734,6 +741,9 @@ impl WsRegistry {
             room.close();
         }
         self.owners.remove(&id);
+        if !ws_pull().lock().unwrap().contains_key(&id) {
+            self.pull_owners.remove(&id);
+        }
         self.grants.remove(&(id, None));
         self.metadata.remove(&id)
     }
@@ -1028,7 +1038,10 @@ pub fn ws_register_outbound(id: u64, scope: &str, facet: Option<FacetSocket>) {
 }
 /// Record the request that owns the Worker socket `id`.
 pub(crate) fn ws_set_owner(id: u64, owner: u64) {
-    ws_registry().lock().unwrap().owners.insert(id, owner);
+    let shared = ws_registry();
+    let mut registry = shared.lock().unwrap();
+    registry.owners.insert(id, owner);
+    registry.pull_owners.insert(id, owner);
 }
 
 /// Record that the response target `id` was handed to `owner`.

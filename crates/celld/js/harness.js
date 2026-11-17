@@ -12148,7 +12148,8 @@ __celld.__readResponse = (r) => {
   const upstream = r.webSocket;
   if (r.status === 101 && upstream && wsTarget === null && workerSocketId === 0 &&
       !upstream._peer && upstream._outbound && upstream._polled &&
-      upstream._boundTarget === null && !upstream._transferred) {
+      upstream._boundTarget === null && !upstream._transferred &&
+      __sockets.get(upstream._id) === upstream) {
     if (!upstream._accepted &&
         upstream.readyState === WebSocket.READY_STATE_CONNECTING &&
         __ws_prepare_upstream_handoff(upstream._id)) {

@@ -93,6 +93,11 @@ fn prepare_worker_websocket_handoff(id: u64, owner: u64) {
     drop(replaced);
 }
 
+/// Whether the Worker request `caller` opened socket `id`.
+fn opened_by(registry: &WsRegistry, caller: &WsCaller, id: u64) -> bool {
+    caller.cell.is_empty() && registry.pull_owners.get(&id) == Some(&caller.owner)
+}
+
 /// Take an outbound socket's pull queue away from the isolate, for a response
 /// that returns the socket. False when the caller does not own the socket or
 /// the isolate already reads it. A connection that already ended still has its
@@ -100,7 +105,9 @@ fn prepare_worker_websocket_handoff(id: u64, owner: u64) {
 fn prepare_upstream_websocket_handoff(caller: &WsCaller, id: u64) -> bool {
     let shared = ws_registry();
     let mut registry = shared.lock().unwrap();
-    if !registry.may_use(caller, id) {
+    // The queue outlives the socket's registration, so the record of who
+    // opened it is the check; no record fails closed.
+    if !opened_by(&registry, caller, id) {
         return false;
     }
     let Some(queue) = ws_pull().lock().unwrap().remove(&id) else {
@@ -131,10 +138,11 @@ pub(super) fn transfer_upstream_websocket_handoff(
 ) -> Option<UpstreamWebSocket> {
     let shared = ws_registry();
     let mut registry = shared.lock().unwrap();
-    if !registry.may_use(caller, id) {
+    if !opened_by(&registry, caller, id) {
         return None;
     }
     let handoff = registry.upstream_handoffs.remove(&id)?;
+    registry.pull_owners.remove(&id);
     // The Worker no longer owns the socket: its own frames would mix with the
     // client's and skip the room, so every op on this id refuses it.
     registry.owners.remove(&id);
@@ -1057,5 +1065,38 @@ pub(super) fn op_ws_auto_response_ts(
     match stamped {
         Some(ms) => rv.set(v8::Number::new(scope, ms).into()),
         None => rv.set(v8::null(scope).into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A queue that outlives its socket's registration is still its opening
+    /// request's alone: another request cannot take it over by id.
+    #[test]
+    fn another_request_cannot_take_the_handoff_of_a_closed_socket() {
+        let id = 9_200_001;
+        let (_inbound, receiver) = ws_pull_channel();
+        ws_pull_register(id, receiver);
+        ws_set_owner(id, 41);
+        ws_register_outbound(id, "", None);
+        // The connection ended: nothing but the queue is left.
+        ws_unregister(id);
+        let other = WsCaller {
+            cell: String::new(),
+            owner: 42,
+        };
+        let opener = WsCaller {
+            cell: String::new(),
+            owner: 41,
+        };
+        assert!(!prepare_upstream_websocket_handoff(&other, id));
+        assert!(ws_pull_registered(id), "the refused request took the queue");
+        assert!(transfer_upstream_websocket_handoff(&other, id).is_none());
+        assert!(prepare_upstream_websocket_handoff(&opener, id));
+        assert!(transfer_upstream_websocket_handoff(&other, id).is_none());
+        ws_pull_unregister(id);
+        ws_registry().lock().unwrap().upstream_handoffs.remove(&id);
     }
 }
