@@ -2907,6 +2907,17 @@ async fn handle_internal(
         "/peer/handoff" => internal_handoff(request, app).await,
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),
+        "/metrics" => {
+            let mut reply = response(
+                StatusCode::OK,
+                celld::metrics::render(&app.snapshot().await),
+            );
+            reply.headers_mut().insert(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_static(celld::metrics::CONTENT_TYPE),
+            );
+            reply
+        }
         "/state/step0" => response(
             StatusCode::OK,
             celld::claim_provenance::step0_json().to_string(),
@@ -3254,27 +3265,50 @@ fn serve_http_connection(
                 let service_requests = service_requests.clone();
                 async move {
                     let mut request = request;
-                    if let Some(refusal) =
-                        operator_gate(surface, &app.operator_token, request.headers_mut())
-                    {
-                        return Ok(refusal);
-                    }
-                    match surface {
-                        HttpSurface::Public => handle_public(request, app, service_requests).await,
-                        HttpSurface::Internal => handle_internal(request, app, shutdown).await,
-                        HttpSurface::Recovery => {
-                            let path = request.uri().path().to_string();
-                            Ok(match path.as_str() {
-                                "/peer/log/seal" | "/peer/log/tail" => {
-                                    internal_log(request, app, path).await
-                                }
-                                _ => response(
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    "predecessor recovery in progress",
-                                ),
-                            })
+                    let started = std::time::Instant::now();
+                    let listener = match surface {
+                        HttpSurface::Public => celld::metrics::Listener::Public,
+                        HttpSurface::Internal => {
+                            celld::metrics::Listener::internal(request.uri().path())
+                        }
+                        HttpSurface::Recovery => celld::metrics::Listener::Peer,
+                    };
+                    let served: Result<HttpReply, Infallible> = async {
+                        if let Some(refusal) = operator_gate(
+                            surface,
+                            &app.operator_token,
+                            request.headers_mut(),
+                        ) {
+                            return Ok(refusal);
+                        }
+                        match surface {
+                            HttpSurface::Public => {
+                                handle_public(request, app, service_requests).await
+                            }
+                            HttpSurface::Internal => handle_internal(request, app, shutdown).await,
+                            HttpSurface::Recovery => {
+                                let path = request.uri().path().to_string();
+                                Ok(match path.as_str() {
+                                    "/peer/log/seal" | "/peer/log/tail" => {
+                                        internal_log(request, app, path).await
+                                    }
+                                    _ => response(
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        "predecessor recovery in progress",
+                                    ),
+                                })
+                            }
                         }
                     }
+                    .await;
+                    if let Ok(reply) = &served {
+                        celld::metrics::record_request(
+                            listener,
+                            reply.status().as_u16(),
+                            started.elapsed(),
+                        );
+                    }
+                    served
                 }
             });
             let connection = http1::Builder::new()

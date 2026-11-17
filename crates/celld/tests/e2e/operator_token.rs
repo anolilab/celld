@@ -281,3 +281,29 @@ fn an_unusable_token_stops_startup() {
         );
     }
 }
+
+#[tokio::test]
+async fn metrics_answer_with_the_token_and_refuse_without_it() {
+    let server = Server::start("do-ids", &[("CELLD_OPERATOR_TOKEN", TOKEN)]).await;
+    let client = client();
+    let url = server.internal_url("/metrics").await;
+    let bare = client.get(&url).send().await.unwrap();
+    assert_eq!(bare.status().as_u16(), 401);
+    let metrics = client.get(&url).bearer_auth(TOKEN).send().await.unwrap();
+    assert_eq!(metrics.status().as_u16(), 200);
+    assert_eq!(
+        metrics.headers()["content-type"],
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    let text = metrics.text().await.unwrap();
+    assert!(text.contains("# TYPE celld_owned_cells gauge"), "{text}");
+    assert!(text.contains("# TYPE celld_http_request_duration_seconds histogram"));
+    // The 401 above was counted on the internal listener.
+    let refused = text
+        .lines()
+        .find(|line| {
+            line.starts_with("celld_http_requests_total{listener=\"internal\",class=\"4xx\"}")
+        })
+        .expect("the internal 4xx series");
+    assert_ne!(refused.rsplit(' ').next(), Some("0"), "{refused}");
+}
