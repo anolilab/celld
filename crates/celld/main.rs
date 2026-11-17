@@ -4349,6 +4349,16 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     celld::js::set_do_call_tx(do_call_tx);
     let (gate_tx, mut gate_rx) = mpsc::unbounded_channel();
     celld::js::set_gate_tx(gate_tx);
+    let (broken_tx, mut broken_rx) = mpsc::unbounded_channel();
+    celld::js::set_broken_tx(broken_tx);
+    {
+        let tx = app.tx.clone();
+        tokio::spawn(async move {
+            while let Some((cell, instance)) = broken_rx.recv().await {
+                let _ = tx.send(Message::RuntimeBroken { cell, instance });
+            }
+        });
+    }
     let (facet_tx, mut facet_rx) = mpsc::unbounded_channel();
     celld::js::set_facet_tx(facet_tx);
     {

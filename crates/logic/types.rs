@@ -853,6 +853,16 @@ pub enum Event {
         max_age_ms: u64,
         eager_classes: Vec<String>,
     },
+    /// The runtime reports that SQL latched a critical error (disk full, I/O
+    /// error, out of memory, interrupt) that discarded a transaction: every
+    /// later call on this instance fails. The cell restarts at the same epoch
+    /// on a fresh instance, as a generation swap does, so it serves again
+    /// once the fault clears, without a restore. Its activity is cancelled at
+    /// once, but never across a pending durability proof.
+    RuntimeBroken {
+        cell: CellId,
+        now_mono_ms: u64,
+    },
     Published {
         op: OpId,
         result: Result<(), Failure>,
@@ -1184,6 +1194,9 @@ pub enum Effect {
         /// and auto-response pair survive. A shutdown handoff lists every
         /// socket and forgets the pair, because the cell is leaving.
         keep_hibernatable: bool,
+        /// The cell restarts because its SQL latched an error, not because a
+        /// handoff or deployment moves it: there is no handoff to time.
+        recycle: bool,
     },
     Restore {
         op: OpId,

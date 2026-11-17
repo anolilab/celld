@@ -70,6 +70,9 @@ pub struct Cells {
     sql_cursors: RefCell<HashMap<u64, SqlCursor>>,
     sql_statement_caches: RefCell<HashMap<String, SqlStatementCache>>,
     sql_critical_errors: RefCell<HashMap<String, String>>,
+    /// The root cell each open database belongs to. A facet's own scope names
+    /// no root, and the connection map is borrowed while a write latches.
+    roots: RefCell<HashMap<String, String>>,
     /// The schema cookie last read for a cell, and what it was read against.
     schema_cookies: RefCell<HashMap<String, SchemaCookie>>,
 }
@@ -269,6 +272,42 @@ fn sql_statement_caches<T>(f: impl FnOnce(&RefCell<HashMap<String, SqlStatementC
 
 fn sql_critical_errors<T>(f: impl FnOnce(&RefCell<HashMap<String, String>>) -> T) -> T {
     cells(|c| f(&c.sql_critical_errors))
+}
+
+/// Latch `error` for `scope`: every later call on the cell fails with it
+/// until the cell's storage is closed and opened again. The first latch tells
+/// the actor, so it restarts the root cell (a facet shares its root's
+/// runtime) and the latch cannot outlive the instance that raised it.
+fn latch_sql_critical_error(scope: &str, error: String) {
+    let first = sql_critical_errors(|errors| {
+        let mut errors = errors.borrow_mut();
+        let first = !errors.contains_key(scope);
+        errors.entry(scope.to_string()).or_insert(error);
+        first
+    });
+    if first {
+        // Not `dbs`: this can run inside a write that holds that map.
+        let root =
+            cells(|c| c.roots.borrow().get(scope).cloned()).unwrap_or_else(|| scope.to_string());
+        let instance = instance_token(&root).unwrap_or(0);
+        crate::host_channels::report_runtime_broken(root, instance);
+    }
+}
+
+static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+static INSTANCES: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn instances<T>(f: impl FnOnce(&mut std::collections::BTreeMap<String, u64>) -> T) -> T {
+    f(&mut INSTANCES.lock().unwrap_or_else(|p| p.into_inner()))
+}
+
+/// The identity of the open instance of root cell `root`: new at every open,
+/// gone at close. A report about a latch carries it, so a report that
+/// outlives the instance it was raised on (a second scope of the same
+/// instance, or one queued across a restart) cannot recycle its successor.
+pub(crate) fn instance_token(root: &str) -> Option<u64> {
+    instances(|open| open.get(root).copied())
 }
 
 /// The heap memory one cell can hold in cached SQL statements. The budget
@@ -821,6 +860,20 @@ fn finish_open(
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
     sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
+    let root = match &backing {
+        StorageBacking::File { root_scope, .. } | StorageBacking::Embedded { root_scope, .. } => {
+            root_scope.clone()
+        }
+    };
+    cells(|c| c.roots.borrow_mut().insert(scope.to_string(), root));
+    if matches!(backing, StorageBacking::File { .. }) {
+        instances(|open| {
+            open.insert(
+                scope.to_string(),
+                NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            )
+        });
+    }
     dbs(|d| {
         d.borrow_mut().insert(
             scope.to_string(),
@@ -858,6 +911,8 @@ pub fn close(scope: &str) {
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
     sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
+    cells(|c| c.roots.borrow_mut().remove(scope));
+    instances(|open| open.remove(scope));
     cells(|c| c.schema_cookies.borrow_mut().remove(scope));
     dbs(|d| d.borrow_mut().remove(scope));
     active_alarms(|alarms| alarms.borrow_mut().remove(scope));
@@ -2756,12 +2811,7 @@ impl D1TransactionOperation {
 }
 
 fn d1_poison_transaction(scope: &str, error: String) {
-    sql_critical_errors(|errors| {
-        errors
-            .borrow_mut()
-            .entry(scope.to_string())
-            .or_insert(error);
-    });
+    latch_sql_critical_error(scope, error);
 }
 
 fn d1_rollback_after_commit_failure(
@@ -2851,12 +2901,7 @@ fn d1_critical_transaction_failure(
         // A D1 call owns its transaction bracket and cannot hand an open or
         // ambiguous one back to application code. Fail closed even when
         // SQLite did not re-enable autocommit after the control failure.
-        sql_critical_errors(|errors| {
-            errors
-                .borrow_mut()
-                .entry(scope.to_string())
-                .or_insert_with(|| error.clone());
-        });
+        latch_sql_critical_error(scope, error.clone());
     }
     error
 }
@@ -3495,12 +3540,7 @@ fn record_sqlite_operation_failure(
     );
     let now_autocommit = unsafe { rusqlite::ffi::sqlite3_get_autocommit(database) != 0 };
     if celld_logic::sqlite::poisons_actor(result_code, started_in_transaction, now_autocommit) {
-        sql_critical_errors(|errors| {
-            errors
-                .borrow_mut()
-                .entry(scope.to_string())
-                .or_insert_with(|| error.to_string());
-        });
+        latch_sql_critical_error(scope, error.to_string());
     }
 }
 
@@ -4033,4 +4073,158 @@ pub fn bump_alarm_with_policy(scope: &str, now_ms: i64, counts_against_limit: bo
         }
     });
     publish_alarm(scope);
+}
+
+#[cfg(test)]
+mod recycle_tests {
+    use super::*;
+
+    /// The reports the actor would receive, shared by every test of the
+    /// process (the channel is installed once). Tests use distinct scopes.
+    type Reports = (
+        tokio::sync::mpsc::UnboundedReceiver<(String, u64)>,
+        Vec<(String, u64)>,
+    );
+
+    fn reports() -> &'static std::sync::Mutex<Reports> {
+        static REPORTS: std::sync::OnceLock<std::sync::Mutex<Reports>> = std::sync::OnceLock::new();
+        REPORTS.get_or_init(|| {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            crate::host_channels::set_broken_tx(tx);
+            std::sync::Mutex::new((rx, Vec::new()))
+        })
+    }
+
+    /// Take the reports that named `cell`, keeping other tests' reports, and
+    /// answer the instances they named.
+    fn reported(cell: &str) -> Vec<u64> {
+        let mut guard = reports().lock().unwrap();
+        let (rx, held) = &mut *guard;
+        while let Ok(reported) = rx.try_recv() {
+            held.push(reported);
+        }
+        let taken = held
+            .iter()
+            .filter(|(reported, _)| reported == cell)
+            .map(|(_, instance)| *instance)
+            .collect();
+        held.retain(|(reported, _)| reported != cell);
+        taken
+    }
+
+    fn limit_pages(scope: &str, pages: i64) {
+        with_mut(scope, |c| {
+            without_sql_authorizer(c, |c| c.pragma_update(None, "max_page_count", pages))
+        })
+        .expect("db open")
+        .expect("set limit");
+    }
+
+    fn page_count(scope: &str) -> i64 {
+        with_mut(scope, |c| {
+            without_sql_authorizer(c, |c| {
+                c.query_row("PRAGMA page_count", [], |row| row.get(0))
+            })
+        })
+        .expect("db open")
+        .expect("page count")
+    }
+
+    /// Open a transaction on a database with no room left, and write until
+    /// SQLite reports a full disk and discards it.
+    fn fill_until_full(scope: &str) {
+        limit_pages(scope, page_count(scope) + 2);
+        transaction_control(scope, "start", false, "").unwrap();
+        let big = vec![7u8; 64 * 1024];
+        let failure = (0..64)
+            .find_map(|i| put_serialized(scope, &format!("lost-{i}"), &big).err())
+            .expect("the limit never produced a full error");
+        assert!(failure.to_string().contains("full"), "{failure:#}");
+        assert!(
+            sql_critical_error(scope).is_some(),
+            "the cell did not latch"
+        );
+    }
+
+    fn open_in(dir: &tempfile::TempDir, name: &str, scope: &str) -> String {
+        let path = dir.path().join(name).to_string_lossy().into_owned();
+        open(scope, &path).unwrap();
+        path
+    }
+
+    /// A transaction destroyed by a full disk latches the cell and tells the
+    /// actor once; reopening the database (what the restart does) clears the
+    /// latch, and nothing committed before the failure is lost.
+    #[test]
+    fn a_full_disk_latches_and_reports_until_the_cell_reopens() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let _ = reports();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "full-cell";
+        let path = open_in(&dir, "cell.sqlite", scope);
+        put_serialized(scope, "kept", b"acknowledged").unwrap();
+        assert!(reported(scope).is_empty());
+        let instance = instance_token(scope).expect("an open root has an instance");
+
+        fill_until_full(scope);
+        assert_eq!(
+            reported(scope),
+            vec![instance],
+            "the actor was not told once"
+        );
+        assert!(put_serialized(scope, "late", b"x").is_err());
+        assert!(
+            reported(scope).is_empty(),
+            "a second failure told the actor again"
+        );
+
+        close(scope);
+        assert_eq!(instance_token(scope), None);
+        open(scope, &path).unwrap();
+        assert_ne!(
+            instance_token(scope),
+            Some(instance),
+            "a restart kept the instance a stale report names"
+        );
+        assert!(sql_critical_error(scope).is_none());
+        put_serialized(scope, "after", b"fresh").unwrap();
+        assert!(get_stored(scope, "lost-0").unwrap().is_none());
+        assert!(get_stored(scope, "kept").unwrap().is_some());
+        assert!(get_stored(scope, "after").unwrap().is_some());
+        close(scope);
+    }
+
+    /// A facet's scope is `<class>:<hex>` and names no root, so the report
+    /// must carry the root cell the facet runs in.
+    #[test]
+    fn a_facet_latch_reports_its_root_cell() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let _ = reports();
+        let dir = tempfile::tempdir().unwrap();
+        let root = "facet-root-cell";
+        let root_path = open_in(&dir, "root.sqlite", root);
+        let parent = StorageIdentity {
+            root_path,
+            root_scope: root.to_string(),
+            facet_path: Vec::new(),
+            epoch: 1,
+            root_position: 0,
+            root_observed: None,
+        };
+        let facet = "Child:00ff00ff";
+        let facet_path = dir.path().join("facet.sqlite");
+        open_embedded(facet, &parent, "child", &facet_path, false).unwrap();
+
+        fill_until_full(facet);
+        assert!(reported(facet).is_empty(), "the report named the facet");
+        assert_eq!(
+            reported(root),
+            vec![instance_token(root).unwrap()],
+            "the root cell was not reported once"
+        );
+        close(facet);
+        close(root);
+    }
 }

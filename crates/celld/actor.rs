@@ -505,6 +505,12 @@ pub enum Message {
     /// bounded by the drain deadline, so a wedged store still cannot hold
     /// the exit hostage.
     ReleaseAll,
+    /// SQL on `cell` latched a critical error: restart the cell.
+    RuntimeBroken {
+        cell: String,
+        /// The instance that raised it; see `storage::instance_token`.
+        instance: u64,
+    },
     /// Give up to `cells` idle cells to the fleet. The balancing loop sends
     /// this after it has confirmed from the leases that this node is the
     /// densest and a peer has room.
@@ -2727,6 +2733,19 @@ impl Actor {
                 crate::claim_provenance::drain_started();
                 self.drive(Event::ReleaseAll, out);
             }
+            // A report from an instance that is gone, or replaced by a restart
+            // since, describes a latch that died with it.
+            Message::RuntimeBroken { cell, instance } => {
+                if crate::storage::instance_token(&cell) == Some(instance) {
+                    self.drive(
+                        Event::RuntimeBroken {
+                            cell,
+                            now_mono_ms: crate::asyncrt::mono_ms(),
+                        },
+                        out,
+                    );
+                }
+            }
             Message::Rebalance { .. } if self.preserving => {}
             Message::Rebalance { cells } => self.drive(Event::Rebalance { cells }, out),
             Message::GenerationChanged {
@@ -3496,20 +3515,29 @@ impl Actor {
                 websockets,
                 alarm,
                 keep_hibernatable,
+                recycle,
             } => {
-                self.handoff_timings
-                    .entry(cell.clone())
-                    .or_insert(HandoffCellTiming {
-                        nominated_mono_ms: crate::asyncrt::mono_ms(),
-                        quiesce_us: None,
-                        durability_us: None,
-                        stop_us: None,
-                        release_us: None,
-                    });
+                // A recycle is no handoff: it has no phases to time, and its
+                // swap stop would never remove the entry.
+                if !recycle {
+                    self.handoff_timings
+                        .entry(cell.clone())
+                        .or_insert(HandoffCellTiming {
+                            nominated_mono_ms: crate::asyncrt::mono_ms(),
+                            quiesce_us: None,
+                            durability_us: None,
+                            stop_us: None,
+                            release_us: None,
+                        });
+                }
+                let cancellation = if recycle {
+                    "sql_recycle"
+                } else {
+                    "shutdown_quiesce"
+                };
                 for request in requests {
-                    if let Some((request_id, _)) = self
-                        .drain_pins
-                        .cancel_core_request(request, "shutdown_quiesce")
+                    if let Some((request_id, _)) =
+                        self.drain_pins.cancel_core_request(request, cancellation)
                     {
                         // The handler can answer before its output gate or
                         // waitUntil work settles. Cancel every pinned phase,
@@ -3920,6 +3948,9 @@ impl Actor {
                 }
                 self.stops += 1;
                 if matches!(cause, StopCause::Swap) {
+                    // A forced swap's cancel opened a timing no handoff will
+                    // close; the same-epoch restart ends it.
+                    self.handoff_timings.remove(&cell);
                     // A generation swap: the cell leaves its isolate and
                     // nothing else changes. No durability barrier, no
                     // replica release, no local unlink -- the same epoch
