@@ -129,28 +129,7 @@ impl LocalStore {
         mut visit: impl FnMut(StoredObject) -> object_store::Result<bool>,
     ) -> object_store::Result<()> {
         let connection = self.connect()?;
-        // Only the bounds in use are written into the statement. A bound that
-        // is a parameter tested against NULL would hide the comparison from the
-        // planner, and the scan would fall back to every row.
-        let mut conditions = Vec::new();
-        let mut bounds = Vec::new();
-        if let Some((key, inclusive)) = &range.lower {
-            bounds.push(key.as_str());
-            conditions.push(if *inclusive { "key >= ?" } else { "key > ?" });
-        }
-        if let Some(key) = &range.upper {
-            bounds.push(key.as_str());
-            conditions.push("key < ?");
-        }
-        let filter = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
-        };
-        let sql = format!(
-            "SELECT key, CAST(X'' AS BLOB), etag, modified_ms, attributes, length(body)
-             FROM objects {filter} ORDER BY key"
-        );
+        let (sql, bounds) = range.select();
         let mut statement = connection.prepare(&sql).map_err(db_error)?;
         let mut rows = statement
             .query(rusqlite::params_from_iter(bounds))
@@ -370,10 +349,14 @@ impl ObjectStore for LocalStore {
         let mut objects = Vec::new();
         for object in self.metadata(&range)? {
             let location = stored_location(&object.key)?;
+            // The range holds only keys below the prefix, so neither `else`
+            // can run. They stay so a wrong range cannot corrupt a listing.
             let Some(mut remainder) = location.prefix_match(&prefix) else {
+                debug_assert!(false, "{} is outside the listed prefix", object.key);
                 continue;
             };
             let Some(child) = remainder.next() else {
+                debug_assert!(false, "{} is the listed prefix itself", object.key);
                 continue;
             };
             if remainder.next().is_some() {
@@ -422,6 +405,7 @@ impl PaginatedListStore for LocalStore {
         let mut entries: Vec<(String, Option<Path>, Option<ObjectMeta>)> = Vec::new();
         self.scan(&KeyRange::string_prefix(prefix, after), |object| {
             let Some(remainder) = object.key.strip_prefix(prefix) else {
+                debug_assert!(false, "{} is outside the listed prefix", object.key);
                 return Ok(true);
             };
             let common = delimiter.and_then(|delimiter| {
@@ -476,14 +460,18 @@ struct KeyRange {
 
 impl KeyRange {
     /// Every key below a path prefix, which is every key that starts with the
-    /// prefix and a `/`. No prefix, or an empty one, is the whole store.
+    /// prefix and a `/`. No prefix, or an empty one, is the whole store except
+    /// the object at the empty key, which is not below any path.
     fn directory(prefix: Option<&Path>) -> Self {
         match prefix
             .map(Path::to_string)
             .filter(|prefix| !prefix.is_empty())
         {
             Some(prefix) => Self::string_prefix(&format!("{prefix}/"), None),
-            None => Self::default(),
+            None => Self {
+                lower: Some((String::new(), false)),
+                upper: None,
+            },
         }
     }
 
@@ -498,6 +486,36 @@ impl KeyRange {
             lower,
             upper: prefix_successor(prefix),
         }
+    }
+}
+
+impl KeyRange {
+    /// The statement that reads the rows in the range, and its bounds.
+    ///
+    /// Only the bounds in use are written into the statement. A bound that is
+    /// a parameter tested against NULL would hide the comparison from the
+    /// planner, and the scan would fall back to every row.
+    fn select(&self) -> (String, Vec<&str>) {
+        let mut conditions = Vec::new();
+        let mut bounds = Vec::new();
+        if let Some((key, inclusive)) = &self.lower {
+            bounds.push(key.as_str());
+            conditions.push(if *inclusive { "key >= ?" } else { "key > ?" });
+        }
+        if let Some(key) = &self.upper {
+            bounds.push(key.as_str());
+            conditions.push("key < ?");
+        }
+        let filter = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT key, CAST(X'' AS BLOB), etag, modified_ms, attributes, length(body)
+             FROM objects {filter} ORDER BY key"
+        );
+        (sql, bounds)
     }
 }
 
@@ -850,15 +868,39 @@ mod tests {
     fn a_prefix_list_uses_the_key_index() {
         let (_directory, store) = store_with(KEYS);
         let connection = store.connect().unwrap();
-        let plan: String = connection
-            .query_row(
-                "EXPLAIN QUERY PLAN SELECT key FROM objects
-                 WHERE key >= ?1 AND key < ?2 ORDER BY key",
-                ["a/", "a0"],
-                |row| row.get(3),
-            )
-            .unwrap();
-        assert!(plan.contains("SEARCH") && plan.contains("key>"), "{plan}");
+        for range in [
+            KeyRange::directory(Some(&Path::from("a"))),
+            KeyRange::directory(None),
+            KeyRange::string_prefix("a/", Some("a/b")),
+        ] {
+            let (sql, bounds) = range.select();
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let plan = statement
+                .query_map(rusqlite::params_from_iter(bounds), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("; ");
+            assert!(plan.contains("SEARCH") || plan.contains("SCAN"), "{plan}");
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+            if range.lower.is_some() {
+                assert!(plan.contains("SEARCH") && plan.contains("key>"), "{plan}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_prefix_does_not_list_the_object_at_the_empty_key() {
+        let (_directory, store) = store_with(&["", "a", "b/c"]);
+        for prefix in [None, Some(Path::from(""))] {
+            assert_eq!(listed(&store, prefix.as_ref()).await, ["a", "b/c"]);
+        }
+        let root = store.list_with_delimiter(None).await.unwrap();
+        assert_eq!(names(&root.objects), ["a"]);
     }
 
     /// Times a prefix list on a store of 200 000 keys under 2 000 prefixes.
