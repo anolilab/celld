@@ -6,7 +6,7 @@ const OUTBOUND_CODE = `
   import { connect } from "cloudflare:sockets";
   const failure = (error) => ({
     ok: false,
-    type: error instanceof TypeError,
+    name: error?.name,
     message: String(error?.message ?? error),
   });
   export default {
@@ -27,7 +27,11 @@ const OUTBOUND_CODE = `
           const socket = new WebSocket(target.replace(/^http/, "ws"));
           await new Promise((resolve, reject) => {
             socket.addEventListener("open", resolve, { once: true });
-            socket.addEventListener("error", () => reject(new Error("websocket error event")), { once: true });
+            socket.addEventListener(
+              "error",
+              (event) => reject(new TypeError(event.message || "websocket error event")),
+              { once: true },
+            );
             socket.addEventListener("close", () => reject(new Error("websocket closed")), { once: true });
           });
           return Response.json({ ok: true });
@@ -80,12 +84,16 @@ const FACET_CODE = `
         };
         for (const name of names) {
           out.facets[name] = await attempt(async () => {
-            const facet = this.ctx.facets.get(name, () => ({ class: this.ctx.exports.App ?? this.constructor }));
+            const facet = this.ctx.facets.get(name, () => ({ class: this.ctx.exports.App }));
             return await (await facet.fetch("http://facet/?op=dump")).json();
           });
         }
         out.sibling = await attempt(async () => {
-          const stub = this.ctx.exports.Host.get(params.get("sibling"));
+          const host = this.ctx.exports?.Host;
+          if (!host) {
+            return { absent: true };
+          }
+          const stub = host.get(host.idFromString(params.get("sibling")));
           return await (await stub.fetch("http://host/")).text();
         });
         return Response.json(out);
@@ -93,6 +101,7 @@ const FACET_CODE = `
       return new Response("unknown op", { status: 400 });
     }
     dump() {
+      this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS s (v TEXT)");
       return {
         kv: [...this.ctx.storage.kv.list()],
         sql: this.ctx.storage.sql.exec("SELECT v FROM s").toArray(),

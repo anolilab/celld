@@ -14,9 +14,13 @@ use std::future::Future;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 const CELLD: &str = env!("CARGO_BIN_EXE_celld");
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -539,4 +543,47 @@ pub fn esbuild() -> Option<String> {
         .ok()
         .filter(|output| output.status.success())
         .map(|_| binary)
+}
+
+/// A loopback server standing in for an internal service. It counts the
+/// connections it accepts, so a refused destination is proven never to have
+/// been dialed. It answers `hello`, and a redirect to `localhost` on `/redirect`.
+pub struct CountingListener {
+    pub port: u16,
+    hits: Arc<AtomicUsize>,
+}
+
+impl CountingListener {
+    pub async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 2048];
+                    let read = stream.read(&mut buffer).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                    let path = head.split_whitespace().nth(1).unwrap_or("/");
+                    let reply = if path == "/redirect" {
+                        format!(
+                            "HTTP/1.1 302 Found\r\nlocation: http://localhost:{port}/hello\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        )
+                    } else {
+                        "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello"
+                            .to_string()
+                    };
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        Self { port, hits }
+    }
+
+    pub fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
 }
