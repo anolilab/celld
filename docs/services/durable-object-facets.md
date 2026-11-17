@@ -87,7 +87,9 @@ loopback class without properties supplies an empty object.
   must differ, and the facets below the source are not copied. The copy reads
   and writes the whole database, so its cost is proportional to the size of
   the source. It adds no request on the root object's stream; the target's
-  stream ships the copy as one write.
+  stream ships the copy as one write. A source that was not running when the
+  clone began starts only once the clone has finished: `get(source)` waits
+  for it.
 - A clone refuses a source database above 16 MiB, because the copy is one
   write that must reach the bucket within the durability wait. The refusal
   leaves the target as it was, stopped, and the name usable.
