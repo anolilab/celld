@@ -2790,13 +2790,23 @@ async fn await_arm_gates(gates: Vec<ArmGateRx>) -> Result<(), String> {
 }
 
 fn send_answer_after_arm_gates<T: Send + 'static>(
-    mut reply: tokio::sync::oneshot::Sender<Result<T>>,
+    reply: tokio::sync::oneshot::Sender<Result<T>>,
     value: Result<T>,
     gates: Vec<ArmGateRx>,
 ) -> Option<GatedReplyRx> {
+    send_answer_checked(reply, value, gates).0
+}
+
+/// Like [`send_answer_after_arm_gates`], and also says whether an ungated
+/// reply reached its receiver. A gated reply reports `true`: its outcome comes
+/// back later as a [`GatedReplyCompletion`].
+fn send_answer_checked<T: Send + 'static>(
+    mut reply: tokio::sync::oneshot::Sender<Result<T>>,
+    value: Result<T>,
+    gates: Vec<ArmGateRx>,
+) -> (Option<GatedReplyRx>, bool) {
     if gates.is_empty() {
-        drop(reply.send(value));
-        return None;
+        return (None, reply.send(value).is_ok());
     }
     let (completed, completion) = tokio::sync::oneshot::channel();
     let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
@@ -2828,6 +2838,7 @@ fn send_answer_after_arm_gates<T: Send + 'static>(
             drop(waiting);
             result
         };
+        let mut cancelled_by_driver = false;
         let value = match gate_wait {
             GateWait::Completed(gate_result) => match (value, gate_result) {
                 (value, Ok(())) => value,
@@ -2854,10 +2865,13 @@ fn send_answer_after_arm_gates<T: Send + 'static>(
             // fixed its reply. Do not enter JavaScript again: the handler is
             // already over. A successful answer becomes a disconnect error,
             // while an existing handler error remains the primary failure.
-            GateWait::Cancelled => match value {
-                Ok(_) => Err(anyhow!("The client has disconnected")),
-                Err(primary) => Err(primary),
-            },
+            GateWait::Cancelled => {
+                cancelled_by_driver = true;
+                match value {
+                    Ok(_) => Err(anyhow!("The client has disconnected")),
+                    Err(primary) => Err(primary),
+                }
+            }
             // Dropping the driver drops both halves of its completion handle.
             // Release every detached resource, but do not let an abandoned
             // driver manufacture a reply that nothing owns any longer.
@@ -2871,6 +2885,9 @@ fn send_answer_after_arm_gates<T: Send + 'static>(
             .err()
             .map(|error| crate::telemetry::cap_error(format!("{error:#}")));
         let completion = match reply.send(value) {
+            // The client left, so whatever the receiver was handed, it got no
+            // status.
+            _ if cancelled_by_driver => GatedReplyCompletion::Cancelled { failure },
             Ok(()) => GatedReplyCompletion::Sent { failure },
             Err(value) => {
                 drop(value);
@@ -2880,10 +2897,13 @@ fn send_answer_after_arm_gates<T: Send + 'static>(
         let _ = completed.send(completion);
     })
     .detach();
-    Some(GatedReplyRx {
-        completion,
-        cancel: Some(cancel),
-    })
+    (
+        Some(GatedReplyRx {
+            completion,
+            cancel: Some(cancel),
+        }),
+        true,
+    )
 }
 
 pub(crate) enum GatedReplyCompletion {
@@ -2891,6 +2911,9 @@ pub(crate) enum GatedReplyCompletion {
     Sent { failure: Option<String> },
     /// The receiver disappeared, so no reply remains to deliver.
     CallerClosed { failure: Option<String> },
+    /// The request was cancelled while the gate was pending; the client left,
+    /// and `failure` is the disconnect (or the handler's own error).
+    Cancelled { failure: Option<String> },
 }
 
 /// The status the host answers for a handler status: one it cannot send
@@ -2913,8 +2936,14 @@ fn status_after_gate(
     match completion {
         Ok(GatedReplyCompletion::Sent { failure: None }) => status,
         Ok(GatedReplyCompletion::Sent { failure: Some(_) }) => status.map(|_| 500),
-        Ok(GatedReplyCompletion::CallerClosed { .. }) | Err(_) => None,
+        Ok(GatedReplyCompletion::CallerClosed { .. } | GatedReplyCompletion::Cancelled { .. })
+        | Err(_) => None,
     }
+}
+
+/// The status of an ungated reply: it counts only when the receiver got it.
+fn status_after_send(status: Option<u16>, delivered: bool) -> Option<u16> {
+    status.filter(|_| delivered)
 }
 
 pub(crate) struct GatedReplyRx {
@@ -3053,7 +3082,10 @@ impl InFlight {
                 if let (Some(report), Err(error)) = (&mut self.tail_report, &read) {
                     report.record_failure(format!("{error:#}"));
                 }
-                send_and_end(tc, &self.context, reply, read)
+                let (background, gated_reply, delivered) =
+                    send_and_end_checked(tc, &self.context, reply, read);
+                self.response_status = status_after_send(self.response_status, delivered);
+                (background, gated_reply)
             }
             Answer::Rpc(reply) => {
                 let read =
@@ -3291,11 +3323,19 @@ impl InFlight {
                 Ok(GatedReplyCompletion::Sent {
                     failure: Some(failure),
                 })
-                | Ok(GatedReplyCompletion::CallerClosed {
-                    failure: Some(failure),
-                }) => self.failure = Some(failure),
+                | Ok(
+                    GatedReplyCompletion::CallerClosed {
+                        failure: Some(failure),
+                    }
+                    | GatedReplyCompletion::Cancelled {
+                        failure: Some(failure),
+                    },
+                ) => self.failure = Some(failure),
                 Ok(GatedReplyCompletion::Sent { failure: None }) => {}
-                Ok(GatedReplyCompletion::CallerClosed { failure: None }) => {
+                Ok(
+                    GatedReplyCompletion::CallerClosed { failure: None }
+                    | GatedReplyCompletion::Cancelled { failure: None },
+                ) => {
                     if self.failure.is_none() {
                         self.failure = Some("The client has disconnected".to_string());
                     }
@@ -4720,11 +4760,26 @@ fn send_and_end<T>(
 where
     T: Send + 'static,
 {
+    let (background, gated_reply, _) = send_and_end_checked(tc, context, reply, value);
+    (background, gated_reply)
+}
+
+/// [`send_and_end`], also saying whether an ungated reply reached its receiver.
+fn send_and_end_checked<T>(
+    tc: &mut v8::PinScope,
+    context: &IoContext,
+    reply: tokio::sync::oneshot::Sender<Result<T>>,
+    value: Result<T>,
+) -> (Option<v8::Global<v8::Promise>>, Option<GatedReplyRx>, bool)
+where
+    T: Send + 'static,
+{
     let background = end_event_context(tc).ok().flatten();
-    let gated_reply = send_answer_after_arm_gates(reply, value, context.take_arm_gates());
+    let (gated_reply, delivered) = send_answer_checked(reply, value, context.take_arm_gates());
     (
         background.map(|promise| v8::Global::new(tc, promise)),
         gated_reply,
+        delivered,
     )
 }
 
@@ -12002,6 +12057,21 @@ mod response_status_tests {
     fn a_client_that_left_got_no_status() {
         let closed = Ok(GatedReplyCompletion::CallerClosed { failure: None });
         assert_eq!(status_after_gate(Some(200), &closed), None);
+    }
+
+    #[test]
+    fn a_cancelled_gate_got_no_status_but_keeps_its_failure() {
+        let cancelled = Ok(GatedReplyCompletion::Cancelled {
+            failure: Some("The client has disconnected".to_string()),
+        });
+        assert_eq!(status_after_gate(Some(200), &cancelled), None);
+    }
+
+    #[test]
+    fn an_ungated_reply_keeps_its_status_only_when_delivered() {
+        assert_eq!(status_after_send(Some(200), true), Some(200));
+        assert_eq!(status_after_send(Some(200), false), None);
+        assert_eq!(status_after_send(None, true), None);
     }
 
     #[test]
