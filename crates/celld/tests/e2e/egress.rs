@@ -3,59 +3,10 @@
 
 #![allow(clippy::disallowed_methods)]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use super::harness::{run_expecting_exit, Server};
-
-/// A loopback server standing in for an internal service. It counts the
-/// requests it receives, so a refused destination is proven never to have
-/// been dialed.
-struct Internal {
-    port: u16,
-    hits: Arc<AtomicUsize>,
-}
-
-impl Internal {
-    async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let hits = Arc::new(AtomicUsize::new(0));
-        let counted = hits.clone();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let counted = counted.clone();
-                tokio::spawn(async move {
-                    let mut buffer = [0_u8; 2048];
-                    let read = stream.read(&mut buffer).await.unwrap_or(0);
-                    let head = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                    counted.fetch_add(1, Ordering::SeqCst);
-                    let path = head.split_whitespace().nth(1).unwrap_or("/");
-                    let reply = if path == "/redirect" {
-                        format!(
-                            "HTTP/1.1 302 Found\r\nlocation: http://localhost:{}/hello\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                            stream.local_addr().unwrap().port()
-                        )
-                    } else {
-                        "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello"
-                            .to_string()
-                    };
-                    let _ = stream.write_all(reply.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                });
-            }
-        });
-        Self { port, hits }
-    }
-
-    fn hits(&self) -> usize {
-        self.hits.load(Ordering::SeqCst)
-    }
-}
+use super::harness::{run_expecting_exit, CountingListener, Server};
 
 async fn call(server: &Server, path: &str, target: &str) -> Value {
     let query = url::form_urlencoded::Serializer::new(String::new())
@@ -74,7 +25,7 @@ fn assert_refused(result: &Value, expect: &str) {
 
 #[tokio::test]
 async fn public_mode_refuses_non_public_destinations() {
-    let internal = Internal::start().await;
+    let internal = CountingListener::start().await;
     let port = internal.port;
     let server = Server::start("egress", &[("CELLD_EGRESS", "public")]).await;
 
@@ -131,7 +82,7 @@ async fn public_mode_refuses_non_public_destinations() {
 
 #[tokio::test]
 async fn exceptions_permit_a_destination_and_not_a_redirect_into_another() {
-    let internal = Internal::start().await;
+    let internal = CountingListener::start().await;
     let port = internal.port;
     let allow = format!("127.0.0.1:{port}");
     let server = Server::start(
@@ -214,7 +165,7 @@ async fn a_worker_cannot_reach_the_nodes_loopback_listeners_even_when_allowed() 
 
 #[tokio::test]
 async fn dev_leaves_egress_open_by_default() {
-    let internal = Internal::start().await;
+    let internal = CountingListener::start().await;
     let server = Server::start("egress", &[]).await;
     let result = call(
         &server,
@@ -227,7 +178,7 @@ async fn dev_leaves_egress_open_by_default() {
 
 #[tokio::test]
 async fn open_mode_is_unchanged() {
-    let internal = Internal::start().await;
+    let internal = CountingListener::start().await;
     let server = Server::start("egress", &[("CELLD_EGRESS", "open")]).await;
     let result = call(
         &server,
