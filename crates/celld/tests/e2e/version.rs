@@ -14,12 +14,10 @@ fn version_flag_reports_the_build_version() {
     } else {
         ""
     };
+    // stdout carries only the answer: logs, such as the allocator's startup
+    // warning on macOS, go to stderr.
     assert_eq!(
-        // The allocator may log a warning before the answer on some hosts.
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .last()
-            .unwrap_or_default(),
-        format!("celld {}{profile}", env!("CELLD_VERSION"))
+        String::from_utf8_lossy(&output.stdout),
+        format!("celld {}{profile}\n", env!("CELLD_VERSION"))
     );
 }

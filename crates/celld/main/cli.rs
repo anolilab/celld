@@ -62,11 +62,10 @@ impl Action {
     /// parses. Sharing one stream between the two prefixes an operator's data
     /// with whatever the process happened to warn about at startup, which is
     /// how this was found -- an allocator warning landed in front of a value.
+    /// `--help` and `--version` answer on stdout too, so their logs (such as
+    /// the allocator's startup warning on macOS) go to stderr.
     pub(crate) fn stdout_is_data(&self) -> bool {
-        !matches!(
-            self,
-            Self::Run(_) | Self::Dev(_) | Self::Help | Self::Version
-        )
+        !matches!(self, Self::Run(_) | Self::Dev(_))
     }
 }
 
