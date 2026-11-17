@@ -18,5 +18,7 @@ The work is tracked as epics. Each link opens the issue with its tasks.
 4. Reliability work, each change with its bench delta.
 5. Bindings, then multi-app.
 
-See [benchmarks](benchmarks.md) for the measurements and
-[limitations](limitations.md) for the current gaps.
+[Benchmarks](benchmarks.md) describes how celld is measured. Published results
+with raw data are tracked in
+[#10](https://github.com/anolilab/celld/issues/10).
+[Limitations](limitations.md) lists the current gaps.
