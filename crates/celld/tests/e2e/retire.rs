@@ -284,13 +284,6 @@ async fn an_answered_durable_object_event_with_a_leftover_timer_does_not_pin_a_s
     assert_eq!(server.get_text("/version").await, "v2");
 }
 
-/// Durable Object events still running when the deadline passes are ended by
-/// the timer, inside each object's own storage scope, and the node goes on
-/// serving.
-///
-/// A resident cell is normally moved to the new deployment at the maximum
-/// age, which ends its events first. The handoffs run one at a time, so with
-/// enough objects some are still on the old isolate when the deadline passes.
 /// A request running when its object is moved to the new deployment by force
 /// is ended, though its client is still connected: the node answers 503 with
 /// `Retry-After` and says why, and asking again is served.
@@ -325,7 +318,7 @@ async fn a_request_ended_by_a_forced_move_answers_503_and_can_be_retried() {
     let body = ended.text().await.expect("body");
     assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(retry_after.as_deref(), Some("1"), "{body}");
-    assert!(body.contains("Durable Object moved"), "{body}");
+    assert!(body.contains("Durable Object was moved"), "{body}");
     assert!(!body.contains("client has disconnected"), "{body}");
 
     // The retry runs on the new deployment.
@@ -338,6 +331,13 @@ async fn a_request_ended_by_a_forced_move_answers_503_and_can_be_retried() {
     assert_eq!(again.text().await.expect("body"), "stayed");
 }
 
+/// Durable Object events still running when the deadline passes are ended by
+/// the timer, inside each object's own storage scope, and the node goes on
+/// serving.
+///
+/// A resident cell is normally moved to the new deployment at the maximum
+/// age, which ends its events first. The handoffs run one at a time, so with
+/// enough objects some are still on the old isolate when the deadline passes.
 #[tokio::test(flavor = "multi_thread")]
 async fn durable_object_events_running_at_the_deadline_are_ended_and_the_node_keeps_serving() {
     const OBJECTS: usize = 300;
