@@ -72,8 +72,12 @@ setting that turns it off. A node takes the token from `CELLD_OPERATOR_TOKEN`:
   users can read. celld creates its own directories (the configuration
   directory and `.celld/dev`) with mode 0700 and tightens the configuration
   directory when group or other users can write to it. `celld dev` and
-  `celld d1 --local` refuse a `.celld/dev` or `.celld` that they can write to. It refuses any other directory they can write
-  to, and one that another user owns, and leaves it unchanged.
+  `celld d1 --local` refuse a directory that is not private. `celld dev` first
+  sets mode 0700 on a `.celld` or `.celld/dev` of its own that group or others
+  can write to, and refuses it only if it stays loose (a filesystem that keeps
+  no modes, such as a Windows drive under WSL: use `--state-dir` on another
+  one). `celld d1 --local` sends a credential, so it never tightens: it
+  refuses a loose one, and any directory that another user owns.
 - With it unset and the internal listener bound to, or the node advertising,
   any other address, the node refuses to start. A generated file cannot reach
   the other machines, so a fleet needs one shared value.
