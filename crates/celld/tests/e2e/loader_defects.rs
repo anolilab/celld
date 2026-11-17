@@ -243,3 +243,20 @@ async fn a_durable_objects_own_socket_is_released_when_the_caller_did_not_upgrad
     // The refused socket is closed on the object's side, not left registered.
     assert_eq!(out["closes"].as_array().map(Vec::len), Some(1), "{out}");
 }
+
+#[tokio::test]
+async fn a_service_binding_does_not_hand_a_socket_to_a_fetch_that_did_not_upgrade() {
+    let server = Server::start("loader-defects", ONE_ISOLATE).await;
+    let out: Value = server.get_json("/svc-plain").await;
+    let threw = out["threw"].as_str().unwrap_or_default();
+    assert!(
+        threw.contains("did not contain the header \"Upgrade: websocket\""),
+        "{out}"
+    );
+    // Nobody can reach the socket, so the target's end is closed.
+    assert_eq!(
+        out["state"]["socketCloses"].as_array().map(Vec::len),
+        Some(1),
+        "{out}"
+    );
+}

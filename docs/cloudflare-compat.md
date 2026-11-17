@@ -136,8 +136,8 @@ The `tail` and `email` handlers are unavailable.
   code 1012. If a frame is incomplete, the ingress closes the transport instead.
 - `acceptWebSocket()` throws above 90 percent of the V8 heap limit.
 - A response with a WebSocket to a request without `Upgrade: websocket` fails,
-  as in workerd. A Durable Object's `stub.fetch()` call then rejects, and an
-  HTTP client receives status 500. The server end of the socket receives a close
+  as in workerd. A Durable Object's, service binding's, or loaded Worker's `fetch()`
+  call then rejects, and an HTTP client receives status 500. The server end of the socket receives a close
   event with code 1006.
 - A Durable Object's `stub.fetch()` call rejects when the handler fails, on the
   owner node and on any other node.

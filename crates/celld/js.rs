@@ -6696,6 +6696,8 @@ fn op_svc_call_impl(
         },
         None => RequestBodyGuard::of(&body),
     };
+    // The headers move into the call, so ask now whether it wants an upgrade.
+    let upgrade = crate::cell_dispatch::requests_websocket_upgrade(&headers);
     let (tx, rx) = tokio::sync::oneshot::channel();
     // Shares the Durable Object cancel registry and the id encoding
     // `attach_cancel_id` writes, so `__do_call_cancel` works unchanged for a
@@ -6736,7 +6738,8 @@ fn op_svc_call_impl(
         let mut cancel_guard = cancel_guard;
         gated_channel_send(gate, &SVC_CALL_TX, request, "no service binding channel").await?;
         let result = match rx.await {
-            Ok(Ok(response)) => encode_granted_response(ws_owner, response, &stream_service),
+            Ok(Ok(mut response)) => refuse_unrequested_websocket(&mut response, upgrade)
+                .and_then(|()| encode_granted_response(ws_owner, response, &stream_service)),
             Ok(Err(error)) => Err(format!("{error}")),
             Err(error) => Err(format!("service dropped: {error}")),
         };
@@ -7374,24 +7377,8 @@ fn op_loader_fetch(
         // context. That context owns an unread body tail through its
         // waitUntil work.
         body_guard.disarm();
-        use crate::cell_dispatch::WEBSOCKET_WITHOUT_UPGRADE;
         let mut response = response;
-        if !upgrade {
-            // A socket answers only a fetch that asked to upgrade. Dropping a
-            // Worker's socket closes it, and a cell's needs the explicit close.
-            match response.websocket.take() {
-                Some(HttpResponseWebSocket::Cell(target)) => {
-                    if target.tunnel.is_none() {
-                        ws_close(target.id, 1006, WEBSOCKET_WITHOUT_UPGRADE);
-                    }
-                    return Err(format!("TypeError: {WEBSOCKET_WITHOUT_UPGRADE}"));
-                }
-                Some(HttpResponseWebSocket::Worker(_)) => {
-                    return Err(format!("TypeError: {WEBSOCKET_WITHOUT_UPGRADE}"));
-                }
-                None => {}
-            }
-        }
+        refuse_unrequested_websocket(&mut response, upgrade)?;
         // A loaded worker can answer with an upgrade, and the caller may bind
         // or return its socket, so the grant names this request as its owner.
         encode_granted_response(ws_owner, response, &stream_service)
@@ -9516,6 +9503,26 @@ fn op_do_id(
             .unwrap()
             .into(),
     );
+}
+
+/// A socket answers only a fetch that asked to upgrade. For one that did not,
+/// release the socket and return the `TypeError`: dropping a Worker's socket
+/// closes it, a cell's needs the explicit close, and a tunneled cell's parked
+/// peer upgrade is taken out so loaded code cannot strand it.
+fn refuse_unrequested_websocket(response: &mut HttpResponse, upgrade: bool) -> Result<(), String> {
+    use crate::cell_dispatch::{take_tunnel_upgrade, WEBSOCKET_WITHOUT_UPGRADE};
+    if upgrade {
+        return Ok(());
+    }
+    match response.websocket.take() {
+        Some(HttpResponseWebSocket::Cell(target)) => match target.tunnel {
+            Some(parked) => drop(take_tunnel_upgrade(parked)),
+            None => ws_close(target.id, 1006, WEBSOCKET_WITHOUT_UPGRADE),
+        },
+        Some(HttpResponseWebSocket::Worker(_)) => {}
+        None => return Ok(()),
+    }
+    Err(format!("TypeError: {WEBSOCKET_WITHOUT_UPGRADE}"))
 }
 
 /// Encode a response for the request `owner`. A cell's WebSocket the response
@@ -11844,5 +11851,50 @@ mod current_context_tests {
         }
         assert!(CURRENT.with(|current| current.borrow().is_none()));
         assert!(std::sync::Arc::ptr_eq(&default, &current_context()));
+    }
+}
+
+#[cfg(test)]
+mod refuse_unrequested_websocket_tests {
+    use super::{refuse_unrequested_websocket, HttpResponse, HttpResponseWebSocket, WsTarget};
+    use crate::cell_dispatch::{park_tunnel_upgrade, take_tunnel_upgrade};
+
+    fn tunneled_response() -> (HttpResponse, u64) {
+        let mut upgraded = hyper::Response::new(());
+        let parked = park_tunnel_upgrade(hyper::upgrade::on(&mut upgraded));
+        let response = HttpResponse {
+            status: 101,
+            body: Vec::new(),
+            stream: None,
+            headers: Vec::new(),
+            websocket: Some(HttpResponseWebSocket::Cell(WsTarget {
+                id: 0,
+                scope: String::new(),
+                tunnel: Some(parked),
+            })),
+            write_position: None,
+            observed_position: None,
+        };
+        (response, parked)
+    }
+
+    #[test]
+    fn a_refused_tunneled_socket_releases_its_parked_upgrade() {
+        let (mut response, parked) = tunneled_response();
+        let error = refuse_unrequested_websocket(&mut response, false).unwrap_err();
+        assert!(error.starts_with("TypeError: "), "{error}");
+        assert!(response.websocket.is_none());
+        assert!(
+            take_tunnel_upgrade(parked).is_none(),
+            "the parked upgrade survived the refusal"
+        );
+    }
+
+    #[test]
+    fn a_requested_upgrade_keeps_its_parked_upgrade() {
+        let (mut response, parked) = tunneled_response();
+        refuse_unrequested_websocket(&mut response, true).unwrap();
+        assert!(response.websocket.is_some());
+        assert!(take_tunnel_upgrade(parked).is_some());
     }
 }

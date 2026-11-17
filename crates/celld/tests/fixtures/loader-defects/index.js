@@ -162,6 +162,19 @@ export default {
     }
     if (url.pathname === "/outbound-state") return Response.json(outbound);
     // A Fetcher answers the loaded Worker's `fetch()` with a socket.
+    // A service-binding fetch that did not ask to upgrade, answered with a 101.
+    // Props send the call through the host, as a call to another script goes.
+    if (url.pathname === "/svc-plain") {
+      let threw = null;
+      let status = null;
+      try {
+        status = (await ctx.exports.Outbound({ props: {} }).fetch("http://svc/upgrade")).status;
+      } catch (error) {
+        threw = String(error);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      return Response.json({ threw, status, state: outbound });
+    }
     if (url.pathname === "/outbound-upgraded") {
       const worker = load(env, "upgraded", UPGRADED_CODE, "main.js", {}, {
         globalOutbound: ctx.exports.Outbound,
