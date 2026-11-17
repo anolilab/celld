@@ -122,7 +122,13 @@ impl DevState {
                 // creates, so a `DIR/<hash>` that another user planted must be
                 // refused before it is used.
                 self.ensure_not_redirected("use")?;
-                crate::config_dir::create_private(root)
+                crate::config_dir::create_private(root)?;
+                // In a directory others can write to, a link or directory can
+                // be planted between the first check and the create, which
+                // accepts an existing path. Checking again once `DIR/<hash>`
+                // exists closes that window: from then on it is ours, private,
+                // and nobody else can create the levels below it.
+                self.ensure_not_redirected("use")
             }
             None => Ok(()),
         }
