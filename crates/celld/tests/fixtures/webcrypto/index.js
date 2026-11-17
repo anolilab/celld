@@ -302,6 +302,88 @@ const checks = {
   "RSASSA-PKCS1-v1_5": () =>
     signature("RSASSA-PKCS1-v1_5", V["RSASSA-PKCS1-v1_5"], { hash: "SHA-256" }, true),
   "RSA-PSS": () => signature("RSA-PSS", V["RSA-PSS"], { hash: "SHA-256", saltLength: 32 }, false),
+  // Verification checks the salt length it is given.
+  async "RSA-PSS salt length"() {
+    const vector = V["RSA-PSS"];
+    const pub = await subtle.importKey("spki", unhex(vector.spki), { name: "RSA-PSS", hash: "SHA-256" }, true, ["verify"]);
+    const reference = unhex(vector.signature);
+    equal(await subtle.verify({ name: "RSA-PSS", saltLength: 32 }, pub, reference, message), true, "the salt it was made with");
+    equal(await subtle.verify({ name: "RSA-PSS", saltLength: 20 }, pub, reference, message), false, "another salt length");
+  },
+  // An EC public key's `raw` form is the uncompressed point, which is the
+  // bit string at the end of its SPKI document.
+  ...Object.fromEntries(["ECDSA", "ECDH"].flatMap((name) =>
+    [["P-256", 65], ["P-384", 97], ["P-521", 133]].map(([curve, size]) => [
+      `${name} ${curve} raw`,
+      async () => {
+        const vector = V[`${name} ${curve}`];
+        const algorithm = { name, namedCurve: curve, hash: vector.hash };
+        const usages = name === "ECDSA" ? ["verify"] : [];
+        // The ECDH vector names the peer's SPKI; ECDSA names its own.
+        const spki = vector.spki ?? vector.peer;
+        const pub = await subtle.importKey("spki", unhex(spki), algorithm, true, usages);
+        const raw = await subtle.exportKey("raw", pub);
+        equal(raw.byteLength, size, "raw length");
+        equal(hex(raw), spki.slice(-2 * size), "raw is the uncompressed point");
+        const back = await subtle.importKey("raw", raw, algorithm, true, usages);
+        equal(hex(await subtle.exportKey("spki", back)), spki, "spki after a raw round trip");
+        equal(back.algorithm.namedCurve, curve, "curve");
+        equal(back.type, "public", "key type");
+        if (name === "ECDSA") {
+          equal(await subtle.verify(algorithm, back, unhex(vector.signature), message), true, "reference verifies with the raw key");
+        } else {
+          const priv = await subtle.importKey("pkcs8", unhex(vector.pkcs8), algorithm, false, ["deriveBits"]);
+          equal(hex(await subtle.deriveBits({ name, public: back }, priv, vector.length)), vector.shared, "shared secret with a raw peer");
+        }
+        // A point off the curve and a wrong length are refused.
+        const refused = async (data) => subtle.importKey("raw", data, algorithm, true, usages).then(() => "imported", (error) => error.name);
+        const off = new Uint8Array(raw.slice(0));
+        off[off.length - 1] ^= 1;
+        equal(await refused(off), "DataError", "point off the curve");
+        equal(await refused(raw.slice(0, size - 1)), "DataError", "short point");
+        const rsa = await subtle.importKey("spki", unhex(V["RSA-PSS"].spki), { name: "RSA-PSS", hash: "SHA-256" }, true, ["verify"]);
+        const rsaRaw = await subtle.exportKey("raw", rsa).then(() => "exported", (error) => error.name);
+        equal(rsaRaw, "NotSupportedError", "RSA raw export");
+      },
+    ]))),
+  // Celld reads the uncompressed point only, and says so for a compressed one.
+  async "EC compressed raw key"() {
+    const compressed = new Uint8Array(33);
+    compressed[0] = 2;
+    const error = await subtle.importKey("raw", compressed, { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]).then(() => null, (e) => e);
+    equal(error?.name, "NotSupportedError", "error name");
+    equal(/compressed/.test(error.message), true, "the error names the format");
+  },
+  // RFC 3394 section 4.1 and 4.3 vectors, and the errors the spec names.
+  async "AES-KW"() {
+    const unwrapUsages = ["wrapKey", "unwrapKey"];
+    const kek = (text) => subtle.importKey("raw", unhex(text), "AES-KW", true, unwrapUsages);
+    const keyData = unhex("00112233445566778899aabbccddeeff");
+    const target = await subtle.importKey("raw", keyData, "AES-CBC", true, ["encrypt"]);
+    for (const [key, wrapped] of [
+      ["000102030405060708090a0b0c0d0e0f", "1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5"],
+      ["000102030405060708090a0b0c0d0e0f1011121314151617", "96778b25ae6ca435f92b5b97c050aed2468ab8a17ad84e5d"],
+      ["000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "64e8c3f9ce0f5ba263e9777905818a2a93c8191e7d6e8ae7"],
+    ]) {
+      const wrapping = await kek(key);
+      equal(wrapping.algorithm.name, "AES-KW", "algorithm name");
+      equal(hex(await subtle.wrapKey("raw", target, wrapping, "AES-KW")), wrapped, `wrap under a ${key.length * 4}-bit key`);
+      const back = await subtle.unwrapKey("raw", unhex(wrapped), wrapping, "AES-KW", "AES-CBC", true, ["encrypt"]);
+      equal(hex(await subtle.exportKey("raw", back)), hex(keyData), "unwrapped key");
+    }
+    const wrapping = await kek("000102030405060708090a0b0c0d0e0f");
+    const outcome = (promise) => promise.then(() => "ok", (error) => error.name);
+    const altered = new Uint8Array(unhex("1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5"));
+    altered[0] ^= 1;
+    equal(await outcome(subtle.unwrapKey("raw", altered, wrapping, "AES-KW", "AES-CBC", true, ["encrypt"])), "OperationError", "altered wrapped key");
+    const wrapOnly = await subtle.importKey("raw", unhex("000102030405060708090a0b0c0d0e0f"), "AES-KW", true, ["wrapKey"]);
+    equal(await outcome(subtle.unwrapKey("raw", unhex("1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5"), wrapOnly, "AES-KW", "AES-CBC", true, ["encrypt"])), "InvalidAccessError", "unwrap without the usage");
+    equal(await outcome(subtle.encrypt({ name: "AES-KW" }, wrapping, keyData)), "NotSupportedError", "AES-KW has no encrypt");
+    equal(await outcome(subtle.importKey("raw", new Uint8Array(15), "AES-KW", true, unwrapUsages)), "DataError", "a 120-bit key");
+    const generated = await subtle.generateKey({ name: "AES-KW", length: 256 }, true, unwrapUsages);
+    const sealed = await subtle.wrapKey("raw", target, generated, "AES-KW");
+    equal(sealed.byteLength, 24, "wrapped length");
+  },
   async "RSA-OAEP"() {
     const vector = V["RSA-OAEP"];
     const algorithm = { name: "RSA-OAEP", hash: "SHA-256" };

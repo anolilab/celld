@@ -890,10 +890,10 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             };
             Ok(serde_json::json!({ "ok": ok }))
         }
-        // Web Crypto RSA-PSS. Signing takes the caller's salt length —
-        // the spec makes it an explicit parameter — and verification
-        // recovers the salt length from the signature, which accepts
-        // every salt the signer could legally have used.
+        // RSA-PSS. Signing takes the caller's salt length (the spec makes it
+        // an explicit parameter). Verification checks the salt length it is
+        // given, and recovers it from the signature when none is given,
+        // which accepts every salt the signer could legally have used.
         "rsa-pss-sign" => {
             use rsa::pkcs8::DecodePrivateKey;
             use rsa::signature::RandomizedSigner;
@@ -936,11 +936,18 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("SHA-256")
                 .to_string();
+            let salt_len = args
+                .get("saltLength")
+                .and_then(serde_json::Value::as_u64)
+                .map(|len| len as usize);
             let key = rsa::PublicKey::from_public_key_der(&key)
                 .map_err(|_| anyhow!("invalid RSA SPKI key"))?;
             macro_rules! verify {
                 ($hash:ty) => {{
-                    let key = rsa::pss::VerifyingKey::<$hash>::new(key);
+                    let key = match salt_len {
+                        Some(len) => rsa::pss::VerifyingKey::<$hash>::new_with_salt_len(key, len),
+                        None => rsa::pss::VerifyingKey::<$hash>::new_with_auto_salt_len(key),
+                    };
                     rsa::pss::Signature::try_from(signature.as_slice())
                         .map(|signature| key.verify(&data, &signature).is_ok())
                         .unwrap_or(false)
@@ -953,6 +960,15 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 other => return Err(anyhow!("unsupported RSA verify hash {other}")),
             };
             Ok(serde_json::json!({ "ok": ok }))
+        }
+        // AES Key Wrap (RFC 3394). `unwrap` is false for wrap. A wrong
+        // key or altered data is `{ "bytes": null }`, which `crypto.js`
+        // turns into the OperationError Web Crypto names.
+        "aes-kw-wrap" | "aes-kw-unwrap" => {
+            let key = crypto_bytes(args, "key")?;
+            let data = crypto_bytes(args, "data")?;
+            let bytes = aes_key_wrap(&key, &data, operation == "aes-kw-wrap")?;
+            Ok(serde_json::json!({ "bytes": bytes }))
         }
         "rsa-oaep-encrypt" => {
             use rsa::pkcs8::DecodePublicKey;
@@ -2033,6 +2049,153 @@ fn webcrypto_aes_block_mode(
         other => Err(anyhow!(
             "AES-CBC requires a 128- or 256-bit key, got {other} bytes"
         )),
+    }
+}
+
+/// AES Key Wrap, RFC 3394. Wrapping takes a multiple of 8 bytes, at least 16,
+/// and returns 8 more; unwrapping returns `None` when the integrity register
+/// does not come back as the default IV, which is what a wrong key or altered
+/// data looks like.
+fn aes_key_wrap(key: &[u8], data: &[u8], wrapping: bool) -> Result<Option<Vec<u8>>> {
+    use aes::cipher::consts::U16;
+    use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, BlockSizeUser, KeyInit};
+    const IV: [u8; 8] = [0xA6; 8];
+    if !data.len().is_multiple_of(8) || data.len() < if wrapping { 16 } else { 24 } {
+        return Err(anyhow!(
+            "AES-KW data must be a multiple of 8 bytes, at least {}",
+            if wrapping { 16 } else { 24 }
+        ));
+    }
+    fn run<
+        C: BlockCipherEncrypt + BlockCipherDecrypt + KeyInit + BlockSizeUser<BlockSize = U16>,
+    >(
+        key: &[u8],
+        data: &[u8],
+        wrapping: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        let cipher = C::new_from_slice(key).map_err(|_| anyhow!("invalid AES-KW key"))?;
+        let mut a: [u8; 8] = if wrapping {
+            IV
+        } else {
+            data[..8].try_into().expect("8 bytes")
+        };
+        let mut r: Vec<[u8; 8]> = data[if wrapping { 0 } else { 8 }..].as_chunks().0.to_vec();
+        let n = r.len() as u64;
+        let mut block = aes::Block::default();
+        for j in 0..6u64 {
+            for i in 1..=n {
+                // Unwrapping walks the rounds and the registers backwards.
+                let (round, index) = if wrapping { (j, i) } else { (5 - j, n + 1 - i) };
+                let t = (n * round + index).to_be_bytes();
+                let slot = &mut r[(index - 1) as usize];
+                if wrapping {
+                    block[..8].copy_from_slice(&a);
+                    block[8..].copy_from_slice(slot);
+                    cipher.encrypt_block(&mut block);
+                    a = block[..8].try_into().expect("8 bytes");
+                    a.iter_mut().zip(t).for_each(|(byte, t)| *byte ^= t);
+                } else {
+                    block[..8]
+                        .iter_mut()
+                        .zip(a.iter().zip(t))
+                        .for_each(|(byte, (a, t))| *byte = a ^ t);
+                    block[8..].copy_from_slice(slot);
+                    cipher.decrypt_block(&mut block);
+                    a = block[..8].try_into().expect("8 bytes");
+                }
+                slot.copy_from_slice(&block[8..]);
+            }
+        }
+        if !wrapping && a != IV {
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(data.len() + 8);
+        if wrapping {
+            out.extend_from_slice(&a);
+        }
+        out.extend(r.iter().flatten());
+        Ok(Some(out))
+    }
+    match key.len() {
+        16 => run::<aes::Aes128>(key, data, wrapping),
+        24 => run::<aes::Aes192>(key, data, wrapping),
+        32 => run::<aes::Aes256>(key, data, wrapping),
+        other => Err(anyhow!(
+            "AES-KW requires a 128-, 192- or 256-bit key, got {other} bytes"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod aes_kw_tests {
+    use super::aes_key_wrap;
+
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // RFC 3394 section 4: each case wraps key data under a KEK.
+    const VECTORS: [(&str, &str, &str); 6] = [
+        (
+            "000102030405060708090A0B0C0D0E0F",
+            "00112233445566778899AABBCCDDEEFF",
+            "1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5",
+        ),
+        (
+            "000102030405060708090A0B0C0D0E0F1011121314151617",
+            "00112233445566778899AABBCCDDEEFF",
+            "96778B25AE6CA435F92B5B97C050AED2468AB8A17AD84E5D",
+        ),
+        (
+            "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F",
+            "00112233445566778899AABBCCDDEEFF",
+            "64E8C3F9CE0F5BA263E9777905818A2A93C8191E7D6E8AE7",
+        ),
+        (
+            "000102030405060708090A0B0C0D0E0F1011121314151617",
+            "00112233445566778899AABBCCDDEEFF0001020304050607",
+            "031D33264E15D33268F24EC260743EDCE1C6C7DDEE725A936BA814915C6762D2",
+        ),
+        (
+            "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F",
+            "00112233445566778899AABBCCDDEEFF0001020304050607",
+            "A8F9BC1612C68B3FF6E6F4FBE30E71E4769C8B80A32CB8958CD5D17D6B254DA1",
+        ),
+        (
+            "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F",
+            "00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F",
+            "28C9F404C4B810F4CBCCB35CFB87F8263F5786E2D80ED326CBC7F0E71A99F43BFB988B9B7A02DD21",
+        ),
+    ];
+
+    #[test]
+    fn matches_the_rfc_3394_vectors() {
+        for (kek, data, wrapped) in VECTORS {
+            let (kek, data, wrapped) = (hex(kek), hex(data), hex(wrapped));
+            assert_eq!(
+                aes_key_wrap(&kek, &data, true).unwrap(),
+                Some(wrapped.clone())
+            );
+            assert_eq!(aes_key_wrap(&kek, &wrapped, false).unwrap(), Some(data));
+        }
+    }
+
+    #[test]
+    fn altered_data_or_a_wrong_key_does_not_unwrap() {
+        let (kek, _, wrapped) = VECTORS[0];
+        let mut wrapped = hex(wrapped);
+        wrapped[3] ^= 1;
+        assert_eq!(aes_key_wrap(&hex(kek), &wrapped, false).unwrap(), None);
+    }
+
+    #[test]
+    fn refuses_data_that_is_not_whole_registers() {
+        assert!(aes_key_wrap(&[0; 16], &[0; 15], true).is_err());
+        assert!(aes_key_wrap(&[0; 16], &[0; 8], true).is_err());
+        assert!(aes_key_wrap(&[0; 16], &[0; 16], false).is_err());
     }
 }
 

@@ -18,7 +18,7 @@
     "SHA-1", "SHA-256", "SHA-384", "SHA-512", "MD5",
   ]);
   const _SECRET_KEY_ALGS = new Set(
-    ["HMAC", "AES-GCM", "AES-CBC", "AES-CTR"],
+    ["HMAC", "AES-GCM", "AES-CBC", "AES-CTR", "AES-KW"],
   );
   // Cloudflare accepts its own pre-standard curve spellings beside the
   // standard ones.
@@ -31,6 +31,16 @@
     "P-521": "P-521", "secp521r1": "P-521",
   };
   const _canonicalEcCurve = (curve) => _EC_CURVES[_curveName(curve)];
+  // Bytes of one coordinate of an EC point, by curve.
+  const _EC_COORDINATE_BYTES = { "P-256": 32, "P-384": 48, "P-521": 66 };
+  const _b64urlEncode = (bytes) =>
+    btoa(String.fromCharCode(...bytes))
+      .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+  const _b64urlDecode = (text) =>
+    Uint8Array.from(
+      atob(text.replaceAll("-", "+").replaceAll("_", "/")),
+      (char) => char.charCodeAt(0),
+    );
   // The asymmetric algorithms, as the uppercased name `_algorithmName`
   // produces mapped to the spelling `key.algorithm.name` reports. The
   // uppercased form is for lookup only: echoing it back names an algorithm
@@ -208,6 +218,31 @@
     return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
   }
 
+  // RFC 3394 key wrap. `wrapKey` and `unwrapKey` are the only operations
+  // Web Crypto defines for AES-KW.
+  function _aesKw(key, data, wrapping) {
+    if (_algorithmName(key?.algorithm) !== "AES-KW") {
+      throw new DOMException(
+        "key is not an AES-KW key", "InvalidAccessError");
+    }
+    const usage = wrapping ? "wrapKey" : "unwrapKey";
+    if (!key.usages.includes(usage)) {
+      throw new DOMException(
+        `key does not permit ${usage}`, "InvalidAccessError");
+    }
+    let result;
+    try {
+      result = _extra(wrapping ? "aes-kw-wrap" : "aes-kw-unwrap", {
+        key: Array.from(key.__celldMaterial.bytes),
+        data: Array.from(_toBuf(data)),
+      });
+    } catch (error) {
+      throw _operationError(String(error?.message ?? error));
+    }
+    if (!result.bytes) throw _operationError("AES-KW unwrap failed");
+    return Uint8Array.from(result.bytes).buffer;
+  }
+
   class SubtleCrypto {
     get [Symbol.toStringTag]() { return "SubtleCrypto"; }
 
@@ -236,6 +271,10 @@
       }
       if (format === "raw" && _SECRET_KEY_ALGS.has(name)) {
         const raw = _toBuf(keyData).slice();
+        if (name === "AES-KW" && ![16, 24, 32].includes(raw.byteLength)) {
+          throw new DOMException(
+            "AES-KW keys must be 128, 192 or 256 bits", "DataError");
+        }
         const normalized = name === "HMAC"
           ? { name, hash: { name: _hashName(algorithm?.hash) }, length: raw.byteLength * 8 }
           : { name, length: raw.byteLength * 8 };
@@ -255,6 +294,56 @@
           visibility: "public",
           passphrase: null,
         });
+        return _makeKey(
+          "public",
+          _keyAlgorithm(name, algorithm, imported.keyType, imported.details),
+          extractable,
+          usages,
+          {
+            bytes: Uint8Array.from(imported.der),
+            keyType: imported.keyType,
+            details: imported.details,
+          },
+        );
+      }
+      // An EC public key's `raw` form is the uncompressed point
+      // `0x04 || X || Y`. It is rebuilt as a JWK, which the host checks
+      // against the curve, so a point that is not on it is a DataError.
+      if (format === "raw" && (name === "ECDSA" || name === "ECDH")) {
+        const curve = _canonicalEcCurve(algorithm?.namedCurve);
+        if (curve === undefined) {
+          throw _notSupported(
+            "unsupported EC namedCurve: " + String(algorithm?.namedCurve));
+        }
+        const point = _toBuf(keyData);
+        const size = _EC_COORDINATE_BYTES[curve];
+        if (point[0] === 2 || point[0] === 3) {
+          throw _notSupported(
+            "compressed EC points are not supported; use the uncompressed " +
+              "0x04 form");
+        }
+        if (point.byteLength !== 1 + 2 * size || point[0] !== 4) {
+          throw new DOMException(
+            `a ${curve} raw public key is the ${1 + 2 * size}-byte ` +
+              "uncompressed point", "DataError");
+        }
+        let imported;
+        try {
+          imported = _extra("asym-key-import", {
+            key: {
+              kty: "EC", crv: curve,
+              x: _b64urlEncode(point.subarray(1, 1 + size)),
+              y: _b64urlEncode(point.subarray(1 + size)),
+            },
+            format: "jwk",
+            type: null,
+            visibility: "public",
+            passphrase: null,
+          });
+        } catch {
+          throw new DOMException(
+            "the point is not on the " + curve + " curve", "DataError");
+        }
         return _makeKey(
           "public",
           _keyAlgorithm(name, algorithm, imported.keyType, imported.details),
@@ -330,7 +419,28 @@
           der: Array.from(key.__celldMaterial.bytes),
         }).bytes).buffer;
       }
-      if (format === "raw" && key?.__celldMaterial?.bytes) {
+      // Likewise an EC public key's `raw` form is its uncompressed point,
+      // not the SPKI document the stored bytes hold.
+      if (format === "raw" && key?.type === "public" &&
+          key.__celldMaterial?.keyType === "ec") {
+        if (!key.extractable) {
+          throw new DOMException("key is not extractable", "InvalidAccessError");
+        }
+        const jwk = _extra("asym-key-export", {
+          der: Array.from(key.__celldMaterial.bytes),
+          visibility: "public",
+        }).jwk;
+        const x = _b64urlDecode(jwk.x), y = _b64urlDecode(jwk.y);
+        const point = new Uint8Array(1 + x.byteLength + y.byteLength);
+        point[0] = 4;
+        point.set(x, 1);
+        point.set(y, 1 + x.byteLength);
+        return point.buffer;
+      }
+      // Only a secret key's stored bytes are its `raw` form. An asymmetric
+      // key's are a DER document, and an RSA key has no `raw` form at all.
+      if (format === "raw" && key?.__celldMaterial?.bytes &&
+          key.__celldMaterial.keyType === undefined) {
         if (!key.extractable) {
           throw new DOMException("key is not extractable", "InvalidAccessError");
         }
@@ -486,8 +596,12 @@
           );
         }
         byteLength = Number(algorithm?.length || 256) / 8;
-        if (byteLength !== 16 && byteLength !== 32) {
-          throw new DOMException("AES-GCM length must be 128 or 256", "OperationError");
+        if (byteLength !== 16 && byteLength !== 32 &&
+            !(name === "AES-KW" && byteLength === 24)) {
+          throw new DOMException(
+            name + " length must be 128 or 256" +
+              (name === "AES-KW" ? " (or 192)" : ""),
+            "OperationError");
         }
         const raw = new Uint8Array(byteLength);
         crypto.getRandomValues(raw);
@@ -646,6 +760,10 @@
         key: Array.from(material),
         data: Array.from(_toBuf(data)),
         signature: Array.from(_toBuf(signature)),
+        // RSA-PSS checks the salt length it is given.
+        saltLength: name === "RSA-PSS" && algorithm?.saltLength != null
+          ? Number(algorithm.saltLength)
+          : null,
         // ECDSA carries its hash on the call, RSASSA on the key.
         hash: _hashName(
           name === "ECDSA" ? algorithm?.hash : key?.algorithm?.hash,
@@ -679,9 +797,20 @@
     // jwk-format key crosses as its JSON bytes.
     async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
       const exported = await this.exportKey(format, key);
-      const raw = format === "jwk"
+      let raw = format === "jwk"
         ? new TextEncoder().encode(JSON.stringify(exported))
-        : exported;
+        : _toBuf(exported);
+      if (_algorithmName(wrapAlgorithm) === "AES-KW") {
+        // AES-KW wraps whole 8-byte registers. Web Crypto pads a JWK with
+        // spaces, which JSON ignores, to get there.
+        if (format === "jwk" && raw.byteLength % 8 !== 0) {
+          const padded = new Uint8Array(Math.ceil(raw.byteLength / 8) * 8)
+            .fill(0x20);
+          padded.set(raw);
+          raw = padded;
+        }
+        return _aesKw(wrappingKey, raw, true);
+      }
       return this.encrypt(wrapAlgorithm, wrappingKey, raw);
     }
 
@@ -689,7 +818,9 @@
       format, wrapped, unwrappingKey, unwrapAlgorithm,
       algorithm, extractable, usages,
     ) {
-      const raw = await this.decrypt(unwrapAlgorithm, unwrappingKey, wrapped);
+      const raw = _algorithmName(unwrapAlgorithm) === "AES-KW"
+        ? _aesKw(unwrappingKey, wrapped, false)
+        : await this.decrypt(unwrapAlgorithm, unwrappingKey, wrapped);
       const keyData = format === "jwk"
         ? JSON.parse(new TextDecoder().decode(raw))
         : raw;

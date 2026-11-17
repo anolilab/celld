@@ -130,7 +130,15 @@ The `tail` and `email` handlers are unavailable.
 - AES-GCM accepts authentication tags from 96 through 128 bits in 8-bit steps.
 - RSA-OAEP accepts SHA-1, SHA-256, SHA-384, and SHA-512. A nonempty label must
   contain valid UTF-8.
+- AES-KW (RFC 3394) wraps and unwraps with 128-, 192- and 256-bit keys through
+  `wrapKey()` and `unwrapKey()`. It has no `encrypt()` or `decrypt()`, as in
+  the specification.
 - A secret key cannot use `jwk` with `exportKey()` or `wrapKey()`.
+- An EC public key uses its uncompressed point (`0x04 || X || Y`) for the
+  `raw` format, for ECDSA and ECDH on P-256, P-384 and P-521. `importKey()`
+  rejects a compressed point with a `NotSupportedError`, and a point that is not
+  on the curve with a `DataError`. An RSA key has no `raw` format.
+- RSA-PSS `verify()` checks the `saltLength` it is given.
 - Ed25519 signs and verifies, and `NODE-ED25519` names the same algorithm. A
   signature from one spelling verifies under the other.
 - X25519 derives bits and keys. A peer key of a low order gives a shared secret
@@ -152,8 +160,13 @@ execution.
   `node:diagnostics_channel`, `node:events`, `node:fs`, `node:os`, `node:path`,
   `node:stream`, `node:timers/promises`, and `node:util`.
 - `node:diagnostics_channel` does not export messages to a tail Worker.
-- `node:crypto` does not implement Diffie-Hellman, streaming signatures,
-  ciphers, RSA-PSS, or DSA signatures and key generation.
+- `node:crypto` does not implement Diffie-Hellman, streaming signatures
+  (`createSign()`, `createVerify()`), ciphers, or DSA signatures and key
+  generation.
+- `crypto.sign()` and `crypto.verify()` honour `padding` with
+  `RSA_PKCS1_PSS_PADDING` and `saltLength`, and `dsaEncoding` with `der` or
+  `ieee-p1363`. A padding other than PKCS#1 v1.5 and PSS throws instead of
+  signing another way.
 - `scrypt()` and `scryptSync()` take Node.js's parameters (`N`, `r`, `p`,
   `maxmem`, and the `cost`, `blockSize` and `parallelization` aliases), its
   defaults, and its errors. Both throw for rejected parameters; `scrypt()`
