@@ -54,6 +54,7 @@ async fn stage_variant(server: &Server) -> String {
         region: None,
         dry_run: false,
         strict: false,
+        allow_unknown_compat_flags: false,
         json: false,
         no_activate: true,
         vars: VarOverrides::None,

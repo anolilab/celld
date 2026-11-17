@@ -243,6 +243,13 @@ Wrangler configuration key stops the deploy. See
 A node verifies the SHA-256 digest of each module before it builds a
 deployment.
 
+`celld deploy` and `celld dev` fail when `compatibility_flags` holds a flag
+that celld does not support, or one it does not know, and name each.
+`--allow-unknown-compat-flags` accepts an unknown flag with a warning, never an
+unsupported one. The
+[compatibility flags table](cloudflare-compat.md#compatibility-flags) gives the
+status of each known flag.
+
 `celld deploy` lists each `node:` module the bundle imports that celld does
 not implement, with the module to use instead where there is one. The list is
 a warning; `--strict` makes it an error. Importing such a module still works

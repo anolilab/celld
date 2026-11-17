@@ -64,6 +64,7 @@ fn build(tag: Option<&str>) -> celld::deploy::Built {
         json: false,
         no_activate: false,
         strict: false,
+        allow_unknown_compat_flags: false,
         vars: celld::deploy::VarOverrides::None,
         local_images: true,
         sourcemap: None,

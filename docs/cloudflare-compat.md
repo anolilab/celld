@@ -290,17 +290,96 @@ The class exists so that a bundle can load, but its constructor throws.
 
 ## Compatibility flags
 
-celld honors these compatibility flags:
+`celld deploy` and `celld dev` check `compatibility_flags` against the table
+below when they build, so a flag costs nothing at runtime.
 
-- `delete_all_deletes_alarm`
-- `js_rpc`
-- `fetcher_no_get_put_delete`
-- `sqlite_vec`
-- `websocket_standard_binary_type`
-- The static-assets navigation flags
+- **Honoured**: celld implements the flag. A date in "implied from" turns the
+  behavior on for that compatibility date and later, with no flag; the flag
+  turns it on for an earlier date, and its opt-out turns it off.
+- **Always on**: celld behaves as if the flag is set. Setting it is accepted.
+- **Not applicable**: the flag has no meaning on celld. Setting it is accepted
+  and changes nothing.
+- **Unsupported**: celld does not implement the flag. The build fails and
+  names it.
 
-celld accepts every other flag without effect.
-`Cloudflare.compatibilityFlags` reports only the honored flags.
+A flag that is not in the table also fails the build, because celld cannot
+show that it behaves as the config expects. `--allow-unknown-compat-flags`
+(on `celld deploy` and `celld dev`) accepts such a flag with a warning; it
+never accepts an unsupported one. The static-assets navigation flags are in the
+table. A Dynamic Worker's `compatibilityFlags` are not checked.
+
+`Cloudflare.compatibilityFlags` reports a subset: the flags celld applies and
+that a Worker may test.
+
+<!-- compat-flags:start -->
+| flag | status | implied from | notes |
+| --- | --- | --- | --- |
+| `delete_all_deletes_alarm` | **Honoured** | 2026-02-24 | `deleteAll()` also deletes the alarm. |
+| `delete_all_preserves_alarm` | **Honoured** |  | `deleteAll()` keeps the alarm; turns off `delete_all_deletes_alarm`. |
+| `js_rpc` | **Honoured** |  | RPC on a Durable Object class that does not extend `DurableObject`. |
+| `fetcher_no_get_put_delete` | **Honoured** | 2024-03-26 | A stub has no `get()`, `put()` or `delete()` helper. |
+| `fetcher_has_get_put_delete` | **Honoured** |  | A stub keeps the `get()`, `put()` and `delete()` helpers; turns off `fetcher_no_get_put_delete`. |
+| `sqlite_vec` | **Honoured** |  | SQLite-backed Durable Objects get the sqlite-vec extension. |
+| `websocket_standard_binary_type` | **Honoured** |  | A WebSocket's `binaryType` defaults to `blob`. celld has no date default for it. |
+| `queue_json_messages` | **Honoured** | 2024-03-18 | A queue message body defaults to JSON instead of V8 structured clone. |
+| `queue_v8_messages` | **Honoured** |  | A queue message body defaults to V8 structured clone; turns off `queue_json_messages`. |
+| `nodejs_compat` | **Honoured** |  | Lets `process.env` hold the Worker's vars. celld provides the `node:` modules without it. |
+| `nodejs_compat_v2` | **Honoured** |  | The same as `nodejs_compat`. |
+| `nodejs_compat_populate_process_env` | **Honoured** | 2025-04-01 | With `nodejs_compat`, `process.env` holds the Worker's text vars and secrets. |
+| `nodejs_compat_do_not_populate_process_env` | **Honoured** |  | `process.env` stays empty; turns off `nodejs_compat_populate_process_env`. |
+| `assets_navigation_prefers_asset_serving` | **Honoured** | 2025-04-01 | A browser navigation request is served from the assets before the Worker runs. |
+| `assets_navigation_has_no_effect` | **Honoured** |  | A navigation request is routed like any other; turns off `assets_navigation_prefers_asset_serving`. |
+| `python_workers` | **Honoured** |  | Required for a Python entry. |
+| `python_workers_20250116` | **Honoured** | 2025-09-29 | Pyodide 0.28, the only line celld runs. |
+| `enable_python_external_sdk` | **Honoured** | 2026-04-21 | The vendored Workers SDK, the only one celld runs. |
+| `python_no_global_handlers` | **Honoured** | 2025-08-14 | Handlers are `Default` entrypoint classes, the only form celld runs. |
+| `python_workers_force_new_vendor_path` | **Honoured** | 2025-08-11 | Vendored packages come from `python_modules`, the only path celld uses. |
+| `python_process_pth_files` | **Honoured** | 2026-05-26 | A `.pth` file in a vendored package is processed. |
+| `disable_python_process_pth_files` | **Honoured** |  | `.pth` files are not processed; turns off `python_process_pth_files`. |
+| `python_request_headers_preserve_commas` | **Honoured** | 2026-02-17 | A request header value keeps its commas. |
+| `disable_python_request_headers_preserve_commas` | **Honoured** |  | Turns off `python_request_headers_preserve_commas`. |
+| `python_workflows_implicit_dependencies` | **Honoured** |  | Python Workflow steps get implicit dependencies. |
+| `no_python_workflows_implicit_dependencies` | **Honoured** |  | Turns off `python_workflows_implicit_dependencies`. |
+| `no_python_workers_314` | **Honoured** |  | Keeps Pyodide 0.28 on a date that selects Python 3.14 on Cloudflare. |
+| `upper_case_all_http_methods` | **Always on** |  | `Request` upper-cases every method. |
+| `capture_async_api_throws` | **Always on** |  | An async API reports an error as a rejected promise. |
+| `global_navigator` | **Always on** |  | `navigator` is a global. |
+| `streams_enable_constructors` | **Always on** |  | `ReadableStream` and `WritableStream` have their standard constructors. |
+| `transformstream_enable_standard_constructor` | **Always on** |  | `TransformStream` has its standard constructor. |
+| `formdata_parser_supports_files` | **Always on** |  | `formData()` returns a `File` for a file part. |
+| `http_headers_getsetcookie` | **Always on** |  | `Headers.getSetCookie()` exists. |
+| `url_standard` | **Always on** |  | `URL` follows the WHATWG URL standard. |
+| `fetch_refuses_unknown_protocols` | **Always on** |  | `fetch()` rejects a URL with a scheme other than `http` and `https`. |
+| `nodejs_als` | **Always on** |  | `AsyncLocalStorage` is available. |
+| `nodejs_zlib` | **Always on** |  | `node:zlib` is available, limited to the synchronous gzip and deflate functions. |
+| `enable_nodejs_fs_module` | **Always on** |  | `node:fs` is available, as described under Node.js compatibility. |
+| `enable_ctx_exports` | **Always on** |  | `ctx.exports` is available. |
+| `enable_nodejs_process_v2` | **Always on** |  | The global `process` and `node:process`, with the fields celld defines. |
+| `r2_list_honor_include` | **Always on** |  | An R2 listing honours `include`. |
+| `tcp_sockets_support` | **Always on** |  | `connect()` from `cloudflare:sockets` is available. |
+| `experimental` | **Not applicable** |  | Unlocks experimental workerd APIs. celld decides each of them by its own flag. |
+| `minimal_subrequests` | **Not applicable** |  | celld has no CDN, so a subrequest has no edge features to drop. |
+| `global_fetch_strictly_public` | **Not applicable** |  | celld has no zones. The fleet network and `CELLD_EXTRA_CA_CERTS` govern egress. |
+| `no_cots_on_external_fetch` | **Not applicable** |  | celld has no Cloudflare-to-Cloudflare subrequest path. |
+| `request_cf_overrides_cache_rules` | **Not applicable** |  | celld has no edge cache rules for `cf` to override. |
+| `export_commonjs_default` | **Not applicable** |  | esbuild bundles a CommonJS module in `celld deploy`; celld has no module loader to configure. |
+| `cache_option_enabled` | **Unsupported** |  | The `cache` request option throws on celld. |
+| `no_global_navigator` | **Unsupported** |  | `navigator` is always a global. |
+| `url_original` | **Unsupported** |  | celld has only the WHATWG `URL`. |
+| `formdata_parser_converts_files_to_strings` | **Unsupported** |  | `formData()` always returns a `File` for a file part. |
+| `no_nodejs_compat_v2` | **Unsupported** |  | celld has no polyfill-based `nodejs_compat` to fall back to. |
+| `enable_nodejs_http_modules` | **Unsupported** |  | `node:http` and `node:https` are not implemented. |
+| `enable_nodejs_http_server_modules` | **Unsupported** |  | `node:http` servers are not implemented. |
+| `enable_nodejs_tty_module` | **Unsupported** |  | `node:tty` is not implemented. |
+| `enable_nodejs_vm_module` | **Unsupported** |  | `node:vm` is not implemented. |
+| `streaming_tail_worker` | **Unsupported** |  | The `tail` handler is unavailable. |
+| `python_workers_314` | **Unsupported** |  | celld runs Pyodide 0.28 (Python 3.13). |
+| `python_workers_20260610` | **Unsupported** |  | celld runs Pyodide 0.28 (Python 3.13). |
+| `python_workers_development` | **Unsupported** |  | celld runs Pyodide 0.28 (Python 3.13). |
+| `no_python_workers_20250116` | **Unsupported** |  | celld runs only Pyodide 0.28. |
+| `disable_python_external_sdk` | **Unsupported** |  | celld runs only the vendored Workers SDK. |
+| `disable_python_no_global_handlers` | **Unsupported** |  | celld runs only `Default` entrypoint classes. |
+<!-- compat-flags:end -->
 
 ## Wrangler configuration
 
