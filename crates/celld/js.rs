@@ -6319,6 +6319,9 @@ ops! { OP_NAMES, install_op_functions,
         "__pending_event_end" => op_pending_event_end,
         "__vfs_mkdir" => op_vfs_mkdir,
         "__vfs_read_file" => op_vfs_read_file,
+        "__vfs_readdir" => op_vfs_readdir,
+        "__vfs_remove" => op_vfs_remove,
+        "__vfs_write" => op_vfs_write,
         "__vfs_stat" => op_vfs_stat,
         "__wait_until" => op_wait_until,
         "__wait_until_active" => op_wait_until_active,
@@ -9831,19 +9834,35 @@ struct IoEventState {
 
 /// The writable directory subset of Workerd's per-request virtual filesystem.
 ///
-/// The first compatibility slice stores directories only. Keeping the tree on
-/// `IoContext` is the isolation mechanism: async continuations for one request
-/// share it, while a concurrent or later request receives a different tree.
-/// No path can escape into the host filesystem.
+/// Keeping the tree on `IoContext` is the isolation mechanism: async
+/// continuations for one request share it, while a concurrent or later request
+/// receives a different tree. No path can escape into the host filesystem, and
+/// the tree is freed with the request.
+///
+/// The tree lives in memory, so `used` bounds what one request can make the
+/// node hold: file bytes plus a fixed charge per entry, so a request cannot
+/// get around the cap with many empty files or directories.
 struct RequestVfs {
     nodes: HashMap<String, VfsNode>,
+    used: usize,
 }
 
-/// Keep the node kind in the tree, even while the first slice can only create
-/// directories. Deno's VFS uses the same entry-typed shape; a path-only set
-/// would make a later file node indistinguishable from its parent directory.
+/// The most memory one request's `/tmp` may hold.
+const VFS_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Charged for each entry on top of its path and bytes.
+const VFS_NODE_OVERHEAD: usize = 64;
+
+/// A file has no kind but its bytes; a path-only set would make a file
+/// indistinguishable from its parent directory.
 enum VfsNode {
     Directory { writable: bool },
+    File(Vec<u8>),
+}
+
+enum VfsStat {
+    Directory { writable: bool },
+    File(usize),
 }
 
 /// The read-only `/bundle` projection of a worker's own modules.
@@ -9950,6 +9969,7 @@ impl Default for RequestVfs {
             .into_iter()
             .map(|(path, writable)| (path.to_string(), VfsNode::Directory { writable }))
             .collect(),
+            used: 0,
         }
     }
 }
@@ -9975,18 +9995,50 @@ impl Default for InputGateClaims {
 }
 
 impl RequestVfs {
-    fn stat(&self, path: &str) -> Option<bool> {
+    fn stat(&self, path: &str) -> Option<VfsStat> {
         self.nodes.get(path).map(|node| match node {
-            VfsNode::Directory { writable } => *writable,
+            VfsNode::Directory { writable } => VfsStat::Directory {
+                writable: *writable,
+            },
+            VfsNode::File(bytes) => VfsStat::File(bytes.len()),
         })
     }
 
+    /// Only `/tmp` is writable; everything else answers `EPERM`.
+    fn writable_path(path: &str) -> bool {
+        path == "/tmp" || path.starts_with("/tmp/")
+    }
+
+    fn parent_of(path: &str) -> &str {
+        match path.rsplit_once('/') {
+            Some(("", _)) | None => "/",
+            Some((parent, _)) => parent,
+        }
+    }
+
+    /// Make room for `extra` more bytes, or refuse without changing anything.
+    fn charge(&mut self, extra: usize) -> Result<(), &'static str> {
+        match self.used.checked_add(extra) {
+            Some(total) if total <= VFS_MAX_BYTES => {
+                self.used = total;
+                Ok(())
+            }
+            _ => Err("ENOSPC"),
+        }
+    }
+
+    fn node_cost(path: &str) -> usize {
+        path.len() + VFS_NODE_OVERHEAD
+    }
+
     fn mkdir(&mut self, path: &str, recursive: bool) -> VfsMkdirResult {
-        if path != "/tmp" && !path.starts_with("/tmp/") {
+        if !Self::writable_path(path) {
             return VfsMkdirResult::Error("EPERM");
         }
-        if self.stat(path).is_some() {
-            return VfsMkdirResult::Created(None);
+        match self.nodes.get(path) {
+            Some(VfsNode::File(_)) => return VfsMkdirResult::Error("EEXIST"),
+            Some(VfsNode::Directory { .. }) => return VfsMkdirResult::Created(None),
+            None => {}
         }
         if recursive {
             let mut current = "/tmp".to_string();
@@ -9994,34 +10046,129 @@ impl RequestVfs {
             for segment in path.trim_start_matches("/tmp/").split('/') {
                 current.push('/');
                 current.push_str(segment);
-                if self
-                    .nodes
-                    .insert(current.clone(), VfsNode::Directory { writable: true })
-                    .is_none()
-                    && first_created.is_none()
-                {
-                    first_created = Some(current.clone());
+                match self.nodes.get(&current) {
+                    Some(VfsNode::File(_)) => return VfsMkdirResult::Error("ENOTDIR"),
+                    Some(VfsNode::Directory { .. }) => continue,
+                    None => {}
                 }
+                if let Err(code) = self.charge(Self::node_cost(&current)) {
+                    return VfsMkdirResult::Error(code);
+                }
+                self.nodes
+                    .insert(current.clone(), VfsNode::Directory { writable: true });
+                first_created.get_or_insert_with(|| current.clone());
             }
             return VfsMkdirResult::Created(first_created);
         }
-        let parent =
-            path.rsplit_once('/').map_or(
-                "/",
-                |(parent, _)| {
-                    if parent.is_empty() {
-                        "/"
-                    } else {
-                        parent
-                    }
-                },
-            );
-        if self.stat(parent).is_none() {
-            return VfsMkdirResult::Error("ENOENT");
+        match self.nodes.get(Self::parent_of(path)) {
+            None => return VfsMkdirResult::Error("ENOENT"),
+            Some(VfsNode::File(_)) => return VfsMkdirResult::Error("ENOTDIR"),
+            Some(VfsNode::Directory { .. }) => {}
+        }
+        if let Err(code) = self.charge(Self::node_cost(path)) {
+            return VfsMkdirResult::Error(code);
         }
         self.nodes
             .insert(path.to_string(), VfsNode::Directory { writable: true });
         VfsMkdirResult::Created(None)
+    }
+
+    /// Replace or extend a file. A write that would pass the cap changes
+    /// nothing.
+    fn write(&mut self, path: &str, data: &[u8], append: bool) -> Result<(), &'static str> {
+        if !Self::writable_path(path) {
+            return Err("EPERM");
+        }
+        match self.nodes.get(Self::parent_of(path)) {
+            None => return Err("ENOENT"),
+            Some(VfsNode::File(_)) => return Err("ENOTDIR"),
+            Some(VfsNode::Directory { .. }) => {}
+        }
+        match self.nodes.get(path) {
+            Some(VfsNode::Directory { .. }) => Err("EISDIR"),
+            Some(VfsNode::File(old)) => {
+                let old_len = old.len();
+                if append {
+                    self.charge(data.len())?;
+                } else if data.len() > old_len {
+                    self.charge(data.len() - old_len)?;
+                } else {
+                    self.used -= old_len - data.len();
+                }
+                let Some(VfsNode::File(bytes)) = self.nodes.get_mut(path) else {
+                    unreachable!("the node was a file a moment ago");
+                };
+                if append {
+                    bytes.extend_from_slice(data);
+                } else {
+                    *bytes = data.to_vec();
+                }
+                Ok(())
+            }
+            None => {
+                self.charge(Self::node_cost(path) + data.len())?;
+                self.nodes
+                    .insert(path.to_string(), VfsNode::File(data.to_vec()));
+                Ok(())
+            }
+        }
+    }
+
+    fn read(&self, path: &str) -> Option<&[u8]> {
+        match self.nodes.get(path) {
+            Some(VfsNode::File(bytes)) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// The names directly inside a directory of the writable tree, sorted.
+    fn readdir(&self, path: &str) -> Result<Vec<String>, &'static str> {
+        if !Self::writable_path(path) {
+            return Err("ENOENT");
+        }
+        match self.nodes.get(path) {
+            None => return Err("ENOENT"),
+            Some(VfsNode::File(_)) => return Err("ENOTDIR"),
+            Some(VfsNode::Directory { .. }) => {}
+        }
+        let prefix = format!("{path}/");
+        let mut names: Vec<String> = self
+            .nodes
+            .keys()
+            .filter_map(|key| key.strip_prefix(&prefix))
+            .filter(|name| !name.contains('/'))
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
+    /// Remove a file, or a directory with everything under it when
+    /// `recursive`. A directory without `recursive` is `EISDIR`.
+    fn remove(&mut self, path: &str, recursive: bool) -> Result<(), &'static str> {
+        if !Self::writable_path(path) || path == "/tmp" {
+            return Err("EPERM");
+        }
+        match self.nodes.get(path) {
+            None => return Err("ENOENT"),
+            Some(VfsNode::Directory { .. }) if !recursive => return Err("EISDIR"),
+            _ => {}
+        }
+        let prefix = format!("{path}/");
+        let mut freed = 0;
+        self.nodes.retain(|key, node| {
+            if key != path && !key.starts_with(&prefix) {
+                return true;
+            }
+            freed += Self::node_cost(key)
+                + match node {
+                    VfsNode::File(bytes) => bytes.len(),
+                    VfsNode::Directory { .. } => 0,
+                };
+            false
+        });
+        self.used -= freed;
+        Ok(())
     }
 }
 
@@ -10872,6 +11019,17 @@ fn op_pending_event_end(
     }
 }
 
+/// Run `f` on the current request's virtual `/tmp` tree.
+fn with_vfs<R>(scope: &mut v8::PinScope, f: impl FnOnce(&mut RequestVfs) -> R) -> R {
+    let context = event_context(scope);
+    let mut vfs = context
+        .vfs
+        .get_or_init(|| Mutex::new(RequestVfs::default()))
+        .lock()
+        .unwrap();
+    f(&mut vfs)
+}
+
 /// Create one directory in the current request's virtual `/tmp` tree.
 /// A created path starts with `/`, an error is a Node code, and an empty string
 /// means that no path must be returned. The disjoint representation keeps the
@@ -10884,12 +11042,7 @@ fn op_vfs_mkdir(
 ) {
     let path = args.get(0).to_rust_string_lossy(scope);
     let recursive = args.get(1).boolean_value(scope);
-    let result = event_context(scope)
-        .vfs
-        .get_or_init(|| Mutex::new(RequestVfs::default()))
-        .lock()
-        .unwrap()
-        .mkdir(&path, recursive);
+    let result = with_vfs(scope, |vfs| vfs.mkdir(&path, recursive));
     let result = match result {
         VfsMkdirResult::Created(Some(path)) => path,
         VfsMkdirResult::Created(None) => String::new(),
@@ -10898,9 +11051,67 @@ fn op_vfs_mkdir(
     rv.set(v8::String::new(scope, &result).unwrap().into());
 }
 
+/// Write (or, when the third argument is true, append to) a file of the
+/// request's `/tmp`. Returns `""` or a Node error code; `ENOSPC` means the
+/// request's `/tmp` is full.
+fn op_vfs_write(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let path = args.get(0).to_rust_string_lossy(scope);
+    let mut data = Vec::new();
+    if let Ok(view) = args.get(1).try_cast::<v8::ArrayBufferView>() {
+        data.resize(view.byte_length(), 0);
+        view.copy_contents(&mut data);
+    }
+    let append = args.get(2).boolean_value(scope);
+    let code = with_vfs(scope, |vfs| vfs.write(&path, &data, append))
+        .err()
+        .unwrap_or("");
+    rv.set(v8::String::new(scope, code).unwrap().into());
+}
+
+/// The names in a directory of the request's `/tmp` as an array, or a Node
+/// error code as a string.
+fn op_vfs_readdir(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let path = args.get(0).to_rust_string_lossy(scope);
+    match with_vfs(scope, |vfs| vfs.readdir(&path)) {
+        Ok(names) => {
+            let array = v8::Array::new(scope, names.len() as i32);
+            for (index, name) in names.iter().enumerate() {
+                let name = v8::String::new(scope, name).unwrap();
+                array.set_index(scope, index as u32, name.into());
+            }
+            rv.set(array.into());
+        }
+        Err(code) => rv.set(v8::String::new(scope, code).unwrap().into()),
+    }
+}
+
+/// Remove a file or directory of the request's `/tmp`. Returns `""` or a
+/// Node error code.
+fn op_vfs_remove(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let path = args.get(0).to_rust_string_lossy(scope);
+    let recursive = args.get(1).boolean_value(scope);
+    let code = with_vfs(scope, |vfs| vfs.remove(&path, recursive))
+        .err()
+        .unwrap_or("");
+    rv.set(v8::String::new(scope, code).unwrap().into());
+}
+
 /// Return `[kind, size]`, where kind is 0 for a missing path, 1 for a
-/// read-only directory, 2 for a writable directory, and 3 for a read-only
-/// file. Only a file has a size; a directory reports 0, matching workerd.
+/// read-only directory, 2 for a writable directory, 3 for a read-only
+/// file and 4 for a writable file. Only a file has a size; a directory reports
+/// 0, matching workerd.
 ///
 /// The pair travels together because a caller that knows a path is a file
 /// always needs its size to build `Stats`, and a second lookup could observe a
@@ -10911,14 +11122,9 @@ fn op_vfs_stat(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let path = args.get(0).to_rust_string_lossy(scope);
-    let (kind, size) = match event_context(scope)
-        .vfs
-        .get_or_init(|| Mutex::new(RequestVfs::default()))
-        .lock()
-        .unwrap()
-        .stat(&path)
-    {
-        Some(writable) => (if writable { 2 } else { 1 }, 0),
+    let (kind, size) = match with_vfs(scope, |vfs| vfs.stat(&path)) {
+        Some(VfsStat::Directory { writable }) => (if writable { 2 } else { 1 }, 0),
+        Some(VfsStat::File(size)) => (4, size),
         // Only a path the writable tree does not claim can be a bundle path,
         // so the request tree stays authoritative for `/tmp`.
         None => match bundle_node(scope, &path) {
@@ -10959,6 +11165,11 @@ fn op_vfs_read_file(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let path = args.get(0).to_rust_string_lossy(scope);
+    if let Some(bytes) = with_vfs(scope, |vfs| vfs.read(&path).map(<[u8]>::to_vec)) {
+        let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+        rv.set(v8::ArrayBuffer::with_backing_store(scope, &store).into());
+        return;
+    }
     let Some(bundle) = scope.get_slot::<Arc<BundleFs>>().cloned() else {
         return;
     };

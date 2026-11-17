@@ -263,6 +263,11 @@ pub struct Compat {
     /// Queue bodies default to JSON on compatibility dates after 2024-03-18;
     /// older deployments retain the V8 structured-clone default.
     pub queue_json_messages: bool,
+    /// `nodejs_compat` with `nodejs_compat_populate_process_env` (default on
+    /// for dates >= 2025-04-01, off with
+    /// `nodejs_compat_do_not_populate_process_env`): `process.env` holds the
+    /// Worker's string `vars` and secrets.
+    pub populate_process_env: bool,
 }
 
 /// A non-main module the worker's main module may import, tagged by how the

@@ -172,8 +172,8 @@ execution.
 - celld implements `node:assert` (and `assert/strict`), `node:async_hooks`,
   `node:buffer`, `node:crypto`, `node:diagnostics_channel`, `node:events`,
   `node:fs` (and `fs/promises`), `node:os`, `node:path` (including `posix` and
-  `win32`), `node:stream` (including `promises`, `web` and `consumers`),
-  `node:test` (and `test/reporters`), `node:timers/promises`, `node:util`
+  `win32`), `node:process`, `node:stream` (including `promises`, `web` and `consumers`),
+  `node:test` (and `test/reporters`), `node:timers/promises`, `node:url`, `node:util`
   (and `util/types`), and `node:zlib`.
 - Importing any other `node:` module succeeds, and the first call throws
   "`node:<name>` is not implemented in celld". `celld deploy` and
@@ -205,9 +205,24 @@ execution.
 - `KeyObject.toCryptoKey()` applies the requested algorithm, extractability,
   and usages to an asymmetric key.
 - `node:zlib` implements only the synchronous gzip and deflate functions.
-- `node:fs` provides `access`, `mkdir`, `realpath`, `stat`, `lstat`, and
-  `readFile`. It exposes an empty, request-local `/tmp` and a read-only
-  `/bundle` that contains the Worker modules.
+- `node:fs` provides `access`, `mkdir`, `realpath`, `stat`, `lstat`,
+  `readFile`, `writeFile`, `appendFile`, `readdir`, `unlink`, and `rm`, in
+  sync, callback, and `fs.promises` forms. It exposes a request-local `/tmp` and
+  a read-only `/bundle` that contains the Worker modules. `/tmp` starts empty,
+  lives in memory, and is freed when the request ends. One request can hold at
+  most 64 MiB in it, counting file bytes and a small charge for each entry; a
+  write that would pass that fails with `ENOSPC` and changes nothing. Writes
+  outside `/tmp` fail with `EPERM`.
+- `node:url` provides `URL`, `URLSearchParams`, `fileURLToPath`,
+  `pathToFileURL`, and `format` for URL objects and legacy URL objects, with
+  Node.js's POSIX results and errors. The legacy `parse()` and `format()` of a
+  string throw `ERR_METHOD_NOT_IMPLEMENTED`.
+- With `nodejs_compat`, `process.env` holds the Worker's string `vars` and
+  secrets when the compatibility date is 2025-04-01 or later, or the
+  `nodejs_compat_populate_process_env` flag is set, unless
+  `nodejs_compat_do_not_populate_process_env` is set. Otherwise it is an empty
+  object. A name that is not set is `undefined`, and bindings that are not text
+  are not listed. `node:process` and `process` are the global `process`.
 - The global `process` matches workerd for each field that it defines, such
   as `process.execPath`, `process.argv`, and `process.title`. Other fields,
   such as `process.kill` and `process.features`, are undefined.

@@ -625,6 +625,16 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 metadata.binding, metadata.id, metadata.tag, metadata.timestamp
             ));
         }
+        // Text bindings only, written once while the isolate loads: a request
+        // reads a plain property and no per-request work is added.
+        if config.compat.populate_process_env {
+            for (name, value) in vars {
+                lines.push_str(&format!(
+                    "globalThis.process.env[{:?}] = {:?};\n",
+                    name, value
+                ));
+            }
+        }
         if let Some(name) = asset_binding {
             lines.push_str(&format!(
                 "e[{:?}] = __celld.__makeAssetsBinding({:?});\n",

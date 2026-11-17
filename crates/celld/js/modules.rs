@@ -22,6 +22,7 @@ static_source!(NODE_UTIL_SOURCE, "node_util.js");
 static_source!(NODE_EVENTS_SOURCE, "node_events.js");
 static_source!(NODE_OS_SOURCE, "node_os.js");
 static_source!(NODE_PATH_SOURCE, "node_path.js");
+static_source!(NODE_URL_SOURCE, "node_url.js");
 static_source!(NODE_BUFFER_SOURCE, "node_buffer.js");
 static_source!(NODE_CRYPTO_SOURCE, "node_crypto.js");
 static_source!(NODE_ASYNC_HOOKS_SOURCE, "node_async_hooks.js");
@@ -332,6 +333,11 @@ const LAZY_MODULES: &[LazyModule] = &[
         global: "__pathModule",
         source: &NODE_PATH_SOURCE,
     },
+    LazyModule {
+        specs: &["url", "node:url"],
+        global: "__urlModule",
+        source: &NODE_URL_SOURCE,
+    },
     // Same source; either entry's guard covers the other.
     LazyModule {
         specs: &["path/win32", "node:path/win32"],
@@ -490,6 +496,7 @@ const EAGER_MODULES: &[(&[&str], &str)] = &[
     (&["fs", "node:fs"], "__fs"),
     (&["fs/promises", "node:fs/promises"], "__fsPromises"),
     (&["zlib", "node:zlib"], "__zlibModule"),
+    (&["process", "node:process"], "__process"),
 ];
 
 /// A `node:` import the runtime has no implementation for: its stub imports
@@ -515,10 +522,8 @@ fn alternative(name: &str) -> Option<&'static str> {
         "http" | "https" | "http2" => "the global fetch()",
         "net" | "tls" => "connect() from cloudflare:sockets",
         "dns" => "DNS over HTTPS with fetch()",
-        "url" => "the global URL and URLSearchParams",
         "querystring" => "URLSearchParams",
         "string_decoder" => "TextDecoder",
-        "process" => "the global process",
         "timers" => "the global setTimeout and node:timers/promises",
         "console" => "the global console",
         "perf_hooks" => "the global performance",
