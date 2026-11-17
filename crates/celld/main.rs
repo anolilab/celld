@@ -3693,6 +3693,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let listen = ingress.listen.to_string();
     let listener = ingress.listener;
     let internal_listener = internal.listener;
+    celld::egress_filter::register_node_addresses(
+        &[listener.local_addr()?, internal_listener.local_addr()?],
+        &internal.advertise,
+    )
+    .await?;
     let mut adapter_credential_version = None;
     let managed_storage = if settings.control_plane {
         if let Some(spec) = settings.bucket.take() {

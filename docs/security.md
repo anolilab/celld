@@ -95,11 +95,15 @@ it holds the token.
 
 ## Limit Worker egress
 
-A Worker's `fetch()` and sockets start on the node, so by default they can
-reach everything the node reaches: the internal listener, other services on
-the host network, and the cloud metadata endpoint. Set `CELLD_EGRESS=public` to
-refuse a Worker's `fetch()`, `connect()` and outbound WebSocket dials to any
-address that is not on the public internet. A refused `fetch()` or WebSocket
+A Worker's `fetch()` and sockets start on the node, so without a limit they
+could reach everything the node reaches: the internal listener, other services
+on the host network, and the cloud metadata endpoint. By default
+(`CELLD_EGRESS=public`) celld refuses a Worker's `fetch()`, `connect()` and
+outbound WebSocket dials to any address that is not on the public internet, and
+to the node's own addresses. `CELLD_EGRESS=open` turns the limit off. `celld
+dev` defaults to `open` and prints a line saying so, because developers fetch
+local services; set `CELLD_EGRESS=public` or `CELLD_EGRESS_ALLOW` to apply the
+limit there. A refused `fetch()` or WebSocket
 dial rejects with a `TypeError` whose message begins `egress refused:`, and a
 refused `connect()` rejects its `opened` promise with the same message.
 
@@ -115,6 +119,7 @@ celld refuses these address classes:
 | Unique-local | `fc00::/7` |
 | Multicast | `224.0.0.0/4`, `ff00::/8` |
 | Reserved | `240.0.0.0/4` including the broadcast address, `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `2001::/23`, `2001:db8::/32`, `3fff::/20`, `100::/64`, `fec0::/10`, `64:ff9b:1::/48`, and every IPv6 address outside `2000::/3` |
+| The node's own addresses | What the node's listeners bind (every interface address, for a wildcard bind such as `0.0.0.0`), the address it advertises (a hostname in `--advertise` is resolved once at startup, waiting at most 2 seconds) and the addresses in `CELLD_FENCE_NODE_ADDRS`, even when public. Loopback and these addresses are refused on every port a listener of the node binds and on the port it advertises, whatever `CELLD_EGRESS_ALLOW` says. The hostname in `--advertise` is also refused on those ports, whether or not it resolved at startup. Other ports follow the exceptions, except that a name looked up by `fetch()` has no port yet, so it is refused when it resolves to any address of the node: use the IP literal or a `host:port` entry for a service of the host. The same address written as IPv4 inside IPv6 is the same address. The list is read once at startup (a node with a wildcard bind that cannot list its interfaces refuses to start), and a public address that a NAT or an elastic IP maps to the node is on no interface, so the node knows it only when it is advertised (`--advertise`) or, with `CELLD_FENCE_NODE_NETNS=auto`, listed in `CELLD_FENCE_NODE_ADDRS`, which also changes the [container fence](services/containers.md#a-node-in-a-container) |
 | IPv4 inside IPv6 | IPv4-mapped (`::ffff:a.b.c.d`), NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`) addresses are public only when the embedded IPv4 address is. An ISATAP address (`::5efe:a.b.c.d`) is public only when its prefix and its embedded IPv4 address both are. Teredo (`2001::/32`) is always refused |
 
 The check runs on the address celld connects to, not on the hostname. A name
@@ -126,7 +131,9 @@ server cannot redirect a Worker to `http://169.254.169.254/`. With
 `redirect: "manual"`, the Worker receives the redirect and its next `fetch()`
 is checked as a new request.
 
-`CELLD_EGRESS_ALLOW` lists exceptions, separated by commas or whitespace:
+`CELLD_EGRESS_ALLOW` lists exceptions, separated by commas or whitespace. The
+list applies to every Worker on the node; an exception cannot be limited to one
+Worker or binding yet.
 
 | Entry | Effect |
 | --- | --- |
@@ -134,8 +141,23 @@ is checked as a new request.
 | `10.0.0.5:5432`, `[fd00::5]:5432` | Permits that address on that port when the request names the address itself. |
 | `db.internal:5432` | Permits any address the name resolves to, on that port only. The name is refused on every other port, so the exception does not open the rest of the host. |
 
-celld refuses to start on an invalid value, on `CELLD_EGRESS_ALLOW` without
-`CELLD_EGRESS=public`, and on a mode other than `open` or `public`.
+A destination that is one of the node's own addresses and a port celld
+listens on (the ingress and internal listeners) is always refused, whatever
+`CELLD_EGRESS_ALLOW` says, so an exception cannot reach the operator API. That
+includes every loopback address, and a hostname that resolves to a node address
+when the port is not known, as for `fetch()`; use an IP literal or a
+`host:port` exception to reach a service on another port of the node. For the
+same reason, a name allowed on a listener port and on another port cannot be
+fetched by name on the other port (allow the IP literal with that port), and
+`fetch()` cannot reach a container's published loopback port by hostname (use
+the container API or the IP literal). `connect()` and WebSockets know the port,
+so they decide it. Another
+port of a node address is refused like a private address and an exception can
+open it, for a database on the same host.
+
+celld refuses to start on an invalid value, on `CELLD_EGRESS_ALLOW` with
+`CELLD_EGRESS=open`, and on a mode other than `open` or `public`. An entry that
+covers a node address lets the Worker reach it, so list only what you mean.
 
 These do not use the filter:
 
@@ -144,9 +166,24 @@ These do not use the filter:
   container on its private bridge address or its published loopback port, and
   celld permits exactly those addresses.
 
-`CELLD_EGRESS=public` also stops a Worker's `fetch()` from using an
-`HTTP_PROXY` or `ALL_PROXY` proxy. A proxy receives the name and resolves it
-where the filter cannot see the address.
+The public policy also stops a Worker's `fetch()` from using an `HTTP_PROXY` or
+`ALL_PROXY` proxy. A proxy receives the name and resolves it where the filter
+cannot see the address.
+
+### Upgrade note
+
+`CELLD_EGRESS` now defaults to `public`; before, an unset value meant `open`.
+After the upgrade:
+
+- A Worker that fetches a private, loopback, link-local or metadata address, or
+  the node's own address, is refused. Set `CELLD_EGRESS=open` to keep the old
+  behaviour, or list the destinations in `CELLD_EGRESS_ALLOW`.
+- A node whose only route to the internet is an `HTTP_PROXY` or `ALL_PROXY`
+  proxy can no longer fetch, because the public policy does not use the proxy.
+  Set `CELLD_EGRESS=open` on such a node, which lets Workers use the proxy
+  again and turns the address checks off.
+- `CELLD_EGRESS_ALLOW` alone is valid now and applies to the default policy;
+  with `CELLD_EGRESS=open` it is still an error.
 
 The filter does not apply to what a container does. A container has its own
 network: use `enableInternet: false`, or a firewall on the container network.

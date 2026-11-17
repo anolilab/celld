@@ -437,6 +437,12 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     if !options.stack.watch {
         console.detail("Watch", "disabled");
     }
+    if crate::egress_filter::dev_default_mode().is_some() {
+        console.detail(
+            "Egress",
+            "open in dev, so Workers can reach local services (set CELLD_EGRESS=public to refuse them)",
+        );
+    }
 
     let project_hash =
         crate::control_plane::hex(&Sha256::digest(project.as_os_str().as_encoded_bytes()));
@@ -702,6 +708,9 @@ async fn start_node(
         "S3_ENDPOINT",
     ] {
         command.env_remove(variable);
+    }
+    if let Some(mode) = crate::egress_filter::dev_default_mode() {
+        command.env(crate::egress_filter::MODE_ENV, mode);
     }
     command
         .args([

@@ -1,4 +1,4 @@
-//! `CELLD_EGRESS=public`: a Worker's `fetch()`, `connect()` and outbound
+//! The public egress policy: a Worker's `fetch()`, `connect()` and outbound
 //! WebSocket dials are refused on the resolved address, on every redirect hop.
 
 #![allow(clippy::disallowed_methods)]
@@ -154,12 +154,12 @@ async fn exceptions_permit_a_destination_and_not_a_redirect_into_another() {
     // or on another port, is still refused.
     let result = call(&server, "/fetch", &format!("http://localhost:{port}/hello")).await;
     assert_refused(&result, "loopback");
-    let result = call(
-        &server,
-        "/fetch",
-        &format!("http://127.0.0.1:{}/", port.wrapping_add(1)),
-    )
-    .await;
+    // A port no listener of the node holds: bound and released just now.
+    let unused = {
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        socket.local_addr().unwrap().port()
+    };
+    let result = call(&server, "/fetch", &format!("http://127.0.0.1:{unused}/")).await;
     assert_refused(&result, "loopback");
     assert_eq!(internal.hits(), before);
     // connect() agrees with fetch(): the exception names the literal address.
@@ -196,9 +196,39 @@ async fn exceptions_permit_a_destination_and_not_a_redirect_into_another() {
 }
 
 #[tokio::test]
-async fn open_mode_is_unchanged() {
+async fn a_worker_cannot_reach_the_nodes_loopback_listeners_even_when_allowed() {
+    // The internal listener and the ingress listener both bind loopback. A
+    // range that covers loopback opens other loopback services, never these.
+    for env in [
+        vec![("CELLD_EGRESS", "public")],
+        vec![("CELLD_EGRESS_ALLOW", "127.0.0.0/8")],
+    ] {
+        let server = Server::start("egress", &env).await;
+        let internal = server.internal_url("/").await;
+        let result = call(&server, "/fetch", &internal).await;
+        assert_refused(&result, "this node's own address");
+        let result = call(&server, "/fetch", &server.url("/hello")).await;
+        assert_refused(&result, "this node's own address");
+    }
+}
+
+#[tokio::test]
+async fn dev_leaves_egress_open_by_default() {
     let internal = Internal::start().await;
     let server = Server::start("egress", &[]).await;
+    let result = call(
+        &server,
+        "/fetch",
+        &format!("http://127.0.0.1:{}/hello", internal.port),
+    )
+    .await;
+    assert_eq!(result["status"], 200, "{result}");
+}
+
+#[tokio::test]
+async fn open_mode_is_unchanged() {
+    let internal = Internal::start().await;
+    let server = Server::start("egress", &[("CELLD_EGRESS", "open")]).await;
     let result = call(
         &server,
         "/fetch",
@@ -221,7 +251,14 @@ fn unusable_egress_settings_stop_startup() {
         (vec![("CELLD_EGRESS", "publc")], "CELLD_EGRESS"),
         (vec![("CELLD_EGRESS", "")], "CELLD_EGRESS"),
         (
-            vec![("CELLD_EGRESS_ALLOW", "10.0.0.0/8")],
+            vec![
+                ("CELLD_EGRESS", "open"),
+                ("CELLD_EGRESS_ALLOW", "10.0.0.0/8"),
+            ],
+            "CELLD_EGRESS_ALLOW",
+        ),
+        (
+            vec![("CELLD_EGRESS_ALLOW", "10.0.0.0/99")],
             "CELLD_EGRESS_ALLOW",
         ),
         (
