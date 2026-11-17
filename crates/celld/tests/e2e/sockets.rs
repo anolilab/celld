@@ -150,6 +150,20 @@ async fn a_hibernatable_object_socket_keeps_working() {
 }
 
 #[tokio::test]
+async fn a_caller_cannot_fill_a_socket_the_object_does_not_take_frames_from() {
+    let server = Server::start("sockets", &[]).await;
+    let out: Value = server.get_json("/do/stuck-flood").await;
+    assert_eq!(out["code"], 1009, "the caller was not cut off: {out}");
+}
+
+#[tokio::test]
+async fn a_close_sent_while_the_object_does_not_take_frames_ends_the_pipe() {
+    let server = Server::start("sockets", &[]).await;
+    let out: Value = server.get_json("/do/stuck-close").await;
+    assert_eq!(out["code"], 3001, "the close was not passed on: {out}");
+}
+
+#[tokio::test]
 async fn a_regular_object_socket_keeps_working() {
     let server = Server::start("sockets", &[]).await;
     let out: Value = server.get_json("/do/selftest?kind=plain").await;

@@ -460,18 +460,6 @@ impl OutboundWebSocketSink {
     }
 }
 
-/// Pass one data frame an end sent to the queue of the end it faces. False
-/// when that end stopped reading, which ends the pipe.
-async fn forward_data(sink: &celld::js::WsPullSender, frame: celld::js::WsOut) -> bool {
-    match frame {
-        celld::js::WsOut::Text(text) => sink.send(celld::js::WsPull::Text(text)).await.is_ok(),
-        celld::js::WsOut::Binary(bytes) => {
-            sink.send(celld::js::WsPull::Binary(bytes)).await.is_ok()
-        }
-        celld::js::WsOut::Close(..) => false,
-    }
-}
-
 /// One direction of a pipe: the frames an end sent that the end it faces has
 /// not yet made room for.
 ///
@@ -520,20 +508,31 @@ impl Lane {
         self.waiting.front().map(celld::js::WsPull::queue_bytes)
     }
 
+    /// Take the frame next in line out of the backlog.
+    fn next(&mut self) -> Option<celld::js::WsPull> {
+        let frame = self.waiting.pop_front()?;
+        self.bytes -= frame.queue_bytes();
+        Some(frame)
+    }
+
     /// Pass the frame next in line to its queue, in the room already reserved.
     /// False when that end stopped reading.
     fn flush(&mut self, sink: &celld::js::WsPullSender, permit: celld::js::WsPullPermit) -> bool {
-        let Some(frame) = self.waiting.pop_front() else {
-            return true;
-        };
-        self.bytes -= frame.queue_bytes();
-        sink.send_reserved(frame, permit).is_ok()
+        match self.next() {
+            Some(frame) => sink.send_reserved(frame, permit).is_ok(),
+            None => true,
+        }
     }
 
     /// The end has closed and everything it sent before has been passed on.
     fn finished(&self) -> bool {
         self.end.is_some() && self.waiting.is_empty()
     }
+}
+
+/// What both ends hear when a pipe's backlog overflows.
+fn buffer_full() -> (u16, String) {
+    (1009, "WebSocket buffer is full".into())
 }
 
 /// Carry frames between a stateless Worker's socket and a client end another
@@ -584,7 +583,7 @@ async fn worker_websocket_pipe(
             frame = from_caller.recv(), if to_worker.end.is_none() => match frame {
                 Some(frame) => {
                     if !to_worker.hold(frame) {
-                        closing = (1009, "WebSocket buffer is full".into());
+                        closing = buffer_full();
                         break;
                     }
                 }
@@ -597,7 +596,7 @@ async fn worker_websocket_pipe(
             frame = from_worker.recv(), if to_caller.end.is_none() => match frame {
                 Some(frame) => {
                     if !to_caller.hold(frame) {
-                        closing = (1009, "WebSocket buffer is full".into());
+                        closing = buffer_full();
                         break;
                     }
                 }
@@ -637,6 +636,14 @@ async fn worker_websocket_pipe(
 /// `dispatch_ws_message` into the cell, a pull queue out to the caller —
 /// which is also why a hibernatable server end needs nothing special here.
 ///
+/// A dispatch waits while the cell is busy or its input gate is closed. The
+/// pipe keeps reading both ends meanwhile, into the same per-direction backlog
+/// the Worker pipe keeps: a caller that sends more than a queue's budget while
+/// the cell does not take frames is closed with 1009, and a close or a
+/// vanished end ends the pipe at once. The dispatches go one at a time, in the
+/// order the frames came; a frame whose dispatch had not returned when the
+/// pipe ended is dropped.
+///
 /// The task ends when either side closes, and it unregisters both.
 async fn local_websocket_pipe(
     app: AppHandle,
@@ -664,62 +671,98 @@ async fn local_websocket_pipe(
         protocol: None,
         declined: None,
     }));
-    // Set only by a close the caller sent. A close from the cell needs no
-    // entry here: the isolate that sent it has already told the cell's own
+    let mut to_cell = Lane::new();
+    let mut to_caller = Lane::new();
+    // The dispatch of the frame the cell is being given, kept across loop
+    // turns so that reading the ends does not cancel it.
+    let mut dispatching: Option<
+        std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>>,
+    > = None;
+    let mut dispatched = false;
+    // Set when the cell's own handler must hear of the end: a close the
+    // caller sent, or an overflow that cut it off. A close from the cell needs
+    // no entry here: the isolate that sent it has already told the cell's own
     // handler, and telling it again would be a second `webSocketClose`.
-    let mut caller_close: Option<(u16, String)> = None;
+    let mut cell_close: Option<(u16, String)> = None;
+    // What the caller reads.
+    let mut closing = (1011, "WebSocket pipe failed".to_string());
     loop {
+        if std::mem::take(&mut dispatched) {
+            dispatching = None;
+        }
+        if dispatching.is_none() {
+            let data = match to_cell.next() {
+                Some(celld::js::WsPull::Text(text)) => Some(celld::js::WsIn::Text(text)),
+                Some(celld::js::WsPull::Binary(bytes)) => Some(celld::js::WsIn::Binary(bytes)),
+                _ => None,
+            };
+            if let Some(data) = data {
+                dispatching = Some(Box::pin(dispatch_ws_message(
+                    &app, &socket, target.id, data,
+                )));
+            }
+        }
+        if let Some(end) = to_caller.end.as_ref().filter(|_| to_caller.finished()) {
+            closing = end.clone();
+            break;
+        }
+        let to_caller_front = to_caller.front_bytes();
         celld::asyncrt::select! {
             frame = from_caller.recv() => match frame {
-                Some(celld::js::WsOut::Text(text)) => {
-                    if let Err(error) = dispatch_ws_message(
-                        &app, &socket, target.id, celld::js::WsIn::Text(text),
-                    ).await {
-                        tracing::warn!(%error, scope = %target.scope, "kept WebSocket message failed");
-                        break;
-                    }
-                }
-                Some(celld::js::WsOut::Binary(bytes)) => {
-                    if let Err(error) = dispatch_ws_message(
-                        &app, &socket, target.id, celld::js::WsIn::Binary(bytes),
-                    ).await {
-                        tracing::warn!(%error, scope = %target.scope, "kept WebSocket message failed");
-                        break;
-                    }
-                }
                 Some(celld::js::WsOut::Close(code, reason)) => {
-                    caller_close = Some((code, reason));
+                    closing = (code, reason);
+                    cell_close = Some(closing.clone());
                     break;
+                }
+                Some(frame) => {
+                    if !to_cell.hold(frame) {
+                        closing = buffer_full();
+                        cell_close = Some(closing.clone());
+                        break;
+                    }
                 }
                 // The caller's request retired and took its socket with it.
                 None => break,
             },
-            frame = from_cell.recv() => match frame {
-                Some(celld::js::WsOut::Close(code, reason)) => {
-                    let _ = pull.send_close(code, reason, true);
-                    break;
-                }
+            frame = from_cell.recv(), if to_caller.end.is_none() => match frame {
                 Some(frame) => {
-                    if !forward_data(&pull, frame).await { break; }
+                    if !to_caller.hold(frame) {
+                        closing = buffer_full();
+                        cell_close = Some(closing.clone());
+                        break;
+                    }
                 }
                 None => break,
             },
+            permit = async { pull.reserve(to_caller_front.unwrap_or(0)).await },
+                if to_caller_front.is_some() => {
+                    let kept = permit.is_some_and(|permit| to_caller.flush(&pull, permit));
+                    if !kept { break; }
+                },
+            result = async { dispatching.as_mut().expect("guarded").await },
+                if dispatching.is_some() => {
+                    dispatched = true;
+                    if let Err(error) = result {
+                        tracing::warn!(%error, scope = %target.scope, "kept WebSocket message failed");
+                        break;
+                    }
+                },
         }
     }
-    // The caller's own close is echoed to it, and a pipe that ended without
-    // a close from either end closes the caller with 1011 rather than leaving
-    // it to read an abnormal end. A close the cell sent is already queued.
-    let (code, reason) = caller_close
-        .clone()
-        .unwrap_or((1011, "WebSocket pipe failed".into()));
+    drop(dispatching);
+    // The close the caller reads: its own, echoed to it; the cell's, once the
+    // data before it was passed on; a 1009 when a backlog overflowed; or, for
+    // a pipe that ended without a close from either end, 1011 rather than an
+    // abnormal end.
+    let (code, reason) = closing;
     let _ = pull.send_close(code, reason, true);
-    if let Some((code, reason)) = caller_close {
+    celld::js::ws_unregister(id);
+    celld::js::ws_pull_unregister(id);
+    if let Some((code, reason)) = cell_close {
         let _ = dispatch_ws_closed(&app, &socket, target.id, code, reason, true).await;
     }
     app.websocket_closed(socket.cell().to_string(), target.id);
     celld::js::ws_unregister(target.id);
-    celld::js::ws_unregister(id);
-    celld::js::ws_pull_unregister(id);
     Ok(())
 }
 

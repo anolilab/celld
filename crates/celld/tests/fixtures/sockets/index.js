@@ -77,6 +77,20 @@ export class Chat extends DurableObject {
   }
 }
 
+// A Durable Object whose message handler never returns and holds the cell's
+// input gate shut, so no later frame is dispatched into it.
+export class Stuck extends DurableObject {
+  async fetch() {
+    const [client, server] = Object.values(new WebSocketPair());
+    this.ctx.acceptWebSocket(server);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  webSocketMessage() {
+    return this.ctx.blockConcurrencyWhile(() => new Promise(() => {}));
+  }
+}
+
 // A Durable Object that serves a regular, non-hibernatable socket.
 export class Plain extends DurableObject {
   async fetch(request) {
@@ -217,6 +231,40 @@ export default {
       const b = await second;
       ws.close();
       return Response.json([a, b]);
+    }
+    // Frames sent to an object that takes none: the pipe must cap what it holds
+    // and close the caller with 1009 instead of buffering the flood.
+    if (url.pathname === "/do/stuck-flood") {
+      const response = await env.STUCK.getByName("flood").fetch(request.url, {
+        headers: { Upgrade: "websocket" },
+      });
+      const ws = response.webSocket;
+      ws.accept();
+      const closed = new Promise((resolve) =>
+        ws.addEventListener("close", (event) => resolve(event.code)),
+      );
+      const chunk = "x".repeat(64 * 1024);
+      let sent = 0;
+      for (; sent < 200; sent++) ws.send(chunk);
+      const code = await Promise.race([closed, sleep(5000).then(() => "timeout")]);
+      return Response.json({ sent, code });
+    }
+    // A close sent while a frame waits for the object must still end the pipe.
+    if (url.pathname === "/do/stuck-close") {
+      const response = await env.STUCK.getByName("close").fetch(request.url, {
+        headers: { Upgrade: "websocket" },
+      });
+      const ws = response.webSocket;
+      ws.accept();
+      const closed = new Promise((resolve) =>
+        ws.addEventListener("close", (event) => resolve(event.code)),
+      );
+      ws.send("one");
+      ws.send("two");
+      await sleep(300);
+      ws.close(3001, "done");
+      const code = await Promise.race([closed, sleep(5000).then(() => "timeout")]);
+      return Response.json({ code });
     }
     if (url.pathname === "/proxy/chat") {
       return env.CHAT.getByName("room").fetch(request);

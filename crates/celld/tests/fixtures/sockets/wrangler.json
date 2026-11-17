@@ -8,8 +8,9 @@
     "bindings": [
       { "name": "CHAT", "class_name": "Chat" },
       { "name": "PLAIN", "class_name": "Plain" },
-      { "name": "HOST", "class_name": "Host" }
+      { "name": "HOST", "class_name": "Host" },
+      { "name": "STUCK", "class_name": "Stuck" }
     ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Chat", "Plain", "Host"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Chat", "Plain", "Host", "Stuck"] }]
 }
