@@ -288,16 +288,14 @@ impl Reachable {
                 });
                 if let Err(error) = proven {
                     refused.push(format!("{url}: {error:#}"));
-                    let refused_connection = error.chain().any(|cause| {
-                        cause
-                            .downcast_ref::<reqwest::Error>()
-                            .is_some_and(reqwest::Error::is_connect)
-                    });
-                    if refused_connection && !last {
+                    // The probe carries no token, so a listener that is not
+                    // the node has seen no credential, and any failure, not
+                    // only a refused connection, can move on to the next
+                    // lease: a stale one whose port another process now
+                    // holds must not hide the live node behind it.
+                    if !last {
                         continue;
                     }
-                    // The probe carries no token, so a listener that is not
-                    // the node has seen no credential.
                     match &self.unreachable {
                         Some(message) => bail!("{message}{}", report(&refused)),
                         None => bail!(
