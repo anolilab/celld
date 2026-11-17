@@ -116,3 +116,18 @@ async fn a_key_file_reached_through_a_symlink_is_read() {
     let after: Value = server.get_json("/").await;
     assert_eq!(after["token"], PLANTED);
 }
+
+#[tokio::test]
+async fn a_broken_key_file_does_not_stop_a_script_without_secrets() {
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let path = directory
+        .path()
+        .join("missing")
+        .to_str()
+        .expect("a UTF-8 path")
+        .to_string();
+    let server = Server::start("secrets", &[("CELLD_SECRETS_KEY_FILE", path.as_str())]).await;
+    let served: Value = server.get_json("/").await;
+    assert_eq!(served["token"], Value::Null);
+    assert_eq!(served["plain"], "plain");
+}

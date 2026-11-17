@@ -943,7 +943,7 @@ async fn load_worker_at_pointer(
         crate::secrets::load(
             bucket,
             &manifest,
-            crate::secrets::SecretsKey::from_environment()?,
+            crate::secrets::SecretsKey::from_environment,
         )
         .await?,
     );

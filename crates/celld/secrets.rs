@@ -397,11 +397,12 @@ async fn update(
 /// module.
 ///
 /// A script with secrets and no key is an error, so a node never serves a
-/// Worker that silently lacks a credential.
-pub async fn load(
+/// Worker that silently lacks a credential. `key` runs only when the script
+/// has secrets, so an unreadable key file stops no script that has none.
+pub async fn load<'k>(
     bucket: &Bucket,
     manifest: &Manifest,
-    key: Option<&SecretsKey>,
+    key: impl FnOnce() -> anyhow::Result<Option<&'k SecretsKey>>,
 ) -> anyhow::Result<Vec<(String, String)>> {
     if manifest.main_module.is_none() {
         return Ok(Vec::new());
@@ -413,7 +414,7 @@ pub async fn load(
     if set.secrets.is_empty() {
         return Ok(Vec::new());
     }
-    let key = key.with_context(|| {
+    let key = key()?.with_context(|| {
         format!(
             "script {script} has {} secret(s), and no secrets key is configured; \
              set {KEY_VARIABLE} or {KEY_FILE_VARIABLE} to the key they were put under",
@@ -603,14 +604,18 @@ mod tests {
         ensure_no_clash(&bucket, &manifest(&["DB"])).await.unwrap();
         let clashing = manifest(&["TOKEN"]);
         assert!(ensure_no_clash(&bucket, &clashing).await.is_err());
-        let error = load(&bucket, &clashing, Some(&key)).await.unwrap_err();
+        let error = load(&bucket, &clashing, || Ok(Some(&key)))
+            .await
+            .unwrap_err();
         let text = format!("{error:#}");
         assert!(
             text.contains("secret TOKEN of script app has the name of a binding"),
             "{text}"
         );
         assert_eq!(
-            load(&bucket, &manifest(&["DB"]), Some(&key)).await.unwrap(),
+            load(&bucket, &manifest(&["DB"]), || Ok(Some(&key)))
+                .await
+                .unwrap(),
             [("TOKEN".to_string(), "v".to_string())]
         );
     }
@@ -620,16 +625,22 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let bucket = bucket(&directory);
         let manifest = manifest(&[]);
-        assert!(load(&bucket, &manifest, None).await.unwrap().is_empty());
+        assert!(load(&bucket, &manifest, || Ok(None))
+            .await
+            .unwrap()
+            .is_empty());
         put(&bucket, &key(3), "app", "TOKEN", "v", &BTreeSet::new())
             .await
             .unwrap();
-        let error = load(&bucket, &manifest, None).await.unwrap_err();
+        let error = load(&bucket, &manifest, || Ok(None)).await.unwrap_err();
         assert!(
             format!("{error:#}").contains("no secrets key is configured"),
             "{error:#}"
         );
-        let error = load(&bucket, &manifest, Some(&key(4))).await.unwrap_err();
+        let other = key(4);
+        let error = load(&bucket, &manifest, || Ok(Some(&other)))
+            .await
+            .unwrap_err();
         assert!(
             format!("{error:#}").contains("does not open under the secrets key"),
             "{error:#}"
@@ -661,7 +672,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let error = load(&bucket, &manifest(&[]), Some(&key)).await.unwrap_err();
+        let error = load(&bucket, &manifest(&[]), || Ok(Some(&key)))
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("__proto__"), "{error}");
     }
 
