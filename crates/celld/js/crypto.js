@@ -18,7 +18,7 @@
     "SHA-1", "SHA-256", "SHA-384", "SHA-512", "MD5",
   ]);
   const _SECRET_KEY_ALGS = new Set(
-    ["HMAC", "AES-GCM", "AES-CBC", "AES-CTR"],
+    ["HMAC", "AES-GCM", "AES-CBC", "AES-CTR", "AES-KW"],
   );
   // Cloudflare accepts its own pre-standard curve spellings beside the
   // standard ones.
@@ -31,6 +31,42 @@
     "P-521": "P-521", "secp521r1": "P-521",
   };
   const _canonicalEcCurve = (curve) => _EC_CURVES[_curveName(curve)];
+  // AES key sizes in bytes. Key Wrap also takes 192-bit keys.
+  const _AES_KEY_BYTES = {
+    "AES-GCM": [16, 32], "AES-CBC": [16, 32], "AES-CTR": [16, 32],
+    "AES-KW": [16, 24, 32],
+  };
+  const _aesKeySizes = (name) =>
+    _AES_KEY_BYTES[name].map((bytes) => bytes * 8).join(", ")
+      .replace(/, (\d+)$/, " or $1");
+  // Key Wrap keys exist to wrap and unwrap, and Web Crypto refuses any other
+  // usage when one is imported or generated.
+  const _checkKwUsages = (usages) => {
+    if (!Array.from(usages || []).every(
+      (usage) => usage === "wrapKey" || usage === "unwrapKey")) {
+      throw new DOMException(
+        "AES-KW keys can only be used for: wrapKey, unwrapKey",
+        "SyntaxError");
+    }
+  };
+  // Key Wrap has no default size: `length` is required, and is 128, 192 or
+  // 256 bits.
+  const _kwLength = (length) => {
+    if (length === undefined || length === null) {
+      throw new TypeError("AES-KW requires a length");
+    }
+    const bits = Number(length);
+    if (!_AES_KEY_BYTES["AES-KW"].includes(bits / 8)) {
+      throw _operationError(`AES-KW length must be ${_aesKeySizes("AES-KW")}`);
+    }
+    return bits;
+  };
+  // The host reports a refusal Web Crypto names as `Name: message`.
+  const _fromHost = (error) => {
+    const named = /^(?:crypto: )?(NotSupportedError|DataError|OperationError|InvalidAccessError): ([^]*)$/
+      .exec(String(error?.message ?? error));
+    return named ? new DOMException(named[2], named[1]) : error;
+  };
   // The asymmetric algorithms, as the uppercased name `_algorithmName`
   // produces mapped to the spelling `key.algorithm.name` reports. The
   // uppercased form is for lookup only: echoing it back names an algorithm
@@ -179,7 +215,115 @@
   // AES-GCM reports a failure by returning nothing, and this turns that into
   // the `OperationError` the Web Crypto specification names. The block modes
   // throw from the host with the cause, so they never reach that branch.
-  function _aes(name, algorithm, key, data, encrypting) {
+  // Web Crypto names the algorithm and usage a key was made for, and a key
+  // is only used with those. `usage` is the one the operation needs:
+  // `encrypt` and `decrypt` for the operations of that name, `wrapKey` and
+  // `unwrapKey` when the same cipher runs under them.
+  function _checkKeyUse(name, key, usage) {
+    const keyName = _algorithmName(key?.algorithm);
+    if (keyName !== name &&
+        !(_ED25519_ALGS.has(keyName) && _ED25519_ALGS.has(name))) {
+      throw new DOMException(
+        `key is not a ${name} key`, "InvalidAccessError");
+    }
+    if (!key.usages.includes(usage)) {
+      throw new DOMException(
+        `key does not permit ${usage}`, "InvalidAccessError");
+    }
+  }
+
+  // The derivation shared by `deriveBits` and `deriveKey`. Each asks for its
+  // own usage, so a key granted only one of them cannot be used for the other.
+  function _derive(algorithm, baseKey, length, usage) {
+    _checkKeyUse(_algorithmName(algorithm), baseKey, usage);
+    const name = _algorithmName(algorithm);
+    if (name === "HKDF" || name === "PBKDF2") {
+      const bits = Number(length);
+      if (!Number.isInteger(bits) || bits <= 0 || bits % 8 !== 0) {
+        throw _operationError(
+          name + " length must be a positive multiple of 8 bits");
+      }
+      const hash = _hashName(algorithm?.hash);
+      if (!_DIGEST_ALGS.has(hash)) {
+        throw _notSupported("unsupported " + name + " hash: " + hash);
+      }
+      const ikm = baseKey.__celldMaterial.bytes;
+      const salt = _toBuf(algorithm?.salt ?? new Uint8Array());
+      let out;
+      if (name === "HKDF") {
+        out = $$hkdf(
+          hash, ikm, salt,
+          _toBuf(algorithm?.info ?? new Uint8Array()), bits / 8);
+        if (!out) {
+          throw _operationError("HKDF length is too large for the hash");
+        }
+      } else {
+        const iterations = Number(algorithm?.iterations);
+        if (!Number.isInteger(iterations) || iterations <= 0) {
+          throw _operationError(
+            "PBKDF2 iterations must be a positive integer");
+        }
+        out = $$pbkdf2(hash, ikm, salt, iterations, bits / 8);
+      }
+      return out.buffer.slice(
+        out.byteOffset, out.byteOffset + out.byteLength);
+    }
+    if (name !== "ECDH" && name !== "X25519") {
+      throw _notSupported("unsupported derive algorithm: " + name);
+    }
+    const publicKey = algorithm?.public;
+    if (!publicKey || publicKey.type !== "public") {
+      throw new TypeError(name + " requires a public key in algorithm.public");
+    }
+    // X25519 carries no `namedCurve`, so it cannot ride the curve match
+    // `ecdh-derive` runs; its op is separate for that reason alone. Both
+    // answer the raw shared secret, so everything below is shared.
+    const shared = Uint8Array.from(_extra(
+      name === "X25519" ? "x25519-derive" : "ecdh-derive", {
+        private: Array.from(_toBuf(baseKey.__celldMaterial.bytes)),
+        public: Array.from(_toBuf(publicKey.__celldMaterial.bytes)),
+      }).bytes);
+    if (length === null || length === undefined) return shared.buffer;
+    const bytes = Number(length) / 8;
+    if (!Number.isInteger(bytes) || bytes < 0 || bytes > shared.byteLength) {
+      throw _operationError("requested length exceeds the derived secret");
+    }
+    return shared.slice(0, bytes).buffer;
+  
+  }
+
+  // RSA-PSS `saltLength` is a required `[EnforceRange] unsigned long`: a
+  // missing, non-finite, negative or oversized value is a TypeError, and a
+  // fraction truncates.
+  function _saltLength(algorithm) {
+    const value = algorithm?.saltLength;
+    const length = Math.trunc(Number(value));
+    if (value === undefined || !(length >= 0 && length <= 4294967295)) {
+      throw new TypeError(
+        "RsaPssParams saltLength must be an unsigned long, got " +
+          String(value));
+    }
+    return length;
+  }
+
+  // The usages an imported EC key may carry. A public ECDH key is used by
+  // being passed as `public` to a derive call, so it holds none.
+  const _EC_USAGES = {
+    ECDSA: { public: ["verify"], private: ["sign"] },
+    ECDH: { public: [], private: ["deriveKey", "deriveBits"] },
+  };
+  function _checkEcUsages(name, visibility, usages) {
+    const allowed = _EC_USAGES[name][visibility];
+    if (!Array.from(usages || []).every((usage) => allowed.includes(usage))) {
+      throw new DOMException(
+        `a ${visibility} ${name} key can only be used for: ` +
+          (allowed.join(", ") || "nothing"),
+        "SyntaxError");
+    }
+  }
+
+  function _aes(name, algorithm, key, data, encrypting, usage) {
+    _checkKeyUse(name, key, usage);
     if (name === "AES-GCM" && _toBuf(algorithm.iv).byteLength === 0) {
       throw new DOMException("AES-GCM IV must not be empty.", "OperationError");
     }
@@ -205,6 +349,30 @@
         name + (encrypting ? " encrypt failed" : " decrypt failed"),
       );
     }
+    return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
+  }
+
+  // RFC 3394 key wrap. `wrapKey` and `unwrapKey` are the only operations
+  // Web Crypto defines for AES-KW.
+  function _aesKw(key, data, wrapping) {
+    if (_algorithmName(key?.algorithm) !== "AES-KW") {
+      throw new DOMException(
+        "key is not an AES-KW key", "InvalidAccessError");
+    }
+    const usage = wrapping ? "wrapKey" : "unwrapKey";
+    if (!key.usages.includes(usage)) {
+      throw new DOMException(
+        `key does not permit ${usage}`, "InvalidAccessError");
+    }
+    let out;
+    try {
+      out = (wrapping ? _aesEncrypt : _aesDecrypt)(
+        "AES-KW", key.__celldMaterial.bytes, new Uint8Array(),
+        _toBuf(data), new Uint8Array(), 0);
+    } catch (error) {
+      throw _operationError(String(error?.message ?? error));
+    }
+    if (!out) throw _operationError("AES-KW unwrap failed");
     return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
   }
 
@@ -236,6 +404,12 @@
       }
       if (format === "raw" && _SECRET_KEY_ALGS.has(name)) {
         const raw = _toBuf(keyData).slice();
+        if (name === "AES-KW") _checkKwUsages(usages);
+        // Only Key Wrap checks the size here; the other modes fail at use.
+        if (name === "AES-KW" && !_AES_KEY_BYTES[name].includes(raw.byteLength)) {
+          throw new DOMException(
+            `${name} keys must be ${_aesKeySizes(name)} bits`, "DataError");
+        }
         const normalized = name === "HMAC"
           ? { name, hash: { name: _hashName(algorithm?.hash) }, length: raw.byteLength * 8 }
           : { name, length: raw.byteLength * 8 };
@@ -244,17 +418,34 @@
         );
       }
       // A Secure Curves public key has a `raw` form: the 32-byte point on
-      // its own. It is checked before the asymmetric block below, because
-      // that block reads `raw` bytes as a DER document and can only report a
-      // parse failure for them.
-      if (format === "raw" && _OKP_CURVES[name] !== undefined) {
-        const imported = _extra("asym-key-import", {
-          key: Array.from(_toBuf(keyData)),
-          format: "raw",
-          type: _OKP_CURVES[name],
-          visibility: "public",
-          passphrase: null,
-        });
+      // its own. An EC public key's is the uncompressed point
+      // `0x04 || X || Y`. Either is checked before the asymmetric block
+      // below, because that block reads `raw` bytes as a DER document and
+      // can only report a parse failure for them. The host reads the point;
+      // the curve cannot be told from the bytes, so it goes in `type`.
+      const ec = name === "ECDSA" || name === "ECDH";
+      if (format === "raw" && (ec || _OKP_CURVES[name] !== undefined)) {
+        let curve = _OKP_CURVES[name];
+        if (ec) {
+          _checkEcUsages(name, "public", usages);
+          curve = _canonicalEcCurve(algorithm?.namedCurve);
+          if (curve === undefined) {
+            throw _notSupported(
+              "unsupported EC namedCurve: " + String(algorithm?.namedCurve));
+          }
+        }
+        let imported;
+        try {
+          imported = _extra("asym-key-import", {
+            key: Array.from(_toBuf(keyData)),
+            format: "raw",
+            type: curve,
+            visibility: "public",
+            passphrase: null,
+          });
+        } catch (error) {
+          throw _fromHost(error);
+        }
         return _makeKey(
           "public",
           _keyAlgorithm(name, algorithm, imported.keyType, imported.details),
@@ -292,6 +483,9 @@
           format === "pkcs8" || (jwk && keyData?.d !== undefined)
             ? "private"
             : "public";
+        if (name === "ECDSA" || name === "ECDH") {
+          _checkEcUsages(name, visibility, usages);
+        }
         const imported = _extra("asym-key-import", {
           key: jwk ? keyData : Array.from(_toBuf(keyData)),
           format: jwk ? "jwk" : "der",
@@ -315,14 +509,25 @@
     }
 
     async exportKey(format, key) {
-      // The `raw` form of a Secure Curves public key is its 32-byte point.
-      // The branch below answers every `raw` request from the stored bytes,
-      // which for an asymmetric key are its SPKI document -- so without this
-      // arm an X25519 peer key exports as 44 bytes that no counterpart can
-      // read, and nothing reports an error.
+      // Extractability is checked before the format is considered.
+      if (key?.__celldMaterial && !key.extractable) {
+        throw new DOMException("key is not extractable", "InvalidAccessError");
+      }
+      // Only a public EC or Secure Curves key has a `raw` form.
+      if (format === "raw" && key?.type === "private" &&
+          key.__celldMaterial?.keyType !== undefined &&
+          key.__celldMaterial.keyType !== "rsa") {
+        throw new DOMException(
+          "a private key has no raw form", "InvalidAccessError");
+      }
+      // The `raw` form of a Secure Curves public key is its 32-byte point,
+      // and an EC public key's is its uncompressed point. The branch below
+      // answers every `raw` request from the stored bytes, which for an
+      // asymmetric key are its SPKI document -- so without this arm an X25519
+      // peer key exports as 44 bytes that no counterpart can read, and
+      // nothing reports an error.
       if (format === "raw" && key?.type === "public" &&
-          (key.__celldMaterial?.keyType === "ed25519" ||
-            key.__celldMaterial?.keyType === "x25519")) {
+          ["ed25519", "x25519", "ec"].includes(key.__celldMaterial?.keyType)) {
         if (!key.extractable) {
           throw new DOMException("key is not extractable", "InvalidAccessError");
         }
@@ -330,7 +535,10 @@
           der: Array.from(key.__celldMaterial.bytes),
         }).bytes).buffer;
       }
-      if (format === "raw" && key?.__celldMaterial?.bytes) {
+      // Only a secret key's stored bytes are its `raw` form. An asymmetric
+      // key's are a DER document, and an RSA key has no `raw` form at all.
+      if (format === "raw" && key?.__celldMaterial?.bytes &&
+          key.__celldMaterial.keyType === undefined) {
         if (!key.extractable) {
           throw new DOMException("key is not extractable", "InvalidAccessError");
         }
@@ -388,73 +596,21 @@
     // HKDF and PBKDF2 have no natural output size, so for them a missing
     // or unaligned length is the OperationError the spec names.
     async deriveBits(algorithm, baseKey, length) {
-      const name = _algorithmName(algorithm);
-      if (name === "HKDF" || name === "PBKDF2") {
-        const bits = Number(length);
-        if (!Number.isInteger(bits) || bits <= 0 || bits % 8 !== 0) {
-          throw _operationError(
-            name + " length must be a positive multiple of 8 bits");
-        }
-        const hash = _hashName(algorithm?.hash);
-        if (!_DIGEST_ALGS.has(hash)) {
-          throw _notSupported("unsupported " + name + " hash: " + hash);
-        }
-        const ikm = baseKey.__celldMaterial.bytes;
-        const salt = _toBuf(algorithm?.salt ?? new Uint8Array());
-        let out;
-        if (name === "HKDF") {
-          out = $$hkdf(
-            hash, ikm, salt,
-            _toBuf(algorithm?.info ?? new Uint8Array()), bits / 8);
-          if (!out) {
-            throw _operationError("HKDF length is too large for the hash");
-          }
-        } else {
-          const iterations = Number(algorithm?.iterations);
-          if (!Number.isInteger(iterations) || iterations <= 0) {
-            throw _operationError(
-              "PBKDF2 iterations must be a positive integer");
-          }
-          out = $$pbkdf2(hash, ikm, salt, iterations, bits / 8);
-        }
-        return out.buffer.slice(
-          out.byteOffset, out.byteOffset + out.byteLength);
-      }
-      if (name !== "ECDH" && name !== "X25519") {
-        throw _notSupported("unsupported derive algorithm: " + name);
-      }
-      const publicKey = algorithm?.public;
-      if (!publicKey || publicKey.type !== "public") {
-        throw new TypeError(name + " requires a public key in algorithm.public");
-      }
-      // X25519 carries no `namedCurve`, so it cannot ride the curve match
-      // `ecdh-derive` runs; its op is separate for that reason alone. Both
-      // answer the raw shared secret, so everything below is shared.
-      const shared = Uint8Array.from(_extra(
-        name === "X25519" ? "x25519-derive" : "ecdh-derive", {
-          private: Array.from(_toBuf(baseKey.__celldMaterial.bytes)),
-          public: Array.from(_toBuf(publicKey.__celldMaterial.bytes)),
-        }).bytes);
-      if (length === null || length === undefined) return shared.buffer;
-      const bytes = Number(length) / 8;
-      if (!Number.isInteger(bytes) || bytes < 0 || bytes > shared.byteLength) {
-        throw _operationError("requested length exceeds the derived secret");
-      }
-      return shared.slice(0, bytes).buffer;
+      return _derive(algorithm, baseKey, length, "deriveBits");
     }
 
     async deriveKey(algorithm, baseKey, derived, extractable, usages) {
       const name = _algorithmName(derived);
       // An HMAC key with no stated length defaults to its hash's block
       // size, which is what the spec's getKeyLength returns.
-      const length = derived?.length ??
+      const length = name === "AES-KW" ? _kwLength(derived?.length) : derived?.length ??
         (name === "AES-GCM" || name === "AES-CBC" || name === "AES-CTR"
           ? 256
           : name === "HMAC"
             ? ({ "SHA-384": 1024, "SHA-512": 1024 }[
               _hashName(derived?.hash)] ?? 512)
             : null);
-      const bits = await this.deriveBits(algorithm, baseKey, length);
+      const bits = await _derive(algorithm, baseKey, length, "deriveKey");
       return this.importKey(
         "raw", bits, derived, extractable, usages);
     }
@@ -485,9 +641,15 @@
             { bytes: raw },
           );
         }
-        byteLength = Number(algorithm?.length || 256) / 8;
-        if (byteLength !== 16 && byteLength !== 32) {
-          throw new DOMException("AES-GCM length must be 128 or 256", "OperationError");
+        if (name === "AES-KW") {
+          _checkKwUsages(usages);
+          byteLength = _kwLength(algorithm?.length) / 8;
+        } else {
+          byteLength = Number(algorithm?.length || 256) / 8;
+        }
+        if (!_AES_KEY_BYTES[name].includes(byteLength)) {
+          throw new DOMException(
+            `${name} length must be ${_aesKeySizes(name)}`, "OperationError");
         }
         const raw = new Uint8Array(byteLength);
         crypto.getRandomValues(raw);
@@ -580,6 +742,7 @@
 
     async sign(algorithm, key, data) {
       const name = _algorithmName(algorithm || key?.algorithm);
+      _checkKeyUse(name, key, "sign");
       const bytes = _toBuf(data);
       if (name === "HMAC") {
         const hash = _hashName(key?.algorithm?.hash);
@@ -600,19 +763,26 @@
       if (name === "ECDSA" && algorithm?.hash == null) {
         throw new TypeError("EcdsaParams requires a hash");
       }
-      const result = _extra(operation, {
-        key: Array.from(key?.__celldMaterial?.bytes || []),
-        data: Array.from(bytes),
-        // ECDSA carries its hash on the call, RSA on the key; Ed25519
-        // ignores the field.
-        hash: _hashName(name === "ECDSA" ? algorithm?.hash : key?.algorithm?.hash),
-        saltLength: Number(algorithm?.saltLength ?? 0),
-      });
+      const saltLength = name === "RSA-PSS" ? _saltLength(algorithm) : null;
+      let result;
+      try {
+        result = _extra(operation, {
+          key: Array.from(key?.__celldMaterial?.bytes || []),
+          data: Array.from(bytes),
+          // ECDSA carries its hash on the call, RSA on the key; Ed25519
+          // ignores the field.
+          hash: _hashName(name === "ECDSA" ? algorithm?.hash : key?.algorithm?.hash),
+          saltLength,
+        });
+      } catch (error) {
+        throw _fromHost(error);
+      }
       return Uint8Array.from(result.bytes).buffer;
     }
 
     async verify(algorithm, key, signature, data) {
       const name = _algorithmName(algorithm || key?.algorithm);
+      _checkKeyUse(name, key, "verify");
       if (name === "HMAC") {
         return _hmacVerify(
           _hashName(key?.algorithm?.hash),
@@ -646,6 +816,8 @@
         key: Array.from(material),
         data: Array.from(_toBuf(data)),
         signature: Array.from(_toBuf(signature)),
+        // RSA-PSS checks the salt length it is given.
+        saltLength: name === "RSA-PSS" ? _saltLength(algorithm) : null,
         // ECDSA carries its hash on the call, RSASSA on the key.
         hash: _hashName(
           name === "ECDSA" ? algorithm?.hash : key?.algorithm?.hash,
@@ -654,24 +826,11 @@
     }
 
     async encrypt(algorithm, key, data) {
-      const name = _algorithmName(algorithm);
-      if (_AES_MODES.has(name)) {
-        return _aes(name, algorithm, key, data, true);
-      }
-      if (name === "RSA-OAEP") {
-        const hash = _hashName(key?.algorithm?.hash);
-        if (!_RSA_OAEP_HASHES.has(hash)) {
-          throw _notSupported("unsupported RSA-OAEP hash: " + hash);
-        }
-        const result = _extra("rsa-oaep-encrypt", {
-          key: Array.from(key?.__celldMaterial?.bytes || []),
-          data: Array.from(_toBuf(data)),
-          hash,
-          label: _rsaOaepLabel(algorithm),
-        });
-        return Uint8Array.from(result.bytes).buffer;
-      }
-      throw _notSupported("unsupported encrypt algorithm: " + name);
+      return _encrypt(algorithm, key, data, "encrypt");
+    }
+
+    async decrypt(algorithm, key, data) {
+      return _decrypt(algorithm, key, data, "decrypt");
     }
 
     // wrapKey and unwrapKey compose the primitives exactly the way the
@@ -679,43 +838,79 @@
     // jwk-format key crosses as its JSON bytes.
     async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
       const exported = await this.exportKey(format, key);
-      const raw = format === "jwk"
+      let raw = format === "jwk"
         ? new TextEncoder().encode(JSON.stringify(exported))
-        : exported;
-      return this.encrypt(wrapAlgorithm, wrappingKey, raw);
+        : _toBuf(exported);
+      if (_algorithmName(wrapAlgorithm) === "AES-KW") {
+        // AES-KW wraps whole 8-byte registers. Web Crypto pads a JWK with
+        // spaces, which JSON ignores, to get there.
+        if (format === "jwk" && raw.byteLength % 8 !== 0) {
+          const padded = new Uint8Array(Math.ceil(raw.byteLength / 8) * 8)
+            .fill(0x20);
+          padded.set(raw);
+          raw = padded;
+        }
+        return _aesKw(wrappingKey, raw, true);
+      }
+      return _encrypt(wrapAlgorithm, wrappingKey, raw, "wrapKey");
     }
 
     async unwrapKey(
       format, wrapped, unwrappingKey, unwrapAlgorithm,
       algorithm, extractable, usages,
     ) {
-      const raw = await this.decrypt(unwrapAlgorithm, unwrappingKey, wrapped);
+      const raw = _algorithmName(unwrapAlgorithm) === "AES-KW"
+        ? _aesKw(unwrappingKey, wrapped, false)
+        : await _decrypt(unwrapAlgorithm, unwrappingKey, wrapped, "unwrapKey");
       const keyData = format === "jwk"
         ? JSON.parse(new TextDecoder().decode(raw))
         : raw;
       return this.importKey(format, keyData, algorithm, extractable, usages);
     }
+  }
 
-    async decrypt(algorithm, key, data) {
-      const name = _algorithmName(algorithm);
-      if (_AES_MODES.has(name)) {
-        return _aes(name, algorithm, key, data, false);
-      }
-      if (name === "RSA-OAEP") {
-        const hash = _hashName(key?.algorithm?.hash);
-        if (!_RSA_OAEP_HASHES.has(hash)) {
-          throw _notSupported("unsupported RSA-OAEP hash: " + hash);
-        }
-        const result = _extra("rsa-oaep-decrypt", {
-          key: Array.from(key?.__celldMaterial?.bytes || []),
-          data: Array.from(_toBuf(data)),
-          hash,
-          label: _rsaOaepLabel(algorithm),
-        });
-        return Uint8Array.from(result.bytes).buffer;
-      }
-      throw _notSupported("unsupported decrypt algorithm: " + name);
+  function _encrypt(algorithm, key, data, usage) {
+    const name = _algorithmName(algorithm);
+    if (_AES_MODES.has(name)) {
+      return _aes(name, algorithm, key, data, true, usage);
     }
+    if (name === "RSA-OAEP") {
+      _checkKeyUse(name, key, usage);
+      const hash = _hashName(key?.algorithm?.hash);
+      if (!_RSA_OAEP_HASHES.has(hash)) {
+        throw _notSupported("unsupported RSA-OAEP hash: " + hash);
+      }
+      const result = _extra("rsa-oaep-encrypt", {
+        key: Array.from(key?.__celldMaterial?.bytes || []),
+        data: Array.from(_toBuf(data)),
+        hash,
+        label: _rsaOaepLabel(algorithm),
+      });
+      return Uint8Array.from(result.bytes).buffer;
+    }
+    throw _notSupported("unsupported encrypt algorithm: " + name);
+  }
+
+  function _decrypt(algorithm, key, data, usage) {
+    const name = _algorithmName(algorithm);
+    if (_AES_MODES.has(name)) {
+      return _aes(name, algorithm, key, data, false, usage);
+    }
+    if (name === "RSA-OAEP") {
+      _checkKeyUse(name, key, usage);
+      const hash = _hashName(key?.algorithm?.hash);
+      if (!_RSA_OAEP_HASHES.has(hash)) {
+        throw _notSupported("unsupported RSA-OAEP hash: " + hash);
+      }
+      const result = _extra("rsa-oaep-decrypt", {
+        key: Array.from(key?.__celldMaterial?.bytes || []),
+        data: Array.from(_toBuf(data)),
+        hash,
+        label: _rsaOaepLabel(algorithm),
+      });
+      return Uint8Array.from(result.bytes).buffer;
+    }
+    throw _notSupported("unsupported decrypt algorithm: " + name);
   }
 
   const subtle = new SubtleCrypto();

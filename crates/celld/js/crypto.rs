@@ -38,6 +38,21 @@ fn rsa_exponent(e: &rsa::BoxedUint) -> u64 {
         .fold(0, |acc, byte| acc << 8 | u64::from(*byte))
 }
 
+/// The longest salt an RSA-PSS signature can carry:
+/// `ceil((modBits - 1) / 8) - hLen - 2` (RFC 8017 section 9.1.1).
+fn pss_max_salt_len(modulus_bits: u32, hash: &str) -> Result<u64> {
+    let hash_len: u64 = match hash {
+        "SHA-256" => 32,
+        "SHA-384" => 48,
+        "SHA-512" => 64,
+        other => return Err(anyhow!("NotSupportedError: unsupported RSA hash {other}")),
+    };
+    let em_len = u64::from(modulus_bits.saturating_sub(1)).div_ceil(8);
+    em_len
+        .checked_sub(hash_len + 2)
+        .ok_or_else(|| anyhow!("OperationError: RSA key is too small for {hash} PSS"))
+}
+
 /// The OS RNG in the `rand_core` 0.10 shape the RustCrypto crates take.
 fn os_rng() -> getrandom::rand_core::UnwrapErr<getrandom::SysRng> {
     getrandom::rand_core::UnwrapErr(getrandom::SysRng)
@@ -890,30 +905,41 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             };
             Ok(serde_json::json!({ "ok": ok }))
         }
-        // Web Crypto RSA-PSS. Signing takes the caller's salt length —
-        // the spec makes it an explicit parameter — and verification
-        // recovers the salt length from the signature, which accepts
-        // every salt the signer could legally have used.
+        // RSA-PSS. Signing takes the caller's salt length (the spec makes it
+        // an explicit parameter). Verification checks the salt length it is
+        // given, and recovers it from the signature when none is given,
+        // which accepts every salt the signer could legally have used.
         "rsa-pss-sign" => {
             use rsa::pkcs8::DecodePrivateKey;
             use rsa::signature::RandomizedSigner;
             use rsa::signature::SignatureEncoding;
+            use rsa::traits::PublicKeyParts;
             let key = crypto_bytes(args, "key")?;
             let data = crypto_bytes(args, "data")?;
             let salt_len = args
                 .get("saltLength")
                 .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as usize;
+                .ok_or_else(|| anyhow!("RSA-PSS needs a saltLength"))?;
             let hash = args
                 .get("hash")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("SHA-256");
             let key = rsa::PrivateKey::from_pkcs8_der(&key)
-                .map_err(|_| anyhow!("invalid RSA private key"))?;
+                .map_err(|_| anyhow!("InvalidAccessError: invalid RSA private key"))?;
+            // A salt the modulus cannot hold is refused before the signer
+            // allocates it or asserts on it.
+            let max = pss_max_salt_len(key.n().bit_width(), hash)?;
+            if salt_len > max {
+                return Err(anyhow!(
+                    "OperationError: RSA-PSS saltLength {salt_len} is larger than the {max} this key allows"
+                ));
+            }
+            let salt_len = salt_len as usize;
             macro_rules! sign {
                 ($hash:ty) => {
                     rsa::pss::SigningKey::<$hash>::new_with_salt_len(key, salt_len)
-                        .sign_with_rng(&mut os_rng(), &data)
+                        .try_sign_with_rng(&mut os_rng(), &data)
+                        .map_err(|_| anyhow!("RSA signing failed"))?
                         .to_vec()
                 };
             }
@@ -928,6 +954,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
         "rsa-pss-verify" => {
             use rsa::pkcs8::DecodePublicKey;
             use rsa::signature::Verifier;
+            use rsa::traits::PublicKeyParts;
             let key = crypto_bytes(args, "key")?;
             let data = crypto_bytes(args, "data")?;
             let signature = crypto_bytes(args, "signature")?;
@@ -936,11 +963,32 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("SHA-256")
                 .to_string();
+            let salt_len = args.get("saltLength").and_then(serde_json::Value::as_u64);
             let key = rsa::PublicKey::from_public_key_der(&key)
                 .map_err(|_| anyhow!("invalid RSA SPKI key"))?;
+            // No signature carries a salt longer than the modulus allows, and
+            // a modulus too small for the hash holds no signature at all.
+            // Only an unsupported hash is an error.
+            let max = match pss_max_salt_len(key.n().bit_width(), &hash) {
+                Ok(max) => Some(max),
+                Err(error) if error.to_string().starts_with("NotSupportedError") => {
+                    return Err(error);
+                }
+                Err(_) => None,
+            };
+            let salt_len = match (salt_len, max) {
+                (Some(_), None) => return Ok(serde_json::json!({ "ok": false })),
+                (Some(len), Some(max)) if len > max => {
+                    return Ok(serde_json::json!({ "ok": false }));
+                }
+                (other, _) => other.map(|len| len as usize),
+            };
             macro_rules! verify {
                 ($hash:ty) => {{
-                    let key = rsa::pss::VerifyingKey::<$hash>::new(key);
+                    let key = match salt_len {
+                        Some(len) => rsa::pss::VerifyingKey::<$hash>::new_with_salt_len(key, len),
+                        None => rsa::pss::VerifyingKey::<$hash>::new_with_auto_salt_len(key),
+                    };
                     rsa::pss::Signature::try_from(signature.as_slice())
                         .map(|signature| key.verify(&data, &signature).is_ok())
                         .unwrap_or(false)
@@ -1021,13 +1069,15 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                     .get("type")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
-                let point: [u8; 32] = key
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| anyhow!("a {curve} raw public key must be 32 bytes"))?;
+                let point = || -> Result<[u8; 32]> {
+                    key.as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow!("a {curve} raw public key must be 32 bytes"))
+                };
                 let der = match curve {
-                    "X25519" => x25519_spki(&point),
+                    "X25519" => x25519_spki(&point()?),
                     "Ed25519" => {
+                        let point = point()?;
                         use ed25519_dalek::pkcs8::EncodePublicKey;
                         // Unlike X25519, an Ed25519 point has to decompress
                         // to a curve point, so a bad one fails here.
@@ -1036,6 +1086,43 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                             .to_public_key_der()?
                             .as_bytes()
                             .to_vec()
+                    }
+                    // An EC public key is the uncompressed point
+                    // `0x04 || X || Y`. A compressed point is a different,
+                    // valid encoding that celld does not read, so it is
+                    // refused by name rather than reported as off the curve.
+                    "P-256" | "P-384" | "P-521" => {
+                        macro_rules! import {
+                            ($c:ident) => {{
+                                use $c::pkcs8::EncodePublicKey;
+                                match key.first() {
+                                    Some(2 | 3) => {
+                                        return Err(anyhow!(
+                                            "NotSupportedError: compressed EC points are not \
+                                             supported; use the uncompressed 0x04 form"
+                                        ))
+                                    }
+                                    Some(4) => {}
+                                    _ => {
+                                        return Err(anyhow!(
+                                            "DataError: a {curve} raw public key is the \
+                                             uncompressed point"
+                                        ))
+                                    }
+                                }
+                                $c::PublicKey::from_sec1_bytes(&key)
+                                    .map_err(|_| {
+                                        anyhow!(
+                                            "DataError: the point is not a valid {curve} \
+                                             point"
+                                        )
+                                    })?
+                                    .to_public_key_der()?
+                                    .as_bytes()
+                                    .to_vec()
+                            }};
+                        }
+                        ec_curve!(curve, import)
                     }
                     other => return Err(anyhow!("cannot import a raw {other} key")),
                 };
@@ -1334,7 +1421,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             }
         }
         // The inverse of the `raw` import above: the 32-byte point inside an
-        // Ed25519 or X25519 SPKI document. Web Crypto's `raw` export of a
+        // Ed25519 or X25519 SPKI document, or an EC key's uncompressed point. Web Crypto's `raw` export of a
         // Secure Curves public key is those bytes, not the document holding
         // them, and a peer that receives 44 bytes of SPKI where it expects a
         // point fails far from here.
@@ -1349,6 +1436,20 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                         .map_err(|_| anyhow!("invalid Ed25519 public key"))?
                         .to_bytes()
                         .to_vec()
+                }
+                "ec" => {
+                    let crv = ec_jwk_crv(&parsed)?;
+                    macro_rules! export {
+                        ($c:ident) => {{
+                            use $c::elliptic_curve::sec1::ToSec1Point;
+                            use $c::pkcs8::DecodePublicKey;
+                            $c::PublicKey::from_public_key_der(&der)?
+                                .to_sec1_point(false)
+                                .as_bytes()
+                                .to_vec()
+                        }};
+                    }
+                    ec_curve!(crv, export)
                 }
                 other => return Err(anyhow!("cannot export a {other} key as raw")),
             };
@@ -1943,6 +2044,9 @@ fn webcrypto_aes_gcm(
 #[derive(Clone, Copy)]
 enum AesMode {
     Gcm,
+    /// RFC 3394 key wrap. Like GCM it reports an integrity failure by
+    /// returning nothing; `encrypting` means wrap.
+    Kw,
     /// GCM reports a failure by returning nothing and the block modes report
     /// a cause, so the two answer to different callers and cannot share one
     /// branch.
@@ -1959,6 +2063,7 @@ impl AesMode {
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
             "AES-GCM" => Self::Gcm,
+            "AES-KW" => Self::Kw,
             "AES-CBC" => Self::Block(AesBlockMode::Cbc),
             "AES-CTR" => Self::Block(AesBlockMode::Ctr),
             _ => return None,
@@ -2036,9 +2141,96 @@ fn webcrypto_aes_block_mode(
     }
 }
 
+/// AES Key Wrap, RFC 3394: takes a multiple of 8 bytes, at least 16, and
+/// returns 8 more.
+fn aes_kw_wrap(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    aes_kw(key, data, true)?.ok_or_else(|| anyhow!("AES-KW wrap failed"))
+}
+
+/// The inverse of [`aes_kw_wrap`]. `None` when the integrity register does not
+/// come back as the default IV, which is what a wrong key or altered data
+/// looks like.
+fn aes_kw_unwrap(key: &[u8], data: &[u8]) -> Result<Option<Vec<u8>>> {
+    aes_kw(key, data, false)
+}
+
+/// The cipher dispatch and the register walk both directions share.
+fn aes_kw(key: &[u8], data: &[u8], wrapping: bool) -> Result<Option<Vec<u8>>> {
+    use aes::cipher::consts::U16;
+    use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, BlockSizeUser, KeyInit};
+    const IV: [u8; 8] = [0xA6; 8];
+    if !data.len().is_multiple_of(8) || data.len() < if wrapping { 16 } else { 24 } {
+        return Err(anyhow!(
+            "AES-KW data must be a multiple of 8 bytes, at least {}",
+            if wrapping { 16 } else { 24 }
+        ));
+    }
+    fn run<
+        C: BlockCipherEncrypt + BlockCipherDecrypt + KeyInit + BlockSizeUser<BlockSize = U16>,
+    >(
+        key: &[u8],
+        data: &[u8],
+        wrapping: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        let cipher = C::new_from_slice(key).map_err(|_| anyhow!("invalid AES-KW key"))?;
+        let mut a: [u8; 8] = if wrapping {
+            IV
+        } else {
+            data[..8].try_into().expect("8 bytes")
+        };
+        let mut r: Vec<[u8; 8]> = data[if wrapping { 0 } else { 8 }..].as_chunks().0.to_vec();
+        let n = r.len() as u64;
+        let mut block = aes::Block::default();
+        for j in 0..6u64 {
+            for i in 1..=n {
+                // Unwrapping walks the rounds and the registers backwards.
+                let (round, index) = if wrapping { (j, i) } else { (5 - j, n + 1 - i) };
+                let t = (n * round + index).to_be_bytes();
+                let slot = &mut r[(index - 1) as usize];
+                if wrapping {
+                    block[..8].copy_from_slice(&a);
+                    block[8..].copy_from_slice(slot);
+                    cipher.encrypt_block(&mut block);
+                    a = block[..8].try_into().expect("8 bytes");
+                    a.iter_mut().zip(t).for_each(|(byte, t)| *byte ^= t);
+                } else {
+                    block[..8]
+                        .iter_mut()
+                        .zip(a.iter().zip(t))
+                        .for_each(|(byte, (a, t))| *byte = a ^ t);
+                    block[8..].copy_from_slice(slot);
+                    cipher.decrypt_block(&mut block);
+                    a = block[..8].try_into().expect("8 bytes");
+                }
+                slot.copy_from_slice(&block[8..]);
+            }
+        }
+        // The integrity check compares in constant time, so the unwrap does
+        // not say how many bytes of a forged block matched.
+        if !wrapping && !bool::from(subtle::ConstantTimeEq::ct_eq(&a[..], &IV[..])) {
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(data.len() + 8);
+        if wrapping {
+            out.extend_from_slice(&a);
+        }
+        out.extend(r.iter().flatten());
+        Ok(Some(out))
+    }
+    match key.len() {
+        16 => run::<aes::Aes128>(key, data, wrapping),
+        24 => run::<aes::Aes192>(key, data, wrapping),
+        32 => run::<aes::Aes256>(key, data, wrapping),
+        other => Err(anyhow!(
+            "AES-KW requires a 128-, 192- or 256-bit key, got {other} bytes"
+        )),
+    }
+}
+
 /// `$$aesEncrypt(mode, key, iv, data, additionalData, tagBytes)` and its
 /// decrypt counterpart return a Uint8Array. The last two arguments apply only
-/// to AES-GCM, so one typed-array op pair still serves all three AES modes.
+/// to AES-GCM, so one typed-array op pair still serves every AES mode. AES-KW
+/// is wrap on the encrypt op and unwrap on the decrypt op.
 fn op_webcrypto_aes(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -2076,6 +2268,18 @@ fn op_webcrypto_aes(
                 webcrypto_aes_gcm(&key, &iv, &additional_data, &data, tag_size, encrypting)
             {
                 webcrypto_return_bytes(scope, rv, &out);
+            }
+        }
+        AesMode::Kw => {
+            let out = if encrypting {
+                aes_kw_wrap(&key, &data).map(Some)
+            } else {
+                aes_kw_unwrap(&key, &data)
+            };
+            match out {
+                Ok(Some(out)) => webcrypto_return_bytes(scope, rv, &out),
+                Ok(None) => {}
+                Err(error) => throw(scope, error),
             }
         }
         AesMode::Block(block) => {
@@ -2189,5 +2393,145 @@ mod scrypt_tests {
             scrypt_kdf(b"", b"", 1 << 20, 8, 1, u64::MAX, 16),
             Err(ScryptRefusal::MemoryLimit)
         );
+    }
+}
+
+#[cfg(test)]
+mod aes_kw_tests {
+    use super::{aes_kw_unwrap, aes_kw_wrap};
+
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // RFC 3394 section 4: each case wraps key data under a KEK.
+    const VECTORS: [(&str, &str, &str); 6] = [
+        (
+            "000102030405060708090A0B0C0D0E0F",
+            "00112233445566778899AABBCCDDEEFF",
+            "1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5",
+        ),
+        (
+            "000102030405060708090A0B0C0D0E0F1011121314151617",
+            "00112233445566778899AABBCCDDEEFF",
+            "96778B25AE6CA435F92B5B97C050AED2468AB8A17AD84E5D",
+        ),
+        (
+            "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F",
+            "00112233445566778899AABBCCDDEEFF",
+            "64E8C3F9CE0F5BA263E9777905818A2A93C8191E7D6E8AE7",
+        ),
+        (
+            "000102030405060708090A0B0C0D0E0F1011121314151617",
+            "00112233445566778899AABBCCDDEEFF0001020304050607",
+            "031D33264E15D33268F24EC260743EDCE1C6C7DDEE725A936BA814915C6762D2",
+        ),
+        (
+            "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F",
+            "00112233445566778899AABBCCDDEEFF0001020304050607",
+            "A8F9BC1612C68B3FF6E6F4FBE30E71E4769C8B80A32CB8958CD5D17D6B254DA1",
+        ),
+        (
+            "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F",
+            "00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F",
+            "28C9F404C4B810F4CBCCB35CFB87F8263F5786E2D80ED326CBC7F0E71A99F43BFB988B9B7A02DD21",
+        ),
+    ];
+
+    #[test]
+    fn matches_the_rfc_3394_vectors() {
+        for (kek, data, wrapped) in VECTORS {
+            let (kek, data, wrapped) = (hex(kek), hex(data), hex(wrapped));
+            assert_eq!(aes_kw_wrap(&kek, &data).unwrap(), wrapped);
+            assert_eq!(aes_kw_unwrap(&kek, &wrapped).unwrap(), Some(data));
+        }
+    }
+
+    #[test]
+    fn altered_data_or_a_wrong_key_does_not_unwrap() {
+        let (kek, _, wrapped) = VECTORS[0];
+        let mut wrapped = hex(wrapped);
+        wrapped[3] ^= 1;
+        assert_eq!(aes_kw_unwrap(&hex(kek), &wrapped).unwrap(), None);
+    }
+
+    #[test]
+    fn refuses_data_that_is_not_whole_registers() {
+        assert!(aes_kw_wrap(&[0; 16], &[0; 15]).is_err());
+        assert!(aes_kw_wrap(&[0; 16], &[0; 8]).is_err());
+        assert!(aes_kw_unwrap(&[0; 16], &[0; 16]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod pss_tests {
+    use super::{crypto_operation, pss_max_salt_len};
+
+    #[test]
+    fn the_salt_limit_follows_the_modulus_and_the_hash() {
+        assert_eq!(pss_max_salt_len(2048, "SHA-256").unwrap(), 222);
+        assert_eq!(pss_max_salt_len(2048, "SHA-512").unwrap(), 190);
+        assert_eq!(pss_max_salt_len(1025, "SHA-256").unwrap(), 94);
+        assert!(pss_max_salt_len(512, "SHA-512").is_err());
+    }
+
+    #[test]
+    fn a_salt_the_key_cannot_hold_is_an_error_not_a_crash() {
+        let pair = crypto_operation(
+            "asym-key-generate",
+            &serde_json::json!({ "type": "rsa", "modulusLength": 1024 }),
+        )
+        .unwrap();
+        let sign = |salt: u64| {
+            crypto_operation(
+                "rsa-pss-sign",
+                &serde_json::json!({
+                    "key": pair["privateDer"], "data": [1, 2, 3],
+                    "hash": "SHA-256", "saltLength": salt,
+                }),
+            )
+        };
+        // 128 - 32 - 2 = 94 bytes at most.
+        assert!(sign(94).is_ok());
+        assert!(sign(95).is_err());
+        assert!(sign(u64::MAX).is_err());
+        let verify = |signature: &serde_json::Value, salt: u64| {
+            crypto_operation(
+                "rsa-pss-verify",
+                &serde_json::json!({
+                    "key": pair["publicDer"], "data": [1, 2, 3], "signature": signature,
+                    "hash": "SHA-256", "saltLength": salt,
+                }),
+            )
+            .unwrap()["ok"]
+                .as_bool()
+        };
+        let signature = sign(94).unwrap()["bytes"].clone();
+        assert_eq!(verify(&signature, 94), Some(true));
+        assert_eq!(verify(&signature, 95), Some(false));
+        assert_eq!(verify(&signature, u64::MAX), Some(false));
+    }
+
+    #[test]
+    fn verifying_with_an_unsupported_hash_is_still_an_error() {
+        let pair = crypto_operation(
+            "asym-key-generate",
+            &serde_json::json!({ "type": "rsa", "modulusLength": 1024 }),
+        )
+        .unwrap();
+        let verify = crypto_operation(
+            "rsa-pss-verify",
+            &serde_json::json!({
+                "key": pair["publicDer"], "data": [1], "signature": vec![0u8; 128],
+                "hash": "SHA-1", "saltLength": 20,
+            }),
+        );
+        assert!(verify
+            .unwrap_err()
+            .to_string()
+            .starts_with("NotSupportedError"));
     }
 }

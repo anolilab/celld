@@ -30,6 +30,16 @@ const ECDSA = {
   "p521 sha384": "MIGIAkIBQzJRfxYFGMsDHlDMQt4DJudxDw9LR6STffVNOyjxjo7O1pzcCJHK91bEDSRgQG/xeY3IT3r9CLfwaUCyMwzLENsCQgEhWosPFbpp7b/stdbu6yhiYzSCpSSTrIfQHjguuSoGxL+cVNGd6OY+wA3/gmPGQ+CuKQ7ovwQAQhysCQi2ii8guw==",
   "p521 sha512": "MIGHAkIAua/726x3Cs9rH0t2b0bvwshsPiiLdRP2ICzaNegKBB8qHce5xIW4srcARa8nqGbcoYB9+zPynytB4YBODDOwlYMCQXOPeqLyBqFNiCAEkrioyr518N5IsB7paN6KaZM/ciEPpkPOOldYxejDQRz/7RMBw9Jx24d30QxtM8EM1SgHtUEy"
 };
+const PSS = {
+  "20": "XfWywe7hPsTLfHx/uCO771kcXmwXermby7ow9/VjR6l0C+Y09LvAYVA0SRILBox03Cawh8iMy54HWb+PHOQoFnD6oaWPfs86qGzpeAePGqI7BTpDT+dCVz0l9Nc0g6mOnW5e3Jr8sT5PBh7Go63yYbG6IZ0UNvdMD+J66X/fnXoULdOqsxrSuEAneX2/q3BIIDkDZNd1HvnsrFQ3ACsZlHkdvD4Na5WHZR5V9tDZ13r/fmjfH/NMy+0BbXDv36LSfpltzI/ryZvwaO21X/MHb6TreQTepCzdoP68PjvoGALvo6l0IpcHYOUsf+nj1/XBOZZtGo6FRfwbK9b4MHETDA==",
+  "max": "aLy4vAvRNzgbeWhjFL3R5n6hN5lNxNnzKR7elclpg4pLWLjcZ0Nbvnwx2DBx2Sq5tQze7sfCpT61F3sb4y8BKi00scIC3Pt+3uh+f0C9vWkuL8k2dslqCQ590oMmiCWI+32orXRiODaIiQ52R+ux+ClQ1oWW3d0wz4/bJmcYJ90O3rC+SwNKQKYK1obSU8wvtmEGnwGQ1Sgnzg1vEyJTCEqM0qll42p2wOA4t++RTP/zaaWmj/tKSSmPqGWXCl5jpG8x5EW8CE3ce5YsQElhPiaOIJL+JN/5cDV3NP1h545UKXrLM2EgUxEDzBMfoiTXqOoLY1D0+Pj6cdBrK/mblA==",
+  "digest": "QZvdrWRjFxLSpn02iRxXx7+uko31yTqQjra8inrxdMMnEl8yn/nXz6gHXapicjIWpm0ms16d06i3w9Okg8B+UQJKuPc3sFGJc4Ih90lWI7UR1Ymq+sw/tt7j7Yz1hb7ekju38Y0wEFnYQpcRobBR8YKyNw/+Ref/AKJTV+6NWYIDl2T8USryBAV/r0mykjUVHEeTuMWC1dnqqiqyEOHJ3HRP9/amEk+BPuknkCmIdCSx4i8cTivHJjHiXo3imiBA0dvSKiKwxplVM+9ltJzqGU7BQJzPTIuK2EFu5NJfumXkjjLiVw0j6/fNkicrjfMWoQCNBk58WYSG/PgKXuZHcg=="
+};
+const P1363 = {
+  "p256": "69Hu+YPWgpNafB2+1ccryX9IE4vqbUVsMt+OsgYJBcNrjL+sQBMv+nDcSD265c7t04xX5KqcFMCUfir7SxW/8Q==",
+  "p384": "ep2LcIVaDknZ2GizKU3VlPCGg16aUjSeSXlF9Pm1W9BS/5+aQoHM42h6ZRmzt0kKC0UFr7yEz+KT6ufJUQiUFqWXkIfs7/805eGms4pnffMbuS81sYwfqiIHa+Id2XTP",
+  "p521": "APCQ0/D2d7vML/eadw/r/68mBKjYC56pedl8c3VgmXQBXxoLtnQuK1YiPyo9tN+r3hS91ouCWG5oiFXl6KQx4TNjAMZfF8RzrGBZrG3f4U+9Upi9kSg17asMTrc0f6eQl0YpFD/9wT1SvUyAgmClwXxecQnIScOnqzPMLe7eqKjvgkDu"
+};
 const REFERENCE = {
   "createHash md5": "900150983cd24fb0d6963f7d28e17f72",
   "createHmac md5": "X8qyZ7YZFEj/Luc8FgtRnA==",
@@ -317,6 +327,86 @@ const checks = {
       for (const hash of ["sha256", "sha384", "sha512"]) {
         roundTrip(`ECDSA ${curve} ${hash}`, hash, KEYS[curve], ECDSA[`${curve} ${hash}`]);
       }
+    }
+  },
+  // `padding`, `saltLength` and `dsaEncoding` change the signature a key
+  // makes, so each is honoured: a PSS request must never come back as a
+  // PKCS#1 v1.5 signature.
+  "sign and verify options"() {
+    const { RSA_PKCS1_PSS_PADDING: PSS_PADDING, RSA_NO_PADDING } = crypto.constants;
+    const pub = crypto.createPublicKey(KEYS.rsa.private);
+    const pss = (saltLength) => ({ padding: PSS_PADDING, saltLength });
+    const verifyPss = (signature, saltLength, data = message) =>
+      crypto.verify("sha256", data, { key: pub, ...pss(saltLength) }, signature);
+    // Node's PSS signatures verify with the salt length they were made with,
+    // and with the default of reading it off the signature.
+    for (const [name, saltLength] of [["max", -2], ["digest", -1], ["20", 20]]) {
+      const reference = Buffer.from(PSS[name], "base64");
+      equal(verifyPss(reference, saltLength), true, `reference PSS ${name}`);
+      equal(crypto.verify("sha256", message, { key: pub, padding: PSS_PADDING }, reference), true, `reference PSS ${name} with the salt read off`);
+      equal(crypto.verify("sha256", message, pub, reference), false, `reference PSS ${name} read as PKCS#1 v1.5`);
+    }
+    equal(verifyPss(Buffer.from(PSS["20"], "base64"), -1), false, "salt 20 against the digest length");
+    // The signature made here is PSS, at the salt length asked for.
+    const own = crypto.sign("sha256", message, { key: KEYS.rsa.private, padding: PSS_PADDING });
+    equal(own.length, 256, "PSS signature length");
+    equal(verifyPss(own, -2), true, "own PSS verifies");
+    equal(verifyPss(own, 222), true, "own PSS defaults to the largest salt for a 2048-bit key");
+    equal(verifyPss(own, -1), false, "own PSS is not at the digest length");
+    equal(verifyPss(own, -2, tampered), false, "tampered PSS verifies");
+    equal(crypto.verify("sha256", message, pub, own), false, "own PSS read as PKCS#1 v1.5");
+    const digest = crypto.sign("sha256", message, { key: KEYS.rsa.private, ...pss(-1) });
+    equal(verifyPss(digest, 32), true, "own PSS at the digest length");
+    equal(crypto.verify("sha256", message, pub, crypto.sign("sha256", message, { key: KEYS.rsa.private, padding: crypto.constants.RSA_PKCS1_PADDING })), true, "explicit PKCS#1 v1.5");
+    // A padding that is not implemented throws instead of signing another way.
+    for (const call of [
+      () => crypto.sign("sha256", message, { key: KEYS.rsa.private, padding: RSA_NO_PADDING }),
+      () => crypto.verify("sha256", message, { key: pub, padding: RSA_NO_PADDING }, own),
+    ]) {
+      let threw = false;
+      try { call(); } catch { threw = true; }
+      equal(threw, true, "an unsupported RSA padding throws");
+    }
+    // `saltLength` means nothing without PSS padding, so it is ignored there.
+    const plain = crypto.sign("sha256", message, KEYS.rsa.private);
+    equal(crypto.sign("sha256", message, { key: KEYS.rsa.private, saltLength: 20 }).equals(plain), true, "saltLength without PSS padding");
+    equal(crypto.verify("sha256", message, { key: pub, saltLength: 20 }, plain), true, "verify with saltLength and no PSS padding");
+    // A salt the modulus cannot hold throws; 222 is the most a 2048-bit key
+    // holds with SHA-256.
+    equal(crypto.verify("sha256", message, { key: pub, ...pss(222) }, crypto.sign("sha256", message, { key: KEYS.rsa.private, ...pss(222) })), true, "the largest salt");
+    for (const saltLength of [223, 1000, 2 ** 31 - 1]) {
+      let threw = false;
+      try { crypto.sign("sha256", message, { key: KEYS.rsa.private, ...pss(saltLength) }); } catch { threw = true; }
+      equal(threw, true, `PSS saltLength ${saltLength} throws`);
+    }
+    // A PEM public key given beside the options verifies, and so does a
+    // private PEM, which yields its public half.
+    const publicPem = pub.export({ type: "spki", format: "pem" });
+    equal(crypto.verify("sha256", message, { key: publicPem, padding: PSS_PADDING }, own), true, "PSS verify with a public PEM");
+    equal(crypto.verify("sha256", message, { key: KEYS.rsa.private, padding: PSS_PADDING }, own), true, "PSS verify with a private PEM");
+    equal(crypto.verify("sha256", message, publicPem, plain), true, "PKCS#1 v1.5 verify with a bare public PEM");
+    // A key too small for the digest says so, rather than asking for a saltLength.
+    // A 512-bit key, which cannot be generated here, so it is a fixed PEM.
+    const small = "-----BEGIN PRIVATE KEY-----\nMIIBVgIBADANBgkqhkiG9w0BAQEFAASCAUAwggE8AgEAAkEAxSOGbv8MDw+B2Atg\nPszhkYGRTxBivAxCUsH5rp85YsOVdI/Nyit33G60L6493m5wP6DymdpW7OAIU6dL\n610+DQIDAQABAkEAqBfPhAtS8/CMDXQ9v66g05oAFcNp/OATGU+unzfDDbMo/3Js\ncCEuWM6REReDmdgxB75xyzK7rcX6dlsCUP4dfQIhAPNyqJeyaWnc4pkYhbD0K2n5\n1Hcl7zY3RvOsXi3udYgfAiEAz02eY8AvrgOFAW7UfflppO/c9U3iG6duFK8afwMq\nZFMCIQC/b2dRupMYEwEBIH5osui8sh83/lWIDZm2ndGFTuGPQwIhAIOWQXQQCjPr\nCAJg14EfUG/h0d/kECJ9pOJ8Q9VbrQ0BAiAeINXa8l0bZh/I40B5DL0Hhu33SJPW\nekFyoCah657ncg==\n-----END PRIVATE KEY-----\n";
+    let tooSmall;
+    try { crypto.sign("sha512", message, { key: small, padding: PSS_PADDING }); } catch (error) { tooSmall = error.message; }
+    equal(/too small/.test(tooSmall), true, `512-bit key with sha512 PSS: ${tooSmall}`);
+    // ECDSA signatures are DER unless IEEE P1363 is asked for.
+    for (const [curve, size] of [["p256", 32], ["p384", 48], ["p521", 66]]) {
+      const key = crypto.createPublicKey(KEYS[curve].private);
+      const reference = Buffer.from(P1363[curve], "base64");
+      equal(reference.length, 2 * size, `${curve} P1363 reference length`);
+      equal(crypto.verify("sha256", message, { key, dsaEncoding: "ieee-p1363" }, reference), true, `${curve} P1363 reference verifies`);
+      equal(crypto.verify("sha256", message, key, reference), false, `${curve} P1363 reference read as DER`);
+      const raw = crypto.sign("sha256", message, { key: KEYS[curve].private, dsaEncoding: "ieee-p1363" });
+      equal(raw.length, 2 * size, `${curve} own P1363 length`);
+      equal(crypto.verify("sha256", message, { key, dsaEncoding: "ieee-p1363" }, raw), true, `${curve} own P1363 verifies`);
+      equal(crypto.verify("sha256", tampered, { key, dsaEncoding: "ieee-p1363" }, raw), false, `${curve} own P1363 tampered`);
+      const der = crypto.sign("sha256", message, { key: KEYS[curve].private, dsaEncoding: "der" });
+      equal(crypto.verify("sha256", message, key, der), true, `${curve} explicit DER verifies`);
+      let code;
+      try { crypto.sign("sha256", message, { key: KEYS[curve].private, dsaEncoding: "x" }); } catch (error) { code = error.code; }
+      equal(code, "ERR_INVALID_ARG_VALUE", `${curve} unknown dsaEncoding`);
     }
   },
   generateKeyPairSync() {

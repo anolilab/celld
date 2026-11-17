@@ -137,6 +137,24 @@ const V = {
     "pkcs8": "302e020100300506032b656e04220420f0df55bb4ae320cfd4f5f3a37c67cbd156f058b9a2b226903b313cba26f96d74",
     "peer": "302a300506032b656e03210000164085139c6b1d451f6eabf3d62ae066e143f8f7c4b1ce95ba1ad62e923c67",
     "shared": "0c1a33f52050e9b4b645e98e0c45cf591cfffc6b1fdf330dfcc47e732285ad12"
+  },
+  "AES-KW": {
+    "128": {
+      "kek": "808182838485868788898a8b8c8d8e8f",
+      "wrapped": "978e0b2d9409e9e9eae6513a532970b01ed665b73e844ee0"
+    },
+    "192": {
+      "kek": "808182838485868788898a8b8c8d8e8f9091929394959697",
+      "wrapped": "3eb5a80f3d4694a13f57f5d26ce420fbf995910fbeab97f6"
+    },
+    "256": {
+      "kek": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+      "wrapped": "fe1743aa34fb4ce9d87ba9f0dcb4d7db2699c0d85e633025"
+    },
+    "jwk": {
+      "kek": "808182838485868788898a8b8c8d8e8f",
+      "wrapped": "d50f91d24bb4a00016ee15ba6dff2e50600efd4b5c5cb7e6d64081fbe114af3a1f8ba96be66297029f3a57d08d851417bf5d04c30fc8b71af3d25602cf965e088e10ec17a7bf607ecc29847ef90f11bb3bc4511965d9f244c7ce46ceb1ea4497708800043c80d6d36929e69c847c5b00875b612d045037042b3bd5850fe2f86b21a9e155256eeba4"
+    }
   }
 };
 // END VECTORS
@@ -302,6 +320,269 @@ const checks = {
   "RSASSA-PKCS1-v1_5": () =>
     signature("RSASSA-PKCS1-v1_5", V["RSASSA-PKCS1-v1_5"], { hash: "SHA-256" }, true),
   "RSA-PSS": () => signature("RSA-PSS", V["RSA-PSS"], { hash: "SHA-256", saltLength: 32 }, false),
+  // Verification checks the salt length it is given.
+  async "RSA-PSS salt length"() {
+    const vector = V["RSA-PSS"];
+    const pub = await subtle.importKey("spki", unhex(vector.spki), { name: "RSA-PSS", hash: "SHA-256" }, true, ["verify"]);
+    const reference = unhex(vector.signature);
+    equal(await subtle.verify({ name: "RSA-PSS", saltLength: 32 }, pub, reference, message), true, "the salt it was made with");
+    equal(await subtle.verify({ name: "RSA-PSS", saltLength: 20 }, pub, reference, message), false, "another salt length");
+  },
+  // `saltLength` is a required unsigned long: anything else is a TypeError,
+  // not a signature of another scheme, and a salt the modulus cannot hold is
+  // an OperationError rather than a crash.
+  async "RSA-PSS salt length range"() {
+    const vector = V["RSA-PSS"];
+    const algorithm = { name: "RSA-PSS", hash: "SHA-256" };
+    const pub = await subtle.importKey("spki", unhex(vector.spki), algorithm, true, ["verify"]);
+    const priv = await subtle.importKey("pkcs8", unhex(vector.pkcs8), algorithm, false, ["sign"]);
+    const reference = unhex(vector.signature);
+    const outcome = (promise) => promise.then(() => "ok", (error) => error.name);
+    for (const saltLength of [undefined, -1, NaN, Infinity, 2 ** 32, "x"]) {
+      equal(await outcome(subtle.verify({ name: "RSA-PSS", saltLength }, pub, reference, message)), "TypeError", `verify with saltLength ${saltLength}`);
+      equal(await outcome(subtle.sign({ name: "RSA-PSS", saltLength }, priv, message)), "TypeError", `sign with saltLength ${saltLength}`);
+    }
+    equal(await subtle.verify({ name: "RSA-PSS", saltLength: 32.9 }, pub, reference, message), true, "a fraction truncates");
+    equal(await subtle.verify({ name: "RSA-PSS", saltLength: 4e9 }, pub, reference, message), false, "a salt no modulus holds");
+    // 2048-bit key with SHA-256: 256 - 32 - 2 = 222 bytes at most.
+    const sealed = await subtle.sign({ name: "RSA-PSS", saltLength: 222 }, priv, message);
+    equal(await subtle.verify({ name: "RSA-PSS", saltLength: 222 }, pub, sealed, message), true, "the largest salt");
+    for (const saltLength of [223, 1e6, 4e9]) {
+      equal(await outcome(subtle.sign({ name: "RSA-PSS", saltLength }, priv, message)), "OperationError", `sign with saltLength ${saltLength}`);
+    }
+    // Only the salt is the caller's to fix as an OperationError: a key that is
+    // not an RSA private key is an InvalidAccessError, and a hash the host has
+    // no PSS for is a NotSupportedError.
+    const ec = await subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+    equal(await outcome(subtle.sign({ name: "RSA-PSS", saltLength: 32 }, ec.privateKey, message)), "InvalidAccessError", "sign with an EC key");
+    const sha1 = await subtle.importKey("pkcs8", unhex(vector.pkcs8), { name: "RSA-PSS", hash: "SHA-1" }, false, ["sign"]);
+    equal(await outcome(subtle.sign({ name: "RSA-PSS", saltLength: 20 }, sha1, message)), "NotSupportedError", "sign with SHA-1");
+  },
+  // A key is used only with the algorithm and usage it was made for.
+  async "AES key use"() {
+    const outcome = (promise) => promise.then(() => "ok", (error) => error.name);
+    const iv12 = new Uint8Array(12);
+    const kw = await subtle.importKey("raw", aesKey, "AES-KW", true, ["wrapKey", "unwrapKey"]);
+    const cbc = await subtle.importKey("raw", aesKey, "AES-CBC", true, ["encrypt", "decrypt"]);
+    const encryptOnly = await subtle.importKey("raw", aesKey, "AES-GCM", true, ["encrypt"]);
+    const decryptOnly = await subtle.importKey("raw", aesKey, "AES-GCM", true, ["decrypt"]);
+    const gcm = { name: "AES-GCM", iv: iv12 };
+    equal(await outcome(subtle.encrypt(gcm, kw, message)), "InvalidAccessError", "an AES-KW key in GCM");
+    equal(await outcome(subtle.encrypt(gcm, cbc, message)), "InvalidAccessError", "a CBC key in GCM");
+    equal(await outcome(subtle.encrypt(gcm, decryptOnly, message)), "InvalidAccessError", "encrypt without the usage");
+    equal(await outcome(subtle.decrypt(gcm, encryptOnly, message)), "InvalidAccessError", "decrypt without the usage");
+    equal(await outcome(subtle.encrypt(gcm, encryptOnly, message)), "ok", "the right key and usage");
+    // wrapKey and unwrapKey ask for their own usages, not encrypt and decrypt.
+    const target = await subtle.importKey("raw", aesKey, "AES-CBC", true, ["encrypt"]);
+    equal(await outcome(subtle.wrapKey("raw", target, encryptOnly, gcm)), "InvalidAccessError", "wrapKey with an encrypt key");
+    const wrapper = await subtle.importKey("raw", aesKey, "AES-GCM", true, ["wrapKey", "unwrapKey"]);
+    const wrapped = await subtle.wrapKey("raw", target, wrapper, gcm);
+    const back = await subtle.unwrapKey("raw", wrapped, wrapper, gcm, "AES-CBC", true, ["encrypt"]);
+    equal(hex(await subtle.exportKey("raw", back)), hex(aesKey), "unwrapped key");
+  },
+  // Extractability comes before the format, and only a public key has a raw form.
+  async "key export rules"() {
+    const outcome = (promise) => promise.then(() => "ok", (error) => error.name);
+    const ec = V["ECDSA P-256"];
+    const algorithm = { name: "ECDSA", namedCurve: "P-256" };
+    const open = await subtle.importKey("pkcs8", unhex(ec.pkcs8), algorithm, true, ["sign"]);
+    equal(await outcome(subtle.exportKey("raw", open)), "InvalidAccessError", "raw of an EC private key");
+    const shut = await subtle.importKey("pkcs8", unhex(ec.pkcs8), algorithm, false, ["sign"]);
+    equal(await outcome(subtle.exportKey("raw", shut)), "InvalidAccessError", "raw of a non-extractable key");
+    const rsa = { name: "RSA-PSS", hash: "SHA-256" };
+    const rsaShut = await subtle.importKey("pkcs8", unhex(V["RSA-PSS"].pkcs8), rsa, false, ["sign"]);
+    equal(await outcome(subtle.exportKey("raw", rsaShut)), "InvalidAccessError", "raw of a non-extractable RSA key");
+    equal(await outcome(subtle.exportKey("spki", rsaShut)), "InvalidAccessError", "spki of a non-extractable RSA key");
+  },
+  // An EC public key takes `verify` (ECDSA) or no usage at all (ECDH).
+  async "EC import usages"() {
+    const outcome = (promise) => promise.then(() => "ok", (error) => error.name);
+    const ecdsa = { name: "ECDSA", namedCurve: "P-256" };
+    const ecdh = { name: "ECDH", namedCurve: "P-256" };
+    const point = unhex(V["ECDSA P-256"].spki).slice(-65);
+    const peer = unhex(V["ECDH P-256"].peer);
+    equal(await outcome(subtle.importKey("raw", point, ecdsa, true, ["verify"])), "ok", "ECDSA verify");
+    equal(await outcome(subtle.importKey("raw", point, ecdsa, true, ["sign"])), "SyntaxError", "ECDSA raw with sign");
+    equal(await outcome(subtle.importKey("spki", unhex(V["ECDSA P-256"].spki), ecdsa, true, ["sign"])), "SyntaxError", "ECDSA spki with sign");
+    equal(await outcome(subtle.importKey("raw", point, ecdh, true, ["deriveBits"])), "SyntaxError", "ECDH raw with deriveBits");
+    equal(await outcome(subtle.importKey("spki", peer, ecdh, true, ["deriveBits"])), "SyntaxError", "ECDH spki with deriveBits");
+    equal(await outcome(subtle.importKey("pkcs8", unhex(V["ECDH P-256"].pkcs8), ecdh, true, ["sign"])), "SyntaxError", "ECDH private with sign");
+    const jwk = await subtle.exportKey("jwk", await subtle.importKey("spki", peer, ecdh, true, []));
+    equal(await outcome(subtle.importKey("jwk", jwk, ecdh, true, ["deriveKey"])), "SyntaxError", "ECDH public jwk with deriveKey");
+    equal(await outcome(subtle.importKey("jwk", jwk, ecdh, true, [])), "ok", "ECDH public jwk with none");
+  },
+  // sign and verify run only with a key made for that algorithm and usage.
+  async "sign and verify need the key's usage"() {
+    const outcome = (promise) => promise.then(() => "ok", (error) => error.name);
+    const ecdsa = { name: "ECDSA", namedCurve: "P-256" };
+    const params = { name: "ECDSA", hash: "SHA-256" };
+    const vector = V["ECDSA P-256"];
+    const point = unhex(vector.spki).slice(-65);
+    const bare = await subtle.importKey("raw", point, ecdsa, true, []);
+    const signature = unhex(vector.signature);
+    equal(await outcome(subtle.verify(params, bare, signature, message)), "InvalidAccessError", "ECDSA verify with no usage");
+    const pub = await subtle.importKey("raw", point, ecdsa, true, ["verify"]);
+    equal(await subtle.verify(params, pub, signature, message), true, "ECDSA verify with the usage");
+    const priv = await subtle.importKey("pkcs8", unhex(vector.pkcs8), ecdsa, true, ["sign"]);
+    equal(await outcome(subtle.verify(params, priv, signature, message)), "InvalidAccessError", "ECDSA verify with a sign-only key");
+    const verifyOnly = await subtle.importKey("pkcs8", unhex(vector.pkcs8), ecdsa, true, []);
+    equal(await outcome(subtle.sign(params, verifyOnly, message)), "InvalidAccessError", "ECDSA sign with no usage");
+    // A key of another algorithm is refused, even with the usage.
+    const rsa = V["RSASSA-PKCS1-v1_5"];
+    const rsaPub = await subtle.importKey("spki", unhex(rsa.spki), { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, true, ["verify"]);
+    equal(await outcome(subtle.verify(params, rsaPub, signature, message)), "InvalidAccessError", "ECDSA verify with an RSA key");
+    const rsaBare = await subtle.importKey("spki", unhex(rsa.spki), { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, true, []);
+    equal(await outcome(subtle.verify("RSASSA-PKCS1-v1_5", rsaBare, unhex(rsa.signature), message)), "InvalidAccessError", "RSASSA verify with no usage");
+    const pss = V["RSA-PSS"];
+    const pssBare = await subtle.importKey("spki", unhex(pss.spki), { name: "RSA-PSS", hash: "SHA-256" }, true, []);
+    equal(await outcome(subtle.verify({ name: "RSA-PSS", saltLength: 32 }, pssBare, unhex(pss.signature), message)), "InvalidAccessError", "RSA-PSS verify with no usage");
+    const edVector = V.Ed25519;
+    const edBare = await subtle.importKey("spki", unhex(edVector.spki), "Ed25519", true, []);
+    equal(await outcome(subtle.verify("Ed25519", edBare, unhex(edVector.signature), message)), "InvalidAccessError", "Ed25519 verify with no usage");
+    const mac = await subtle.importKey("raw", aesKey, { name: "HMAC", hash: "SHA-256" }, true, ["sign"]);
+    equal(await outcome(subtle.verify("HMAC", mac, new Uint8Array(32), message)), "InvalidAccessError", "HMAC verify with a sign-only key");
+    const macVerify = await subtle.importKey("raw", aesKey, { name: "HMAC", hash: "SHA-256" }, true, ["verify"]);
+    equal(await outcome(subtle.sign("HMAC", macVerify, message)), "InvalidAccessError", "HMAC sign with a verify-only key");
+  },
+  // deriveKey and deriveBits are separate usages of a base key, and each
+  // operation asks for its own.
+  async "derive needs the base key's usage"() {
+    const outcome = (promise) => promise.then(() => "ok", (error) => error.name);
+    const material = unhex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+    const params = { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(4), info: new Uint8Array(4) };
+    const bitsOnly = await subtle.importKey("raw", material, "HKDF", false, ["deriveBits"]);
+    const keyOnly = await subtle.importKey("raw", material, "HKDF", false, ["deriveKey"]);
+    for (const [target, usages] of [
+      [{ name: "AES-KW", length: 128 }, ["wrapKey"]],
+      [{ name: "AES-GCM", length: 128 }, ["encrypt"]],
+      [{ name: "HMAC", hash: "SHA-256" }, ["sign"]],
+    ]) {
+      equal(await outcome(subtle.deriveKey(params, bitsOnly, target, true, usages)), "InvalidAccessError", `${target.name} derived with a deriveBits-only key`);
+      equal(await outcome(subtle.deriveKey(params, keyOnly, target, true, usages)), "ok", `${target.name} derived with a deriveKey key`);
+    }
+    equal(await outcome(subtle.deriveBits(params, keyOnly, 128)), "InvalidAccessError", "deriveBits with a deriveKey-only key");
+    equal(await outcome(subtle.deriveBits(params, bitsOnly, 128)), "ok", "deriveBits with a deriveBits key");
+    // The base key must be of the algorithm being derived with.
+    const pbkdf2 = { name: "PBKDF2", hash: "SHA-256", salt: new Uint8Array(4), iterations: 1 };
+    equal(await outcome(subtle.deriveBits(pbkdf2, bitsOnly, 128)), "InvalidAccessError", "PBKDF2 with an HKDF key");
+    const pair = await subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+    const ecdh = { name: "ECDH", public: pair.publicKey };
+    equal(await outcome(subtle.deriveKey(ecdh, pair.privateKey, { name: "AES-KW", length: 128 }, true, ["wrapKey"])), "InvalidAccessError", "ECDH deriveKey with a deriveBits-only key");
+  },
+  // An EC public key's `raw` form is the uncompressed point, which is the
+  // bit string at the end of its SPKI document.
+  ...Object.fromEntries(["ECDSA", "ECDH"].flatMap((name) =>
+    [["P-256", 65], ["P-384", 97], ["P-521", 133]].map(([curve, size]) => [
+      `${name} ${curve} raw`,
+      async () => {
+        const vector = V[`${name} ${curve}`];
+        const algorithm = { name, namedCurve: curve, hash: vector.hash };
+        const usages = name === "ECDSA" ? ["verify"] : [];
+        // The ECDH vector names the peer's SPKI; ECDSA names its own.
+        const spki = vector.spki ?? vector.peer;
+        const pub = await subtle.importKey("spki", unhex(spki), algorithm, true, usages);
+        const raw = await subtle.exportKey("raw", pub);
+        equal(raw.byteLength, size, "raw length");
+        equal(hex(raw), spki.slice(-2 * size), "raw is the uncompressed point");
+        const back = await subtle.importKey("raw", raw, algorithm, true, usages);
+        equal(hex(await subtle.exportKey("spki", back)), spki, "spki after a raw round trip");
+        equal(back.algorithm.namedCurve, curve, "curve");
+        equal(back.type, "public", "key type");
+        if (name === "ECDSA") {
+          equal(await subtle.verify(algorithm, back, unhex(vector.signature), message), true, "reference verifies with the raw key");
+        } else {
+          const priv = await subtle.importKey("pkcs8", unhex(vector.pkcs8), algorithm, false, ["deriveBits"]);
+          equal(hex(await subtle.deriveBits({ name, public: back }, priv, vector.length)), vector.shared, "shared secret with a raw peer");
+        }
+        // A point off the curve and a wrong length are refused.
+        const refused = async (data) => subtle.importKey("raw", data, algorithm, true, usages).then(() => "imported", (error) => error.name);
+        const off = new Uint8Array(raw.slice(0));
+        off[off.length - 1] ^= 1;
+        equal(await refused(off), "DataError", "point off the curve");
+        equal(await refused(raw.slice(0, size - 1)), "DataError", "short point");
+      },
+    ]))),
+  // An RSA key has no `raw` form.
+  async "RSA raw export"() {
+    const rsa = await subtle.importKey("spki", unhex(V["RSA-PSS"].spki), { name: "RSA-PSS", hash: "SHA-256" }, true, ["verify"]);
+    const rsaRaw = await subtle.exportKey("raw", rsa).then(() => "exported", (error) => error.name);
+    equal(rsaRaw, "NotSupportedError", "RSA raw export");
+  },
+  // Celld reads the uncompressed point only, and says so for a compressed one.
+  async "EC compressed raw key"() {
+    const compressed = new Uint8Array(33);
+    compressed[0] = 2;
+    const error = await subtle.importKey("raw", compressed, { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]).then(() => null, (e) => e);
+    equal(error?.name, "NotSupportedError", "error name");
+    equal(/compressed/.test(error.message), true, "the error names the format");
+  },
+  // RFC 3394 section 4.1 and 4.3 vectors, and the errors the spec names.
+  async "AES-KW"() {
+    const unwrapUsages = ["wrapKey", "unwrapKey"];
+    const kek = (text) => subtle.importKey("raw", unhex(text), "AES-KW", true, unwrapUsages);
+    const keyData = unhex("00112233445566778899aabbccddeeff");
+    const target = await subtle.importKey("raw", keyData, "AES-CBC", true, ["encrypt"]);
+    for (const [key, wrapped] of [
+      ["000102030405060708090a0b0c0d0e0f", "1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5"],
+      ["000102030405060708090a0b0c0d0e0f1011121314151617", "96778b25ae6ca435f92b5b97c050aed2468ab8a17ad84e5d"],
+      ["000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "64e8c3f9ce0f5ba263e9777905818a2a93c8191e7d6e8ae7"],
+    ]) {
+      const wrapping = await kek(key);
+      equal(wrapping.algorithm.name, "AES-KW", "algorithm name");
+      equal(hex(await subtle.wrapKey("raw", target, wrapping, "AES-KW")), wrapped, `wrap under a ${key.length * 4}-bit key`);
+      const back = await subtle.unwrapKey("raw", unhex(wrapped), wrapping, "AES-KW", "AES-CBC", true, ["encrypt"]);
+      equal(hex(await subtle.exportKey("raw", back)), hex(keyData), "unwrapped key");
+    }
+    // Node's wrapped keys: each size, and a public key as a JWK, which Web Crypto pads with
+    // spaces. Wrapping a raw key is deterministic, so celld's output must match, and
+    // celld must unwrap what Node made.
+    const publicKey = await subtle.importKey("spki", unhex(V.Ed25519.spki), "Ed25519", true, ["verify"]);
+    for (const [size, vector] of Object.entries(V["AES-KW"])) {
+      const jwk = size === "jwk";
+      const own = await kek(vector.kek);
+      const sealed = await subtle.wrapKey(jwk ? "jwk" : "raw", jwk ? publicKey : target, own, "AES-KW");
+      // A JWK's members and their order are each library's own, so its wrapped bytes are
+      // not comparable: celld must unwrap Node's, and its own must come back, with the
+      // padding a JWK needs to fill whole 8-byte registers.
+      if (jwk) {
+        equal(sealed.byteLength % 8, 0, "wrapped JWK is whole registers");
+        const back = await subtle.unwrapKey("jwk", sealed, own, "AES-KW", "Ed25519", true, ["verify"]);
+        equal(hex(await subtle.exportKey("spki", back)), V.Ed25519.spki, "own JWK round trip");
+      } else equal(hex(sealed), vector.wrapped, `Node wrap, ${size}`);
+      const opened = jwk
+        ? await subtle.unwrapKey("jwk", unhex(vector.wrapped), own, "AES-KW", "Ed25519", true, ["verify"])
+        : await subtle.unwrapKey("raw", unhex(vector.wrapped), own, "AES-KW", "AES-CBC", true, ["encrypt"]);
+      equal(hex(await subtle.exportKey(jwk ? "spki" : "raw", opened)), jwk ? V.Ed25519.spki : hex(keyData), `Node unwrap, ${size}`);
+    }
+    const wrapping = await kek("000102030405060708090a0b0c0d0e0f");
+    const outcome = (promise) => promise.then(() => "ok", (error) => error.name);
+    const altered = new Uint8Array(unhex("1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5"));
+    altered[0] ^= 1;
+    equal(await outcome(subtle.unwrapKey("raw", altered, wrapping, "AES-KW", "AES-CBC", true, ["encrypt"])), "OperationError", "altered wrapped key");
+    const wrapOnly = await subtle.importKey("raw", unhex("000102030405060708090a0b0c0d0e0f"), "AES-KW", true, ["wrapKey"]);
+    equal(await outcome(subtle.unwrapKey("raw", unhex("1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5"), wrapOnly, "AES-KW", "AES-CBC", true, ["encrypt"])), "InvalidAccessError", "unwrap without the usage");
+    equal(await outcome(subtle.encrypt({ name: "AES-KW" }, wrapping, keyData)), "NotSupportedError", "AES-KW has no encrypt");
+    equal(await outcome(subtle.importKey("raw", new Uint8Array(15), "AES-KW", true, unwrapUsages)), "DataError", "a 120-bit key");
+    // Only wrapKey and unwrapKey are usages of a Key Wrap key, and its size is never defaulted.
+    equal(await outcome(subtle.importKey("raw", unhex("000102030405060708090a0b0c0d0e0f"), "AES-KW", true, ["encrypt"])), "SyntaxError", "import with encrypt");
+    equal(await outcome(subtle.generateKey({ name: "AES-KW", length: 128 }, true, ["wrapKey", "decrypt"])), "SyntaxError", "generate with decrypt");
+    equal(await outcome(subtle.generateKey({ name: "AES-KW" }, true, unwrapUsages)), "TypeError", "generate without a length");
+    equal(await outcome(subtle.generateKey({ name: "AES-KW", length: 64 }, true, unwrapUsages)), "OperationError", "generate with a 64-bit length");
+    // A derived Key Wrap key needs its size too, whatever the base algorithm.
+    const hkdf = await subtle.importKey("raw", unhex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"), "HKDF", false, ["deriveKey"]);
+    const hkdfParams = { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(4), info: new Uint8Array(4) };
+    const ecdhPair = await subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveKey"]);
+    const ecdhParams = { name: "ECDH", public: ecdhPair.publicKey };
+    for (const [params, base] of [[hkdfParams, hkdf], [ecdhParams, ecdhPair.privateKey]]) {
+      equal(await outcome(subtle.deriveKey(params, base, { name: "AES-KW" }, true, unwrapUsages)), "TypeError", `${params.name} derive without a length`);
+      equal(await outcome(subtle.deriveKey(params, base, { name: "AES-KW", length: 100 }, true, unwrapUsages)), "OperationError", `${params.name} derive with a 100-bit length`);
+      const derived = await subtle.deriveKey(params, base, { name: "AES-KW", length: 128 }, true, unwrapUsages);
+      equal(derived.algorithm.length, 128, `${params.name} derived length`);
+    }
+    const generated = await subtle.generateKey({ name: "AES-KW", length: 256 }, true, unwrapUsages);
+    const sealed = await subtle.wrapKey("raw", target, generated, "AES-KW");
+    equal(sealed.byteLength, 24, "wrapped length");
+  },
   async "RSA-OAEP"() {
     const vector = V["RSA-OAEP"];
     const algorithm = { name: "RSA-OAEP", hash: "SHA-256" };
