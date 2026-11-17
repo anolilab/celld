@@ -389,6 +389,18 @@ fn bits(d: Design) -> LazyConfig {
 }
 
 fn run(name: &str, cfg: LazyConfig, stop_at_first: bool, max: usize) -> Report {
+    run_expecting(name, cfg, stop_at_first, max, &[])
+}
+
+/// A run that names the invariants it already knows fail, so that a world
+/// behind one of them is still explored.
+fn run_expecting(
+    name: &str,
+    cfg: LazyConfig,
+    stop_at_first: bool,
+    max: usize,
+    expected: &'static [&'static str],
+) -> Report {
     let line = config_line(&cfg);
     let r = explore(
         &Lazy::new(cfg),
@@ -396,6 +408,7 @@ fn run(name: &str, cfg: LazyConfig, stop_at_first: bool, max: usize) -> Report {
             max_states: max,
             max_depth: 400,
             stop_at_first,
+            expected,
         },
     );
     eprintln!("{line}\n  {}", r.summary(name));
@@ -763,6 +776,18 @@ fn finding_a_stalled_first_record_puts_two_writers_in_one_prefix() {
     ));
 }
 
+/// The invariants the standard path's known window fires.
+const WINDOW_ONLY: &[&str] = &[STANDARD_WINDOW];
+
+/// What the stalled-record scenario of revision 3 fires: the finding, and the
+/// invariants that the same faults fire without the stalled write.
+const STALLED_STD_FINDINGS: &[&str] = &[
+    "a1_one_acting_writer",
+    "a2_prefix_two_writers",
+    "a6_stalled_first_record",
+    STANDARD_WINDOW,
+];
+
 /// `CELLD_EXPLORE=large cargo test -p celld-logic --lib explore_large -- --ignored --nocapture`
 #[test]
 #[ignore]
@@ -783,20 +808,22 @@ fn explore_large() {
         "settle",
         "stalled_std",
     ] {
-        let r = run_design(
-            &format!("control {scn}"),
-            scn,
-            "rev3",
-            &[],
-            false,
-            3_000_000,
-        );
-        r.print_violations();
         // The window of the standard path is the one the model reports and
-        // does not fail; the findings have tests of their own.
+        // does not fail. The stalled-record scenario carries the finding it is
+        // named for, and nothing else.
+        let known = if scn == "stalled_std" {
+            STALLED_STD_FINDINGS
+        } else {
+            WINDOW_ONLY
+        };
+        let cfg = scenario(scn)(design_named("rev3"));
+        let r = run_expecting(&format!("control {scn}"), cfg, false, 3_000_000, known);
+        r.print_violations();
+        assert!(r.passed_except(known), "control {scn} fails");
+        // Only the widest scenario is cut off by its bound, and says so.
         assert!(
-            scn == "stalled_std" || r.passed_except(&["a6_standard_window"]),
-            "control {scn} fails"
+            scn == "broad_large" || r.complete(),
+            "control {scn} hit a bound"
         );
     }
     let r = run_design(

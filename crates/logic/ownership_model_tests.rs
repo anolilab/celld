@@ -13,6 +13,7 @@ fn limits(stop_at_first: bool) -> Limits {
         max_states: 400_000,
         max_depth: 400,
         stop_at_first,
+        expected: &[STALLED_CREATE],
     }
 }
 
@@ -178,6 +179,7 @@ fn explore_large() {
                 max_states: 3_000_000,
                 max_depth: 400,
                 stop_at_first: false,
+                expected: &[STALLED_CREATE],
             },
         );
         eprintln!(
@@ -245,6 +247,7 @@ fn each_shell_mutant_breaks_an_invariant_its_control_keeps() {
             control.passed_except(&[STALLED_CREATE]),
             "the control of {mutant:?} fails"
         );
+        assert!(control.complete(), "the control of {mutant:?} hit a bound");
         let report = run(&format!("{mutant:?}"), mutant_config(mutant), false);
         report.print_violations();
         if !report.violations.contains_key(expected) {

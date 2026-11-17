@@ -62,6 +62,10 @@ pub(crate) struct Limits {
     /// Stop at the first violation (a mutant run) or keep going and collect
     /// the shortest trace of each invariant (a pass run).
     pub stop_at_first: bool,
+    /// Invariants the caller already knows fail. A world whose only violations
+    /// are these is still expanded, so a later, unexpected violation behind one
+    /// is found; each is reported with its shortest trace like any other.
+    pub expected: &'static [&'static str],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,14 +240,17 @@ pub(crate) fn explore<M: Model>(model: &M, limits: Limits) -> Report {
                 report.states += 1;
                 let violations = model.check(&step.world);
                 let violating = !violations.is_empty();
+                let unexpected = violations
+                    .iter()
+                    .any(|violation| !limits.expected.contains(&violation.invariant));
                 record(&mut report, &parents, next_fp, violations);
                 if violating && limits.stop_at_first {
                     report.stopped_early = true;
                     break 'levels;
                 }
-                // A world that broke an invariant is not expanded: what
-                // follows it is noise about the same failure.
-                if !violating {
+                // A world that broke an unexpected invariant is not expanded:
+                // what follows it is noise about the same failure.
+                if !unexpected {
                     next.push((step.world, next_fp));
                 }
                 if report.states >= limits.max_states {
@@ -317,6 +324,7 @@ mod tests {
                 max_states: 1_000,
                 max_depth: 100,
                 stop_at_first: false,
+                expected: &[],
             },
         );
         assert_eq!(report.states, 16);
@@ -333,9 +341,62 @@ mod tests {
                 max_states: 1_000,
                 max_depth: 2,
                 stop_at_first: false,
+                expected: &[],
             },
         );
         assert_eq!(report.bound_hit, Some(Bound::Depth));
         assert!(report.passed());
+    }
+
+    /// A world that fails an expected invariant is still expanded, so a second
+    /// invariant behind it is found.
+    #[test]
+    fn an_expected_violation_does_not_hide_a_later_one() {
+        struct Behind;
+
+        impl Model for Behind {
+            type World = u8;
+            type Action = ();
+
+            fn init(&self) -> u8 {
+                0
+            }
+
+            fn actions(&self, world: &u8) -> Vec<()> {
+                if *world < 3 {
+                    vec![()]
+                } else {
+                    Vec::new()
+                }
+            }
+
+            fn apply(&self, world: &u8, _: &()) -> Step<u8> {
+                Step {
+                    world: world + 1,
+                    labels: Vec::new(),
+                }
+            }
+
+            fn check(&self, world: &u8) -> Vec<Violation> {
+                match world {
+                    1 => vec![Violation::new("early", "known")],
+                    3 => vec![Violation::new("late", "behind the known one")],
+                    _ => Vec::new(),
+                }
+            }
+        }
+
+        let limits = |expected| Limits {
+            max_states: 100,
+            max_depth: 100,
+            stop_at_first: false,
+            expected,
+        };
+        let hidden = explore(&Behind, limits(&[]));
+        assert!(hidden.violations.contains_key("early"));
+        assert!(!hidden.violations.contains_key("late"));
+        let seen = explore(&Behind, limits(&["early"]));
+        assert!(seen.violations.contains_key("late"));
+        assert!(seen.passed_except(&["early", "late"]));
     }
 }
