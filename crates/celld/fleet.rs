@@ -628,7 +628,7 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     match manifest_write {
         deploy::ManifestWrite::Created => {}
         deploy::ManifestWrite::Updated => note!(
-            "This version was already deployed; its manifest is updated and keeps its first tag and timestamp."
+            "This version was already deployed; its manifest is updated and keeps its first tag and timestamp. A node that already serves the version keeps its old cron schedule until it reloads the version or restarts."
         ),
         deploy::ManifestWrite::Unchanged => {
             note!("This version was already deployed; it keeps its first tag and timestamp.")

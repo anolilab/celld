@@ -52,7 +52,7 @@ the deployment the Worker runs under:
 `env.CF_VERSION_METADATA` is a frozen object with three strings:
 
 - `id` is a UUID-shaped string derived from the deployment's version, the hash
-  of the bundle and the configuration. Every node that serves the same bundle
+  of the bundle and the configuration, and from its cron schedules. Every node that serves the same bundle
   and configuration reports the same `id`, and any change reports a new one.
 - `tag` is the label given with `celld deploy --tag`, or `""` when there is
   none. The tag is not part of the version, so the same bundle with another tag
@@ -67,6 +67,11 @@ the same values. `celld deploy` says so when it finds the version already
 deployed. A deployment that declares the binding requires the
 `version-metadata-v1` feature, so a node that predates it refuses the
 deployment instead of serving a Worker without the binding.
+
+A cron-only change keeps the version but gives the binding a new `id`. The
+manifest is updated in the bucket; a node that already serves the version does
+not read it again, so it keeps the old schedule and `id` until it reloads the
+version or restarts. A binding cannot be named `__proto__`.
 
 `celld dev` fills the binding too: `tag` is `""`, and `timestamp` is the time of
 the build that produced the running version. The values are fixed when the

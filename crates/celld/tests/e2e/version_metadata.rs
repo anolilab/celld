@@ -71,7 +71,7 @@ fn build(tag: Option<&str>) -> celld::deploy::Built {
     .expect("build the fixture")
 }
 
-/// The id is `version_metadata_id(manifest.version)`, and `version` is a hash of
+/// The id is `version_metadata_id(manifest.version, &[])`, and `version` is a hash of
 /// the bundle and config alone, so every node that loads the same manifest
 /// derives the same id.
 #[test]
@@ -83,11 +83,11 @@ fn a_tag_and_a_creation_time_ride_in_the_manifest_outside_the_version() {
     assert_eq!(plain.manifest.tag, None);
     assert!(tagged.manifest.created_at.is_some());
     assert_eq!(
-        celld::protocol::version_metadata_id(&tagged.version),
-        celld::protocol::version_metadata_id(&plain.version)
+        celld::protocol::version_metadata_id(&tagged.version, &[]),
+        celld::protocol::version_metadata_id(&plain.version, &[])
     );
     assert_ne!(
-        celld::protocol::version_metadata_id(&plain.version),
-        celld::protocol::version_metadata_id("0123456789abcdef")
+        celld::protocol::version_metadata_id(&plain.version, &[]),
+        celld::protocol::version_metadata_id("0123456789abcdef", &[])
     );
 }

@@ -2307,6 +2307,11 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     for binding in &bindings {
         let name = binding.get("name").and_then(Value::as_str).unwrap_or("");
         let kind = binding.get("type").and_then(Value::as_str).unwrap_or("");
+        // `e["__proto__"] = x` sets the object's prototype and installs no
+        // binding, so the name cannot be an own property of `env`.
+        if name == "__proto__" {
+            bail!("a {kind} binding cannot be named `__proto__`");
+        }
         if let Some(previous) = binding_names.insert(name, kind) {
             bail!(
                 "binding name {name:?} is declared by both a {previous} and a {kind} \
@@ -3669,6 +3674,17 @@ mod version_metadata_config_tests {
             .manifest
             .required_features
             .contains(&FEATURE_VERSION_METADATA_V1.to_string()));
+    }
+
+    #[test]
+    fn no_binding_may_be_named_proto() {
+        for extra in [
+            r#""vars": { "__proto__": "x" }"#,
+            r#""version_metadata": { "binding": "__proto__" }"#,
+        ] {
+            let error = read(&base(extra)).err().expect("the name is refused");
+            assert!(error.to_string().contains("__proto__"), "{error}");
+        }
     }
 
     #[test]

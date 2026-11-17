@@ -587,4 +587,11 @@ async fn a_cron_only_redeploy_updates_the_schedule_and_keeps_the_first_tag() {
     assert_eq!(kept.crons, vec!["*/5 * * * *".to_string()]);
     assert_eq!(kept.tag.as_deref(), Some("first"));
     assert_eq!(kept.created_at.as_deref(), Some("2026-01-01T00:00:00.000Z"));
+    // The schedule is part of the configuration, so the binding reports a new
+    // id for it; the tag and timestamp stay the first deploy's.
+    let before = first.manifest.version_metadata("META");
+    let after = kept.version_metadata("META");
+    assert_ne!(before.id, after.id);
+    assert_eq!(before.tag, after.tag);
+    assert_eq!(before.timestamp, after.timestamp);
 }

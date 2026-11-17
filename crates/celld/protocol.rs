@@ -69,7 +69,7 @@ impl Manifest {
     pub fn version_metadata(&self, binding: &str) -> crate::engine_api::VersionMetadata {
         crate::engine_api::VersionMetadata {
             binding: binding.to_string(),
-            id: version_metadata_id(&self.version),
+            id: version_metadata_id(&self.version, &self.crons),
             tag: self.tag.clone().unwrap_or_default(),
             // A manifest from before `created_at` existed has no creation time.
             timestamp: self
@@ -81,10 +81,15 @@ impl Manifest {
 }
 
 /// The `version_metadata` binding's `id`: a version 8 UUID that is a pure
-/// function of the deployment `version`, so every node serving the same
-/// bundle and config reports the same one and any change reports another.
-pub fn version_metadata_id(version: &str) -> String {
-    let digest = Sha256::digest(format!("celld:version_metadata:{version}"));
+/// function of the deployment `version` and its cron schedules, so every node
+/// serving the same bundle and config reports the same one and any change
+/// reports another. The schedules are named here because the version hash
+/// leaves them out; they are taken sorted, so their order does not matter.
+pub fn version_metadata_id(version: &str, crons: &[String]) -> String {
+    let mut crons: Vec<&str> = crons.iter().map(String::as_str).collect();
+    crons.sort_unstable();
+    let crons = serde_json::to_string(&crons).expect("strings serialize");
+    let digest = Sha256::digest(format!("celld:version_metadata:{version}:{crons}"));
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     // UUID version 8 (RFC 9562, custom) and the RFC variant, so a validator
@@ -605,7 +610,7 @@ mod version_metadata_tests {
 
     #[test]
     fn the_id_is_a_version_8_uuid_with_the_rfc_variant() {
-        let id = version_metadata_id("abc123");
+        let id = version_metadata_id("abc123", &[]);
         let groups: Vec<&str> = id.split('-').collect();
         assert_eq!(
             groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
@@ -616,7 +621,21 @@ mod version_metadata_tests {
             matches!(groups[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'),
             "{id}"
         );
-        assert_eq!(id, version_metadata_id("abc123"));
-        assert_ne!(id, version_metadata_id("abc124"));
+        assert_eq!(id, version_metadata_id("abc123", &[]));
+        assert_ne!(id, version_metadata_id("abc124", &[]));
+    }
+
+    #[test]
+    fn the_id_changes_with_the_cron_schedules_but_not_their_order() {
+        let a = "0 * * * *".to_string();
+        let b = "*/5 * * * *".to_string();
+        let none = version_metadata_id("v", &[]);
+        let one = version_metadata_id("v", std::slice::from_ref(&a));
+        assert_ne!(none, one);
+        assert_ne!(one, version_metadata_id("v", std::slice::from_ref(&b)));
+        assert_eq!(
+            version_metadata_id("v", &[a.clone(), b.clone()]),
+            version_metadata_id("v", &[b, a])
+        );
     }
 }
