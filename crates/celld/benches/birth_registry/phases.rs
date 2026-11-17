@@ -328,7 +328,7 @@ pub async fn guard_answers(fleet: &Fleet, nodes: &[usize]) -> Value {
     })
 }
 
-const COUNTERS: [&str; 35] = [
+const COUNTERS: [&str; 40] = [
     "spills_takeover",
     "spills_records",
     "spills_deltas",
@@ -364,6 +364,11 @@ const COUNTERS: [&str; 35] = [
     "list_requests",
     "put_requests",
     "get_requests",
+    "pushes_sent",
+    "push_failures",
+    "pushes_received",
+    "prefetch_skipped",
+    "prefetch_loads",
 ];
 
 // ---------------------------------------------------------------------------

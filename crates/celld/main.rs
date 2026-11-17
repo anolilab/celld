@@ -2620,6 +2620,43 @@ async fn internal_registry_pass(request: Request<Incoming>, app: AppHandle) -> H
     peer_response(response(StatusCode::OK, "{\"ok\":true}"))
 }
 
+/// The registry's holder says it wrote a root that names new deltas. A hint
+/// that makes this node load them early; fleet-HMAC verified like every
+/// internal peer surface.
+async fn internal_registry_root(request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    let (parts, body) = request.into_parts();
+    let body = match collect_limited_body(body, MAX_PEER_CONTROL_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(error) => return peer_response(body_read_error("registry root", error)),
+    };
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| parts.uri.path().to_string(), ToString::to_string);
+    if let Err(error) = app.peer_auth.verify(
+        &parts.method,
+        &path_and_query,
+        &parts.headers,
+        &body,
+        app.peer_auth.source(),
+    ) {
+        return peer_response(response(error.status(), error.message()));
+    }
+    if parts.method != hyper::Method::POST {
+        return peer_response(response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+        ));
+    }
+    let Some(registry) = celld::registry::global() else {
+        return peer_response(response(StatusCode::NOT_FOUND, "no registry"));
+    };
+    if !registry.on_push(&body) {
+        return peer_response(response(StatusCode::BAD_REQUEST, "not a root push"));
+    }
+    peer_response(response(StatusCode::OK, "{\"ok\":true}"))
+}
+
 /// The registry's debug routes, which exist only with
 /// `CELLD_REGISTRY_DEBUG_API=1`.
 async fn internal_registry_debug(request: Request<Incoming>, path: String) -> HttpReply {
@@ -2980,6 +3017,7 @@ async fn handle_internal(
         "/peer/probe" => internal_probe(request, app).await,
         "/peer/handoff" => internal_handoff(request, app).await,
         "/peer/registry/pass" => internal_registry_pass(request, app).await,
+        "/peer/registry/root" => internal_registry_root(request, app).await,
         _ if path.starts_with("/__registry/") && celld::registry_api::enabled() => {
             internal_registry_debug(request, path.clone()).await
         }
@@ -4655,6 +4693,15 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         (now_ms, Vec::new())
                     }
                 };
+                if let Some(registry) = celld::registry::global() {
+                    registry.set_fleet(
+                        peers
+                            .iter()
+                            .filter(|peer| peer.expires_ms > view_ms && !peer.addr.is_empty())
+                            .map(|peer| (peer.node.clone(), peer.addr.clone()))
+                            .collect(),
+                    );
+                }
                 if let Some(replication) = &replication {
                     let format = celld_logic::format::BUCKET_FORMAT;
                     let open = celld_logic::format::fleet_reads(&peers, view_ms, format);

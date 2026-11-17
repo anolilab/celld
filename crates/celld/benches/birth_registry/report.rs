@@ -81,7 +81,14 @@ fn units(result: &Value) -> Option<Value> {
         "segment_gets_per_segment": get("GET seg") / get("PUT seg").max(1.0),
         "lists_per_pass": get("LIST seg") / passes.max(1.0),
         "writes_per_delta": (get("PUT delta") + get("PUT root")) / get("PUT delta").max(1.0),
-        "delta_gets_per_node_per_delta": get("GET delta") / (nodes * get("PUT delta")).max(1.0),
+        // The holder writes each delta and seeds its own cache from memory, so it
+        // never reads one: the unit is per node that is not the holder.
+        "delta_gets_per_node_per_delta": get("GET delta") / ((nodes - 1.0).max(1.0) * get("PUT delta")).max(1.0),
+        "delta_gets_per_node_per_delta_raw": get("GET delta") / (nodes * get("PUT delta")).max(1.0),
+        "pushes_sent_per_delta": c("pushes_sent") / get("PUT delta").max(1.0),
+        "push_failures": c("push_failures"),
+        "pushes_received": c("pushes_received"),
+        "prefetch_loads": c("prefetch_loads"),
         "segment_deletes_per_segment": get("BATCH_DELETE seg") / get("PUT seg").max(1.0),
         // One DeleteObjects per pass covers the segments it folded; the objects a
         // spill or a merge replaces are deleted together, after the grace.
@@ -144,7 +151,9 @@ pub async fn report() {
             "segments": { "a": NODES * months_windows * seg_puts },
             "compactor_reads": { "b": NODES * months_windows * seg_puts * seg_gets },
             "passes": { "a": passes * a_per_pass },
-            "node_delta_reads": { "b": NODES * passes * delta_gets },
+            "node_delta_reads": { "b": (NODES - 1.0) * passes * delta_gets },
+            // The holder's push: node-to-node HTTP, no bucket request, so no a or b.
+            "root_push": { "http_requests": (NODES - 1.0) * passes, "bucket_requests": 0.0 },
             "spills": { "a": spills * run_puts, "b": spills * run_gets },
             "base_merges": { "a": 0.5e6 },
             "audit_list": { "a": AGENTS / 256.0 },
