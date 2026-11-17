@@ -86,8 +86,12 @@ pub const KV_CLASS: &str = celld_logic::kv::RESERVED_CLASS;
 /// The Durable Object class every Queue broker runs as.
 pub const QUEUE_CLASS: &str = celld_logic::queue::RESERVED_CLASS;
 
+/// The Durable Object class every birth-registry partition runs as (spike).
+pub const BORN_CLASS: &str = celld_logic::born::RESERVED_CLASS;
+
 /// Every runtime-supplied Durable Object class.
-pub const RESERVED_CLASSES: &[&str] = &[D1_CLASS, WORKFLOW_CLASS, KV_CLASS, QUEUE_CLASS];
+pub const RESERVED_CLASSES: &[&str] =
+    &[D1_CLASS, WORKFLOW_CLASS, KV_CLASS, QUEUE_CLASS, BORN_CLASS];
 
 /// The Durable Object class a script's workflow instances run as.
 ///
@@ -122,7 +126,7 @@ pub fn workflow_class(script_name: &str) -> String {
 /// both is correct rather than merely tolerated. A workflow class carries its
 /// script, so it is never shared and a collision there is a real one.
 pub fn is_shared_reserved_class(class: &str) -> bool {
-    class == D1_CLASS || class == KV_CLASS || class == QUEUE_CLASS
+    class == D1_CLASS || class == KV_CLASS || class == QUEUE_CLASS || class == BORN_CLASS
 }
 
 /// Whether a class name is a script-scoped workflow class.

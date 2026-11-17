@@ -15,6 +15,7 @@ pub use tokio_select::__asyncrt_select_support;
 pub mod actor;
 pub mod assets;
 pub mod asyncrt;
+pub mod born;
 pub mod bucket;
 pub mod cell_cli;
 pub mod cell_directory;

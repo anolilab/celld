@@ -681,6 +681,19 @@ struct CellCompaction {
     /// L0 bytes uploaded since the last fold, the size trigger's measure.
     pending_bytes: AtomicU64,
     compacted_txid: AtomicU64,
+    /// When the last fold finished, on the monotonic clock. The birth registry
+    /// spike's time-based fold measures its interval from here.
+    last_fold_mono_ms: AtomicU64,
+    /// Fold without listing what this handle already knows (birth registry
+    /// spike). The handle is the only writer of its epoch's level 1, so the
+    /// level's end after a clean round is known and the next round does not
+    /// list it. The source listing also trusts the bundle rows when they run
+    /// on from the fold's start. Off for every cell but a registry partition.
+    quiet_fold: AtomicBool,
+    /// The end of level 1 as the last clean round left it, or `UNKNOWN_END`.
+    /// Cleared by any round that did not end cleanly, because a write that
+    /// failed or was cancelled may still have landed.
+    level1_end: AtomicU64,
     /// Ship rounds also queue work, so the failure delay must gate admission
     /// rather than only delaying the worker's own requeue task.
     retry_after_ms: AtomicU64,
@@ -698,6 +711,9 @@ struct CellCompaction {
     /// the quiesced database image.
     run: tokio::sync::Mutex<()>,
 }
+
+/// `CellCompaction::level1_end` before any round has proved it.
+const UNKNOWN_END: u64 = u64::MAX;
 
 impl CellCompaction {
     /// Whether a round must not start or continue: the replica closed, or a
@@ -1488,6 +1504,11 @@ impl LtxRepl {
             "ltx_bundle",
             bundle_loop(cells.clone(), registration.clone(), stop.clone(), flush_ms),
         );
+        // The birth registry spike's time-based fold. Not spawned when the
+        // spike is off, so a node without it has no new task.
+        if crate::born::enabled() && compaction.is_some() {
+            tasks.spawn_owned("ltx_born_fold", born_fold_loop(cells.clone(), stop.clone()));
+        }
         let compaction_queue =
             compaction.map(|config| start_compaction_loop(config, tasks.clone()));
         Self {
@@ -2705,10 +2726,16 @@ impl LtxRepl {
                     // The overlay lets compaction read bundle-resident frames
                     // beside the per-cell objects; its output stays pure
                     // per-cell L1s, which is the continuous drain.
-                    client: celld_ltx::BundleOverlayClient::new(
-                        client.clone(),
-                        Some(fetcher.clone()),
-                    ),
+                    client: {
+                        let overlay = celld_ltx::BundleOverlayClient::new(
+                            client.clone(),
+                            Some(fetcher.clone()),
+                        );
+                        overlay.set_overlay_first(
+                            crate::born::enabled() && celld_logic::born::is_registry_scope(cell),
+                        );
+                        overlay
+                    },
                     fetcher,
                     local_path: Db::meta_path_for_path(&dst),
                     host: self.ltx_host.clone(),
@@ -2718,6 +2745,11 @@ impl LtxRepl {
                     min_bytes: self.compaction_min_bytes,
                     pending_bytes: AtomicU64::new(0),
                     compacted_txid: AtomicU64::new(resume_cut),
+                    last_fold_mono_ms: AtomicU64::new(asyncrt::mono_ms()),
+                    quiet_fold: AtomicBool::new(
+                        crate::born::enabled() && celld_logic::born::is_registry_scope(cell),
+                    ),
+                    level1_end: AtomicU64::new(UNKNOWN_END),
                     retry_after_ms: AtomicU64::new(0),
                     failures: AtomicU64::new(0),
                     queued: AtomicBool::new(false),
@@ -4288,7 +4320,15 @@ async fn compact_cell(
     // The run lock keeps the snapshot stable through listing and every row
     // open. The next round must see bundles published since this one began.
     *compaction.fetcher.rows.lock().await = None;
+    let quiet = compaction.quiet_fold.load(Ordering::SeqCst);
+    let known_end = Some(compaction.level1_end.load(Ordering::SeqCst))
+        .filter(|end| quiet && *end != UNKNOWN_END)
+        .map(TXID);
+    // The known end is only trusted again by a round that ends cleanly, so a
+    // round that fails, is cancelled or is dropped mid-write leaves it unknown.
+    compaction.level1_end.store(UNKNOWN_END, Ordering::SeqCst);
     let compactor = ReplicaCompactor::new(&compaction.client)
+        .with_known_destination_end(known_end)
         .with_host(compaction.host.clone())
         .with_verification(true)
         .with_local_path(&compaction.local_path)
@@ -4316,8 +4356,14 @@ async fn compact_cell(
         })) => {
             let info = output.info;
             compaction
+                .level1_end
+                .store(info.max_txid.0, Ordering::SeqCst);
+            compaction
                 .compacted_txid
                 .store(info.max_txid.0, Ordering::SeqCst);
+            compaction
+                .last_fold_mono_ms
+                .store(asyncrt::mono_ms(), Ordering::SeqCst);
             // The fold consumed the tail it saw; bytes that landed during it
             // count toward the next one only approximately, which delays it
             // by at most one window.
@@ -4347,6 +4393,9 @@ async fn compact_cell(
             covered_txid,
             output: None,
         })) => {
+            compaction
+                .level1_end
+                .store(covered_txid.0, Ordering::SeqCst);
             compaction
                 .compacted_txid
                 .store(covered_txid.0, Ordering::SeqCst);
@@ -4614,6 +4663,46 @@ async fn sync_loop(
                     dirty.notify_one();
                 }
             });
+        }
+    }
+}
+
+/// The birth registry's time-based fold (spike, plan 005 findings F3/F6/F7).
+///
+/// A registry cell at a steady birth rate may never reach the threshold fold's
+/// 256 txids, and until it folds, each of its rows keeps the node bundle that
+/// holds it alive. So a registry cell that has durable rows above its fold, and
+/// has not folded for `born::fold_interval_ms()`, queues a fold. The interval
+/// runs from the cell's last fold, so a cell the threshold fold keeps current
+/// is left alone, and a quiet cell queues nothing.
+async fn born_fold_loop(cells: Arc<Mutex<BTreeMap<(String, u64), CellHandle>>>, stop: StopToken) {
+    let mut tick = asyncrt::interval(Duration::from_millis(celld_logic::born::FOLD_TICK_MS));
+    tick.set_missed_tick_behavior(asyncrt::MissedTickBehavior::Delay);
+    let interval = crate::born::fold_interval_ms();
+    loop {
+        asyncrt::select_biased! {
+            "a stop signal that ties the registry fold tick starts no further fold";
+            _ = stop.stopped() => break,
+            _ = tick.tick() => {},
+        }
+        let due: Vec<CellHandle> = cells
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|handle| {
+                handle.compaction.as_ref().is_some_and(|compaction| {
+                    celld_logic::born::is_registry_scope(&compaction.cell)
+                        && handle.durable_txid.load(Ordering::SeqCst)
+                            > compaction.compacted_txid.load(Ordering::SeqCst)
+                        && asyncrt::mono_ms()
+                            .saturating_sub(compaction.last_fold_mono_ms.load(Ordering::SeqCst))
+                            >= interval
+                })
+            })
+            .cloned()
+            .collect();
+        for handle in due {
+            enqueue_compaction(&handle, "born_time");
         }
     }
 }

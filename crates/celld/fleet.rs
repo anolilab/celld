@@ -958,11 +958,21 @@ async fn load_worker_at_pointer(
     let crons = manifest.crons.clone();
     let containers = manifest.containers.clone();
     let fence_image = manifest.fence_image.clone();
+    let mut do_classes = manifest.do_classes;
+    // The birth registry's class is the runtime's own, so a manifest never
+    // names it. The spike adds it here, and only when the spike is on.
+    if crate::born::enabled()
+        && !do_classes
+            .iter()
+            .any(|class| class == crate::deploy::BORN_CLASS)
+    {
+        do_classes.push(crate::deploy::BORN_CLASS.to_string());
+    }
     Ok(LoadedDeployment {
         options: WorkerConfigOptions {
             src,
             script_name: script_name.clone(),
-            do_classes: manifest.do_classes,
+            do_classes,
             bindings: do_bindings,
             r2_bindings,
             d1_bindings,

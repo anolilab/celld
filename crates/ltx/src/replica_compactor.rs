@@ -50,6 +50,8 @@ pub struct ReplicaCompactor<'a, C> {
     base: TXID,
     local_path: Option<PathBuf>,
     host: LtxHost,
+    /// The destination level's end, when the caller already proved it.
+    known_destination_end: Option<TXID>,
 }
 
 impl<'a, C: ReplicaClient> ReplicaCompactor<'a, C> {
@@ -62,7 +64,21 @@ impl<'a, C: ReplicaClient> ReplicaCompactor<'a, C> {
             base: TXID(1),
             local_path: None,
             host: LtxHost::default(),
+            known_destination_end: None,
         }
+    }
+
+    /// The destination level is already known to run without a gap from the
+    /// epoch's base to `end` (zero for an empty level), because this caller
+    /// proved it in an earlier round and is the only writer of the level. The
+    /// attempt then lists no destination level, before or after the write: the
+    /// new object starts at `end + 1`, so the level stays contiguous by
+    /// construction. A caller that cannot promise that must not set it, and
+    /// must clear it after any attempt that did not end cleanly, since a write
+    /// that failed may still have landed.
+    pub fn with_known_destination_end(mut self, end: Option<TXID>) -> Self {
+        self.known_destination_end = end;
+        self
     }
 
     /// The txid the epoch's chain starts at (see the `base` field).
@@ -117,13 +133,18 @@ impl<'a, C: ReplicaClient> ReplicaCompactor<'a, C> {
             return Err(invalid("the compaction limits must be positive"));
         }
 
-        let destination = self.files_from_base(destination_level).await?;
-        self.verify_files(&destination)?;
-        let previous_max = destination
-            .iter()
-            .map(|file| file.max_txid)
-            .max()
-            .unwrap_or(TXID(0));
+        let previous_max = match self.known_destination_end {
+            Some(end) => end,
+            None => {
+                let destination = self.files_from_base(destination_level).await?;
+                self.verify_files(&destination)?;
+                destination
+                    .iter()
+                    .map(|file| file.max_txid)
+                    .max()
+                    .unwrap_or(TXID(0))
+            }
+        };
         let Some(next) = previous_max.0.checked_add(1) else {
             return Ok(CompactionResult {
                 covered_txid: previous_max,
@@ -261,7 +282,7 @@ impl<'a, C: ReplicaClient> ReplicaCompactor<'a, C> {
             .write_ltx_file(destination_level, min_txid, max_txid, &output)
             .await?;
 
-        if self.verify {
+        if self.verify && self.known_destination_end.is_none() {
             self.verify_level(destination_level).await?;
         }
         Ok(CompactionResult {
@@ -365,7 +386,7 @@ impl<'a, C: ReplicaClient> ReplicaCompactor<'a, C> {
                 self.host.clone(),
             )
             .await?;
-        if self.verify {
+        if self.verify && self.known_destination_end.is_none() {
             self.verify_level(destination_level).await?;
         }
         Ok(CompactionOutput {

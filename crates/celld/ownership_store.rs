@@ -1131,6 +1131,38 @@ impl BucketOwnership {
     }
 }
 
+/// The birth registry's client (spike). It calls the owner of the cell's
+/// partition, `born/<p>`, over the dispatcher's signed peer path and never reads
+/// the bucket. Off unless `CELLD_BORN_SPIKE=1`, and nothing in the claim path
+/// calls it: a claim still decides from the record and the listing.
+impl BucketOwnership {
+    /// Whether `scope` has been registered. `Unknown` is any failure or timeout.
+    pub async fn born_lookup(&self, scope: &str) -> crate::born::Answer {
+        if !crate::born::enabled() {
+            return crate::born::Answer::Unknown;
+        }
+        crate::born::lookup(scope).await
+    }
+
+    /// Register scopes, idempotently and in a batch per partition. `true` when
+    /// every partition acknowledged, which is after the insert is durable.
+    pub async fn born_register(&self, scopes: &[&str]) -> bool {
+        crate::born::enabled() && crate::born::register(scopes).await
+    }
+
+    /// Stub for the pack phase: record a cell's base, forward-only on `txid`.
+    pub async fn born_set_base(&self, scope: &str, txid: u64, base: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(crate::born::enabled(), "the birth registry spike is off");
+        crate::born::set_base(scope, txid, base).await
+    }
+
+    /// Stub for the pack phase: the base `born_set_base` recorded, if any.
+    pub async fn born_get_base(&self, scope: &str) -> anyhow::Result<Option<(u64, String)>> {
+        anyhow::ensure!(crate::born::enabled(), "the birth registry spike is off");
+        crate::born::get_base(scope).await
+    }
+}
+
 /// The class of a completed node-lease store request.
 ///
 /// A fence names the lease state the core observed, not the store request

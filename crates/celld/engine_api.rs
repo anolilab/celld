@@ -519,6 +519,9 @@ pub(crate) const KV_NAMESPACE_KEY: &str = "cells:v1:kv:__KvNamespace";
 /// scripts must derive the same cell id.
 pub(crate) const QUEUE_NAMESPACE_KEY: &str = "cells:v1:queue:__Queue";
 
+/// The fleet-wide namespace of the birth registry's partitions (spike).
+pub(crate) const BORN_NAMESPACE_KEY: &str = "cells:v1:born:__Born";
+
 /// A shared reserved class addresses one set of cells for the whole fleet; every
 /// other class, reserved or not, is scoped to the script that exports it.
 ///
@@ -532,6 +535,7 @@ fn shared_namespace_key(class_name: &str) -> Option<&'static str> {
         crate::deploy::D1_CLASS => Some(D1_NAMESPACE_KEY),
         crate::deploy::KV_CLASS => Some(KV_NAMESPACE_KEY),
         crate::deploy::QUEUE_CLASS => Some(QUEUE_NAMESPACE_KEY),
+        crate::deploy::BORN_CLASS => Some(BORN_NAMESPACE_KEY),
         _ => {
             debug_assert!(
                 !crate::deploy::is_shared_reserved_class(class_name),
@@ -580,6 +584,19 @@ pub fn queue_cell_scope(queue: &str) -> String {
     format!(
         "{}:{}",
         crate::deploy::QUEUE_CLASS,
+        durable_object_id_hex(&id)
+    )
+}
+
+/// The cell scope of one birth-registry partition. The partition's name
+/// `born/<p>` has a `/`, which a scope cannot carry, so the scope is the hash of
+/// the name, as for a KV shard.
+pub fn born_cell_scope(partition: u32) -> String {
+    let id =
+        durable_object_id_for_name(BORN_NAMESPACE_KEY, &celld_logic::born::cell_name(partition));
+    format!(
+        "{}:{}",
+        crate::deploy::BORN_CLASS,
         durable_object_id_hex(&id)
     )
 }
