@@ -229,6 +229,24 @@ pub struct CellOverloaded;
 pub const CELL_OVERLOAD_ERROR_MARKER: &str =
     "celld-internal-cell-overload-7ec38c64-12d7-4ddc-9e77-b63f9dc14130";
 
+/// Carried by the error that ends a request because its Durable Object moved
+/// or the node is stopping. Like [`CELL_OVERLOAD_ERROR_MARKER`] it survives
+/// the V8 promise boundary, so the public ingress can answer 503 with
+/// `Retry-After` for a request the client may retry.
+#[doc(hidden)]
+pub const CANCEL_RETRYABLE_ERROR_MARKER: &str =
+    "celld-internal-retryable-cancel-3b9a51d0-6e2c-4f7a-8c14-a0d5e7b92f68";
+
+/// The public sentences of a retryable cancel, one per cause. The error that
+/// ends the request and the 503 the ingress answers both use these, so they
+/// cannot drift apart.
+pub const CANCEL_MOVED_TEXT: &str =
+    "this Durable Object was moved to a new deployment and its request was ended; retry it";
+pub const CANCEL_RESTARTED_TEXT: &str =
+    "this Durable Object restarted after a storage error and its request was ended; retry it";
+pub const CANCEL_SHUTDOWN_TEXT: &str =
+    "this node is shutting down and its request was ended; retry it";
+
 impl std::fmt::Display for CellOverloaded {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

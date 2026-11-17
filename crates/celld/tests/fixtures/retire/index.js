@@ -11,6 +11,11 @@ export class Pinned extends DurableObject {
     if (url.pathname === "/ticks") {
       return new Response(String((await this.ctx.storage.get("ticks")) ?? 0));
     }
+    // Still running when the object's move to a new deployment ends it.
+    if (url.pathname === "/stay") {
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      return new Response("stayed");
+    }
     if (url.pathname === "/nap") {
       await new Promise((resolve) => setTimeout(resolve, 200));
       return new Response("napped");
@@ -51,6 +56,10 @@ export default {
         return env.PIN.get(
           env.PIN.idFromName(`hang-${url.searchParams.get("n")}`),
         ).fetch(new Request("http://do/nap"));
+      case "/do-stay":
+        return env.PIN.get(env.PIN.idFromName("stay")).fetch(
+          new Request("http://do/stay"),
+        );
       case "/do-ticks":
         return env.PIN.get(env.PIN.idFromName("a")).fetch(
           new Request("http://do/ticks"),

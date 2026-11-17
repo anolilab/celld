@@ -2368,11 +2368,7 @@ fn take_cancellation_wake(
 ) -> Option<Wake> {
     js::take_request_cancellation(request_id)
         .then(|| Wake::Cancelled {
-            cause: if js::take_shutdown_cancellation(request_id) {
-                js::CancelCause::Shutdown
-            } else {
-                js::CancelCause::Client
-            },
+            cause: js::take_shutdown_cancellation(request_id).unwrap_or(js::CancelCause::Client),
         })
         .or_else(|| retire_wake(retire))
 }

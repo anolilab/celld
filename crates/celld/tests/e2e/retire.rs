@@ -33,7 +33,8 @@ async fn state(server: &Server) -> Value {
 }
 
 /// GET `url`, again when the node reports that the handler outlived its
-/// budget, or that the object's move to the new deployment ended it. The tests
+/// budget, or answers 503 because the object's move to the new deployment
+/// ended it. The tests
 /// here set a one-second budget, which a Durable Object start queued behind a
 /// burst of others can use up on a loaded machine, and an object that has
 /// outlived the maximum age is moved with its running events ended; the
@@ -46,7 +47,8 @@ async fn get_within_budget(client: &reqwest::Client, url: &str) -> (reqwest::Sta
         let body = response.text().await.unwrap_or_default();
         attempts += 1;
         if attempts == 5
-            || !(body.contains("handler exceeded") || body.contains("The client has disconnected"))
+            || !(body.contains("handler exceeded")
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE)
         {
             return (status, body);
         }
@@ -280,6 +282,53 @@ async fn an_answered_durable_object_event_with_a_leftover_timer_does_not_pin_a_s
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert_eq!(server.get_text("/do-ticks").await, before);
     assert_eq!(server.get_text("/version").await, "v2");
+}
+
+/// A request running when its object is moved to the new deployment by force
+/// is ended, though its client is still connected: the node answers 503 with
+/// `Retry-After` and says why, and asking again is served.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_ended_by_a_forced_move_answers_503_and_can_be_retried() {
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_RETIRE_DEADLINE_S", "30"),
+            ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
+            // The object's request runs for 5 seconds.
+            ("CELLD_HANDLER_BUDGET_S", "20"),
+        ],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let running = {
+        let (client, url) = (client.clone(), server.url("/do-stay"));
+        tokio::spawn(async move { client.get(url).send().await.expect("get") })
+    };
+    // Let the request reach the object before the deploy supersedes it.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    redeploy(&server).await;
+
+    let ended = running.await.expect("request task");
+    let status = ended.status();
+    let retry_after = ended
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .map(|value| value.to_str().expect("retry-after").to_string());
+    let body = ended.text().await.expect("body");
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(retry_after.as_deref(), Some("1"), "{body}");
+    assert!(body.contains("Durable Object was moved"), "{body}");
+    assert!(!body.contains("client has disconnected"), "{body}");
+
+    // The retry runs on the new deployment.
+    let again = client
+        .get(server.url("/do-stay"))
+        .send()
+        .await
+        .expect("get");
+    assert_eq!(again.status(), reqwest::StatusCode::OK);
+    assert_eq!(again.text().await.expect("body"), "stayed");
 }
 
 /// Durable Object events still running when the deadline passes are ended by

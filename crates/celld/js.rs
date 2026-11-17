@@ -70,6 +70,9 @@ pub use crate::engine_api::WorkflowBinding;
 pub use crate::engine_api::WsTarget;
 pub(crate) use crate::engine_api::BARE_NODE_BUILTINS;
 pub use crate::engine_api::CELL_OVERLOAD_ERROR_MARKER;
+pub use crate::engine_api::{
+    CANCEL_MOVED_TEXT, CANCEL_RESTARTED_TEXT, CANCEL_RETRYABLE_ERROR_MARKER, CANCEL_SHUTDOWN_TEXT,
+};
 pub(crate) use crate::host_channels::outbound_ws_tx;
 pub use crate::host_channels::set_asset_call_tx;
 pub use crate::host_channels::set_broken_tx;
@@ -1427,15 +1430,17 @@ impl TargetThreadCpuClock {
 /// with nothing pending, the mutex is never taken.
 static PENDING_ABORTS: OnceLock<std::sync::Mutex<std::collections::HashSet<RequestId>>> =
     OnceLock::new();
-static SHUTDOWN_ABORTS: OnceLock<std::sync::Mutex<std::collections::HashSet<RequestId>>> =
-    OnceLock::new();
+static SHUTDOWN_ABORTS: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<RequestId, CancelCause>>,
+> = OnceLock::new();
 static PENDING_ABORT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn pending_aborts() -> &'static std::sync::Mutex<std::collections::HashSet<RequestId>> {
     PENDING_ABORTS.get_or_init(Default::default)
 }
 
-fn shutdown_aborts() -> &'static std::sync::Mutex<std::collections::HashSet<RequestId>> {
+fn shutdown_aborts() -> &'static std::sync::Mutex<std::collections::HashMap<RequestId, CancelCause>>
+{
     SHUTDOWN_ABORTS.get_or_init(Default::default)
 }
 
@@ -1450,7 +1455,12 @@ pub fn abort_request(request_id: RequestId) {
 /// disconnect, shutdown cannot preserve `waitUntil` work because the runtime
 /// and its ownership are about to leave this process.
 pub fn abort_request_for_shutdown(request_id: RequestId) {
-    shutdown_aborts().lock().unwrap().insert(request_id);
+    abort_request_for(request_id, CancelCause::Shutdown);
+}
+
+/// Force a cell event to retire for `cause`, which the client is told.
+pub fn abort_request_for(request_id: RequestId, cause: CancelCause) {
+    shutdown_aborts().lock().unwrap().insert(request_id, cause);
     abort_request(request_id);
 }
 
@@ -1460,8 +1470,9 @@ pub(crate) fn clear_request_cancellation(request_id: RequestId) {
     shutdown_aborts().lock().unwrap().remove(&request_id);
 }
 
-pub fn take_shutdown_cancellation(request_id: Option<RequestId>) -> bool {
-    request_id.is_some_and(|request_id| shutdown_aborts().lock().unwrap().remove(&request_id))
+/// The lifecycle cause an event was forced to retire for, if it was.
+pub fn take_shutdown_cancellation(request_id: Option<RequestId>) -> Option<CancelCause> {
+    request_id.and_then(|request_id| shutdown_aborts().lock().unwrap().remove(&request_id))
 }
 
 fn take_pending_abort(request_id: RequestId) -> bool {
@@ -2964,7 +2975,15 @@ fn status_after_gate(
 ) -> Option<u16> {
     match completion {
         Ok(GatedReplyCompletion::Sent { failure: None }) => status,
-        Ok(GatedReplyCompletion::Sent { failure: Some(_) }) => status.map(|_| 500),
+        Ok(GatedReplyCompletion::Sent {
+            failure: Some(failure),
+        }) => status.map(|_| {
+            if failure.contains(crate::engine_api::CANCEL_RETRYABLE_ERROR_MARKER) {
+                503
+            } else {
+                500
+            }
+        }),
         Ok(GatedReplyCompletion::CallerClosed { .. } | GatedReplyCompletion::Cancelled { .. })
         | Err(_) => None,
     }
@@ -5341,6 +5360,13 @@ pub enum CancelCause {
     Client,
     /// The runtime is stopping, so nothing it keeps running would finish.
     Shutdown,
+    /// Its Durable Object is moved to a new deployment and the move reached
+    /// its maximum age. Ended as a shutdown ends it, and the client, which is
+    /// still connected, is told to retry.
+    Moved,
+    /// Its Durable Object restarts because its SQL latched an error. Ended
+    /// and answered as a move is.
+    Restarted,
     /// Its deployment outlived `CELLD_RETIRE_DEADLINE_S`. Ended as a shutdown
     /// ends it, and the client that still waits is told why.
     Superseded,
@@ -5353,7 +5379,22 @@ fn cancel_error(cause: CancelCause) -> anyhow::Error {
             "this deployment was superseded and its isolate was retired after {}s",
             crate::generation::retire_deadline().as_secs()
         ),
-        CancelCause::Client | CancelCause::Shutdown => anyhow!("The client has disconnected"),
+        CancelCause::Moved => anyhow!(
+            "{} ({})",
+            crate::engine_api::CANCEL_MOVED_TEXT,
+            crate::engine_api::CANCEL_RETRYABLE_ERROR_MARKER
+        ),
+        CancelCause::Restarted => anyhow!(
+            "{} ({})",
+            crate::engine_api::CANCEL_RESTARTED_TEXT,
+            crate::engine_api::CANCEL_RETRYABLE_ERROR_MARKER
+        ),
+        CancelCause::Shutdown => anyhow!(
+            "{} ({})",
+            crate::engine_api::CANCEL_SHUTDOWN_TEXT,
+            crate::engine_api::CANCEL_RETRYABLE_ERROR_MARKER
+        ),
+        CancelCause::Client => anyhow!("The client has disconnected"),
     }
 }
 
@@ -5362,11 +5403,7 @@ fn cancelled(tc: &mut v8::PinScope, entry: &mut InFlight) {
     if entry.reply.is_none() || !take_request_cancellation(entry.request_id) {
         return;
     }
-    let cause = if take_shutdown_cancellation(entry.request_id) {
-        CancelCause::Shutdown
-    } else {
-        CancelCause::Client
-    };
+    let cause = take_shutdown_cancellation(entry.request_id).unwrap_or(CancelCause::Client);
     cancel(tc, entry, cause);
 }
 
@@ -12170,15 +12207,40 @@ mod response_status_tests {
     }
 
     #[test]
-    fn a_shutdown_on_a_pending_gate_still_sends_an_error_reply() {
+    fn a_shutdown_on_a_pending_gate_says_so_and_answers_503() {
         let (reply, completion) = cancel_pending_gate(CancelCause::Shutdown);
-        assert_eq!(reply.unwrap_err(), "The client has disconnected");
+        let reply = reply.unwrap_err();
+        assert!(reply.contains("shutting down"), "{reply}");
+        assert!(reply.contains(crate::engine_api::CANCEL_RETRYABLE_ERROR_MARKER));
         let sent = Ok(completion);
         assert!(matches!(
             sent,
             Ok(GatedReplyCompletion::Sent { failure: Some(_) })
         ));
-        assert_eq!(status_after_gate(Some(200), &sent), Some(500));
+        assert_eq!(status_after_gate(Some(200), &sent), Some(503));
+    }
+
+    #[test]
+    fn a_restart_after_a_storage_error_says_so_and_answers_503() {
+        let (reply, completion) = cancel_pending_gate(CancelCause::Restarted);
+        let reply = reply.unwrap_err();
+        assert!(reply.contains("restarted after a storage error"), "{reply}");
+        assert!(reply.contains(crate::engine_api::CANCEL_RETRYABLE_ERROR_MARKER));
+        assert_eq!(status_after_gate(Some(200), &Ok(completion)), Some(503));
+    }
+
+    #[test]
+    fn a_forced_move_on_a_pending_gate_says_so_and_answers_503() {
+        let (reply, completion) = cancel_pending_gate(CancelCause::Moved);
+        let reply = reply.unwrap_err();
+        assert!(reply.contains("moved to a new deployment"), "{reply}");
+        assert!(reply.contains(crate::engine_api::CANCEL_RETRYABLE_ERROR_MARKER));
+        let sent = Ok(completion);
+        assert!(matches!(
+            sent,
+            Ok(GatedReplyCompletion::Sent { failure: Some(_) })
+        ));
+        assert_eq!(status_after_gate(Some(200), &sent), Some(503));
     }
 
     #[test]

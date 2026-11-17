@@ -109,9 +109,13 @@ impl CellHost {
         }
     }
 
-    pub(crate) fn abort_activity(&self, request_id: crate::js::RequestId) {
+    pub(crate) fn abort_activity(
+        &self,
+        request_id: crate::js::RequestId,
+        cause: crate::js::CancelCause,
+    ) {
         match self {
-            Self::Engine(_) => crate::js::abort_request_for_shutdown(request_id),
+            Self::Engine(_) => crate::js::abort_request_for(request_id, cause),
         }
     }
 
