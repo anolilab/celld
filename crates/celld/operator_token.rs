@@ -147,17 +147,7 @@ impl OperatorToken {
     /// errors: the file is a credential, so it must be the node owner's own.
     #[allow(clippy::disallowed_methods)] // A per-user credential file, not node storage.
     pub fn from_file(path: &Path) -> anyhow::Result<Option<Self>> {
-        use std::io::Read as _;
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            // `O_NONBLOCK` keeps the open of a named pipe with no writer from
-            // blocking; the type is checked before anything is read.
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        let file = match options.open(path) {
+        let file = match crate::credential_file::open(path, false) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             #[cfg(unix)]
@@ -173,35 +163,15 @@ impl OperatorToken {
         };
         // Checked on the open file, so the file cannot change between the
         // check and the read.
-        let metadata = file
-            .metadata()
-            .with_context(|| format!("stat {}", path.display()))?;
         #[cfg(unix)]
         {
+            let metadata = file
+                .metadata()
+                .with_context(|| format!("stat {}", path.display()))?;
             // SAFETY: `geteuid` takes no arguments and cannot fail.
             check_private(path, &metadata, unsafe { libc::geteuid() })?;
         }
-        #[cfg(not(unix))]
-        anyhow::ensure!(
-            metadata.is_file(),
-            "{} is not a regular file",
-            path.display()
-        );
-        anyhow::ensure!(
-            metadata.len() <= MAX_FILE_BYTES,
-            "{} is too large to be a token file",
-            path.display()
-        );
-        // Bounded again on the read, for a file that grows after the check.
-        let mut text = String::new();
-        file.take(MAX_FILE_BYTES + 1)
-            .read_to_string(&mut text)
-            .with_context(|| format!("read {}", path.display()))?;
-        anyhow::ensure!(
-            text.len() as u64 <= MAX_FILE_BYTES,
-            "{} is too large to be a token file",
-            path.display()
-        );
+        let text = crate::credential_file::read_open(file, path, MAX_FILE_BYTES)?;
         Self::parse(OsStr::new(text.trim_end_matches(['\r', '\n'])))
             .with_context(|| format!("{} does not hold a usable token", path.display()))
             .map(Some)

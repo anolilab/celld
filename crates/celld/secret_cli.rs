@@ -1,9 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-// Operator commands read the process environment for their fleet settings and
-// the secret value from standard input.
-#![allow(clippy::disallowed_methods)]
-
 //! `celld secret` — put, list and delete the secrets of a deployed Worker.
 //!
 //! The command reads and writes the fleet bucket directly, so it needs no
@@ -22,12 +18,23 @@ use crate::bucket::Bucket;
 use crate::cli_options::{FleetFlags, FLEET_HELP};
 use crate::cli_output::{Format, Output, Record};
 use crate::note;
-use crate::secrets::{self, FleetKey};
+use crate::secrets::{self, SecretsKey};
 
 enum Action {
     Put(String),
     List,
     Delete(String),
+}
+
+/// What `run` does once everything that needs no bucket is settled.
+enum Step {
+    Put {
+        key: &'static SecretsKey,
+        name: String,
+        value: String,
+    },
+    Delete(String),
+    List,
 }
 
 struct Command {
@@ -62,33 +69,35 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         None => crate::deploy::read_script_name(command.config.clone())
             .context("name the Worker with --script, or run in its project")?,
     };
-    let put = match &command.action {
+    let step = match command.action {
         Action::Put(name) => {
-            let key = FleetKey::from_environment()?.with_context(|| {
+            let key = SecretsKey::from_environment()?.with_context(|| {
                 format!(
-                    "`celld secret put` needs the fleet key: set {} or {} to 32 random bytes \
+                    "`celld secret put` needs the secrets key: set {} or {} to 32 random bytes \
                      in base64 (for example `openssl rand -base64 32`)",
                     secrets::KEY_VARIABLE,
                     secrets::KEY_FILE_VARIABLE,
                 )
             })?;
-            Some((key, name.clone(), read_value(name)?))
+            let value = read_value(&name)?;
+            Step::Put { key, name, value }
         }
-        _ => None,
+        Action::Delete(name) => Step::Delete(name),
+        Action::List => Step::List,
     };
     let storage = command.fleet.resolve("celld secret")?;
     let bucket = storage.open().await?;
-    match (command.action, put) {
-        (Action::Put(_), Some((key, name, value))) => {
+    match step {
+        Step::Put { key, name, value } => {
             let bindings = current_bindings(&bucket, &script).await?;
-            secrets::put(&bucket, &key, &script, &name, &value, &bindings).await?;
+            secrets::put(&bucket, key, &script, &name, &value, &bindings).await?;
             note!(
                 "Stored secret {name} for {script}. A node serves it from its next load of the \
                  deployment: a deploy, `POST /reload`, or a restart."
             );
             Ok(())
         }
-        (Action::Delete(name), _) => {
+        Step::Delete(name) => {
             secrets::delete(&bucket, &script, &name).await?;
             note!(
                 "Deleted secret {name} of {script}. A node stops serving it at its next load of \
@@ -96,7 +105,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        _ => {
+        Step::List => {
             let mut output = Output::new(if command.json {
                 Format::Json
             } else {
@@ -120,49 +129,40 @@ fn read_value(name: &str) -> anyhow::Result<String> {
         );
     }
     let mut bytes = Vec::new();
-    // A few bytes over the limit tell an oversized value from one at the limit.
+    // A few bytes over the limit tell an oversized value from one at the limit
+    // that ends in a line break.
     stdin
         .by_ref()
         .take(secrets::MAX_VALUE_BYTES as u64 + 3)
         .read_to_end(&mut bytes)
         .context("read the secret value from standard input")?;
-    let mut value = String::from_utf8(bytes).map_err(|_| anyhow!("the value is not UTF-8"))?;
-    if value.ends_with('\n') {
-        value.pop();
-        if value.ends_with('\r') {
-            value.pop();
+    value_from_bytes(bytes)
+}
+
+/// The value in `bytes` without its final line break. The size is checked on
+/// the bytes, before decoding, so a limit never falls inside a character.
+fn value_from_bytes(mut bytes: Vec<u8>) -> anyhow::Result<String> {
+    if bytes.ends_with(b"\n") {
+        bytes.pop();
+        if bytes.ends_with(b"\r") {
+            bytes.pop();
         }
     }
-    Ok(value)
+    anyhow::ensure!(
+        bytes.len() <= secrets::MAX_VALUE_BYTES,
+        "a secret value is at most {} bytes",
+        secrets::MAX_VALUE_BYTES
+    );
+    String::from_utf8(bytes).map_err(|_| anyhow!("the value is not UTF-8"))
 }
 
 /// The binding names of the deployment the fleet serves for `script`, or none
 /// when it has no deployment yet.
 async fn current_bindings(bucket: &Bucket, script: &str) -> anyhow::Result<BTreeSet<String>> {
-    let selected = match crate::deploy::read_fleet_pointer(bucket).await? {
-        Some((fleet, _)) => fleet.selection_for(script).map(|selected| selected.prefix),
-        None => None,
-    };
-    let prefix = match selected {
-        Some(prefix) => prefix,
-        None => {
-            let key = format!("deploy/{script}/current.json");
-            let Some((body, _)) = bucket.get(&key).await? else {
-                return Ok(BTreeSet::new());
-            };
-            serde_json::from_slice::<crate::protocol::DeployPointer>(&body)
-                .with_context(|| format!("decode {key}"))?
-                .prefix
-        }
-    };
-    let key = format!("{prefix}/manifest.json");
-    let (body, _) = bucket
-        .get(&key)
+    Ok(crate::deploy::current_manifest(bucket, script)
         .await?
-        .with_context(|| format!("read {key}"))?;
-    let manifest: crate::protocol::Manifest =
-        serde_json::from_slice(&body).with_context(|| format!("decode {key}"))?;
-    Ok(secrets::binding_names(&manifest.raw_metadata))
+        .map(|manifest| secrets::binding_names(&manifest.raw_metadata))
+        .unwrap_or_default())
 }
 
 impl Command {
@@ -233,10 +233,10 @@ USAGE
   celld secret delete NAME [--script SCRIPT] [fleet options]
 
 The Worker reads a secret as `env.NAME`. The value is read from standard input,
-without its final line break, and is encrypted with the fleet key before it
+without its final line break, and is encrypted with the secrets key before it
 leaves this command. `list` prints names only.
 
-The fleet key is {} (base64, 32 bytes) or the file in {}.
+The secrets key is {} (base64, 32 bytes) or the file in {}.
 Every node and every `celld secret put` must use the same key, and celld never
 stores it in the bucket. A node refuses to load a deployment whose script has
 secrets when no key is set.
@@ -279,5 +279,23 @@ mod tests {
             .unwrap();
         assert!(matches!(command.action, Action::Put(name) if name == "TOKEN"));
         assert_eq!(command.script.as_deref(), Some("app"));
+    }
+
+    #[test]
+    fn the_size_limit_is_checked_on_bytes_before_decoding() {
+        let limit = secrets::MAX_VALUE_BYTES;
+        // A multi-byte character that straddles the limit is a size error, not
+        // a decode error.
+        let mut straddling = vec![b'a'; limit - 1];
+        straddling.extend("é".bytes());
+        straddling.extend(b"abc");
+        let error = value_from_bytes(straddling).unwrap_err();
+        assert!(error.to_string().contains("at most"), "{error}");
+        // A value at the limit, with its line break, is accepted.
+        let mut at_limit = vec![b'a'; limit];
+        at_limit.extend(b"\r\n");
+        assert_eq!(value_from_bytes(at_limit).unwrap().len(), limit);
+        let error = value_from_bytes(vec![0xff, b'a']).unwrap_err();
+        assert!(error.to_string().contains("UTF-8"), "{error}");
     }
 }

@@ -32,6 +32,7 @@ pub mod cli_output;
 pub(crate) mod config_dir;
 pub mod container;
 pub mod control_plane;
+pub(crate) mod credential_file;
 pub mod d1_cli;
 pub mod d1_export;
 pub mod dead_node_gc;

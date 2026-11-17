@@ -443,6 +443,7 @@ dependencies = [
  "v8",
  "webpki-roots",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

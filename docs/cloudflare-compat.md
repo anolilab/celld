@@ -28,7 +28,7 @@ An unsupported feature that does not cause an error is a defect.
 | [D1](services/d1.md) | **Yes** |
 | [Workflows](services/workflows.md) | **Yes** |
 | [R2](services/r2.md) | **Yes** |
-| [Worker secrets](README.md#secrets) | **Yes** — `celld secret` stores them encrypted under a fleet key; no key rotation yet, and a change reaches a node at its next deployment load |
+| [Worker secrets](services/workers.md#secrets) | **Partial** — `celld secret` stores them encrypted under a secrets key; no key rotation yet, and a change reaches a node at its next deployment load |
 | Workers AI | **No** |
 | Vectorize | **No** |
 | Hyperdrive | **No** |

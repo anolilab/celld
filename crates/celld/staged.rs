@@ -203,7 +203,8 @@ fn next_pointer(
 /// Select `targets` with one conditional write of the fleet pointer.
 ///
 /// Everything that can refuse runs before anything is written: every version
-/// must be uploaded, and no queue may have a competing consumer. Queue
+/// must be uploaded, no queue may have a competing consumer, and no binding
+/// may share a name with a stored secret. Queue
 /// consumer attachments follow, then the fleet pointer, which is the commit
 /// point, then each script's own pointer for nodes that read only that.
 pub async fn activate(
@@ -218,6 +219,9 @@ pub async fn activate(
     let mut attachments = Vec::with_capacity(targets.len());
     for manifest in &manifests {
         attachments.push(crate::deploy::prepare_queue_attachments(bucket, manifest).await?);
+        // A secret put after this version was uploaded may use a name this
+        // version binds, and activation would shadow it.
+        crate::secrets::ensure_no_clash(bucket, manifest).await?;
     }
 
     let read = crate::deploy::read_fleet_pointer(bucket).await?;

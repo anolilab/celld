@@ -92,6 +92,7 @@ pkcs8.workspace = true
 crc.workspace = true
 dsa.workspace = true
 x25519-dalek.workspace = true
+zeroize.workspace = true
 rand.workspace = true
 regex.workspace = true
 scrypt.workspace = true

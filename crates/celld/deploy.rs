@@ -1017,12 +1017,7 @@ pub async fn write(
     let queue_attachments = prepare_queue_attachments(bucket, &built.manifest).await?;
     // A secret is bound as `env.NAME`, so a binding of the same name would be
     // shadowed. Refuse before anything is uploaded; this reads names only.
-    crate::secrets::ensure_no_clash(
-        bucket,
-        &built.manifest.script_name,
-        &crate::secrets::binding_names(&built.manifest.raw_metadata),
-    )
-    .await?;
+    crate::secrets::ensure_no_clash(bucket, &built.manifest).await?;
 
     // Images are fleet-wide and content-addressed like asset bodies, and
     // they are what a node loads before a container class can start.
@@ -1306,10 +1301,12 @@ pub(crate) async fn prepare_queue_attachments(
     Ok(states)
 }
 
-async fn current_queue_consumers(
+/// The manifest of the deployment the fleet serves for `script_name`, or
+/// `None` when it has no deployment yet.
+pub(crate) async fn current_manifest(
     bucket: &Bucket,
     script_name: &str,
-) -> anyhow::Result<BTreeSet<String>> {
+) -> anyhow::Result<Option<Manifest>> {
     // What serves is what the fleet pointer selects, so a script the
     // component map lists is read from there. The named pointer answers for
     // any script the map does not list.
@@ -1322,7 +1319,7 @@ async fn current_queue_consumers(
         None => {
             let pointer_key = format!("deploy/{script_name}/current.json");
             let Some((pointer_body, _)) = bucket.get(&pointer_key).await? else {
-                return Ok(BTreeSet::new());
+                return Ok(None);
             };
             let pointer: DeployPointer = serde_json::from_slice(&pointer_body)
                 .with_context(|| format!("decode {pointer_key}"))?;
@@ -1346,9 +1343,17 @@ async fn current_queue_consumers(
         "named deployment pointer {pointer_key} resolved script {:?}",
         manifest.script_name
     );
-    Ok(manifest
-        .queue_consumers
+    Ok(Some(manifest))
+}
+
+async fn current_queue_consumers(
+    bucket: &Bucket,
+    script_name: &str,
+) -> anyhow::Result<BTreeSet<String>> {
+    Ok(current_manifest(bucket, script_name)
+        .await?
         .into_iter()
+        .flat_map(|manifest| manifest.queue_consumers)
         .map(|consumer| consumer.queue)
         .collect())
 }
@@ -1468,14 +1473,20 @@ pub struct D1Declaration {
     pub migrations_table: String,
 }
 
-/// The Worker name of the project at `given` (a directory or a config), for a
-/// command that acts on a deployed script without building it.
-pub fn read_script_name(given: Option<PathBuf>) -> anyhow::Result<String> {
+/// The config file at `given` (a directory or a config), parsed as JSONC.
+fn read_config(given: Option<PathBuf>) -> anyhow::Result<(PathBuf, Value)> {
     let path = resolve_config(given)?;
     let source =
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let config: Value = serde_json::from_str(&strip_jsonc(&source))
         .with_context(|| format!("parse {}", path.display()))?;
+    Ok((path, config))
+}
+
+/// The Worker name of the project at `given` (a directory or a config), for a
+/// command that acts on a deployed script without building it.
+pub fn read_script_name(given: Option<PathBuf>) -> anyhow::Result<String> {
+    let (path, config) = read_config(given)?;
     config
         .get("name")
         .and_then(Value::as_str)
@@ -1487,12 +1498,8 @@ pub fn read_script_name(given: Option<PathBuf>) -> anyhow::Result<String> {
 /// but it does not bundle: `celld d1` acts on a database that is already
 /// deployed, and a project that fails to build must still be migratable.
 pub fn read_d1_project(given: Option<PathBuf>) -> anyhow::Result<D1Project> {
-    let path = resolve_config(given)?;
+    let (path, config) = read_config(given)?;
     let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let source =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let config: Value = serde_json::from_str(&strip_jsonc(&source))
-        .with_context(|| format!("parse {}", path.display()))?;
     let object = config
         .as_object()
         .ok_or_else(|| anyhow!("{} is not a JSON object", path.display()))?;
@@ -2324,11 +2331,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     for binding in &bindings {
         let name = binding.get("name").and_then(Value::as_str).unwrap_or("");
         let kind = binding.get("type").and_then(Value::as_str).unwrap_or("");
-        // `e["__proto__"] = x` sets the object's prototype and installs no
-        // binding, so the name cannot be an own property of `env`.
-        if name == "__proto__" {
-            bail!("a {kind} binding cannot be named `__proto__`");
-        }
+        check_env_name(name).map_err(|error| anyhow!("a {kind} binding: {error}"))?;
         if let Some(previous) = binding_names.insert(name, kind) {
             bail!(
                 "binding name {name:?} is declared by both a {previous} and a {kind} \
@@ -3002,6 +3005,13 @@ fn optional_asset_mode(
         bail!("unsupported assets.{key} value: {value:?}");
     }
     Ok(value.to_string())
+}
+
+/// Refuse a name that cannot be an own property of `env`. `e["__proto__"] = x`
+/// sets the object's prototype and installs no binding.
+pub(crate) fn check_env_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(name != "__proto__", "`__proto__` cannot be a binding name");
+    Ok(())
 }
 
 pub(crate) fn valid_binding(binding: &str) -> bool {

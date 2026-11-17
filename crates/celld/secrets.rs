@@ -1,13 +1,9 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-// The key file is operator input, and the CLI retries a lost conditional write
-// at once; neither runs inside the execution boundary.
-#![allow(clippy::disallowed_methods)]
-
 //! Worker secrets in production, encrypted in the fleet bucket.
 //!
 //! A script's secrets are one object, `deploy/<script>/secrets.json`. Each
-//! value is sealed with AES-256-GCM under the fleet key, which the nodes and the
+//! value is sealed with AES-256-GCM under the secrets key, which the nodes and the
 //! operator hold (`CELLD_SECRETS_KEY` or `CELLD_SECRETS_KEY_FILE`) and the
 //! bucket never does. A random nonce seals each value, and the associated data
 //! names the script and the secret, so an entry copied under another name or
@@ -23,6 +19,7 @@
 //! are stored in the clear, so `list` and the clash check at deploy need no key.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -31,8 +28,10 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::bucket::Bucket;
+use crate::protocol::Manifest;
 
 pub const KEY_VARIABLE: &str = "CELLD_SECRETS_KEY";
 pub const KEY_FILE_VARIABLE: &str = "CELLD_SECRETS_KEY_FILE";
@@ -41,19 +40,27 @@ pub const KEY_FILE_VARIABLE: &str = "CELLD_SECRETS_KEY_FILE";
 pub const MAX_VALUE_BYTES: usize = 5 * 1024;
 const SCHEMA_VERSION: u32 = 1;
 const KEY_BYTES: usize = 32;
+/// A key is 44 characters of base64; a file larger than this is not one.
+const KEY_FILE_MAX_BYTES: u64 = 4096;
 const NONCE_BYTES: usize = 12;
 /// Lost conditional writes before a put gives up. Each loss means another
 /// operator changed the object in between, so this only bounds a livelock.
 const WRITE_ATTEMPTS: usize = 16;
 
-/// The fleet key, with a short public id that is stored beside each value.
-pub struct FleetKey {
+/// The secrets key, with a short public id that is stored beside each value.
+pub struct SecretsKey {
     bytes: [u8; KEY_BYTES],
     id: String,
 }
 
-impl FleetKey {
-    pub fn from_bytes(bytes: [u8; KEY_BYTES]) -> Self {
+impl Drop for SecretsKey {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+impl SecretsKey {
+    fn from_bytes(bytes: [u8; KEY_BYTES]) -> Self {
         // A hash prefix of the key under a fixed label: it names the key in an
         // error and in a later rotation, and tells nothing of the key.
         let digest = Sha256::new()
@@ -69,38 +76,73 @@ impl FleetKey {
 
     /// A base64 key of exactly 32 bytes. The text is never echoed.
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let bytes = STANDARD
-            .decode(text.trim())
-            .map_err(|_| anyhow!("the fleet key is not valid base64"))?;
-        let bytes: [u8; KEY_BYTES] = bytes
-            .try_into()
-            .map_err(|_| anyhow!("the fleet key must be {KEY_BYTES} bytes, in base64"))?;
-        Ok(Self::from_bytes(bytes))
+        let decoded = Zeroizing::new(
+            STANDARD
+                .decode(text.trim())
+                .map_err(|_| anyhow!("the secrets key is not valid base64"))?,
+        );
+        let mut bytes = [0u8; KEY_BYTES];
+        anyhow::ensure!(
+            decoded.len() == KEY_BYTES,
+            "the secrets key must be {KEY_BYTES} bytes, in base64"
+        );
+        bytes.copy_from_slice(&decoded);
+        let key = Self::from_bytes(bytes);
+        bytes.zeroize();
+        Ok(key)
+    }
+
+    /// The key in `CELLD_SECRETS_KEY` alone, or `None` when it is unset or
+    /// blank. Startup validation uses it, so a node stops at once on a
+    /// malformed key without reading the file.
+    pub(crate) fn from_variable() -> anyhow::Result<Option<Self>> {
+        let Some(text) = crate::env_vars::value(KEY_VARIABLE)? else {
+            return Ok(None);
+        };
+        let text = Zeroizing::new(text);
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        Self::parse(&text)
+            .map(Some)
+            .with_context(|| format!("{KEY_VARIABLE} is invalid"))
     }
 
     /// The key from `CELLD_SECRETS_KEY` or `CELLD_SECRETS_KEY_FILE`, or `None`
     /// when neither is set. Setting both is refused, since a node and an
     /// operator that read different ones would disagree about every value.
-    pub fn from_environment() -> anyhow::Result<Option<Self>> {
-        let set = |name: &str| -> anyhow::Result<Option<String>> {
-            Ok(crate::env_vars::value(name)?.filter(|value| !value.trim().is_empty()))
-        };
-        match (set(KEY_VARIABLE)?, set(KEY_FILE_VARIABLE)?) {
-            (None, None) => Ok(None),
-            (Some(text), None) => Self::parse(&text)
-                .map(Some)
-                .with_context(|| format!("{KEY_VARIABLE} is invalid")),
-            (None, Some(path)) => {
-                let text = std::fs::read_to_string(&path)
-                    .with_context(|| format!("read {KEY_FILE_VARIABLE} ({path})"))?;
-                Self::parse(&text)
-                    .map(Some)
-                    .with_context(|| format!("{KEY_FILE_VARIABLE} ({path}) is invalid"))
+    ///
+    /// The key is read and parsed once per process; a change to the variable or
+    /// the file takes effect at the next start.
+    #[allow(clippy::disallowed_methods)] // Operator input, not node storage.
+    pub fn from_environment() -> anyhow::Result<Option<&'static Self>> {
+        static KEY: OnceLock<Option<SecretsKey>> = OnceLock::new();
+        if let Some(key) = KEY.get() {
+            return Ok(key.as_ref());
+        }
+        let file =
+            crate::env_vars::value(KEY_FILE_VARIABLE)?.filter(|path| !path.trim().is_empty());
+        let variable_set =
+            crate::env_vars::value(KEY_VARIABLE)?.is_some_and(|value| !value.trim().is_empty());
+        let key = match (variable_set, file) {
+            (false, None) => None,
+            (true, None) => Self::from_variable()?,
+            (false, Some(path)) => {
+                let path = std::path::Path::new(&path);
+                let text = Zeroizing::new(
+                    crate::credential_file::read(path, KEY_FILE_MAX_BYTES)
+                        .with_context(|| format!("read {KEY_FILE_VARIABLE}"))?,
+                );
+                warn_if_shared(path);
+                Some(Self::parse(&text).with_context(|| {
+                    format!("{KEY_FILE_VARIABLE} ({}) is invalid", path.display())
+                })?)
             }
-            (Some(_), Some(_)) => {
+            (true, Some(_)) => {
                 bail!("set only one of {KEY_VARIABLE} and {KEY_FILE_VARIABLE}")
             }
-        }
+        };
+        Ok(KEY.get_or_init(|| key).as_ref())
     }
 
     pub fn id(&self) -> &str {
@@ -134,7 +176,7 @@ impl FleetKey {
     fn open(&self, script: &str, name: &str, sealed: &Sealed) -> anyhow::Result<Vec<u8>> {
         let wrong = || {
             anyhow!(
-                "secret {name} of script {script} does not open under the fleet key {} \
+                "secret {name} of script {script} does not open under the secrets key {} \
                  (it was sealed under key {}, was altered, or was copied from another \
                  name or script)",
                 self.id,
@@ -158,6 +200,28 @@ impl FleetKey {
             .map_err(|_| wrong())
     }
 }
+
+/// Log once that the key file can be read by other users. A container secret
+/// mount is often mode 0644, so this is a warning and never a refusal.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // Operator input, not node storage.
+fn warn_if_shared(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                event = "secrets_key_file_shared",
+                path = %path.display(),
+                mode = format!("{mode:o}"),
+                "the secrets key file can be read by other users; restrict it to its owner"
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_shared(_path: &std::path::Path) {}
 
 /// What a value is bound to: its script and its name. The separators cannot
 /// occur in either, so two pairs never give the same bytes.
@@ -222,7 +286,7 @@ fn check_name(name: &str) -> anyhow::Result<()> {
         crate::deploy::valid_binding(name),
         "{name:?} is not a valid secret name; use letters, digits, `_` and `$`, not starting with a digit"
     );
-    Ok(())
+    crate::deploy::check_env_name(name)
 }
 
 fn clash(script: &str, name: &str) -> anyhow::Error {
@@ -240,14 +304,11 @@ pub async fn names(bucket: &Bucket, script: &str) -> anyhow::Result<Vec<String>>
 
 /// Refuse a deployment whose bindings use the name of a stored secret. Reads
 /// names only, so a deploy needs no key.
-pub async fn ensure_no_clash(
-    bucket: &Bucket,
-    script: &str,
-    bindings: &BTreeSet<String>,
-) -> anyhow::Result<()> {
-    for name in names(bucket, script).await? {
+pub async fn ensure_no_clash(bucket: &Bucket, manifest: &Manifest) -> anyhow::Result<()> {
+    let bindings = binding_names(&manifest.raw_metadata);
+    for name in names(bucket, &manifest.script_name).await? {
         if bindings.contains(&name) {
-            return Err(clash(script, &name)
+            return Err(clash(&manifest.script_name, &name)
                 .context("run `celld secret delete` or rename the binding in the config"));
         }
     }
@@ -255,10 +316,15 @@ pub async fn ensure_no_clash(
 }
 
 /// Store `value` under `name`. `bindings` are the binding names of the script's
-/// current deployment, which the name must not use.
+/// current deployment, which the name must not use. Only the selected
+/// deployment is checked: a staged or retained version is checked when it is
+/// activated.
+///
+/// A put under a key other than the one that sealed the existing entries is
+/// refused, so one script never holds values no single key opens.
 pub async fn put(
     bucket: &Bucket,
-    key: &FleetKey,
+    key: &SecretsKey,
     script: &str,
     name: &str,
     value: &str,
@@ -276,6 +342,13 @@ pub async fn put(
     }
     let sealed = key.seal(script, name, value.as_bytes())?;
     update(bucket, script, |set| {
+        anyhow::ensure!(
+            set.secrets
+                .values()
+                .all(|existing| existing.kid == key.id()),
+            "the secrets key differs from the one these secrets were sealed with; \
+             use that key, or delete the secrets of script {script} first"
+        );
         set.secrets.insert(name.to_string(), sealed.clone());
         Ok(())
     })
@@ -319,32 +392,39 @@ async fn update(
     bail!("{key} kept changing under this write; try again")
 }
 
-/// The decrypted secrets of `script`, as `env` bindings, for a deployment whose
-/// bindings are `bindings`. One bucket read; empty when the script has none.
+/// The decrypted secrets of the script of `manifest`, as `env` bindings. One
+/// bucket read; empty when the script has none or the deployment has no Worker
+/// module.
 ///
 /// A script with secrets and no key is an error, so a node never serves a
 /// Worker that silently lacks a credential.
 pub async fn load(
     bucket: &Bucket,
-    script: &str,
-    bindings: &BTreeSet<String>,
+    manifest: &Manifest,
+    key: Option<&SecretsKey>,
 ) -> anyhow::Result<Vec<(String, String)>> {
+    if manifest.main_module.is_none() {
+        return Ok(Vec::new());
+    }
+    let script = manifest.script_name.as_str();
     let Some((set, _)) = read(bucket, script).await? else {
         return Ok(Vec::new());
     };
     if set.secrets.is_empty() {
         return Ok(Vec::new());
     }
-    let key = FleetKey::from_environment()?.with_context(|| {
+    let key = key.with_context(|| {
         format!(
-            "script {script} has {} secret(s), and no fleet key is configured; \
+            "script {script} has {} secret(s), and no secrets key is configured; \
              set {KEY_VARIABLE} or {KEY_FILE_VARIABLE} to the key they were put under",
             set.secrets.len()
         )
     })?;
+    let bindings = binding_names(&manifest.raw_metadata);
     set.secrets
         .iter()
         .map(|(name, sealed)| {
+            crate::deploy::check_env_name(name)?;
             if bindings.contains(name) {
                 return Err(clash(script, name));
             }
@@ -370,8 +450,8 @@ pub fn binding_names(metadata: &serde_json::Value) -> BTreeSet<String> {
 mod tests {
     use super::*;
 
-    fn key(byte: u8) -> FleetKey {
-        FleetKey::from_bytes([byte; KEY_BYTES])
+    fn key(byte: u8) -> SecretsKey {
+        SecretsKey::from_bytes([byte; KEY_BYTES])
     }
 
     #[test]
@@ -434,12 +514,14 @@ mod tests {
     fn a_key_is_32_bytes_of_base64() {
         let text = STANDARD.encode([9u8; 32]);
         assert_eq!(
-            FleetKey::parse(&format!("{text}\n")).unwrap().id(),
+            SecretsKey::parse(&format!("{text}\n")).unwrap().id(),
             key(9).id()
         );
-        assert!(FleetKey::parse("not base64!").is_err());
-        assert!(FleetKey::parse(&STANDARD.encode([9u8; 16])).is_err());
-        let error = FleetKey::parse(&STANDARD.encode([9u8; 16])).err().unwrap();
+        assert!(SecretsKey::parse("not base64!").is_err());
+        assert!(SecretsKey::parse(&STANDARD.encode([9u8; 16])).is_err());
+        let error = SecretsKey::parse(&STANDARD.encode([9u8; 16]))
+            .err()
+            .unwrap();
         assert!(!format!("{error:#}").contains(&STANDARD.encode([9u8; 16])));
     }
 
@@ -453,6 +535,23 @@ mod tests {
             binding_names(&metadata),
             BTreeSet::from(["A".to_string(), "B".to_string()])
         );
+    }
+
+    fn manifest(bindings: &[&str]) -> Manifest {
+        let bindings: Vec<_> = bindings
+            .iter()
+            .map(|name| serde_json::json!({ "type": "plain_text", "name": name, "text": "x" }))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "version": "v1",
+            "script_name": "app",
+            "main_module": "index.js",
+            "do_classes": [],
+            "sqlite_classes": [],
+            "modules": [],
+            "raw_metadata": { "bindings": bindings },
+        }))
+        .unwrap()
     }
 
     fn bucket(directory: &tempfile::TempDir) -> Bucket {
@@ -492,7 +591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_name_that_a_binding_uses_is_refused_by_put_and_by_deploy() {
+    async fn a_name_that_a_binding_uses_is_refused_by_put_deploy_and_load() {
         let directory = tempfile::tempdir().unwrap();
         let bucket = bucket(&directory);
         let key = key(3);
@@ -501,10 +600,90 @@ mod tests {
         put(&bucket, &key, "app", "TOKEN", "v", &BTreeSet::new())
             .await
             .unwrap();
-        ensure_no_clash(&bucket, "app", &taken).await.unwrap();
-        let clashing = BTreeSet::from(["TOKEN".to_string()]);
-        assert!(ensure_no_clash(&bucket, "app", &clashing).await.is_err());
-        assert!(load(&bucket, "app", &clashing).await.is_err());
+        ensure_no_clash(&bucket, &manifest(&["DB"])).await.unwrap();
+        let clashing = manifest(&["TOKEN"]);
+        assert!(ensure_no_clash(&bucket, &clashing).await.is_err());
+        let error = load(&bucket, &clashing, Some(&key)).await.unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("secret TOKEN of script app has the name of a binding"),
+            "{text}"
+        );
+        assert_eq!(
+            load(&bucket, &manifest(&["DB"]), Some(&key)).await.unwrap(),
+            [("TOKEN".to_string(), "v".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn load_needs_a_key_only_when_the_script_has_secrets() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let manifest = manifest(&[]);
+        assert!(load(&bucket, &manifest, None).await.unwrap().is_empty());
+        put(&bucket, &key(3), "app", "TOKEN", "v", &BTreeSet::new())
+            .await
+            .unwrap();
+        let error = load(&bucket, &manifest, None).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no secrets key is configured"),
+            "{error:#}"
+        );
+        let error = load(&bucket, &manifest, Some(&key(4))).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not open under the secrets key"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_proto_name_is_refused_by_put_and_by_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let key = key(3);
+        let error = put(&bucket, &key, "app", "__proto__", "v", &BTreeSet::new())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("__proto__"), "{error}");
+        // An entry that reached the bucket another way never becomes a binding.
+        put(&bucket, &key, "app", "A", "v", &BTreeSet::new())
+            .await
+            .unwrap();
+        let (mut set, token) = read(&bucket, "app").await.unwrap().unwrap();
+        let moved = set.secrets["A"].clone();
+        set.secrets.insert("__proto__".into(), moved);
+        bucket
+            .put_cas(
+                &object_key("app"),
+                serde_json::to_vec(&set).unwrap(),
+                Some(&token),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let error = load(&bucket, &manifest(&[]), Some(&key)).await.unwrap_err();
+        assert!(error.to_string().contains("__proto__"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_put_under_another_key_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let none = BTreeSet::new();
+        put(&bucket, &key(3), "app", "A", "one", &none)
+            .await
+            .unwrap();
+        let error = put(&bucket, &key(4), "app", "B", "two", &none)
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("secrets key differs"), "{text}");
+        assert!(!text.contains(key(3).id()) && !text.contains(key(4).id()));
+        assert_eq!(names(&bucket, "app").await.unwrap(), ["A"]);
+        // The same key still adds entries.
+        put(&bucket, &key(3), "app", "B", "two", &none)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

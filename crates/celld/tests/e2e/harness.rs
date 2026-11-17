@@ -492,7 +492,7 @@ fn spawn(project: &Path, env: &[(String, String)], log: &Path) -> Child {
         .env_remove("CELLD_OPERATOR_TOKEN")
         // Likewise a state directory would move the node's state and token.
         .env_remove("CELLD_DEV_STATE_DIR")
-        // Likewise a fleet key would decide whether a secret opens.
+        // Likewise a secrets key would decide whether a secret opens.
         .env_remove("CELLD_SECRETS_KEY")
         .env_remove("CELLD_SECRETS_KEY_FILE")
         .envs(env.iter().map(|(k, v)| (k, v)))
