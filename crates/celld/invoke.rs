@@ -146,23 +146,7 @@ pub fn shadow_pointer(
     }
 }
 
-/// Aborts the staged request when the handler is dropped before it answers,
-/// as when the caller disconnects, so the shadow generation can drain.
-struct AbortOnDrop(Option<std::sync::Arc<crate::runtime::RequestCancellationLifetime>>);
-
-impl AbortOnDrop {
-    fn disarm(&mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        if let Some(cancellation) = self.0.take() {
-            cancellation.publish_abort();
-        }
-    }
-}
+use crate::runtime::AbortOnDrop;
 
 /// Answer one request to [`PATH`]. Returns the HTTP status and the JSON body.
 pub async fn handle(

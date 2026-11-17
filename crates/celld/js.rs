@@ -7320,6 +7320,7 @@ fn op_loader_fetch(
         .map(|entry| entry.state.clone());
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
     let stream_service = http_stream_service();
+    let ws_owner = websocket::ws_caller(scope).owner;
     let async_id = asyncrt::enqueue(async move {
         let mut cancel_guard = cancel_guard;
         // The child's own `IoContext` has an empty egress stack, so nothing
@@ -7370,7 +7371,9 @@ fn op_loader_fetch(
         // context. That context owns an unread body tail through its
         // waitUntil work.
         body_guard.disarm();
-        encode_http_response(response, false, &stream_service)
+        // A loaded worker can answer with an upgrade, and the caller may bind
+        // or return its socket, so the grant names this request as its owner.
+        encode_granted_response(ws_owner, response, &stream_service)
     });
     let response = promise_for(scope, async_id);
     if let Some(request_id) = cancel_id {
@@ -9498,11 +9501,21 @@ fn op_do_id(
 /// bind to it or return it.
 fn encode_granted_response(
     owner: u64,
-    response: HttpResponse,
+    mut response: HttpResponse,
     stream_service: &Arc<crate::http_streams::HttpStreamService>,
 ) -> Result<String, String> {
-    if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
-        ws_grant_target(target, owner);
+    // A stateless Worker's socket is parked for the request it is handed to,
+    // which names it by a target of its own kind.
+    match response.websocket.take() {
+        Some(HttpResponseWebSocket::Worker(socket)) => {
+            let target = websocket::ws_park_worker(socket, owner);
+            response.websocket = Some(HttpResponseWebSocket::Cell(target));
+        }
+        Some(HttpResponseWebSocket::Cell(target)) => {
+            ws_grant_target(&target, owner);
+            response.websocket = Some(HttpResponseWebSocket::Cell(target));
+        }
+        None => {}
     }
     encode_http_response(response, true, stream_service)
 }
@@ -11754,6 +11767,11 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
         tracing::info!(%ws_json, has_target = ws.is_some(), "JS WebSocket response");
     }
     let websocket = match (ws, worker_ws) {
+        // A socket a loaded Worker answered with, returned as it was handed.
+        (Some(target), None) if target.scope.is_empty() => Some(HttpResponseWebSocket::Worker(
+            websocket::ws_take_parked_worker(&target)
+                .ok_or_else(|| anyhow!("Worker WebSocket {} was already taken", target.id))?,
+        )),
         (Some(target), None) => Some(HttpResponseWebSocket::Cell(target)),
         (None, Some(worker)) => Some(HttpResponseWebSocket::Worker(worker)),
         (None, None) => None,

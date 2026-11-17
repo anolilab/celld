@@ -490,6 +490,10 @@ pub struct WsRegistry {
     /// Only that request can bind to it or return it, and only as handed: the
     /// scope and the tunnel cross application JavaScript like the id does.
     grants: HashMap<(u64, Option<u64>), (u64, String)>,
+    /// The socket a stateless Worker answered an upgrade with, held for the
+    /// request it was handed to, keyed by the Worker end's id. That request
+    /// either binds a client end to it or returns it, and takes it out here.
+    parked_workers: HashMap<u64, WorkerWebSocket>,
 }
 impl WsRegistry {
     #[doc(hidden)]
@@ -770,9 +774,56 @@ pub(crate) fn ws_grant_target(target: &WsTarget, owner: u64) {
 pub(crate) fn ws_revoke_grants(owner: u64) {
     let registry = ws_registry();
     let mut registry = registry.lock().unwrap();
-    if !registry.grants.is_empty() {
-        registry.grants.retain(|_, (granted, _)| *granted != owner);
+    if registry.grants.is_empty() {
+        return;
     }
+    let revoked: Vec<u64> = registry
+        .grants
+        .iter()
+        .filter(|(_, (granted, _))| *granted == owner)
+        .map(|((id, _), _)| *id)
+        .collect();
+    registry.grants.retain(|_, (granted, _)| *granted != owner);
+    // Dropping a Worker socket unregisters it, which takes this lock.
+    let unclaimed: Vec<WorkerWebSocket> = revoked
+        .iter()
+        .filter_map(|id| registry.parked_workers.remove(id))
+        .collect();
+    drop(registry);
+    drop(unclaimed);
+}
+
+/// Hand `owner` the socket a stateless Worker answered an upgrade with. The
+/// Worker end lives in another isolate, so the owner gets a target with an
+/// empty scope (no cell has one) that it can bind a client end to, or return.
+pub(crate) fn ws_park_worker(socket: WorkerWebSocket, owner: u64) -> WsTarget {
+    let target = WsTarget {
+        id: socket.id,
+        scope: String::new(),
+        tunnel: None,
+    };
+    let shared = ws_registry();
+    let mut registry = shared.lock().unwrap();
+    registry
+        .grants
+        .insert((target.id, None), (owner, String::new()));
+    let replaced = registry.parked_workers.insert(target.id, socket);
+    drop(registry);
+    drop(replaced);
+    target
+}
+
+/// Take the parked Worker socket named by `target`, once the request that was
+/// handed it has been checked.
+pub fn ws_take_parked_worker(target: &WsTarget) -> Option<WorkerWebSocket> {
+    if !target.scope.is_empty() {
+        return None;
+    }
+    ws_registry()
+        .lock()
+        .unwrap()
+        .parked_workers
+        .remove(&target.id)
 }
 
 /// Whether `owner` was handed exactly the response target `target`.

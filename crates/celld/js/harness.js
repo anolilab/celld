@@ -3515,7 +3515,9 @@ __celld.__makeLoader = () => {
           ? new CelldHttpBodyStream(r.streamId)
           : r.body !== undefined ? r.body : Uint8Array.from(r.bodyBytes || []);
         return __wrapServiceResponse(
-          new Response(responseBody, { status: r.status, headers: r.headers }),
+          new Response(responseBody, {
+            status: r.status, headers: r.headers, __wsTarget: r.wsTarget,
+          }),
           req.url);
       },
     };

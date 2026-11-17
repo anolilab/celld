@@ -75,6 +75,21 @@ Fetcher brokers each `fetch()` through the loader. A `connect()` or a WebSocket
 through a Fetcher throws, because the celld service protocol carries no
 bidirectional tunnel.
 
+## Calls into a loaded Worker
+
+Every module of a loaded Worker can import any name from a built-in module such
+as `cloudflare:workers`, whichever other modules import from it.
+
+A `fetch()` on an entrypoint takes an `AbortSignal`. Aborting it rejects the
+caller and aborts the request of the loaded Worker, so its `request.signal`
+fires and a provider request that uses that signal stops. The same happens
+when the caller goes away before the call answers.
+
+A loaded Worker can answer a request with a `101` response and a `webSocket`.
+The caller receives that `webSocket`, which carries messages to and from the
+loaded Worker after the caller calls `accept()`, or the caller can return the
+response to its own client.
+
 ## Lifetime and caching
 
 `get(id, getCode)` memoizes the compiled Worker by id inside one loader binding

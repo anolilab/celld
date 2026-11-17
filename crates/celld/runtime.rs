@@ -695,7 +695,11 @@ pub(crate) async fn receive_service_fetch_response(
     cancellation: Arc<RequestCancellationLifetime>,
     cancel: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> anyhow::Result<HttpResponse> {
-    match cancel {
+    // The waiter is dropped, rather than told, when its caller goes away
+    // (an abort rejects the caller's promise and abandons the call), so the
+    // target's request would run on with a live `request.signal`.
+    let mut abort = AbortOnDrop(Some(cancellation.clone()));
+    let received = match cancel {
         Some(mut cancel) => crate::asyncrt::select_biased! {
             "a completed service response wins a tie with an external disconnect";
             response = response => response,
@@ -705,6 +709,26 @@ pub(crate) async fn receive_service_fetch_response(
             }
         },
         None => response.await,
+    };
+    abort.disarm();
+    received
+}
+
+/// Aborts a request when its waiter is dropped before the request answers,
+/// as when the caller disconnects.
+pub(crate) struct AbortOnDrop(pub(crate) Option<Arc<RequestCancellationLifetime>>);
+
+impl AbortOnDrop {
+    pub(crate) fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.0.take() {
+            cancellation.publish_abort();
+        }
     }
 }
 

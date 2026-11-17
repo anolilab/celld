@@ -460,6 +460,73 @@ impl OutboundWebSocketSink {
     }
 }
 
+/// Carry frames between a stateless Worker's socket and a client end another
+/// isolate in this process kept. The Worker end answered an upgrade as a
+/// top-level Worker does, so its frames use the channels it prepared for an
+/// external client: its output queue out, its inbound queue in.
+///
+/// The task ends when either side closes, and it unregisters the client end.
+/// Dropping the Worker's socket unregisters its own.
+async fn worker_websocket_pipe(
+    id: u64,
+    target: &celld::js::WsTarget,
+    pull: celld::js::WsPullSender,
+    reply: tokio::sync::oneshot::Sender<anyhow::Result<celld::js::OutboundWsOpen>>,
+) -> anyhow::Result<()> {
+    let Some(worker) = celld::js::websocket::ws_take_parked_worker(target) else {
+        let _ = reply.send(Err(anyhow::anyhow!(
+            "the Worker WebSocket was already taken"
+        )));
+        return Ok(());
+    };
+    let inbound = worker.inbound();
+    let (caller_tx, mut from_caller) = mpsc::unbounded_channel();
+    let (worker_tx, mut from_worker) = mpsc::unbounded_channel();
+    celld::js::ws_register(id, caller_tx);
+    celld::js::ws_register(worker.id(), worker_tx);
+    let _ = reply.send(Ok(celld::js::OutboundWsOpen {
+        protocol: None,
+        declined: None,
+    }));
+    loop {
+        celld::asyncrt::select! {
+            frame = from_caller.recv() => match frame {
+                Some(celld::js::WsOut::Text(text)) => {
+                    if inbound.send(celld::js::WsIn::Text(text).into()).await.is_err() { break; }
+                }
+                Some(celld::js::WsOut::Binary(bytes)) => {
+                    if inbound.send(celld::js::WsIn::Binary(bytes).into()).await.is_err() { break; }
+                }
+                Some(celld::js::WsOut::Close(code, reason)) => {
+                    let _ = inbound.send_close(code, reason, true);
+                    break;
+                }
+                // The caller's request retired and took its socket with it.
+                None => {
+                    let _ = inbound.send_close(1001, "request ended".into(), true);
+                    break;
+                }
+            },
+            frame = from_worker.recv() => match frame {
+                Some(celld::js::WsOut::Text(text)) => {
+                    if pull.send(celld::js::WsPull::Text(text)).await.is_err() { break; }
+                }
+                Some(celld::js::WsOut::Binary(bytes)) => {
+                    if pull.send(celld::js::WsPull::Binary(bytes)).await.is_err() { break; }
+                }
+                Some(celld::js::WsOut::Close(code, reason)) => {
+                    let _ = pull.send_close(code, reason, true);
+                    break;
+                }
+                None => break,
+            },
+        }
+    }
+    celld::js::ws_unregister(id);
+    celld::js::ws_pull_unregister(id);
+    Ok(())
+}
+
 /// Carry frames between a Durable Object's socket and a client end another
 /// isolate in this process kept, after a `stub.fetch` upgrade.
 ///
@@ -484,6 +551,9 @@ async fn local_websocket_pipe(
         )));
         return Ok(());
     };
+    if target.scope.is_empty() {
+        return worker_websocket_pipe(id, &target, pull, reply).await;
+    }
     // Both registrations flush whatever each end queued before it had
     // anywhere to send: the cell's greeting frame is queued while its own
     // fetch handler still runs, and the caller can send the moment it
