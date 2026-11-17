@@ -349,6 +349,11 @@ async fn dispatch_local_fetch(
             // has installed its request context. That context now
             // owns an unread tail through its waitUntil work.
             body_guard.disarm();
+            // Record the object's own socket first, so a refusal below still
+            // releases it (`RefusedWebSocket`).
+            if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
+                accepted = Some(target.clone());
+            }
             // A Durable Object can return a loaded Worker's socket as well as
             // its own, and either needs the caller to have asked to upgrade.
             if response.websocket.is_some() {
@@ -358,7 +363,6 @@ async fn dispatch_local_fetch(
                 anyhow::ensure!(upgrade, "TypeError: {WEBSOCKET_WITHOUT_UPGRADE}");
             }
             if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
-                accepted = Some(target.clone());
                 let (cell, hibernatable) = crate::js::ws_core_registration(target);
                 let kind = if hibernatable {
                     WebSocketKind::Hibernatable
