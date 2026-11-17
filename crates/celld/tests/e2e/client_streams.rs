@@ -482,7 +482,7 @@ async fn an_exception_in_a_hibernation_handler_is_reported_and_closes_the_socket
 
 /// What the upstream server of a proxied socket saw.
 #[derive(Debug, PartialEq)]
-enum Seen {
+pub(super) enum Seen {
     Text(String),
     Binary(Vec<u8>),
     Close(u16, String),
@@ -498,7 +498,7 @@ enum Seen {
 /// connection ends, `/proto` selects the subprotocol the client offered, and
 /// `/slow` reads nothing for three seconds and then echoes its texts.
 /// Everything it receives is reported on the channel it returns.
-async fn upstream() -> (u16, tokio::sync::mpsc::UnboundedReceiver<Seen>) {
+pub(super) async fn upstream() -> (u16, tokio::sync::mpsc::UnboundedReceiver<Seen>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");

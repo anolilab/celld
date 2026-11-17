@@ -237,3 +237,73 @@ async fn a_websocket_listener_that_throws_marks_the_frame_span_as_an_error() {
     })
     .await;
 }
+
+/// A message listener that throws a value with no printable form still ends
+/// the frame's span as an error, and the socket answers the next frame.
+#[tokio::test]
+async fn an_unprintable_listener_exception_still_marks_the_frame_span_as_an_error() {
+    let (port, bodies) = collector().await;
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let server = Server::start(
+        "client-streams",
+        &[("CELLD_OTEL", &endpoint), ("CELLD_OTEL_FLUSH_MS", "100")],
+    )
+    .await;
+    let mut socket = client_streams::client(&server, "/object/unprintable").await;
+    socket.set_auto_close(false);
+    let answer = client_streams::exchange(&mut socket, "one").await;
+    assert_eq!(answer, Some("echo:one".to_string()));
+    wait_until("an errored frame span", Duration::from_secs(30), || {
+        let found = bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|body| spans(body))
+            .any(|(name, attributes)| {
+                name == "celld.ws_message" && attribute(&attributes, "status.error").is_some()
+            });
+        async move { found.then_some(()) }
+    })
+    .await;
+}
+
+/// An open listener that throws while a fetch awaits an outbound socket is
+/// reported, but the fetch's span is not an error: the request succeeded.
+#[tokio::test]
+async fn an_open_listener_that_throws_during_a_fetch_does_not_mark_the_fetch_span() {
+    let (port, bodies) = collector().await;
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let (upstream_port, _seen) = client_streams::upstream().await;
+    let server = Server::start(
+        "client-streams",
+        &[("CELLD_OTEL", &endpoint), ("CELLD_OTEL_FLUSH_MS", "100")],
+    )
+    .await;
+    let answer = client()
+        .get(server.url(&format!("/dial-open-throws?port={upstream_port}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status().as_u16(), 200);
+    assert_eq!(answer.text().await.unwrap(), "done");
+    let fetches = wait_until("the request span", Duration::from_secs(30), || {
+        let found: Vec<_> = bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|body| spans(body))
+            .filter(|(name, attributes)| {
+                name == "celld.fetch"
+                    && attribute(attributes, "http.response.status_code") == Some("200")
+            })
+            .collect();
+        async move { (!found.is_empty()).then_some(found) }
+    })
+    .await;
+    assert!(
+        fetches
+            .iter()
+            .all(|(_, attributes)| attribute(attributes, "status.error").is_none()),
+        "the fetch span was marked as an error: {fetches:?}"
+    );
+}
