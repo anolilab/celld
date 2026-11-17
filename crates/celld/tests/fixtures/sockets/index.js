@@ -339,16 +339,14 @@ export default {
     }
     if (url.pathname === "/poke") {
       const entry = held.get(name);
-      if (entry) entry.poke = true;
+      if (!entry) return new Response(`nothing held under ${name}`, { status: 404 });
+      entry.poke = true;
       return new Response("poked");
     }
     if (url.pathname === "/info") {
       const entry = held.get(name);
-      return Response.json({
-        ready: !!entry?.ready,
-        id: entry?.id ?? null,
-        log: entry?.log ?? [],
-      });
+      if (!entry) return new Response(`nothing held under ${name}`, { status: 404 });
+      return Response.json({ ready: entry.ready, id: entry.id, log: entry.log });
     }
     if (url.pathname === "/ws/forge-bind") {
       // Binds this request to a Durable Object's socket it was never handed.
@@ -390,7 +388,8 @@ export default {
     }
     if (url.pathname === "/release") {
       const entry = held.get(name);
-      if (entry) entry.released = true;
+      if (!entry) return new Response(`nothing held under ${name}`, { status: 404 });
+      entry.released = true;
       return new Response("released");
     }
     if (url.pathname === "/ws/steal") {
