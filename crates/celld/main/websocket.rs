@@ -758,6 +758,13 @@ async fn pipe_to_object(
         if std::mem::take(&mut dispatched) {
             dispatching = None;
         }
+        // The cell already closed: what the caller sends now is read and
+        // dropped, never given to it.
+        let cell_closed = to_caller.end.is_some() && !draining;
+        if cell_closed {
+            to_cell = Lane::new();
+            dispatching = None;
+        }
         if dispatching.is_none() {
             let data = match to_cell.next() {
                 Some(celld::js::WsPull::Text(text)) => Some(celld::js::WsIn::Text(text)),
@@ -779,6 +786,7 @@ async fn pipe_to_object(
         let to_caller_front = to_caller.front_bytes().filter(|_| !draining);
         celld::asyncrt::select! {
             frame = from_caller.recv(), if !draining => match frame {
+                Some(_) if cell_closed => {}
                 Some(celld::js::WsOut::Close(code, reason)) => {
                     // The caller is answered and released now; the cell hears
                     // the frames sent before the close, then the close.
@@ -846,8 +854,11 @@ async fn pipe_to_object(
     if caller_gone {
         celld::js::ws_pull_unregister(id);
     }
+    // The cell's handler may wait on a gate that never opens, so hearing of
+    // the end is bounded by the handler budget too.
     if let Some((code, reason)) = cell_close {
-        cell.closed(code, reason).await;
+        let _ =
+            celld::asyncrt::timeout(celld::js::handler_budget(), cell.closed(code, reason)).await;
     }
     cell.release();
     celld::js::ws_unregister(cell.id());
@@ -1631,6 +1642,7 @@ mod pipe_tests {
         id: u64,
         gate: Arc<tokio::sync::Semaphore>,
         log: Arc<Mutex<Vec<String>>>,
+        close_gate: Arc<tokio::sync::Semaphore>,
     }
 
     impl ObjectEnd for Object {
@@ -1643,6 +1655,7 @@ mod pipe_tests {
         }
 
         async fn closed(&self, code: u16, _reason: String) {
+            self.close_gate.acquire().await.unwrap().forget();
             self.log.lock().unwrap().push(format!("close:{code}"));
         }
 
@@ -1658,6 +1671,7 @@ mod pipe_tests {
         object: u64,
         gate: Arc<tokio::sync::Semaphore>,
         log: Arc<Mutex<Vec<String>>>,
+        close_gate: Arc<tokio::sync::Semaphore>,
         task: tokio::task::JoinHandle<anyhow::Result<()>>,
     }
 
@@ -1667,6 +1681,7 @@ mod pipe_tests {
         // The drain's timer runs on the process runtime, bound once per process.
         static HOST: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
         HOST.get_or_init(|| {
+            std::env::set_var("CELLD_HANDLER_BUDGET_S", "1");
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
@@ -1678,6 +1693,7 @@ mod pipe_tests {
         let object = caller + 1;
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let log = Arc::new(Mutex::new(Vec::new()));
+        let close_gate = Arc::new(tokio::sync::Semaphore::new(1000));
         let (pull, receiver) = celld::js::ws_pull_channel();
         celld::js::ws_pull_register(caller, receiver);
         let (reply, opened) = tokio::sync::oneshot::channel();
@@ -1685,6 +1701,7 @@ mod pipe_tests {
             id: object,
             gate: gate.clone(),
             log: log.clone(),
+            close_gate: close_gate.clone(),
         };
         let task = tokio::spawn(pipe_to_object(cell, caller, pull, reply));
         opened.await.unwrap().unwrap();
@@ -1693,6 +1710,7 @@ mod pipe_tests {
             object,
             gate,
             log,
+            close_gate,
             task,
         }
     }
@@ -1774,5 +1792,41 @@ mod pipe_tests {
         celld::js::ws_unregister(pipe.caller);
         assert!(ended(pipe.task).await);
         assert!(!celld::js::ws_pull_registered(pipe.caller));
+    }
+
+    #[tokio::test]
+    async fn a_close_the_object_never_takes_does_not_hold_the_pipe() {
+        let pipe = start(9_200_050).await;
+        // The object's input gate stays shut: its close handler never runs.
+        pipe.close_gate.forget_permits(1000);
+        emit(pipe.caller, celld::js::WsOut::Close(3005, "done".into()));
+        assert!(
+            ended(pipe.task).await,
+            "the pipe waited on a close the object never took"
+        );
+        assert!(pipe.log.lock().unwrap().is_empty());
+        celld::js::ws_pull_unregister(pipe.caller);
+    }
+
+    #[tokio::test]
+    async fn a_closed_object_is_not_given_what_the_caller_sends_after() {
+        let pipe = start(9_200_060).await;
+        // The first frame takes the caller's queue; the second waits behind it
+        // in the pipe, so the object's close waits too.
+        let big = "x".repeat(celld::js::WS_PULL_QUEUE_MAX_BYTES);
+        emit(pipe.object, celld::js::WsOut::Text(big.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        emit(pipe.object, celld::js::WsOut::Text(big));
+        emit(pipe.object, celld::js::WsOut::Close(3006, "done".into()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        pipe.gate.add_permits(10);
+        emit(pipe.caller, celld::js::WsOut::Text("late".into()));
+        emit(pipe.caller, celld::js::WsOut::Close(3007, "late".into()));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The caller leaves without reading: the pipe ends.
+        celld::js::ws_pull_unregister(pipe.caller);
+        assert!(ended(pipe.task).await);
+        // The object closed itself: it gets neither frame nor a second close.
+        assert!(pipe.log.lock().unwrap().is_empty(), "{:?}", pipe.log);
     }
 }
