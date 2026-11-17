@@ -15,6 +15,18 @@ APIs, and Wrangler configuration.
   It moves only hibernated cells, so a fleet without idle eviction balances
   only the cells that hibernate on their own.
 
+## Deployments
+
+- After a deploy, the previous deployment keeps serving the requests it
+  already holds. It lives at most `CELLD_RETIRE_DEADLINE_S` (default:
+  `CELLD_HANDLER_BUDGET_S` plus 60 seconds). Then celld ends what still runs
+  there, including `waitUntil` work and open streams, answers those requests
+  with an error, logs `retire_deadline_forced`, and frees the isolates. Finish
+  background work within that time, or start it again from the new deployment.
+- `/state` reports `deployment.retiring`: how many superseded deployments still
+  hold isolates, and the age in milliseconds of the oldest. A cell that has not
+  yet moved to the new deployment keeps its isolate until it does.
+
 ## Networking and security
 
 - celld does not terminate TLS. Terminate public TLS at an ingress proxy, and

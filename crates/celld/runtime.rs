@@ -2237,7 +2237,17 @@ async fn drive_worker(
     after_turn(&entry);
 
     while !entry.finished() {
-        let started = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await {
+        let retire_deadline = js::retire_deadline();
+        let woke = asyncrt::select_biased! {
+            "a request still running when its superseded isolate's deadline passes is ended, even if it is ready";
+            _ = slot.superseded_deadline(retire_deadline) => Wake::Retired,
+            woke = wake_with_cross_entry_gate(&mut ops, &mut entry, budget) => woke,
+        };
+        let started = match woke {
+            Wake::Retired => {
+                entry.retired_by_deadline(retire_deadline);
+                Vec::new()
+            }
             Wake::Op(op, result) => {
                 slot.turn(|worker| worker.turn_deliver(&mut entry, op, result))
                     .await
@@ -2310,6 +2320,9 @@ enum Wake {
     CrossEntryGateChanged,
     /// Its client hung up, or shutdown forced the complete event to retire.
     Cancelled { shutdown: bool },
+    /// The isolate's deployment was superseded long enough ago that its
+    /// work must end, answered or not.
+    Retired,
     /// It ran past the handler budget without answering.
     Expired,
     /// Nothing outstanding could ever move it.
@@ -3263,8 +3276,19 @@ async fn drive_cell_inner(
     }
 
     while !entry.finished() {
-        let (started, moves) = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await
-        {
+        let retire_deadline = js::retire_deadline();
+        let woke = asyncrt::select_biased! {
+            "a request still running when its superseded isolate's deadline passes is ended, even if it is ready";
+            _ = slot.superseded_deadline(retire_deadline) => Wake::Retired,
+            woke = wake_with_cross_entry_gate(&mut ops, &mut entry, budget) => woke,
+        };
+        let (started, moves) = match woke {
+            Wake::Retired => {
+                entry.retired_by_deadline(retire_deadline);
+                slot.turn(|worker| worker.turn_retire_input_gates(&entry))
+                    .await;
+                (Vec::new(), Vec::new())
+            }
             Wake::Op(op, result) => {
                 slot.turn(|worker| {
                     let started = worker.turn_deliver(&mut entry, op, result);

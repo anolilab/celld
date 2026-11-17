@@ -888,3 +888,19 @@ pub fn handler_budget() -> std::time::Duration {
         )
     })
 }
+
+/// How long a superseded deployment's isolates may live,
+/// `CELLD_RETIRE_DEADLINE_S`. Past it, work still running there is ended
+/// and the isolates are freed. The default is the handler budget plus a
+/// minute: a handler that obeys its budget is never cut short, and what
+/// outlives it is `waitUntil` work or a stream nobody reads.
+pub fn retire_deadline() -> std::time::Duration {
+    static DEADLINE: OnceLock<std::time::Duration> = OnceLock::new();
+    *DEADLINE.get_or_init(|| {
+        let default = handler_budget().as_secs().saturating_add(60);
+        std::time::Duration::from_secs(
+            crate::env_vars::positive_or("CELLD_RETIRE_DEADLINE_S", default)
+                .expect("validated CELLD_RETIRE_DEADLINE_S"),
+        )
+    })
+}

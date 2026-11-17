@@ -413,6 +413,7 @@ TUNING:
   CELLD_V8_HEAP_LIMIT_MB          Per-isolate V8 heap limit
   CELLD_FETCH_TIMEOUT_S           Outbound fetch timeout
   CELLD_HANDLER_BUDGET_S          JavaScript handler budget
+  CELLD_RETIRE_DEADLINE_S         Lifetime of a superseded deployment's isolates
   CELLD_TOKIO_THREADS             Tokio runtime worker threads
   CELLD_DURABILITY                `fleet` acks when every follower holds the
                                   write on disk, or when the bucket upload

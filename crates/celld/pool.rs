@@ -36,6 +36,7 @@ use celld_logic::isolate::PoolLimits;
 use celld_logic::isolate::PoolLoad;
 use celld_logic::isolate::Refusal;
 
+use crate::asyncrt;
 use crate::js;
 
 pub use crate::engine_api::AdmitError;
@@ -203,6 +204,13 @@ pub struct Slot {
     // toward the collection boundary. Residency drop retires both counts.
     adopted_cells: AtomicUsize,
     retiring: AtomicBool,
+    /// When this isolate was retired because its deployment was superseded,
+    /// in `asyncrt::mono_ms`. Work still running here once the retire
+    /// deadline has passed from this instant is ended.
+    superseded_at: tokio::sync::watch::Sender<Option<u64>>,
+    /// Whether the deadline already forced this isolate, so the log line
+    /// appears once per isolate and not once per request.
+    forced: AtomicBool,
 }
 
 thread_local! {
@@ -329,6 +337,8 @@ impl Slot {
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
+            superseded_at: tokio::sync::watch::channel(None).0,
+            forced: AtomicBool::new(false),
         })
     }
 
@@ -351,6 +361,54 @@ impl Slot {
 
     pub fn is_retiring(&self) -> bool {
         self.retiring.load(Ordering::Relaxed)
+    }
+
+    /// Retire this isolate because its deployment was superseded, and start
+    /// the clock on [`Self::superseded_deadline`]. Returns whether it was
+    /// not retiring already.
+    fn supersede(&self) -> bool {
+        self.superseded_at.send_if_modified(|at| {
+            let first = at.is_none();
+            if first {
+                *at = Some(asyncrt::mono_ms());
+            }
+            first
+        });
+        !self.retiring.swap(true, Ordering::Relaxed)
+    }
+
+    /// Resolves once this isolate has been superseded for `deadline`, and
+    /// never for an isolate that is not superseded. A request driver races
+    /// it against its own wake, and on a win ends the request, so no
+    /// request or `waitUntil` task can keep a superseded heap alive past
+    /// the deadline.
+    pub(crate) async fn superseded_deadline(&self, deadline: std::time::Duration) {
+        let mut at = self.superseded_at.subscribe();
+        loop {
+            let since = *at.borrow_and_update();
+            match since {
+                Some(since) => {
+                    let ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
+                    asyncrt::sleep_until(since.saturating_add(ms)).await;
+                    if !self.forced.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            event = "retire_deadline_forced",
+                            isolate = %self.heap_id,
+                            slot = self.id,
+                            deadline_s = deadline.as_secs(),
+                            requests = self.requests.load(Ordering::Relaxed),
+                            "superseded isolate outlived its deadline; ending its work"
+                        );
+                    }
+                    return;
+                }
+                None => {
+                    if at.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            }
+        }
     }
 
     /// Retire this isolate because its guest can no longer run in it, and
@@ -579,6 +637,12 @@ impl Pool {
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(self.retired.load(Ordering::Relaxed)),
+            // An isolate grown after the flip is superseded from the start.
+            superseded_at: tokio::sync::watch::channel(
+                self.retired.load(Ordering::Relaxed).then(asyncrt::mono_ms),
+            )
+            .0,
+            forced: AtomicBool::new(false),
         });
         if let Some(id) = reusable {
             slots[id] = slot.clone();
@@ -752,7 +816,7 @@ impl Pool {
         let _maintenance = self.maintenance.write().expect("pool poisoned");
         self.retired.store(true, Ordering::Relaxed);
         for slot in self.slots.read().expect("pool poisoned").iter() {
-            if !slot.retiring.swap(true, Ordering::Relaxed) {
+            if slot.supersede() {
                 tracing::info!(isolate = %slot.heap_id, slot = slot.id, "isolate retiring");
             }
         }

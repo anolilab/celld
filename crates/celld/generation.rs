@@ -347,6 +347,8 @@ pub struct Generation {
     /// See `Manifest::fence_image`; the first script's, they are all the
     /// same image when one celld deployed them.
     pub(crate) fence_image: Option<String>,
+    /// When this generation was superseded, in `asyncrt::mono_ms`.
+    retired_at: std::sync::OnceLock<u64>,
 }
 
 impl Generation {
@@ -438,12 +440,22 @@ impl Generation {
     /// isolates free as their affiliations drop; cell isolates free as their
     /// cells move to a newer generation.
     pub(crate) fn retire(&self) {
+        let _ = self.retired_at.set(crate::asyncrt::mono_ms());
         for service in self.services.values() {
             service.isolates.retire_all();
         }
         for pool in self.cell_isolates.values() {
             pool.retire_all();
         }
+    }
+
+    /// How long this generation has been superseded, or `None` while it
+    /// serves. A superseded generation that is still listed holds isolates,
+    /// and `CELLD_RETIRE_DEADLINE_S` bounds this age.
+    pub(crate) fn retired_for_ms(&self) -> Option<u64> {
+        self.retired_at
+            .get()
+            .map(|at| crate::asyncrt::mono_ms().saturating_sub(*at))
     }
 
     /// Whether every isolate of this generation has been freed, so the
@@ -688,6 +700,7 @@ impl Generation {
             assets,
             containers: all_containers,
             fence_image,
+            retired_at: std::sync::OnceLock::new(),
         })
     }
 }

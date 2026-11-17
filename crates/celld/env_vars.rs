@@ -264,6 +264,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_OPERATION_DEADLINE_MS",
         "CELLD_PLACEMENT_WEIGHT",
         "CELLD_RELEASES",
+        "CELLD_RETIRE_DEADLINE_S",
         "CELLD_TOKIO_THREADS",
         "CELLD_TTL_MS",
         "CELLD_WAKER_TICK_MS",

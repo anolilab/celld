@@ -44,6 +44,7 @@ pub use crate::engine_api::next_request_id;
 pub use crate::engine_api::parse_request_id;
 pub use crate::engine_api::queue_cell_scope;
 pub use crate::engine_api::request_id_string;
+pub use crate::engine_api::retire_deadline;
 pub use crate::engine_api::CellOverloaded;
 pub use crate::engine_api::Compat;
 pub use crate::engine_api::FailedInTurn;
@@ -3334,6 +3335,18 @@ impl InFlight {
     /// Give up on a handler that will not settle.
     pub fn time_out(&mut self, budget: Duration) {
         self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
+    }
+
+    /// The isolate this request runs in belongs to a superseded deployment
+    /// that has outlived `CELLD_RETIRE_DEADLINE_S`. Answer the client, if it
+    /// still waits, and drop the background work so the isolate can free.
+    pub fn retired_by_deadline(&mut self, deadline: Duration) {
+        self.fail(anyhow!(
+            "this deployment was superseded and its isolate was retired after {}s",
+            deadline.as_secs()
+        ));
+        self.background = None;
+        self.context.seal_wait_until();
     }
 
     /// Nothing this request awaits can move it, so it will never settle on
