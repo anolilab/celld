@@ -50,6 +50,8 @@ async fn get_within_budget(client: &reqwest::Client, url: &str) -> (reqwest::Sta
         {
             return (status, body);
         }
+        // Give the queue that made it time out a moment to drain.
+        tokio::time::sleep(Duration::from_millis(200 * attempts)).await;
     }
 }
 
@@ -328,14 +330,16 @@ async fn durable_object_events_running_at_the_deadline_are_ended_and_the_node_ke
         Duration::from_secs(30),
         || async {
             let state = state(&server).await;
-            state["deployment"]["draining"]
-                .as_array()
-                .is_none_or(|draining| {
-                    draining
+            // An empty list means the generation was already freed, which
+            // happens only at the deadline: the objects hold work until then.
+            let freed = state["deployment"]["retiring"]["generations"] == 0;
+            let draining = state["deployment"]["draining"].as_array()?;
+            (freed
+                || (!draining.is_empty()
+                    && draining
                         .iter()
-                        .all(|generation| generation["retiredForMs"].as_u64() >= Some(2500))
-                })
-                .then_some(())
+                        .all(|generation| generation["retiredForMs"].as_u64() >= Some(2500))))
+            .then_some(())
         },
     )
     .await;
