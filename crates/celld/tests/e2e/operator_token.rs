@@ -108,9 +108,16 @@ async fn assert_every_route_refused(server: &Server, credentials: &[(&str, Optio
                     .send()
                     .await
                     .unwrap_or_else(|error| panic!("{method} {path}: {error}"));
+                // The signed probe is exempt from the token and refuses a
+                // method it does not serve before it reads anything.
+                let expected = if path == "/peer/probe" && method == reqwest::Method::POST {
+                    405
+                } else {
+                    401
+                };
                 assert_eq!(
                     response.status().as_u16(),
-                    401,
+                    expected,
                     "{method} {path} {what} must be refused"
                 );
             }
@@ -329,4 +336,37 @@ async fn metrics_answer_with_the_token_and_refuse_without_it() {
         })
         .expect("the internal 4xx series");
     assert_ne!(refused.rsplit(' ').next(), Some("0"), "{refused}");
+}
+
+/// The probe skips the token gate, so an unsigned caller must not be able to
+/// hold a task open by promising a body and never sending it.
+#[tokio::test]
+async fn the_probe_refuses_an_unsigned_body_without_waiting_for_it() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let server = Server::start("do-ids", &[]).await;
+    let address = server
+        .internal_url("")
+        .await
+        .trim_start_matches("http://")
+        .to_string();
+    for head in [
+        "POST /peer/probe HTTP/1.1\r\nhost: x\r\ncontent-length: 1000\r\n\r\n",
+        "GET /peer/probe HTTP/1.1\r\nhost: x\r\ncontent-length: 1000\r\n\r\n",
+        "GET /peer/probe HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\n\r\n",
+    ] {
+        let mut stream = tokio::net::TcpStream::connect(&address).await.unwrap();
+        stream.write_all(head.as_bytes()).await.unwrap();
+        // The body never comes: the refusal must not depend on it.
+        let mut buffer = [0_u8; 512];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buffer))
+                .await
+                .unwrap_or_else(|_| panic!("the probe waited for a body: {head:?}"))
+                .unwrap();
+        let answer = String::from_utf8_lossy(&buffer[..read]);
+        assert!(
+            answer.starts_with("HTTP/1.1 400") || answer.starts_with("HTTP/1.1 405"),
+            "{head:?} -> {answer}"
+        );
+    }
 }

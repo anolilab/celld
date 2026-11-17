@@ -180,3 +180,49 @@ async fn local_follows_a_linked_config_to_its_state() {
         .expect("run celld d1");
     assert!(output.status.success(), "{}", stderr(&output));
 }
+
+/// A lease outlives its node. Another local user who binds the lease's port
+/// gets no operator token from `--local`, and the command says to start
+/// `celld dev`.
+#[tokio::test]
+async fn local_sends_no_token_to_another_listener_on_the_leases_port() {
+    use std::io::{Read as _, Write as _};
+    let mut server = Server::start("d1", &[]).await;
+    let token = std::fs::read_to_string(server.project_dir().join(".celld/dev/operator-token"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let internal = server.internal_url("").await;
+    let address = internal.trim_start_matches("http://").to_string();
+    server.stop();
+
+    let listener = std::net::TcpListener::bind(&address).expect("take over the lease's port");
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let seen = heard.clone();
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut buffer = [0_u8; 8192];
+            if let Ok(read) = stream.read(&mut buffer) {
+                seen.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buffer[..read]));
+            }
+            let _ = stream.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            );
+        }
+    });
+
+    let output = d1(&server, &["execute", "ledger", "--command", "SELECT 1"]);
+    assert!(!output.status.success());
+    let text = stderr(&output);
+    assert!(
+        text.contains("start `celld dev` for this project first"),
+        "{text}"
+    );
+    let heard = heard.lock().unwrap().to_ascii_lowercase();
+    assert!(
+        !heard.contains(&token.to_ascii_lowercase()) && !heard.contains("authorization"),
+        "the foreign listener received the token: {heard}"
+    );
+}
