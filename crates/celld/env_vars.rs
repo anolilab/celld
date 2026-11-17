@@ -308,10 +308,18 @@ pub fn validate() -> anyhow::Result<()> {
     positive::<usize>("CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES")?;
 
     // A resident cell is forced onto the new deployment at the maximum age, so
-    // a retire deadline at or before it would end work the swap still allows.
+    // a retire deadline at or before it would end work the swap still allows,
+    // and one at or before the handler budget would end a handler that is
+    // still within its budget.
     if let Some(deadline) = positive::<u64>("CELLD_RETIRE_DEADLINE_S")? {
         optional::<u64>("CELLD_DEPLOY_MAX_AGE_S")?;
         let max_age = crate::generation::max_age().as_secs();
+        let budget = crate::js::handler_budget().as_secs();
+        if deadline <= budget {
+            bail!(
+                "CELLD_RETIRE_DEADLINE_S ({deadline}) must exceed CELLD_HANDLER_BUDGET_S ({budget})"
+            );
+        }
         if deadline <= max_age {
             bail!(
                 "CELLD_RETIRE_DEADLINE_S ({deadline}) must exceed CELLD_DEPLOY_MAX_AGE_S ({max_age})"

@@ -459,14 +459,15 @@ impl Generation {
     /// isolates free as their affiliations drop; cell isolates free as their
     /// cells move to a newer generation.
     pub(crate) fn retire(self: &Arc<Self>) {
-        let _ = self.retired_at.set(crate::asyncrt::mono_ms());
+        let retired_at = crate::asyncrt::mono_ms();
+        let _ = self.retired_at.set(retired_at);
         for service in self.services.values() {
             service.isolates.retire_all();
         }
         for pool in self.cell_isolates.values() {
             pool.retire_all();
         }
-        self.spawn_retire_deadline();
+        self.spawn_retire_deadline(retired_at);
     }
 
     /// Start the one timer that ends this generation's remaining work at
@@ -476,14 +477,18 @@ impl Generation {
     // Spawned on the ambient runtime like the generation's maintenance loop,
     // and not at all where there is none.
     #[allow(clippy::disallowed_methods)]
-    fn spawn_retire_deadline(self: &Arc<Self>) {
+    fn spawn_retire_deadline(self: &Arc<Self>, retired_at: u64) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let deadline = retire_deadline();
         let generation = Arc::downgrade(self);
         handle.spawn(async move {
-            tokio::time::sleep(deadline).await;
+            // From the moment of retiring, not from when the pool locks let
+            // the timer start.
+            let elapsed = crate::asyncrt::mono_ms().saturating_sub(retired_at);
+            tokio::time::sleep(deadline.saturating_sub(std::time::Duration::from_millis(elapsed)))
+                .await;
             if let Some(generation) = generation.upgrade() {
                 generation.force_retired(deadline);
             }

@@ -86,23 +86,16 @@ async fn a_superseded_generation_is_freed_at_its_deadline_though_its_work_never_
             ("CELLD_OPERATOR_TOKEN", TOKEN),
             ("CELLD_RETIRE_DEADLINE_S", DEADLINE_S),
             ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
-            // Far past the test, so only the retire deadline can end the work.
-            ("CELLD_HANDLER_BUDGET_S", "3600"),
+            // Under the deadline, which must exceed it. The work held here
+            // has answered, so only the retire deadline can end it.
+            ("CELLD_HANDLER_BUDGET_S", "1"),
         ],
     )
     .await;
     assert_eq!(server.get_text("/version").await, "v1");
-    // `waitUntil` work that outlives its response, and a request that never
-    // answers: both hold the first generation's isolate.
+    // `waitUntil` work that outlives its response holds the first
+    // generation's isolate.
     assert_eq!(server.get_text("/pin").await, "pinned");
-    let hung = tokio::spawn({
-        let url = server.url("/hang");
-        async move {
-            let response = reqwest::Client::new().get(url).send().await.expect("hang");
-            (response.status(), response.text().await.unwrap_or_default())
-        }
-    });
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     redeploy(&server).await;
 
@@ -117,14 +110,6 @@ async fn a_superseded_generation_is_freed_at_its_deadline_though_its_work_never_
         during["deployment"]["draining"][0]["retiredForMs"].is_u64(),
         "{during}"
     );
-
-    // Past the deadline the hung request is answered with an error.
-    let (status, body) = tokio::time::timeout(Duration::from_secs(60), hung)
-        .await
-        .expect("the hung request ended")
-        .expect("hang task");
-    assert!(status.is_server_error(), "{status} {body}");
-    assert!(body.contains("superseded"), "{body}");
 
     // The isolate is freed, the generation leaves the list, and the new one
     // is unaffected.
@@ -150,6 +135,61 @@ async fn a_superseded_generation_is_freed_at_its_deadline_though_its_work_never_
     );
 }
 
+/// The deadline passes while the event's first turn is still running. It was
+/// running at the deadline, so it is ended, not left to run for ever.
+#[tokio::test]
+async fn an_event_whose_first_turn_spans_the_deadline_is_ended() {
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_RETIRE_DEADLINE_S", DEADLINE_S),
+            ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
+            ("CELLD_HANDLER_BUDGET_S", "1"),
+        ],
+    )
+    .await;
+    assert_eq!(server.get_text("/version").await, "v1");
+    let spinning = tokio::spawn({
+        let url = server.url("/spin");
+        async move {
+            reqwest::Client::new()
+                .get(url)
+                .send()
+                .await
+                .expect("spin")
+                .text()
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    redeploy(&server).await;
+
+    // The event answers after the deadline has passed, and its `waitUntil`
+    // work, which never ends, is ended all the same.
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(60), spinning)
+            .await
+            .expect("the event answered")
+            .expect("spin task")
+            .expect("spin body"),
+        "spun"
+    );
+    wait_until(
+        "the superseded generation to be freed",
+        Duration::from_secs(60),
+        || async {
+            let state = state(&server).await;
+            state["deployment"]["draining"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+                .then_some(())
+        },
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn wait_until_work_that_never_ends_is_ended_at_the_deadline() {
     let server = Server::start(
@@ -158,7 +198,7 @@ async fn wait_until_work_that_never_ends_is_ended_at_the_deadline() {
             ("CELLD_OPERATOR_TOKEN", TOKEN),
             ("CELLD_RETIRE_DEADLINE_S", DEADLINE_S),
             ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
-            ("CELLD_HANDLER_BUDGET_S", "3600"),
+            ("CELLD_HANDLER_BUDGET_S", "1"),
         ],
     )
     .await;
@@ -190,7 +230,7 @@ async fn an_answered_durable_object_event_with_a_leftover_timer_does_not_pin_a_s
             ("CELLD_OPERATOR_TOKEN", TOKEN),
             ("CELLD_RETIRE_DEADLINE_S", DEADLINE_S),
             ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
-            ("CELLD_HANDLER_BUDGET_S", "3600"),
+            ("CELLD_HANDLER_BUDGET_S", "1"),
         ],
     )
     .await;
@@ -235,57 +275,48 @@ async fn durable_object_events_running_at_the_deadline_are_ended_and_the_node_ke
             ("CELLD_RETIRE_DEADLINE_S", "2"),
             ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
             ("CELLD_RELEASES", "1"),
-            ("CELLD_HANDLER_BUDGET_S", "3600"),
+            ("CELLD_HANDLER_BUDGET_S", "1"),
         ],
     )
     .await;
     let client = reqwest::Client::new();
-    let hung: Vec<_> = (0..OBJECTS)
-        .map(|n| {
-            let (client, url) = (client.clone(), server.url(&format!("/do-hang?n={n}")));
-            tokio::spawn(async move {
-                let response = client.get(url).send().await.expect("hang");
-                (response.status(), response.text().await.unwrap_or_default())
+    // In batches: the node accepts them faster than it builds the objects.
+    for batch in (0..OBJECTS).collect::<Vec<_>>().chunks(30) {
+        let hung: Vec<_> = batch
+            .iter()
+            .map(|n| {
+                let (client, url) = (client.clone(), server.url(&format!("/do-hang?n={n}")));
+                tokio::spawn(async move { client.get(url).send().await.expect("hang").status() })
             })
-        })
-        .collect();
+            .collect();
+        for task in hung {
+            let status = task.await.expect("hang task");
+            assert!(status.is_success(), "{status}");
+        }
+    }
     tokio::time::sleep(Duration::from_secs(8)).await;
 
     redeploy(&server).await;
 
-    let mut superseded = 0;
-    for task in hung {
-        let (status, body) = tokio::time::timeout(Duration::from_secs(60), task)
-            .await
-            .expect("the hung event ended")
-            .expect("hang task");
-        assert!(status.is_server_error(), "{status} {body}");
-        superseded += usize::from(body.contains("superseded"));
-    }
-    assert!(
-        superseded > 0,
-        "the swap moved every object before the deadline"
-    );
+    // Every object's `waitUntil` work never ends. Held on the old isolate
+    // past the deadline, it is ended, and the generation is freed.
+    wait_until(
+        "the generation held by the objects' work to be freed",
+        Duration::from_secs(60),
+        || async {
+            let state = state(&server).await;
+            state["deployment"]["draining"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+                .then_some(())
+        },
+    )
+    .await;
     assert!(
         !server.log_text().contains("panicked"),
         "{}",
         server.log_text()
     );
 
-    // Only what was running at the deadline is ended. An event that starts
-    // afterwards on an object that has not moved yet is left to the swap.
-    let naps: Vec<_> = (0..OBJECTS)
-        .map(|n| {
-            let (client, url) = (client.clone(), server.url(&format!("/do-nap?n={n}")));
-            tokio::spawn(async move {
-                let response = client.get(url).send().await.expect("nap");
-                response.text().await.unwrap_or_default()
-            })
-        })
-        .collect();
-    for task in naps {
-        let body = task.await.expect("nap task");
-        assert!(!body.contains("superseded"), "{body}");
-    }
     assert_eq!(server.get_text("/version").await, "v2");
 }

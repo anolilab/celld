@@ -2224,6 +2224,11 @@ async fn drive_worker(
 ) {
     let mut ops = Ops::new();
 
+    // Whether the retire deadline binds this event is what it was when the
+    // event began, not after its first turn: work that was already running
+    // when the timer fired is ended, and a turn can be what the timer
+    // interrupts.
+    let mut retire = (!slot.deadline_forced()).then_some(slot);
     let (begun, started) = slot.turn(|worker| worker.turn_begin(job, trace)).await;
     // Nothing is in flight; the reply already carries the error.
     let Some(mut entry) = begun else {
@@ -2238,7 +2243,6 @@ async fn drive_worker(
     }
     after_turn(&entry);
 
-    let mut retire = Some(slot).filter(|slot| !slot.deadline_forced());
     while !entry.finished() {
         let wake = wake_with_cross_entry_gate(&mut ops, &mut entry, budget, retire).await;
         let started = match wake {
@@ -3317,6 +3321,7 @@ async fn drive_cell_inner(
         Some(CellJob::WsMessage { started, .. } | CellJob::Alarm { started, .. }) => started.take(),
         _ => None,
     };
+    let mut binds = false;
     let (begun, started, moves) = loop {
         let mut waiting = None;
         let taken = slot
@@ -3327,6 +3332,8 @@ async fn drive_cell_inner(
                     pending = Some(job);
                     return None;
                 }
+                // Sampled as the event begins, not after its first turn.
+                binds = !slot.deadline_forced();
                 let (begun, started) = worker.turn_begin_cell(job, trace);
                 Some((begun, started, worker.take_alarm_moves()))
             })
@@ -3380,7 +3387,7 @@ async fn drive_cell_inner(
         abort_ops(&mut ops, &mut entry);
     }
 
-    let mut retire = Some(&*slot).filter(|slot| !slot.deadline_forced());
+    let mut retire = binds.then_some(&*slot);
     while !entry.finished() {
         let wake = wake_with_cross_entry_gate(&mut ops, &mut entry, budget, retire).await;
         let (started, moves) = match wake {
