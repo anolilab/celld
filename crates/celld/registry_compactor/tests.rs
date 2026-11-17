@@ -1042,6 +1042,170 @@ async fn a_load_from_an_older_root_does_not_drop_a_delta_a_newer_root_names() {
 }
 
 // ---------------------------------------------------------------------------
+// The holder's root push: a hint that loads a delta early
+// ---------------------------------------------------------------------------
+
+fn newest_delta(holding: &Holding) -> DeltaId {
+    *holding.root.deltas.last().expect("a delta")
+}
+
+#[tokio::test]
+async fn a_push_that_arrives_before_the_root_names_the_delta_loads_it_and_proves_nothing() {
+    let (scripted, store) = scripted();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &[cell(1)]).await;
+    let pushed = reader_of(&scripted);
+    let control = reader_of(&scripted);
+    for reader in [&pushed, &control] {
+        assert!(matches!(answer(reader, &cell(1)).await, Answer::Exists(_)));
+    }
+    // The pass wrote the delta for cell 2; its root is not readable yet.
+    let (name, key) = (cell(2), objects::key_of(&cell(2)));
+    node.register_at_claim(&name, 1);
+    node.flush_now().await.unwrap();
+    assert_eq!(node.fold_segments(&mut holding).await.unwrap().len(), 1);
+    scripted.reset();
+    pushed.prefetch(&[newest_delta(&holding)]).await;
+    assert_eq!(scripted.reads("/delta/"), 1, "the push loaded the delta");
+    assert_eq!(
+        answer(&pushed, &name).await,
+        Answer::New,
+        "a delta that no root this node read names is not an answer"
+    );
+    assert!(!pushed.evidence_contains(&key), "and it is not coverage");
+    assert!(!pushed.covered_now(&key));
+    // The root becomes readable. The pushed node reads no delta for it.
+    assert!(node.write_root(&mut holding).await.unwrap());
+    scripted.reset();
+    let (with, without) = (pushed.lookup(&key).await, control.lookup(&key).await);
+    assert!(matches!(with.answer, Answer::Exists(_)));
+    assert!(matches!(without.answer, Answer::Exists(_)));
+    assert_eq!(
+        scripted.reads("/delta/"),
+        1,
+        "only the node that was not pushed to fetches it: {:?}",
+        scripted.keys("/delta/")
+    );
+    assert_eq!(with.gets + 1, without.gets);
+}
+
+#[tokio::test]
+async fn the_holder_serves_its_own_delta_from_memory() {
+    let (scripted, _store) = scripted();
+    let view: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_on(&view, "node-a");
+    let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &[cell(1)]).await;
+    scripted.reset();
+    let result = node.lookup(&objects::key_of(&cell(1))).await;
+    assert!(matches!(result.answer, Answer::Exists(_)));
+    assert_eq!(
+        scripted.reads("/delta/"),
+        0,
+        "the holder wrote it and holds it"
+    );
+    assert_eq!(result.gets, 1, "the root only");
+}
+
+#[tokio::test]
+async fn a_dropped_push_costs_the_lookup_its_own_fetch_and_changes_no_answer() {
+    let (scripted, store) = scripted();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &[cell(1)]).await;
+    let reader = reader_of(&scripted);
+    assert!(matches!(answer(&reader, &cell(1)).await, Answer::Exists(_)));
+    register_and_fold(&node, &mut holding, &[cell(2)]).await;
+    let second = newest_delta(&holding);
+    register_and_fold(&node, &mut holding, &[cell(3)]).await;
+    // The push for the second delta arrives; the push for the third is lost.
+    reader.prefetch(&[second]).await;
+    scripted.reset();
+    let third = reader.lookup(&objects::key_of(&cell(3))).await;
+    assert!(matches!(third.answer, Answer::Exists(_)));
+    assert_eq!(
+        scripted.reads("/delta/"),
+        1,
+        "the lookup fetched the lost one"
+    );
+    assert_eq!(third.gets, 2, "the root and that delta");
+    assert!(matches!(answer(&reader, &cell(2)).await, Answer::Exists(_)));
+    assert_eq!(answer(&reader, &cell(4)).await, Answer::New);
+    assert_eq!(scripted.reads("/delta/"), 1, "nothing else was fetched");
+}
+
+#[tokio::test]
+async fn a_push_naming_a_delta_that_no_root_ever_named_is_never_an_answer() {
+    let (scripted, store) = scripted();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &[cell(1)]).await;
+    let reader = reader_of(&scripted);
+    assert!(matches!(answer(&reader, &cell(1)).await, Answer::Exists(_)));
+    // A holder that was displaced wrote this delta and lost its root write.
+    let (ghost_cell, key) = (cell(9), objects::key_of(&cell(9)));
+    let ghost = DeltaId {
+        epoch: holding.epoch,
+        n: 90,
+    };
+    write_delta(
+        store.as_ref(),
+        PREFIX,
+        ghost,
+        vec!["seg/ghost".to_owned()],
+        vec![Record::birth(key, 1)],
+    )
+    .await
+    .unwrap();
+    let never = DeltaId { epoch: 99, n: 0 };
+    scripted.reset();
+    reader.prefetch(&[ghost, never]).await;
+    assert_eq!(
+        scripted.reads("/delta/"),
+        2,
+        "both were fetched; one exists"
+    );
+    assert_eq!(answer(&reader, &ghost_cell).await, Answer::New);
+    assert!(!reader.evidence_contains(&key));
+    assert!(!reader.covered_now(&key));
+    // A later root does not make the ghost an answer either.
+    register_and_fold(&node, &mut holding, &[cell(2)]).await;
+    assert_eq!(answer(&reader, &ghost_cell).await, Answer::New);
+    assert!(matches!(answer(&reader, &cell(2)).await, Answer::Exists(_)));
+    // The delta that does not exist is not remembered: the next push asks again.
+    scripted.reset();
+    reader.prefetch(&[never]).await;
+    assert_eq!(scripted.reads("/delta/"), 1);
+}
+
+#[tokio::test]
+async fn pushes_cannot_fill_the_cache_with_deltas_that_no_root_names() {
+    let (scripted, store) = scripted();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &[cell(1)]).await;
+    let reader = reader_of(&scripted);
+    assert!(matches!(answer(&reader, &cell(1)).await, Answer::Exists(_)));
+    let ids: Vec<DeltaId> = (0..40).map(|n| DeltaId { epoch: 7, n }).collect();
+    for id in &ids {
+        write_delta(store.as_ref(), PREFIX, *id, Vec::new(), Vec::new())
+            .await
+            .unwrap();
+    }
+    scripted.reset();
+    for chunk in ids.chunks(8) {
+        reader.prefetch(chunk).await;
+    }
+    assert_eq!(
+        scripted.reads("/delta/"),
+        32,
+        "the cache of unnamed deltas is bounded"
+    );
+    assert!(!reader.on_push(b"not a push"));
+}
+
+// ---------------------------------------------------------------------------
 // One DeleteObjects per pass
 // ---------------------------------------------------------------------------
 

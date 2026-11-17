@@ -635,6 +635,8 @@ struct Holding {
     running: Arc<AtomicUsize>,
     prepared: Arc<Mutex<Vec<Prepared>>>,
     abandon: Arc<AtomicBool>,
+    /// The delta the last fold wrote, with its content, until its root is written.
+    fresh_delta: Option<(DeltaId, crate::registry::Loaded)>,
 }
 
 enum Ended {
@@ -817,6 +819,7 @@ impl Registry {
             running: Arc::new(AtomicUsize::new(0)),
             prepared: Arc::new(Mutex::new(Vec::new())),
             abandon: Arc::new(AtomicBool::new(false)),
+            fresh_delta: None,
         }))
     }
 
@@ -898,6 +901,71 @@ impl Registry {
         }
     }
 
+    /// Tell the other nodes about the newest deltas, now that a root names
+    /// them. A hint: the push runs beside the pass, a failed request is
+    /// counted and forgotten, and a node that never gets it reads the delta
+    /// after its next root read, as it always could.
+    fn push_root(self: &Arc<Self>, holding: &Holding) {
+        let Some(peer) = self.peer.get() else {
+            return;
+        };
+        let (auth, client) = (peer.auth.clone(), peer.client.clone());
+        let mut ids: Vec<DeltaId> = holding
+            .root
+            .deltas
+            .iter()
+            .rev()
+            .take(crate::registry::PUSH_IDS)
+            .copied()
+            .collect();
+        ids.reverse();
+        let nodes: Vec<(String, String)> = self
+            .fleet
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(node, _)| *node != self.node)
+            .cloned()
+            .collect();
+        if nodes.is_empty() {
+            return;
+        }
+        let body = serde_json::json!({
+            "deltas": ids.iter().map(|id| serde_json::json!({"epoch": id.epoch, "n": id.n})).collect::<Vec<_>>(),
+        })
+        .to_string()
+        .into_bytes();
+        let path = "/peer/registry/root";
+        let this = self.clone();
+        crate::asyncrt::spawn(async move {
+            let sends = nodes.into_iter().map(|(node, addr)| {
+                let request = auth
+                    .sign(
+                        client.post(format!("http://{addr}{path}")),
+                        "POST",
+                        path,
+                        &body,
+                        &node,
+                    )
+                    .map(|request| request.body(body.clone()));
+                let this = this.clone();
+                async move {
+                    this.counters.pushes_sent.fetch_add(1, Ordering::Relaxed);
+                    let sent = match request {
+                        Ok(request) => {
+                            crate::asyncrt::timeout(Duration::from_secs(1), request.send()).await
+                        }
+                        Err(_) => return,
+                    };
+                    if !matches!(&sent, Ok(Ok(reply)) if reply.status().is_success()) {
+                        this.counters.push_failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+            futures_util::future::join_all(sends).await;
+        });
+    }
+
     /// One pass. `Ok(false)` when this holder was displaced.
     async fn pass(self: &Arc<Self>, holding: &mut Holding) -> anyhow::Result<bool> {
         self.counters.passes.fetch_add(1, Ordering::Relaxed);
@@ -922,8 +990,15 @@ impl Registry {
         }
         let beat_due =
             crate::asyncrt::mono_ms().saturating_sub(holding.last_root_ms) >= self.cfg.pass_ms * 2;
-        if (changed || beat_due) && !self.write_root(holding).await? {
+        let wrote = changed || beat_due;
+        if wrote && !self.write_root(holding).await? {
             return Ok(false);
+        }
+        if wrote && !folded.is_empty() {
+            if let Some((id, loaded)) = holding.fresh_delta.take() {
+                self.seed_delta(id, loaded);
+            }
+            self.push_root(holding);
         }
         objects::delete_many(self.store.as_ref(), &folded).await;
         holding.last_pass_ms = crate::asyncrt::mono_ms();
@@ -996,6 +1071,13 @@ impl Registry {
         };
         holding.next_delta += 1;
         let count = records.len() as u64;
+        holding.fresh_delta = Some((
+            id,
+            crate::registry::Loaded {
+                segments: segments.iter().cloned().collect(),
+                records: records.clone(),
+            },
+        ));
         self.counters.put_requests.fetch_add(1, Ordering::Relaxed);
         let size = write_delta(
             self.store.as_ref(),

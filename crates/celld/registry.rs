@@ -23,6 +23,10 @@ pub(crate) const LOOKUP_DEADLINE: Duration = Duration::from_secs(2);
 const EVIDENCE_CAP: usize = 1 << 19;
 /// Samples a counter keeps, so a long run does not grow without bound.
 const SAMPLES_CAP: usize = 400_000;
+/// Delta ids one root push is read for.
+pub(crate) const PUSH_IDS: usize = 8;
+/// Cached deltas that no root this node read names: what pushes may add.
+const PREFETCH_CAP: usize = 32;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
@@ -159,6 +163,14 @@ pub(crate) struct Counters {
     pub list_requests: AtomicU64,
     pub put_requests: AtomicU64,
     pub get_requests: AtomicU64,
+    /// Root pushes sent by this node as holder, and the requests that failed.
+    pub pushes_sent: AtomicU64,
+    pub push_failures: AtomicU64,
+    /// Root pushes this node received, and the delta ids it did not fetch.
+    pub pushes_received: AtomicU64,
+    pub prefetch_skipped: AtomicU64,
+    /// Deltas fetched because of a push; `delta_loads` counts the others.
+    pub prefetch_loads: AtomicU64,
 }
 
 /// Samples the node keeps for the gates that need a percentile of its own
@@ -242,6 +254,8 @@ pub struct Registry {
     pub(crate) holds: Holds,
     pub(crate) peer: OnceLock<PeerCall>,
     pub(crate) peer_addr: Mutex<HashMap<String, (u64, String)>>,
+    /// Live nodes and their addresses, for the holder's root push.
+    pub(crate) fleet: Mutex<Vec<(String, String)>>,
     pub(crate) last_pass_request_ms: AtomicU64,
     pub(crate) debug: Mutex<serde_json::Map<String, serde_json::Value>>,
     pub(crate) forced: Mutex<std::collections::VecDeque<(String, usize)>>,
@@ -296,6 +310,7 @@ impl Registry {
             holds: Holds::default(),
             peer: OnceLock::new(),
             peer_addr: Mutex::new(HashMap::new()),
+            fleet: Mutex::new(Vec::new()),
             last_pass_request_ms: AtomicU64::new(0),
             debug: Mutex::new(serde_json::Map::new()),
             forced: Mutex::new(std::collections::VecDeque::new()),
@@ -395,27 +410,7 @@ impl Registry {
         };
         let mut deltas_ok = !over_cap;
         let loaded: Vec<Option<Arc<Loaded>>> = futures_util::stream::iter(cells)
-            .map(|(id, cell)| async move {
-                let load = cell
-                    .get_or_try_init(|| async {
-                        let (delta, size) =
-                            objects::read_delta(self.store.as_ref(), &self.prefix, id).await?;
-                        io.get(size);
-                        self.counters.delta_loads.fetch_add(1, Ordering::Relaxed);
-                        anyhow::Ok(Arc::new(Loaded {
-                            segments: delta.segments.into_iter().collect(),
-                            records: delta.records,
-                        }))
-                    })
-                    .await;
-                match load {
-                    Ok(loaded) => Some(loaded.clone()),
-                    Err(error) => {
-                        tracing::debug!(%error, "registry delta unreadable");
-                        None
-                    }
-                }
-            })
+            .map(|(id, cell)| async move { self.delta_in(id, &cell, io, false).await })
             .buffered(16)
             .collect()
             .await;
@@ -460,6 +455,146 @@ impl Registry {
             map,
             map_ok,
         }
+    }
+
+    /// The delta `id`, fetched once into `cell` however many callers ask.
+    async fn delta_in(
+        &self,
+        id: reg::DeltaId,
+        cell: &tokio::sync::OnceCell<Arc<Loaded>>,
+        io: &Io,
+        pushed: bool,
+    ) -> Option<Arc<Loaded>> {
+        let load = cell
+            .get_or_try_init(|| async {
+                let (delta, size) =
+                    objects::read_delta(self.store.as_ref(), &self.prefix, id).await?;
+                io.get(size);
+                if pushed {
+                    &self.counters.prefetch_loads
+                } else {
+                    &self.counters.delta_loads
+                }
+                .fetch_add(1, Ordering::Relaxed);
+                anyhow::Ok(Arc::new(Loaded {
+                    segments: delta.segments.into_iter().collect(),
+                    records: delta.records,
+                }))
+            })
+            .await;
+        match load {
+            Ok(loaded) => Some(loaded.clone()),
+            Err(error) => {
+                tracing::debug!(%error, "registry delta unreadable");
+                None
+            }
+        }
+    }
+
+    /// The holder wrote this delta and holds its content: put it in the cache,
+    /// so its own lookups read nothing for it. The content is what the bucket
+    /// holds under the id, as for any other fetch.
+    pub(crate) fn seed_delta(&self, id: reg::DeltaId, loaded: Loaded) {
+        let cell = self
+            .view
+            .lock()
+            .unwrap()
+            .deltas
+            .entry(id)
+            .or_default()
+            .clone();
+        let _ = cell.set(Arc::new(loaded));
+    }
+
+    /// The holder says it wrote a root that names these deltas: fetch the ones
+    /// this node lacks, so the next lookup that a root names them for finds
+    /// them loaded. A hint and nothing more. It touches the delta cache only:
+    /// not the root this node last read, not its version or age (the role
+    /// watch measures those), not the coverage notices. A lookup still takes
+    /// cached deltas only for the ids its own fresh root names, so a delta
+    /// that no root names, however it got here, proves nothing. The content
+    /// of a delta is fixed by its id, and the push carries ids, never content.
+    pub(crate) async fn prefetch(&self, ids: &[reg::DeltaId]) {
+        self.counters
+            .pushes_received
+            .fetch_add(1, Ordering::Relaxed);
+        let cells: Vec<(reg::DeltaId, Arc<tokio::sync::OnceCell<Arc<Loaded>>>)> = {
+            let mut view = self.view.lock().unwrap();
+            let named = view.root.clone();
+            let newest = named.as_ref().and_then(|root| root.deltas.last().copied());
+            let mut unnamed = view
+                .deltas
+                .keys()
+                .filter(|id| !named.as_ref().is_some_and(|root| root.deltas.contains(id)))
+                .count();
+            let mut taken = Vec::new();
+            for id in ids.iter().take(PUSH_IDS) {
+                let stale = newest.is_some_and(|newest| *id <= newest)
+                    && !named.as_ref().is_some_and(|root| root.deltas.contains(id));
+                if view.deltas.contains_key(id) || stale || unnamed >= PREFETCH_CAP {
+                    self.counters
+                        .prefetch_skipped
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                unnamed += 1;
+                let cell = view.deltas.entry(*id).or_default().clone();
+                taken.push((*id, cell));
+            }
+            taken
+        };
+        let io = Io::default();
+        for (id, cell) in cells {
+            let fetched =
+                crate::asyncrt::timeout(LOOKUP_DEADLINE, self.delta_in(id, &cell, &io, true))
+                    .await
+                    .ok()
+                    .flatten();
+            if fetched.is_none() {
+                let mut view = self.view.lock().unwrap();
+                if view
+                    .deltas
+                    .get(&id)
+                    .is_some_and(|held| Arc::ptr_eq(held, &cell) && cell.get().is_none())
+                {
+                    view.deltas.remove(&id);
+                }
+            }
+        }
+    }
+
+    /// A root push arrived (already authenticated): read the ids it names and
+    /// fetch the deltas in the background. `false` when the body is not a push.
+    pub fn on_push(self: &Arc<Self>, body: &[u8]) -> bool {
+        #[derive(serde::Deserialize)]
+        struct Push {
+            deltas: Vec<Id>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Id {
+            epoch: u64,
+            n: u64,
+        }
+        let Ok(push) = serde_json::from_slice::<Push>(body) else {
+            return false;
+        };
+        let ids: Vec<reg::DeltaId> = push
+            .deltas
+            .into_iter()
+            .map(|id| reg::DeltaId {
+                epoch: id.epoch,
+                n: id.n,
+            })
+            .collect();
+        let this = self.clone();
+        crate::asyncrt::spawn(async move { this.prefetch(&ids).await });
+        true
+    }
+
+    /// The live nodes a root push goes to: the fleet sample every node reads
+    /// for balancing, so the push needs no bucket request of its own.
+    pub fn set_fleet(&self, peers: Vec<(String, String)>) {
+        *self.fleet.lock().unwrap() = peers;
     }
 
     /// Where the buckets of `key` were, by the map this node last loaded: the
@@ -682,6 +817,11 @@ impl Registry {
             ("list_requests", &counters.list_requests),
             ("put_requests", &counters.put_requests),
             ("get_requests", &counters.get_requests),
+            ("pushes_sent", &counters.pushes_sent),
+            ("push_failures", &counters.push_failures),
+            ("pushes_received", &counters.pushes_received),
+            ("prefetch_skipped", &counters.prefetch_skipped),
+            ("prefetch_loads", &counters.prefetch_loads),
         ]
         .into_iter()
         .map(|(name, value)| (name.to_owned(), load(value).into()))
