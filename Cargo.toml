@@ -42,6 +42,10 @@ aes-gcm = "0.11"
 cbc = { version = "0.2", features = ["alloc"] }
 ctr = "0.10"
 anyhow = "1"
+# Decodes a gzip or brotli fetch() response body as it streams. The reqwest
+# decompression features are off: they cannot be switched per request, and
+# encodeResponseBody: "manual" must reach the Worker undecoded.
+async-compression = { version = "0.4", default-features = false, features = ["tokio", "gzip", "brotli"] }
 async-trait = "0.1"
 axum = { version = "0.7", features = ["multipart"] }
 base64 = "0.22"
@@ -120,6 +124,7 @@ crc = "3"
 crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 percent-encoding = "2"
 rand = "0.8"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false }
 rsa = { version = "0.10", features = ["pkcs1v15"] }

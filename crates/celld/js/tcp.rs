@@ -80,31 +80,10 @@ fn insert(id: u64, owner: u64, stream: Duplex) {
     );
 }
 
-// Rebuilt per handshake only under the internal-tests cfg, where the
-// injected root must be visible; production caches the connector.
-
-fn tls_connector() -> tokio_rustls::TlsConnector {
-    static CONNECTOR: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
-    CONNECTOR.get_or_init(|| build_tls_connector(None)).clone()
-}
-
-fn build_tls_connector(extra_root: Option<Vec<u8>>) -> tokio_rustls::TlsConnector {
-    let mut roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    if let Some(der) = extra_root {
-        let _ = roots.add(rustls::pki_types::CertificateDer::from(der));
-    }
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tokio_rustls::TlsConnector::from(Arc::new(config))
-}
-
 async fn handshake(stream: Duplex, host: String) -> Result<Duplex, String> {
     let name = rustls::pki_types::ServerName::try_from(host)
         .map_err(|error| format!("invalid TLS server name: {error}"))?;
-    let tls = tls_connector()
+    let tls = crate::tls_roots::connector()
         .connect(name, stream)
         .await
         .map_err(|error| format!("TLS handshake failed: {error}"))?;

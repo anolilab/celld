@@ -298,6 +298,7 @@ pub fn validate() -> anyhow::Result<()> {
     // `deploy` or any command that never reads it.
     crate::operator_token::OperatorToken::from_variable()?;
     crate::egress_filter::from_env()?;
+    crate::tls_roots::extra()?;
     crate::container::FenceNodeNetns::from_env()?;
 
     positive::<usize>("CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES")?;

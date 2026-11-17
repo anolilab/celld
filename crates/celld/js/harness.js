@@ -492,6 +492,16 @@ globalThis.Request = class Request {
     if (!__FETCH_REDIRECT_MODES.has(this.redirect)) {
       throw new TypeError(`Invalid redirect mode: ${this.redirect}`);
     }
+    const encodeResponseBody = init.encodeResponseBody === undefined
+      ? (prior?.encodeResponseBody ?? "automatic")
+      : String(init.encodeResponseBody);
+    if (encodeResponseBody !== "automatic" && encodeResponseBody !== "manual") {
+      throw new TypeError(
+        `encodeResponseBody: unexpected value: ${encodeResponseBody}`);
+    }
+    // Absent unless set, like `cf`, so a Request that never mentions it
+    // serializes as before.
+    if (encodeResponseBody === "manual") this.encodeResponseBody = "manual";
     const cf = init.cf === undefined
       ? (prior ? prior.cf : undefined) : init.cf;
     if (cf !== undefined) this.cf = cf;
@@ -692,7 +702,7 @@ globalThis.fetch = async (input, init) => {
     const dispatch = __op_fetch(
       req.method, req.url, body,
       JSON.stringify(req.headers.__celldHeaderList), req.redirect,
-      streamId, signal != null,
+      streamId, signal != null, req.encodeResponseBody === "manual",
     );
     if (signal) {
       // An abort and the response can cross, leaving a body stream nobody
@@ -4126,6 +4136,9 @@ const __ctxAbortCurrent =
 // running its target, the handle's for the serialize-elsewhere
 // check.
 const __stubEntries = new Map();
+// How many stubs and disposers the isolate holds. Only a node started with
+// `CELLD_TEST_PROBES` in its environment, which a Worker cannot set, shows it.
+if (__test_probes()) globalThis.__celld_stub_entries = () => __stubEntries.size;
 const __stubMeta = new WeakMap();
 // Keep the Durable Object brand outside the user-visible object. Reading a
 // string property here would invoke an inherited getter before validation can
@@ -4509,7 +4522,7 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       if (!allowCapabilities) return v;
       marker = { "__celld$req": v.url, m: v.method,
                  h: [...v.headers], r: v.redirect, c: v.cf,
-                 b: liftBody(v) };
+                 e: v.encodeResponseBody, b: liftBody(v) };
     } else if (v instanceof Response) {
       if (!allowCapabilities) return v;
       marker = { "__celld$res": v.status,
@@ -4549,8 +4562,10 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
     for (const key of Object.keys(v)) out[key] = lift(v[key]);
     const disposerSource = originals?.get(v) ?? v;
     const disposer = disposerSource[Symbol.dispose];
+    // The shared no-op on a plain RPC result releases nothing, so it is not
+    // a capability to forward.
     if (allowCapabilities && !Array.isArray(v) &&
-        typeof disposer === "function") {
+        typeof disposer === "function" && disposer !== __noDispose) {
       lifted = true;
       caps = true;
       out["__celld$disp"] =
@@ -4588,9 +4603,10 @@ const __reviveRequest = (marker, url, revive) => {
   if (!(marker.b instanceof Uint8Array))
     return new Request(url, { method: marker.m,
       headers: marker.h, redirect: marker.r, cf: marker.c,
-      body: revive(marker.b) });
+      encodeResponseBody: marker.e, body: revive(marker.b) });
   const req = new Request(url, { method: marker.m,
-    headers: marker.h, redirect: marker.r, cf: marker.c });
+    headers: marker.h, redirect: marker.r, cf: marker.c,
+    encodeResponseBody: marker.e });
   __adoptBody(req, marker.b);
   return req;
 };
@@ -5277,14 +5293,30 @@ const __rpcDesArgs = (bytes) => {
 // The caller half: decode a reply, rebuilding stubs and rethrowing
 // callee exceptions as real Errors with the callee's own
 // properties, `.remote`, and a local (caller-side) stack.
+// A plain object or array result is disposable, as every RPC result is in
+// workerd, with nothing to release. One function and one descriptor serve every
+// result, so a call allocates neither.
+const __noDispose = () => {};
+const __noDisposeProperty = { configurable: true, value: __noDispose };
+const __markPlainDisposable = (value) => {
+  if (value !== null && typeof value === "object" && !__stubMeta.has(value)) {
+    const proto = Object.getPrototypeOf(value);
+    if (proto === Object.prototype || proto === Array.prototype ||
+        proto === null) {
+      Object.defineProperty(value, Symbol.dispose, __noDisposeProperty);
+    }
+  }
+  return value;
+};
 const __rpcDes = (bytes) => {
-  if (bytes[0] === 0xff) return __sc_decode(bytes);
+  if (bytes[0] === 0xff) return __markPlainDisposable(__sc_decode(bytes));
   if (bytes[0] === 1 || bytes[0] === 2) {
     const { value, handles, disposers } =
       __stubRevive(__sc_decode(bytes.subarray(1)));
-    if (value !== null && typeof value === "object" &&
-        !__stubMeta.has(value) &&
-        (handles.length > 0 || disposers.length > 0)) {
+    if (handles.length === 0 && disposers.length === 0) {
+      __markPlainDisposable(value);
+    } else if (value !== null && typeof value === "object" &&
+        !__stubMeta.has(value)) {
       Object.defineProperty(value, Symbol.dispose, {
         configurable: true,
         value: () => {

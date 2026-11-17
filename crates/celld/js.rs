@@ -579,8 +579,10 @@ thread_local! {
     // One outbound HTTP client per JS thread — building it per fetch rebuilds
     // the TLS stack every call (async-op-hazards.md).
     static HTTP: reqwest::Client = match crate::egress_filter::active() {
-        None => reqwest::Client::new(),
-        Some(filter) => crate::egress_filter::guard(reqwest::Client::builder(), Some(&filter))
+        None => crate::egress_filter::worker_egress_builder(None)
+            .build()
+            .unwrap(),
+        Some(filter) => crate::egress_filter::worker_egress_builder(Some(&filter))
             .redirect(crate::egress_filter::redirect_policy(
                 filter,
                 crate::egress_filter::default_redirect_limit,
@@ -588,18 +590,12 @@ thread_local! {
             .build()
             .unwrap(),
     };
-    static HTTP_MANUAL: reqwest::Client = crate::egress_filter::guard(
-        reqwest::Client::builder(),
-        crate::egress_filter::active().as_ref(),
-    )
+    static HTTP_MANUAL: reqwest::Client = crate::egress_filter::worker_egress_builder(crate::egress_filter::active().as_ref())
     .redirect(reqwest::redirect::Policy::none()).build().unwrap();
     // A separate policy stops an `error` request before reqwest can replay it
     // at the destination. Inspecting the final response would be too late:
     // the method, body, and credentials could already have left the process.
-    static HTTP_ERROR: reqwest::Client = crate::egress_filter::guard(
-        reqwest::Client::builder(),
-        crate::egress_filter::active().as_ref(),
-    )
+    static HTTP_ERROR: reqwest::Client = crate::egress_filter::worker_egress_builder(crate::egress_filter::active().as_ref())
     .redirect(reqwest::redirect::Policy::custom(|attempt| {
         attempt.error("fetch redirect mode is error")
     })).build().unwrap();
@@ -6243,6 +6239,7 @@ ops! { OP_NAMES, install_op_functions,
         "__heap_limit_excessively_exceeded" =>
             op_heap_limit_excessively_exceeded,
         "__heap_over_admission_share" => op_heap_over_admission_share,
+        "__test_probes" => op_test_probes,
         "__ws_send" => websocket::op_ws_send,
         "__ws_send_binary" => websocket::op_ws_send_binary,
         "__ws_close" => websocket::op_ws_close,
@@ -8558,6 +8555,8 @@ fn op_fetch(
     // An absent argument is `false`, so a direct caller gets the uncancellable
     // request it asked for.
     let cancellable = args.get(6).boolean_value(scope);
+    // `encodeResponseBody: "manual"`: the Worker gets the encoded bytes.
+    let manual_encoding = args.get(7).boolean_value(scope);
     let mut body_guard = match body.as_ref().and_then(RequestBody::stream_id) {
         Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
             Some(guard) => guard,
@@ -8723,7 +8722,7 @@ fn op_fetch(
         let fetch_timeout = crate::env_vars::positive_or("CELLD_FETCH_TIMEOUT_S", 120)
             .expect("validated CELLD_FETCH_TIMEOUT_S");
         let mut rb = client
-            .request(m, &url)
+            .request(m.clone(), &url)
             .timeout(std::time::Duration::from_secs(fetch_timeout));
         // reqwest omits Content-Length for an empty Vec, which collapses the
         // wire representation of `Some([])` into the representation of
@@ -8776,9 +8775,27 @@ fn op_fetch(
         match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
+                // A gzip or brotli body is decoded as it streams, unless the
+                // Worker asked for the encoded bytes. An unencoded response
+                // takes no extra step.
+                let encoding = if manual_encoding {
+                    None
+                } else {
+                    crate::response_encoding::ResponseEncoding::of(
+                        &m,
+                        resp.status(),
+                        resp.headers(),
+                    )
+                };
                 let headers = resp
                     .headers()
                     .iter()
+                    // The decoded body is neither encoded nor the length
+                    // the server announced.
+                    .filter(|(name, _)| {
+                        encoding.is_none()
+                            || !matches!(name.as_str(), "content-encoding" | "content-length")
+                    })
                     .map(|(name, value)| {
                         (
                             name.as_str().to_string(),
@@ -8788,9 +8805,11 @@ fn op_fetch(
                         )
                     })
                     .collect::<Vec<_>>();
-                let Some(stream_id) =
-                    stream_service.register_source(HttpStreamSource::Response(resp))
-                else {
+                let source = match encoding {
+                    Some(encoding) => HttpStreamSource::Stream(encoding.decode(resp)),
+                    None => HttpStreamSource::Response(resp),
+                };
+                let Some(stream_id) = stream_service.register_source(source) else {
                     let error = format!("fetch: {HTTP_STREAM_REGISTRATION_CLOSED}");
                     finish(false, Some(status), Some(error.clone()));
                     return Err(error);
@@ -9641,6 +9660,17 @@ fn op_heap_limit_excessively_exceeded(
         .is_some_and(|state| state.excessively_exceeded.load(Ordering::Relaxed));
     rv.set(v8::Boolean::new(scope, exceeded).into());
 }
+/// Whether the node was started with `CELLD_TEST_PROBES`, which lets the
+/// harness show a test-only global. A Worker cannot set the node's environment.
+fn op_test_probes(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let on = std::env::var_os("CELLD_TEST_PROBES").is_some();
+    rv.set(v8::Boolean::new(scope, on).into());
+}
+
 /// Whether this isolate is too close to its heap limit to retain more state.
 fn op_heap_over_admission_share(
     scope: &mut v8::PinScope,
@@ -10262,7 +10292,7 @@ impl IoContext {
             .get_or_init(|| {
                 let context = Arc::downgrade(self);
                 let filter = crate::egress_filter::active();
-                crate::egress_filter::guard(reqwest::Client::builder(), filter.as_ref())
+                crate::egress_filter::worker_egress_builder(filter.as_ref())
                     .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                         // Each hop is checked before it is counted or followed.
                         if let Some(filter) = &filter {
