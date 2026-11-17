@@ -1294,6 +1294,8 @@ pub struct LtxRepl {
     /// Every cell with per-cell LTX, as far as this node has read. The store
     /// registers a cell here before its first artifact is written.
     cell_directory: Option<Arc<crate::cell_directory::CellDirectory>>,
+    /// The birth registry, in `CELLD_BIRTH_REGISTRY=shadow` with fleet durability.
+    registry: Option<Arc<crate::registry::Registry>>,
 }
 
 impl LtxRepl {
@@ -1373,6 +1375,30 @@ impl LtxRepl {
         // The tiering flush interval: with a healthy shipper, at most one
         // upload per cell per interval; it is simultaneously the bucket lag
         // budget. 0 disables pacing.
+        let (store, registry) = match birth_registry_mode()? {
+            Some(()) => {
+                anyhow::ensure!(
+                    directory.is_none(),
+                    "CELLD_BIRTH_REGISTRY=shadow cannot run with CELLD_CELL_DIRECTORY_SHADOW=1: \
+                     two store wrappers would stack two waits"
+                );
+                let config = crate::registry::Config::from_env(durability_timeout_ms)?;
+                crate::registry_writer::check_bound(config.bound, durability_timeout_ms)?;
+                let registry = crate::registry::Registry::new(
+                    store.clone(),
+                    prefix.clone(),
+                    node.to_owned(),
+                    crate::machine::random_process_generation(),
+                    config,
+                );
+                registry.install();
+                let wrapped: Arc<dyn ObjectStore> = Arc::new(
+                    crate::registry_writer::RegistryStore::new(store, registry.clone()),
+                );
+                (wrapped, Some(registry))
+            }
+            None => (store, None),
+        };
         let flush_ms = crate::env_vars::with_default("CELLD_LOG_FLUSH_MS", 2000)? as u64;
         let (directory, registrar) = match directory {
             Some((directory, registrar)) => (Some(directory), Some(registrar)),
@@ -1402,7 +1428,20 @@ impl LtxRepl {
             durability_timeout_ms,
             LtxConfig::from_env(),
             directory,
+            registry.clone(),
         );
+        if let Some(registry) = registry {
+            let (flusher, compactor, stop) = (registry.clone(), registry, replicator.stop.clone());
+            let flush_stop = stop.clone();
+            replicator.tasks.spawn_owned("registry_flush", async move {
+                flusher.run_flusher(flush_stop).await
+            });
+            replicator
+                .tasks
+                .spawn_owned("registry_compactor", async move {
+                    compactor.run_compactor(stop).await
+                });
+        }
         if let Some(registrar) = registrar {
             let stop = replicator.stop.clone();
             replicator
@@ -1447,6 +1486,7 @@ impl LtxRepl {
         durability_timeout_ms: u64,
         config: LtxConfig,
         cell_directory: Option<Arc<crate::cell_directory::CellDirectory>>,
+        registry: Option<Arc<crate::registry::Registry>>,
     ) -> Self {
         let cells: Arc<Mutex<BTreeMap<(String, u64), CellHandle>>> = Arc::default();
         let dirty = Arc::new(Notify::new());
@@ -1536,7 +1576,13 @@ impl LtxRepl {
             epoch_gc_grace_ms: config.epoch_gc_grace_ms,
             truncate_pages: Some(config.truncate_pages),
             cell_directory,
+            registry,
         }
+    }
+
+    /// The birth registry of this node, when it runs one.
+    pub fn registry(&self) -> Option<Arc<crate::registry::Registry>> {
+        self.registry.clone()
     }
 
     /// The node's view of the fleet directory of cells with LTX.
@@ -5530,3 +5576,24 @@ pub(crate) use retained::{live_path, remove_lineage};
 
 #[cfg(test)]
 mod tests;
+
+/// Whether `CELLD_BIRTH_REGISTRY=shadow` applies to this node: it acts only with
+/// fleet durability, and a node with bucket durability logs once that it
+/// ignores the flag.
+fn birth_registry_mode() -> anyhow::Result<Option<()>> {
+    match crate::env_vars::value("CELLD_BIRTH_REGISTRY")?.as_deref() {
+        None | Some("off") => Ok(None),
+        Some("shadow") => {
+            let durability = std::env::var("CELLD_DURABILITY").unwrap_or_else(|_| "fleet".into());
+            if durability == "fleet" {
+                Ok(Some(()))
+            } else {
+                tracing::warn!("CELLD_BIRTH_REGISTRY=shadow is ignored: this node does not use fleet durability");
+                Ok(None)
+            }
+        }
+        Some(other) => {
+            anyhow::bail!("CELLD_BIRTH_REGISTRY must be `off` or `shadow`, not {other:?}")
+        }
+    }
+}

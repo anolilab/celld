@@ -29,6 +29,7 @@ pub mod peer;
 pub mod pressure;
 pub mod queue;
 pub mod rebalance;
+pub mod registry;
 pub mod restore;
 pub mod routing;
 pub mod schedule;

@@ -233,6 +233,8 @@ pub fn validate() -> anyhow::Result<()> {
     for name in [
         "CELLD_CELL_DIRECTORY_SHADOW",
         "CELLD_CLOUD",
+        "CELLD_REGISTRY_DEBUG_API",
+        "CELLD_REGISTRY_WAIT",
         "CELLD_LTX_COMPACTION",
         "CELLD_LTX_PAGED",
         "CELLD_RESUME_DORMANT_LOCAL",
@@ -286,6 +288,11 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_MAX_RESIDENT_CELLS",
         "CELLD_MAX_RSS_MB",
         "CELLD_READY_FLEET_GATE_MS",
+        "CELLD_REGISTRY_BASE_DAYS",
+        "CELLD_REGISTRY_BATCH_MS",
+        "CELLD_REGISTRY_PARTITIONS",
+        "CELLD_REGISTRY_PASS_MS",
+        "CELLD_REGISTRY_SPILL_MS",
         "CELLD_REBALANCE_INTERVAL_MS",
     ] {
         optional::<u64>(name)?;
@@ -314,6 +321,12 @@ pub fn validate() -> anyhow::Result<()> {
     if let Some(value) = value("CELLD_LOG_TRANSPORT")? {
         if !matches!(value.as_str(), "http" | "stream") {
             bail!("CELLD_LOG_TRANSPORT must be http or stream, not {value:?}");
+        }
+    }
+
+    if let Some(value) = value("CELLD_BIRTH_REGISTRY")? {
+        if !matches!(value.as_str(), "off" | "shadow") {
+            bail!("CELLD_BIRTH_REGISTRY must be off or shadow, not {value:?}");
         }
     }
 

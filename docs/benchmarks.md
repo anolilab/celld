@@ -419,3 +419,24 @@ number was taken with.
 A bucket-backed system keeps its state in the bucket, so before trusting a
 count, check that one agent restores from the bucket alone: remove the
 server's local state, restart it, and request an agent that it had.
+
+### Birth registry spike: `birth_registry`
+
+`birth_registry` runs real nodes with `CELLD_BIRTH_REGISTRY=shadow` on a copy of an aged registry
+and measures the gates of plan 006. `CELLD_REG_PHASE` picks one phase (`steady`, `units2`, `units4`,
+`off`, `month1`, `streams`, `x4`, `calibrate`, `rolling`, `compactor_kill`, `gather`, `cold`, `race`,
+`flap`, `real`, `report`); each writes `<phase>.json` under `CELLD_REG_OUT`. The aged registry is built
+once by the ignored test `synthetic_aged_registry`, which runs the production spill and base merge:
+
+```sh
+CELLD_REG_SYNTH_ENDPOINT=http://127.0.0.1:9000 CELLD_REG_SYNTH_BUCKET=bench CELLD_REG_SYNTH_RUN=aged12 \
+  cargo test -p celld --lib --profile lab synthetic_aged_registry -- --ignored --nocapture
+CELLD_BENCH_S3_ENDPOINT=http://127.0.0.1:9000 CELLD_BENCH_BUCKET=s3://bench CELLD_REG_AGED=aged12 \
+CELLD_REG_OUT=/tmp/reg CELLD_REG_PHASE=steady cargo bench -p celld --bench birth_registry --profile lab
+```
+
+Each phase copies the aged run inside the store's container (`docker exec rustfs-reg`), so the store
+must be the local one. Fleet-rate load goes through a segment generator that writes registry segments
+directly; only 5 real births a second are created, which is the per-node production rate. The counting
+proxy is used by `units2` and `units4` only: it opens a new connection to the store per request, which
+runs a laptop out of ports at lookup-check rates.

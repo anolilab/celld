@@ -416,6 +416,9 @@ pub struct BucketOwnership {
     /// only shadows the lost-record listing; see [`Self::directory_answer`].
     cell_directory: Option<Arc<crate::cell_directory::CellDirectory>>,
     directory_answers: DirectoryAnswers,
+    /// The birth registry, which only shadows the lost-record listing.
+    registry: Option<Arc<crate::registry::Registry>>,
+    registry_answers: RegistryAnswers,
 }
 
 /// How often the fleet directory answered a claim guard, by its answer and by
@@ -449,6 +452,57 @@ impl DirectoryAnswers {
             "new": pair(&self.counts[0]),
             "exists": pair(&self.counts[1]),
             "unknown": pair(&self.counts[2]),
+        })
+    }
+}
+
+/// How often the birth registry answered a claim guard, by its answer and by
+/// whether the listing beside it found LTX, with the latencies of both.
+#[derive(Debug, Default)]
+pub(crate) struct RegistryAnswers {
+    counts: [[AtomicU64; 2]; 3],
+    mismatches: AtomicU64,
+    lookup_us: std::sync::Mutex<Vec<u64>>,
+    list_us: std::sync::Mutex<Vec<u64>>,
+}
+
+impl RegistryAnswers {
+    fn record(
+        &self,
+        answer: celld_logic::registry::Answer,
+        ltx_found: bool,
+        lookup_us: u64,
+        list_us: u64,
+    ) {
+        use celld_logic::registry::Answer;
+        let row = match answer {
+            Answer::New => 0,
+            Answer::Exists(_) => 1,
+            Answer::Unknown => 2,
+        };
+        self.counts[row][usize::from(ltx_found)].fetch_add(1, Ordering::Relaxed);
+        for (samples, value) in [(&self.lookup_us, lookup_us), (&self.list_us, list_us)] {
+            let mut samples = samples.lock().unwrap();
+            if samples.len() < 400_000 {
+                samples.push(value);
+            }
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let pair = |row: &[AtomicU64; 2]| {
+            serde_json::json!({
+                "no_ltx": row[0].load(Ordering::Relaxed),
+                "ltx": row[1].load(Ordering::Relaxed),
+            })
+        };
+        serde_json::json!({
+            "new": pair(&self.counts[0]),
+            "exists": pair(&self.counts[1]),
+            "unknown": pair(&self.counts[2]),
+            "mismatches": self.mismatches.load(Ordering::Relaxed),
+            "lookup_us": *self.lookup_us.lock().unwrap(),
+            "list_us": *self.list_us.lock().unwrap(),
         })
     }
 }
@@ -549,7 +603,14 @@ impl BucketOwnership {
             lost_records: std::sync::Mutex::default(),
             cell_directory: None,
             directory_answers: DirectoryAnswers::default(),
+            registry: None,
+            registry_answers: RegistryAnswers::default(),
         }
+    }
+
+    pub fn with_registry(mut self, registry: Option<Arc<crate::registry::Registry>>) -> Self {
+        self.registry = registry;
+        self
     }
 
     pub fn with_cell_directory(
@@ -632,6 +693,50 @@ impl BucketOwnership {
     ) -> Option<celld_logic::cell_directory::DirectoryAnswer> {
         let directory = self.cell_directory.as_ref()?;
         Some(directory.lookup(cell, crate::asyncrt::mono_ms()).await)
+    }
+
+    /// What the birth registry says about `cell`, with the time it took in
+    /// microseconds, or `None` on a node without one.
+    pub(crate) async fn registry_answer(
+        &self,
+        cell: &str,
+    ) -> Option<(celld_logic::registry::Answer, u64)> {
+        let registry = self.registry.as_ref()?;
+        let result = registry
+            .lookup(&crate::registry_objects::key_of(cell))
+            .await;
+        Some((result.answer, result.micros))
+    }
+
+    /// Count one answer of the registry beside the listing of the same claim.
+    pub(crate) fn record_registry_answer(
+        &self,
+        answer: celld_logic::registry::Answer,
+        ltx_found: bool,
+        lookup_us: u64,
+        list_us: u64,
+    ) {
+        self.registry_answers
+            .record(answer, ltx_found, lookup_us, list_us);
+    }
+
+    /// The registry called a cell new while its LTX exists and its record is
+    /// still absent after a re-read: a record lost beside LTX that the registry
+    /// did not know.
+    pub(crate) fn record_registry_mismatch(&self) {
+        self.registry_answers
+            .mismatches
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(registry) = &self.registry {
+            registry.counters.mismatches.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The registry answers counted so far, or `None` on a node without one.
+    pub(crate) fn registry_answers(&self) -> Option<serde_json::Value> {
+        self.registry
+            .is_some()
+            .then(|| self.registry_answers.to_json())
     }
 
     /// Count one answer of the directory beside the listing of the same claim.
@@ -1022,6 +1127,11 @@ impl BucketOwnership {
                     if let Some(directory) = &self.cell_directory {
                         directory.register_at_claim(cell);
                     }
+                }
+                // Every applied claim queues the cell in the registry: a create,
+                // a wake and a takeover alike.
+                if let Some(registry) = &self.registry {
+                    registry.register_at_claim(cell, epoch);
                 }
                 Ok(CasOutcome::Applied)
             }

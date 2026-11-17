@@ -12,8 +12,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
 use std::io::Write;
 use std::net::IpAddr;
+use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,7 +29,7 @@ use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
 use regex::Regex;
 use serde_json::{json, Value};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
 /// S3 Standard request prices in dollars, per request.
 pub const CLASS_A_PRICE: f64 = 0.005 / 1000.0;
@@ -442,7 +444,15 @@ impl Proxy {
         let shared = tally.clone();
         let classifier_info = classifier.describe();
         let accept = tokio::spawn(async move {
-            while let Ok((stream, peer)) = listener.accept().await {
+            loop {
+                let (stream, peer) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        eprintln!("counting proxy: accept failed: {error}");
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        continue;
+                    }
+                };
                 let (tally, upstream, root, classifier) = (
                     shared.clone(),
                     upstream.clone(),
@@ -559,16 +569,39 @@ pub fn control_response(
     }
 }
 
+type UpstreamBody = BoxBody<Bytes, BoxError>;
+
+/// One pooled client to the store: a connection per request would run a laptop
+/// out of ephemeral ports at the rates a lookup check reaches.
+fn upstream_client() -> &'static hyper_util::client::legacy::Client<
+    hyper_util::client::legacy::connect::HttpConnector,
+    UpstreamBody,
+> {
+    static CLIENT: std::sync::OnceLock<
+        hyper_util::client::legacy::Client<
+            hyper_util::client::legacy::connect::HttpConnector,
+            UpstreamBody,
+        >,
+    > = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build_http()
+    })
+}
+
 async fn forward<B>(upstream: String, request: Request<B>) -> Result<Response<ProxyBody>, BoxError>
 where
-    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B: hyper::body::Body<Data = Bytes> + Send + Sync + 'static,
     B::Error: Into<BoxError>,
 {
-    let stream = TcpStream::connect(upstream).await?;
-    let (mut sender, connection) =
-        hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-    tokio::spawn(connection);
-    Ok(sender.send_request(request).await?.map(BodyExt::boxed))
+    let (mut parts, body) = request.into_parts();
+    let target = parts.uri.path_and_query().map_or("/", |pq| pq.as_str());
+    parts.uri = format!("http://{upstream}{target}").parse()?;
+    let request = Request::from_parts(parts, body.map_err(Into::into).boxed());
+    Ok(upstream_client()
+        .request(request)
+        .await?
+        .map(BodyExt::boxed))
 }
 
 /// The request kind a store bills: a GET on the bucket itself is a LIST, and
@@ -1200,4 +1233,135 @@ pub fn free_port() -> u16 {
         .local_addr()
         .expect("read local address")
         .port()
+}
+
+/// The `celld` binary under test.
+pub const CELLD: &str = env!("CARGO_BIN_EXE_celld");
+
+/// The binary a fleet runs: `CELLD_BENCH_BIN` when set (a build of another
+/// revision), else the one built beside this bench.
+pub fn celld_bin() -> String {
+    env_text("CELLD_BENCH_BIN").unwrap_or_else(|| CELLD.to_owned())
+}
+
+/// One `celld` fleet node in its own process group, stopped on drop. Shared by
+/// the bench targets that run a real fleet.
+pub struct Node {
+    child: Child,
+    pub public: String,
+    pub internal: String,
+}
+
+impl Node {
+    pub fn spawn(
+        dir: &Path,
+        index: usize,
+        bucket: &str,
+        endpoint: &str,
+        env: &[(&str, &str)],
+    ) -> Node {
+        let (public, internal) = (free_port(), free_port());
+        let home = dir.join(format!("node-{index}"));
+        std::fs::create_dir_all(&home).expect("create node directory");
+        // Appended, not truncated: a respawned node keeps its earlier lines, so
+        // a count over the log covers the node's whole run.
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(home.join("celld.log"))
+            .expect("open node log");
+        let child = Command::new(celld_bin())
+            .args([
+                "--bucket",
+                bucket,
+                "--endpoint",
+                endpoint,
+                "--region",
+                "us-east-1",
+            ])
+            .args(["--listen", &format!("127.0.0.1:{public}")])
+            .args(["--internal-listen", &format!("127.0.0.1:{internal}")])
+            .args(["--advertise", &format!("127.0.0.1:{internal}")])
+            .env("CELLD_NODE", format!("node-{index}"))
+            .env("CELLD_WATCH", home.join("state"))
+            .envs(env.iter().copied())
+            .current_dir(&home)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().expect("clone log handle"))
+            .stderr(log)
+            .process_group(0)
+            .spawn()
+            .expect("spawn celld");
+        Node {
+            child,
+            public: format!("http://127.0.0.1:{public}"),
+            internal: format!("http://127.0.0.1:{internal}"),
+        }
+    }
+
+    /// Waits for celld's own health check, which also waits for the fleet
+    /// to settle, and for the Worker to answer.
+    pub async fn wait_ready(&self, client: &reqwest::Client) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let paths = ["/.well-known/celld/health", "/__ready"];
+        while Instant::now() < deadline {
+            let mut ready = true;
+            for path in paths {
+                ready &= client
+                    .get(format!("{}{path}", self.public))
+                    .send()
+                    .await
+                    .is_ok_and(|r| r.status().is_success());
+            }
+            if ready {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        panic!("node at {} did not become ready", self.public);
+    }
+
+    /// The node's process id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// SIGKILL the whole process group and reap it: a crash, with no handoff.
+    pub fn kill(&mut self) {
+        let group = format!("-{}", self.child.id());
+        let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+        let _ = self.child.wait();
+    }
+
+    /// Ask the node to drain and hand its cells off, then wait for it to exit.
+    pub async fn drain(&mut self, client: &reqwest::Client, within: Duration) -> bool {
+        let _ = client
+            .post(format!("{}/shutdown", self.internal))
+            .send()
+            .await;
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        let group = format!("-{}", self.child.id());
+        let _ = Command::new("kill").args(["-TERM", "--", &group]).status();
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+        let _ = self.child.wait();
+    }
 }
