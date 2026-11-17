@@ -1,0 +1,896 @@
+//! Runs of the session-granted birth model.
+//!
+//! Each scenario is a small configuration of the adversary: which events may
+//! happen, and how often. A design runs in a scenario with its control, the
+//! design as it stands (revision 3), in the same configuration: the control
+//! must pass and the variant or mutant must fail. A run says which invariant
+//! fired and prints the shortest trace.
+//!
+//! The tests below run in CI. The larger scenarios run with
+//! `CELLD_EXPLORE=large cargo test -p celld-logic --lib explore_large -- --ignored --nocapture`,
+//! and `explore_scenario` runs one scenario of one design:
+//! `SCN=r1 DESIGN=rev1 cargo test -p celld-logic --lib explore_scenario -- --ignored --nocapture`.
+//!
+//! Mutants that this model does not kill, and why:
+//!
+//! - M3: the nonce in a body matters only on a store whose token is a hash of
+//!   the body, and every scenario here uses a token that is new for every write.
+//! - M6, the sweep of a dead sealed session: it runs after the seal, when the
+//!   sealed chunk already holds every mark, so its missing guard changes nothing.
+//! - M7: the header of a predecessor left open stalls its readers (a liveness
+//!   loss) and nothing else in the model touches it.
+//! - M12: needs a leave-form record whose nonce the chunk lost to a declared
+//!   loss, with a stalled leave and a lost record: past the budgets of every
+//!   scenario here.
+//! - M21: the two readings of the old left-lazy bit are not modelled; the
+//!   design has one reading.
+//! - M22: the read-only variant (birth-form record, P3) is not modelled.
+//! - M23: a lost header recreated as empty is harmless while the chunk
+//!   survives; the model loses a header and a chunk separately.
+//! - M24: the mint before the lease or the count is refused by the grant rule
+//!   itself (B1 asks for a counted chunk), so the knob is masked.
+//! - M25: needs a second chunk; the model has one.
+//! - M29, second form: the capture check still holds when only the order of the
+//!   leave changes.
+//! - M30, second form: needs two distinct tags in the carried set at its bound.
+
+use crate::explorer::{explore, Limits, Report};
+use crate::lazy_birth::*;
+use crate::lazy_birth_model::*;
+
+const STANDARD_WINDOW: &str = "a6_standard_window";
+
+type Build = fn(Design) -> LazyConfig;
+
+fn base(design: Design) -> LazyConfig {
+    let mut c = LazyConfig::base(design);
+    c.ignore = vec![STANDARD_WINDOW];
+    c
+}
+
+/// A taker acts at the epoch after a sealed session's, then its record is lost
+/// and another taker's stale read creates over the gap. The leave of a cell
+/// is announced, written late and confirmed late.
+fn r1(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.late_takers = true;
+    c.fresh_reads = true;
+    c.b.mints = 1;
+    c.b.handoffs = 1;
+    c.b.takes = 2;
+    c.b.seals = 1;
+    c.b.expiries = 1;
+    c.b.losses = 1;
+    c.b.stalls = 1;
+    c
+}
+
+/// Two sealers gather different tails, one holding an unproven leave.
+fn r2(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.late_takers = true;
+    c.fresh_reads = true;
+    c.b.writes = 1;
+    c.b.mints = 1;
+    c.b.handoffs = 1;
+    c.b.partial = 1;
+    c.b.takes = 2;
+    c.b.seals = 2;
+    c.b.expiries = 1;
+    c.b.losses = 1;
+    c
+}
+
+/// A session in `shadow` mode hands a cell off; the takers run with the flag
+/// `on`.
+fn r3(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.late_takers = true;
+    c.fresh_reads = true;
+    c.modes = [Mode::Shadow; 3];
+    c.taker_flag = Mode::On;
+    c.b.mints = 1;
+    c.b.handoffs = 1;
+    c.b.takes = 2;
+    c.b.writes = 1;
+    c.b.seals = 1;
+    c.b.expiries = 1;
+    c.b.losses = 1;
+    c
+}
+
+fn r3_read(d: Design) -> LazyConfig {
+    let mut c = r3(d);
+    c.modes = [Mode::Read; 3];
+    c
+}
+
+/// A declared loss removes the confirmed leave of a released cell.
+fn r4a_chunk(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.b.mints = 1;
+    c.b.handoffs = 2;
+    c.b.seals = 1;
+    c.b.declared = 1;
+    c.b.expiries = 1;
+    c
+}
+
+/// A declared loss removes the marks of a leave that the bucket depends on.
+fn r4a(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.late_takers = true;
+    c.fresh_reads = true;
+    c.b.mints = 1;
+    c.b.ckpts = 1;
+    c.b.handoffs = 2;
+    c.b.takes = 2;
+    c.b.writes = 1;
+    c.b.seals = 1;
+    c.b.declared = 1;
+    c.b.expiries = 1;
+    c.b.losses = 1;
+    c
+}
+
+/// A declared loss removes a grant whose cell already has a per-cell object.
+fn r4b(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.b.mints = 1;
+    c.b.writes = 1;
+    c.b.flushes = 2;
+    c.b.crashes = 1;
+    c.b.seals = 1;
+    c.b.declared = 1;
+    c.b.expiries = 1;
+    c
+}
+
+/// A grant whose proof fails, then a handoff and a lost record.
+fn q1(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.late_takers = true;
+    c.fresh_reads = true;
+    c.b.mints = 1;
+    c.b.partial = 1;
+    c.b.handoffs = 1;
+    c.b.takes = 2;
+    c.b.writes = 1;
+    c.b.seals = 1;
+    c.b.expiries = 1;
+    c.b.losses = 1;
+    c
+}
+
+/// A preserved restart over a lazy cell.
+fn q2(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.b.mints = 1;
+    c.b.handoffs = 1;
+    c.b.preserved = 1;
+    c.b.restarts = 1;
+    c.b.takes = 1;
+    c.b.writes = 2;
+    c.b.seals = 1;
+    c
+}
+
+/// Two preserved restarts in a row over a cell with a plain record.
+fn q3(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.modes = [Mode::Shadow; 3];
+    c.b.mints = 1;
+    c.b.preserved = 2;
+    c.b.restarts = 2;
+    c.b.seals = 2;
+    c
+}
+
+/// The close of a header without a fence, while the process installs.
+fn q4(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.minter = 2;
+    c.fast_boot = false;
+    c.b.mints = 1;
+    c.b.writes = 2;
+    c.b.takes = 1;
+    c.b.seals = 1;
+    c
+}
+
+/// A taker claims an id of a session that is not sealed.
+fn live(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.b.mints = 1;
+    c.b.writes = 2;
+    c.b.takes = 1;
+    c
+}
+
+/// A cell that was waived and never got a record, taken after its session.
+fn waived(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.b.mints = 1;
+    c.b.degrades = 1;
+    c.b.crashes = 1;
+    c.b.takes = 1;
+    c.b.seals = 1;
+    c.b.expiries = 1;
+    c.b.stalls = 1;
+    c
+}
+
+/// A write whose answer is an error is sent again.
+fn retry(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.b.mints = 1;
+    c.b.handoffs = 1;
+    c.b.stalls = 1;
+    c.b.ambiguous = 1;
+    c
+}
+
+/// The plain claim of a taker whose answer was an error is settled by name,
+/// while a second process of its node claims the same epoch.
+fn settle(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.modes = [Mode::Shadow; 3];
+    c.takers = 0b110;
+    c.late_takers = true;
+    c.b.mints = 1;
+    c.b.handoffs = 1;
+    c.b.takes = 2;
+    c.b.writes = 2;
+    c.b.seals = 1;
+    c.b.expiries = 1;
+    c.b.stalls = 2;
+    c.b.ambiguous = 1;
+    c.b.restarts = 1;
+    c
+}
+
+/// Two takers read before one acts: the mark decides.
+fn paused(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.b.mints = 1;
+    c.b.crashes = 1;
+    c.b.takes = 2;
+    c.b.writes = 2;
+    c.b.seals = 1;
+    c.b.expiries = 1;
+    c.b.losses = 1;
+    c
+}
+
+/// A successor of a preserved restart acknowledges, then ends; a taker takes
+/// the cell after both.
+fn gate(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.modes = [Mode::Shadow; 3];
+    c.late_takers = true;
+    c.b.mints = 1;
+    c.b.preserved = 1;
+    c.b.restarts = 1;
+    c.b.writes = 1;
+    c.b.takes = 1;
+    c.b.seals = 2;
+    c.b.expiries = 1;
+    c
+}
+
+/// A first-form record of a taker lies over the mark of another taker.
+fn foreign(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.takers = 0b111;
+    c.late_takers = true;
+    c.b.mints = 1;
+    c.b.takes = 3;
+    c.b.writes = 2;
+    c.b.restarts = 1;
+    c.b.seals = 1;
+    c.b.expiries = 1;
+    c.b.losses = 1;
+    c
+}
+
+/// The stalled first record of a waived id: the session's create-only write
+/// lands after another node claimed the id and the record was lost.
+fn stalled_std(d: Design) -> LazyConfig {
+    let mut c = LazyConfig::base(d);
+    c.modes = [Mode::Shadow; 3];
+    c.late_takers = true;
+    c.fresh_reads = true;
+    c.b.mints = 1;
+    c.b.stalls = 1;
+    c.b.takes = 2;
+    c.b.writes = 2;
+    c.b.seals = 1;
+    c.b.expiries = 1;
+    c.b.losses = 1;
+    c
+}
+
+/// A fenced session writes a bundle and a per-cell object after a sealer
+/// gathered, under a declared loss.
+fn late_bundle(d: Design) -> LazyConfig {
+    let mut c = r4b(d);
+    c.late_session = true;
+    c
+}
+
+/// Every kind of step, with one of each: the pass run of CI.
+fn broad(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.late_takers = true;
+    c.fresh_reads = true;
+    c.b.mints = 1;
+    c.b.writes = 1;
+    c.b.handoffs = 1;
+    c.b.takes = 1;
+    c.b.seals = 1;
+    c.b.expiries = 1;
+    c.b.ckpts = 1;
+    c.b.losses = 1;
+    c.b.stalls = 1;
+    c
+}
+
+/// The same with a failed grant, a wake, a flush and a degraded ensemble:
+/// the pass run behind `CELLD_EXPLORE=large`.
+fn broad_large(d: Design) -> LazyConfig {
+    let mut c = broad(d);
+    c.b.partial = 1;
+    c.b.wakes = 1;
+    c.b.flushes = 1;
+    c.b.degrades = 1;
+    c.b.ambiguous = 1;
+    c.b.takes = 2;
+    c
+}
+
+/// A restore after a sealed session.
+fn restore(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.b.mints = 1;
+    c.b.writes = 1;
+    c.b.crashes = 1;
+    c.b.takes = 1;
+    c.b.seals = 1;
+    c.b.expiries = 1;
+    c
+}
+
+/// The paths that release a bundle or a batch.
+fn release(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.b.mints = 1;
+    c.b.writes = 1;
+    c.b.flushes = 3;
+    c.b.gcs = 2;
+    c.b.crashes = 1;
+    c.b.restarts = 1;
+    c.b.seals = 1;
+    c.b.declared = 1;
+    c.b.expiries = 1;
+    c
+}
+
+/// A sealer pauses between its rows and its bits; another sealer proceeds
+/// with a declared loss.
+fn bits(d: Design) -> LazyConfig {
+    let mut c = base(d);
+    c.b.mints = 1;
+    c.b.writes = 1;
+    c.b.crashes = 1;
+    c.b.seals = 2;
+    c.b.declared = 1;
+    c.b.expiries = 1;
+    c
+}
+
+fn run(name: &str, cfg: LazyConfig, stop_at_first: bool, max: usize) -> Report {
+    run_expecting(name, cfg, stop_at_first, max, &[])
+}
+
+/// A run that names the invariants it already knows fail, so that a world
+/// behind one of them is still explored.
+fn run_expecting(
+    name: &str,
+    cfg: LazyConfig,
+    stop_at_first: bool,
+    max: usize,
+    expected: &'static [&'static str],
+) -> Report {
+    let line = config_line(&cfg);
+    let r = explore(
+        &Lazy::new(cfg),
+        Limits {
+            max_states: max,
+            max_depth: 400,
+            stop_at_first,
+            expected,
+        },
+    );
+    eprintln!("{line}\n  {}", r.summary(name));
+    r
+}
+
+fn config_line(cfg: &LazyConfig) -> String {
+    format!(
+        "  config: 1 minting node (up to 3 processes, process {} mints), takers {:#05b} of 3, 2 sealers, 2 cells, 2 followers; adversary {:?}",
+        cfg.minter, cfg.takers, cfg.b
+    )
+}
+
+fn design_named(which: &str) -> Design {
+    match which {
+        "rev1" => Design::rev1(),
+        "rev2" => Design::rev2(),
+        "rev3" => Design::rev3(),
+        m => {
+            let (n, f) = m[1..].split_once('f').unwrap_or((&m[1..], "0"));
+            Design::mutant(n.parse().unwrap(), f.parse().unwrap())
+        }
+    }
+}
+
+fn scenario(name: &str) -> Build {
+    match name {
+        "r1" => r1,
+        "r2" => r2,
+        "r3" => r3,
+        "r3_read" => r3_read,
+        "r4a" => r4a,
+        "r4a_chunk" => r4a_chunk,
+        "r4b" => r4b,
+        "q1" => q1,
+        "q2" => q2,
+        "q3" => q3,
+        "q4" => q4,
+        "live" => live,
+        "waived" => waived,
+        "retry" => retry,
+        "settle" => settle,
+        "paused" => paused,
+        "restore" => restore,
+        "release" => release,
+        "bits" => bits,
+        "gate" => gate,
+        "foreign" => foreign,
+        "stalled_std" => stalled_std,
+        "late_bundle" => late_bundle,
+        "broad" => broad,
+        "broad_large" => broad_large,
+        other => panic!("no scenario {other}"),
+    }
+}
+
+/// Run a design in a scenario with some invariants left unreported.
+fn run_design(
+    name: &str,
+    scn: &str,
+    design: &str,
+    ignore: &[&'static str],
+    stop: bool,
+    cap: usize,
+) -> Report {
+    let mut cfg = scenario(scn)(design_named(design));
+    cfg.ignore.extend_from_slice(ignore);
+    run(name, cfg, stop, cap)
+}
+
+/// Record one reproduced failure and print its shortest trace.
+fn found(label: &str, r: &Report, any_of: &[&str]) -> bool {
+    let Some(name) = any_of.iter().find(|n| r.violations.contains_key(**n)) else {
+        eprintln!(
+            "NOT FOUND: {label} (expected one of {any_of:?}, found {:?})",
+            r.violations.keys().collect::<Vec<_>>()
+        );
+        return false;
+    };
+    let cx = &r.violations[*name];
+    eprintln!(
+        "found: {label}: {name}: {} ({} steps)",
+        cx.violation.detail,
+        cx.trace.len()
+    );
+    for (i, step) in cx.trace.iter().enumerate() {
+        eprintln!("    {:>2}. {step}", i + 1);
+    }
+    true
+}
+
+const CAP: usize = 400_000;
+
+/// The scenarios whose control runs in CI.
+const CI_CONTROLS: &[&str] = &[
+    "broad",
+    "r1",
+    "r3",
+    "r3_read",
+    "r4a_chunk",
+    "r4b",
+    "q1",
+    "q2",
+    "q3",
+    "q4",
+    "live",
+    "retry",
+    "restore",
+];
+
+#[test]
+fn the_design_holds_every_invariant_in_every_scenario() {
+    let mut labels = std::collections::BTreeSet::new();
+    for scn in CI_CONTROLS {
+        let r = run_design(&format!("control {scn}"), scn, "rev3", &[], false, CAP);
+        assert!(
+            r.passed(),
+            "{scn}: {}",
+            r.violations.keys().copied().collect::<Vec<_>>().join(", ")
+        );
+        assert!(r.complete(), "{scn} hit a bound");
+        labels.extend(r.labels.keys().copied());
+    }
+    // The adversary reached what the invariants are about.
+    for needed in [
+        "ambiguous_after_apply",
+        "grant",
+        "grant_pending",
+        "leave_confirmed",
+        "leave_put_in_flight",
+        "record_lost",
+        "sealed",
+        "taker_active",
+        "taker_mark_in_flight",
+        "header_close_lost",
+        "chunk_seal_lost",
+        "preserved_resume",
+        "late_landing_after_seal",
+        "acknowledged_by_fleet",
+        "declared_loss",
+    ] {
+        eprintln!("  reached {needed}: {}", labels.contains(needed));
+        assert!(
+            labels.contains(needed),
+            "the adversary never reached {needed}"
+        );
+    }
+}
+
+/// `(label, design, scenario, invariants of which one must fire, ignored)`.
+type Past = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+);
+const PAST: &[Past] = &[
+    (
+        "R1 on revision 1",
+        "rev1",
+        "r1",
+        &[
+            "epoch_two_claims",
+            "a1_one_acting_writer",
+            "a2_prefix_two_writers",
+        ],
+        &["a10_sealer_wrote"],
+    ),
+    (
+        "R3 on revision 1, shadow",
+        "rev1",
+        "r3",
+        &["a5_claim_over_gap", "a1_one_acting_writer"],
+        &["a10_sealer_wrote"],
+    ),
+    (
+        "R3 on revision 1, read",
+        "rev1",
+        "r3_read",
+        &["a5_claim_over_gap", "a1_one_acting_writer"],
+        &["a10_sealer_wrote"],
+    ),
+    (
+        "R4 on revision 1, a leave lost with its marks",
+        "rev1",
+        "r4a_chunk",
+        &["a8_sealed_chunk_incomplete"],
+        &[],
+    ),
+    (
+        "R4 on revision 1, a grant lost under an object",
+        "rev1",
+        "r4b",
+        &["a8_sealed_chunk_incomplete"],
+        &[],
+    ),
+    (
+        "Q1 on revision 2",
+        "rev2",
+        "q1",
+        &["a5_claim_over_gap", "a8_sealed_chunk_incomplete"],
+        &[],
+    ),
+    ("Q2 on revision 2", "rev2", "q2", &["a11_resume"], &[]),
+    ("Q3 on revision 2", "rev2", "q3", &["a11_resume"], &[]),
+    (
+        "Q4 on revision 2",
+        "rev2",
+        "q4",
+        &["a8_sealed_chunk_incomplete", "a1_one_acting_writer"],
+        &[],
+    ),
+];
+
+#[test]
+fn every_recorded_failure_is_found_on_the_design_that_had_it() {
+    let mut missing = Vec::new();
+    for (label, design, scn, any_of, ignore) in PAST {
+        let r = run_design(label, scn, design, ignore, false, CAP);
+        if !found(label, &r, any_of) {
+            missing.push(*label);
+        }
+    }
+    assert!(missing.is_empty(), "not reproduced: {missing:?}");
+}
+
+/// R2 and the two-writer form of Q4 need the larger scenarios.
+#[test]
+fn the_two_writer_form_of_q4_is_found_when_the_incomplete_seal_is_not_reported() {
+    let r = run_design(
+        "Q4 on revision 2, deeper",
+        "q4",
+        "rev2",
+        &["a8_sealed_chunk_incomplete"],
+        false,
+        CAP,
+    );
+    assert!(found(
+        "Q4 on revision 2 (two writers)",
+        &r,
+        &[
+            "a1_one_acting_writer",
+            "a2_prefix_two_writers",
+            "a5_claim_over_gap"
+        ]
+    ));
+}
+
+/// `(mutant, scenario, invariants of which one must fire)`.
+const MUTANTS: &[(&str, &str, &[&str])] = &[
+    ("M1", "live", &["a1_one_acting_writer", "a3_lost_ack"]),
+    ("M5", "retry", &["a9_body_repeated"]),
+    ("M10", "r1", &["a7_taken_leave", "epoch_two_claims"]),
+    ("M11", "r1", &["a7_taken_leave", "epoch_two_claims"]),
+    ("M13", "r1", &["a10_sealer_wrote"]),
+    ("M14", "bits", &["a8_sealed_chunk_incomplete"]),
+    ("M15", "r3", &["a5_claim_over_gap"]),
+    ("M16", "r3_read", &["a5_claim_over_gap"]),
+    ("M17", "r4a_chunk", &["a8_sealed_chunk_incomplete"]),
+    ("M18", "r4b", &["a8_sealed_chunk_incomplete"]),
+    ("M20", "r1", &["epoch_two_claims"]),
+    ("M27", "restore", &["a3_lost_ack"]),
+    (
+        "M28",
+        "q1",
+        &["a5_claim_over_gap", "a8_sealed_chunk_incomplete"],
+    ),
+    ("M29f0", "q2", &["a11_resume"]),
+    ("M29f2", "q2", &["a11_resume"]),
+    ("M30f0", "q3", &["a11_resume"]),
+    (
+        "M31f0",
+        "q4",
+        &["a8_sealed_chunk_incomplete", "a1_one_acting_writer"],
+    ),
+    (
+        "M31f1",
+        "q4",
+        &["a8_sealed_chunk_incomplete", "a1_one_acting_writer"],
+    ),
+];
+
+fn check_mutants(table: &[(&str, &str, &[&str])], cap: usize) {
+    let mut survivors = Vec::new();
+    for (m, scn, any_of) in table {
+        let r = run_design(&format!("{m} in {scn}"), scn, m, &[], true, cap);
+        if !found(&format!("{m} in {scn}"), &r, any_of) {
+            survivors.push(*m);
+        }
+    }
+    assert!(survivors.is_empty(), "surviving mutants: {survivors:?}");
+}
+
+#[test]
+fn each_mutant_breaks_an_invariant_its_control_keeps() {
+    check_mutants(MUTANTS, CAP);
+}
+
+/// The invariant that a rule's removal fires is the one the rule serves:
+/// `M30` fails invariant 11 and not one of the first ten.
+#[test]
+fn the_carried_set_is_what_invariant_eleven_asks_for() {
+    let r = run_design("M30f0 in q3", "q3", "M30f0", &[], false, CAP);
+    assert!(!r.violations.is_empty());
+    assert!(r.violations.keys().all(|n| *n == "a11_resume"));
+}
+
+/// A finding on revision 3: a fenced session that continues writes a bundle
+/// and a per-cell object after a sealer gathered under a declared loss, so a
+/// sealed chunk lacks a grant that the bucket depends on. A reader refuses the
+/// cell (the standard path finds rows); no second writer follows.
+#[test]
+fn finding_a_late_bundle_leaves_a_sealed_chunk_without_its_grant() {
+    let r = run_design(
+        "late bundle on revision 3",
+        "late_bundle",
+        "rev3",
+        &[],
+        false,
+        CAP,
+    );
+    assert!(found(
+        "finding F-A on revision 3",
+        &r,
+        &["a8_sealed_chunk_incomplete"]
+    ));
+    assert!(r.passed_except(&["a8_sealed_chunk_incomplete"]));
+}
+
+/// The case that the design leaves to the explorer: a stalled create-only
+/// write of a waived or `shadow` id lands after a peer claimed the id at epoch
+/// 2 and the record was lost, and a reader takes the late record over.
+#[test]
+fn finding_a_stalled_first_record_puts_two_writers_in_one_prefix() {
+    let mut cfg = scenario("stalled_std")(Design::rev3());
+    cfg.ignore.clear();
+    let r = run("stalled first record on revision 3", cfg, false, CAP);
+    assert!(
+        found(
+            "finding F-B on revision 3",
+            &r,
+            &["a6_stalled_first_record"]
+        ),
+        "the stalled first record did not reach two writers"
+    );
+    // Two writers in one prefix are also reached without the stalled write: a
+    // lost record before the first writer has an object in the bucket gives the
+    // same outcome, under the window of the standard path.
+    assert!(r.violations.contains_key("a2_prefix_two_writers"));
+    // Today's rule, which puts the first record of every cell at epoch 1, gives the same
+    // two acting writers in two prefixes.
+    let today = run_design(
+        "stalled first record, first record at epoch 1",
+        "stalled_std",
+        "M2",
+        &["a4_epoch1_foreign"],
+        false,
+        CAP,
+    );
+    assert!(found(
+        "the same faults under today's epochs",
+        &today,
+        &["a6_standard_window", "a1_one_acting_writer"]
+    ));
+}
+
+/// The invariants the standard path's known window fires.
+const WINDOW_ONLY: &[&str] = &[STANDARD_WINDOW];
+
+/// What the stalled-record scenario of revision 3 fires: the finding, and the
+/// invariants that the same faults fire without the stalled write.
+const STALLED_STD_FINDINGS: &[&str] = &[
+    "a1_one_acting_writer",
+    "a2_prefix_two_writers",
+    "a6_stalled_first_record",
+    STANDARD_WINDOW,
+];
+
+/// `CELLD_EXPLORE=large cargo test -p celld-logic --lib explore_large -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn explore_large() {
+    if std::env::var("CELLD_EXPLORE").as_deref() != Ok("large") {
+        return;
+    }
+    for scn in [
+        "broad_large",
+        "r4a",
+        "r2",
+        "waived",
+        "paused",
+        "bits",
+        "release",
+        "gate",
+        "foreign",
+        "settle",
+        "stalled_std",
+    ] {
+        // The window of the standard path is the one the model reports and
+        // does not fail. The stalled-record scenario carries the finding it is
+        // named for, and nothing else.
+        let known = if scn == "stalled_std" {
+            STALLED_STD_FINDINGS
+        } else {
+            WINDOW_ONLY
+        };
+        let cfg = scenario(scn)(design_named("rev3"));
+        let r = run_expecting(&format!("control {scn}"), cfg, false, 3_000_000, known);
+        r.print_violations();
+        assert!(r.passed_except(known), "control {scn} fails");
+        // Only the widest scenario is cut off by its bound, and says so.
+        assert!(
+            scn == "broad_large" || r.complete(),
+            "control {scn} hit a bound"
+        );
+    }
+    let r = run_design(
+        "R2 on revision 1",
+        "r2",
+        "rev1",
+        &["a10_sealer_wrote"],
+        false,
+        3_000_000,
+    );
+    assert!(found(
+        "R2 on revision 1",
+        &r,
+        &["a5_claim_over_gap", "epoch_two_claims"],
+    ));
+    let r = run_design(
+        "R4 on revision 1, two writers",
+        "r4a",
+        "rev1",
+        &["a10_sealer_wrote"],
+        false,
+        3_000_000,
+    );
+    assert!(found(
+        "R4 on revision 1, two writers",
+        &r,
+        &["a5_claim_over_gap", "epoch_two_claims"],
+    ));
+    check_mutants(
+        &[
+            ("M2", "waived", &["a4_epoch1_foreign"]),
+            (
+                "M4",
+                "settle",
+                &["a1_one_acting_writer", "a2_prefix_two_writers"],
+            ),
+            ("M6f0", "release", &["a8_sealed_chunk_incomplete"]),
+            ("M6f1", "release", &["a8_sealed_chunk_incomplete"]),
+            ("M6f3", "release", &["a8_sealed_chunk_incomplete"]),
+            (
+                "M8",
+                "paused",
+                &["a1_one_acting_writer", "a5_claim_over_gap"],
+            ),
+            ("M9", "foreign", &["a1_one_acting_writer"]),
+            ("M19", "bits", &["a8_sealed_chunk_incomplete"]),
+            ("M26", "gate", &["a3_lost_ack", "a11_resume"]),
+        ],
+        3_000_000,
+    );
+}
+
+/// One scenario of one design, for iteration:
+/// `SCN=r1 DESIGN=rev1 cargo test -p celld-logic --lib explore_scenario -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn explore_scenario() {
+    let scn = std::env::var("SCN").unwrap_or_else(|_| "r1".into());
+    let design = std::env::var("DESIGN").unwrap_or_else(|_| "rev3".into());
+    let r = run_design(
+        &format!("{scn} {design}"),
+        &scn,
+        &design,
+        &[],
+        false,
+        3_000_000,
+    );
+    r.print_violations();
+    r.print_labels();
+}

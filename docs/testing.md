@@ -70,7 +70,9 @@ deployment mode.
 ## Specification: exhaustive at small size
 
 *Status: no TLA+ specification is in this repository. A clean-room
-specification is tracked in [#4](https://github.com/anolilab/celld/issues/4).*
+specification is tracked in [#4](https://github.com/anolilab/celld/issues/4).
+In the meantime `crates/logic` holds an exhaustive explorer that runs in
+`cargo test`; see [the explorer](#the-explorer-in-the-repository) below.*
 
 The coordination protocol is specified in TLA+. Heyang Zhou wrote the
 specifications against celld v0.1.0. His model checking found four bugs and a
@@ -101,6 +103,42 @@ recoverable ordering error into permanent data loss.
 We update the specifications by hand with protocol changes. They do not run in
 continuous integration. A separate record tracks what the model does not yet
 describe, including guarantees weaker than the code's.
+
+### The explorer in the repository
+
+`explorer.rs`, `ownership_model.rs` and their tests in `crates/logic` visit
+every interleaving of a small configuration of today's ownership protocol. Each
+node is the real decision core, fed through `on_event`. The model supplies only
+the effects: a store with create-only and token-guarded writes, an error that
+does not say whether a write applied, a write that lands after its writer
+crashed, node-log sessions, lease expiry, record loss, a drain and a preserved
+restart. A node that is paused is a node whose steps are not chosen.
+
+It checks that no epoch has two writers, that no acknowledged write is lost,
+that a stale owner never acknowledges, and that a lost record is not answered
+as a new cell. Each run prints its state count, its depth, the bound it hit and
+its time. The pass runs are exhaustive and fit a debug build. Shell-side
+mutants, each removing one rule, must each break an invariant that their
+control keeps, so a pass cannot come from a checker that cannot fail.
+
+The model finds one window in today's design, pinned as an expected
+counterexample: after a record is lost, a first claim lands over the cell if
+its claimer read the record as absent, either before the record existed or
+before any row reached the bucket. The shell refuses an absent record only
+when the bucket already holds rows. `lazy_birth_model.rs` explores a proposed change to how a cell is born: the
+node that minted an id grants the first epoch without writing an ownership
+record, and the grant is sealed into its session record. It is an abstract
+protocol model, because the decision core knows nothing of tagged ids, and its
+rules are pure functions of a `Design` value of knobs in `lazy_birth.rs`. Two
+earlier revisions of the design are knob sets, and each failure recorded
+against them is found as a counterexample and printed. Each mutant flips one
+knob and runs beside a control in the same configuration; the survivors and
+the reason for each are listed at the top of `lazy_birth_tests.rs`. The
+runtime does not contain this design.
+
+A longer configuration runs with
+`CELLD_EXPLORE=large cargo test -p celld-logic --lib explore_large -- --ignored
+--nocapture`. What each model leaves out is listed at the top of its file.
 
 ## Simulation: the protocol under adversarial schedules
 
