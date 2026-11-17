@@ -38,6 +38,7 @@
 //! `HTTP_PROXY`-style proxy, because a proxy would receive the name and
 //! resolve it where this filter cannot see.
 
+use crate::startup::Advertise;
 use anyhow::{anyhow, bail, Context};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -64,6 +65,9 @@ pub enum Class {
     /// Reserved, documentation, benchmarking, protocol-assignment and
     /// translation ranges with no public use.
     Reserved,
+    /// An address of this node. [`classify`] never returns it; the policy
+    /// uses it for a public address that belongs to the node itself.
+    Own,
 }
 
 impl Class {
@@ -79,6 +83,7 @@ impl Class {
             Self::UniqueLocal => "a unique-local address",
             Self::Multicast => "a multicast address",
             Self::Reserved => "a reserved address",
+            Self::Own => "this node's own address",
         }
     }
 }
@@ -293,7 +298,20 @@ impl std::error::Error for Refused {}
 /// The marker that a Worker-facing message is an egress refusal.
 pub const REFUSAL_PREFIX: &str = "egress refused:";
 
-/// The policy: a mode, the exceptions, and a hook for container endpoints.
+/// How a destination relates to this node, as the node reports it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeEndpoint {
+    /// Not an address of this node.
+    Elsewhere,
+    /// An address of this node, on a port celld does not listen on.
+    Address,
+    /// An address of this node on a port celld listens on. Port 0 means the
+    /// port is not known yet, and counts as a listener port.
+    Listener,
+}
+
+/// The policy: a mode, the exceptions, and hooks for the node's own
+/// endpoints and its containers.
 #[derive(Clone)]
 pub struct Filter {
     ranges: Vec<Cidr>,
@@ -303,9 +321,8 @@ pub struct Filter {
     literals: Vec<SocketAddr>,
     /// Whether an address is a running container's endpoint.
     container_endpoint: fn(SocketAddr) -> bool,
-    /// The node's own addresses, set once its listeners are bound. A public
-    /// one is refused like a private one.
-    own: Arc<OnceLock<Vec<IpAddr>>>,
+    /// How an address relates to this node.
+    node_endpoint: fn(SocketAddr) -> NodeEndpoint,
 }
 
 impl std::fmt::Debug for Filter {
@@ -322,28 +339,21 @@ fn no_container(_: SocketAddr) -> bool {
     false
 }
 
+fn not_the_node(_: SocketAddr) -> NodeEndpoint {
+    NodeEndpoint::Elsewhere
+}
+
 impl Filter {
-    /// A public-only policy with no exceptions and no container endpoints.
+    /// A public-only policy with no exceptions, no container endpoints and no
+    /// node addresses.
     pub fn public() -> Self {
         Self {
             ranges: Vec::new(),
             names: HashMap::new(),
             literals: Vec::new(),
             container_endpoint: no_container,
-            own: Arc::new(OnceLock::new()),
+            node_endpoint: not_the_node,
         }
-    }
-
-    /// Record the node's own addresses. Only the first call counts.
-    pub fn set_own_addresses(&self, addresses: impl IntoIterator<Item = IpAddr>) {
-        let mut own: Vec<IpAddr> = addresses.into_iter().map(canonical).collect();
-        own.sort();
-        own.dedup();
-        let _ = self.own.set(own);
-    }
-
-    fn is_own(&self, ip: IpAddr) -> bool {
-        self.own.get().is_some_and(|own| own.contains(&ip))
     }
 
     /// Parse the text of `CELLD_EGRESS_ALLOW` into a policy.
@@ -385,27 +395,60 @@ impl Filter {
         self
     }
 
+    /// Refuse the node's own addresses; see [`node_endpoint`].
+    #[must_use]
+    pub fn with_node_endpoints(mut self, check: fn(SocketAddr) -> NodeEndpoint) -> Self {
+        self.node_endpoint = check;
+        self
+    }
+
     /// Whether `addr` may be dialed, by address alone.
     fn permits(&self, addr: SocketAddr) -> Result<(), Refused> {
+        self.permits_on(addr, addr.port())
+    }
+
+    /// Like [`Self::permits`], when the connection will use `port`, which is
+    /// 0 when it is not known. An exception for an IP matches the port in
+    /// `addr`; the node's own listeners are matched on `port`.
+    fn permits_on(&self, addr: SocketAddr, port: u16) -> Result<(), Refused> {
         let ip = canonical(addr.ip());
-        let class = classify(ip);
-        let own = class == Class::Public && self.is_own(ip);
-        if (class == Class::Public && !own)
+        let mut class = classify(ip);
+        // The node's own listeners are never reachable, whatever the
+        // exceptions say: they carry the operator API and the peers. With the
+        // port unknown, the address is a listener only if it would otherwise
+        // be permitted, so a refusal keeps its own reason.
+        let listener = match (self.node_endpoint)(SocketAddr::new(ip, port)) {
+            NodeEndpoint::Listener => true,
+            // Another port of the node is refused unless an exception names
+            // it, as a private address is.
+            NodeEndpoint::Address if class == Class::Public => {
+                class = Class::Own;
+                false
+            }
+            NodeEndpoint::Address | NodeEndpoint::Elsewhere => false,
+        };
+        if listener && port != 0 {
+            return Err(Refused::address(addr.ip(), Class::Own));
+        }
+        if class == Class::Public
             || self.ranges.iter().any(|range| range.contains(ip))
             || self.literals.contains(&SocketAddr::new(ip, addr.port()))
             || (self.container_endpoint)(SocketAddr::new(ip, addr.port()))
         {
-            return Ok(());
-        }
-        if own {
-            return Err(Refused(format!(
-                "egress refused: {} is this node's own address ({MODE_ENV}=public)",
-                addr.ip()
-            )));
+            return if listener {
+                Err(Refused::address(addr.ip(), Class::Own))
+            } else {
+                Ok(())
+            };
         }
         // Report the class of the address as written, so an embedded
         // loopback reads as the loopback it is.
-        Err(Refused::address(addr.ip(), classify(addr.ip())))
+        let written = if class == Class::Own {
+            class
+        } else {
+            classify(addr.ip())
+        };
+        Err(Refused::address(addr.ip(), written))
     }
 
     /// The ports a hostname is allowed on, if it has an exception.
@@ -468,10 +511,26 @@ impl Filter {
         port: u16,
         resolved: Vec<SocketAddr>,
     ) -> Result<Vec<SocketAddr>, Refused> {
-        if self.name_ports(name).is_some() {
-            return Ok(resolved);
-        }
         let mut first_refusal = None;
+        if let Some(ports) = self.name_ports(name) {
+            // A hostname with an exception keeps every address, except one
+            // that is a listener of the node on a port it may be dialed on.
+            let dialed: Vec<u16> = if port == 0 { ports.clone() } else { vec![port] };
+            let kept: Vec<SocketAddr> = resolved
+                .into_iter()
+                .filter(|addr| {
+                    let listener = dialed.iter().any(|port| {
+                        let at = SocketAddr::new(canonical(addr.ip()), *port);
+                        (self.node_endpoint)(at) == NodeEndpoint::Listener
+                    });
+                    if listener {
+                        first_refusal.get_or_insert(Refused::address(addr.ip(), Class::Own));
+                    }
+                    !listener
+                })
+                .collect();
+            return self.kept_or_refused(name, kept, first_refusal);
+        }
         let kept: Vec<SocketAddr> = resolved
             .into_iter()
             .filter_map(|addr| {
@@ -481,7 +540,7 @@ impl Filter {
                 // names the IP. The port is not part of this check, so
                 // `fetch()`, which resolves without a port, and `connect()`
                 // agree: a name that resolves to a listed IP needs a range.
-                match self.permits(SocketAddr::new(addr.ip(), 0)) {
+                match self.permits_on(SocketAddr::new(addr.ip(), 0), port) {
                     Ok(()) => Some(dialed),
                     Err(refusal) => {
                         first_refusal.get_or_insert(refusal);
@@ -490,6 +549,15 @@ impl Filter {
                 }
             })
             .collect();
+        self.kept_or_refused(name, kept, first_refusal)
+    }
+
+    fn kept_or_refused(
+        &self,
+        name: &str,
+        kept: Vec<SocketAddr>,
+        first_refusal: Option<Refused>,
+    ) -> Result<Vec<SocketAddr>, Refused> {
         if kept.is_empty() {
             return Err(first_refusal.map_or_else(
                 || Refused(format!("egress: {name} did not resolve to any address")),
@@ -592,7 +660,9 @@ fn from_settings(mode: Option<&str>, allow: Option<&str>) -> anyhow::Result<Opti
             Ok(None)
         }
         None | Some("public") => {
-            let filter = Filter::public().with_container_endpoints(crate::container::is_endpoint);
+            let filter = Filter::public()
+                .with_container_endpoints(crate::container::is_endpoint)
+                .with_node_endpoints(node_endpoint);
             match allow {
                 Some(text) => filter
                     .with_exceptions(text)
@@ -605,25 +675,130 @@ fn from_settings(mode: Option<&str>, allow: Option<&str>) -> anyhow::Result<Opti
     }
 }
 
-/// Tell the policy which addresses are the node's own: what its listeners
-/// bind (every interface address for a wildcard bind) and what it advertises
-/// (a hostname is resolved once). Called once, after the listeners are bound.
-pub async fn register_node_addresses(listeners: &[SocketAddr], advertise: &str) {
-    let Some(filter) = active() else {
-        return;
-    };
-    let mut own = Vec::new();
-    for listener in listeners {
-        if listener.ip().is_unspecified() {
-            own.extend(crate::container::node_interface_addrs());
-        } else {
-            own.push(listener.ip());
+/// What `celld dev` sets `CELLD_EGRESS` to when the operator set neither
+/// variable: developers fetch local services. `None` leaves the setting alone.
+pub fn dev_default_mode() -> Option<&'static str> {
+    (std::env::var_os(MODE_ENV).is_none() && std::env::var_os(ALLOW_ENV).is_none())
+        .then_some("open")
+}
+
+/// The node's own addresses and the ports its listeners bind.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct NodeAddrs {
+    addrs: Vec<IpAddr>,
+    listener_ports: Vec<u16>,
+}
+
+static NODE: OnceLock<NodeAddrs> = OnceLock::new();
+
+impl NodeAddrs {
+    /// What the node knows about itself: every address its listeners bind
+    /// (every interface address for a wildcard bind), the addresses it
+    /// advertises, and those an operator pinned. Loopback is always the
+    /// node's own and is not listed.
+    fn new(
+        listeners: &[SocketAddr],
+        advertised: Vec<IpAddr>,
+        pinned: Vec<IpAddr>,
+        interfaces: impl FnOnce() -> Vec<IpAddr>,
+    ) -> Self {
+        let mut addrs = advertised;
+        addrs.extend(pinned);
+        let mut interfaces = Some(interfaces);
+        for listener in listeners {
+            if listener.ip().is_unspecified() {
+                addrs.extend(interfaces.take().map(|list| list()).unwrap_or_default());
+            } else {
+                addrs.push(listener.ip());
+            }
+        }
+        let mut addrs: Vec<IpAddr> = addrs
+            .into_iter()
+            .flat_map(|ip| [ip, canonical(ip)])
+            .collect();
+        addrs.sort();
+        addrs.dedup();
+        let mut listener_ports: Vec<u16> = listeners.iter().map(SocketAddr::port).collect();
+        listener_ports.sort_unstable();
+        listener_ports.dedup();
+        Self {
+            addrs,
+            listener_ports,
         }
     }
-    if let Ok(resolved) = tokio::net::lookup_host(advertise).await {
-        own.extend(resolved.map(|addr| addr.ip()));
+
+    fn endpoint(&self, addr: SocketAddr) -> NodeEndpoint {
+        let own = |ip: IpAddr| {
+            ip.is_loopback() || ip.is_unspecified() || self.addrs.binary_search(&ip).is_ok()
+        };
+        let ip = addr.ip();
+        // An IPv4 address carried in IPv6 is the node's own when it is.
+        let own = own(ip)
+            || match ip {
+                IpAddr::V6(v6) => [embedded_v4(v6), isatap_v4(v6)]
+                    .into_iter()
+                    .flatten()
+                    .any(|v4| own(IpAddr::V4(v4))),
+                IpAddr::V4(_) => false,
+            };
+        if !own {
+            NodeEndpoint::Elsewhere
+        } else if (addr.port() == 0 && !self.listener_ports.is_empty())
+            || self.listener_ports.contains(&addr.port())
+        {
+            NodeEndpoint::Listener
+        } else {
+            NodeEndpoint::Address
+        }
     }
-    filter.set_own_addresses(own);
+}
+
+/// The node's own endpoints, as [`register_node_addresses`] recorded them.
+/// Loopback is the node's own before and after.
+pub fn node_endpoint(addr: SocketAddr) -> NodeEndpoint {
+    match NODE.get() {
+        Some(node) => node.endpoint(addr),
+        None => NodeAddrs::default().endpoint(addr),
+    }
+}
+
+/// Tell the policy which addresses are the node's own, once its listeners are
+/// bound: what they bind, what the node advertises and what an operator pinned
+/// in `CELLD_FENCE_NODE_ADDRS`. The addresses and the listener ports come from
+/// one snapshot taken here, so an address the node gains later is not known.
+/// A public address that a NAT or an elastic IP maps to the node is on no
+/// interface, so it is known only when advertised or pinned.
+///
+/// A peer resolves an advertised name from its own network, so celld never
+/// does. The egress filter resolves it here, once, because a Worker on this
+/// node that dials the name connects to the node itself.
+pub async fn register_node_addresses(listeners: &[SocketAddr], advertise: &Advertise) {
+    if active().is_none() {
+        return;
+    }
+    let advertised = match advertise {
+        Advertise::Addr(address) => vec![address.ip()],
+        Advertise::Name { host, port } => {
+            match tokio::net::lookup_host((host.as_str(), *port)).await {
+                Ok(resolved) => resolved.map(|address| address.ip()).collect(),
+                Err(error) => {
+                    tracing::warn!(
+                        host,
+                        %error,
+                        "could not resolve the advertised name, so a Worker is not stopped from dialing the address it names"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+    };
+    let node = NodeAddrs::new(
+        listeners,
+        advertised,
+        crate::node_addrs::pinned_from_env(),
+        crate::node_addrs::interfaces,
+    );
+    let _ = NODE.set(node);
 }
 
 /// The node's policy, read from the environment once. `None` means open.
@@ -663,28 +838,199 @@ mod tests {
         assert!(from_settings(Some("other"), None).is_err());
     }
 
+    /// A node with a public address, a private one and loopback, listening on
+    /// 8080 (public), 8081 (private, the operator API) and 8082 (loopback).
+    fn node(addr: SocketAddr) -> NodeEndpoint {
+        NodeAddrs::new(
+            &[
+                sock("93.184.216.34:8080"),
+                sock("10.0.0.5:8081"),
+                sock("127.0.0.1:8082"),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new,
+        )
+        .endpoint(addr)
+    }
+
+    fn on_node(allow: &str) -> Filter {
+        let filter = Filter::public().with_node_endpoints(node);
+        if allow.is_empty() {
+            filter
+        } else {
+            filter.with_exceptions(allow).unwrap()
+        }
+    }
+
+    fn assert_own(filter: &Filter, addr: &str) {
+        let refusal = filter.permits(sock(addr)).unwrap_err();
+        assert!(
+            refusal.to_string().contains("own address"),
+            "{addr}: {refusal}"
+        );
+    }
+
     #[test]
-    fn the_nodes_own_public_address_is_refused() {
-        let filter = Filter::public();
-        let own = ip("93.184.216.34");
+    fn the_nodes_own_public_address_is_refused_on_every_port() {
         // Before the listeners are bound nothing is the node's own.
-        assert!(filter.permits(SocketAddr::new(own, 8787)).is_ok());
-        filter.set_own_addresses([own, ip("::ffff:203.0.113.9")]);
-        let refusal = filter.permits(SocketAddr::new(own, 8787)).unwrap_err();
-        assert!(refusal.to_string().contains("own address"), "{refusal}");
-        // Any port, and a name that resolves to it.
-        assert!(filter.permits(SocketAddr::new(own, 1)).is_err());
+        let unbound = Filter::public().with_node_endpoints(node_endpoint);
+        assert!(unbound.permits(sock("93.184.216.34:8787")).is_ok());
+        let filter = on_node("");
+        assert_own(&filter, "93.184.216.34:8080");
+        assert_own(&filter, "93.184.216.34:1");
         assert!(filter
-            .filter_resolved("self.example", 443, vec![SocketAddr::new(own, 0)])
+            .filter_resolved("self.example", 443, vec![sock("93.184.216.34:0")])
             .is_err());
-        // Other public addresses are unaffected.
-        assert!(filter.permits(sock("8.8.8.8:8787")).is_ok());
-        // An exception still lets an operator hairpin.
-        let allowed = Filter::public()
-            .with_exceptions("93.184.216.34/32")
+        assert!(filter.permits(sock("8.8.8.8:8080")).is_ok());
+    }
+
+    #[test]
+    fn an_exception_reaches_another_port_of_the_node_but_never_a_listener() {
+        // A database on the host's own address is allowed by naming it.
+        for allow in ["93.184.216.34/32", "93.184.216.34:5432"] {
+            let filter = on_node(allow);
+            assert!(
+                filter.permits(sock("93.184.216.34:5432")).is_ok(),
+                "{allow}"
+            );
+            assert_own(&filter, "93.184.216.34:8080");
+        }
+        // The operator API on a private address, allowed by its range.
+        let filter = on_node("10.0.0.0/8");
+        assert_own(&filter, "10.0.0.5:8081");
+        assert!(filter.permits(sock("10.0.0.5:5432")).is_ok());
+        assert!(filter.permits(sock("10.0.0.6:8081")).is_ok());
+        // A name that resolves to a listener, with the port known or not.
+        for port in [0, 8081] {
+            let refused = filter.filter_resolved("self.internal", port, vec![sock("10.0.0.5:0")]);
+            assert!(refused.is_err(), "port {port}");
+        }
+    }
+
+    #[test]
+    fn loopback_never_reaches_a_listener_even_when_allowed() {
+        let filter = on_node("127.0.0.0/8");
+        assert_own(&filter, "127.0.0.1:8082");
+        // Any loopback address reaches a wildcard or loopback bind.
+        assert_own(&filter, "127.0.0.2:8082");
+        assert_own(&filter, "[::ffff:127.0.0.1]:8082");
+        // The ingress and internal ports are listener ports on loopback too.
+        assert_own(&filter, "127.0.0.1:8081");
+        // Another loopback service is allowed by the range.
+        assert!(filter.permits(sock("127.0.0.1:5432")).is_ok());
+        // Refused by default, on a port that is not a listener.
+        assert!(on_node("").permits(sock("127.0.0.1:5432")).is_err());
+    }
+
+    #[test]
+    fn a_container_endpoint_exception_does_not_open_a_listener() {
+        let filter = on_node("").with_container_endpoints(|_| true);
+        assert_own(&filter, "10.0.0.5:8081");
+        assert!(filter.permits(sock("10.0.0.5:5432")).is_ok());
+    }
+
+    #[test]
+    fn a_name_exception_does_not_open_a_listener() {
+        let filter = on_node("db.internal:8081");
+        let refused = filter.filter_resolved("db.internal", 8081, vec![sock("10.0.0.5:0")]);
+        assert!(refused.is_err());
+        let refused = filter.filter_resolved("db.internal", 0, vec![sock("10.0.0.5:0")]);
+        assert!(refused.is_err());
+        let kept = filter
+            .filter_resolved(
+                "db.internal",
+                8081,
+                vec![sock("10.0.0.5:0"), sock("10.0.0.9:0")],
+            )
             .unwrap();
-        allowed.set_own_addresses([own]);
-        assert!(allowed.permits(SocketAddr::new(own, 8787)).is_ok());
+        assert_eq!(kept, [sock("10.0.0.9:0")]);
+        // On a port that is not a listener's it keeps the node's address.
+        let filter = on_node("db.internal:5432");
+        assert!(filter
+            .filter_resolved("db.internal", 5432, vec![sock("10.0.0.5:0")])
+            .is_ok());
+    }
+
+    #[test]
+    fn the_nodes_ipv4_written_as_ipv6_is_still_the_nodes() {
+        let filter = on_node("");
+        for own in [
+            "[::ffff:93.184.216.34]:8080",
+            // NAT64
+            "[64:ff9b::5db8:d822]:8080",
+            "[64:ff9b::5db8:d822]:1",
+            // 6to4: 93.184.216.34 is 5db8:d822
+            "[2002:5db8:d822::1]:8080",
+            "[2002:5db8:d822:1:2:3:4:5]:1",
+            // ISATAP
+            "[2001:db8::5efe:5db8:d822]:8080",
+            // The private address, as a mapped address
+            "[::ffff:10.0.0.5]:8081",
+        ] {
+            assert!(
+                matches!(
+                    node(sock(own)),
+                    NodeEndpoint::Address | NodeEndpoint::Listener
+                ),
+                "{own}"
+            );
+        }
+        assert_own(&filter, "[64:ff9b::5db8:d822]:1");
+        assert_own(&filter, "[2002:5db8:d822::1]:8080");
+        // The same forms of another address are not.
+        assert_eq!(
+            node(sock("[64:ff9b::808:808]:8080")),
+            NodeEndpoint::Elsewhere
+        );
+        assert!(filter.permits(sock("[64:ff9b::808:808]:8080")).is_ok());
+    }
+
+    #[test]
+    fn the_nodes_addresses_come_from_its_listeners_its_advertised_name_and_its_pins() {
+        let listeners = [sock("0.0.0.0:8787"), sock("10.1.1.1:9000")];
+        let interfaces = || vec![ip("172.17.0.2"), ip("fd00::2")];
+        let node = NodeAddrs::new(
+            &listeners,
+            vec![ip("198.51.100.7")],
+            vec![ip("203.0.113.9"), ip("::ffff:203.0.113.10")],
+            interfaces,
+        );
+        let at = |text: &str| node.endpoint(sock(text));
+        // A wildcard bind covers every interface address.
+        assert_eq!(at("172.17.0.2:8787"), NodeEndpoint::Listener);
+        assert_eq!(at("[fd00::2]:9000"), NodeEndpoint::Listener);
+        assert_eq!(at("172.17.0.2:80"), NodeEndpoint::Address);
+        // A specific bind covers that address only.
+        assert_eq!(at("10.1.1.1:9000"), NodeEndpoint::Listener);
+        // The advertised address and the pinned ones, which are on no
+        // interface when a NAT maps them to the node.
+        assert_eq!(at("198.51.100.7:80"), NodeEndpoint::Address);
+        assert_eq!(at("203.0.113.9:8787"), NodeEndpoint::Listener);
+        assert_eq!(at("203.0.113.10:80"), NodeEndpoint::Address);
+        // Anything else, including a public address not known to the node.
+        assert_eq!(at("93.184.216.34:8787"), NodeEndpoint::Elsewhere);
+        assert_eq!(at("10.1.1.2:9000"), NodeEndpoint::Elsewhere);
+        // Loopback is always the node's own. An unknown port is a listener.
+        assert_eq!(at("127.0.0.9:80"), NodeEndpoint::Address);
+        assert_eq!(at("127.0.0.9:0"), NodeEndpoint::Listener);
+        assert_eq!(at("[::1]:9000"), NodeEndpoint::Listener);
+    }
+
+    #[test]
+    fn a_node_with_only_specific_binds_does_not_list_its_interfaces() {
+        let node = NodeAddrs::new(&[sock("10.1.1.1:9000")], Vec::new(), Vec::new(), || {
+            panic!("the interfaces were listed for a node without a wildcard bind")
+        });
+        assert_eq!(node.endpoint(sock("10.1.1.1:80")), NodeEndpoint::Address);
+    }
+
+    #[test]
+    fn dev_leaves_egress_open_unless_the_operator_chose() {
+        // The process environment is shared, so only the rule is checked
+        // against what this test run set.
+        let set = std::env::var_os(MODE_ENV).is_some() || std::env::var_os(ALLOW_ENV).is_some();
+        assert_eq!(dev_default_mode().is_none(), set);
     }
 
     #[test]

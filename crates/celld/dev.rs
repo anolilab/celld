@@ -437,7 +437,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     if !options.stack.watch {
         console.detail("Watch", "disabled");
     }
-    if egress_defaults_open() {
+    if crate::egress_filter::dev_default_mode().is_some() {
         console.detail(
             "Egress",
             "open in dev, so Workers can reach local services (set CELLD_EGRESS=public to refuse them)",
@@ -678,13 +678,6 @@ enum NodeEvent {
     Shutdown,
 }
 
-/// Developers fetch local APIs, so a dev node leaves egress open unless the
-/// operator chose a mode or exceptions.
-fn egress_defaults_open() -> bool {
-    std::env::var_os(crate::egress_filter::MODE_ENV).is_none()
-        && std::env::var_os(crate::egress_filter::ALLOW_ENV).is_none()
-}
-
 #[allow(clippy::disallowed_methods)] // Child supervision uses real host process and time APIs.
 async fn start_node(
     state: &Path,
@@ -715,8 +708,8 @@ async fn start_node(
     ] {
         command.env_remove(variable);
     }
-    if egress_defaults_open() {
-        command.env(crate::egress_filter::MODE_ENV, "open");
+    if let Some(mode) = crate::egress_filter::dev_default_mode() {
+        command.env(crate::egress_filter::MODE_ENV, mode);
     }
     command
         .args([

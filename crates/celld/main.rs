@@ -3695,7 +3695,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let internal_listener = internal.listener;
     celld::egress_filter::register_node_addresses(
         &[listener.local_addr()?, internal_listener.local_addr()?],
-        &advertise,
+        &internal.advertise,
     )
     .await;
     let mut adapter_credential_version = None;

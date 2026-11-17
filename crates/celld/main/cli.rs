@@ -374,7 +374,8 @@ TUNING:
   CELLD_EGRESS                    `public` refuses Worker fetch(), connect() and
                                   WebSocket dials to non-public and the node's
                                   own addresses; `open` allows all
-                                  (default: public; `celld dev`: open)
+                                  (default: public; `celld dev`: open). `public`
+                                  ignores HTTP_PROXY for Worker fetch()
   CELLD_EGRESS_ALLOW              CIDR and host:port exceptions to
                                   the public policy, comma separated
   CELLD_RECOVERY_RETRY_MS         Dead-owner recovery retry backoff (default: 1000)

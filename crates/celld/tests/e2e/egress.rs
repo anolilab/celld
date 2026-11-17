@@ -196,14 +196,20 @@ async fn exceptions_permit_a_destination_and_not_a_redirect_into_another() {
 }
 
 #[tokio::test]
-async fn a_worker_cannot_reach_the_nodes_own_listeners() {
-    let server = Server::start("egress", &[("CELLD_EGRESS", "public")]).await;
-    // The internal listener and the ingress listener both bind loopback.
-    let internal = server.internal_url("/").await;
-    let result = call(&server, "/fetch", &internal).await;
-    assert_refused(&result, "loopback");
-    let result = call(&server, "/fetch", &server.url("/hello")).await;
-    assert_refused(&result, "loopback");
+async fn a_worker_cannot_reach_the_nodes_loopback_listeners_even_when_allowed() {
+    // The internal listener and the ingress listener both bind loopback. A
+    // range that covers loopback opens other loopback services, never these.
+    for env in [
+        vec![("CELLD_EGRESS", "public")],
+        vec![("CELLD_EGRESS_ALLOW", "127.0.0.0/8")],
+    ] {
+        let server = Server::start("egress", &env).await;
+        let internal = server.internal_url("/").await;
+        let result = call(&server, "/fetch", &internal).await;
+        assert_refused(&result, "this node's own address");
+        let result = call(&server, "/fetch", &server.url("/hello")).await;
+        assert_refused(&result, "this node's own address");
+    }
 }
 
 #[tokio::test]

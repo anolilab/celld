@@ -241,7 +241,7 @@ impl FenceNodeNetns {
             read("CELLD_FENCE_NODE_NETNS")?.as_deref(),
             read("CELLD_FENCE_NODE_ADDRS")?.as_deref(),
             in_container_netns(),
-            node_interface_addrs,
+            crate::node_addrs::interfaces,
         )
     }
 
@@ -265,9 +265,9 @@ impl FenceNodeNetns {
             }
             Some("auto") => {
                 let addrs = match addrs {
-                    Some(text) => parse_node_addrs(text)?,
+                    Some(text) => crate::node_addrs::parse_pinned(text)?,
                     None if in_container => {
-                        let own = own_unicast_addrs(interface_addrs());
+                        let own = crate::node_addrs::unicast(interface_addrs());
                         anyhow::ensure!(
                             !own.is_empty(),
                             "CELLD_FENCE_NODE_NETNS=auto found no address of this node's own to admit replies to; set CELLD_FENCE_NODE_ADDRS to them"
@@ -311,73 +311,6 @@ impl FenceNodeNetns {
         }
         lines
     }
-}
-
-/// Whether a reply can be addressed to `addr`: not loopback, not unspecified,
-/// not multicast, not the IPv4 broadcast address, and not link-local, which
-/// the fence rejects whatever the allowance says.
-fn is_node_unicast(addr: &std::net::IpAddr) -> bool {
-    // `::ffff:224.0.0.1` is the IPv4 address, whatever the IPv6 predicates say.
-    let addr = &addr.to_canonical();
-    let link_local = match addr {
-        std::net::IpAddr::V4(v4) => v4.is_link_local(),
-        std::net::IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
-    };
-    let broadcast = matches!(addr, std::net::IpAddr::V4(v4) if v4.is_broadcast());
-    !addr.is_loopback()
-        && !addr.is_unspecified()
-        && !addr.is_multicast()
-        && !broadcast
-        && !link_local
-}
-
-/// What of a list of interface addresses a reply can be addressed to; see
-/// [`is_node_unicast`]. Sorted, without duplicates.
-fn own_unicast_addrs(addrs: Vec<std::net::IpAddr>) -> Vec<std::net::IpAddr> {
-    let mut own: Vec<std::net::IpAddr> = addrs.into_iter().filter(is_node_unicast).collect();
-    own.sort();
-    own.dedup();
-    own
-}
-
-/// The addresses of this process's own network interfaces.
-pub(crate) fn node_interface_addrs() -> Vec<std::net::IpAddr> {
-    let Ok(interfaces) = nix::ifaddrs::getifaddrs() else {
-        return Vec::new();
-    };
-    interfaces
-        .filter_map(|interface| {
-            let address = interface.address?;
-            match (address.as_sockaddr_in(), address.as_sockaddr_in6()) {
-                (Some(v4), _) => Some(std::net::IpAddr::V4(v4.ip())),
-                (_, Some(v6)) => Some(std::net::IpAddr::V6(v6.ip())),
-                _ => None,
-            }
-        })
-        .collect()
-}
-
-/// The node's own addresses as an operator pins them: a comma-separated list
-/// of IP addresses, nothing else, because they are written into a ruleset
-/// that a privileged container loads. Sorted, without duplicates, so nodes
-/// that share an engine render the same rules whatever order they list them in.
-fn parse_node_addrs(text: &str) -> anyhow::Result<Vec<std::net::IpAddr>> {
-    let mut addrs = Vec::new();
-    for part in text.split(',') {
-        let part = part.trim();
-        let addr: std::net::IpAddr = part.parse().map_err(|_| {
-            anyhow!("CELLD_FENCE_NODE_ADDRS names {part:?}, which is not an IP address")
-        })?;
-        anyhow::ensure!(
-            is_node_unicast(&addr),
-            "CELLD_FENCE_NODE_ADDRS names {part:?}, which is not a unicast address of a node: \
-             loopback, link-local, unspecified, multicast and broadcast addresses never are"
-        );
-        addrs.push(addr.to_canonical());
-    }
-    addrs.sort();
-    addrs.dedup();
-    Ok(addrs)
 }
 
 /// Whether this process runs in a container, by the marker files Docker and
@@ -3870,16 +3803,6 @@ table inet celld {
         let one = rules("172.17.0.3,fd00::3,172.17.0.2");
         assert_eq!(one, rules("fd00::3, 172.17.0.2 ,172.17.0.3,172.17.0.3"));
         assert_ne!(one, rules("172.17.0.2,172.17.0.3"));
-    }
-
-    #[test]
-    fn the_interfaces_of_this_machine_are_listed() {
-        // Every machine that runs the tests has a loopback interface.
-        assert!(
-            node_interface_addrs().contains(&"127.0.0.1".parse().unwrap()),
-            "{:?}",
-            node_interface_addrs()
-        );
     }
 
     #[test]
