@@ -876,10 +876,30 @@ pub fn node_name(host: &str, port: u16) -> bool {
 /// node that dials the name connects to the node itself. The name is also kept
 /// and refused on the node's listener ports, so a lookup that failed here, or
 /// that answers differently later, does not open the node to its own name.
-pub async fn register_node_addresses(listeners: &[SocketAddr], advertise: &Advertise) {
+///
+/// A wildcard bind serves every interface address, so when the interfaces
+/// cannot be listed the node cannot tell which addresses are its own, and it
+/// refuses to start rather than let Workers dial them.
+pub async fn register_node_addresses(
+    listeners: &[SocketAddr],
+    advertise: &Advertise,
+) -> anyhow::Result<()> {
     if active().is_none() {
-        return;
+        return Ok(());
     }
+    let interfaces = if listeners
+        .iter()
+        .any(|listener| listener.ip().is_unspecified())
+    {
+        crate::node_addrs::try_interfaces().map_err(|error| {
+            anyhow!(
+                "could not list this node's interface addresses ({error}), so Worker egress \
+                 cannot refuse them; bind specific addresses or set {MODE_ENV}=open"
+            )
+        })?
+    } else {
+        Vec::new()
+    };
     let advertised = match advertise {
         Advertise::Addr(address) => vec![*address],
         Advertise::Name { host, port } => {
@@ -908,12 +928,13 @@ pub async fn register_node_addresses(listeners: &[SocketAddr], advertise: &Adver
         listeners,
         advertised,
         crate::node_addrs::pinned_from_env(),
-        crate::node_addrs::interfaces,
+        move || interfaces,
     );
     if let Advertise::Name { host, port } = advertise {
         node = node.with_name(host, *port);
     }
     let _ = NODE.set(node);
+    Ok(())
 }
 
 /// The node's policy, read from the environment once. `None` means open.

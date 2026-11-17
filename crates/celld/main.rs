@@ -3697,7 +3697,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         &[listener.local_addr()?, internal_listener.local_addr()?],
         &internal.advertise,
     )
-    .await;
+    .await?;
     let mut adapter_credential_version = None;
     let managed_storage = if settings.control_plane {
         if let Some(spec) = settings.bucket.take() {

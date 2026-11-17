@@ -119,7 +119,7 @@ celld refuses these address classes:
 | Unique-local | `fc00::/7` |
 | Multicast | `224.0.0.0/4`, `ff00::/8` |
 | Reserved | `240.0.0.0/4` including the broadcast address, `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `2001::/23`, `2001:db8::/32`, `3fff::/20`, `100::/64`, `fec0::/10`, `64:ff9b:1::/48`, and every IPv6 address outside `2000::/3` |
-| The node's own addresses | What the node's listeners bind (every interface address, for a wildcard bind such as `0.0.0.0`), the address it advertises (a hostname in `--advertise` is resolved once at startup, waiting at most 2 seconds) and the addresses in `CELLD_FENCE_NODE_ADDRS`, even when public. Loopback and these addresses are refused on every port a listener of the node binds and on the port it advertises, whatever `CELLD_EGRESS_ALLOW` says. The hostname in `--advertise` is also refused on those ports, whether or not it resolved at startup. Other ports follow the exceptions, except that a name looked up by `fetch()` has no port yet, so it is refused when it resolves to any address of the node: use the IP literal or a `host:port` entry for a service of the host. The same address written as IPv4 inside IPv6 is the same address. The list is read once at startup, and a public address that a NAT or an elastic IP maps to the node is on no interface, so the node knows it only when it is advertised (`--advertise`) or, with `CELLD_FENCE_NODE_NETNS=auto`, listed in `CELLD_FENCE_NODE_ADDRS`, which also changes the [container fence](services/containers.md#a-node-in-a-container) |
+| The node's own addresses | What the node's listeners bind (every interface address, for a wildcard bind such as `0.0.0.0`), the address it advertises (a hostname in `--advertise` is resolved once at startup, waiting at most 2 seconds) and the addresses in `CELLD_FENCE_NODE_ADDRS`, even when public. Loopback and these addresses are refused on every port a listener of the node binds and on the port it advertises, whatever `CELLD_EGRESS_ALLOW` says. The hostname in `--advertise` is also refused on those ports, whether or not it resolved at startup. Other ports follow the exceptions, except that a name looked up by `fetch()` has no port yet, so it is refused when it resolves to any address of the node: use the IP literal or a `host:port` entry for a service of the host. The same address written as IPv4 inside IPv6 is the same address. The list is read once at startup (a node with a wildcard bind that cannot list its interfaces refuses to start), and a public address that a NAT or an elastic IP maps to the node is on no interface, so the node knows it only when it is advertised (`--advertise`) or, with `CELLD_FENCE_NODE_NETNS=auto`, listed in `CELLD_FENCE_NODE_ADDRS`, which also changes the [container fence](services/containers.md#a-node-in-a-container) |
 | IPv4 inside IPv6 | IPv4-mapped (`::ffff:a.b.c.d`), NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`) addresses are public only when the embedded IPv4 address is. An ISATAP address (`::5efe:a.b.c.d`) is public only when its prefix and its embedded IPv4 address both are. Teredo (`2001::/32`) is always refused |
 
 The check runs on the address celld connects to, not on the hostname. A name
@@ -131,7 +131,9 @@ server cannot redirect a Worker to `http://169.254.169.254/`. With
 `redirect: "manual"`, the Worker receives the redirect and its next `fetch()`
 is checked as a new request.
 
-`CELLD_EGRESS_ALLOW` lists exceptions, separated by commas or whitespace:
+`CELLD_EGRESS_ALLOW` lists exceptions, separated by commas or whitespace. The
+list applies to every Worker on the node; an exception cannot be limited to one
+Worker or binding yet.
 
 | Entry | Effect |
 | --- | --- |

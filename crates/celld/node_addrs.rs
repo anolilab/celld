@@ -44,10 +44,12 @@ pub fn unicast(addrs: Vec<IpAddr>) -> Vec<IpAddr> {
 
 /// The addresses of this process's own network interfaces.
 pub fn interfaces() -> Vec<IpAddr> {
-    let Ok(interfaces) = nix::ifaddrs::getifaddrs() else {
-        return Vec::new();
-    };
-    interfaces
+    try_interfaces().unwrap_or_default()
+}
+
+/// [`interfaces`], with a failed lookup reported rather than read as "none".
+pub fn try_interfaces() -> nix::Result<Vec<IpAddr>> {
+    Ok(nix::ifaddrs::getifaddrs()?
         .filter_map(|interface| {
             let address = interface.address?;
             match (address.as_sockaddr_in(), address.as_sockaddr_in6()) {
@@ -56,7 +58,7 @@ pub fn interfaces() -> Vec<IpAddr> {
                 _ => None,
             }
         })
-        .collect()
+        .collect())
 }
 
 /// The node's own addresses as an operator pins them: a comma-separated list
