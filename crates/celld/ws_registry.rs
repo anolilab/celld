@@ -456,6 +456,7 @@ pub(crate) fn ws_retire_handoff_readers(ids: Vec<u64>) {
         match registry.pull_retention.remove(&id) {
             Some(PullRetention::ClosedUnread) => {
                 pull.remove(&id);
+                registry.pull_owners.remove(&id);
             }
             _ if pull.contains_key(&id) => {
                 registry
