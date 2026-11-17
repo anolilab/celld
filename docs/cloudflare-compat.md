@@ -172,8 +172,8 @@ execution.
 - celld implements `node:assert` (and `assert/strict`), `node:async_hooks`,
   `node:buffer`, `node:crypto`, `node:diagnostics_channel`, `node:events`,
   `node:fs` (and `fs/promises`), `node:os`, `node:path` (including `posix` and
-  `win32`), `node:stream` (including `promises`, `web` and `consumers`),
-  `node:test` (and `test/reporters`), `node:timers/promises`, `node:util`
+  `win32`), `node:process`, `node:stream` (including `promises`, `web` and `consumers`),
+  `node:test` (and `test/reporters`), `node:timers/promises`, `node:url`, `node:util`
   (and `util/types`), and `node:zlib`.
 - Importing any other `node:` module succeeds, and the first call throws
   "`node:<name>` is not implemented in celld". `celld deploy` and
@@ -205,9 +205,38 @@ execution.
 - `KeyObject.toCryptoKey()` applies the requested algorithm, extractability,
   and usages to an asymmetric key.
 - `node:zlib` implements only the synchronous gzip and deflate functions.
-- `node:fs` provides `access`, `mkdir`, `realpath`, `stat`, `lstat`, and
-  `readFile`. It exposes an empty, request-local `/tmp` and a read-only
-  `/bundle` that contains the Worker modules.
+- `node:fs` provides `access`, `mkdir`, `realpath`, `stat`, `lstat`,
+  `readFile`, `writeFile`, `appendFile`, `readdir`, `unlink`, and `rm`, in
+  sync, callback, and `fs.promises` forms. It exposes a request-local `/tmp` and
+  a read-only `/bundle` that contains the Worker modules. `/tmp` starts empty,
+  lives in memory, and is freed when the request ends. One request can hold at
+  most 64 MiB in it, counting the memory each file holds (a file that grows by appends may
+  hold up to twice its length) and a small charge for each entry; a
+  write that would pass that fails with `ENOSPC` and changes nothing. Writes
+  outside `/tmp` fail with `EPERM`. `/tmp` belongs to a request: code that runs
+  with no request, such as module scope while the Worker loads, cannot change
+  it, and those calls fail with `EPERM`; reads there see an empty tree. A
+  request that was already running when the Worker first loaded `node:fs` (a
+  dynamic `import()` in the handler) has no `/tmp` either, and fails the same
+  way; the next request gets one. A
+  reaction left behind by a finished event has no request either, even
+  when another request's turn runs it, and a reaction of a live request keeps
+  its own `/tmp` when another request's turn runs it. A write takes the `open`
+  flags `r` (fails with `EBADF`), `r+` (writes at offset 0 and keeps the rest),
+  `w`, `a`, their `+` forms, and the exclusive `x` forms; any other flag throws
+  `ERR_INVALID_ARG_VALUE`.
+- `node:url` provides `URL`, `URLSearchParams`, `fileURLToPath`,
+  `pathToFileURL`, and `format` for `URL` objects (including `unicode`), with Node.js's POSIX results
+  and errors. The legacy API (`parse`, `resolve`, `resolveObject`, `Url`,
+  `domainToASCII`, `domainToUnicode`, `urlToHttpOptions`, and `format` of a
+  string or a legacy object) throws `ERR_METHOD_NOT_IMPLEMENTED`.
+- With `nodejs_compat`, `process.env` holds the Worker's string `vars` and
+  secrets when the compatibility date is 2025-04-01 or later, or the
+  `nodejs_compat_populate_process_env` flag is set, unless
+  `nodejs_compat_do_not_populate_process_env` is set. Otherwise it is an empty
+  object. A name that is not set is `undefined`, and bindings that are not text
+  are not listed. It is filled before the main module evaluates, so module scope
+  reads it. `node:process` and `process` are the global `process`.
 - The global `process` matches workerd for each field that it defines, such
   as `process.execPath`, `process.argv`, and `process.title`. Other fields,
   such as `process.kill` and `process.features`, are undefined.

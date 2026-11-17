@@ -11299,6 +11299,9 @@ globalThis.process.exit = (code = 0) => {
 };
 globalThis.process.getBuiltinModule =
   (id) => __builtin_module(String(id));
+// `node:process` is the global itself, not a copy: a change made through
+// either name is visible through the other.
+__celld.__process = globalThis.process;
 if (!globalThis.global) globalThis.global = globalThis;
 // Events belong to the request, and the host owns the request. `__event_*`
 // and `__wait_until` operate on whichever context the host has made current
@@ -11361,9 +11364,24 @@ const __fsPath = (value) => {
   return "/" + parts.join("/");
 };
 const __fsError = (code, syscall, path) => {
-  const e = new Error(`${code}: ${syscall} '${path}'`);
-  e.errno = { EPERM: -1, ENOENT: -2, EEXIST: -17, ENOTDIR: -20 }[code];
-  e.code = code;
+  // A change to `/tmp` with no request-local tree is `EPERM`: either there is
+  // no request, such as at module scope, or the request began before
+  // `node:fs` was loaded and so has no token to name its `/tmp` by.
+  const noRequest = code === "ENOREQUEST";
+  const noToken = code === "ENOTMPTOKEN";
+  const name = noRequest || noToken ? "EPERM" : code;
+  const e = new Error(
+    `${name}: ${syscall} '${path}'` +
+      (noRequest
+        ? " (there is no request-local /tmp outside a request)"
+        : noToken
+          ? " (this request started before node:fs was loaded, so it has no request-local /tmp; it is available from the next request)"
+          : ""),
+  );
+  e.errno = {
+    EPERM: -1, ENOENT: -2, EBADF: -9, EEXIST: -17, ENOTDIR: -20, EISDIR: -21, ENOSPC: -28,
+  }[name];
+  e.code = name;
   e.syscall = syscall;
   e.path = path;
   return e;
@@ -11373,12 +11391,14 @@ const __fsStatsBadge = Symbol("fs.Stats");
 class __FsStats {
   constructor(badge, kind, size, bigint) {
     if (badge !== __fsStatsBadge) throw new TypeError("Illegal constructor");
-    const file = kind === 3;
+    const file = kind === 3 || kind === 4;
     this.dev = 0;
     this.ino = 0;
-    // A bundle file is 0o100444 and a writable temporary directory is 0o40666,
+    // A bundle file is 0o100444, a temporary file 0o100666 and a writable
+    // temporary directory 0o40666,
     // matching the mode values workerd's fs-stat-test.js asserts.
-    this.mode = (file ? 0o100000 : 0o40000) | 0o444 | (kind === 2 ? 0o222 : 0);
+    this.mode = (file ? 0o100000 : 0o40000) | 0o444 |
+      (kind === 2 || kind === 4 ? 0o222 : 0);
     this.nlink = 1;
     this.uid = 0;
     this.gid = 0;
@@ -11471,6 +11491,146 @@ const __fsReadFileSync = (value, options) => {
   const buffer = Buffer.from(bytes);
   return encoding ? buffer.toString(encoding) : buffer;
 };
+// The writable tree is the request's `/tmp` (see `RequestVfs`). `ENOSPC` is
+// the request's byte cap, not a disk.
+const __fsThrowCode = (code, syscall, path) => {
+  if (code) throw __fsError(code, syscall, path);
+};
+const __fsBytes = (data, encoding) => {
+  if (typeof data === "string") return Buffer.from(data, encoding || "utf8");
+  if (ArrayBuffer.isView(data)) return data;
+  const error = new TypeError(
+    'The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView',
+  );
+  error.code = "ERR_INVALID_ARG_TYPE";
+  throw error;
+};
+// The `open` flags a write accepts, as [create, exclusive, truncate, append,
+// writable]. `r` opens read-only, so writing through it fails as in Node.
+const __fsFlags = {
+  r: [false, false, false, false, false],
+  "r+": [false, false, false, false, true],
+  w: [true, false, true, false, true],
+  "w+": [true, false, true, false, true],
+  wx: [true, true, true, false, true],
+  xw: [true, true, true, false, true],
+  "wx+": [true, true, true, false, true],
+  "xw+": [true, true, true, false, true],
+  a: [true, false, false, true, true],
+  "a+": [true, false, false, true, true],
+  ax: [true, true, false, true, true],
+  xa: [true, true, false, true, true],
+  "ax+": [true, true, false, true, true],
+  "xa+": [true, true, false, true, true],
+};
+// Validates a write's options and returns them with the flag's mode. The
+// callback forms run this before the operation is deferred, so a bad flag
+// throws from the call as in Node and never reaches the callback.
+const __fsWriteOptions = (options, append) => {
+  if (typeof options === "string") options = { encoding: options };
+  options = __fsOptions(options, []);
+  const flag = options.flag ?? (append ? "a" : "w");
+  const mode = typeof flag === "string" &&
+    Object.prototype.hasOwnProperty.call(__fsFlags, flag)
+    ? __fsFlags[flag]
+    : undefined;
+  if (!mode) {
+    const error = new TypeError(
+      `The argument 'flags' is invalid. Received ${
+        typeof flag === "string" ? `'${flag}'` : String(flag)
+      }`,
+    );
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
+  }
+  return [options, mode];
+};
+const __fsWrite = (value, data, options, append) => {
+  const path = __fsPath(value);
+  let mode;
+  [options, mode] = __fsWriteOptions(options, append);
+  const [create, exclusive, truncate, appending, writable] = mode;
+  const bytes = __fsBytes(data, options.encoding);
+  const kind = __vfs_stat(path)[0];
+  if (exclusive && kind) throw __fsError("EEXIST", "open", path);
+  if (!create && !kind) throw __fsError("ENOENT", "open", path);
+  if (!writable) throw __fsError("EBADF", "write", path);
+  if (appending) {
+    __fsThrowCode(__vfs_write(path, bytes, true), "open", path);
+    return;
+  }
+  let content = bytes;
+  if (!truncate && kind === 4) {
+    // `r+` writes at offset 0 and keeps whatever lies beyond the new bytes.
+    const old = new Uint8Array(__vfs_read_file(path));
+    if (old.length > bytes.byteLength) {
+      content = Buffer.concat([bytes, old.subarray(bytes.byteLength)]);
+    }
+  }
+  __fsThrowCode(__vfs_write(path, content, false), "open", path);
+};
+const __fsWriteFileSync = (path, data, options) =>
+  __fsWrite(path, data, options, false);
+const __fsAppendFileSync = (path, data, options) =>
+  __fsWrite(path, data, options, true);
+class __FsDirent {
+  constructor(name, parentPath, directory) {
+    this.name = name;
+    this.parentPath = parentPath;
+    this.path = parentPath;
+    Object.defineProperty(this, "__directory", { value: directory });
+  }
+  isFile() { return !this.__directory; }
+  isDirectory() { return this.__directory; }
+  isBlockDevice() { return false; }
+  isCharacterDevice() { return false; }
+  isSymbolicLink() { return false; }
+  isFIFO() { return false; }
+  isSocket() { return false; }
+}
+const __fsReaddirSync = (value, options) => {
+  const path = __fsPath(value);
+  if (typeof options === "string") options = { encoding: options };
+  options = __fsOptions(options, ["withFileTypes", "recursive"]);
+  const walk = (directory, prefix) => {
+    const names = __vfs_readdir(directory);
+    if (typeof names === "string") throw __fsError(names, "scandir", directory);
+    const out = [];
+    for (const name of names) {
+      const full = directory + "/" + name;
+      const kind = __vfs_stat(full)[0];
+      const isDirectory = kind === 1 || kind === 2;
+      out.push(options.withFileTypes
+        ? new __FsDirent(name, directory, isDirectory)
+        : prefix + name);
+      if (options.recursive && isDirectory) {
+        out.push(...walk(full, prefix + name + "/"));
+      }
+    }
+    return out;
+  };
+  return walk(path, "");
+};
+const __fsUnlinkSync = (value) => {
+  const path = __fsPath(value);
+  __fsThrowCode(__vfs_remove(path, false), "unlink", path);
+};
+const __fsRmSync = (value, options) => {
+  const path = __fsPath(value);
+  options = __fsOptions(options, ["recursive", "force"]);
+  const code = __vfs_remove(path, options.recursive === true);
+  if (code === "ENOENT" && options.force === true) return;
+  if (code === "EISDIR") {
+    const error = new Error(
+      `Path is a directory: rm returned EISDIR (is a directory) ${path}`,
+    );
+    error.code = "ERR_FS_EISDIR";
+    error.syscall = "rm";
+    error.path = path;
+    throw error;
+  }
+  __fsThrowCode(code, "rm", path);
+};
 // `fs.constants`, with the four access modes from workerd's
 // `src/node/internal/internal_fs_constants.ts`. The table carries only the
 // modes `access` reads. Every other constant belongs to an operation the
@@ -11508,7 +11668,7 @@ const __fsAccessSync = (value, mode) => {
   const [kind] = __vfs_stat(path);
   const denied = mode & __fsConstants.X_OK
     || !kind
-    || (mode & __fsConstants.W_OK && kind !== 2);
+    || (mode & __fsConstants.W_OK && kind !== 2 && kind !== 4);
   if (denied) throw __fsError("ENOENT", "access", path);
 };
 // The callback forms run the same synchronous core as `fs.promises`.
@@ -11604,6 +11764,45 @@ const __fsMkdir = (value, options, callback) => {
     callback,
   );
 };
+const __fsWriteFile = (value, data, options, callback) => {
+  [options, callback] = __fsCallbackArgs(options, callback);
+  __fsErrorOnlyCallback(
+    () => { __fsPath(value); __fsBytes(data); __fsWriteOptions(options, false); },
+    () => __fsWriteFileSync(value, data, options),
+    callback,
+  );
+};
+const __fsAppendFile = (value, data, options, callback) => {
+  [options, callback] = __fsCallbackArgs(options, callback);
+  __fsErrorOnlyCallback(
+    () => { __fsPath(value); __fsBytes(data); __fsWriteOptions(options, true); },
+    () => __fsAppendFileSync(value, data, options),
+    callback,
+  );
+};
+const __fsReaddir = (value, options, callback) => {
+  [options, callback] = __fsCallbackArgs(options, callback);
+  __fsCallback(
+    () => __fsPath(value),
+    () => __fsReaddirSync(value, options),
+    callback,
+  );
+};
+const __fsUnlink = (value, callback) => {
+  __fsErrorOnlyCallback(
+    () => __fsPath(value),
+    () => __fsUnlinkSync(value),
+    callback,
+  );
+};
+const __fsRm = (value, options, callback) => {
+  [options, callback] = __fsCallbackArgs(options, callback);
+  __fsErrorOnlyCallback(
+    () => { __fsPath(value); __fsOptions(options, ["recursive", "force"]); },
+    () => __fsRmSync(value, options),
+    callback,
+  );
+};
 const __fsPromisesSurface = {
   // The promise form validates inside the promise, so an argument error
   // rejects instead of throwing. Workerd makes the same split, because a
@@ -11614,6 +11813,11 @@ const __fsPromisesSurface = {
   async lstat(...args) { return __fsLstatSync(...args); },
   async realpath(...args) { return __fsRealpathSync(...args); },
   async readFile(...args) { return __fsReadFileSync(...args); },
+  async writeFile(...args) { return __fsWriteFileSync(...args); },
+  async appendFile(...args) { return __fsAppendFileSync(...args); },
+  async readdir(...args) { return __fsReaddirSync(...args); },
+  async unlink(...args) { return __fsUnlinkSync(...args); },
+  async rm(...args) { return __fsRmSync(...args); },
 };
 // A namespace import gets a fixed export set when V8 links the module, so a
 // partial module must enumerate unsupported Node exports too. A get trap alone
@@ -11653,10 +11857,10 @@ const __fsPromises = __celld.__fsPromises = __fsNamespaceProxy(
   __fsPromisesSurface,
   "node:fs/promises",
   [
-    "appendFile", "chmod", "chown", "copyFile", "cp", "lchmod", "lchown",
-    "link", "lutimes", "mkdtemp", "open", "opendir", "readdir", "readlink",
-    "rename", "rm", "rmdir", "statfs", "symlink", "truncate", "unlink",
-    "utimes", "watch", "writeFile",
+    "chmod", "chown", "copyFile", "cp", "lchmod", "lchown",
+    "link", "lutimes", "mkdtemp", "open", "opendir", "readlink",
+    "rename", "rmdir", "statfs", "symlink", "truncate",
+    "utimes", "watch",
   ],
 );
 const __fsSurface = {
@@ -11676,31 +11880,42 @@ const __fsSurface = {
   realpath: __fsRealpath,
   readFile: __fsReadFile,
   mkdir: __fsMkdir,
+  writeFileSync: __fsWriteFileSync,
+  appendFileSync: __fsAppendFileSync,
+  readdirSync: __fsReaddirSync,
+  unlinkSync: __fsUnlinkSync,
+  rmSync: __fsRmSync,
+  writeFile: __fsWriteFile,
+  appendFile: __fsAppendFile,
+  readdir: __fsReaddir,
+  unlink: __fsUnlink,
+  rm: __fsRm,
 };
 const __fsNamespaceNames = [
   "Dir", "Dirent", "ReadStream", "WriteStream", "_toUnixTimestamp",
-  "appendFile", "appendFileSync", "chmod", "chmodSync", "chown", "chownSync",
+  "chmod", "chmodSync", "chown", "chownSync",
   "close", "closeSync", "copyFile", "copyFileSync", "cp", "cpSync",
   "createReadStream", "createWriteStream", "exists", "fchmod", "fchmodSync",
   "fchown", "fchownSync", "fdatasync", "fdatasyncSync", "fstat", "fstatSync",
   "fsync", "fsyncSync", "ftruncate", "ftruncateSync", "futimes", "futimesSync",
   "lchmod", "lchmodSync", "lchown", "lchownSync", "link", "linkSync",
   "lutimes", "lutimesSync", "mkdtemp", "mkdtempSync", "open", "openSync",
-  "opendir", "opendirSync", "read", "readSync", "readdir", "readdirSync",
+  "opendir", "opendirSync", "read", "readSync",
   "readlink", "readlinkSync", "readv", "readvSync", "rename", "renameSync",
-  "rm", "rmSync", "rmdir", "rmdirSync", "statfs", "statfsSync", "symlink",
-  "symlinkSync", "truncate", "truncateSync", "unlink", "unlinkSync",
+  "rmdir", "rmdirSync", "statfs", "statfsSync", "symlink",
+  "symlinkSync", "truncate", "truncateSync",
   "unwatchFile", "utimes", "utimesSync", "watch", "watchFile", "write",
-  "writeFile", "writeFileSync", "writeSync", "writev", "writevSync",
+  "writeSync", "writev", "writevSync",
 ];
-// Writable file contents and every mutation remain explicit unsupported
-// surfaces until a failing application seam requires them. These two reads
-// use ENOENT so dependencies can take their no-filesystem fallback path.
+// Writes, appends, directory listing and removal work on the request's `/tmp`.
+// Everything else stays an explicit unsupported surface until a failing
+// application seam requires it. `readlinkSync` fails with ENOENT so
+// dependencies can take their no-filesystem fallback path.
 __celld.__fs = __fsNamespaceProxy(
   __fsSurface,
   "node:fs",
   __fsNamespaceNames,
-  ["readdirSync", "readlinkSync"],
+  ["readlinkSync"],
 );
 const __bridgeResponseStream = (body, requestControllers) => {
   const streamId = __response_stream_create();

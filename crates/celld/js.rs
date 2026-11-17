@@ -703,8 +703,32 @@ impl EgressGate {
 /// A's reaction would otherwise be gated against the wrong cell's position, or
 /// refused as belonging to the wrong cell. The turn owner remains the answer
 /// for a context that installs no continuation token.
+///
+/// This one is lenient: a token whose context is gone still falls back to the
+/// turn owner, because its callers must always get a context to charge. A
+/// caller that must not touch another event's state uses
+/// [`reaction_context_or`], the single strict rule: a token names exactly its
+/// own context (`None` once that is gone), and only code with no token at all
+/// falls back to what the caller supplies.
 fn event_context(scope: &mut v8::PinScope) -> Arc<IoContext> {
     current_reaction_io_context(scope).unwrap_or_else(current_context)
+}
+
+/// The strict resolution of "whose request is this code?".
+///
+/// A continuation token names one `IoContext`. If that context is gone the
+/// event has finished, and the code must not borrow whatever event happens to
+/// drive this microtask checkpoint, so the answer is `None`. Only code that
+/// carries no token (a stateless request, which installs none) takes
+/// `fallback`.
+fn reaction_context_or(
+    scope: &mut v8::PinScope,
+    fallback: impl FnOnce() -> Option<Arc<IoContext>>,
+) -> Option<Arc<IoContext>> {
+    match reaction_continuation_id(scope) {
+        Some(id) => actor_runtime_state(scope).io_context(id),
+        None => fallback(),
+    }
 }
 
 /// What one cell event's outbound effects gate against.
@@ -2195,6 +2219,12 @@ struct ActorRuntimeState {
     termination: std::sync::Mutex<Option<ExecutionTermination>>,
     pending_puts: std::sync::Mutex<PendingPuts>,
     io_contexts: std::sync::Mutex<HashMap<u64, Weak<IoContext>>>,
+    /// Set once the Worker imports `node:fs`. From then on every stateless
+    /// request installs a `/tmp` token (see [`install_tmp_token`]); a Worker
+    /// that never touches the filesystem keeps the empty continuation slot.
+    tmp_tokens: AtomicBool,
+    /// The stateless requests that hold a `/tmp` token, by that token.
+    tmp_contexts: std::sync::Mutex<HashMap<u64, Weak<IoContext>>>,
     /// WebSocket captures that received a frame in the current isolate turn.
     /// Weak references record every continuation context without extending
     /// an event's lifetime merely to flush its output.
@@ -2268,6 +2298,15 @@ fn advance_io_time(scope: &mut v8::PinScope) -> i64 {
 }
 
 impl ActorRuntimeState {
+    fn tmp_context(&self, id: u64) -> Option<Arc<IoContext>> {
+        let mut contexts = self.tmp_contexts.lock().unwrap();
+        let context = contexts.get(&id)?.upgrade();
+        if context.is_none() {
+            contexts.remove(&id);
+        }
+        context
+    }
+
     fn io_context(&self, id: u64) -> Option<Arc<IoContext>> {
         let mut contexts = self.io_contexts.lock().unwrap();
         let context = contexts.get(&id)?.upgrade();
@@ -3601,15 +3640,59 @@ fn restore_trace(scope: &mut v8::PinScope, previous: Option<v8::Local<v8::Value>
 /// event's microtask checkpoint.
 fn install_io_context<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    context: &IoContext,
+    context: &Arc<IoContext>,
 ) -> Option<v8::Local<'s, v8::Value>> {
-    let (id, _) = context.continuation.as_ref()?;
+    let Some((id, _)) = context.continuation.as_ref() else {
+        return install_tmp_token(scope, context);
+    };
     let previous = scope.get_continuation_preserved_embedder_data();
     let frame = cped_frame(scope);
     let trace = cped_trace(scope);
     let token: v8::Local<v8::Value> = v8::BigInt::new_from_u64(scope, *id).into();
     set_cped(scope, frame, trace, token);
     Some(previous)
+}
+
+/// Name a stateless request in the continuation slot, so its `/tmp` follows
+/// its promise reactions.
+///
+/// A stateless request has no cell identity, and V8 runs one request's
+/// reaction inside the microtask checkpoint of whichever request is driving
+/// the isolate. Without a token that reaction cannot be told from the driving
+/// request's own code, and would read its `/tmp`. The token is a Number, so
+/// every reader of the cell-event BigInt token ignores it. Only a Worker that
+/// imports `node:fs` pays for it: the slot stays empty otherwise.
+fn install_tmp_token<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    context: &Arc<IoContext>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let runtime_state = actor_runtime_state(scope);
+    if !runtime_state.tmp_tokens.load(Ordering::Relaxed) {
+        return None;
+    }
+    let (id, _) = context.tmp_token.get_or_init(|| {
+        let id = allocate_io_context_id();
+        runtime_state
+            .tmp_contexts
+            .lock()
+            .unwrap()
+            .insert(id, Arc::downgrade(context));
+        (id, Arc::downgrade(&runtime_state))
+    });
+    let previous = scope.get_continuation_preserved_embedder_data();
+    let frame = cped_frame(scope);
+    let trace = cped_trace(scope);
+    let token: v8::Local<v8::Value> = v8::Number::new(scope, *id as f64).into();
+    set_cped(scope, frame, trace, token);
+    Some(previous)
+}
+
+/// The `/tmp` token of the code running at this point, if it has one.
+fn tmp_token_id(scope: &mut v8::PinScope) -> Option<u64> {
+    let token = cped_io_context(scope);
+    let number = v8::Local::<v8::Number>::try_from(token).ok()?;
+    // A BigInt is not a Number to V8, so a cell token never reads as one.
+    Some(number.value() as u64)
 }
 
 fn restore_io_context(scope: &mut v8::PinScope, previous: Option<v8::Local<v8::Value>>) {
@@ -3696,10 +3779,7 @@ fn op_with_input_gate_context(
 /// Stateless requests install no token, so their current turn remains the
 /// only context that can own a synchronous operation such as `process.exit`.
 fn current_reaction_or_untracked_io_context(scope: &mut v8::PinScope) -> Option<Arc<IoContext>> {
-    if cped_io_context(scope).is_undefined() {
-        return Some(current_context());
-    }
-    current_reaction_io_context(scope)
+    reaction_context_or(scope, || Some(current_context()))
 }
 
 /// The trace context current at this exact point of JS execution, read
@@ -3784,6 +3864,9 @@ impl Worker {
         let tc = &mut tc.init();
 
         advance_io_time(tc);
+        // `begin` may give the request a `/tmp` token that no caller holds the
+        // previous slot of, so the slot as it was is restored as a whole.
+        let slot = tc.get_continuation_preserved_embedder_data();
         let previous = install_trace(tc, trace.as_ref());
         let invocation_limits = match &job {
             crate::WorkerJob::Fetch {
@@ -3831,6 +3914,7 @@ impl Worker {
             Begun::Nothing => (None, Vec::new()),
         };
         restore_trace(tc, previous);
+        tc.set_continuation_preserved_embedder_data(slot);
         out
     }
 
@@ -4166,6 +4250,7 @@ fn begin<'s>(
         context.own_body_stream(stream_id);
     }
     let guard = CurrentGuard::enter(context.clone());
+    install_io_context(tc, &context);
     context.begin_cpu_turn();
     let target = match entrypoint {
         Some(entrypoint) => FetchTarget::Entrypoint(entrypoint),
@@ -4261,6 +4346,7 @@ fn begin_entrypoint_rpc(
         invocation_limits,
     ));
     let guard = CurrentGuard::enter(context.clone());
+    install_io_context(tc, &context);
     context.begin_cpu_turn();
     let started = (|| {
         let f = internal_function(tc, "__dispatchEntrypointRpc")?;
@@ -4517,6 +4603,7 @@ fn begin_queue(
 ) -> Begun {
     let context = IoContext::with_resource_limits(actor_runtime_state(tc).resource_limits);
     let guard = CurrentGuard::enter(context.clone());
+    install_io_context(tc, &context);
     context.begin_cpu_turn();
     let started = (|| {
         let dispatch = internal_function(tc, "__dispatchEntrypointQueue")?;
@@ -5401,6 +5488,8 @@ impl Worker {
             // read Cloudflare.compatibilityFlags at module scope.
             inject_compatibility_flags(scope, compat)?;
             inject_storage_compatibility(scope, compat)?;
+            // Before the module evaluates, so module scope reads it.
+            populate_process_env(scope, &config)?;
 
             let module = match compile_module(scope, &config.main_module_name, src) {
                 Some(m) => m,
@@ -6317,9 +6406,12 @@ ops! { OP_NAMES, install_op_functions,
         "__event_end" => op_event_end,
         "__pending_event_begin" => op_pending_event_begin,
         "__pending_event_end" => op_pending_event_end,
-        "__vfs_mkdir" => op_vfs_mkdir,
-        "__vfs_read_file" => op_vfs_read_file,
-        "__vfs_stat" => op_vfs_stat,
+        "__vfs_mkdir" => vfs::op_vfs_mkdir,
+        "__vfs_read_file" => vfs::op_vfs_read_file,
+        "__vfs_readdir" => vfs::op_vfs_readdir,
+        "__vfs_remove" => vfs::op_vfs_remove,
+        "__vfs_write" => vfs::op_vfs_write,
+        "__vfs_stat" => vfs::op_vfs_stat,
         "__wait_until" => op_wait_until,
         "__wait_until_active" => op_wait_until_active,
         "__event_depth" => op_event_depth,
@@ -9575,7 +9667,9 @@ fn op_heap_over_admission_share(
 // of the object record.
 pub(crate) mod r2_ops;
 mod storage_ops;
+mod vfs;
 use storage_ops::{actor_runtime_state, throw_storage_error};
+use vfs::RequestVfs;
 
 /// $$urlParse(input, base?) -> {protocol,username,password,host,port,pathname,search,hash,href}
 /// Backed by the WHATWG-conformant `url` crate.
@@ -9829,23 +9923,6 @@ struct IoEventState {
     arm_gates_sealed: bool,
 }
 
-/// The writable directory subset of Workerd's per-request virtual filesystem.
-///
-/// The first compatibility slice stores directories only. Keeping the tree on
-/// `IoContext` is the isolation mechanism: async continuations for one request
-/// share it, while a concurrent or later request receives a different tree.
-/// No path can escape into the host filesystem.
-struct RequestVfs {
-    nodes: HashMap<String, VfsNode>,
-}
-
-/// Keep the node kind in the tree, even while the first slice can only create
-/// directories. Deno's VFS uses the same entry-typed shape; a path-only set
-/// would make a later file node indistinguishable from its parent directory.
-enum VfsNode {
-    Directory { writable: bool },
-}
-
 /// The read-only `/bundle` projection of a worker's own modules.
 ///
 /// This is isolate state, not request state. The bytes are immutable and
@@ -9933,27 +10010,6 @@ impl BundleTree {
     }
 }
 
-enum VfsMkdirResult {
-    Created(Option<String>),
-    Error(&'static str),
-}
-
-impl Default for RequestVfs {
-    fn default() -> Self {
-        Self {
-            nodes: [
-                ("/", false),
-                ("/bundle", false),
-                ("/dev", false),
-                ("/tmp", true),
-            ]
-            .into_iter()
-            .map(|(path, writable)| (path.to_string(), VfsNode::Directory { writable }))
-            .collect(),
-        }
-    }
-}
-
 struct InputGateClaims {
     /// Set before the turn owner releases its final `IoContext` owner. The
     /// watch wakes its pending gate acquisition even when the promise
@@ -9971,57 +10027,6 @@ impl Default for InputGateClaims {
             held: HashMap::new(),
             retirement,
         }
-    }
-}
-
-impl RequestVfs {
-    fn stat(&self, path: &str) -> Option<bool> {
-        self.nodes.get(path).map(|node| match node {
-            VfsNode::Directory { writable } => *writable,
-        })
-    }
-
-    fn mkdir(&mut self, path: &str, recursive: bool) -> VfsMkdirResult {
-        if path != "/tmp" && !path.starts_with("/tmp/") {
-            return VfsMkdirResult::Error("EPERM");
-        }
-        if self.stat(path).is_some() {
-            return VfsMkdirResult::Created(None);
-        }
-        if recursive {
-            let mut current = "/tmp".to_string();
-            let mut first_created = None;
-            for segment in path.trim_start_matches("/tmp/").split('/') {
-                current.push('/');
-                current.push_str(segment);
-                if self
-                    .nodes
-                    .insert(current.clone(), VfsNode::Directory { writable: true })
-                    .is_none()
-                    && first_created.is_none()
-                {
-                    first_created = Some(current.clone());
-                }
-            }
-            return VfsMkdirResult::Created(first_created);
-        }
-        let parent =
-            path.rsplit_once('/').map_or(
-                "/",
-                |(parent, _)| {
-                    if parent.is_empty() {
-                        "/"
-                    } else {
-                        parent
-                    }
-                },
-            );
-        if self.stat(parent).is_none() {
-            return VfsMkdirResult::Error("ENOENT");
-        }
-        self.nodes
-            .insert(path.to_string(), VfsNode::Directory { writable: true });
-        VfsMkdirResult::Created(None)
     }
 }
 
@@ -10062,6 +10067,9 @@ pub struct IoContext {
     /// cross-entry input gate adds an explicit claim that prevents this
     /// context's `InFlight` from retiring while its callback still runs.
     continuation: Option<(u64, Weak<ActorRuntimeState>)>,
+    /// The `/tmp` identity of a stateless request, given when it first needs
+    /// one. See [`install_tmp_token`].
+    tmp_token: OnceLock<(u64, Weak<ActorRuntimeState>)>,
     /// This caller's delivery order for each cell it has called. See
     /// `CallOrder` — it is here rather than in a process-wide map because
     /// nothing outside this caller ever reads it.
@@ -10343,6 +10351,7 @@ impl IoContext {
     fn with_options(limits: Option<ResourceLimits>, tail_reporting: bool) -> Arc<Self> {
         Arc::new(Self {
             continuation: None,
+            tmp_token: OnceLock::new(),
             call_chains: Mutex::new(CallChains::default()),
             events: Mutex::new(IoEventState::default()),
             vfs: OnceLock::new(),
@@ -10377,6 +10386,7 @@ impl IoContext {
         let id = allocate_io_context_id();
         let context = Arc::new(Self {
             continuation: Some((id, Arc::downgrade(runtime_state))),
+            tmp_token: OnceLock::new(),
             call_chains: Mutex::new(CallChains::default()),
             events: Mutex::new(IoEventState::default()),
             vfs: OnceLock::new(),
@@ -10736,6 +10746,11 @@ impl Drop for IoContext {
                 runtime_state.io_contexts.lock().unwrap().remove(id);
             }
         }
+        if let Some((id, runtime_state)) = self.tmp_token.get() {
+            if let Some(runtime_state) = runtime_state.upgrade() {
+                runtime_state.tmp_contexts.lock().unwrap().remove(id);
+            }
+        }
         if let Some(payload) = first_panic {
             if already_panicking {
                 std::mem::forget(payload);
@@ -10771,6 +10786,12 @@ thread_local! {
     /// turns. Never set by JS.
     static CURRENT: RefCell<Option<Arc<IoContext>>> =
         const { RefCell::new(None) };
+
+    /// The default context of a thread that has had none installed. Kept apart
+    /// from `CURRENT` so that code can tell an installed request from this
+    /// fallback, which is shared by everything that runs on the thread.
+    static DEFAULT_CONTEXT: RefCell<Option<Arc<IoContext>>> =
+        const { RefCell::new(None) };
 }
 
 /// Install `context` for the duration of a turn, restoring whatever was
@@ -10802,10 +10823,16 @@ impl Drop for CurrentGuard {
 /// Isolation is a property of *installing* a context, so it arrives with the
 /// paths that need it rather than being retrofitted to every caller at once.
 fn current_context() -> Arc<IoContext> {
-    CURRENT.with(|current| {
-        let mut current = current.borrow_mut();
-        current.get_or_insert_with(IoContext::new).clone()
-    })
+    CURRENT
+        .with(|current| current.borrow().clone())
+        .unwrap_or_else(|| {
+            DEFAULT_CONTEXT.with(|default| {
+                default
+                    .borrow_mut()
+                    .get_or_insert_with(IoContext::new)
+                    .clone()
+            })
+        })
 }
 
 fn op_event_begin(
@@ -10840,10 +10867,7 @@ fn op_event_end<'s>(
 /// during another request's microtask checkpoint. A missing captured context
 /// is retired, so it must not fall back to the request driving this turn.
 fn reaction_or_current_context(scope: &mut v8::PinScope) -> Option<Arc<IoContext>> {
-    match reaction_continuation_id(scope) {
-        Some(id) => actor_runtime_state(scope).io_context(id),
-        None => Some(current_context()),
-    }
+    reaction_context_or(scope, || Some(current_context()))
 }
 
 fn op_pending_event_begin(
@@ -10872,67 +10896,44 @@ fn op_pending_event_end(
     }
 }
 
-/// Create one directory in the current request's virtual `/tmp` tree.
-/// A created path starts with `/`, an error is a Node code, and an empty string
-/// means that no path must be returned. The disjoint representation keeps the
-/// result and its meaning together without allocating a JS object for each
-/// directory segment.
-fn op_vfs_mkdir(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let path = args.get(0).to_rust_string_lossy(scope);
-    let recursive = args.get(1).boolean_value(scope);
-    let result = event_context(scope)
-        .vfs
-        .get_or_init(|| Mutex::new(RequestVfs::default()))
-        .lock()
-        .unwrap()
-        .mkdir(&path, recursive);
-    let result = match result {
-        VfsMkdirResult::Created(Some(path)) => path,
-        VfsMkdirResult::Created(None) => String::new(),
-        VfsMkdirResult::Error(code) => code.to_string(),
-    };
-    rv.set(v8::String::new(scope, &result).unwrap().into());
+/// The context a request installed, never a default one.
+///
+/// Code that runs with no request (a module evaluating while the isolate
+/// loads) would otherwise fall back to the thread's default context, which is
+/// shared by every script on the thread and never dropped: its `/tmp` would
+/// outlive the script and leak into the next one. Only a context a token
+/// names counts; the lazily created default never does. A reaction of a
+/// finished event has a token whose context is gone and gets no `/tmp` at all,
+/// rather than the `/tmp` of the request that runs the checkpoint.
+///
+/// A stateless request answers only through its `/tmp` token. One that began
+/// before the Worker first loaded `node:fs` has none, and its reactions cannot
+/// be told from the code of the request driving the turn, so it gets no `/tmp`
+/// rather than a guess.
+fn request_context(scope: &mut v8::PinScope) -> Option<Arc<IoContext>> {
+    if let Some(id) = tmp_token_id(scope) {
+        return actor_runtime_state(scope).tmp_context(id);
+    }
+    reaction_context_or(scope, || None)
 }
 
-/// Return `[kind, size]`, where kind is 0 for a missing path, 1 for a
-/// read-only directory, 2 for a writable directory, and 3 for a read-only
-/// file. Only a file has a size; a directory reports 0, matching workerd.
-///
-/// The pair travels together because a caller that knows a path is a file
-/// always needs its size to build `Stats`, and a second lookup could observe a
-/// different tree.
-fn op_vfs_stat(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let path = args.get(0).to_rust_string_lossy(scope);
-    let (kind, size) = match event_context(scope)
-        .vfs
-        .get_or_init(|| Mutex::new(RequestVfs::default()))
-        .lock()
-        .unwrap()
-        .stat(&path)
-    {
-        Some(writable) => (if writable { 2 } else { 1 }, 0),
-        // Only a path the writable tree does not claim can be a bundle path,
-        // so the request tree stays authoritative for `/tmp`.
-        None => match bundle_node(scope, &path) {
-            Some(BundleStat::Directory) => (1, 0),
-            Some(BundleStat::File(size)) => (3, size),
-            None => (0, 0),
-        },
-    };
-    let pair = v8::Array::new(scope, 2);
-    let kind = v8::Integer::new(scope, kind).into();
-    let size = v8::Number::new(scope, size as f64).into();
-    pair.set_index(scope, 0, kind);
-    pair.set_index(scope, 1, size);
-    rv.set(pair.into());
+/// The error code for a `/tmp` change that has no request-local tree: a
+/// stateless request without a token began before `node:fs` was loaded, and
+/// code with no request at all (module scope) has none either.
+fn tmp_unavailable_code(scope: &mut v8::PinScope) -> &'static str {
+    let stateless_without_token = tmp_token_id(scope).is_none()
+        && reaction_continuation_id(scope).is_none()
+        && CURRENT.with(|current| {
+            current
+                .borrow()
+                .as_ref()
+                .is_some_and(|current| current.continuation.is_none())
+        });
+    if stateless_without_token {
+        "ENOTMPTOKEN"
+    } else {
+        "ENOREQUEST"
+    }
 }
 
 /// What a bundle path is, without copying the bytes a stat does not need.
@@ -10948,29 +10949,6 @@ fn bundle_node(scope: &mut v8::PinScope, path: &str) -> Option<BundleStat> {
         BundleNode::Directory => Some(BundleStat::Directory),
         BundleNode::File(bytes) => Some(BundleStat::File(bytes.len())),
     }
-}
-
-/// Read a whole bundle file. Returns an `ArrayBuffer` of the module's bytes,
-/// or `null` when the path is not a bundle file, so the caller raises the
-/// `ENOENT` that names the syscall it was performing.
-fn op_vfs_read_file(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let path = args.get(0).to_rust_string_lossy(scope);
-    let Some(bundle) = scope.get_slot::<Arc<BundleFs>>().cloned() else {
-        return;
-    };
-    let tree = bundle.tree();
-    let Some(BundleNode::File(bytes)) = tree.nodes.get(&path) else {
-        return;
-    };
-    // One copy into the V8 heap. The projected `Bytes` stays shared, so a
-    // second read of the same module does not re-copy the config's source.
-    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes.to_vec()).make_shared();
-    let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
-    rv.set(buffer.into());
 }
 
 fn op_wait_until<'s>(
@@ -11547,8 +11525,8 @@ use bootstrap::{
     adopt_cell, adopt_embedded_cell, begin_event_context, build_env, end_event_context,
     harness_env, inject_compatibility_flags, inject_containers, inject_crons, inject_kv_limits,
     inject_namespace_keys, inject_queue_config, inject_routing, inject_storage_compatibility,
-    inject_workflows, install_harness, install_prelude, populate_cf_exports, register_class,
-    register_entrypoints, validate_workflow_classes, EmbeddedStartup,
+    inject_workflows, install_harness, install_prelude, populate_cf_exports, populate_process_env,
+    register_class, register_entrypoints, validate_workflow_classes, EmbeddedStartup,
 };
 use modules::{
     compile_module, host_import_module_dynamically, install_lazy_globals, op_builtin_module,
@@ -11742,4 +11720,27 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
         write_position: None,
         observed_position: None,
     })
+}
+
+#[cfg(test)]
+mod current_context_tests {
+    use super::{current_context, CurrentGuard, IoContext, CURRENT};
+
+    #[test]
+    fn the_lazy_default_context_is_never_an_installed_request() {
+        // Module scope runs with no request but may still reach for a context.
+        let default = current_context();
+        assert!(
+            CURRENT.with(|current| current.borrow().is_none()),
+            "creating the default must not install it"
+        );
+        // A request installed by a guard is what counts, and it goes away.
+        let request = IoContext::new();
+        {
+            let _guard = CurrentGuard::enter(request.clone());
+            assert!(CURRENT.with(|current| current.borrow().is_some()));
+        }
+        assert!(CURRENT.with(|current| current.borrow().is_none()));
+        assert!(std::sync::Arc::ptr_eq(&default, &current_context()));
+    }
 }

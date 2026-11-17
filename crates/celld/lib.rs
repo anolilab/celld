@@ -212,6 +212,12 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
         sqlite_vec: has_flag("sqlite_vec"),
         websocket_standard_binary_type: has_flag("websocket_standard_binary_type"),
         queue_json_messages: switch("queue_json_messages", "queue_v8_messages", "2024-03-18"),
+        populate_process_env: (has_flag("nodejs_compat") || has_flag("nodejs_compat_v2"))
+            && switch(
+                "nodejs_compat_populate_process_env",
+                "nodejs_compat_do_not_populate_process_env",
+                "2025-04-01",
+            ),
     }
 }
 
