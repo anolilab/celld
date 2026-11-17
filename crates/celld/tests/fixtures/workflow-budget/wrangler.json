@@ -18,6 +18,37 @@
       "binding": "UNDO",
       "name": "undo",
       "class_name": "Undo"
+    },
+    {
+      "binding": "LATE",
+      "name": "late",
+      "class_name": "Late"
+    },
+    {
+      "binding": "NAPS",
+      "name": "naps",
+      "class_name": "Naps"
+    },
+    {
+      "binding": "FENCE",
+      "name": "fence",
+      "class_name": "Fence"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "COUNTER",
+        "class_name": "Counter"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "Counter"
+      ]
     }
   ]
 }

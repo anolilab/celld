@@ -8789,6 +8789,12 @@ const __wfTrackStorageFailures = (storage, driver) => {
   for (const name of ["get", "put", "transactionSync"]) {
     Object.defineProperty(tracked, name, {
       value(...args) {
+        // A fenced drive no longer owns the ledger: a callback it abandoned
+        // must not record its outcome over the replacement drive's records.
+        if (name !== "get" && driver.fenced()) {
+          if (name === "put") return __wfNever;
+          throw new Error("the workflow drive was fenced");
+        }
         try {
           const result = storage[name](...args);
           if (result !== null && typeof result === "object" &&
@@ -8815,6 +8821,13 @@ const __wfTrackStorageFailures = (storage, driver) => {
 // distinct keys in call order, and a repeated name in a loop cannot collide.
 const __wfMakeStep = (driver) => {
   const storage = driver.storage;
+  // The handler budget bounds one turn, not the run. A turn that has used
+  // half of it and made progress hands the rest to a fresh turn: the replay
+  // skips every finished step, so the next turn continues where this one
+  // stopped. A replay alone never yields, or a slow one would never end.
+  const turnSpent = () =>
+    driver.executed > 0 &&
+    Date.now() - driver.startedMs >= __cell.handlerBudgetMs / 2;
   // The shared step frame. `body` resolves to {value} or {block: at, kind};
   // a blocked step leaves its promise unsettled forever in this invocation.
   // The running counter covers the whole body, ledger reads included, so
@@ -8925,14 +8938,7 @@ const __wfMakeStep = (driver) => {
       if (record !== undefined && record.nextAt > Date.now()) {
         return { block: record.nextAt, kind: "retry" };
       }
-      // The handler budget bounds one turn, not the run. A turn that has
-      // used half of it and ran a step hands the rest to a fresh turn: the
-      // replay skips every finished step, so the next turn continues here.
-      if (driver.executed > 0 &&
-          Date.now() - driver.startedMs >= __cell.handlerBudgetMs / 2) {
-        return { block: Date.now(), kind: "yield" };
-      }
-      driver.executed += 1;
+      if (turnSpent()) return { block: Date.now(), kind: "yield" };
       const attempt = (record === undefined ? 0 : record.attempt) + 1;
       const historyOrdinal = record?.ordinal ?? ordinal;
       const retries = config.retries ??
@@ -8940,12 +8946,20 @@ const __wfMakeStep = (driver) => {
       const timeout = config.timeout ?? "10 minutes";
       // An attempt must end before its handler does. The handler's expiry
       // would cancel it without recording a failure, so the step would run
-      // again unchanged, forever. A timeout records the failure instead and
-      // the retry policy applies.
-      const timeoutMs = Math.min(
+      // again unchanged. A timeout records the failure instead and the retry
+      // policy applies. The cap is what is left of 90% of the budget; a step
+      // that would not get its full timeout starts in a fresh turn instead.
+      const wanted = Math.min(
         __wfDuration(timeout, `the timeout of step ${JSON.stringify(name)}`),
         Math.floor(__cell.handlerBudgetMs * 0.9),
       );
+      const remaining = Math.floor(__cell.handlerBudgetMs * 0.9) -
+        (Date.now() - driver.startedMs);
+      if (driver.executed > 0 && remaining < wanted) {
+        return { block: Date.now(), kind: "yield" };
+      }
+      driver.executed += 1;
+      const timeoutMs = Math.max(1, Math.min(wanted, remaining));
       // Upstream omits a dynamic delay from the step context. Copying the
       // config verbatim would expose the callback to itself as retry policy,
       // while callers expect only the serializable limit and backoff fields.
@@ -9039,6 +9053,9 @@ const __wfMakeStep = (driver) => {
     if (record !== undefined && record.status === "completed") {
       return { value: undefined };
     }
+    // Sleeps that complete at once count as progress, so a run of them hands
+    // over to a fresh turn like a run of steps.
+    if (turnSpent()) return { block: Date.now(), kind: "yield" };
     const historyOrdinal = record?.ordinal ?? ordinal;
     let at = record === undefined ? undefined : record.deadline;
     if (at === undefined) {
@@ -9065,6 +9082,7 @@ const __wfMakeStep = (driver) => {
         status: "completed",
         ordinal: historyOrdinal,
       });
+      driver.executed += 1;
       return { value: undefined };
     }
     return { block: at, kind: "sleep" };
@@ -9608,6 +9626,8 @@ const __WorkflowCell = (() => {
       pauseRequested: false,
       finished: false,
       startedMs: Date.now(),
+      // A newer drive or a fence took over this instance's token.
+      fenced: () => token !== this._wfDriveToken,
       // Step callbacks started in this turn. A turn yields only after it
       // made progress, or a replay slower than the yield point never ends.
       executed: 0,

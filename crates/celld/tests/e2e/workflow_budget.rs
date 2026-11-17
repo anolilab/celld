@@ -1,11 +1,14 @@
 //! The handler budget bounds one turn of a workflow, not the whole run, and a
 //! step with a rollback handler is refused.
 
+// The tests wait out real time: a fenced drive has to outlive the handler.
+#![allow(clippy::disallowed_methods)]
+
 use std::time::Duration;
 
 use serde_json::Value;
 
-use super::harness::{wait_until, Server};
+use super::harness::{observe_for, wait_until, Server};
 
 const WAIT: Duration = Duration::from_secs(60);
 const BUDGET: (&str, &str) = ("CELLD_HANDLER_BUDGET_S", "2");
@@ -64,4 +67,75 @@ async fn a_step_with_a_rollback_handler_fails_with_a_clear_error() {
         message.contains("rollbackOptions are not implemented"),
         "{done}"
     );
+}
+
+async fn finished(server: &Server, flow: &str) -> Value {
+    wait_until("the workflow to finish", WAIT, || async {
+        let status = status(server, flow).await;
+        (status["status"] != "running"
+            && status["status"] != "queued"
+            && status["status"] != "waiting")
+            .then_some(status)
+    })
+    .await
+}
+
+async fn count(server: &Server, key: &str) -> u64 {
+    server.get_json::<Value>(&format!("/count?key={key}")).await["n"]
+        .as_u64()
+        .expect("a count")
+}
+
+#[tokio::test]
+async fn a_step_that_cannot_get_its_full_timeout_starts_in_a_fresh_turn() {
+    let server = Server::start("workflow-budget", &[BUDGET]).await;
+    // The second step wants 1.7 s but only about 1.3 s of the 1.8 s cap is left.
+    server.get_text("/start?flow=late").await;
+
+    let done = finished(&server, "late").await;
+
+    assert_eq!(done["status"], "complete", "{done}");
+    assert_eq!(done["output"], "ok", "{done}");
+    // Started in the first turn, the handler would have ended it and the alarm
+    // retry would have run the callback a second time.
+    assert_eq!(count(&server, "late").await, 1);
+}
+
+#[tokio::test]
+async fn sleeps_that_complete_at_once_count_toward_the_turn_budget() {
+    let server = Server::start("workflow-budget", &[BUDGET]).await;
+    // Twelve zero-length sleeps, 200 ms of run() time before each.
+    server
+        .get_text("/start?flow=naps&steps=12&stepMs=200")
+        .await;
+
+    let done = finished(&server, "naps").await;
+
+    assert_eq!(done["status"], "complete", "{done}");
+    // Without the count no turn hands over, and the one turn runs past the
+    // 1.0 s yield point until the handler ends it.
+    let longest = count(&server, "naps").await;
+    assert!(
+        longest < 1600,
+        "a turn ran for {longest} ms of a 2000 ms budget"
+    );
+}
+
+#[tokio::test]
+async fn a_fenced_drive_cannot_overwrite_the_record_of_its_replacement() {
+    let server = Server::start("workflow-budget", &[BUDGET]).await;
+    server.get_text("/start?flow=fence").await;
+
+    // The first drive hangs in its attempt, times out after 1 s, and then waits
+    // in its retry delay. A signal after the 2 s budget fences it and starts the
+    // replacement drive, whose attempt completes and lets the delay return.
+    observe_for(Duration::from_millis(2300)).await;
+    server.get_text("/poke?flow=fence").await;
+
+    let done = finished(&server, "fence").await;
+
+    assert_eq!(done["status"], "complete", "{done}");
+    assert_eq!(done["output"]["value"], "ok", "{done}");
+    // The fenced drive's retry record would send the replay back into the step.
+    assert_eq!(count(&server, "fence").await, 2);
 }
