@@ -1140,6 +1140,11 @@ impl Lazy {
         labels.push("placed");
     }
 
+    /// Whether the session has placed the waived id `c` on a peer.
+    fn placed_waived(p: &Proc, c: Cell) -> bool {
+        p.placed[c] && p.cs[c] == Cs::Waived
+    }
+
     /// Whether a peer may claim cell `c` as a placement: the session placed
     /// the id and a live lease has the id's tag as its own.
     fn placement_live(&self, w: &World, c: Cell) -> bool {
@@ -1153,6 +1158,14 @@ impl Lazy {
         self.cfg.early_handoff
             && w.s.node.live
             && rec.is_some_and(|r| r.released && w.s.node.carried.contains(&r.by))
+    }
+
+    /// Whether a task that read the record may go on without waiting for the
+    /// seal: the gate holds, the id is placed on a peer, or it is a handoff.
+    fn past_gate(&self, w: &World, t: &Task) -> bool {
+        self.gate_ok(w, t.rec.as_ref())
+            || self.placement_live(w, t.c)
+            || self.handed_off(w, t.rec.as_ref())
     }
 
     /// An acknowledgement on a bucket proof: the row is uploaded under the
@@ -1423,7 +1436,16 @@ impl Lazy {
             Some(n) => n,
             // A cell with a plain record of the minting session: the entry is
             // made for the release, under a nonce of its own.
-            None if self.d().needs_trace() && k == self.cfg.minter && ch.left[c].is_none() => {
+            None if self.d().needs_trace() && k == self.cfg.minter => {
+                if ch.left[c].as_ref().is_some_and(|l| l.done.is_some()) {
+                    // The chunk holds the confirmed leave already.
+                    w.ps[ki].cs[c] = Cs::Active {
+                        ep,
+                        lazy,
+                        synced: true,
+                    };
+                    return;
+                }
                 let n = w.ps[ki].next_nonce;
                 w.ps[ki].next_nonce += 1;
                 n
@@ -2919,8 +2941,9 @@ impl Model for Lazy {
             // second; without the rule the session claims the id itself.
             if w.b.reclaims > 0 && self.can_mint(w, k) {
                 for c in 0..CELLS {
-                    let placed = p.placed[c] && p.cs[c] == Cs::Waived;
-                    if (placed || p.cs[c] == Cs::Released) && w.s.own[c].is_none() {
+                    if (Self::placed_waived(p, c) || p.cs[c] == Cs::Released)
+                        && w.s.own[c].is_none()
+                    {
                         a.push(Act::Reclaim(c));
                     }
                 }
@@ -3101,9 +3124,7 @@ impl Model for Lazy {
                 Some(task) => {
                     let waits = task.st == TSt::ReadChunk
                         && self.d().taker_waits_for_seal
-                        && !self.gate_ok(w, task.rec.as_ref())
-                        && !self.placement_live(w, task.c)
-                        && !self.handed_off(w, task.rec.as_ref());
+                        && !self.past_gate(w, task);
                     if matches!(
                         task.st,
                         TSt::ReadRec | TSt::ReadChunk | TSt::MarkChunk | TSt::Settle
@@ -3238,7 +3259,7 @@ impl Model for Lazy {
                 if !self.d().session_claims_once {
                     l.push("session_claims_again");
                     self.std_put(&mut w, k, *c, &mut l);
-                } else if w.ps[usize::from(k) - 1].placed[*c] {
+                } else if Self::placed_waived(&w.ps[usize::from(k) - 1], *c) {
                     // A placement writes nothing: the peer decides.
                     l.push("placed_again");
                 } else {
@@ -3351,16 +3372,7 @@ impl Model for Lazy {
                     w.tk[usize::from(*i)]
                         .task
                         .as_ref()
-                        .is_some_and(|t| t.st == TSt::ReadChunk)
-                        && (self.gate_ok(
-                            w,
-                            w.tk[usize::from(*i)]
-                                .task
-                                .as_ref()
-                                .and_then(|t| t.rec.as_ref()),
-                        ) || w.tk[usize::from(*i)].task.as_ref().is_some_and(|t| {
-                            self.placement_live(w, t.c) || self.handed_off(w, t.rec.as_ref())
-                        }))
+                        .is_some_and(|t| t.st == TSt::ReadChunk && self.past_gate(w, t))
                 };
                 if self.cfg.fresh_reads && ready(&w) {
                     self.taker_step(&mut w, *i, &mut l);

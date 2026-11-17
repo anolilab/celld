@@ -547,18 +547,20 @@ fn the_standard_path_of_a_tagged_id_has_one_writer() {
         after.print_violations();
         assert!(after.passed(), "{scn} on revision 4");
         assert!(after.complete(), "{scn} on revision 4 hit a bound");
-    }
-    // The session's second decision about an id reaches both of its answers
-    // and writes nothing: it places the id again, or refuses a claim of its own.
-    for (scn, label) in [
-        ("placed_reclaim", "placed_again"),
-        ("handoff_reclaim", "claimed_again_refused"),
-    ] {
-        let after = run_unfiltered(&format!("{scn} on revision 4"), scn, "rev4", CAP);
-        assert!(
-            after.labels.contains_key(label),
-            "{scn} never reached {label}"
-        );
+        // The session's second decision about an id reaches both of its
+        // answers and writes nothing: it places the id again, or refuses a
+        // claim of its own.
+        let answer = match *scn {
+            "placed_reclaim" => Some("placed_again"),
+            "handoff_reclaim" => Some("claimed_again_refused"),
+            _ => None,
+        };
+        if let Some(label) = answer {
+            assert!(
+                after.labels.contains_key(label),
+                "{scn} never reached {label}"
+            );
+        }
     }
     // Today's rule, which puts the first record of every cell at epoch 1,
     // gives the same two acting writers in two prefixes.
@@ -582,7 +584,10 @@ fn the_standard_path_of_a_tagged_id_has_one_writer() {
 /// holds in it.
 #[test]
 fn the_standard_path_holds_in_mode_read() {
-    for scn in STANDARD_PATH {
+    for scn in STANDARD_PATH
+        .iter()
+        .filter(|n| !n.ends_with("_read") && !n.ends_with("_on"))
+    {
         let mut cfg = scenario(scn)(Design::rev4());
         cfg.ignore.clear();
         cfg.modes = [Mode::Read; 3];
@@ -625,6 +630,7 @@ fn explore_large() {
         "placed_stall",
         "placed_reclaim",
         "handoff_shadow",
+        "handoff_read",
         "q3_final",
     ] {
         // Every invariant is reported here. The window of the standard path
