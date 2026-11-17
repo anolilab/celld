@@ -3,6 +3,7 @@
 mod e2e {
     pub mod alarms;
     pub mod body_clone;
+    pub mod claim_provenance;
     pub mod container_exec;
     pub mod container_fence;
     pub mod container_images;

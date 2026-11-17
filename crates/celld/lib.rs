@@ -25,6 +25,7 @@ pub(crate) mod cell_directory_segments;
 pub mod cell_dispatch;
 mod cell_host;
 pub mod cell_runtime;
+pub mod claim_provenance;
 pub mod clean_reload;
 pub mod cli_options;
 pub mod cli_output;

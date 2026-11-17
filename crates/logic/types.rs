@@ -1048,6 +1048,27 @@ pub enum EvictionAdmission {
     Pending,
 }
 
+/// Whom the record version a claim consumed named, as the executor counts
+/// claims. It only labels a count; nothing branches on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimPrior {
+    /// No node: the record was released or absent.
+    Released,
+    /// The node that makes the claim: a restart of the same node.
+    ThisNode,
+    /// Another node.
+    OtherNode,
+}
+
+/// Why an owner record is released, as the executor counts releases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseReason {
+    /// The node is draining.
+    Drain,
+    /// The node is not draining: a balancing move.
+    Handoff,
+}
+
 /// Work performed outside the core. Every asynchronous effect is versioned;
 /// completion events with an obsolete `op` are ignored.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1113,6 +1134,7 @@ pub enum Effect {
         guard: CasGuard,
         epoch: Epoch,
         takeover: bool,
+        prior: ClaimPrior,
     },
     /// Bring the bucket's wake entry for this cell into line with its alarm.
     ///
@@ -1131,6 +1153,7 @@ pub enum Effect {
         op: OpId,
         cell: CellId,
         epoch: Epoch,
+        reason: ReleaseReason,
     },
     /// Ask a compatible peer to acquire a cell whose owner record was just
     /// released. The result acknowledges authority acquisition. Replica

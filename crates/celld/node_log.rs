@@ -6673,6 +6673,15 @@ impl NodeLogManager {
         self.bundle_index.lock().unwrap().retained(mono_ms())
     }
 
+    /// Whether a fleet ensemble is installed and not degraded.
+    pub(crate) fn ensemble_active(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|shipper| shipper.is_active())
+    }
+
     pub(crate) fn bundle_active(&self) -> bool {
         // Draining rides the bundle path even while the shipper is
         // DEGRADED: degrade stops fleet proofs, not tiering. The credit

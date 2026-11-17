@@ -329,3 +329,66 @@ fn ingress_only_node_drops_a_wake_hint_without_reading_the_owner() {
     assert!(state.capacity_waiters.is_empty());
     assert!(state.cells.get("cell").is_none_or(|cell| !cell.alarm_wake));
 }
+
+/// The `CasOwner` that answers an owner read of a record that names `record`.
+fn claim_after_read(state: &mut State, cell: &str, record: Option<&str>) -> Effect {
+    let op = request(state, 1, cell);
+    let effects = on_event(
+        state,
+        Event::OwnerRead {
+            op,
+            now_ms: NOW_MS,
+            result: Ok(Some(OwnerRecord {
+                node: record.map(Into::into),
+                epoch: 1,
+                etag: "owner-etag".into(),
+            })),
+        },
+    );
+    effects
+        .into_iter()
+        .find(|effect| matches!(effect, Effect::CasOwner { .. }))
+        .expect("the owner read ends in a claim")
+}
+
+#[test]
+fn a_claim_names_whom_it_displaces() {
+    for (record, expected) in [
+        (None, ClaimPrior::Released),
+        (Some("ingress"), ClaimPrior::ThisNode),
+    ] {
+        let mut state = started(2);
+        let claim = claim_after_read(&mut state, "cell", record);
+        assert!(
+            matches!(&claim, Effect::CasOwner { epoch: 2, prior, .. } if *prior == expected),
+            "{record:?}: {claim:?}"
+        );
+    }
+}
+
+#[test]
+fn a_takeover_names_the_dead_owner_as_another_node() {
+    let mut state = started(2);
+    let effects = dead_owner_resolved(&mut state, 1, "cell");
+    let op = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::RecoverNodeLog { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("log recovery");
+
+    let effects = on_event(&mut state, Event::NodeLogRecovered { op, result: Ok(()) });
+
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::CasOwner {
+                takeover: true,
+                prior: ClaimPrior::OtherNode,
+                ..
+            }
+        )),
+        "{effects:?}"
+    );
+}
