@@ -97,6 +97,9 @@ pub(crate) struct Reachable {
     /// even when the cell moves between calls.
     entrances: Vec<Entrance>,
     subject: Subject,
+    /// What to say when no entrance accepts a connection, for a caller that
+    /// knows why (a node it expects on this host that is not running).
+    unreachable: Option<String>,
 }
 
 impl Reachable {
@@ -167,7 +170,15 @@ impl Reachable {
                     path: path.clone(),
                 })
                 .collect(),
+            unreachable: None,
         })
+    }
+
+    /// Answer a connection refused by every entrance with `message` rather
+    /// than the transport error.
+    pub(crate) fn when_unreachable(mut self, message: String) -> Self {
+        self.unreachable = Some(message);
+        self
     }
 
     /// A lease outlives the node that wrote it, and a node that drains keeps
@@ -248,6 +259,13 @@ impl Reachable {
                 Err(error) if error.is_connect() && !last => {
                     refused.push(format!("{url}: {error}"));
                     continue;
+                }
+                Err(error) if error.is_connect() && self.unreachable.is_some() => {
+                    bail!(
+                        "{}{}",
+                        self.unreachable.as_deref().unwrap_or_default(),
+                        report(&refused)
+                    );
                 }
                 Err(error) => {
                     return Err(anyhow::Error::new(error)).with_context(|| {
@@ -364,6 +382,7 @@ mod operator_token_tests {
                 source: "d1-cli",
                 timeout: Duration::from_secs(5),
             },
+            unreachable: None,
         };
         let _ = reachable.call(serde_json::json!({})).await;
         assert_eq!(
@@ -399,5 +418,42 @@ mod address_tests {
         assert!(!refused(Addresses::Private, "10.0.0.5:9001"));
         assert!(refused(Addresses::Private, "8.8.8.8:9001"));
         assert!(!refused(Addresses::Public, "8.8.8.8:9001"));
+    }
+}
+
+#[cfg(test)]
+mod unreachable_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_refused_connection_gets_the_callers_message() {
+        // A port nobody listens on: bind, note the port, drop the listener.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let path = "/runtime/scope".to_string();
+        let reachable = Reachable {
+            http: reqwest::Client::new(),
+            auth: crate::peer_auth::PeerAuth::new([6; 32], "d1-cli").unwrap(),
+            entrances: vec![Entrance {
+                node: "node-b".to_string(),
+                url: format!("http://127.0.0.1:{port}{path}"),
+                path,
+            }],
+            subject: Subject {
+                noun: "database",
+                source: "d1-cli",
+                timeout: Duration::from_secs(5),
+            },
+            unreachable: None,
+        }
+        .when_unreachable("start `celld dev` first".to_string());
+        let error = reachable.call(serde_json::json!({})).await.unwrap_err();
+        assert!(
+            error.to_string().starts_with("start `celld dev` first"),
+            "{error}"
+        );
     }
 }

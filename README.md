@@ -311,7 +311,9 @@ celld d1 migrations apply ledger --bucket s3://my-cells-bucket
 To migrate the database of a running `celld dev`, add `--local` instead of a
 bucket: `celld d1 migrations apply ledger --local`. It reads the project's
 local state, or the directory given to `celld dev --state-dir`, and every
-`celld d1` subcommand takes it.
+`celld d1` subcommand takes it. With `celld dev` stopped, or when its state
+directory can be written to by other users, the command refuses and names the
+directory.
 
 The migration file extension is ASCII case-insensitive, so `.sql` and `.SQL`
 files are migrations. The command ignores a file with a different extension.

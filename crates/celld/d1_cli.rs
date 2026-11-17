@@ -125,10 +125,20 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         // lease is used, so a planted lease cannot send the request elsewhere.
         let (store, token) =
             crate::dev::local_node_files(&project.root, command.state_dir.clone())?;
+        let state = store.parent().unwrap_or(&store).display().to_string();
+        let not_running = |why: &dyn std::fmt::Display| {
+            anyhow!(
+                "no running `celld dev` node for this project (local state in {state}): {why}\n\
+                 start `celld dev` for this project first"
+            )
+        };
+        let token = crate::operator_token::OperatorToken::from_file(&token)?
+            .ok_or_else(|| not_running(&"the node's token file is missing"))?;
         let bucket = crate::dev::open_local_bucket(&store)?;
-        let auth =
-            crate::peer_auth::PeerAuth::new(crate::peer_auth::load_existing(&bucket).await?, "d1")?
-                .with_operator_token(crate::operator_token::OperatorToken::from_file(&token)?);
+        let auth = crate::peer_auth::load_existing(&bucket)
+            .await
+            .map_err(|error| not_running(&format!("{error:#}")))?;
+        let auth = crate::peer_auth::PeerAuth::new(auth, "d1")?.with_operator_token(Some(token));
         Reachable::open_at(
             &bucket,
             crate::operator_cell::Addresses::Loopback,
@@ -136,7 +146,9 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             format!("/runtime/{scope}"),
             Some(auth),
         )
-        .await?
+        .await
+        .map_err(|error| not_running(&format!("{error:#}")))?
+        .when_unreachable(not_running(&"the node does not answer").to_string())
     } else {
         let storage = command.fleet.clone().resolve("celld d1")?;
         Reachable::open(
@@ -778,6 +790,8 @@ instead of a fleet's. It reads that node's local state (`--state-dir` or
 `CELLD_DEV_STATE_DIR` if `celld dev` was given one) and needs no bucket. The
 node has to be running, on this host: only a loopback address is used, and the
 operator token comes from that node's token file, not `CELLD_OPERATOR_TOKEN`.
+With `celld dev` stopped, or with a state directory that group or other users can
+write to, the command refuses and names the directory.
 Every subcommand takes it, so
 `celld d1 migrations apply DATABASE --local` migrates the development database.
 

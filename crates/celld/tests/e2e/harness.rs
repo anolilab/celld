@@ -55,6 +55,9 @@ pub struct Server {
     child: Option<Child>,
     port: u16,
     env: Vec<(String, String)>,
+    /// A `CELLD_OPERATOR_TOKEN` in the environment of the `celld dev` process
+    /// itself, which the node ignores.
+    ambient_token: Option<String>,
     log: PathBuf,
     project: PathBuf,
     client: reqwest::Client,
@@ -65,19 +68,35 @@ pub struct Server {
 impl Server {
     /// Copies `fixture` to a fresh directory and waits until the server answers.
     pub async fn start(fixture: &str, env: &[(&str, &str)]) -> Server {
+        let mut server = Server::prepare(fixture, env);
+        server.launch().await;
+        server
+    }
+
+    fn prepare(fixture: &str, env: &[(&str, &str)]) -> Server {
         let dir = TempDir::new().expect("create temp dir");
         let project = dir.path().join("project");
         copy_dir(&fixture_dir(fixture), &project);
-        let mut server = Server {
+        Server {
             child: None,
             port: 0,
             env: owned_env(env),
+            ambient_token: None,
             log: dir.path().join("celld.log"),
             project,
             client: client(),
             boot: Duration::ZERO,
             _dir: dir,
-        };
+        }
+    }
+
+    /// [`Self::start`] with `token` as `CELLD_OPERATOR_TOKEN` in the environment
+    /// of the `celld dev` process, as a shell that holds a fleet's token has it.
+    /// The node does not take it: it enforces the token of its own state
+    /// directory.
+    pub async fn start_with_ambient_token(fixture: &str, token: &str) -> Server {
+        let mut server = Server::prepare(fixture, &[]);
+        server.ambient_token = Some(token.to_owned());
         server.launch().await;
         server
     }
@@ -129,15 +148,11 @@ impl Server {
             .header(reqwest::header::AUTHORIZATION, token.bearer())
     }
 
-    /// The operator token of this node: the variable the test passed, else the
-    /// file the node generated, which exists once the node announced its
-    /// internal listener.
+    /// The operator token of this node: the file in its state directory, which
+    /// exists once the node announced its internal listener.
     pub async fn operator_token(&self) -> celld::operator_token::OperatorToken {
         use celld::operator_token::OperatorToken;
         self.internal_url("/").await;
-        if let Some((_, token)) = self.env.iter().find(|(k, _)| k == "CELLD_OPERATOR_TOKEN") {
-            return OperatorToken::parse(std::ffi::OsStr::new(token)).expect("a valid token");
-        }
         let state_dir = self
             .env
             .iter()
@@ -275,7 +290,12 @@ impl Server {
         for attempt in 1..=START_ATTEMPTS {
             self.port = 0;
             let spawned = Instant::now();
-            self.child = Some(spawn(&self.project, &self.env, &self.log));
+            self.child = Some(spawn(
+                &self.project,
+                &self.env,
+                self.ambient_token.as_deref(),
+                &self.log,
+            ));
             match self.wait_ready().await {
                 Ok(()) => {
                     self.boot = spawned.elapsed();
@@ -320,7 +340,7 @@ impl Server {
     /// Asks the whole process group to stop gracefully, so it can hand its
     /// state to disk, and kills the group when it does not exit in time.
     /// Returns only after the supervisor has exited.
-    fn stop(&mut self) {
+    pub fn stop(&mut self) {
         let Some(mut child) = self.child.take() else {
             return;
         };
@@ -401,7 +421,18 @@ pub fn run_expecting_exit(fixture: &str, env: &[(&str, &str)]) -> Exited {
     let project = dir.path().join("project");
     copy_dir(&fixture_dir(fixture), &project);
     let log_path = dir.path().join("celld.log");
-    let mut child = spawn(&project, &owned_env(env), &log_path);
+    // The process takes a token from its environment only to validate it, so
+    // this is the ambient value, not a seeded file.
+    let ambient = env
+        .iter()
+        .find(|(k, _)| *k == "CELLD_OPERATOR_TOKEN")
+        .map(|(_, v)| *v);
+    let others: Vec<_> = env
+        .iter()
+        .filter(|(k, _)| *k != "CELLD_OPERATOR_TOKEN")
+        .copied()
+        .collect();
+    let mut child = spawn(&project, &owned_env(&others), ambient, &log_path);
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll celld") {
@@ -481,7 +512,13 @@ fn signal_group(pgid: u32, signal: &str) {
 
 /// Starts `celld dev` on `project`, with its output going to `log`. The child
 /// leads a process group of its own, so the whole tree can be signalled.
-fn spawn(project: &Path, env: &[(String, String)], log: &Path) -> Child {
+///
+/// `celld dev` does not take a token from its environment, so a
+/// `CELLD_OPERATOR_TOKEN` in `env` is written to the token file of the node's
+/// state directory, the way an operator who keeps one there would, and
+/// `ambient` is set in the environment of the process itself.
+fn spawn(project: &Path, env: &[(String, String)], ambient: Option<&str>, log: &Path) -> Child {
+    seed_token_file(project, env);
     let log = fs::File::create(log).expect("create log file");
     Command::new(CELLD)
         .arg("dev")
@@ -495,13 +532,43 @@ fn spawn(project: &Path, env: &[(String, String)], log: &Path) -> Child {
         // Likewise a secrets key would decide whether a secret opens.
         .env_remove("CELLD_SECRETS_KEY")
         .env_remove("CELLD_SECRETS_KEY_FILE")
-        .envs(env.iter().map(|(k, v)| (k, v)))
+        .envs(
+            env.iter()
+                .filter(|(k, _)| k != "CELLD_OPERATOR_TOKEN")
+                .map(|(k, v)| (k, v)),
+        )
+        .envs(ambient.map(|token| ("CELLD_OPERATOR_TOKEN", token)))
         .stdin(Stdio::null())
         .stdout(log.try_clone().expect("clone log handle"))
         .stderr(log)
         .process_group(0)
         .spawn()
         .expect("spawn celld")
+}
+
+fn seed_token_file(project: &Path, env: &[(String, String)]) {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let Some((_, token)) = env.iter().find(|(k, _)| k == "CELLD_OPERATOR_TOKEN") else {
+        return;
+    };
+    let state_dir = env
+        .iter()
+        .find(|(k, _)| k == "CELLD_DEV_STATE_DIR")
+        .map(|(_, v)| v.into());
+    let file =
+        celld::dev::operator_token_path_with(project, state_dir).expect("resolve the token path");
+    let directory = file.parent().expect("the token file has a directory");
+    fs::create_dir_all(directory).expect("create the state directory");
+    for level in [directory.parent().expect("the .celld level"), directory] {
+        fs::set_permissions(level, fs::Permissions::from_mode(0o700)).expect("restrict state");
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    std::io::Write::write_all(
+        &mut options.open(&file).expect("create the token file"),
+        token.as_bytes(),
+    )
+    .expect("write the token file");
 }
 
 pub fn client() -> reqwest::Client {

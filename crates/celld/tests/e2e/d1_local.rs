@@ -113,3 +113,70 @@ async fn local_refuses_a_bucket() {
         stderr(&output)
     );
 }
+
+#[tokio::test]
+async fn local_names_the_state_when_celld_dev_is_stopped() {
+    let mut server = Server::start("d1", &[]).await;
+    server.stop();
+    let output = d1(&server, &["execute", "ledger", "--command", "SELECT 1"]);
+    assert!(!output.status.success());
+    let text = stderr(&output);
+    assert!(text.contains("no running `celld dev` node"), "{text}");
+    assert!(text.contains(".celld/dev"), "{text}");
+    assert!(
+        text.contains("start `celld dev` for this project first"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn local_refuses_a_state_directory_others_can_write_to() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let server = Server::start("d1", &[]).await;
+    let state = server.project_dir().join(".celld/dev");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let output = d1(&server, &["migrations", "list", "ledger"]);
+    assert!(!output.status.success());
+    let text = stderr(&output);
+    assert!(text.contains("can be written to by other users"), "{text}");
+    assert!(!text.contains("No migrations"), "{text}");
+}
+
+#[tokio::test]
+async fn local_uses_the_token_file_and_not_the_environment_of_celld_dev() {
+    let server = Server::start_with_ambient_token("d1", "a-fleets-token").await;
+    let output = d1(&server, &["execute", "ledger", "--command", "SELECT 1"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[tokio::test]
+async fn local_without_a_token_file_says_to_start_celld_dev() {
+    let server = Server::start("d1", &[]).await;
+    std::fs::remove_file(server.project_dir().join(".celld/dev/operator-token")).unwrap();
+    let output = d1(&server, &["migrations", "list", "ledger"]);
+    assert!(!output.status.success());
+    let text = stderr(&output);
+    assert!(text.contains("token file is missing"), "{text}");
+    assert!(
+        text.contains("start `celld dev` for this project first"),
+        "{text}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_follows_a_linked_config_to_its_state() {
+    let server = Server::start("d1", &[]).await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    let link = elsewhere.path().join("wrangler.json");
+    std::os::unix::fs::symlink(server.project_dir().join("wrangler.json"), &link).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_celld"))
+        .args(["d1", "execute", "ledger", "--command", "SELECT 1"])
+        .arg(&link)
+        .arg("--local")
+        .env_remove("CELLD_BUCKET")
+        .env_remove("CELLD_OPERATOR_TOKEN")
+        .output()
+        .expect("run celld d1");
+    assert!(output.status.success(), "{}", stderr(&output));
+}

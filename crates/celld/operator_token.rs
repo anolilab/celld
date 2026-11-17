@@ -78,19 +78,9 @@ impl OperatorToken {
     /// typo must not quietly send no credential. The file's location is
     /// resolved only when the variable is not set.
     pub fn from_env() -> anyhow::Result<Option<Self>> {
-        Self::resolve(token_file)
-    }
-
-    /// Like [`from_env`](Self::from_env), with the token file at `path`.
-    /// `celld dev` keeps its node's file in the project's state directory.
-    pub fn from_env_or_file(path: &Path) -> anyhow::Result<Option<Self>> {
-        Self::resolve(|| Ok(path.to_path_buf()))
-    }
-
-    fn resolve(path: impl FnOnce() -> anyhow::Result<PathBuf>) -> anyhow::Result<Option<Self>> {
         match Self::from_variable()? {
             Some(token) => Ok(Some(token)),
-            None => Self::from_file(&path()?),
+            None => Self::from_file(&token_file()?),
         }
     }
 
