@@ -67,6 +67,8 @@ hkdf.workspace = true
 lol_html.workspace = true
 hmac.workspace = true
 http-body-util.workspace = true
+# Unused directly: the workspace floor on h2 binds only through a member.
+h2.workspace = true
 httpdate.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true

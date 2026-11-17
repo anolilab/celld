@@ -341,6 +341,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "glob",
+ "h2",
  "hkdf",
  "hmac",
  "http-body-util",
