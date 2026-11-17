@@ -45,23 +45,26 @@ not apply `If-Match` to a PUT. For an `az://` bucket, the NAME is the container.
 
 ## The storage test
 
-`celld diagnose` sends four conditional writes to the bucket:
+`celld diagnose` sends four conditional writes to the bucket, then races eight
+writers on one create and eight on one update:
 
 ```
-ok bucket conditional write (create, reject-create, update, reject-stale)
+ok bucket conditional write (create, reject-create, update, reject-stale, one racing create, one racing update)
 ```
 
-Two of the four must fail; if the store accepts either, the command exits with
-an error that names the store. Use `celld diagnose --read-only` with a
-credential that cannot write.
+Two of the four must fail, and exactly one racing writer of each race may apply;
+if the store accepts a write it must reject, or applies more than one racing
+write, the command exits with an error that names the store. Use
+`celld diagnose --read-only` with a credential that cannot write.
 
 Each node runs the same writes before it serves, then reads a range of a second
 object and verifies the range and bytes. A node cannot disable this test. It
 makes at most three attempts, with new objects, when an operation fails without
 a clear cause; then the node starts with a warning, because a temporary outage
 can end. The node stops immediately when a required conditional write or ranged
-read is unsupported, when the store ignores a condition or the `Range` header,
-or when it returns a wrong range or wrong bytes.
+read is unsupported, when the store ignores a condition, when it applies more
+than one of several racing conditional writes, when it ignores the `Range`
+header, or when it returns a wrong range or wrong bytes.
 
 A process that stops mid-test can leave a small object under `probe/`; celld
 never reads it.

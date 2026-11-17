@@ -63,6 +63,9 @@ use std::time::Duration;
 /// The stored form of an empty blob key segment. See [`Bucket::blob_path`].
 const EMPTY_SEGMENT: &str = "%";
 
+/// Writers that race one conditional write in the startup probe.
+const CAS_RACERS: usize = 8;
+
 /// Explicit credentials for a managed installation; everything else comes
 /// from the standard `AWS_*` environment.
 pub struct StaticCredentials {
@@ -1544,13 +1547,43 @@ impl Bucket {
     /// clears, so it can stop a node. An `Err` is ambiguous — a network
     /// fault, a rejected credential — and a retry can clear it, so a
     /// caller that must not fail on a transient blip keeps serving.
+    ///
+    /// The four sequential steps cannot see a store that checks a
+    /// precondition and then writes without holding the object, so every
+    /// writer that checked before the first one wrote applies. After they
+    /// pass, [`CAS_RACERS`] writers race one create and then one update
+    /// that carries the same token, and exactly one of each may apply.
+    /// That adds two rounds of [`CAS_RACERS`] class A requests (the racing
+    /// PUTs, rejected ones included) and one DELETE to the four PUTs and
+    /// one DELETE of the sequential steps, once per node boot, plus one GET
+    /// per race in which the store throttled a racer. A store
+    /// that lets a second writer through only rarely can still pass; the
+    /// contract suite in `tests/store_contract.rs` is the full proof.
     pub(crate) async fn probe_cas_steps(&self) -> anyhow::Result<StorageProbeVerdict> {
-        let key = Self::probe_key("cas");
-        let verdict = self.cas_contract(&key).await;
-        // The object is debris on every path, so retire it before the
-        // verdict. A delete that fails leaves one tiny object under
-        // `probe/`, which nothing lists and nothing reads — but a
-        // credential that cannot delete accrues one per boot, so say so.
+        match self
+            .probe_on_fresh_key("cas", async |key| self.cas_contract(key).await)
+            .await?
+        {
+            StorageProbeVerdict::Conformant => {
+                self.probe_on_fresh_key("cas-race", async |key| self.race_contract(key).await)
+                    .await
+            }
+            violation => Ok(violation),
+        }
+    }
+
+    /// Run one contract on a fresh probe key, then retire the key. The
+    /// object is debris on every path, so it goes before the verdict. A
+    /// delete that fails leaves one tiny object under `probe/`, which
+    /// nothing lists and nothing reads — but a credential that cannot
+    /// delete accrues one per boot, so say so.
+    async fn probe_on_fresh_key(
+        &self,
+        kind: &str,
+        contract: impl AsyncFnOnce(&str) -> anyhow::Result<StorageProbeVerdict>,
+    ) -> anyhow::Result<StorageProbeVerdict> {
+        let key = Self::probe_key(kind);
+        let verdict = contract(&key).await;
         if let Err(error) = self.delete(&key).await {
             tracing::warn!(%error, "the conditional-write probe could not delete its object");
         }
@@ -1614,13 +1647,7 @@ impl Bucket {
     /// a store that applies either one cannot fence.
     async fn cas_contract(&self, key: &str) -> anyhow::Result<StorageProbeVerdict> {
         let precondition = self.backend.precondition();
-        let ambiguous = || {
-            format!(
-                "the store answered a conditional write with an error where celld requires a \
-                 clean rejection, so celld cannot tell a lost race from a failed write and \
-                 reconciles forever; the store must answer {precondition} with a rejection"
-            )
-        };
+        let ambiguous = || ambiguous_rejection(precondition);
 
         // 1. A create on an absent key applies, and answers the token that
         //    steps 3 and 4 need.
@@ -1644,8 +1671,8 @@ impl Bucket {
         {
             return Ok(StorageProbeVerdict::Violation(format!(
                 "the store overwrote an object although the write was conditional on that object \
-                 being absent; the store accepts {precondition} and does not enforce it, so two \
-                 nodes can own one cell"
+                 being absent; {}",
+                unenforced(precondition)
             )));
         }
 
@@ -1672,11 +1699,101 @@ impl Bucket {
             .is_some()
         {
             return Ok(StorageProbeVerdict::Violation(format!(
-                "the store applied a conditional write that carried a stale token; the store \
-                 accepts {precondition} and does not enforce it, so two nodes can own one cell"
+                "the store applied a conditional write that carried a stale token; {}",
+                unenforced(precondition)
             )));
         }
 
+        Ok(StorageProbeVerdict::Conformant)
+    }
+
+    /// The two races, against one fresh key: [`CAS_RACERS`] writers race a
+    /// create, then race an update that all carry the winner's token. A
+    /// conforming store serializes them, so one applies and the rest get a
+    /// clean rejection. More than one applying is a store that does not
+    /// serialize, so two nodes can own one cell.
+    ///
+    /// A store may throttle writers that hit one key at once, and a
+    /// throttled request is taken as rejected before it applies. A proxy
+    /// can commit a write and still answer 503, so when a racer was
+    /// throttled the object is read back and must carry the reporting
+    /// winner's body and token; a throttled racer that applied is a
+    /// violation. Any other error from a racer stays ambiguous, as in the
+    /// sequential steps. Every write carries a body no earlier write used:
+    /// a store whose ETag is a hash of the body keeps the ETag when a
+    /// write repeats the body, and the next racer's condition would still
+    /// hold.
+    async fn race_contract(&self, key: &str) -> anyhow::Result<StorageProbeVerdict> {
+        let precondition = self.backend.precondition();
+        let mut token: Option<String> = None;
+        // The first race carries no token, so it is a create; the second
+        // carries the winner's, so it is an update.
+        for race in ["create", "update"] {
+            let outcomes = futures_util::future::join_all((0..CAS_RACERS).map(|racer| {
+                let body = format!("probe-race-{race}-{racer}").into_bytes();
+                self.put_cas(key, body, token.as_deref())
+            }))
+            .await;
+            let applied: Vec<(usize, String)> = outcomes
+                .iter()
+                .enumerate()
+                .filter_map(|(racer, outcome)| Some((racer, outcome.as_ref().ok()?.clone()?)))
+                .collect();
+            if applied.len() > 1 {
+                return Ok(StorageProbeVerdict::Violation(format!(
+                    "the store applied {} of {CAS_RACERS} racing conditional {race}s that \
+                     carried the same condition; {}",
+                    applied.len(),
+                    unenforced(precondition)
+                )));
+            }
+            let throttled = outcomes
+                .iter()
+                .filter_map(|outcome| outcome.as_ref().err())
+                .filter(|error| is_throttled(error))
+                .count();
+            if let Some(error) = outcomes
+                .into_iter()
+                .filter_map(Result::err)
+                .find(|error| !is_throttled(error))
+            {
+                return Err(error.context(ambiguous_rejection(precondition)));
+            }
+            let Some((winner_racer, winner)) = applied.into_iter().next() else {
+                return Err(anyhow!(
+                    "no racing conditional {race} applied although the condition held, and the \
+                     store answered every one with a rejection or a throttle"
+                ));
+            };
+            // A throttle is only believed to mean "not applied" if the object
+            // agrees: a store or proxy can commit a write and still answer
+            // 503. The last writer's body and token are what remain, so the
+            // winner's must be what is there.
+            if throttled > 0 {
+                let held = self.get(key).await.with_context(|| {
+                    format!(
+                        "the conditional-write probe could not read its object back after \
+                         throttling {throttled} racing {race}s"
+                    )
+                })?;
+                let Some((body, held_token)) = held else {
+                    return Err(anyhow!(
+                        "the conditional-write probe's object is gone after a racing {race} \
+                         reported success"
+                    ));
+                };
+                let expected = format!("probe-race-{race}-{winner_racer}");
+                if body.as_ref() != expected.as_bytes() || held_token != winner {
+                    return Ok(StorageProbeVerdict::Violation(format!(
+                        "a racing conditional {race} that the store answered with a throttle had \
+                         in fact applied, so the store does not serialize or report conditional \
+                         writes reliably; {}",
+                        unenforced(precondition)
+                    )));
+                }
+            }
+            token = Some(winner);
+        }
         Ok(StorageProbeVerdict::Conformant)
     }
 
@@ -1756,6 +1873,37 @@ fn is_unsupported_operation(error: &anyhow::Error) -> bool {
             || text.contains("status 501")
             || text.contains("405 Method Not Allowed")
             || text.contains("501 Not Implemented")
+    })
+}
+
+/// The answer for a probe write that failed where a clean rejection is
+/// required.
+fn ambiguous_rejection(precondition: &str) -> String {
+    format!(
+        "the store answered a conditional write with an error where celld requires a clean \
+         rejection, so celld cannot tell a lost race from a failed write and reconciles \
+         forever; the store must answer {precondition} with a rejection"
+    )
+}
+
+/// The tail of a violation: the store takes the condition and ignores it.
+fn unenforced(precondition: &str) -> String {
+    format!(
+        "the store accepts {precondition} and does not enforce it, so two nodes can own one cell"
+    )
+}
+
+/// Whether the store throttled a request (429, or 503 `SlowDown`). A
+/// throttled request is rejected before it applies. The HTTP adapters keep
+/// the status in a private source error, so its text is the only boundary;
+/// a dependency update must verify these messages.
+fn is_throttled(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let text = cause.to_string();
+        text.contains("status 429")
+            || text.contains("status 503")
+            || text.contains("status code: 429 Too Many Requests")
+            || text.contains("status code: 503 Service Unavailable")
     })
 }
 
@@ -2082,3 +2230,7 @@ pub fn is_unauthorized(error: &anyhow::Error) -> bool {
             || text.contains("status code: 401 Unauthorized")
     })
 }
+
+#[cfg(test)]
+#[path = "bucket_tests.rs"]
+mod tests;
