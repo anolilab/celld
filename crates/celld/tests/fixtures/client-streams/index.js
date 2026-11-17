@@ -141,6 +141,9 @@ export class Streams extends DurableObject {
     if (url.pathname === "/ws-close") {
       return socket(url.searchParams.get("when"));
     }
+    if (url.pathname === "/written") {
+      return new Response((await this.ctx.storage.get("written")) ?? "none");
+    }
     if (url.pathname === "/close-all") {
       for (const ws of this.ctx.getWebSockets()) ws.close(4001, "done");
       return new Response("closed");
@@ -158,6 +161,10 @@ export class Streams extends DurableObject {
   async webSocketMessage(ws, message) {
     if (message === "throw") {
       throw new Error("hibernation boom");
+    }
+    if (message === "throw-write") {
+      await this.ctx.storage.put("written", "yes");
+      throw new Error("hibernation write boom");
     }
     if (message === "echo") {
       ws.send("echoed");

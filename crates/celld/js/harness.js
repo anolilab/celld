@@ -6103,18 +6103,20 @@ const __wsStub = __celld.__wsStub = (wsId) => ({
     __ws_close(wsId, code, reason);
   },
 });
-// An exception a socket's handler or listener throws is reported as a
-// console error with its stack, and the socket stays open: failing the event
-// would drop the frames the other listeners sent and close the socket.
+// An exception a socket's listener throws is reported as a console error with
+// its stack, and the socket stays open: failing the event would drop the frames
+// the other listeners sent and close the socket.
 const __reportHandlerError = (what, error) => {
   console.error(`Uncaught exception in ${what}:`, error);
 };
-// Runs a hibernation handler, reporting what it throws.
+// Runs a hibernation handler. What it throws is reported with its stack and
+// then fails the event as before.
 const __runSocketHandler = async (name, handler) => {
   try {
     await handler();
   } catch (error) {
     __reportHandlerError(name, error);
+    throw error;
   }
 };
 __celld.__wsOpen = async (scope, wsId, protocol) => {

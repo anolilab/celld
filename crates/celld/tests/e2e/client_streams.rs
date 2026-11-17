@@ -433,20 +433,32 @@ async fn an_exception_in_a_websocket_listener_is_reported_and_the_socket_keeps_w
     }
 }
 
-/// An exception in a hibernation handler is reported, and the socket keeps
-/// working for the next message.
+/// An exception in a hibernation handler is reported, fails the event, and
+/// closes the socket with 1011. A write the handler committed before it threw
+/// stays, as it does when the report is absent.
 #[tokio::test]
-async fn an_exception_in_a_hibernation_handler_is_reported_and_the_socket_keeps_working() {
+async fn an_exception_in_a_hibernation_handler_is_reported_and_closes_the_socket() {
     let server = Server::start("client-streams", &[]).await;
     let mut socket = client(&server, "/object/ws-hibernate").await;
     socket.set_auto_close(false);
     socket
-        .write_frame(Frame::text(Payload::Borrowed(b"throw")))
+        .write_frame(Frame::text(Payload::Borrowed(b"throw-write")))
         .await
         .expect("send");
-    log_has(&server, "hibernation boom").await;
-    assert_eq!(
-        exchange(&mut socket, "echo").await.as_deref(),
-        Some("echoed")
-    );
+    log_has(&server, "Uncaught exception in webSocketMessage").await;
+    let closed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match socket.read_frame().await {
+                Ok(frame) if frame.opcode == OpCode::Close => {
+                    return u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
+                }
+                Ok(_) => {}
+                Err(error) => panic!("no close frame: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("the socket was not closed");
+    assert_eq!(closed, 1011);
+    assert_eq!(server.get_text("/object/written").await, "yes");
 }

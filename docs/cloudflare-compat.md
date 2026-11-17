@@ -135,10 +135,11 @@ The `tail` and `email` handlers are unavailable.
   If the owner connection fails between frames before a Close, the ingress sends
   code 1012. If a frame is incomplete, the ingress closes the transport instead.
 - `acceptWebSocket()` throws above 90 percent of the V8 heap limit.
-- An exception in a WebSocket `message`, `close` or `error` listener, or in
-  `webSocketMessage`, `webSocketClose` or `webSocketError`, is logged with its
-  stack as a console error. The other listeners still run and the socket stays
-  open.
+- An exception in a WebSocket `message`, `close` or `error` listener is logged
+  with its stack as a console error. The other listeners still run and the
+  socket stays open. An exception in `webSocketMessage`, `webSocketClose` or
+  `webSocketError` is logged the same way, and still fails the event and closes
+  the socket with 1011.
 - A response with a WebSocket to a request without `Upgrade: websocket` fails,
   as in workerd. A Durable Object's `stub.fetch()` call then rejects, and an
   HTTP client receives status 500. The server end of the socket receives a close
