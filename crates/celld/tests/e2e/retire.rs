@@ -13,7 +13,7 @@ use std::time::Duration;
 use celld::deploy::{Options, VarOverrides};
 use serde_json::Value;
 
-use super::harness::{host_runtime, wait_until, Server};
+use super::harness::{host_runtime, wait_until, Server, ONE_ISOLATE};
 
 const TOKEN: &str = "e2e-retire-token";
 const DEADLINE_S: &str = "4";
@@ -437,4 +437,288 @@ async fn durable_object_events_running_at_the_deadline_are_ended_and_the_node_ke
     );
 
     assert_eq!(server.get_text("/version").await, "v2");
+}
+
+/// Start a request that waits on its own, and give the caller the task to
+/// drop when the client should hang up.
+fn start_waiting(server: &Server, path: &str) -> tokio::task::JoinHandle<()> {
+    let (client, url) = (reqwest::Client::new(), server.url(path));
+    tokio::spawn(async move {
+        let _ = client.get(url).send().await;
+    })
+}
+
+/// Wait until a route reports `want`, so a test acts on what the handler did
+/// and not on how long it took.
+async fn wait_for_text(server: &Server, what: &str, path: &str, want: &str) {
+    wait_until(what, Duration::from_secs(10), || async {
+        (get_within_budget(&reqwest::Client::new(), &server.url(path))
+            .await
+            .1
+            == want)
+            .then_some(())
+    })
+    .await;
+}
+
+/// Hang up on a request whose handler has started.
+async fn hang_up(waiting: tokio::task::JoinHandle<()>) {
+    waiting.abort();
+    let _ = waiting.await;
+}
+
+/// Work one event started stays reachable through a promise another event
+/// holds. When the first event ends, that promise must settle, not wait for
+/// ever on an operation nothing drives any more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_promise_for_work_of_an_ended_event_rejects_instead_of_staying_pending() {
+    // One isolate, so the second request sees the promise the first left.
+    let mut vars = vec![
+        ("CELLD_OPERATOR_TOKEN", TOKEN),
+        ("CELLD_HANDLER_BUDGET_S", "3"),
+    ];
+    vars.extend_from_slice(ONE_ISOLATE);
+    let server = Server::start("retire", &vars).await;
+    // The client gives up while the event waits, which ends the event.
+    let waiting = start_waiting(&server, "/stash");
+    wait_for_text(
+        &server,
+        "the handler to stash its promise",
+        "/stash-state",
+        "waiting",
+    )
+    .await;
+    hang_up(waiting).await;
+    wait_for_text(
+        &server,
+        "the hang-up to end the event",
+        "/stash-state",
+        "aborted",
+    )
+    .await;
+
+    let (status, body) =
+        get_within_budget(&reqwest::Client::new(), &server.url("/await-stash")).await;
+    assert!(status.is_success(), "{status} {body}");
+    assert_eq!(body, "rejected: The client has disconnected");
+}
+
+/// The handlers a rejected wait runs, when the client hangs up, run inside
+/// the turn that ends the event. They must not write storage or start work.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_event_ended_by_a_hang_up_writes_and_starts_nothing_while_it_unwinds() {
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_HANDLER_BUDGET_S", "3"),
+        ],
+    )
+    .await;
+    let waiting = start_waiting(&server, "/do-guarded");
+    wait_for_text(
+        &server,
+        "the handler to start",
+        "/do-guarded-entered",
+        "entered",
+    )
+    .await;
+    hang_up(waiting).await;
+    // The outcome is written by the handler's catch block, after the hang-up.
+    wait_until(
+        "the catch block to run",
+        Duration::from_secs(10),
+        || async {
+            let (_, body) =
+                get_within_budget(&reqwest::Client::new(), &server.url("/do-guarded-outcome"))
+                    .await;
+            body.contains("\"ended\"").then_some(())
+        },
+    )
+    .await;
+
+    let (status, body) =
+        get_within_budget(&reqwest::Client::new(), &server.url("/do-guarded-outcome")).await;
+    assert!(status.is_success(), "{status} {body}");
+    let outcome: Value = serde_json::from_str(&body).expect("outcome json");
+    let reason = "The client has disconnected";
+    assert_eq!(outcome["ended"], reason, "{body}");
+    assert_eq!(outcome["write"], reason, "{body}");
+    assert_eq!(outcome["fetch"], reason, "{body}");
+    assert_eq!(outcome["rows"], 0, "{body}");
+}
+
+/// A continuation of an ended event keeps its context id after the context
+/// itself is dropped, and must still be refused when it runs later.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continuation_that_outlives_its_ended_events_context_cannot_write() {
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_HANDLER_BUDGET_S", "3"),
+        ],
+    )
+    .await;
+    let waiting = start_waiting(&server, "/do-late-write");
+    wait_for_text(&server, "the handler to start", "/do-lw-entered", "entered").await;
+    hang_up(waiting).await;
+    wait_for_text(
+        &server,
+        "the hang-up to reach the handler",
+        "/do-late-aborted",
+        "aborted",
+    )
+    .await;
+    // Long enough for the ended event's context to be dropped.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let (status, body) =
+        get_within_budget(&reqwest::Client::new(), &server.url("/do-late-release")).await;
+    assert!(status.is_success(), "{status} {body}");
+    let outcome: Value = serde_json::from_str(&body).expect("outcome json");
+    assert_eq!(
+        outcome["write"], "The client has disconnected",
+        "the late write was not refused: {body}"
+    );
+    assert_eq!(outcome["rows"], 0, "{body}");
+}
+
+/// A continuation of an event that completed normally keeps its context id
+/// after the context is dropped. It is not an ended event, so it still writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continuation_of_a_completed_event_can_still_write_after_its_context_is_dropped() {
+    let server = Server::start("retire", &[("CELLD_OPERATOR_TOKEN", TOKEN)]).await;
+    assert_eq!(server.get_text("/do-orphan").await, "started");
+    // Long enough for the completed event's context to be dropped.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (status, body) =
+        get_within_budget(&reqwest::Client::new(), &server.url("/do-orphan-release")).await;
+    assert!(status.is_success(), "{status} {body}");
+    let outcome: Value = serde_json::from_str(&body).expect("outcome json");
+    assert_eq!(outcome["write"], "written", "{body}");
+    assert_eq!(outcome["rows"], 1, "{body}");
+}
+
+/// Storage work a leftover timer starts after the handler returned either
+/// completes or leaves nothing behind when its object is moved to the new
+/// deployment mid-way: a transaction is never half written.
+#[tokio::test(flavor = "multi_thread")]
+async fn background_storage_work_after_the_handler_returns_completes_or_leaves_nothing() {
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_RETIRE_DEADLINE_S", DEADLINE_S),
+            ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
+            ("CELLD_HANDLER_BUDGET_S", "1"),
+        ],
+    )
+    .await;
+    assert_eq!(server.get_text("/do-late").await, "started");
+    // Only a transaction that began can be cut off half way.
+    wait_until(
+        "the leftover timer to enter its transaction",
+        Duration::from_secs(10),
+        || async { (server.get_text("/do-late-entered").await == "entered").then_some(()) },
+    )
+    .await;
+    redeploy(&server).await;
+    wait_until(
+        "the superseded generation to be freed",
+        Duration::from_secs(60),
+        || async {
+            let state = state(&server).await;
+            state["deployment"]["draining"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+                .then_some(())
+        },
+    )
+    .await;
+    let (status, keys) =
+        get_within_budget(&reqwest::Client::new(), &server.url("/do-late-keys")).await;
+    assert!(status.is_success(), "{status} {keys}");
+    // Entering the transaction is what the wait above proves; what remains
+    // is that the move never leaves half of it.
+    assert!(
+        keys.is_empty() || keys == "late,late2",
+        "half a transaction: {keys}"
+    );
+}
+
+/// An event ended inside an open transaction is unwound by a rejection, and
+/// the rollback that follows must not be refused as new storage work: the
+/// object would be taken for broken and aborted.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_event_ended_inside_a_transaction_rolls_it_back_without_aborting_the_object() {
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_RETIRE_DEADLINE_S", "30"),
+            ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
+            ("CELLD_HANDLER_BUDGET_S", "20"),
+        ],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let running = {
+        let (client, url) = (client.clone(), server.url("/do-tx-hold"));
+        tokio::spawn(async move { client.get(url).send().await.expect("get") })
+    };
+    wait_until(
+        "the request to open its transaction",
+        Duration::from_secs(10),
+        || async { (server.get_text("/do-tx-entered").await == "entered").then_some(()) },
+    )
+    .await;
+    redeploy(&server).await;
+
+    let ended = running.await.expect("request task");
+    let body = ended.text().await.expect("body");
+    assert!(body.contains("Durable Object was moved"), "{body}");
+    assert!(
+        !server.log_text().contains("transaction rollback failed"),
+        "the rollback was refused and the object aborted"
+    );
+    let (status, value) = get_within_budget(&client, &server.url("/do-tx-value")).await;
+    assert!(status.is_success(), "{status} {value}");
+    assert_eq!(value, "none", "the open transaction was committed");
+}
+
+/// A stateless Worker has no continuation id to look up. When its client
+/// hangs up, the catch block its rejected wait runs must not write through D1.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stateless_worker_ended_by_a_hang_up_cannot_write_to_d1_while_it_unwinds() {
+    let mut vars = vec![
+        ("CELLD_OPERATOR_TOKEN", TOKEN),
+        ("CELLD_HANDLER_BUDGET_S", "3"),
+    ];
+    vars.extend_from_slice(ONE_ISOLATE);
+    let server = Server::start("retire", &vars).await;
+    let waiting = start_waiting(&server, "/d1-guarded");
+    wait_for_text(&server, "the handler to start", "/d1-state", "waiting").await;
+    hang_up(waiting).await;
+    wait_until(
+        "the catch block to run",
+        Duration::from_secs(10),
+        || async {
+            let (_, body) =
+                get_within_budget(&reqwest::Client::new(), &server.url("/d1-outcome")).await;
+            body.contains("\"ended\"").then_some(())
+        },
+    )
+    .await;
+    let (status, body) =
+        get_within_budget(&reqwest::Client::new(), &server.url("/d1-outcome")).await;
+    assert!(status.is_success(), "{status} {body}");
+    let outcome: Value = serde_json::from_str(&body).expect("outcome json");
+    assert!(
+        outcome["write"]
+            .as_str()
+            .is_some_and(|reason| reason.ends_with("The client has disconnected")),
+        "{body}"
+    );
+    assert_eq!(outcome["rows"], 0, "{body}");
 }
