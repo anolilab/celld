@@ -53,6 +53,7 @@ pub use crate::engine_api::HttpResponse;
 pub use crate::engine_api::HttpResponseWebSocket;
 pub use crate::engine_api::ModuleSource;
 pub use crate::engine_api::QueueBatch;
+pub use crate::engine_api::QueueBinding;
 pub use crate::engine_api::QueueContentType;
 pub use crate::engine_api::QueueDispatchResult;
 pub use crate::engine_api::QueueMessage;
@@ -60,6 +61,7 @@ pub use crate::engine_api::QueueMetrics;
 pub use crate::engine_api::QueueOutcome;
 pub use crate::engine_api::QueueRetryBatch;
 pub use crate::engine_api::QueueRetryMessage;
+pub use crate::engine_api::RateLimitBinding;
 pub use crate::engine_api::RequestBody;
 pub use crate::engine_api::RequestId;
 pub use crate::engine_api::RpcData;
@@ -69,7 +71,6 @@ pub use crate::engine_api::WorkflowBinding;
 pub use crate::engine_api::WsTarget;
 pub(crate) use crate::engine_api::BARE_NODE_BUILTINS;
 pub use crate::engine_api::CELL_OVERLOAD_ERROR_MARKER;
-pub use crate::engine_api::{QueueBinding, RateLimitBinding};
 pub use crate::engine_api::{
     CANCEL_MOVED_TEXT, CANCEL_RESTARTED_TEXT, CANCEL_RETRYABLE_ERROR_MARKER, CANCEL_SHUTDOWN_TEXT,
 };
