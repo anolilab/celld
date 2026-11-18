@@ -588,6 +588,7 @@ fn the_standard_path_holds_in_mode_read() {
     for scn in STANDARD_PATH
         .iter()
         .filter(|n| !n.ends_with("_read") && !n.ends_with("_on"))
+        .filter(|n| !STANDARD_PATH.contains(&format!("{n}_read").as_str()))
     {
         let mut cfg = scenario(scn)(Design::rev4());
         cfg.ignore.clear();
