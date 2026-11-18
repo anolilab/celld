@@ -35,6 +35,9 @@ pub const MAX_BODY_BYTES: usize = 32 << 20;
 /// The shortest start of the key that is dropped from the end of an error
 /// body that may have been cut inside the key.
 const MIN_KEY_PREFIX: usize = 4;
+/// How much of an upstream error body is read so that a JSON one parses whole.
+const ERROR_PARSE_BYTES: usize = 64 * 1024;
+const ERROR_BODY_HIDDEN: &str = "the upstream error body was not shown";
 
 /// Which OpenAI-compatible route a `run()` call goes to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -147,10 +150,11 @@ impl Config {
         }
     }
 
-    /// How many bytes of an upstream error to read so that `cut_detail` can
-    /// still see a whole key that starts inside the first `max`.
+    /// How many bytes of an upstream error to read: enough to parse a JSON
+    /// error body whole (its escaped key shows only in decoded strings) and to
+    /// see a whole key that starts inside the first `max`.
     fn error_read_limit(&self, max: usize) -> usize {
-        max + self.key.as_ref().map_or(0, |key| key.len())
+        ERROR_PARSE_BYTES.max(max + self.key.as_ref().map_or(0, |key| key.len()))
     }
 
     /// The first `max` bytes of the body of an upstream error `response`, with
@@ -190,6 +194,10 @@ impl Config {
                 self.redact_json(&mut value);
                 value.to_string()
             }
+            // Text that is not JSON may still write the key with escapes the
+            // raw text does not match, such as a JSON body cut by the read
+            // limit: show none of it.
+            Err(_) if text.contains('\\') => return ERROR_BODY_HIDDEN.to_string(),
             Err(_) => self.redact(text.trim()),
         };
         let mut end = max.min(text.len());
@@ -470,6 +478,31 @@ mod tests {
         let detail = config.cut_detail(raw, 2048);
         assert!(!detail.contains("key-0123"), "{detail}");
         assert!(detail.contains("[redacted]"), "{detail}");
+    }
+
+    #[test]
+    fn a_long_json_error_with_an_escaped_key_is_redacted_whole() {
+        let config = config(Some("sk-a/b-key-0123"));
+        let max = 2048;
+        let body = format!(
+            r#"{{"error":{{"message":"bad key sk-a\/b-key-0123"}},"pad":"{}"}}"#,
+            "x".repeat(4096)
+        );
+        let mut raw = body.into_bytes();
+        raw.truncate(config.error_read_limit(max));
+        let detail = config.cut_detail(&raw, max);
+        assert!(!detail.contains("key-0123"), "{detail}");
+        assert!(detail.contains("[redacted]"), "{detail}");
+    }
+
+    #[test]
+    fn an_error_that_is_not_json_and_has_a_backslash_is_not_shown() {
+        let config = config(Some("sk-a/b-key-0123"));
+        let detail = config.cut_detail(br#"oops sk-a\/b-key-0123 {not json"#, 2048);
+        assert_eq!(detail, ERROR_BODY_HIDDEN);
+        // Without a backslash the raw redaction is enough.
+        let detail = config.cut_detail(b"oops sk-a/b-key-0123", 2048);
+        assert_eq!(detail, "oops [redacted]");
     }
 
     #[test]
