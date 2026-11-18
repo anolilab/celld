@@ -10711,7 +10711,10 @@ impl BundleTree {
             }
             path.push('/');
             path.push_str(file);
-            nodes.insert(path, BundleNode::File(bytes));
+            // The first file at a path wins. The entry module comes first, so
+            // a sibling that normalises to its path cannot replace it; of two
+            // siblings that normalise alike, the earlier one is kept.
+            nodes.entry(path).or_insert(BundleNode::File(bytes));
         }
         let mut children: HashMap<String, Vec<String>> = HashMap::new();
         for path in nodes.keys() {

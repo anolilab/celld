@@ -526,7 +526,7 @@ pub(super) fn op_vfs_read_file(
 #[cfg(test)]
 mod tests {
     use super::{IoContext, RequestVfs, VfsNode, VFS_MAX_BYTES};
-    use crate::js::BundleTree;
+    use crate::js::{BundleNode, BundleTree};
 
     #[test]
     fn a_bundle_lists_recursively_without_scanning_every_node_per_directory() {
@@ -572,6 +572,19 @@ mod tests {
         );
         assert_eq!(tree.list("/bundle").unwrap(), ["foo.js", "lib", "y.js"]);
         assert_eq!(tree.list("/bundle/lib").unwrap(), ["a.js"]);
+    }
+
+    #[test]
+    fn a_sibling_module_does_not_replace_the_entry_at_the_same_path() {
+        let tree = BundleTree::from_files(
+            [("worker.js", "entry"), ("./worker.js", "sibling")]
+                .into_iter()
+                .map(|(name, body)| (name, bytes::Bytes::from(body))),
+        );
+        match tree.nodes.get("/bundle/worker.js") {
+            Some(BundleNode::File(bytes)) => assert_eq!(&bytes[..], b"entry"),
+            _ => panic!("worker.js is not a file"),
+        }
     }
 
     #[test]
