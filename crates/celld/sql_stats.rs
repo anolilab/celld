@@ -23,7 +23,8 @@
 //! class. It never carries SQL text, a bound value or a cell id.
 
 use std::fmt::Write as _;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::metrics::{write_histogram, Histogram};
@@ -204,10 +205,21 @@ pub(crate) fn set_threshold_for_test(threshold: Option<Duration>) {
     OVERRIDE.with(|slot| slot.set(Some(threshold)));
 }
 
+/// The rate limiter's state. The window's start second and its line count share
+/// one word, so a compare-exchange rolls the window and takes a line together.
 struct Window {
-    started: Instant,
-    lines: u32,
-    suppressed: u64,
+    /// Start second in the high half, lines taken in the low half.
+    state: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+impl Window {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+        }
+    }
 }
 
 /// Take one of this second's log slots. `Some` carries how many statements the
@@ -217,35 +229,40 @@ fn take_log_slot() -> Option<u64> {
     // not use up each other's lines.
     #[cfg(test)]
     thread_local! {
-        static WINDOW: Mutex<Option<Window>> = const { Mutex::new(None) };
+        static WINDOW: Window = const { Window::new() };
     }
     #[cfg(not(test))]
-    static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
+    static WINDOW: Window = Window::new();
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let secs = EPOCH.get_or_init(Instant::now).elapsed().as_secs() as u32;
     #[cfg(test)]
-    return WINDOW.with(|window| take_slot(window, Instant::now()));
+    return WINDOW.with(|window| take_slot(window, secs));
     #[cfg(not(test))]
-    take_slot(&WINDOW, Instant::now())
+    take_slot(&WINDOW, secs)
 }
 
-fn take_slot(window: &Mutex<Option<Window>>, now: Instant) -> Option<u64> {
-    let mut window = window
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let window = window.get_or_insert(Window {
-        started: now,
-        lines: 0,
-        suppressed: 0,
-    });
-    if now.saturating_duration_since(window.started) >= Duration::from_secs(1) {
-        window.started = now;
-        window.lines = 0;
+fn take_slot(window: &Window, secs: u32) -> Option<u64> {
+    let mut current = window.state.load(Ordering::Relaxed);
+    loop {
+        let (start, lines) = ((current >> 32) as u32, current as u32);
+        let next = if secs > start {
+            u64::from(secs) << 32 | 1
+        } else if lines >= LOG_LINES_PER_SECOND {
+            window.suppressed.fetch_add(1, Ordering::Relaxed);
+            return None;
+        } else {
+            current + 1
+        };
+        match window.state.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(window.suppressed.swap(0, Ordering::Relaxed)),
+            Err(seen) => current = seen,
+        }
     }
-    if window.lines >= LOG_LINES_PER_SECOND {
-        window.suppressed += 1;
-        return None;
-    }
-    window.lines += 1;
-    Some(std::mem::take(&mut window.suppressed))
 }
 
 /// The longest class name a line carries.
@@ -390,13 +407,31 @@ mod tests {
 
     #[test]
     fn the_log_window_limits_lines_and_counts_what_it_dropped() {
-        let window = Mutex::new(None);
-        let now = Instant::now();
+        let window = Window::new();
         let taken = (0..LOG_LINES_PER_SECOND + 5)
-            .filter_map(|_| take_slot(&window, now))
+            .filter_map(|_| take_slot(&window, 7))
             .count();
         assert_eq!(taken, LOG_LINES_PER_SECOND as usize);
-        assert_eq!(take_slot(&window, now + Duration::from_secs(2)), Some(5));
+        assert_eq!(take_slot(&window, 9), Some(5));
+    }
+
+    #[test]
+    fn threads_never_take_more_than_the_limit_in_one_window() {
+        let window = Window::new();
+        let taken = std::sync::atomic::AtomicU32::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..1000 {
+                        if take_slot(&window, 3).is_some() {
+                            taken.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(taken.load(Ordering::Relaxed), LOG_LINES_PER_SECOND);
+        assert_eq!(window.suppressed.load(Ordering::Relaxed), 8000 - 10);
     }
 
     #[test]
