@@ -930,9 +930,7 @@ async fn load_worker_at_pointer(
     let version_metadata = bindings(&manifest, "version_metadata")
         .find_map(|binding| binding.get("name")?.as_str())
         .map(|binding| manifest.version_metadata(binding));
-    let ai_binding = bindings(&manifest, "ai")
-        .find_map(|binding| binding.get("name")?.as_str())
-        .map(str::to_string);
+    let ai_binding = crate::protocol::ai_binding(&manifest)?;
     let services = service_bindings(&manifest);
     let mut vars = worker_vars(&manifest);
     // Secrets are decrypted here, once per deployment load, and join the vars

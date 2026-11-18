@@ -72,6 +72,14 @@ pub(crate) struct Credential {
     pub origin: String,
 }
 
+/// How a credential file that other users can read is reported: the `event`
+/// field of the log line, so that a filter on it keeps working, and what the
+/// file holds, for its message.
+pub(crate) struct SharedWarning {
+    pub event: &'static str,
+    pub subject: &'static str,
+}
+
 /// The credential in the variable `variable` or in the file that the variable
 /// `file_variable` names, or `None` when neither is set. A blank value is
 /// unset. Setting both is refused, since a node and an operator that read
@@ -81,18 +89,21 @@ pub(crate) fn variable_or_file(
     variable: &str,
     file_variable: &str,
     max_bytes: u64,
+    shared: &SharedWarning,
 ) -> anyhow::Result<Option<Credential>> {
     choose(
         (variable, crate::env_vars::value(variable)?),
         (file_variable, crate::env_vars::value(file_variable)?),
         max_bytes,
+        shared,
     )
 }
 
-fn choose(
+pub(crate) fn choose(
     (variable, text): (&str, Option<String>),
     (file_variable, path): (&str, Option<String>),
     max_bytes: u64,
+    shared: &SharedWarning,
 ) -> anyhow::Result<Option<Credential>> {
     let text = text
         .map(Zeroizing::new)
@@ -109,7 +120,7 @@ fn choose(
             let text = Zeroizing::new(
                 read(path, max_bytes).with_context(|| format!("read {file_variable}"))?,
             );
-            warn_if_shared(file_variable, path);
+            warn_if_shared(shared, path);
             Ok(Some(Credential {
                 text,
                 origin: format!("{file_variable} ({})", path.display()),
@@ -121,24 +132,24 @@ fn choose(
 
 /// Log that the credential file can be read by other users.
 #[cfg(unix)]
-fn warn_if_shared(file_variable: &str, path: &Path) {
+fn warn_if_shared(shared: &SharedWarning, path: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
     if let Ok(metadata) = std::fs::metadata(path) {
         let mode = metadata.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             tracing::warn!(
-                event = "credential_file_shared",
-                variable = file_variable,
+                event = shared.event,
                 path = %path.display(),
                 mode = format!("{mode:o}"),
-                "the credential file can be read by other users; restrict it to its owner"
+                "the {} can be read by other users; restrict it to its owner",
+                shared.subject
             );
         }
     }
 }
 
 #[cfg(not(unix))]
-fn warn_if_shared(_file_variable: &str, _path: &Path) {}
+fn warn_if_shared(_shared: &SharedWarning, _path: &Path) {}
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -185,6 +196,10 @@ mod tests {
                 ("KEY", text.map(String::from)),
                 ("KEY_FILE", file.map(String::from)),
                 16,
+                &SharedWarning {
+                    event: "test_key_file_shared",
+                    subject: "test key file",
+                },
             )
         };
         assert!(pick(None, None).unwrap().is_none());

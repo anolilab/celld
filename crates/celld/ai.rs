@@ -206,17 +206,50 @@ impl Config {
 /// default.
 pub fn load() -> anyhow::Result<Option<&'static Config>> {
     static CONFIG: OnceLock<Option<Config>> = OnceLock::new();
-    if let Some(config) = CONFIG.get() {
+    cached(&CONFIG, read)
+}
+
+/// Checks the settings at startup without keeping them. The log is not set up
+/// yet, so a warning about the key file would go nowhere, and a kept result
+/// would keep the first real `load` from repeating it.
+pub fn validate() -> anyhow::Result<()> {
+    validate_with(read)
+}
+
+const SHARED_KEY_FILE: crate::credential_file::SharedWarning =
+    crate::credential_file::SharedWarning {
+        event: "ai_key_file_shared",
+        subject: "AI API key file",
+    };
+
+fn validate_with(read: impl FnOnce() -> anyhow::Result<Option<Config>>) -> anyhow::Result<()> {
+    read().map(drop)
+}
+
+fn cached(
+    cell: &OnceLock<Option<Config>>,
+    read: impl FnOnce() -> anyhow::Result<Option<Config>>,
+) -> anyhow::Result<Option<&Config>> {
+    if let Some(config) = cell.get() {
         return Ok(config.as_ref());
     }
-    let key = crate::credential_file::variable_or_file(API_KEY, API_KEY_FILE, KEY_FILE_MAX_BYTES)?;
-    let config = parse(
+    let config = read()?;
+    Ok(cell.get_or_init(|| config).as_ref())
+}
+
+fn read() -> anyhow::Result<Option<Config>> {
+    let key = crate::credential_file::variable_or_file(
+        API_KEY,
+        API_KEY_FILE,
+        KEY_FILE_MAX_BYTES,
+        &SHARED_KEY_FILE,
+    )?;
+    parse(
         crate::env_vars::value(BASE_URL)?.as_deref(),
         key.as_ref()
             .map(|key| key.text.trim_end_matches(['\r', '\n'])),
         crate::env_vars::value(MODELS)?.as_deref(),
-    )?;
-    Ok(CONFIG.get_or_init(|| config).as_ref())
+    )
 }
 
 fn parse(
@@ -290,6 +323,63 @@ mod tests {
         parse(Some("https://api.example.com/v1/"), key, Some(MODELS_JSON))
             .unwrap()
             .unwrap()
+    }
+
+    #[derive(Clone, Default)]
+    struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Log {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // A fixture file, not node storage.
+    fn the_shared_key_file_warning_is_logged_by_the_first_load_after_startup_validation() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        std::fs::write(&path, "sk-secret\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = path.to_str().unwrap().to_string();
+        // What `read` does with `CELLD_AI_API_KEY_FILE`, without the process
+        // environment.
+        let read = || {
+            let key = crate::credential_file::choose(
+                (API_KEY, None),
+                (API_KEY_FILE, Some(path.clone())),
+                KEY_FILE_MAX_BYTES,
+                &SHARED_KEY_FILE,
+            )?;
+            parse(
+                Some("https://api.example.com/v1/"),
+                key.as_ref().map(|key| key.text.trim()),
+                Some(MODELS_JSON),
+            )
+        };
+
+        let log = Log::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        // Startup validation runs before any subscriber exists.
+        validate_with(read).unwrap();
+        assert!(log.0.lock().unwrap().is_empty());
+        let cell = OnceLock::new();
+        tracing::subscriber::with_default(subscriber, || {
+            cached(&cell, read).unwrap();
+            cached(&cell, read).unwrap();
+        });
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.matches("ai_key_file_shared").count(), 1, "{text}");
     }
 
     #[test]

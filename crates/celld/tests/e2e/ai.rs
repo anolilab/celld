@@ -105,12 +105,20 @@ async fn serve(mut stream: tokio::net::TcpStream, log: Arc<Mutex<Vec<Seen>>>) {
     let embedding = |data: &str| http(200, "application/json", &format!(r#"{{"data":{data}}}"#));
     let reply = if path.ends_with("/embeddings") && body["input"] == "bad-shape" {
         http(200, "application/json", r#"{"data":[{"index":0}]}"#)
-    } else if path.ends_with("/embeddings") && body["input"] == "embed-ragged" {
+    } else if path.ends_with("/embeddings") && body["input"][0] == "embed-ragged" {
         embedding(r#"[{"index":0,"embedding":[1,2]},{"index":1,"embedding":[1]}]"#)
-    } else if path.ends_with("/embeddings") && body["input"] == "embed-nonnumber" {
-        embedding(r#"[{"index":0,"embedding":[1,"x"]}]"#)
-    } else if path.ends_with("/embeddings") && body["input"] == "embed-infinite" {
-        embedding(r#"[{"index":0,"embedding":[1,1e999]}]"#)
+    } else if path.ends_with("/embeddings") && body["input"][0] == "embed-nonnumber" {
+        embedding(r#"[{"index":0,"embedding":[1,"x"]},{"index":1,"embedding":[1,2]}]"#)
+    } else if path.ends_with("/embeddings") && body["input"][0] == "embed-infinite" {
+        embedding(r#"[{"index":0,"embedding":[1,1e999]},{"index":1,"embedding":[1,2]}]"#)
+    } else if path.ends_with("/embeddings") && body["input"][0] == "embed-short" {
+        embedding(r#"[{"index":0,"embedding":[1,2]}]"#)
+    } else if path.ends_with("/embeddings") && body["input"][0] == "embed-extra" {
+        embedding(
+            r#"[{"index":0,"embedding":[1,2]},{"index":1,"embedding":[1,2]},{"index":2,"embedding":[1,2]}]"#,
+        )
+    } else if path.ends_with("/embeddings") && body["input"][0] == "embed-dup-index" {
+        embedding(r#"[{"index":0,"embedding":[1,2]},{"index":0,"embedding":[1,2]}]"#)
     } else if path.ends_with("/embeddings") {
         let inputs = match &body["input"] {
             Value::String(text) => vec![text.clone()],
@@ -693,4 +701,23 @@ async fn a_stream_completes_at_done_while_the_connection_stays_open() {
         result["text"],
         "data: {\"response\":\"Hel\"}\n\ndata: [DONE]\n\n"
     );
+}
+
+#[tokio::test]
+async fn embeddings_that_do_not_match_the_texts_fail_the_call() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    for (path, expect) in [
+        ("/embed-short", "1 embeddings for 2 texts"),
+        ("/embed-extra", "3 embeddings for 2 texts"),
+        ("/embed-dup-index", "index each text once"),
+    ] {
+        let result: Value = server.get_json(path).await;
+        assert_eq!(result["ok"], false, "{path}: {result}");
+        assert!(
+            result["message"].as_str().unwrap().contains(expect),
+            "{path}: {result}"
+        );
+    }
 }

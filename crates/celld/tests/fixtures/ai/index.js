@@ -74,8 +74,11 @@ export default {
       case "/embed-ragged":
       case "/embed-nonnumber":
       case "/embed-infinite":
+      case "/embed-short":
+      case "/embed-extra":
+      case "/embed-dup-index":
         return Response.json(
-          await attempt(() => env.AI.run(EMBED, { text: url.pathname.slice(1) })));
+          await attempt(() => env.AI.run(EMBED, { text: [url.pathname.slice(1), "x"] })));
       case "/echo-key":
         return Response.json(await attempt(() => env.AI.run(CHAT, { prompt: "echo-key" })));
       case "/bad-shape":

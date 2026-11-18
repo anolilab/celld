@@ -310,6 +310,33 @@ pub fn validate_ratelimit_manifest(
     Ok(bindings)
 }
 
+/// The name of the Workers AI binding of a manifest, `None` without one. A
+/// binding without a string name is an error: dropping it would leave the
+/// Worker without `env.AI` and a failure far from the cause.
+#[doc(hidden)]
+pub fn ai_binding(manifest: &Manifest) -> anyhow::Result<Option<String>> {
+    let mut name = None;
+    for (position, binding) in manifest
+        .raw_metadata
+        .get("bindings")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|binding| binding.get("type").and_then(serde_json::Value::as_str) == Some("ai"))
+        .enumerate()
+    {
+        let this = binding
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("the Workers AI binding #{position} has no string name")
+            })?;
+        name.get_or_insert_with(|| this.to_string());
+    }
+    Ok(name)
+}
+
 /// Validate every Queue value before a deployment becomes runtime state.
 ///
 /// A native deploy validates its source configuration before it writes a
@@ -754,5 +781,31 @@ mod ratelimit_manifest_tests {
         broken.raw_metadata["bindings"][0]["simple"]["period"] = json!(30);
         let error = validate_ratelimit_manifest(&broken).unwrap_err();
         assert!(error.to_string().contains("invalid ratelimit binding"));
+    }
+}
+
+#[cfg(test)]
+mod ai_manifest_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn manifest(bindings: serde_json::Value) -> Manifest {
+        serde_json::from_value(json!({
+            "version": "v", "script_name": "s", "main_module": "index.js",
+            "do_classes": [], "sqlite_classes": [], "modules": [],
+            "raw_metadata": { "bindings": bindings }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_ai_binding_is_named_and_a_nameless_one_is_refused() {
+        assert_eq!(ai_binding(&manifest(json!([]))).unwrap(), None);
+        let named = manifest(json!([{ "type": "ai", "name": "AI" }]));
+        assert_eq!(ai_binding(&named).unwrap().as_deref(), Some("AI"));
+        for bad in [json!({ "type": "ai" }), json!({ "type": "ai", "name": 3 })] {
+            let error = ai_binding(&manifest(json!([bad]))).unwrap_err().to_string();
+            assert!(error.contains("Workers AI binding #0"), "{error}");
+        }
     }
 }

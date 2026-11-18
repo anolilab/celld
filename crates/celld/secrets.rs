@@ -54,6 +54,12 @@ const SCHEMA_VERSION: u32 = 1;
 const KEY_BYTES: usize = 32;
 /// A key is 44 characters of base64; a file larger than this is not one.
 const KEY_FILE_MAX_BYTES: u64 = 4096;
+/// The log line for a key file other users can read; operators filter on it.
+pub(crate) const SHARED_KEY_FILE: crate::credential_file::SharedWarning =
+    crate::credential_file::SharedWarning {
+        event: "secrets_key_file_shared",
+        subject: "secrets key file",
+    };
 const NONCE_BYTES: usize = 12;
 /// Lost conditional writes before a put gives up. Each loss means another
 /// operator changed the object in between, so this only bounds a livelock.
@@ -135,6 +141,7 @@ impl SecretsKey {
             KEY_VARIABLE,
             KEY_FILE_VARIABLE,
             KEY_FILE_MAX_BYTES,
+            &SHARED_KEY_FILE,
         )?
         .map(|credential| {
             Self::parse(&credential.text)
@@ -875,6 +882,51 @@ pub fn binding_names(metadata: &serde_json::Value) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // A fixture file, not node storage.
+    fn a_shared_key_file_keeps_its_log_event() {
+        use std::os::unix::fs::PermissionsExt as _;
+        #[derive(Clone, Default)]
+        struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("key");
+        std::fs::write(&path, "k\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let log = Log::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            crate::credential_file::choose(
+                (KEY_VARIABLE, None),
+                (KEY_FILE_VARIABLE, Some(path.to_str().unwrap().to_string())),
+                KEY_FILE_MAX_BYTES,
+                &SHARED_KEY_FILE,
+            )
+            .unwrap();
+        });
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("secrets_key_file_shared"), "{text}");
+        assert!(
+            text.contains(
+                "the secrets key file can be read by other users; restrict it to its owner"
+            ),
+            "{text}"
+        );
+    }
 
     fn key(byte: u8) -> SecretsKey {
         SecretsKey::from_bytes([byte; KEY_BYTES])

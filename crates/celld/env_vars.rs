@@ -303,7 +303,7 @@ pub fn validate() -> anyhow::Result<()> {
     // load. The file is read at load, like the operator token file above.
     crate::secrets::SecretsKey::from_variable()?;
     crate::egress_filter::from_env()?;
-    crate::ai::load()?;
+    crate::ai::validate()?;
     crate::tls_roots::extra()?;
     crate::container::FenceNodeNetns::from_env()?;
 

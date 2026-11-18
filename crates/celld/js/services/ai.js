@@ -232,6 +232,23 @@ __celld.__makeAi = () => ({
       ) {
         throw __aiError("the upstream answer has no data[].embedding vectors");
       }
+      const expected = Array.isArray(text) ? text.length : 1;
+      if (answer.data.length !== expected) {
+        throw __aiError(
+          `the upstream answered ${answer.data.length} embeddings for ${expected} texts`);
+      }
+      // `index`, when present, must place each vector exactly once; with none
+      // the order is the input order.
+      const indexes = answer.data.map((item) => item.index);
+      if (indexes.some((index) => index !== undefined)) {
+        const seen = new Set(indexes);
+        if (
+          seen.size !== expected ||
+          !indexes.every((index) => Number.isInteger(index) && index >= 0 && index < expected)
+        ) {
+          throw __aiError("the upstream embeddings do not index each text once");
+        }
+      }
       const data = [...answer.data]
         .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
         .map((item) => item.embedding);
