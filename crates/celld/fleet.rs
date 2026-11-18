@@ -949,10 +949,13 @@ async fn load_worker_at_pointer(
     );
     // Store secrets are bindings of their own, not vars, so `process.env`
     // never holds them. One more bucket read per distinct store.
+    // `.dev.vars` is read only for a binding that `celld dev` marked, so an
+    // unreadable file cannot stop a Worker that has none.
+    let dev_values = crate::secrets::dev_values_for(&manifest, crate::dev::store_values)?;
     let secret_stores = crate::secrets::load_stores(
         bucket,
         &manifest,
-        &crate::dev::store_values()?,
+        &dev_values,
         crate::secrets::SecretsKey::from_environment,
     )
     .await?;

@@ -610,8 +610,9 @@ struct StoreBinding<'a> {
 /// The Secrets Store bindings of a deployment. A manifest that the config
 /// parser did not write can hold a malformed entry; that fails the load and
 /// names the binding, where skipping it would leave `env.<binding>` undefined.
-fn store_bindings(metadata: &serde_json::Value) -> anyhow::Result<Vec<StoreBinding<'_>>> {
-    metadata
+fn store_bindings(manifest: &Manifest) -> anyhow::Result<Vec<StoreBinding<'_>>> {
+    let bindings = manifest
+        .raw_metadata
         .get("bindings")
         .and_then(serde_json::Value::as_array)
         .into_iter()
@@ -619,6 +620,22 @@ fn store_bindings(metadata: &serde_json::Value) -> anyhow::Result<Vec<StoreBindi
         .filter(|binding| {
             binding.get("type").and_then(serde_json::Value::as_str) == Some(STORE_BINDING_TYPE)
         })
+        .collect::<Vec<_>>();
+    // A node that does not know the binding would start the Worker without it,
+    // so the manifest has to say it needs one that does.
+    if !bindings.is_empty()
+        && !manifest
+            .required_features
+            .iter()
+            .any(|feature| feature == crate::protocol::FEATURE_SECRETS_STORE_V1)
+    {
+        bail!(
+            "the deployment has Secrets Store bindings but does not require the {} feature",
+            crate::protocol::FEATURE_SECRETS_STORE_V1
+        );
+    }
+    bindings
+        .into_iter()
         .map(|binding| {
             let named = binding
                 .get("name")
@@ -634,6 +651,13 @@ fn store_bindings(metadata: &serde_json::Value) -> anyhow::Result<Vec<StoreBindi
                         )
                     })
             };
+            let name = text("name")?;
+            // The name becomes a property of `env` in generated JavaScript.
+            if !crate::deploy::valid_binding(name) {
+                bail!("Secrets Store binding {named} of the deployment has an invalid binding name");
+            }
+            crate::deploy::check_env_name(name)
+                .with_context(|| format!("Secrets Store binding {named} of the deployment"))?;
             let store_id = text("store_id")?;
             // A marked binding never reads its store, but the id is still
             // checked: the mark is data in a manifest, not proof of `celld dev`.
@@ -641,13 +665,41 @@ fn store_bindings(metadata: &serde_json::Value) -> anyhow::Result<Vec<StoreBindi
                 .check()
                 .with_context(|| format!("Secrets Store binding {named} of the deployment"))?;
             Ok(StoreBinding {
-                binding: text("name")?,
+                binding: name,
                 store_id,
                 secret_name: text("secret_name")?,
                 dev_value: binding.get("dev_value") == Some(&serde_json::Value::Bool(true)),
             })
         })
         .collect()
+}
+
+/// Whether the deployment marks a Secrets Store binding as filled by `celld
+/// dev`. Only then does a node read `.dev.vars` when it loads the deployment.
+fn has_dev_value_binding(manifest: &Manifest) -> bool {
+    manifest
+        .raw_metadata
+        .get("bindings")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|binding| {
+            binding.get("type").and_then(serde_json::Value::as_str) == Some(STORE_BINDING_TYPE)
+                && binding.get("dev_value") == Some(&serde_json::Value::Bool(true))
+        })
+}
+
+/// The dev values for `manifest`: `read` runs only when a binding is marked, so
+/// an unreadable `.dev.vars` cannot stop a Worker that has none.
+pub fn dev_values_for(
+    manifest: &Manifest,
+    read: impl FnOnce() -> anyhow::Result<BTreeMap<String, String>>,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    if has_dev_value_binding(manifest) {
+        read()
+    } else {
+        Ok(BTreeMap::new())
+    }
 }
 
 /// The `type` of a Secrets Store binding in a deployment's metadata.
@@ -677,7 +729,7 @@ pub async fn ensure_store_secrets(
     honour_dev_value: bool,
 ) -> anyhow::Result<()> {
     let mut stores: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    let bindings = store_bindings(&manifest.raw_metadata)?;
+    let bindings = store_bindings(manifest)?;
     for binding in bindings
         .iter()
         .filter(|binding| !(honour_dev_value && binding.dev_value))
@@ -738,7 +790,7 @@ pub async fn load_stores<'k>(
     if manifest.main_module.is_none() {
         return Ok(Vec::new());
     }
-    let bindings = store_bindings(&manifest.raw_metadata)?;
+    let bindings = store_bindings(manifest)?;
     let dev_value = |binding: &StoreBinding<'_>| {
         binding
             .dev_value
@@ -1218,7 +1270,64 @@ mod tests {
     fn store_manifest(bindings: serde_json::Value) -> Manifest {
         let mut manifest = manifest(&[]);
         manifest.raw_metadata = serde_json::json!({ "bindings": bindings });
+        manifest.required_features = vec![crate::protocol::FEATURE_SECRETS_STORE_V1.to_string()];
         manifest
+    }
+
+    #[tokio::test]
+    async fn a_store_binding_needs_the_feature_a_valid_name_and_is_refused_otherwise() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let mut manifest = store_manifest(serde_json::json!([store_binding("A", "st1", "k")]));
+        manifest.required_features.clear();
+        let error = ensure_store_secrets(&bucket, &manifest, true)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("secrets-store-v1"),
+            "{error:#}"
+        );
+        let error = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(None))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("secrets-store-v1"),
+            "{error:#}"
+        );
+
+        for name in ["__proto__", "a\"b", "x'); evil(); ('", "1A", "", "a-b"] {
+            let manifest = store_manifest(serde_json::json!([store_binding(name, "st1", "k")]));
+            let error = ensure_store_secrets(&bucket, &manifest, true)
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("binding"),
+                "{name}: {error:#}"
+            );
+            assert!(
+                load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(None))
+                    .await
+                    .is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_values_are_read_only_for_a_marked_binding() {
+        let unmarked = store_manifest(serde_json::json!([store_binding("A", "st1", "k")]));
+        let none = store_manifest(serde_json::json!([]));
+        for manifest in [&unmarked, &none] {
+            let values = dev_values_for(manifest, || anyhow::bail!("unreadable .dev.vars"));
+            assert!(values.unwrap().is_empty());
+        }
+        let marked = store_manifest(serde_json::json!([{
+            "type": STORE_BINDING_TYPE, "name": "A", "store_id": "st1",
+            "secret_name": "k", "dev_value": true,
+        }]));
+        assert!(dev_values_for(&marked, || anyhow::bail!("unreadable .dev.vars")).is_err());
+        let read = || Ok(BTreeMap::from([("A".to_string(), "v".to_string())]));
+        assert_eq!(dev_values_for(&marked, read).unwrap()["A"], "v");
     }
 
     fn store_binding(name: &str, store: &str, secret: &str) -> serde_json::Value {
