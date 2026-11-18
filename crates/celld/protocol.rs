@@ -123,6 +123,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_D1_V1,
     FEATURE_KV_V1,
     FEATURE_QUEUES_V1,
+    FEATURE_RATELIMIT_V1,
     FEATURE_SQLITE_VEC_V1,
     FEATURE_R2_V1,
     FEATURE_WASM_V1,
@@ -187,6 +188,10 @@ pub const FEATURE_KV_V1: &str = "kv-v1";
 /// A deployment with a Queue producer or consumer. A node without the broker
 /// would otherwise omit a producer binding or silently stop consuming.
 pub const FEATURE_QUEUES_V1: &str = "queues-v1";
+
+/// A deployment with `ratelimits` bindings. A node without the rate limit cell
+/// would build an `env` missing the binding and fail on the first `limit()`.
+pub const FEATURE_RATELIMIT_V1: &str = "ratelimit-v1";
 
 pub const QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION: u32 = 1;
 

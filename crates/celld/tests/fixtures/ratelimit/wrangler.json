@@ -1,0 +1,12 @@
+{
+  "name": "ratelimit",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "ratelimits": [
+    { "name": "LIMITER", "namespace_id": "rl-main", "simple": { "limit": 3, "period": 60 } },
+    { "name": "SAME", "namespace_id": "rl-main", "simple": { "limit": 3, "period": 60 } },
+    { "name": "OTHER", "namespace_id": "rl-other", "simple": { "limit": 3, "period": 60 } },
+    { "name": "SHORT", "namespace_id": "rl-short", "simple": { "limit": 1, "period": 10 } }
+  ]
+}

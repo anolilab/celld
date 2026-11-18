@@ -25,6 +25,7 @@ An unsupported feature that does not cause an error is a defect.
 | [Version metadata](services/workers.md#version-metadata) | **Yes** |
 | [KV](services/kv.md) | **Yes** |
 | [Queues](services/queues.md) | **Yes** |
+| [Rate Limiting](services/ratelimit.md) | **Yes** — exact counts through one owner; a window starts over when the cell moves |
 | [D1](services/d1.md) | **Yes** |
 | [Workflows](services/workflows.md) | **Yes** |
 | [R2](services/r2.md) | **Yes** |
@@ -472,7 +473,7 @@ The accepted top-level keys:
 - `compatibility_date` and `compatibility_flags`
 - `durable_objects` and `migrations`
 - `assets`, `services`, `triggers`, and `vars`
-- `d1_databases`, `kv_namespaces`, `queues`, `workflows`, and
+- `d1_databases`, `kv_namespaces`, `queues`, `ratelimits`, `workflows`, and
   `r2_buckets`
 - `worker_loaders`, `version_metadata`, `secrets_store_secrets`, and `containers`
 - `define` and `rules`

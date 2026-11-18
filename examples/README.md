@@ -12,6 +12,7 @@ supports, one service or API at a time:
 - `r2/` — object reads, writes, and deletes on an R2 bucket
 - `kv/` — key reads, writes, and deletes in a KV namespace
 - `queues/` — a producer and a consumer, with retries and a dead-letter queue
+- `ratelimit/` — a rate limit per request path
 - `async/` — a timer and asynchronous Durable Object storage
 - `body/` — request and response bodies
 - `router/` — Worker-to-Durable-Object routing

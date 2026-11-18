@@ -951,6 +951,7 @@ pub(crate) mod tests {
             d1_bindings: Vec::new(),
             kv_bindings: Vec::new(),
             queue_bindings: Vec::new(),
+            ratelimit_bindings: Vec::new(),
             queue_consumers: Vec::new(),
             workflow_bindings: Vec::new(),
             vars: Vec::new(),

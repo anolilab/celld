@@ -918,6 +918,38 @@ async fn load_worker_at_pointer(
             })
         })
         .collect();
+    // A binding the deploy wrote is complete; one that is not means a manifest
+    // this build cannot honour, and a missing `env.LIMITER` would only surface
+    // when the Worker first calls it.
+    let ratelimit_bindings = bindings(&manifest, "ratelimit")
+        .map(|binding| {
+            let name = binding.get("name").and_then(serde_json::Value::as_str);
+            let namespace = binding
+                .get("namespace_id")
+                .and_then(serde_json::Value::as_str);
+            let simple = binding.get("simple");
+            let number = |field| {
+                simple
+                    .and_then(|simple| simple.get(field))
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+            };
+            match (name, namespace, number("limit"), number("period")) {
+                (Some(name), Some(namespace), Some(limit), Some(period))
+                    if celld_logic::ratelimit::valid_limit(u64::from(limit))
+                        && celld_logic::ratelimit::valid_period(u64::from(period)) =>
+                {
+                    Ok(crate::js::RateLimitBinding {
+                        environment: name.to_string(),
+                        namespace: namespace.to_string(),
+                        limit,
+                        period,
+                    })
+                }
+                _ => anyhow::bail!("the manifest has an invalid ratelimit binding: {binding}"),
+            }
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let workflow_bindings = bindings(&manifest, "workflow")
         .filter_map(|binding| {
             Some(crate::js::WorkflowBinding {
@@ -1002,6 +1034,7 @@ async fn load_worker_at_pointer(
             d1_bindings,
             kv_bindings,
             queue_bindings,
+            ratelimit_bindings,
             queue_consumers: manifest.queue_consumers,
             workflow_bindings,
             vars,

@@ -6511,6 +6511,26 @@ __runtimeClass("__KvNamespace", __KvNamespaceCell, [
 const __makeKvNamespace = __celld.__makeKvNamespace = (id, cellName) =>
   new __KvNamespace(() => __cell.makeNamespace("__KvNamespace"), cellName);
 
+// ---- Rate limits ---------------------------------------------------------
+// The namespace cell and the binding's client are `services/ratelimit.js`. The
+// cell counts in memory, so a call is one RPC to the namespace's owner.
+const {
+  RateLimitCell: __RateLimitCell,
+  RateLimit: __RateLimit,
+} = ratelimitService({
+  DurableObject: class {
+    constructor(ctx) {
+      this.ctx = ctx;
+    }
+  },
+  now: () => Date.now(),
+});
+
+__runtimeClass("__RateLimit", __RateLimitCell, ["__ratelimitHit"]);
+
+__celld.__makeRateLimit = (cellName, limit, period) =>
+  new __RateLimit(() => __cell.makeNamespace("__RateLimit"), cellName, limit, period);
+
 // ---- Queues --------------------------------------------------------------
 // A Queue is one runtime-supplied Durable Object. The producer binding writes
 // bytes and a content tag through RPC, and the cell owns the durable order,

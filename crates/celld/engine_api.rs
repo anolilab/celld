@@ -327,6 +327,16 @@ pub struct QueueBinding {
     pub delivery_delay: u32,
 }
 
+/// One Rate Limiting binding in a Worker environment: its `env` name, the
+/// namespace whose cell counts for it, and the `simple` limit and period.
+#[derive(Clone)]
+pub struct RateLimitBinding {
+    pub environment: String,
+    pub namespace: String,
+    pub limit: u32,
+    pub period: u32,
+}
+
 /// The `version_metadata` binding of a deployment: the `env` name and the
 /// values it reports. They are fixed for the deployment, so the binding is one
 /// frozen object and costs nothing per request.
@@ -347,6 +357,7 @@ pub struct WorkerConfigOptions {
     pub d1_bindings: Vec<(String, String)>,
     pub kv_bindings: Vec<(String, String)>,
     pub queue_bindings: Vec<QueueBinding>,
+    pub ratelimit_bindings: Vec<RateLimitBinding>,
     pub queue_consumers: Vec<crate::protocol::QueueConsumerConfig>,
     pub workflow_bindings: Vec<WorkflowBinding>,
     pub vars: Vec<(String, String)>,
@@ -560,6 +571,10 @@ pub(crate) const KV_NAMESPACE_KEY: &str = "cells:v1:kv:__KvNamespace";
 /// scripts must derive the same cell id.
 pub(crate) const QUEUE_NAMESPACE_KEY: &str = "cells:v1:queue:__Queue";
 
+/// The fleet-wide namespace for rate limit cells. A namespace is a resource
+/// several Workers can bind, and they must reach one counter.
+pub(crate) const RATELIMIT_NAMESPACE_KEY: &str = "cells:v1:ratelimit:__RateLimit";
+
 /// A shared reserved class addresses one set of cells for the whole fleet; every
 /// other class, reserved or not, is scoped to the script that exports it.
 ///
@@ -573,6 +588,7 @@ fn shared_namespace_key(class_name: &str) -> Option<&'static str> {
         crate::deploy::D1_CLASS => Some(D1_NAMESPACE_KEY),
         crate::deploy::KV_CLASS => Some(KV_NAMESPACE_KEY),
         crate::deploy::QUEUE_CLASS => Some(QUEUE_NAMESPACE_KEY),
+        crate::deploy::RATELIMIT_CLASS => Some(RATELIMIT_NAMESPACE_KEY),
         _ => {
             debug_assert!(
                 !crate::deploy::is_shared_reserved_class(class_name),
@@ -612,6 +628,17 @@ pub fn kv_cell_scope(namespace_id: &str, shard: u32) -> String {
     let name = celld_logic::kv::cell_name(namespace_id, shard);
     let id = durable_object_id_for_name(KV_NAMESPACE_KEY, &name);
     format!("{}:{}", crate::deploy::KV_CLASS, durable_object_id_hex(&id))
+}
+
+/// The cell scope that counts for a rate limit namespace.
+pub fn ratelimit_cell_scope(namespace_id: &str) -> String {
+    let name = celld_logic::ratelimit::cell_name(namespace_id);
+    let id = durable_object_id_for_name(RATELIMIT_NAMESPACE_KEY, name);
+    format!(
+        "{}:{}",
+        crate::deploy::RATELIMIT_CLASS,
+        durable_object_id_hex(&id)
+    )
 }
 
 /// The Queue broker scope for callers outside a Worker isolate.

@@ -121,7 +121,11 @@ static HARNESS_SOURCE: v8::OneByteConst =
 
 /// The harness and the services it shares with the workerd engine, which
 /// each end in a function declaration the harness calls.
-const HARNESS: &str = concat!(include_str!("harness.js"), include_str!("services/kv.js"));
+const HARNESS: &str = concat!(
+    include_str!("harness.js"),
+    include_str!("services/kv.js"),
+    include_str!("services/ratelimit.js")
+);
 
 fn bootstrap_code_cache() -> &'static std::sync::Mutex<BootstrapCache> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<BootstrapCache>> =
@@ -574,6 +578,7 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
     let d1_bindings = config.d1_bindings.as_slice();
     let kv_bindings = config.kv_bindings.as_slice();
     let queue_bindings = config.queue_bindings.as_slice();
+    let ratelimit_bindings = config.ratelimit_bindings.as_slice();
     let workflow_bindings = config.workflow_bindings.as_slice();
     let vars = config.vars.as_slice();
     let services = config.services.as_slice();
@@ -606,6 +611,15 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 binding,
                 id,
                 celld_logic::kv::cell_name(id, 0),
+            ));
+        }
+        for binding in ratelimit_bindings {
+            lines.push_str(&format!(
+                "e[{:?}] = __celld.__makeRateLimit({:?}, {}, {});\n",
+                binding.environment,
+                celld_logic::ratelimit::cell_name(&binding.namespace),
+                binding.limit,
+                binding.period,
             ));
         }
         for binding in queue_bindings {

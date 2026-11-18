@@ -19,9 +19,9 @@ use crate::protocol::{
     DeployPointer, Manifest, ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig,
     QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1,
     FEATURE_CONTAINER_IMAGES_V1, FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_KV_V1,
-    FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SECRETS_STORE_V1,
-    FEATURE_SQLITE_VEC_V1, FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
-    QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+    FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_RATELIMIT_V1,
+    FEATURE_SECRETS_STORE_V1, FEATURE_SQLITE_VEC_V1, FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1,
+    FEATURE_WORKFLOWS_V1, QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -57,6 +57,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "d1_databases",
     "kv_namespaces",
     "queues",
+    "ratelimits",
     "workflows",
     "r2_buckets",
     "worker_loaders",
@@ -90,8 +91,17 @@ pub const KV_CLASS: &str = celld_logic::kv::RESERVED_CLASS;
 /// The Durable Object class every Queue broker runs as.
 pub const QUEUE_CLASS: &str = celld_logic::queue::RESERVED_CLASS;
 
+/// The Durable Object class every Rate Limiting namespace runs as.
+pub const RATELIMIT_CLASS: &str = celld_logic::ratelimit::RESERVED_CLASS;
+
 /// Every runtime-supplied Durable Object class.
-pub const RESERVED_CLASSES: &[&str] = &[D1_CLASS, WORKFLOW_CLASS, KV_CLASS, QUEUE_CLASS];
+pub const RESERVED_CLASSES: &[&str] = &[
+    D1_CLASS,
+    WORKFLOW_CLASS,
+    KV_CLASS,
+    QUEUE_CLASS,
+    RATELIMIT_CLASS,
+];
 
 /// The Durable Object class a script's workflow instances run as.
 ///
@@ -126,7 +136,7 @@ pub fn workflow_class(script_name: &str) -> String {
 /// both is correct rather than merely tolerated. A workflow class carries its
 /// script, so it is never shared and a collision there is a real one.
 pub fn is_shared_reserved_class(class: &str) -> bool {
-    class == D1_CLASS || class == KV_CLASS || class == QUEUE_CLASS
+    class == D1_CLASS || class == KV_CLASS || class == QUEUE_CLASS || class == RATELIMIT_CLASS
 }
 
 /// Whether a class name is a script-scoped workflow class.
@@ -336,6 +346,7 @@ struct Project {
     has_kv: bool,
     queue_consumers: Vec<QueueConsumerConfig>,
     has_queues: bool,
+    has_ratelimits: bool,
     has_r2: bool,
     containers: Vec<ContainerDecl>,
     /// Set when `main` is a `.py` file: the Python behavior its
@@ -560,6 +571,10 @@ impl Built {
                     Some("kv") => {
                         let id = binding.get("id").and_then(Value::as_str)?;
                         Some((format!("env.{name} (KV)"), id.to_string()))
+                    }
+                    Some("ratelimit") => {
+                        let namespace = binding.get("namespace_id").and_then(Value::as_str)?;
+                        Some((format!("env.{name} (Rate Limit)"), namespace.to_string()))
                     }
                     Some("queue") => {
                         let queue = binding.get("queue").and_then(Value::as_str)?;
@@ -819,6 +834,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if project.has_queues {
                 features.push(FEATURE_QUEUES_V1.to_string());
+            }
+            if project.has_ratelimits {
+                features.push(FEATURE_RATELIMIT_V1.to_string());
             }
             if project.has_r2 {
                 features.push(FEATURE_R2_V1.to_string());
@@ -2122,6 +2140,14 @@ fn read_project(
         do_classes.push(QUEUE_CLASS.to_string());
         sqlite_classes.push(QUEUE_CLASS.to_string());
     }
+    let ratelimits = read_ratelimits(object.get("ratelimits"))?;
+    bindings.extend(ratelimits.iter().cloned());
+    if !ratelimits.is_empty() {
+        // A namespace is a cell of a runtime-supplied class, like KV's, and
+        // stays out of `ctx.exports`.
+        do_classes.push(RATELIMIT_CLASS.to_string());
+        sqlite_classes.push(RATELIMIT_CLASS.to_string());
+    }
     let workflows = match object.get("workflows") {
         None => &[][..],
         Some(Value::Array(workflows)) => workflows.as_slice(),
@@ -2521,6 +2547,7 @@ fn read_project(
         has_workflows: !workflows.is_empty(),
         has_kv: !kv_namespaces.is_empty(),
         has_queues: !queue_producers.is_empty() || !queue_consumers.is_empty(),
+        has_ratelimits: !ratelimits.is_empty(),
         queue_consumers,
         has_r2: !r2_buckets.is_empty(),
         containers,
@@ -3160,6 +3187,82 @@ fn optional_asset_mode(
 pub(crate) fn check_env_name(name: &str) -> anyhow::Result<()> {
     anyhow::ensure!(name != "__proto__", "`__proto__` cannot be a binding name");
     Ok(())
+}
+
+/// The `ratelimits` of a config as manifest bindings.
+///
+/// Wrangler's own checks, applied here so a malformed entry stops the deploy
+/// and never reaches a node: `simple.limit` a positive integer, `simple.period`
+/// 10 or 60, and every key celld does not model refused.
+fn read_ratelimits(value: Option<&Value>) -> anyhow::Result<Vec<Value>> {
+    let ratelimits = match value {
+        None => &[][..],
+        Some(Value::Array(ratelimits)) => ratelimits.as_slice(),
+        Some(_) => bail!("config `ratelimits` must be an array"),
+    };
+    let mut bindings = Vec::new();
+    for ratelimit in ratelimits {
+        let object = ratelimit
+            .as_object()
+            .ok_or_else(|| anyhow!("a `ratelimits` entry must be an object"))?;
+        if let Some(key) = object
+            .keys()
+            .find(|key| !matches!(key.as_str(), "name" | "namespace_id" | "simple"))
+        {
+            bail!(
+                "ratelimit declares `{key}`, which celld does not model; \
+                 celld models `name`, `namespace_id`, and `simple`"
+            );
+        }
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("ratelimit has no `name`"))?;
+        if !valid_binding(name) {
+            bail!("invalid ratelimit binding name: {name:?}");
+        }
+        // Wrangler writes the id as a string of digits; celld takes any stable
+        // string that can name a cell, as it does for a KV namespace.
+        let namespace_id = object
+            .get("namespace_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("ratelimit {name} needs a string `namespace_id`"))?;
+        if !celld_logic::cell::valid_cell_scope(namespace_id) {
+            bail!(
+                "ratelimit {name} has a `namespace_id` that cannot name a cell: \
+                 {namespace_id:?}; use ASCII letters, digits, and `_ - . : $`"
+            );
+        }
+        let simple = object
+            .get("simple")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                anyhow!("ratelimit {name} needs a `simple` object with `limit` and `period`")
+            })?;
+        if let Some(key) = simple
+            .keys()
+            .find(|key| !matches!(key.as_str(), "limit" | "period"))
+        {
+            bail!("ratelimit {name} `simple` declares `{key}`; it takes `limit` and `period`");
+        }
+        let limit = simple
+            .get("limit")
+            .and_then(Value::as_u64)
+            .filter(|limit| celld_logic::ratelimit::valid_limit(*limit))
+            .ok_or_else(|| anyhow!("ratelimit {name} `simple.limit` must be a positive integer"))?;
+        let period = simple
+            .get("period")
+            .and_then(Value::as_u64)
+            .filter(|period| celld_logic::ratelimit::valid_period(*period))
+            .ok_or_else(|| anyhow!("ratelimit {name} `simple.period` must be 10 or 60"))?;
+        bindings.push(json!({
+            "type": "ratelimit",
+            "name": name,
+            "namespace_id": namespace_id,
+            "simple": { "limit": limit, "period": period },
+        }));
+    }
+    Ok(bindings)
 }
 
 pub(crate) fn valid_binding(binding: &str) -> bool {
@@ -4131,5 +4234,90 @@ mod secrets_store_config_tests {
     fn the_deployment_requires_the_secrets_store_feature() {
         let project = read(ENTRY, &VarOverrides::None).unwrap();
         assert!(has_binding_type(&project.metadata, "secrets_store_secret"));
+    }
+}
+
+#[cfg(test)]
+mod ratelimit_config_tests {
+    use super::*;
+
+    fn read(entry: Value) -> anyhow::Result<Vec<Value>> {
+        read_ratelimits(Some(&json!([entry])))
+    }
+
+    fn refused(entry: Value) -> String {
+        format!("{:#}", read(entry).unwrap_err())
+    }
+
+    #[test]
+    fn a_valid_entry_becomes_a_manifest_binding() {
+        let bindings = read(json!({
+            "name": "LIMITER", "namespace_id": "1001", "simple": { "limit": 5, "period": 60 }
+        }))
+        .unwrap();
+        assert_eq!(
+            bindings,
+            [json!({
+                "type": "ratelimit", "name": "LIMITER", "namespace_id": "1001",
+                "simple": { "limit": 5, "period": 60 }
+            })]
+        );
+        assert!(read_ratelimits(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn limit_must_be_a_positive_integer() {
+        for limit in [json!(0), json!(-1), json!(1.5), json!("5"), json!(null)] {
+            let entry = json!({
+                "name": "L", "namespace_id": "1", "simple": { "limit": limit, "period": 10 }
+            });
+            assert!(refused(entry).contains("`simple.limit`"), "{limit}");
+        }
+    }
+
+    #[test]
+    fn period_must_be_ten_or_sixty() {
+        for period in [json!(0), json!(30), json!(61), json!("10"), json!(null)] {
+            let entry = json!({
+                "name": "L", "namespace_id": "1", "simple": { "limit": 1, "period": period }
+            });
+            assert!(refused(entry).contains("`simple.period`"), "{period}");
+        }
+        assert!(read(json!({
+            "name": "L", "namespace_id": "1", "simple": { "limit": 1, "period": 10 }
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn a_malformed_entry_is_refused_with_its_reason() {
+        let simple = json!({ "limit": 1, "period": 10 });
+        assert!(refused(json!({ "namespace_id": "1", "simple": simple })).contains("no `name`"));
+        assert!(
+            refused(json!({ "name": "bad name", "namespace_id": "1", "simple": simple }))
+                .contains("invalid ratelimit binding name")
+        );
+        assert!(refused(json!({ "name": "L", "simple": simple })).contains("`namespace_id`"));
+        assert!(
+            refused(json!({ "name": "L", "namespace_id": 1001, "simple": simple }))
+                .contains("`namespace_id`")
+        );
+        assert!(
+            refused(json!({ "name": "L", "namespace_id": "a/b", "simple": simple }))
+                .contains("cannot name a cell")
+        );
+        assert!(refused(json!({ "name": "L", "namespace_id": "1" })).contains("`simple`"));
+        assert!(
+            refused(json!({ "name": "L", "namespace_id": "1", "simple": simple, "burst": 3 }))
+                .contains("`burst`")
+        );
+        assert!(refused(json!({
+            "name": "L", "namespace_id": "1", "simple": { "limit": 1, "period": 10, "burst": 3 }
+        }))
+        .contains("`burst`"));
+        assert!(read_ratelimits(Some(&json!({})))
+            .unwrap_err()
+            .to_string()
+            .contains("must be an array"));
     }
 }

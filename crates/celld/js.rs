@@ -53,7 +53,6 @@ pub use crate::engine_api::HttpResponse;
 pub use crate::engine_api::HttpResponseWebSocket;
 pub use crate::engine_api::ModuleSource;
 pub use crate::engine_api::QueueBatch;
-pub use crate::engine_api::QueueBinding;
 pub use crate::engine_api::QueueContentType;
 pub use crate::engine_api::QueueDispatchResult;
 pub use crate::engine_api::QueueMessage;
@@ -70,6 +69,7 @@ pub use crate::engine_api::WorkflowBinding;
 pub use crate::engine_api::WsTarget;
 pub(crate) use crate::engine_api::BARE_NODE_BUILTINS;
 pub use crate::engine_api::CELL_OVERLOAD_ERROR_MARKER;
+pub use crate::engine_api::{QueueBinding, RateLimitBinding};
 pub use crate::engine_api::{
     CANCEL_MOVED_TEXT, CANCEL_RESTARTED_TEXT, CANCEL_RETRYABLE_ERROR_MARKER, CANCEL_SHUTDOWN_TEXT,
 };
@@ -1654,6 +1654,7 @@ pub struct WorkerConfig {
     /// [[kv]].
     kv_bindings: Vec<(String, String)>,
     queue_bindings: Vec<QueueBinding>,
+    ratelimit_bindings: Vec<RateLimitBinding>,
     pub(crate) queue_consumers: Vec<QueueConsumerRegistration>,
     /// This script declared a consumer in its own manifest. The deployment-
     /// wide catalog later replaces `queue_consumers` in every isolate, so the
@@ -1781,6 +1782,7 @@ impl WorkerConfig {
             d1_bindings,
             kv_bindings,
             queue_bindings,
+            ratelimit_bindings,
             queue_consumers,
             workflow_bindings,
             vars,
@@ -1811,6 +1813,7 @@ impl WorkerConfig {
             d1_bindings,
             kv_bindings,
             queue_bindings,
+            ratelimit_bindings,
             queue_consumers,
             declares_queue_consumer,
             workflow_bindings,
@@ -1858,6 +1861,7 @@ impl WorkerConfig {
             d1_bindings: Vec::new(),
             kv_bindings: Vec::new(),
             queue_bindings: Vec::new(),
+            ratelimit_bindings: Vec::new(),
             queue_consumers: Vec::new(),
             workflow_bindings: Vec::new(),
             vars: Vec::new(),
@@ -7595,6 +7599,7 @@ fn op_loader_load(
             d1_bindings: Vec::new(),
             kv_bindings: Vec::new(),
             queue_bindings: Vec::new(),
+            ratelimit_bindings: Vec::new(),
             queue_consumers: Vec::new(),
             workflow_bindings: Vec::new(),
             vars: Vec::new(),
@@ -12211,6 +12216,8 @@ fn op_text_decoder_free(
 #[doc(hidden)]
 pub mod bootstrap;
 pub mod modules;
+#[cfg(test)]
+mod ratelimit_tests;
 mod v8_strings;
 use bootstrap::{
     adopt_cell, adopt_embedded_cell, begin_event_context, build_env, end_event_context,
