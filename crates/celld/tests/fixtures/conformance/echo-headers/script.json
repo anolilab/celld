@@ -1,0 +1,14 @@
+{
+  "description": "Method, path, query, request headers and body reach the Worker; response headers, status and redirects come back unchanged.",
+  "compare_headers": ["x-echo-method", "x-multi", "x-request-id"],
+  "normalise": {
+    "headers": ["x-request-id"]
+  },
+  "requests": [
+    { "name": "get", "method": "GET", "path": "/echo?a=1&b=two%20words", "headers": { "x-probe": "hello" } },
+    { "name": "post-text", "method": "POST", "path": "/echo", "headers": { "content-type": "text/plain" }, "body": "plain body" },
+    { "name": "put-empty", "method": "PUT", "path": "/echo" },
+    { "name": "not-found", "method": "GET", "path": "/missing" },
+    { "name": "redirect", "method": "GET", "path": "/redirect" }
+  ]
+}

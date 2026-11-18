@@ -1,0 +1,11 @@
+{
+  "description": "A named Durable Object counts across requests, and two names stay separate.",
+  "requests": [
+    { "name": "read-fresh", "method": "GET", "path": "/read?name=a" },
+    { "name": "inc", "method": "GET", "path": "/inc?name=a" },
+    { "name": "inc-by-5", "method": "GET", "path": "/inc?name=a&by=5" },
+    { "name": "other-name", "method": "GET", "path": "/inc?name=b" },
+    { "name": "reset", "method": "GET", "path": "/reset?name=a" },
+    { "name": "read-after-reset", "method": "GET", "path": "/read?name=a" }
+  ]
+}

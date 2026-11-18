@@ -1,0 +1,4 @@
+{
+  "description": "Expected to differ: counts the properties of globalThis.",
+  "requests": [{ "name": "count", "method": "GET", "path": "/" }]
+}

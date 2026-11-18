@@ -1,0 +1,6 @@
+{
+  "name": "url-parse",
+  "main": "worker.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01"
+}

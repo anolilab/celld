@@ -64,6 +64,33 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  # Replays the fixtures of crates/celld/tests/fixtures/conformance against
+  # celld and a pinned workerd and publishes the JSON report. The run fails on
+  # a difference that is not in the allow-list, and when workerd cannot be
+  # fetched, so a broken download does not read as a pass.
+  conformance:
+    name: Conformance against workerd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: nightly-conformance
+      - run: cargo bench -p celld --bench conformance --profile lab --locked
+        env:
+          CELLD_CONFORMANCE_OUT: ${{ runner.temp }}/conformance/report.json
+          CELLD_CONFORMANCE_REQUIRE: "1"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: conformance-${{ github.sha }}
+          path: ${{ runner.temp }}/conformance/report.json
+          if-no-files-found: error
+          retention-days: 90
+
   # Runs the object-store contract suite against each store in
   # crates/celld/tests/stores/compose.yml and writes one line per store to the
   # job summary, which is what the table in docs/testing.md is updated from.

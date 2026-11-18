@@ -1,0 +1,11 @@
+{
+  "description": "JSON in, JSON out: parsing, number handling, key order, a parse failure, and the fields that legitimately differ per run.",
+  "normalise": {
+    "json_paths": ["id", "received_at", "took_ms"]
+  },
+  "requests": [
+    { "name": "numbers", "method": "POST", "path": "/", "headers": { "content-type": "application/json" }, "json": { "name": "ada", "numbers": [5, 3, 9, 1.5], "zero": -0 } },
+    { "name": "empty", "method": "POST", "path": "/", "headers": { "content-type": "application/json" }, "json": {} },
+    { "name": "broken", "method": "POST", "path": "/", "headers": { "content-type": "application/json" }, "body": "{not json" }
+  ]
+}

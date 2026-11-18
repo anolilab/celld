@@ -1,0 +1,10 @@
+# The workerd release the conformance harness compares against. The npm
+# package for the host platform is fetched by exact version and verified
+# against the SHA-256 of its tarball before anything in it runs. Bump the
+# version and both digests together: the digest of a new release is
+# `shasum -a 256` of the tarball at
+# https://registry.npmjs.org/@cloudflare/workerd-<platform>/-/workerd-<platform>-<version>.tgz
+# checked against the `dist.shasum` (SHA-1) the registry lists for it.
+WORKERD_VERSION=1.20261117.1
+WORKERD_SHA256_DARWIN_ARM64=287a6aa5d9a93e79f374cbe9a532cf7102d62c4cb8a119729bc1a5f42838c124
+WORKERD_SHA256_LINUX_64=b7fa7bcbde8fc42e97cab6e6e72967b518e71f787e74d1599ee36c0f1c019bb9

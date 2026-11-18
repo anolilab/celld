@@ -68,9 +68,18 @@ pub struct Server {
 impl Server {
     /// Copies `fixture` to a fresh directory and waits until the server answers.
     pub async fn start(fixture: &str, env: &[(&str, &str)]) -> Server {
+        Server::try_start(fixture, env)
+            .await
+            .unwrap_or_else(|reason| panic!("{reason}"))
+    }
+
+    /// [`Self::start`] that returns a start failure instead of panicking, for
+    /// a runner built with `panic = "abort"`, where a panic cannot be caught.
+    #[allow(dead_code)]
+    pub async fn try_start(fixture: &str, env: &[(&str, &str)]) -> Result<Server, String> {
         let mut server = Server::prepare(fixture, env);
-        server.launch().await;
-        server
+        server.launch().await?;
+        Ok(server)
     }
 
     fn prepare(fixture: &str, env: &[(&str, &str)]) -> Server {
@@ -97,7 +106,10 @@ impl Server {
     pub async fn start_with_ambient_token(fixture: &str, token: &str) -> Server {
         let mut server = Server::prepare(fixture, &[]);
         server.ambient_token = Some(token.to_owned());
-        server.launch().await;
+        server
+            .launch()
+            .await
+            .unwrap_or_else(|reason| panic!("{reason}"));
         server
     }
 
@@ -260,7 +272,9 @@ impl Server {
     pub async fn restart_after(&mut self, between: impl FnOnce(&Path)) {
         self.stop();
         between(&self.project);
-        self.launch().await;
+        self.launch()
+            .await
+            .unwrap_or_else(|reason| panic!("{reason}"));
     }
 
     /// A GET whose status the test checks itself.
@@ -285,21 +299,21 @@ impl Server {
 
     /// Starts the process on an ephemeral port, which it reports once it is
     /// listening, and retries a start that did not come up.
-    async fn launch(&mut self) {
+    async fn launch(&mut self) -> Result<(), String> {
         let mut last = String::new();
         for attempt in 1..=START_ATTEMPTS {
             self.port = 0;
             let spawned = Instant::now();
-            self.child = Some(spawn(
+            self.child = Some(try_spawn(
                 &self.project,
                 &self.env,
                 self.ambient_token.as_deref(),
                 &self.log,
-            ));
+            )?);
             match self.wait_ready().await {
                 Ok(()) => {
                     self.boot = spawned.elapsed();
-                    return;
+                    return Ok(());
                 }
                 Err(reason) => {
                     last = format!("attempt {attempt}: {reason}");
@@ -307,7 +321,9 @@ impl Server {
                 }
             }
         }
-        panic!("celld did not start after {START_ATTEMPTS} attempts ({last})");
+        Err(format!(
+            "celld did not start after {START_ATTEMPTS} attempts ({last})"
+        ))
     }
 
     async fn wait_ready(&mut self) -> Result<(), String> {
@@ -518,8 +534,20 @@ fn signal_group(pgid: u32, signal: &str) {
 /// state directory, the way an operator who keeps one there would, and
 /// `ambient` is set in the environment of the process itself.
 fn spawn(project: &Path, env: &[(String, String)], ambient: Option<&str>, log: &Path) -> Child {
+    try_spawn(project, env, ambient, log).unwrap_or_else(|reason| panic!("{reason}"))
+}
+
+fn try_spawn(
+    project: &Path,
+    env: &[(String, String)],
+    ambient: Option<&str>,
+    log: &Path,
+) -> Result<Child, String> {
     seed_token_file(project, env);
-    let log = fs::File::create(log).expect("create log file");
+    let log = fs::File::create(log).map_err(|e| format!("create log file: {e}"))?;
+    let clone = log
+        .try_clone()
+        .map_err(|e| format!("clone log handle: {e}"))?;
     Command::new(CELLD)
         .arg("dev")
         .arg(project)
@@ -539,11 +567,11 @@ fn spawn(project: &Path, env: &[(String, String)], ambient: Option<&str>, log: &
         )
         .envs(ambient.map(|token| ("CELLD_OPERATOR_TOKEN", token)))
         .stdin(Stdio::null())
-        .stdout(log.try_clone().expect("clone log handle"))
+        .stdout(clone)
         .stderr(log)
         .process_group(0)
         .spawn()
-        .expect("spawn celld")
+        .map_err(|e| format!("spawn celld: {e}"))
 }
 
 fn seed_token_file(project: &Path, env: &[(String, String)]) {
