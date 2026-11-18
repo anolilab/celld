@@ -52,6 +52,7 @@ export class Pinned extends DurableObject {
     if (url.pathname === "/do-guarded") {
       this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS guarded (k TEXT)");
       this.outcome = {};
+      await this.signal("guarded");
       try {
         await this.env.PIN.get(this.env.PIN.idFromName("stay")).fetch(
           "http://do/stay",
@@ -110,6 +111,10 @@ export class Pinned extends DurableObject {
     if (url.pathname === "/do-late-write") {
       this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS late (k TEXT)");
       this.lateWrite = {};
+      request.signal.addEventListener("abort", () => {
+        this.lateAborted = true;
+      });
+      await this.signal("lw");
       await new Promise((resolve) => {
         this.release = resolve;
       });
@@ -120,6 +125,9 @@ export class Pinned extends DurableObject {
         this.lateWrite.write = refused.message;
       }
       return new Response("late");
+    }
+    if (url.pathname === "/late-aborted") {
+      return new Response(this.lateAborted ? "aborted" : "running");
     }
     if (url.pathname === "/late-release") {
       this.release?.();
@@ -163,10 +171,17 @@ export default {
       // event ended. `/stash` leaves one behind and waits on it, so a client
       // that hangs up ends the event; `/await-stash` waits on it again.
       case "/stash":
+        request.signal.addEventListener("abort", () => {
+          globalThis.stashAborted = true;
+        });
         globalThis.stashed = env.PIN.get(env.PIN.idFromName("stay")).fetch(
           new Request("http://do/stay"),
         );
         return await globalThis.stashed;
+      case "/stash-state":
+        return new Response(
+          globalThis.stashAborted ? "aborted" : globalThis.stashed ? "waiting" : "none",
+        );
       case "/await-stash":
         if (!globalThis.stashed) return new Response("nothing stashed");
         try {
@@ -180,6 +195,48 @@ export default {
       case "/do-guarded-outcome":
         return env.PIN.get(env.PIN.idFromName("guarded")).fetch(
           new Request("http://do/guarded-outcome"),
+        );
+      // A stateless Worker, with no object behind it, ended the same way. Its
+      // catch block writes through D1.
+      case "/d1-guarded": {
+        await env.DB.exec("CREATE TABLE IF NOT EXISTS guarded (k TEXT)");
+        globalThis.d1Outcome = {};
+        request.signal.addEventListener("abort", () => {
+          globalThis.d1Aborted = true;
+        });
+        globalThis.d1Started = true;
+        try {
+          await env.PIN.get(env.PIN.idFromName("stay")).fetch("http://do/stay");
+        } catch (error) {
+          globalThis.d1Outcome.ended = error.message;
+          try {
+            await env.DB.prepare("INSERT INTO guarded VALUES ('caught')").run();
+            globalThis.d1Outcome.write = "written";
+          } catch (refused) {
+            globalThis.d1Outcome.write = refused.message;
+          }
+        }
+        return new Response("guarded");
+      }
+      case "/d1-state":
+        return new Response(
+          globalThis.d1Aborted ? "aborted" : globalThis.d1Started ? "waiting" : "none",
+        );
+      case "/d1-outcome": {
+        const rows = await env.DB.prepare("SELECT count(*) AS n FROM guarded").first("n");
+        return new Response(JSON.stringify({ ...globalThis.d1Outcome, rows }));
+      }
+      case "/do-lw-entered":
+        return env.PIN.get(env.PIN.idFromName("signal-lw")).fetch(
+          new Request("http://do/marked"),
+        );
+      case "/do-late-aborted":
+        return env.PIN.get(env.PIN.idFromName("late-write")).fetch(
+          new Request("http://do/late-aborted"),
+        );
+      case "/do-guarded-entered":
+        return env.PIN.get(env.PIN.idFromName("signal-guarded")).fetch(
+          new Request("http://do/marked"),
         );
       case "/do-late-write":
         return env.PIN.get(env.PIN.idFromName("late-write")).fetch(request);

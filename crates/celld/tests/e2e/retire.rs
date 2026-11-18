@@ -439,6 +439,34 @@ async fn durable_object_events_running_at_the_deadline_are_ended_and_the_node_ke
     assert_eq!(server.get_text("/version").await, "v2");
 }
 
+/// Start a request that waits on its own, and give the caller the task to
+/// drop when the client should hang up.
+fn start_waiting(server: &Server, path: &str) -> tokio::task::JoinHandle<()> {
+    let (client, url) = (reqwest::Client::new(), server.url(path));
+    tokio::spawn(async move {
+        let _ = client.get(url).send().await;
+    })
+}
+
+/// Wait until a route reports `want`, so a test acts on what the handler did
+/// and not on how long it took.
+async fn wait_for_text(server: &Server, what: &str, path: &str, want: &str) {
+    wait_until(what, Duration::from_secs(10), || async {
+        (get_within_budget(&reqwest::Client::new(), &server.url(path))
+            .await
+            .1
+            == want)
+            .then_some(())
+    })
+    .await;
+}
+
+/// Hang up on a request whose handler has started.
+async fn hang_up(waiting: tokio::task::JoinHandle<()>) {
+    waiting.abort();
+    let _ = waiting.await;
+}
+
 /// Work one event started stays reachable through a promise another event
 /// holds. When the first event ends, that promise must settle, not wait for
 /// ever on an operation nothing drives any more.
@@ -452,12 +480,22 @@ async fn a_promise_for_work_of_an_ended_event_rejects_instead_of_staying_pending
     vars.extend_from_slice(ONE_ISOLATE);
     let server = Server::start("retire", &vars).await;
     // The client gives up while the event waits, which ends the event.
-    let _ = reqwest::Client::new()
-        .get(server.url("/stash"))
-        .timeout(Duration::from_millis(500))
-        .send()
-        .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let waiting = start_waiting(&server, "/stash");
+    wait_for_text(
+        &server,
+        "the handler to stash its promise",
+        "/stash-state",
+        "waiting",
+    )
+    .await;
+    hang_up(waiting).await;
+    wait_for_text(
+        &server,
+        "the hang-up to end the event",
+        "/stash-state",
+        "aborted",
+    )
+    .await;
 
     let (status, body) =
         get_within_budget(&reqwest::Client::new(), &server.url("/await-stash")).await;
@@ -477,12 +515,27 @@ async fn an_event_ended_by_a_hang_up_writes_and_starts_nothing_while_it_unwinds(
         ],
     )
     .await;
-    let _ = reqwest::Client::new()
-        .get(server.url("/do-guarded"))
-        .timeout(Duration::from_millis(500))
-        .send()
-        .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let waiting = start_waiting(&server, "/do-guarded");
+    wait_for_text(
+        &server,
+        "the handler to start",
+        "/do-guarded-entered",
+        "entered",
+    )
+    .await;
+    hang_up(waiting).await;
+    // The outcome is written by the handler's catch block, after the hang-up.
+    wait_until(
+        "the catch block to run",
+        Duration::from_secs(10),
+        || async {
+            let (_, body) =
+                get_within_budget(&reqwest::Client::new(), &server.url("/do-guarded-outcome"))
+                    .await;
+            body.contains("\"ended\"").then_some(())
+        },
+    )
+    .await;
 
     let (status, body) =
         get_within_budget(&reqwest::Client::new(), &server.url("/do-guarded-outcome")).await;
@@ -507,11 +560,16 @@ async fn a_continuation_that_outlives_its_ended_events_context_cannot_write() {
         ],
     )
     .await;
-    let _ = reqwest::Client::new()
-        .get(server.url("/do-late-write"))
-        .timeout(Duration::from_millis(500))
-        .send()
-        .await;
+    let waiting = start_waiting(&server, "/do-late-write");
+    wait_for_text(&server, "the handler to start", "/do-lw-entered", "entered").await;
+    hang_up(waiting).await;
+    wait_for_text(
+        &server,
+        "the hang-up to reach the handler",
+        "/do-late-aborted",
+        "aborted",
+    )
+    .await;
     // Long enough for the ended event's context to be dropped.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -611,4 +669,40 @@ async fn an_event_ended_inside_a_transaction_rolls_it_back_without_aborting_the_
     let (status, value) = get_within_budget(&client, &server.url("/do-tx-value")).await;
     assert!(status.is_success(), "{status} {value}");
     assert_eq!(value, "none", "the open transaction was committed");
+}
+
+/// A stateless Worker has no continuation id to look up. When its client
+/// hangs up, the catch block its rejected wait runs must not write through D1.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stateless_worker_ended_by_a_hang_up_cannot_write_to_d1_while_it_unwinds() {
+    let mut vars = vec![
+        ("CELLD_OPERATOR_TOKEN", TOKEN),
+        ("CELLD_HANDLER_BUDGET_S", "3"),
+    ];
+    vars.extend_from_slice(ONE_ISOLATE);
+    let server = Server::start("retire", &vars).await;
+    let waiting = start_waiting(&server, "/d1-guarded");
+    wait_for_text(&server, "the handler to start", "/d1-state", "waiting").await;
+    hang_up(waiting).await;
+    wait_until(
+        "the catch block to run",
+        Duration::from_secs(10),
+        || async {
+            let (_, body) =
+                get_within_budget(&reqwest::Client::new(), &server.url("/d1-outcome")).await;
+            body.contains("\"ended\"").then_some(())
+        },
+    )
+    .await;
+    let (status, body) =
+        get_within_budget(&reqwest::Client::new(), &server.url("/d1-outcome")).await;
+    assert!(status.is_success(), "{status} {body}");
+    let outcome: Value = serde_json::from_str(&body).expect("outcome json");
+    assert!(
+        outcome["write"]
+            .as_str()
+            .is_some_and(|reason| reason.ends_with("The client has disconnected")),
+        "{body}"
+    );
+    assert_eq!(outcome["rows"], 0, "{body}");
 }

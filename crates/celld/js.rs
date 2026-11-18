@@ -2346,8 +2346,18 @@ impl ActorRuntimeState {
     }
 
     /// Why a continuation token may not touch storage: either of its two ends
-    /// having ended is enough. A plain token names one event as both.
-    fn token_ended_reason(&self, origin: Option<u64>, driver: Option<u64>) -> Option<String> {
+    /// having ended is enough. A plain token names one event as both. Code with
+    /// no token at all belongs to a stateless event, which has no id in the
+    /// record, so its own context answers.
+    fn token_ended_reason(
+        &self,
+        origin: Option<u64>,
+        driver: Option<u64>,
+        untracked: impl FnOnce() -> Arc<IoContext>,
+    ) -> Option<String> {
+        if origin.is_none() && driver.is_none() {
+            return untracked().ended().map(str::to_string);
+        }
         [driver, origin]
             .into_iter()
             .flatten()
@@ -2407,6 +2417,11 @@ impl EndedContexts {
                 records.floor = records.floor.max(Some(forgotten));
             }
         }
+        self.any.store(true, Ordering::Release);
+    }
+
+    /// An event without an id ended: the guard has to look at its context.
+    fn note_untracked(&self) {
         self.any.store(true, Ordering::Release);
     }
 
@@ -3678,6 +3693,11 @@ impl InFlight {
     /// handles are silent, so the ones nobody awaits cost nothing.
     fn reject_ops(&mut self, tc: &mut v8::PinScope, message: &str) {
         self.context.end(message);
+        // A stateless event has no id for the record to hold: its own context
+        // answers, once the guard knows there is something to ask.
+        if self.context.continuation_id().is_none() {
+            self.runtime_state.ended_contexts.note_untracked();
+        }
         let handed = self.context.close_handed_ops();
         let ids: Vec<u64> = self
             .ops
@@ -4032,7 +4052,8 @@ fn ended_event_refuses(
     // ends the call. A plain token names one event twice.
     let origin = reaction_continuation_id(scope);
     let driver = operation_continuation_id(scope);
-    let Some(reason) = actor_runtime_state(scope).token_ended_reason(origin, driver) else {
+    let state = actor_runtime_state(scope);
+    let Some(reason) = state.token_ended_reason(origin, driver, current_context) else {
         return false;
     };
     loader_throw(scope, &reason);
@@ -12858,20 +12879,53 @@ mod storage_guard_tests {
         state.ended_contexts.record(9, "driver over");
         // Ended origin, live foreign driver.
         assert_eq!(
-            state.token_ended_reason(Some(7), Some(8)).as_deref(),
+            state
+                .token_ended_reason(Some(7), Some(8), IoContext::new)
+                .as_deref(),
             Some("origin over")
         );
         // Live origin, ended driver.
         assert_eq!(
-            state.token_ended_reason(Some(8), Some(9)).as_deref(),
+            state
+                .token_ended_reason(Some(8), Some(9), IoContext::new)
+                .as_deref(),
             Some("driver over")
         );
         // Neither, and a plain token.
-        assert_eq!(state.token_ended_reason(Some(8), Some(8)), None);
         assert_eq!(
-            state.token_ended_reason(Some(9), Some(9)).as_deref(),
+            state.token_ended_reason(Some(8), Some(8), IoContext::new),
+            None
+        );
+        assert_eq!(
+            state
+                .token_ended_reason(Some(9), Some(9), IoContext::new)
+                .as_deref(),
             Some("driver over")
         );
+    }
+
+    /// Code with no token belongs to a stateless event, whose id the record
+    /// never held. Once that event's operations are rejected, its context
+    /// speaks for it.
+    #[test]
+    fn a_stateless_event_that_has_ended_is_refused_through_its_own_context() {
+        let state = ActorRuntimeState::default();
+        let stateless = IoContext::new();
+        assert_eq!(
+            state.token_ended_reason(None, None, || stateless.clone()),
+            None
+        );
+        stateless.end("the client left");
+        state.ended_contexts.note_untracked();
+        assert!(state.ended_contexts.any.load(Ordering::Acquire));
+        assert_eq!(
+            state
+                .token_ended_reason(None, None, || stateless.clone())
+                .as_deref(),
+            Some("the client left")
+        );
+        // Another stateless event in the isolate is not affected.
+        assert_eq!(state.token_ended_reason(None, None, IoContext::new), None);
     }
 
     #[test]
