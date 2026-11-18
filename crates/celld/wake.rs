@@ -172,16 +172,23 @@ pub async fn run_periodic(
     node: String,
     actor: tokio::sync::mpsc::UnboundedSender<crate::actor::Message>,
     tick_ms: u64,
+    hosts_cells: bool,
 ) {
+    if !hosts_cells {
+        // An earlier run of this node may have held the role while it
+        // still hosted cells; hand it on now, not at its expiry.
+        release_waker(&bucket, &node).await;
+    }
     tokio::join!(
         run_due_scans(
             bucket.clone(),
             ownership.clone(),
             node.clone(),
             actor.clone(),
-            tick_ms
+            tick_ms,
+            hosts_cells
         ),
-        run_cleanup(bucket, ownership, node, actor, tick_ms),
+        run_cleanup(bucket, ownership, node, actor, tick_ms, hosts_cells),
     );
 }
 
@@ -191,6 +198,7 @@ async fn run_cleanup(
     node: String,
     actor: tokio::sync::mpsc::UnboundedSender<crate::actor::Message>,
     tick_ms: u64,
+    hosts_cells: bool,
 ) {
     let mut tick = crate::asyncrt::interval(Duration::from_millis(tick_ms));
     tick.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
@@ -209,6 +217,7 @@ async fn run_cleanup(
         let elected = try_hold_waker(
             &bucket,
             &node,
+            hosts_cells,
             now_ms,
             tick_ms.saturating_mul(3).min(i64::MAX as u64) as i64,
         )
@@ -251,6 +260,7 @@ async fn run_due_scans(
     node: String,
     actor: tokio::sync::mpsc::UnboundedSender<crate::actor::Message>,
     tick_ms: u64,
+    hosts_cells: bool,
 ) {
     let mut tick = crate::asyncrt::interval(Duration::from_millis(tick_ms));
     tick.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
@@ -258,7 +268,9 @@ async fn run_due_scans(
     let mut dead_node_gc = crate::dead_node_gc::DeadNodeGc::default();
     loop {
         tick.tick().await;
-        let elected = dead_node_gc.run_elected_pass(&bucket, &node, tick_ms).await;
+        let elected = dead_node_gc
+            .run_elected_pass(&bucket, &node, hosts_cells, tick_ms)
+            .await;
         let due = due_scan(&bucket, crate::asyncrt::wall_ms()).await;
         let (scope, due) = match elected {
             Some(live) => (
@@ -301,8 +313,35 @@ async fn same_node_still_holds(bucket: &Bucket, key: &str, node: &str) -> bool {
 /// Advisory waker-role lease: one holder per fleet to avoid N nodes polling.
 /// Correctness never depends on it — concurrent wakers race activation CAS
 /// harmlessly — so a caller skips the tick when another node holds the role.
-pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i64) -> bool {
-    try_hold_lease(bucket, WAKER_KEY, node, now_ms, ttl_ms).await
+/// A node that hosts no cells (`hosts_cells` false) never takes it: the
+/// elected node's hints are what start a dead owner's alarms, and a node that
+/// can admit no cell would keep renewing a role it cannot serve.
+pub async fn try_hold_waker(
+    bucket: &Bucket,
+    node: &str,
+    hosts_cells: bool,
+    now_ms: i64,
+    ttl_ms: i64,
+) -> bool {
+    hosts_cells && try_hold_lease(bucket, WAKER_KEY, node, now_ms, ttl_ms).await
+}
+
+/// Give up the waker role if this node holds it, by expiring the lease in
+/// place so another node may take it on its next tick.
+pub(crate) async fn release_waker(bucket: &Bucket, node: &str) {
+    let Ok(Some((bytes, etag))) = bucket.get(WAKER_KEY).await else {
+        return;
+    };
+    let Ok(lease) = serde_json::from_slice::<WakerRoleLease>(&bytes) else {
+        return;
+    };
+    if lease.node != node {
+        return;
+    }
+    let body = format!("{{\"node\":{node:?},\"expires_ms\":0}}").into_bytes();
+    if let Err(error) = bucket.put_cas(WAKER_KEY, body, Some(&etag)).await {
+        warn!(%error, "could not release the waker role");
+    }
 }
 
 const WAKER_KEY: &str = "wake/waker.json";
@@ -351,10 +390,14 @@ pub(crate) async fn try_hold_lease(
 pub(crate) async fn while_holding_waker<F: std::future::Future>(
     bucket: &Bucket,
     node: &str,
+    hosts_cells: bool,
     tick_ms: u64,
     pass: &str,
     work: F,
 ) -> Option<F::Output> {
+    if !hosts_cells {
+        return None;
+    }
     while_holding_lease(bucket, WAKER_KEY, node, tick_ms, pass, work).await
 }
 
@@ -724,15 +767,48 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let bucket = Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
             let now = crate::ownership_store::now_ms() as i64;
-            assert!(try_hold_waker(&bucket, "node-a", now, 60_000).await);
-            assert!(!try_hold_waker(&bucket, "node-b", now, 60_000).await);
+            assert!(try_hold_waker(&bucket, "node-a", true, now, 60_000).await);
+            assert!(!try_hold_waker(&bucket, "node-b", true, now, 60_000).await);
             // The compactor's lease is another object: node-b holds it while
             // node-a holds the waker role, and node-a cannot take it from node-b.
             let key = crate::cell_directory_compactor::LEASE_KEY;
             assert!(try_hold_lease(&bucket, key, "node-b", now, 60_000).await);
             assert!(!try_hold_lease(&bucket, key, "node-a", now, 60_000).await);
             assert!(try_hold_lease(&bucket, key, "node-b", now + 1, 60_000).await);
-            assert!(try_hold_waker(&bucket, "node-a", now + 1, 60_000).await);
+            assert!(try_hold_waker(&bucket, "node-a", true, now + 1, 60_000).await);
+        });
+    }
+
+    #[test]
+    fn an_ingress_only_node_never_takes_the_waker_role() {
+        crate::asyncrt::install_test_host_runtime().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let bucket = Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+            let now = crate::ownership_store::now_ms() as i64;
+            // Free role: the ingress-only node is refused, the hosting node wins.
+            assert!(!try_hold_waker(&bucket, "ingress", false, now, 60_000).await);
+            assert!(try_hold_waker(&bucket, "host", true, now, 60_000).await);
+            assert!(!try_hold_waker(&bucket, "ingress", false, now + 1, 60_000).await);
+            assert!(try_hold_waker(&bucket, "host", true, now + 2, 60_000).await);
+            // An expired role is still not its to take.
+            assert!(!try_hold_waker(&bucket, "ingress", false, now + 120_000, 60_000).await);
+            let held = while_holding_waker(&bucket, "ingress", false, 1_000, "test", async { 1 });
+            assert_eq!(held.await, None);
+        });
+    }
+
+    #[test]
+    fn a_holder_that_became_ingress_only_releases_the_role() {
+        crate::asyncrt::install_test_host_runtime().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let bucket = Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+            let now = crate::ownership_store::now_ms() as i64;
+            assert!(try_hold_waker(&bucket, "node-a", true, now, 60_000).await);
+            // Another node's role is left alone.
+            release_waker(&bucket, "node-b").await;
+            assert!(!try_hold_waker(&bucket, "node-b", true, now + 1, 60_000).await);
+            release_waker(&bucket, "node-a").await;
+            assert!(try_hold_waker(&bucket, "node-b", true, now + 2, 60_000).await);
         });
     }
 }

@@ -4535,6 +4535,7 @@ impl State {
                     && peer.peer_protocol == self.config.peer_protocol
                     && peer.sampled_ms != 0
                     && !peer.pressured
+                    && !peer.ingress_only
                     && self
                         .capacity_rejections
                         .get(&peer.node)

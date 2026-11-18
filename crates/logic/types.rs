@@ -256,13 +256,16 @@ pub struct CapacityPeer {
     /// emptiest node in the fleet, and every cell sent to it fails its
     /// adoption or leaves with the drain.
     pub draining: bool,
+    /// This node hosts no cells (`max_resident = 0`), so it can adopt none.
+    pub ingress_only: bool,
 }
 
 impl CapacityPeer {
     /// Whether this peer's own load report leaves room for another cell.
     ///
     /// The rebalance planner and the handoff executor must return the same
-    /// answer here, so both read this one predicate. The planner counts a
+    /// answer here, so both read this one predicate. An ingress-only peer
+    /// never has room: it can host no cell at all. The planner counts a
     /// peer's room before it releases a batch, and the executor offers each
     /// released cell only to a peer that has room. A peer the planner counts
     /// and the executor then refuses leaves the cell unowned with its epoch
@@ -274,7 +277,7 @@ impl CapacityPeer {
     /// fleet and the planner gives it the largest room, while the executor
     /// refuses every cell it is offered.
     pub fn reports_adoption_capacity(&self) -> bool {
-        !self.pressured && self.memory_headroom != Some(false)
+        !self.ingress_only && !self.pressured && self.memory_headroom != Some(false)
     }
 }
 

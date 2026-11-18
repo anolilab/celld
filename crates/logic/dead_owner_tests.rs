@@ -47,6 +47,7 @@ fn peer(node: &str, expires_ms: u64) -> CapacityPeer {
         paced_handoff: true,
         rebalance_paused: false,
         draining: false,
+        ingress_only: false,
     }
 }
 
@@ -391,4 +392,55 @@ fn a_takeover_names_the_dead_owner_as_another_node() {
         )),
         "{effects:?}"
     );
+}
+
+#[test]
+fn placement_skips_an_ingress_only_peer_that_reports_no_cells() {
+    let mut state = started(0);
+    let effects = dead_owner_resolved(&mut state, 1, "cell");
+    let [Effect::ReadCapacityPeers { op, .. }] = work(&effects)[..] else {
+        panic!("expected peer placement, got {effects:?}");
+    };
+    let mut edge = peer("edge", NOW_MS + 30_000);
+    edge.ingress_only = true;
+    let mut host = peer("host", NOW_MS + 30_000);
+    host.resident_cells = 50;
+    let effects = on_event(
+        &mut state,
+        Event::CapacityPeersRead {
+            op: *op,
+            now_ms: NOW_MS,
+            result: Ok(vec![peer("dead", NOW_MS - 1), edge, host]),
+        },
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Complete {
+                request: 1,
+                result: Ok(Route::Remote { node, .. }),
+            } if node == "host"
+        )),
+        "expected a route to the hosting peer, got {effects:?}"
+    );
+}
+
+#[test]
+fn placement_fails_when_every_peer_is_ingress_only() {
+    let mut state = started(0);
+    let effects = dead_owner_resolved(&mut state, 1, "cell");
+    let [Effect::ReadCapacityPeers { op, .. }] = work(&effects)[..] else {
+        panic!("expected peer placement, got {effects:?}");
+    };
+    let mut edge = peer("edge", NOW_MS + 30_000);
+    edge.ingress_only = true;
+    let effects = on_event(
+        &mut state,
+        Event::CapacityPeersRead {
+            op: *op,
+            now_ms: NOW_MS,
+            result: Ok(vec![peer("dead", NOW_MS - 1), edge]),
+        },
+    );
+    assert_refused(&effects, 1);
 }

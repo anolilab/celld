@@ -70,6 +70,7 @@ pub fn joining_contributes_successor_capacity(
         .find(|peer| peer.node == node)
         .is_some_and(|joining| {
             joining.paced_handoff
+                && !joining.ingress_only
                 && live
                     .iter()
                     .filter(|peer| peer.node != node)
@@ -149,10 +150,15 @@ pub fn fleet_status(
     // successor share above their mean.
     let incumbents = live
         .iter()
-        .filter(|peer| peer.node != node)
+        .filter(|peer| peer.node != node && !peer.ingress_only)
         .collect::<Vec<_>>();
     let count = incumbents.len();
-    if count > 1 {
+    // An ingress-only joiner takes no cells, so the skew is no reason to hold
+    // its rollout: its predecessor has nothing to hand it.
+    let joining_hosts = live
+        .iter()
+        .any(|peer| peer.node == node && !peer.ingress_only);
+    if count > 1 && joining_hosts {
         let total = incumbents
             .iter()
             .fold(0_usize, |sum, peer| sum.saturating_add(peer.resident_cells));
@@ -174,4 +180,89 @@ pub fn fleet_status(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod fleet_tests {
+    use super::*;
+    use crate::CapacityPeer;
+
+    fn peer(node: &str, resident: usize, ingress_only: bool) -> CapacityPeer {
+        CapacityPeer {
+            node: node.into(),
+            addr: format!("{node}:8081"),
+            expires_ms: 100_000,
+            peer_protocol: 1,
+            sampled_ms: 10_000,
+            owned_cells: Some(resident),
+            placement_weight: None,
+            bucket_format: None,
+            resident_cells: resident,
+            host_websockets: 0,
+            rss_bytes: 0,
+            in_use_bytes: None,
+            pressured: false,
+            memory_headroom: None,
+            restoring: 0,
+            paced_handoff: true,
+            rebalance_paused: false,
+            draining: false,
+            ingress_only,
+        }
+    }
+
+    #[test]
+    fn a_joining_ingress_only_node_is_no_successor_capacity() {
+        let hosting = [
+            peer("a", 10, false),
+            peer("b", 10, false),
+            peer("new", 0, false),
+        ];
+        assert!(joining_contributes_successor_capacity(
+            &hosting, "new", 50_000
+        ));
+        let ingress = [
+            peer("a", 10, false),
+            peer("b", 10, false),
+            peer("new", 0, true),
+        ];
+        assert!(!joining_contributes_successor_capacity(
+            &ingress, "new", 50_000
+        ));
+    }
+
+    #[test]
+    fn an_ingress_only_joiner_is_not_held_by_a_skew_it_cannot_repair() {
+        let skewed = |joiner: CapacityPeer| {
+            [
+                peer("a", 90, false),
+                peer("b", 10, false),
+                peer("c", 10, false),
+                joiner,
+            ]
+        };
+        assert_eq!(
+            fleet_status(None, "new", 50_000, &skewed(peer("new", 0, true)), 8),
+            Ok(())
+        );
+        // A hosting joiner that is full still has to wait for the skew to settle.
+        assert!(matches!(
+            fleet_status(None, "new", 50_000, &skewed(peer("new", 90, false)), 8),
+            Err(FleetUnsettled::OwnershipSkew { .. })
+        ));
+    }
+
+    #[test]
+    fn an_ingress_only_incumbent_is_left_out_of_the_skew_mean() {
+        // The joiner is full, so it cannot absorb skew. Without the ingress
+        // nodes the hosting pair is within its share.
+        let peers = [
+            peer("a", 12, false),
+            peer("b", 10, false),
+            peer("edge", 0, true),
+            peer("edge2", 0, true),
+            peer("new", 12, false),
+        ];
+        assert_eq!(fleet_status(None, "new", 50_000, &peers, 8), Ok(()));
+    }
 }

@@ -4807,6 +4807,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             node.clone(),
             app.tx.clone(),
             tick_ms,
+            max_resident > 0,
         ))
         .detach();
     }
