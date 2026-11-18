@@ -477,6 +477,34 @@ async fn a_builder_message_is_delivered_as_mime_and_bcc_stays_out_of_the_headers
 }
 
 #[tokio::test]
+async fn a_builder_call_that_is_far_over_the_limit_is_refused_before_it_is_parsed() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, &[]).await;
+    // The text is 5 million characters, well under the 25 MiB limit, but JSON
+    // writes each control character as six, so the call is about 30 MB.
+    let message = json!({
+        "from": "ann@example.com", "to": "bob@example.com", "subject": "s",
+        "text": "\u{1}".repeat(5_000_000)
+    });
+    let out = send(
+        &server,
+        json!({ "binding": "EMAIL", "kind": "builder", "message": message }),
+    )
+    .await;
+    assert!(
+        out["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("too large")),
+        "{}",
+        out.to_string().chars().take(300).collect::<String>()
+    );
+    assert!(
+        sink.transactions().is_empty(),
+        "an oversized call opened a connection"
+    );
+}
+
+#[tokio::test]
 async fn credentials_are_the_nodes_and_never_the_workers_or_the_logs() {
     let password = "pw-7f3a9c1e5b";
     let sink = Sink::start(Behaviour {

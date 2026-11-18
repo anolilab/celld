@@ -315,6 +315,7 @@ const NOT_CELL_SCOPED: &[&str] = &[
     "__op_fetch",
     "__ai_run",
     "__ai_redact",
+    "__email_send",
     "__r2_head",
     "__r2_get",
     "__r2_put",

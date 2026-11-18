@@ -453,50 +453,42 @@ fn parse_headers(head: &[u8]) -> Result<Vec<Header>, EmailError> {
     Ok(headers)
 }
 
-/// The one address of a mailbox header value such as `Name <a@b.c>` or `a@b.c`,
-/// or `None` for a list, a group, or what is not an address.
+/// The one address of a mailbox header value, or `None` for anything else.
+///
+/// Only three shapes are read: `addr`, `"display name" <addr>` and
+/// `atom words <addr>`, with nothing after the `>`. A comment or a backslash
+/// is refused wherever it is. Mail clients and relays disagree about where a
+/// comment ends when it holds a quoted pair such as `\)`, so a header that
+/// uses one could name a different sender to them than to this check. A list,
+/// a group and what is not an address are refused too.
 fn single_address(value: &str) -> Option<String> {
-    // Drop quoted strings and comments: a display name may hold `<`, `,`, `@`.
-    let mut kept = String::new();
-    let mut quoted = false;
-    let mut escaped = false;
-    let mut comment = 0usize;
-    for c in value.chars() {
-        if quoted {
-            match (escaped, c) {
-                (true, _) => escaped = false,
-                (false, '\\') => escaped = true,
-                (false, '"') => quoted = false,
-                _ => {}
-            }
-        } else if comment > 0 {
-            match c {
-                '(' => comment += 1,
-                ')' => comment -= 1,
-                _ => {}
-            }
-        } else {
-            match c {
-                '"' => quoted = true,
-                '(' => comment = 1,
-                _ => kept.push(c),
-            }
-        }
-    }
-    if quoted || comment > 0 || kept.contains([',', ';']) {
+    let value = value.trim();
+    if value.contains('\\') {
         return None;
     }
-    let address = match (kept.find('<'), kept.find('>')) {
-        (None, None) => kept.trim(),
-        (Some(open), Some(close)) if open < close => {
-            if kept.matches('<').count() != 1 || kept.matches('>').count() != 1 {
-                return None;
-            }
-            kept[open + 1..close].trim()
+    let address = if let Some(quoted) = value.strip_prefix('"') {
+        // The display name is one quoted string, and the address follows it.
+        let (_, rest) = quoted.split_once('"')?;
+        angle_address(rest.trim_start())?
+    } else if let Some(open) = value.find('<') {
+        // Plain words before the address: no character that has a meaning in
+        // a mailbox, so no address, quote, comment, list or group.
+        let words = &value[..open];
+        if words.contains(|c: char| c.is_control() || "@<>,;:\"()[]".contains(c)) {
+            return None;
         }
-        _ => return None,
+        angle_address(&value[open..])?
+    } else {
+        value
     };
     valid_address(address).then(|| address.to_string())
+}
+
+/// The text between `<` and `>` of `<addr>`, which must be all of `text`
+/// but trailing white space.
+fn angle_address(text: &str) -> Option<&str> {
+    let (address, after) = text.strip_prefix('<')?.split_once('>')?;
+    after.trim().is_empty().then_some(address)
 }
 
 // ---- The builder form ------------------------------------------------------
@@ -631,6 +623,23 @@ fn mailbox_parts(mailbox: Mailbox) -> (Option<String>, String) {
 pub fn prepare_builder(binding: &SendEmailBinding, builder: Value) -> Result<Prepared, EmailError> {
     let builder: Builder = serde_json::from_value(builder)
         .map_err(|error| EmailError::invalid(format!("the message is not valid: {error}")))?;
+    // The parts are summed before anything is encoded, so a message that is
+    // too large costs no more than the parse that found it.
+    let parts = builder
+        .text
+        .iter()
+        .chain(&builder.html)
+        .map(String::len)
+        .sum::<usize>()
+        + builder
+            .attachments
+            .iter()
+            .flatten()
+            .map(|attachment| attachment.content.len())
+            .sum::<usize>();
+    if parts > MAX_MESSAGE_BYTES {
+        return Err(too_large());
+    }
     let (from_name, from) = mailbox_parts(builder.from);
     let too_long = |name: &Option<String>| {
         name.as_ref()
@@ -1211,7 +1220,9 @@ mod tests {
         for header in [
             "From: ann@example.com",
             "From: \"Doe, Ann\" <ann@example.com>",
-            "From: Ann (the one) <ann@example.com>",
+            "From: Ann Lee <ann@example.com>",
+            "From: <ann@example.com>",
+            "From: \"Ann (the one)\" <ann@example.com>  ",
         ] {
             let message = format!("{header}\nSubject: x\n\nbody");
             raw(&binding(), "ann@example.com", "bob@example.com", &message).unwrap();
@@ -1230,6 +1241,34 @@ mod tests {
             "From: ann@example.com\nFrom: ann@example.com\n\nbody",
         );
         assert!(two.is_err());
+    }
+
+    #[test]
+    fn a_from_with_a_comment_a_backslash_or_stray_text_is_refused() {
+        // A mail client reads a quoted pair inside a comment, so `\)` does not
+        // end it; a relay and this check must not disagree about the sender.
+        for header in [
+            "From: Ann (x\\) <eve@example.com> (y) <ann@example.com>",
+            "From: Ann (the one) <ann@example.com>",
+            "From: ann@example.com (Ann)",
+            "From: Ann (a (nested) one) <ann@example.com>",
+            "From: Ann\\ <ann@example.com>",
+            "From: \"Ann \\\" <eve@example.com>\" <ann@example.com>",
+            "From: Ann <ann@example.com> junk",
+            "From: Ann <ann@example.com> <eve@example.com>",
+            "From: Ann <ann@example.com> (late comment)",
+            "From: a@b <ann@example.com>",
+            "From: Ann < <ann@example.com>",
+            "From: \"Ann\" x <ann@example.com>",
+            "From: Ann \"Lee\" <ann@example.com>",
+            "From: Ann: <ann@example.com>",
+        ] {
+            let message = format!("{header}\nSubject: x\n\nbody");
+            assert!(
+                raw(&binding(), "ann@example.com", "bob@example.com", &message).is_err(),
+                "{header}"
+            );
+        }
     }
 
     #[test]
@@ -1354,6 +1393,26 @@ mod tests {
 
     fn text_of(prepared: &Prepared) -> String {
         String::from_utf8(prepared.data.clone()).unwrap()
+    }
+
+    #[test]
+    fn the_parts_of_a_builder_are_summed_before_anything_is_encoded() {
+        crate::asyncrt::install_test_host_runtime();
+        // Each part is under the limit and the sum is over it. The content is
+        // not base64, so a message that reached the encoder would fail there.
+        let half = "a".repeat(MAX_MESSAGE_BYTES / 2 + 1);
+        let error = build(json!({
+            "text": half.clone(),
+            "attachments": [{
+                "content": "!not base64!".repeat(MAX_MESSAGE_BYTES / 24 + 1),
+                "filename": "a.bin", "type": "application/octet-stream",
+                "disposition": "attachment"
+            }]
+        }))
+        .unwrap_err();
+        assert_eq!(error.code, "E_CONTENT_TOO_LARGE", "{error:?}");
+        let error = build(json!({ "text": half.clone(), "html": half })).unwrap_err();
+        assert_eq!(error.code, "E_CONTENT_TOO_LARGE", "{error:?}");
     }
 
     #[test]

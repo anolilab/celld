@@ -3,7 +3,7 @@
 //! The `send_email` of a config, checked and written as manifest bindings.
 
 use crate::email::SendEmailBinding;
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use serde_json::Value;
 
 /// The `send_email` of a config as manifest bindings.
@@ -14,39 +14,25 @@ use serde_json::Value;
 /// `allowed_destination_addresses`, which are alternatives. The binding is
 /// built through the manifest reader, so a deploy writes only what a node
 /// accepts.
-pub(super) fn read_send_email(value: Option<&Value>) -> anyhow::Result<Vec<Value>> {
-    let entries = match value {
-        None => &[][..],
-        Some(Value::Array(entries)) => entries.as_slice(),
-        Some(_) => bail!("config `send_email` must be an array"),
-    };
+pub(super) fn read_send_email(
+    object: &serde_json::Map<String, Value>,
+) -> anyhow::Result<Vec<Value>> {
     let mut bindings = Vec::new();
-    for entry in entries {
-        let object = entry
-            .as_object()
-            .ok_or_else(|| anyhow!("a `send_email` entry must be an object"))?;
-        if let Some(key) = object.keys().find(|key| {
-            !matches!(
-                key.as_str(),
-                "name"
-                    | "destination_address"
-                    | "allowed_destination_addresses"
-                    | "allowed_sender_addresses"
-            )
-        }) {
-            bail!(
-                "send_email declares `{key}`, which celld does not model; celld models `name`, \
-                 `destination_address`, `allowed_destination_addresses` and `allowed_sender_addresses`"
-            );
-        }
-        let name = object
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("send_email has no `name`"))?;
+    for entry in super::config_entries(
+        object,
+        "send_email",
+        &[
+            "name",
+            "destination_address",
+            "allowed_destination_addresses",
+            "allowed_sender_addresses",
+        ],
+    )? {
+        let name = super::entry_text(entry, "send_email", "name")?;
         if !super::valid_binding(name) {
             bail!("invalid send_email binding name: {name:?}");
         }
-        let mut manifest = entry.clone();
+        let mut manifest = Value::Object(entry.clone());
         manifest["type"] = Value::from("send_email");
         // The one reader of the shape, shared with the node.
         let binding = SendEmailBinding::from_manifest(&manifest)?;
@@ -60,8 +46,14 @@ mod send_email_config_tests {
     use super::*;
     use serde_json::json;
 
+    fn config(value: Value) -> serde_json::Map<String, Value> {
+        let mut object = serde_json::Map::new();
+        object.insert("send_email".into(), value);
+        object
+    }
+
     fn read(entry: Value) -> anyhow::Result<Vec<Value>> {
-        read_send_email(Some(&json!([entry])))
+        read_send_email(&config(json!([entry])))
     }
 
     fn refused(entry: Value) -> String {
@@ -70,7 +62,7 @@ mod send_email_config_tests {
 
     #[test]
     fn every_documented_shape_becomes_a_manifest_binding() {
-        assert!(read_send_email(None).unwrap().is_empty());
+        assert!(read_send_email(&serde_json::Map::new()).unwrap().is_empty());
         assert_eq!(
             read(json!({ "name": "EMAIL" })).unwrap(),
             [json!({ "type": "send_email", "name": "EMAIL" })]
@@ -112,7 +104,7 @@ mod send_email_config_tests {
             "name": "E", "destination_address": "a@b.co", "allowed_destination_addresses": ["a@b.co"]
         }))
         .contains("use one"));
-        assert!(read_send_email(Some(&json!({}))).is_err());
-        assert!(read_send_email(Some(&json!(["EMAIL"]))).is_err());
+        assert!(read_send_email(&config(json!({}))).is_err());
+        assert!(read_send_email(&config(json!(["EMAIL"]))).is_err());
     }
 }

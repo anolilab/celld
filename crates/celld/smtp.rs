@@ -52,8 +52,11 @@ pub const PASSWORD: &str = "CELLD_SMTP_PASSWORD";
 pub const PASSWORD_FILE: &str = "CELLD_SMTP_PASSWORD_FILE";
 pub const HELO_NAME: &str = "CELLD_SMTP_HELO_NAME";
 
-/// The warning for a password file other users can read.
-const SHARED_FILE_EVENT: &str = "smtp_password_file_shared";
+/// How a password file that other users can read is reported.
+const SHARED_FILE: crate::credential_file::SharedWarning = crate::credential_file::SharedWarning {
+    event: "smtp_password_file_shared",
+    subject: "SMTP password file",
+};
 const PASSWORD_FILE_MAX_BYTES: u64 = 1024;
 const MAX_CREDENTIAL_BYTES: usize = 255;
 
@@ -89,15 +92,6 @@ impl TlsMode {
             Self::Off => 25,
         }
     }
-}
-
-/// What the environment says, before the password file is read.
-struct Parsed {
-    host: String,
-    port: u16,
-    tls: TlsMode,
-    helo: String,
-    credentials: Option<(String, crate::credential_file::Source)>,
 }
 
 /// The relay's settings, with the password in hand.
@@ -180,11 +174,11 @@ fn credential_text(variable: &str, text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The settings in `get`, checked, with the password still unread. Nothing
-/// here reads a file, caches, or logs, so startup can call it before logging
-/// exists. A variable that is set while `CELLD_SMTP_HOST` is not is an error,
-/// since it would otherwise be ignored without a word.
-fn parse(get: &dyn Fn(&str) -> anyhow::Result<Option<String>>) -> anyhow::Result<Option<Parsed>> {
+/// The settings in `get`, checked, with the password read. Nothing here caches
+/// or logs, so startup can call it before logging exists. A variable that is
+/// set while `CELLD_SMTP_HOST` is not is an error, since it would otherwise be
+/// ignored without a word.
+fn parse(get: &dyn Fn(&str) -> anyhow::Result<Option<String>>) -> anyhow::Result<Option<Settings>> {
     let set = |name: &str| -> anyhow::Result<Option<String>> {
         Ok(get(name)?.filter(|value| !value.trim().is_empty()))
     };
@@ -225,20 +219,33 @@ fn parse(get: &dyn Fn(&str) -> anyhow::Result<Option<String>>) -> anyhow::Result
         }
     };
     let username = set(USERNAME)?;
-    let password = crate::credential_file::variable_or_file(get, PASSWORD, PASSWORD_FILE)?;
+    let password = crate::credential_file::choose(
+        (PASSWORD, get(PASSWORD)?),
+        (PASSWORD_FILE, get(PASSWORD_FILE)?),
+        PASSWORD_FILE_MAX_BYTES,
+        &SHARED_FILE,
+    )?;
     let credentials = match (username, password) {
         (None, None) => None,
         (Some(username), Some(password)) => {
             credential_text(USERNAME, &username)?;
-            if let crate::credential_file::Source::Variable(value) = &password {
-                credential_text(PASSWORD, value)?;
-            }
-            Some((username, password))
+            // A file ends in a line end that its editor wrote; a variable is
+            // taken as it is, so one with a line break is refused.
+            let text = if password.origin == PASSWORD {
+                password.text.as_str()
+            } else {
+                password.text.trim_end_matches(['\r', '\n'])
+            };
+            credential_text(&password.origin, text)?;
+            Some(Credentials {
+                username,
+                password: Zeroizing::new(text.to_string()),
+            })
         }
         (Some(_), None) => bail!("{USERNAME} is set without {PASSWORD} or {PASSWORD_FILE}"),
         (None, Some(_)) => bail!("{PASSWORD} or {PASSWORD_FILE} is set without {USERNAME}"),
     };
-    Ok(Some(Parsed {
+    Ok(Some(Settings {
         host,
         port,
         tls,
@@ -247,13 +254,15 @@ fn parse(get: &dyn Fn(&str) -> anyhow::Result<Option<String>>) -> anyhow::Result
     }))
 }
 
-/// Check the node's SMTP settings, for startup. It reads no password file.
+/// Check the node's SMTP settings, for startup. The log is not set up yet, so a
+/// warning about the password file goes nowhere; the first real `settings` call
+/// repeats it.
 pub fn validate() -> anyhow::Result<()> {
     parse(&|name| crate::env_vars::value(name)).map(|_| ())
 }
 
-/// The node's relay, or `None` when `CELLD_SMTP_HOST` is unset. The password
-/// file is read at the first call, and the result is kept for the process.
+/// The node's relay, or `None` when `CELLD_SMTP_HOST` is unset. The result,
+/// the password file's text included, is kept for the process.
 pub fn settings() -> Result<Option<&'static Settings>, &'static str> {
     static SETTINGS: OnceLock<Result<Option<Settings>, String>> = OnceLock::new();
     SETTINGS
@@ -272,25 +281,7 @@ pub fn settings() -> Result<Option<&'static Settings>, &'static str> {
 }
 
 fn load() -> anyhow::Result<Option<Settings>> {
-    let Some(parsed) = parse(&|name| crate::env_vars::value(name))? else {
-        return Ok(None);
-    };
-    let credentials = match parsed.credentials {
-        None => None,
-        Some((username, source)) => {
-            let password =
-                source.read(PASSWORD_FILE, PASSWORD_FILE_MAX_BYTES, SHARED_FILE_EVENT)?;
-            credential_text(PASSWORD_FILE, &password)?;
-            Some(Credentials { username, password })
-        }
-    };
-    Ok(Some(Settings {
-        host: parsed.host,
-        port: parsed.port,
-        tls: parsed.tls,
-        helo: parsed.helo,
-        credentials,
-    }))
+    parse(&|name| crate::env_vars::value(name))
 }
 
 // ---- The client ------------------------------------------------------------
@@ -395,25 +386,25 @@ impl Connection {
                     "the server sent an overlong reply line",
                 ));
             }
-            let text = String::from_utf8_lossy(&line);
-            let text = text.trim_end_matches(['\r', '\n']);
-            let (digits, rest) = text.split_at(text.len().min(3));
-            let code: u16 = digits
-                .parse()
-                .ok()
+            let malformed = || SendError::failed(stage, "the server sent a malformed reply");
+            // The code is read from bytes: the line is the server's, and a
+            // multi-byte character in its first three bytes is not a code.
+            let text = line.strip_suffix(b"\n").unwrap_or(&line);
+            let text = text.strip_suffix(b"\r").unwrap_or(text);
+            let digits = text
+                .get(..3)
+                .filter(|digits| digits.iter().all(u8::is_ascii_digit));
+            let code = digits
+                .and_then(|digits| std::str::from_utf8(digits).ok()?.parse::<u16>().ok())
                 .filter(|code| (200..600).contains(code))
-                .ok_or_else(|| SendError::failed(stage, "the server sent a malformed reply"))?;
-            let (more, body) = match rest.chars().next() {
-                Some('-') => (true, &rest[1..]),
-                Some(' ') => (false, &rest[1..]),
-                None => (false, ""),
-                Some(_) => {
-                    return Err(SendError::failed(
-                        stage,
-                        "the server sent a malformed reply",
-                    ))
-                }
+                .ok_or_else(malformed)?;
+            let (more, body) = match text.get(3) {
+                Some(b'-') => (true, &text[4..]),
+                Some(b' ') => (false, &text[4..]),
+                None => (false, &text[3..]),
+                Some(_) => return Err(malformed()),
             };
+            let body = String::from_utf8_lossy(body);
             lines.push(body.to_ascii_uppercase());
             if lines.len() > MAX_REPLY_LINES {
                 return Err(SendError::failed(stage, "the server sent too long a reply"));
@@ -463,15 +454,8 @@ async fn handshake(
 /// Connect to `host:port` on the addresses the egress policy for this binding
 /// allows, and to nothing else.
 async fn dial(host: &str, port: u16) -> Result<tokio::net::TcpStream, SendError> {
-    let resolved = if let Ok(ip) = host.parse::<IpAddr>() {
-        vec![std::net::SocketAddr::new(ip, port)]
-    } else {
-        tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|_| SendError::failed("connect", "the relay's name did not resolve"))?
-            .collect()
-    };
-    let addresses = crate::egress_filter::smtp_addresses(host, port, resolved)
+    let addresses = crate::egress_filter::smtp_addresses(host, port)
+        .await
         .map_err(|refused| SendError::failed("connect", refused))?;
     match crate::asyncrt::timeout(
         CONNECT_TIMEOUT,
@@ -742,16 +726,13 @@ mod tests {
             .collect()
     }
 
-    fn parsed(pairs: &[(&str, &str)]) -> anyhow::Result<Option<Parsed>> {
+    fn parsed(pairs: &[(&str, &str)]) -> anyhow::Result<Option<Settings>> {
         let map = env(pairs);
         parse(&|name| Ok(map.get(name).cloned()))
     }
 
     fn refusal(pairs: &[(&str, &str)]) -> String {
-        format!(
-            "{:#}",
-            parsed(pairs).err().expect("the settings are refused")
-        )
+        format!("{:#}", parsed(pairs).expect_err("the settings are refused"))
     }
 
     #[test]
@@ -837,15 +818,25 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(ok.credentials.is_some());
-        // A password file is read at the first send, never by validation.
+        // A password file is read with the settings, and a line end is dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pw");
+        #[allow(clippy::disallowed_methods)] // The test writes a credential file.
+        std::fs::write(&path, "from-file\r\n").unwrap();
         let file = parsed(&[
             (HOST, "h"),
             (USERNAME, "u"),
-            (PASSWORD_FILE, "/nonexistent/pw"),
+            (PASSWORD_FILE, path.to_str().unwrap()),
         ])
         .unwrap()
         .unwrap();
-        assert!(file.credentials.is_some());
+        assert_eq!(file.credentials.unwrap().password.as_str(), "from-file");
+        let missing = refusal(&[
+            (HOST, "h"),
+            (USERNAME, "u"),
+            (PASSWORD_FILE, "/nonexistent/pw"),
+        ]);
+        assert!(missing.contains(PASSWORD_FILE), "{missing}");
     }
 
     #[test]
@@ -867,6 +858,44 @@ mod tests {
         );
         let error = refusal(&[(HOST, "h"), (USERNAME, "u"), (PASSWORD, "hunter2-secret\n")]);
         assert!(!error.contains("hunter2-secret"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_a_multibyte_character_in_its_code_is_malformed_not_a_panic() {
+        crate::asyncrt::install_test_host_runtime();
+        for reply in [
+            "2\u{e9}0 ok\r\n",
+            "\u{e9}50 ok\r\n",
+            "25\u{20ac}\r\n",
+            "\u{1f4a5}\r\n",
+            "25\r\n",
+            "250\u{e9}ok\r\n",
+            "abc ok\r\n",
+            "+50 ok\r\n",
+        ] {
+            let (client, mut server) = tokio::io::duplex(1024);
+            tokio::io::AsyncWriteExt::write_all(&mut server, reply.as_bytes())
+                .await
+                .unwrap();
+            let mut connection = Connection::new(Box::new(client));
+            let error = match connection.read_reply("greeting").await {
+                Ok(_) => panic!("{reply:?} was accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                error.message.contains("malformed reply"),
+                "{reply:?}: {error:?}"
+            );
+        }
+        let (client, mut server) = tokio::io::duplex(1024);
+        tokio::io::AsyncWriteExt::write_all(&mut server, b"250-first\r\n250 second\r\n")
+            .await
+            .unwrap();
+        let reply = Connection::new(Box::new(client))
+            .read_reply("greeting")
+            .await
+            .unwrap();
+        assert_eq!((reply.code, reply.lines.len()), (250, 2));
     }
 
     #[test]

@@ -596,11 +596,8 @@ impl Filter {
             }
             NodeEndpoint::Address | NodeEndpoint::Elsewhere => {}
         }
-        match classify(ip) {
-            Class::Public | Class::Private | Class::Cgnat | Class::UniqueLocal => Ok(()),
-            Class::Loopback if allow_loopback => Ok(()),
-            class => Err(Refused::address(addr.ip(), class)),
-        }
+        operator_chosen(classify(ip), allow_loopback)
+            .map_err(|class| Refused::address(addr.ip(), class))
     }
 
     /// Keep the resolved addresses a Worker may dial. A hostname with an
@@ -640,6 +637,18 @@ impl Filter {
             self.permits_on(SocketAddr::new(addr.ip(), 0), port)
                 .map(|()| dialed)
         })
+    }
+}
+
+/// The class rule for a destination that the operator chose, a database or a
+/// mail relay, and not a Worker: private, carrier-grade and unique-local
+/// addresses are fine, loopback only with `allow_loopback`. Unspecified,
+/// link-local, metadata, multicast and reserved addresses are never one.
+fn operator_chosen(class: Class, allow_loopback: bool) -> Result<(), Class> {
+    match class {
+        Class::Public | Class::Private | Class::Cgnat | Class::UniqueLocal => Ok(()),
+        Class::Loopback if allow_loopback => Ok(()),
+        class => Err(class),
     }
 }
 
@@ -1087,21 +1096,25 @@ pub async fn register_node_addresses(
     Ok(())
 }
 
-/// The addresses a `send_email` binding may dial for the operator's SMTP relay,
-/// from the ones `host` resolved to: all but those that are never a mail relay.
+/// Resolve the operator's SMTP relay for a `send_email` binding and return the
+/// addresses it may dial: all but those that are never a mail relay.
 ///
-/// The relay is chosen by the operator, not by a Worker, so a private or
-/// loopback address is fine for it, as a relay on the same network or the same
-/// machine is usual. This does not follow `CELLD_EGRESS` and is on in every
-/// mode, `open` included. It refuses an unspecified, link-local, cloud
-/// metadata, multicast or reserved address, an address that is a listener of
-/// this node, and the name this node advertises. The caller dials the returned
-/// addresses and no others, so a second lookup cannot give a different answer.
-pub fn smtp_addresses(
-    host: &str,
-    port: u16,
-    resolved: Vec<SocketAddr>,
-) -> Result<Vec<SocketAddr>, Refused> {
+/// The relay is chosen by the operator, not by a Worker, so a private address
+/// is fine for it, as is loopback, in every mode: a mail transfer agent on
+/// the same machine is a usual relay, and a Worker cannot name it. This does
+/// not follow `CELLD_EGRESS` and is on in `open` mode too. It refuses an
+/// unspecified, link-local, cloud metadata, multicast or reserved address, an
+/// address that is a listener of this node, and the name this node
+/// advertises. The caller dials the returned addresses and no others, so a
+/// second lookup cannot give a different answer.
+///
+/// The refusals name the class and never the relay's name or address: they
+/// reach the Worker, and the relay is not for it to learn.
+pub async fn smtp_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, Refused> {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let resolved = lookup(bare, port)
+        .await
+        .map_err(|_| Refused("egress: the SMTP relay's name did not resolve".into()))?;
     smtp_addresses_with(host, port, resolved, node_endpoint, node_name)
 }
 
@@ -1112,49 +1125,27 @@ fn smtp_addresses_with(
     endpoint: impl Fn(SocketAddr) -> NodeEndpoint,
     node_name: impl Fn(&str, u16) -> bool,
 ) -> Result<Vec<SocketAddr>, Refused> {
-    let refuse = |what: &str| {
-        Refused(format!(
-            "egress refused: the SMTP relay resolves to {what}, which a send_email binding does not dial"
-        ))
-    };
     if node_name(&name_key(host), port) {
-        return Err(refuse("this node's own name"));
+        return Err(Refused(format!(
+            "egress refused: the SMTP relay is {}",
+            Class::Own.describe()
+        )));
     }
-    let mut first = None;
-    let kept: Vec<SocketAddr> = resolved
-        .into_iter()
-        .filter_map(|addr| {
-            let ip = canonical(addr.ip());
-            let at = SocketAddr::new(ip, port);
-            let class = classify(ip);
-            let never = matches!(
-                class,
-                Class::Unspecified
-                    | Class::LinkLocal
-                    | Class::Metadata
-                    | Class::Multicast
-                    | Class::Reserved
-            );
-            let refusal = if never {
-                Some(class.describe())
-            } else if endpoint(at) == NodeEndpoint::Listener {
-                Some(Class::Own.describe())
-            } else {
-                None
-            };
-            match refusal {
-                Some(what) => {
-                    first.get_or_insert(what);
-                    None
-                }
-                None => Some(at),
-            }
-        })
-        .collect();
-    if kept.is_empty() {
-        return Err(refuse(first.unwrap_or("no address")));
-    }
-    Ok(kept)
+    keep("the SMTP relay", resolved, |addr| {
+        let ip = canonical(addr.ip());
+        let at = SocketAddr::new(ip, port);
+        let refused = |class: Class| {
+            Refused(format!(
+                "egress refused: the SMTP relay is {}",
+                class.describe()
+            ))
+        };
+        operator_chosen(classify(ip), true).map_err(refused)?;
+        if endpoint(at) == NodeEndpoint::Listener {
+            return Err(refused(Class::Own));
+        }
+        Ok(at)
+    })
 }
 
 /// The node's policy, read from the environment once. `None` means open.

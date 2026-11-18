@@ -13,9 +13,11 @@
 use super::*;
 use crate::email::{EmailError, Prepared, SendEmailBinding};
 
-/// The longest call, in UTF-16 units of its JSON. A message is at most 25 MiB,
-/// and JSON escaping can write a control character as six.
-const MAX_CALL_UNITS: usize = 6 * crate::email::MAX_MESSAGE_BYTES;
+/// The longest call, in UTF-16 units of its JSON: a message is at most 25 MiB,
+/// and the rest of the call (addresses, headers, quoting) is small. A message
+/// that needs more once JSON has escaped it is refused, so a call costs the
+/// host no more than about this before it is parsed.
+const MAX_CALL_UNITS: usize = crate::email::MAX_MESSAGE_BYTES + 256 * 1024;
 
 #[derive(serde::Deserialize)]
 struct Call {

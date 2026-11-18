@@ -53,13 +53,13 @@ Worker reads, or in a log.
 | `CELLD_SMTP_TLS` | `starttls` (default), `tls` or `off` |
 | `CELLD_SMTP_USERNAME` | The account. Set it with a password |
 | `CELLD_SMTP_PASSWORD` | The password |
-| `CELLD_SMTP_PASSWORD_FILE` | A file that holds the password, in place of `CELLD_SMTP_PASSWORD`. Setting both is an error. celld reads the file at the first `send()`, accepts a symbolic link as a mounted secret is, drops one trailing line end, and warns (`smtp_password_file_shared`) when other users can read it |
+| `CELLD_SMTP_PASSWORD_FILE` | A file that holds the password, in place of `CELLD_SMTP_PASSWORD`. Setting both is an error. celld reads the file with the settings, accepts a symbolic link as a mounted secret is, drops one trailing line end, and warns (`smtp_password_file_shared`) when other users can read it |
 | `CELLD_SMTP_HELO_NAME` | The name celld gives in `EHLO`. Default `localhost` |
 
 The node checks these at start and refuses to start on a malformed value, or
 on a variable that is set while `CELLD_SMTP_HOST` is not. The error names the
-variable and never the password. A password file that cannot be read is found
-at the first `send()`, which logs `smtp_settings_invalid` once with the cause.
+variable and never the password. That includes a password file that cannot be
+read. The warning about a shared file is logged at the first `send()`.
 
 - **TLS is required unless `CELLD_SMTP_TLS=off` says otherwise.** With
   `starttls`, a relay that does not offer `STARTTLS` is an error: celld never
@@ -69,8 +69,10 @@ at the first `send()`, which logs `smtp_settings_invalid` once with the cause.
 - Login uses `AUTH PLAIN`, or `AUTH LOGIN` when the relay offers only that.
   With `off` the login is sent in the clear: use it for a relay on the same
   host or a trusted network.
-- The host makes the connection. A private or loopback address is fine, as a
-  relay on the same network or machine is usual. An unspecified, link-local,
+- The host makes the connection. A private or loopback address is fine on every
+  node, a fleet node included, as a relay on the same network or a mail agent
+  on the same machine is usual: the operator names the relay, and a Worker
+  cannot. An unspecified, link-local,
   cloud metadata, multicast or reserved address is refused, so is a listener of
   this node, and the connection goes only to the addresses that passed. This
   holds in `celld dev` and with `CELLD_EGRESS=open`.
@@ -121,7 +123,10 @@ check the syntax of the value of an allowlisted header, such as the URI of
 message as a string or a `ReadableStream` of bytes. celld requires that
 
 - the message has exactly one `From:` header whose address is `from`, so an
-  `allowed_sender_addresses` list also holds for what a recipient sees;
+  `allowed_sender_addresses` list also holds for what a recipient sees. The
+  header is `addr`, `"Display Name" <addr>` or `plain words <addr>`, with
+  nothing after the `>`. A comment, a backslash or any other text is refused,
+  because mail programs disagree about where a comment ends;
 - it has no `Received:` header;
 - every line end is CRLF: a bare LF or CR is changed to CRLF.
 
@@ -131,7 +136,8 @@ header. `send()` resolves to `{ messageId }` in both forms.
 ## Limits
 
 - A message weighs at most 25 MiB, attachments included. celld stops reading a
-  stream at the limit and rejects with `E_CONTENT_TOO_LARGE`.
+  stream at the limit and rejects with `E_CONTENT_TOO_LARGE`. A message given
+  as fields is also refused when its call, as JSON, is more than about 25 MiB.
 - At most 50 recipients, `to`, `cc` and `bcc` together, and 32 attachments.
 - The header section of a raw message is at most 64 KiB, and a header line at
   most 998 bytes. A subject has at most 998 characters.
