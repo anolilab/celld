@@ -29,7 +29,7 @@ export default {
       code_points: [...text].length,
       utf16_length: text.length,
       reencoded_equal: encoded.length === bytes.length,
-      first_bytes: [...encoded.slice(0, 6)],
+      encoded: [...encoded].map((b) => b.toString(16).padStart(2, "0")).join(""),
       encode_into: { read: result.read, written: result.written },
       latin1: new TextDecoder("latin1").decode(new Uint8Array([0xe9, 0x41])),
       fatal_error: (() => { try { new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array([0xff])); return null; } catch (e) { return e.name; } })(),

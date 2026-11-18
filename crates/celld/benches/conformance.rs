@@ -42,12 +42,13 @@ use serde_json::{json, Value};
 
 use harness::Server;
 use logic::{
-    apply_allow_list, diff, parse_allow_list, resolve_path, stale_entries, Allowed, Normaliser,
-    Observed, Script, Step, NORMALISED, WRANGLER_KEYS,
+    apply_allow_list, check_wrangler, diff, parse_allow_list, resolve_path, stale_entries, Allowed,
+    Normaliser, Observed, Script, Step, NORMALISED,
 };
 
 const DEFAULT_CORPUS: &str = "conformance";
 const READY_PATH: &str = "/__ready";
+const READY_BODY: &str = "ready";
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn out(text: &str) {
@@ -228,10 +229,10 @@ fn workerd_version(binary: &Path) -> String {
 
 async fn run_fixture(corpus: &str, name: &str, workerd: &Path) -> Result<Value, String> {
     let dir = harness::fixture_dir(&format!("{corpus}/{name}"));
-    let script: Script = serde_json::from_str(
+    let script = Script::parse(
         &fs::read_to_string(dir.join("script.json")).map_err(|e| format!("script.json: {e}"))?,
     )
-    .map_err(|e| format!("script.json: {e}"))?;
+    .map_err(|e| format!("{name}/script.json: {e}"))?;
     let normaliser = Normaliser::new(&script)?;
 
     let celld = Server::try_start(&format!("{corpus}/{name}"), &[]).await?;
@@ -371,7 +372,10 @@ impl WorkerdProcess {
         let started = Instant::now();
         loop {
             if let Ok(response) = client.get(&url).send().await {
-                if response.status().is_success() {
+                // The same probe as celld's: a 2xx with the fixture's own `ready`.
+                if response.status().is_success()
+                    && response.text().await.is_ok_and(|body| body == READY_BODY)
+                {
                     return Ok(process);
                 }
             }
@@ -412,16 +416,7 @@ fn text(value: &str) -> String {
 /// compatibility settings, vars, and Durable Object classes on in-memory
 /// storage, behind one HTTP socket on `port`.
 fn capnp_config(wrangler: &Value, port: u16) -> Result<String, String> {
-    if let Some(key) = wrangler
-        .as_object()
-        .into_iter()
-        .flat_map(|map| map.keys())
-        .find(|key| !WRANGLER_KEYS.contains(&key.as_str()))
-    {
-        return Err(format!(
-            "wrangler.json: `{key}` is not translated to the workerd config, so the runtimes would differ"
-        ));
-    }
+    check_wrangler(wrangler)?;
     let main = wrangler["main"]
         .as_str()
         .ok_or("wrangler.json has no main")?;
@@ -468,10 +463,12 @@ fn capnp_config(wrangler: &Value, port: u16) -> Result<String, String> {
         .into_iter()
         .flatten()
     {
-        let (name, class) = (
-            binding["name"].as_str().unwrap_or_default(),
-            binding["class_name"].as_str().unwrap_or_default(),
-        );
+        let (Some(name), Some(class)) = (binding["name"].as_str(), binding["class_name"].as_str())
+        else {
+            return Err(
+                "wrangler.json: a durable_objects binding needs a name and class_name".into(),
+            );
+        };
         bindings.push(format!(
             "(name = {}, durableObjectNamespace = {})",
             text(name),

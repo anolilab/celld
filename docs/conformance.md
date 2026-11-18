@@ -86,12 +86,17 @@ HTTP socket on a free port.
   matches every array element or object value), `headers` replace a compared
   header's value, and `regexes` rewrite header values and the body text. The
   server's origin is always rewritten to `<origin>`. JSON bodies are compared as
-  parsed values, so key order is not part of the comparison. A body that is not
+  parsed values, so key order is not part of the comparison; the `regexes` run
+  on the compact text that results (after `json_paths`), so write `"id":\d+`,
+  without spaces. A body that is not
   UTF-8 is compared as bytes and shown in the report as `base64:<data>`.
 - A key the runner does not know in `script.json` or `allowlist.json` is an
   error, so a typo cannot drop a check. The same goes for a key of
   `wrangler.json` that the runner does not translate to the workerd config
-  (it would reach celld but not workerd).
+  (it would reach celld but not workerd); that includes the keys of each
+  Durable Object binding (`name`, `class_name`) and migration (`tag`,
+  `new_classes`, `new_sqlite_classes`). A script with no requests, an invalid
+  method, or both `json` and `body` fails the fixture before any request runs.
 
 ## The allow-list
 

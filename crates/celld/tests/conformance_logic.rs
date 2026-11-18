@@ -9,8 +9,8 @@ mod logic;
 use std::path::Path;
 
 use logic::{
-    apply_allow_list, diff, parse_allow_list, resolve_path, stale_entries, Body, Normaliser,
-    Observed, Script,
+    apply_allow_list, check_wrangler, diff, parse_allow_list, resolve_path, stale_entries, Body,
+    Normaliser, Observed, Script,
 };
 use serde_json::{json, Value};
 
@@ -192,4 +192,49 @@ fn relative_paths_resolve_against_the_start_directory() {
         resolve_path(Path::new("workerd"), base),
         Path::new("workerd")
     );
+}
+
+#[test]
+fn a_script_with_no_requests_is_rejected() {
+    assert!(Script::parse(r#"{ "requests": [] }"#).is_err());
+}
+
+#[test]
+fn a_malformed_step_rejects_the_whole_script() {
+    let step =
+        |extra: &str| format!(r#"{{ "requests": [{{ "name": "n", "path": "/", {extra} }}] }}"#);
+    assert!(Script::parse(&step(r#""method": "GET""#)).is_ok());
+    assert!(Script::parse(&step(r#""method": "NOT A METHOD""#)).is_err());
+    assert!(Script::parse(&step(r#""method": "POST", "json": 1, "body": "x""#)).is_err());
+}
+
+#[test]
+fn a_json_content_type_matches_in_any_case() {
+    let normaliser = Normaliser::new(&script(
+        r#"{ "requests": [], "normalise": { "json_paths": ["id"] } }"#,
+    ))
+    .unwrap();
+    let body = normaliser.body("http://x", "Application/JSON", br#"{ "id": 7 }"#);
+    assert_eq!(body, Body::Text(r#"{"id":"<normalised>"}"#.into()));
+}
+
+#[test]
+fn nested_wrangler_keys_are_checked() {
+    let ok = json!({
+        "main": "w.js",
+        "durable_objects": { "bindings": [{ "name": "A", "class_name": "A" }] },
+        "migrations": [{ "tag": "v1", "new_sqlite_classes": ["A"] }],
+    });
+    assert!(check_wrangler(&ok).is_ok());
+    for bad in [
+        json!({ "migrations": [{ "tag": "v1", "renamed_classes": [] }] }),
+        json!({ "migrations": [{ "deleted_classes": ["A"] }] }),
+        json!({ "durable_objects": { "bindings": [{ "name": "A", "class_name": "A", "script_name": "o" }] } }),
+        json!({ "durable_objects": { "bindings": [{ "name": "A" }] } }),
+        json!({ "durable_objects": { "bindings": [{ "name": "A", "class_name": 1 }] } }),
+        json!({ "durable_objects": { "other": [] } }),
+        json!({ "unknown": 1 }),
+    ] {
+        assert!(check_wrangler(&bad).is_err(), "{bad}");
+    }
 }

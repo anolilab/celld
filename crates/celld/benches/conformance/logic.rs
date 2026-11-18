@@ -29,6 +29,51 @@ pub const WRANGLER_KEYS: [&str; 9] = [
     "migrations",
 ];
 
+/// The keys of a `durable_objects` entry, of one of its bindings and of one
+/// migration that the runner translates; any other would be dropped for workerd.
+pub const DURABLE_OBJECTS_KEYS: [&str; 1] = ["bindings"];
+pub const BINDING_KEYS: [&str; 2] = ["name", "class_name"];
+pub const MIGRATION_KEYS: [&str; 3] = ["tag", "new_classes", "new_sqlite_classes"];
+
+fn unknown_key(what: &str, value: &Value, allowed: &[&str]) -> Result<(), String> {
+    match value.as_object().and_then(|map| map.keys().find(|k| !allowed.contains(&k.as_str()))) {
+        Some(key) => Err(format!(
+            "wrangler.json: `{key}` in {what} is not translated to the workerd config, so the runtimes would differ"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Rejects every wrangler key the workerd config would silently drop: at the
+/// top level, in `durable_objects`, in each binding and in each migration. A
+/// binding needs a string `name` and `class_name`.
+pub fn check_wrangler(wrangler: &Value) -> Result<(), String> {
+    unknown_key("the config", wrangler, &WRANGLER_KEYS)?;
+    unknown_key(
+        "durable_objects",
+        &wrangler["durable_objects"],
+        &DURABLE_OBJECTS_KEYS,
+    )?;
+    for binding in wrangler["durable_objects"]["bindings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        unknown_key("a durable_objects binding", binding, &BINDING_KEYS)?;
+        for key in BINDING_KEYS {
+            if !binding[key].is_string() {
+                return Err(format!(
+                    "wrangler.json: a durable_objects binding needs a string `{key}`"
+                ));
+            }
+        }
+    }
+    for migration in wrangler["migrations"].as_array().into_iter().flatten() {
+        unknown_key("a migration", migration, &MIGRATION_KEYS)?;
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Script {
@@ -53,6 +98,24 @@ pub struct Step {
     /// Kept as written, so `-0`, number spelling and key order reach the
     /// Worker exactly as the fixture has them.
     pub json: Option<Box<RawValue>>,
+}
+
+impl Script {
+    /// Parses and validates a whole script, so a malformed one is an error
+    /// before any request is sent and never a difference an allow-list could
+    /// cover: at least one request, a valid method and one body source each.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let script: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        if script.requests.is_empty() {
+            return Err("`requests` is empty, so the fixture exercises nothing".into());
+        }
+        for step in &script.requests {
+            reqwest::Method::from_bytes(step.method.as_bytes())
+                .map_err(|e| format!("{}: method {:?}: {e}", step.name, step.method))?;
+            step.body_bytes()?;
+        }
+        Ok(script)
+    }
 }
 
 impl Step {
@@ -247,7 +310,7 @@ impl Normaliser {
         let Ok(text) = std::str::from_utf8(bytes) else {
             return Body::Bytes(bytes.to_vec());
         };
-        if content_type.contains("json") {
+        if content_type.to_ascii_lowercase().contains("json") {
             if let Ok(mut value) = serde_json::from_str::<Value>(text) {
                 for path in &self.json_paths {
                     replace_path(&mut value, path);
