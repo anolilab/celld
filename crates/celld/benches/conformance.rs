@@ -13,8 +13,9 @@
 //! binary; otherwise the pinned release is fetched), `CELLD_CONFORMANCE_FILTER`
 //! (substring of the fixture name), `CELLD_CONFORMANCE_CORPUS` (directory under
 //! `tests/fixtures`, default `conformance`), `CELLD_CONFORMANCE_OUT` (path of the
-//! JSON report) and `CELLD_CONFORMANCE_REQUIRE` (fail instead of skipping when
-//! workerd is unavailable).
+//! JSON report), `CELLD_CONFORMANCE_REQUIRE` (fail instead of skipping when
+//! workerd is unavailable) and `CELLD_CONFORMANCE_ALLOW_EMPTY` (do not fail when
+//! no fixture is selected).
 
 // The runner drives child processes from the outside, so it is not part of the
 // execution boundary that the disallowed-methods policy protects.
@@ -25,6 +26,9 @@
 #[path = "../tests/e2e/harness.rs"]
 mod harness;
 
+#[path = "conformance/logic.rs"]
+mod logic;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -34,83 +38,17 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
-use regex::Regex;
-use serde::Deserialize;
 use serde_json::{json, Value};
 
 use harness::Server;
+use logic::{
+    apply_allow_list, diff, parse_allow_list, resolve_path, stale_entries, Allowed, Normaliser,
+    Observed, Script, Step, NORMALISED, WRANGLER_KEYS,
+};
 
 const DEFAULT_CORPUS: &str = "conformance";
 const READY_PATH: &str = "/__ready";
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
-/// Response headers compared for every fixture; a fixture adds its own.
-const DEFAULT_HEADERS: [&str; 3] = ["content-type", "cache-control", "location"];
-const NORMALISED: &str = "<normalised>";
-
-#[derive(Deserialize)]
-struct Script {
-    #[serde(default)]
-    description: String,
-    requests: Vec<Step>,
-    #[serde(default)]
-    compare_headers: Vec<String>,
-    #[serde(default)]
-    normalise: Normalise,
-}
-
-#[derive(Deserialize)]
-struct Step {
-    name: String,
-    method: String,
-    path: String,
-    #[serde(default)]
-    headers: BTreeMap<String, String>,
-    body: Option<String>,
-    json: Option<Value>,
-}
-
-/// What differs between runs and must not count as a difference.
-#[derive(Deserialize, Default)]
-struct Normalise {
-    /// Dotted paths into a JSON body (`a.b`, `items.*.id`) whose value is replaced.
-    #[serde(default)]
-    json_paths: Vec<String>,
-    /// Compared response headers whose value is replaced.
-    #[serde(default)]
-    headers: Vec<String>,
-    /// Applied to every compared header value and to the body text.
-    #[serde(default)]
-    regexes: Vec<Rewrite>,
-}
-
-#[derive(Deserialize)]
-struct Rewrite {
-    pattern: String,
-    replace: String,
-}
-
-#[derive(Deserialize)]
-struct Allowed {
-    fixture: String,
-    /// A request name, or `*` for every request of the fixture.
-    request: String,
-    /// `status`, `body`, `error` or `header:<name>`.
-    field: String,
-    reason: String,
-}
-
-#[derive(Deserialize)]
-struct AllowList {
-    allowed: Vec<Allowed>,
-}
-
-/// What one runtime answered for one request, after normalisation.
-#[derive(Clone, PartialEq)]
-struct Observed {
-    status: u16,
-    headers: BTreeMap<String, Option<String>>,
-    body: String,
-}
 
 fn out(text: &str) {
     let mut stdout = std::io::stdout().lock();
@@ -118,18 +56,25 @@ fn out(text: &str) {
 }
 
 fn main() {
+    // The runner starts child processes in other directories, so every path it
+    // is given is made absolute against the directory it started in.
+    let start_dir = std::env::current_dir().expect("read the working directory");
     let corpus =
         std::env::var("CELLD_CONFORMANCE_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into());
     let filter = std::env::var("CELLD_CONFORMANCE_FILTER")
         .ok()
         .filter(|f| !f.is_empty());
     let require = std::env::var_os("CELLD_CONFORMANCE_REQUIRE").is_some();
-    let out_path = std::env::var_os("CELLD_CONFORMANCE_OUT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("celld-conformance/report.json"));
+    let allow_empty = std::env::var_os("CELLD_CONFORMANCE_ALLOW_EMPTY").is_some();
+    let out_path = resolve_path(
+        &std::env::var_os("CELLD_CONFORMANCE_OUT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("celld-conformance/report.json")),
+        &start_dir,
+    );
     let root = harness::fixture_dir(&corpus);
 
-    let workerd = match locate_workerd() {
+    let workerd = match locate_workerd(&start_dir) {
         Ok(found) => found,
         Err(reason) => {
             out(&format!(
@@ -142,7 +87,17 @@ fn main() {
             std::process::exit(i32::from(require));
         }
     };
-    let allow = load_allow_list(&root);
+    let allow = match load_allow_list(&root) {
+        Ok(allow) => allow,
+        Err(reason) => {
+            out(&format!("conformance: {reason}\n"));
+            write_report(
+                &out_path,
+                &json!({ "schema_version": 1, "error": reason, "fixtures": [] }),
+            );
+            std::process::exit(1);
+        }
+    };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -159,18 +114,25 @@ fn main() {
     names.sort();
 
     let mut used = vec![false; allow.len()];
+    let mut errored = Vec::new();
     let mut fixtures = Vec::new();
     for name in &names {
         let started = Instant::now();
+        // A start failure comes back as an error. The catch is for a build with
+        // panic = "unwind"; under "abort" nothing is caught, so the paths that
+        // can fail return a `Result` instead of panicking.
         let outcome =
             runtime.block_on(AssertUnwindSafe(run_fixture(&corpus, name, &workerd)).catch_unwind());
         let mut report = match outcome {
             Ok(Ok(report)) => report,
             Ok(Err(error)) => json!({ "name": name, "status": "error", "error": error }),
             Err(_) => {
-                json!({ "name": name, "status": "error", "error": "a runtime failed to start; see the log above" })
+                json!({ "name": name, "status": "error", "error": "the run panicked; see the log above" })
             }
         };
+        if report["status"] == "error" {
+            errored.push(name.clone());
+        }
         apply_allow_list(name, &mut report, &allow, &mut used);
         report["seconds"] = json!(started.elapsed().as_secs_f64());
         out(&format!(
@@ -180,16 +142,7 @@ fn main() {
         fixtures.push(report);
     }
 
-    // An entry that matched nothing is stale: the difference is gone or the
-    // fixture was renamed, and the list must not carry it.
-    let stale: Vec<Value> = allow
-        .iter()
-        .zip(&used)
-        .filter(|(entry, used)| {
-            !**used && filter.as_deref().is_none_or(|_| names.contains(&entry.fixture))
-        })
-        .map(|(entry, _)| json!({ "fixture": entry.fixture, "request": entry.request, "field": entry.field }))
-        .collect();
+    let stale = stale_entries(&allow, &used, &names, &errored, filter.is_some());
     let count = |status: &str| fixtures.iter().filter(|f| f["status"] == status).count();
     let (pass, allowed, fail, error) = (
         count("pass"),
@@ -197,6 +150,7 @@ fn main() {
         count("fail"),
         count("error"),
     );
+    let empty = names.is_empty() && !allow_empty;
     let report = json!({
         "schema_version": 1,
         "workerd": { "binary": workerd.display().to_string(), "version": workerd_version(&workerd) },
@@ -210,14 +164,18 @@ fn main() {
         stale.len(),
         out_path.display()
     ));
-    if fail + error + stale.len() > 0 {
+    if empty {
+        out("conformance: no fixture was selected; set CELLD_CONFORMANCE_ALLOW_EMPTY to allow that\n");
+    }
+    if fail + error + stale.len() > 0 || empty {
         std::process::exit(1);
     }
 }
 
 fn write_report(path: &Path, report: &Value) {
-    fs::create_dir_all(path.parent().expect("report path has a parent"))
-        .expect("create report dir");
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).expect("create report dir");
+    }
     fs::write(
         path,
         serde_json::to_string_pretty(report).expect("serialise report"),
@@ -225,78 +183,39 @@ fn write_report(path: &Path, report: &Value) {
     .expect("write report");
 }
 
-fn load_allow_list(root: &Path) -> Vec<Allowed> {
-    let Ok(text) = fs::read_to_string(root.join("allowlist.json")) else {
-        return Vec::new();
-    };
-    let list: AllowList = serde_json::from_str(&text).expect("parse allowlist.json");
-    for entry in &list.allowed {
-        assert!(
-            !entry.reason.trim().is_empty(),
-            "allow-list entry for {} has no reason",
-            entry.fixture
-        );
+fn load_allow_list(root: &Path) -> Result<Vec<Allowed>, String> {
+    match fs::read_to_string(root.join("allowlist.json")) {
+        Ok(text) => parse_allow_list(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("allowlist.json: {e}")),
     }
-    list.allowed
 }
 
-/// Marks diffs an allow-list entry covers and settles the fixture's status.
-fn apply_allow_list(name: &str, report: &mut Value, allow: &[Allowed], used: &mut [bool]) {
-    let Some(requests) = report.get_mut("requests").and_then(Value::as_array_mut) else {
-        return;
-    };
-    let mut any = false;
-    let mut open = false;
-    for request in requests {
-        let request_name = request["name"].as_str().unwrap_or_default().to_owned();
-        for diff in request["diffs"].as_array_mut().into_iter().flatten() {
-            any = true;
-            let field = diff["field"].as_str().unwrap_or_default().to_owned();
-            let hit = allow.iter().position(|a| {
-                a.fixture == name
-                    && a.field == field
-                    && (a.request == "*" || a.request == request_name)
-            });
-            match hit {
-                Some(i) => {
-                    used[i] = true;
-                    diff["allowed"] = json!(allow[i].reason);
-                }
-                None => open = true,
-            }
-        }
-    }
-    report["status"] = json!(match (any, open) {
-        (false, _) => "pass",
-        (true, false) => "allowed",
-        (true, true) => "fail",
-    });
-}
-
-fn cache_dir() -> PathBuf {
-    std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"))
-        .join("conformance-workerd")
+fn cache_dir(start_dir: &Path) -> PathBuf {
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(|dir| resolve_path(Path::new(&dir), start_dir))
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"));
+    target.join("conformance-workerd")
 }
 
 /// The workerd binary: `CELLD_WORKERD`, else the pinned release, fetched and
-/// checksum-verified by `.github/scripts/install-workerd.sh`.
-fn locate_workerd() -> Result<PathBuf, String> {
+/// checksum-verified by `.github/scripts/install-workerd.sh`. A relative path
+/// is taken from `start_dir`: workerd runs in a temp directory.
+fn locate_workerd(start_dir: &Path) -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("CELLD_WORKERD") {
-        return Ok(PathBuf::from(path));
+        return Ok(resolve_path(Path::new(&path), start_dir));
     }
     let script =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/scripts/install-workerd.sh");
     let output = Command::new(&script)
-        .arg(cache_dir())
+        .arg(cache_dir(start_dir))
         .output()
         .map_err(|e| format!("cannot run {}: {e}", script.display()))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
     let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    Ok(PathBuf::from(path))
+    Ok(resolve_path(Path::new(&path), start_dir))
 }
 
 fn workerd_version(binary: &Path) -> String {
@@ -315,7 +234,7 @@ async fn run_fixture(corpus: &str, name: &str, workerd: &Path) -> Result<Value, 
     .map_err(|e| format!("script.json: {e}"))?;
     let normaliser = Normaliser::new(&script)?;
 
-    let celld = Server::start(&format!("{corpus}/{name}"), &[]).await;
+    let celld = Server::try_start(&format!("{corpus}/{name}"), &[]).await?;
     let celld_answers = replay(&script, &celld.url(""), &normaliser).await;
     drop(celld);
 
@@ -335,125 +254,6 @@ async fn run_fixture(corpus: &str, name: &str, workerd: &Path) -> Result<Value, 
         );
     }
     Ok(json!({ "name": name, "description": script.description, "requests": requests }))
-}
-
-fn diff(ours: &Result<Observed, String>, theirs: &Result<Observed, String>) -> Vec<Value> {
-    let (ours, theirs) = match (ours, theirs) {
-        (Ok(o), Ok(t)) => (o, t),
-        (o, t) if o.is_err() || t.is_err() => {
-            return vec![json!({
-                "field": "error",
-                "celld": o.as_ref().err(),
-                "workerd": t.as_ref().err(),
-            })];
-        }
-        _ => unreachable!(),
-    };
-    let mut diffs = Vec::new();
-    if ours.status != theirs.status {
-        diffs.push(json!({ "field": "status", "celld": ours.status, "workerd": theirs.status }));
-    }
-    for (header, value) in &ours.headers {
-        if theirs.headers.get(header) != Some(value) {
-            diffs.push(json!({
-                "field": format!("header:{header}"),
-                "celld": value,
-                "workerd": theirs.headers.get(header).cloned().flatten(),
-            }));
-        }
-    }
-    if ours.body != theirs.body {
-        diffs.push(json!({ "field": "body", "celld": ours.body, "workerd": theirs.body }));
-    }
-    diffs
-}
-
-struct Normaliser {
-    headers: Vec<String>,
-    compared: Vec<String>,
-    json_paths: Vec<Vec<String>>,
-    regexes: Vec<(Regex, String)>,
-}
-
-impl Normaliser {
-    fn new(script: &Script) -> Result<Self, String> {
-        let mut compared: Vec<String> = DEFAULT_HEADERS.iter().map(|h| (*h).to_owned()).collect();
-        compared.extend(
-            script
-                .compare_headers
-                .iter()
-                .map(|h| h.to_ascii_lowercase()),
-        );
-        let regexes = script
-            .normalise
-            .regexes
-            .iter()
-            .map(|r| {
-                Regex::new(&r.pattern)
-                    .map(|re| (re, r.replace.clone()))
-                    .map_err(|e| format!("regex {:?}: {e}", r.pattern))
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(Self {
-            headers: script
-                .normalise
-                .headers
-                .iter()
-                .map(|h| h.to_ascii_lowercase())
-                .collect(),
-            compared,
-            json_paths: script
-                .normalise
-                .json_paths
-                .iter()
-                .map(|p| p.split('.').map(str::to_owned).collect())
-                .collect(),
-            regexes,
-        })
-    }
-
-    fn text(&self, base: &str, text: &str) -> String {
-        let mut text = text.replace(base, "<origin>");
-        for (re, replace) in &self.regexes {
-            text = re.replace_all(&text, replace.as_str()).into_owned();
-        }
-        text
-    }
-
-    fn body(&self, base: &str, content_type: &str, bytes: &[u8]) -> String {
-        let text = String::from_utf8_lossy(bytes);
-        if content_type.contains("json") {
-            if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
-                for path in &self.json_paths {
-                    replace_path(&mut value, path);
-                }
-                return self.text(base, &value.to_string());
-            }
-        }
-        self.text(base, &text)
-    }
-}
-
-fn replace_path(value: &mut Value, path: &[String]) {
-    let Some((head, rest)) = path.split_first() else {
-        *value = json!(NORMALISED);
-        return;
-    };
-    match value {
-        Value::Object(map) if head == "*" => map.values_mut().for_each(|v| replace_path(v, rest)),
-        Value::Object(map) => {
-            if let Some(v) = map.get_mut(head) {
-                replace_path(v, rest);
-            }
-        }
-        Value::Array(items) if head == "*" => items.iter_mut().for_each(|v| replace_path(v, rest)),
-        Value::Array(items) => {
-            if let Some(v) = head.parse::<usize>().ok().and_then(|i| items.get_mut(i)) {
-                replace_path(v, rest);
-            }
-        }
-        _ => {}
-    }
 }
 
 async fn replay(
@@ -485,10 +285,8 @@ async fn send(
     for (name, value) in &step.headers {
         request = request.header(name, value);
     }
-    if let Some(json) = &step.json {
-        request = request.body(json.to_string());
-    } else if let Some(body) = &step.body {
-        request = request.body(body.clone());
+    if let Some(body) = step.body_bytes()? {
+        request = request.body(body);
     }
     let response = request
         .send()
@@ -614,6 +412,16 @@ fn text(value: &str) -> String {
 /// compatibility settings, vars, and Durable Object classes on in-memory
 /// storage, behind one HTTP socket on `port`.
 fn capnp_config(wrangler: &Value, port: u16) -> Result<String, String> {
+    if let Some(key) = wrangler
+        .as_object()
+        .into_iter()
+        .flat_map(|map| map.keys())
+        .find(|key| !WRANGLER_KEYS.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "wrangler.json: `{key}` is not translated to the workerd config, so the runtimes would differ"
+        ));
+    }
     let main = wrangler["main"]
         .as_str()
         .ok_or("wrangler.json has no main")?;
