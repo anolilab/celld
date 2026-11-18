@@ -10620,6 +10620,9 @@ struct IoEventState {
 /// below keeps one `Arc` and hands a clone to each reader.
 struct BundleTree {
     nodes: HashMap<String, BundleNode>,
+    /// The sorted entry names of every directory, built with the tree so a
+    /// listing does not scan every node.
+    children: HashMap<String, Vec<String>>,
 }
 
 /// A projected node. A file owns `Bytes` so a read is a refcount bump rather
@@ -10660,8 +10663,6 @@ impl BundleTree {
     /// intervening directory. The entry module is projected under the name it
     /// compiles as, matching workerd's `mainScriptName` entry.
     fn project(config: &WorkerConfig) -> Self {
-        let mut nodes = HashMap::new();
-        nodes.insert("/bundle".to_string(), BundleNode::Directory);
         let entry = std::iter::once((
             ENTRY_MODULE_NAME,
             bytes::Bytes::copy_from_slice(config.src.as_bytes()),
@@ -10678,7 +10679,14 @@ impl BundleTree {
             };
             (name.as_str(), bytes)
         });
-        for (name, bytes) in entry.chain(modules) {
+        Self::from_files(entry.chain(modules))
+    }
+
+    /// The tree of files given by name, with the directories between them.
+    fn from_files<'a>(files: impl Iterator<Item = (&'a str, bytes::Bytes)>) -> Self {
+        let mut nodes = HashMap::new();
+        nodes.insert("/bundle".to_string(), BundleNode::Directory);
+        for (name, bytes) in files {
             // A leading or doubled separator would otherwise create an empty
             // segment, which no path can address.
             let segments: Vec<&str> = name.split('/').filter(|part| !part.is_empty()).collect();
@@ -10695,7 +10703,29 @@ impl BundleTree {
             path.push_str(file);
             nodes.insert(path, BundleNode::File(bytes));
         }
-        Self { nodes }
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        for path in nodes.keys() {
+            if let Some((parent, name)) = path.rsplit_once('/') {
+                children
+                    .entry(parent.to_string())
+                    .or_default()
+                    .push(name.to_string());
+            }
+        }
+        for names in children.values_mut() {
+            names.sort();
+        }
+        Self { nodes, children }
+    }
+
+    /// The entries of a directory, sorted, or the error for a path that is
+    /// not one.
+    fn list(&self, path: &str) -> Result<Vec<String>, &'static str> {
+        match self.nodes.get(path) {
+            None => Err("ENOENT"),
+            Some(BundleNode::File(_)) => Err("ENOTDIR"),
+            Some(BundleNode::Directory) => Ok(self.children.get(path).cloned().unwrap_or_default()),
+        }
     }
 }
 

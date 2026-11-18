@@ -422,22 +422,7 @@ fn bundle_children(
         return None;
     }
     let bundle = scope.get_slot::<Arc<BundleFs>>().cloned()?;
-    let tree = bundle.tree();
-    match tree.nodes.get(path) {
-        None => return Some(Err("ENOENT")),
-        Some(BundleNode::File(_)) => return Some(Err("ENOTDIR")),
-        Some(BundleNode::Directory) => {}
-    }
-    let below = format!("{path}/");
-    let mut names: Vec<String> = tree
-        .nodes
-        .keys()
-        .filter_map(|key| key.strip_prefix(&below))
-        .filter(|name| !name.is_empty() && !name.contains('/'))
-        .map(str::to_string)
-        .collect();
-    names.sort();
-    Some(Ok(names))
+    Some(bundle.tree().list(path))
 }
 
 /// The names in a directory as an array, or a Node error code as a string.
@@ -541,6 +526,39 @@ pub(super) fn op_vfs_read_file(
 #[cfg(test)]
 mod tests {
     use super::{IoContext, RequestVfs, VfsNode, VFS_MAX_BYTES};
+    use crate::js::BundleTree;
+
+    #[test]
+    fn a_bundle_lists_recursively_without_scanning_every_node_per_directory() {
+        // 10 000 directories of 10 files: a scan of every node for each
+        // directory is some 10^9 steps, an index is about 10^5.
+        let names: Vec<String> = (0..10_000)
+            .flat_map(|d| (0..10).map(move |f| format!("d{d}/f{f}")))
+            .collect();
+        let tree = BundleTree::from_files(
+            names
+                .iter()
+                .map(|name| (name.as_str(), bytes::Bytes::new())),
+        );
+        let started = std::time::Instant::now();
+        let mut stack = vec!["/bundle".to_string()];
+        let mut files = 0;
+        while let Some(path) = stack.pop() {
+            for name in tree.list(&path).unwrap() {
+                let child = format!("{path}/{name}");
+                if tree.list(&child).is_ok() {
+                    stack.push(child);
+                } else {
+                    files += 1;
+                }
+            }
+        }
+        assert_eq!(files, 100_000);
+        assert!(started.elapsed().as_secs() < 5, "{:?}", started.elapsed());
+        assert_eq!(tree.list("/bundle/d1/f1"), Err("ENOTDIR"));
+        assert_eq!(tree.list("/bundle/none"), Err("ENOENT"));
+        assert_eq!(tree.list("/bundle/d1").unwrap().len(), 10);
+    }
 
     #[test]
     fn appended_files_are_charged_their_capacity() {
