@@ -7,6 +7,8 @@
 //   POST /streams { count } sends count raw stream messages at once and
 //                answers { results, reads }: one { ok } or { code } for each, and
 //                how many streams were read from at all
+//   POST /stall  { count } starts count sends whose raw stream never yields and
+//                never answers
 //   GET  /env    what a Worker can see of its environment
 import { EmailMessage } from "cloudflare:email";
 import process from "node:process";
@@ -77,6 +79,16 @@ export default {
         results: results.map((result) => (result.status === "fulfilled" ? { ok: true } : { code: result.reason.code })),
         reads,
       });
+    }
+    if (url.pathname === "/stall") {
+      const { count } = await request.json();
+      const stalled = () => new ReadableStream({ pull: () => new Promise(() => {}) });
+      await Promise.allSettled(
+        Array.from({ length: count }, () =>
+          env.EMAIL.send(new EmailMessage("ann@example.com", "bob@example.com", stalled())),
+        ),
+      );
+      return new Response("unreachable");
     }
     if (url.pathname === "/send") {
       const spec = await request.json();

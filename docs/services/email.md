@@ -82,6 +82,8 @@ read. The warning about a shared file is logged at the first `send()`.
   can echo what it was sent. A failure reads `E_DELIVERY_FAILED` with the stage
   and the reply code, such as `the SMTP server answered 535 at auth`.
 
+A project with no `main` (assets only) cannot declare `send_email`.
+
 A `send_email` deployment requires the `send-email-v1` feature, so a node that
 does not have the binding refuses it. A node that has the binding but no relay
 loads the Worker and fails each `send()`.
@@ -119,7 +121,11 @@ such as `In-Reply-To`, `References` and `List-Unsubscribe`. celld checks the
 name, that the value is not empty, has no line break and is at most 2,048
 bytes, at most 20 headers besides `X-` ones, and 16 KiB in all. It does not
 check the syntax of the value of an allowlisted header, such as the URI of
-`List-Unsubscribe`.
+`List-Unsubscribe`. A value with a non-ASCII character is encoded as RFC 2047
+words only in a free-text header: any `X-` header, `Comments`, `Organization`
+and `Thread-Topic`. Every other allowlisted header holds addresses, URIs, ids
+or tokens, where an encoded word is not valid, so a non-ASCII value is refused
+with `E_HEADER_VALUE_INVALID`.
 
 **`send(new EmailMessage(from, to, raw))`** takes the envelope and a finished
 message as a string or a `ReadableStream` of bytes. celld requires that
@@ -140,7 +146,9 @@ header. `send()` resolves to `{ messageId }` in both forms.
 ## Limits
 
 - A message weighs at most 25 MiB, attachments included. celld stops reading a
-  stream at the limit and rejects with `E_CONTENT_TOO_LARGE`. A message given
+  stream at the limit and rejects with `E_CONTENT_TOO_LARGE`. A stream has 60
+  seconds to yield the whole message; after that it is cancelled and `send()`
+  rejects with `E_TIMEOUT`. A message given
   as fields is also refused when its call, as JSON, is more than about 25 MiB.
 - At most 50 recipients, `to`, `cc` and `bcc` together, and 32 attachments.
 - The header section of a raw message is at most 64 KiB, and a header line at
@@ -160,7 +168,10 @@ header. `send()` resolves to `{ messageId }` in both forms.
   plus those 10 minutes, plus the time the body needs at 64 KiB a second.
 - A call costs a subrequest, as a `fetch()` does. An isolate has at most four
   messages in flight: the call after that rejects at once with
-  `E_RATE_LIMIT_EXCEEDED`, before a stream is read from. A script has at most four
+  `E_RATE_LIMIT_EXCEEDED`, before a stream is read from. The slot of a call
+  that is waiting on a stream goes back when the event ends, so a stream that
+  never yields does not keep it. A call past the invocation's subrequest limit
+  rejects with `E_RATE_LIMIT_EXCEEDED` too. A script has at most four
   transactions running on a node, and a node runs at most 16. A call beyond
   either waits up to 60 seconds, and then rejects with `E_RATE_LIMIT_EXCEEDED`
   (for a script) or `E_DELIVERY_FAILED` (for the node).
@@ -188,7 +199,7 @@ base64) for such a relay.
 `E_HEADER_NAME_INVALID`, `E_HEADER_NOT_ALLOWED`, `E_HEADER_USE_API_FIELD`,
 `E_HEADER_VALUE_INVALID`, `E_HEADERS_TOO_MANY`, `E_HEADERS_TOO_LARGE`,
 `E_CONTENT_TOO_LARGE`, `E_LINE_TOO_LONG`, `E_8BIT_NOT_SUPPORTED`,
-`E_RATE_LIMIT_EXCEEDED`, `E_DELIVERY_FAILED` and `E_INTERNAL_SERVER_ERROR` (no
+`E_RATE_LIMIT_EXCEEDED`, `E_TIMEOUT`, `E_DELIVERY_FAILED` and `E_INTERNAL_SERVER_ERROR` (no
 relay, a relay setting that is invalid, or a send that was not made because the
 writes the handler made before it could not be made durable). celld
 connects only after those writes are durable, as it does for `fetch()`.

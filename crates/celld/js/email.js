@@ -3,6 +3,10 @@
 // restrictions and sends the message through the node's SMTP relay.
 (function () {
   const MAX_MESSAGE_BYTES = 25 * 1024 * 1024;
+  // How long a raw stream may take to yield its whole message. A stream that
+  // stalls past it is cancelled and send() rejects, so it cannot hold the
+  // isolate's send slot for good.
+  const READ_DEADLINE_MS = 60 * 1000;
   const raws = new WeakMap();
 
   const fail = (code, message) => {
@@ -44,6 +48,30 @@
     }
     const reader = raw.getReader();
     const chunks = [];
+    let timer;
+    const expired = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        // Not awaited: a stalled stream may never settle its cancel.
+        reader.cancel().catch(() => {});
+        reject(fail("E_TIMEOUT", "the raw stream did not finish within 60 seconds"));
+      }, READ_DEADLINE_MS);
+    });
+    try {
+      await Promise.race([readChunks(reader, chunks), expired]);
+    } finally {
+      clearTimeout(timer);
+    }
+    const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return bytes;
+  };
+
+  const readChunks = async (reader, chunks) => {
     let total = 0;
     for (;;) {
       const { done, value } = await reader.read();
@@ -59,13 +87,6 @@
       }
       chunks.push(value);
     }
-    const bytes = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return bytes;
   };
 
   const base64 = (bytes) => {

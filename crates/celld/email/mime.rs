@@ -109,6 +109,12 @@ const ALLOWED_HEADERS: &[&str] = &[
     "thread-topic",
 ];
 
+/// The allowlisted headers whose value is free text, so a non-ASCII value can
+/// be sent as encoded words. The others hold addresses, URIs, ids or tokens,
+/// where an encoded word is not valid syntax, so they take ASCII only.
+/// Every `X-` header is free text too.
+const TEXT_HEADERS: &[&str] = &["comments", "organization", "thread-topic"];
+
 /// The headers the message sets itself or takes from a field of the builder.
 const OWN_HEADERS: &[&str] = &[
     "bcc",
@@ -355,6 +361,13 @@ fn custom_headers(
             return Err(EmailError::new(
                 "E_HEADER_VALUE_INVALID",
                 format!("the value of header {name} is empty, too long, or holds a line break"),
+            ));
+        }
+        if !value.is_ascii() && !(lower.starts_with("x-") || TEXT_HEADERS.contains(&lower.as_str()))
+        {
+            return Err(EmailError::new(
+                "E_HEADER_VALUE_INVALID",
+                format!("the value of header {name} must be ASCII"),
             ));
         }
         if !lower.starts_with("x-") {
@@ -848,6 +861,26 @@ mod tests {
             .collect();
         assert_eq!(code(Value::Object(many)), "E_HEADER_NOT_ALLOWED");
         build(json!({ "headers": { "Comments": "ok", "x-lower": "ok" } })).unwrap();
+    }
+
+    #[test]
+    fn only_free_text_headers_may_hold_non_ascii() {
+        crate::asyncrt::install_test_host_runtime();
+        // Encoding the whole value would turn `<id>` into an encoded word.
+        for name in ["List-ID", "List-Unsubscribe", "In-Reply-To", "References"] {
+            assert_eq!(
+                build(json!({ "headers": { name: "<über@example.com>" } }))
+                    .unwrap_err()
+                    .code,
+                "E_HEADER_VALUE_INVALID",
+                "{name}"
+            );
+        }
+        let sent = build(json!({ "headers": { "X-Note": "grüße", "Comments": "grüße" } })).unwrap();
+        let text = text_of(&sent);
+        assert!(text.contains("X-Note: =?UTF-8?B?"), "{text}");
+        assert!(text.contains("Comments: =?UTF-8?B?"), "{text}");
+        build(json!({ "headers": { "List-ID": "<list.example.com>" } })).unwrap();
     }
 
     #[test]

@@ -2250,7 +2250,9 @@ fn read_project(
     }
     // A `send_email` binding is a host-side call into the node's SMTP relay: no
     // cell and no class, only the restrictions the manifest carries.
-    bindings.extend(send_email::read_send_email(object)?);
+    let send_emails = send_email::read_send_email(object)?;
+    let declared_send_email = !send_emails.is_empty();
+    bindings.extend(send_emails);
     let workflows = match object.get("workflows") {
         None => &[][..],
         Some(Value::Array(workflows)) => workflows.as_slice(),
@@ -2635,7 +2637,8 @@ fn read_project(
             || !hyperdrive_bindings.is_empty()
             || declared_ai
             || !r2_binding_names.is_empty()
-            || !worker_loaders.is_empty())
+            || !worker_loaders.is_empty()
+            || declared_send_email)
     {
         bail!("an asset-only project cannot declare Worker bindings");
     }

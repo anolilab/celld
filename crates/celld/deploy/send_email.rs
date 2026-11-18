@@ -111,4 +111,29 @@ mod send_email_config_tests {
         assert!(read_send_email(&config(json!({}))).is_err());
         assert!(read_send_email(&config(json!(["EMAIL"]))).is_err());
     }
+
+    #[test]
+    fn an_asset_only_project_cannot_declare_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("public")).unwrap();
+        let path = dir.path().join("wrangler.jsonc");
+        std::fs::write(
+            &path,
+            r#"{ "name": "app", "assets": { "directory": "public" },
+                "send_email": [{ "name": "EMAIL" }] }"#,
+        )
+        .unwrap();
+        let error = crate::deploy::read_project(
+            &path,
+            dir.path(),
+            &crate::deploy::VarOverrides::None,
+            false,
+        )
+        .err()
+        .expect("refused");
+        assert!(
+            error.to_string().contains("cannot declare Worker bindings"),
+            "{error:#}"
+        );
+    }
 }

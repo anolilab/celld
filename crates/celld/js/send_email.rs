@@ -80,6 +80,12 @@ fn rate_limited() -> EmailError {
     )
 }
 
+/// A send past the invocation's subrequest budget: a Worker reads its `code`
+/// like that of any other refusal of `send()`.
+fn subrequest_limit(message: String) -> EmailError {
+    EmailError::new("E_RATE_LIMIT_EXCEEDED", message)
+}
+
 /// Take the isolate's slot and charge the subrequest for a send whose raw
 /// stream the binding is about to read, before it reads any of it. Answers ""
 /// or the refusal as `send()` shall reject with it.
@@ -89,14 +95,17 @@ pub(super) fn op_email_reserve(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let context = event_context(scope);
-    if let Err(error) = context.charge_subrequest() {
-        return loader_throw(scope, &error);
-    }
-    let reserved = actor_runtime_state(scope).declared.reserve_send_slot();
-    let text = if reserved {
-        String::new()
-    } else {
-        answer(Err(rate_limited()))
+    let text = match context.charge_subrequest() {
+        Err(error) => answer(Err(subrequest_limit(error))),
+        Ok(()) => match actor_runtime_state(scope).declared.take_send_slot() {
+            Some(slot) => {
+                // Kept with the event: if it ends while the stream stalls, the
+                // slot goes with it.
+                context.reserve_send(slot);
+                String::new()
+            }
+            None => answer(Err(rate_limited())),
+        },
     };
     let text = v8::String::new(scope, &text).unwrap();
     rv.set(text.into());
@@ -108,11 +117,7 @@ pub(super) fn op_email_release(
     _args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    drop(
-        actor_runtime_state(scope)
-            .declared
-            .take_reserved_send_slot(),
-    );
+    drop(event_context(scope).take_reserved_send());
 }
 
 pub(super) fn op_email_send(
@@ -123,13 +128,8 @@ pub(super) fn op_email_send(
     // A send whose stream was read took its slot and paid its subrequest
     // first; it holds that slot from here, and any early refusal gives it back.
     let reserved = args.get(2).is_true();
-    let held = reserved
-        .then(|| {
-            actor_runtime_state(scope)
-                .declared
-                .take_reserved_send_slot()
-        })
-        .flatten();
+    let context = event_context(scope);
+    let held = reserved.then(|| context.take_reserved_send()).flatten();
     if reserved && held.is_none() {
         return refuse(
             scope,
@@ -138,10 +138,9 @@ pub(super) fn op_email_send(
         );
     }
     // A send costs a subrequest, as a fetch or a Workers AI call does.
-    let context = event_context(scope);
     if held.is_none() {
         if let Err(error) = context.charge_subrequest() {
-            return loader_throw(scope, &error);
+            return refuse(scope, rv, subrequest_limit(error));
         }
     }
     // Bound what the host copies before it copies it: the JavaScript side
@@ -198,4 +197,20 @@ pub(super) fn op_email_send(
         Ok(answer(sent.map(|()| prepared.message_id)))
     });
     rv.set(promise_for(scope, async_id));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_spent_subrequest_budget_reaches_send_as_a_coded_rejection() {
+        let answer: serde_json::Value = serde_json::from_str(&answer(Err(subrequest_limit(
+            "Worker exceeded subrequest limit of 3".into(),
+        ))))
+        .unwrap();
+        assert_eq!(answer["ok"], false);
+        assert_eq!(answer["code"], "E_RATE_LIMIT_EXCEEDED");
+        assert_eq!(answer["message"], "Worker exceeded subrequest limit of 3");
+    }
 }

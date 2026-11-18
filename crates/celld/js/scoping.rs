@@ -28,10 +28,6 @@ pub(super) struct Declared {
     send_email: Vec<crate::email::SendEmailBinding>,
     /// The messages this isolate has in flight, counted for [`crate::smtp::InFlight`].
     send_in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// Slots taken for sends whose stream is still being read. They count in
-    /// `send_in_flight`; `__email_send` takes one over, `__email_release`
-    /// gives one back.
-    send_reserved: std::sync::Mutex<Vec<crate::smtp::InFlight>>,
 }
 
 impl Declared {
@@ -57,28 +53,12 @@ impl Declared {
             shared,
             send_email: config.send_email_bindings.clone(),
             send_in_flight: Default::default(),
-            send_reserved: Default::default(),
         }
     }
 
     /// A slot for one more message of this isolate, if it has one free.
     pub(super) fn take_send_slot(&self) -> Option<crate::smtp::InFlight> {
         crate::smtp::InFlight::take(&self.send_in_flight)
-    }
-
-    /// Keep a slot for a send that has not started yet, if one is free.
-    pub(super) fn reserve_send_slot(&self) -> bool {
-        let Some(slot) = self.take_send_slot() else {
-            return false;
-        };
-        self.send_reserved.lock().unwrap().push(slot);
-        true
-    }
-
-    /// A slot kept by [`Self::reserve_send_slot`], to be held by the send or
-    /// dropped. Slots are interchangeable, so none is named.
-    pub(super) fn take_reserved_send_slot(&self) -> Option<crate::smtp::InFlight> {
-        self.send_reserved.lock().unwrap().pop()
     }
 
     /// The name of the script this isolate runs.

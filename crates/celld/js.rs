@@ -10921,6 +10921,10 @@ pub struct IoContext {
     /// marks the span as an error without failing the event, which would drop
     /// the frames and close the socket.
     listener_error: OnceLock<String>,
+    /// Send slots of this event that a `send_email` call took before reading
+    /// its stream. They are given back with the event, so a stream that never
+    /// yields cannot keep them when the event ends.
+    reserved_sends: Mutex<Vec<crate::smtp::InFlight>>,
 }
 
 /// An op enqueued by one event's continuation during another event's turn: the
@@ -11033,6 +11037,18 @@ impl IoContext {
         Ok(())
     }
 
+    /// Keep `slot` for a send of this event that has not started yet. It is
+    /// given back by [`Self::take_reserved_send`] or when the event ends.
+    fn reserve_send(&self, slot: crate::smtp::InFlight) {
+        self.reserved_sends.lock().unwrap().push(slot);
+    }
+
+    /// A slot kept by [`Self::reserve_send`], to be held by the send or
+    /// dropped. Slots are interchangeable, so none is named.
+    fn take_reserved_send(&self) -> Option<crate::smtp::InFlight> {
+        self.reserved_sends.lock().unwrap().pop()
+    }
+
     fn begin_cpu_turn(&self) {
         if self.cpu_limit_nanos.is_none() {
             return;
@@ -11115,6 +11131,7 @@ impl IoContext {
             tail_reporting,
             tail_logs: Mutex::new(TailLogCapture::default()),
             listener_error: OnceLock::new(),
+            reserved_sends: Mutex::new(Vec::new()),
         })
     }
 
@@ -11159,6 +11176,7 @@ impl IoContext {
             tail_reporting: false,
             tail_logs: Mutex::new(TailLogCapture::default()),
             listener_error: OnceLock::new(),
+            reserved_sends: Mutex::new(Vec::new()),
         });
         runtime_state
             .io_contexts

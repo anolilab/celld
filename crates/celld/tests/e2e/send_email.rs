@@ -889,6 +889,32 @@ async fn streams_past_the_in_flight_limit_are_refused_before_they_are_read() {
 }
 
 #[tokio::test]
+async fn slots_held_by_a_stalled_stream_go_back_when_its_event_ends() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, &[]).await;
+    // Four sends take every slot of the isolate and wait on streams that never
+    // yield. The client gives up, which ends the event.
+    let stalled = client()
+        .post(server.url("/stall"))
+        .json(&json!({ "count": 4 }))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await;
+    assert!(stalled.is_err(), "the request must not answer");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let results: Vec<Value> = client()
+        .post(server.url("/burst"))
+        .json(&json!({ "count": 4 }))
+        .send()
+        .await
+        .expect("POST /burst")
+        .json()
+        .await
+        .expect("a JSON list");
+    assert!(results.iter().all(|r| r["ok"] == true), "{results:?}");
+}
+
+#[tokio::test]
 async fn a_relay_that_never_says_goodbye_does_not_hold_the_send() {
     let sink = Sink::start(Behaviour {
         hang_on_quit: true,
