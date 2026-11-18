@@ -967,10 +967,15 @@ fn keep_interfaces_current(node: &'static NodeAddrs) {
     crate::asyncrt::spawn(async move {
         loop {
             crate::asyncrt::sleep(INTERFACE_REFRESH).await;
-            match crate::node_addrs::try_interfaces() {
-                Ok(listed) => node.learn_interfaces(listed),
-                Err(error) => {
+            // The listing is a system call; it runs on the blocking pool so a
+            // slow one never holds a runtime worker.
+            match crate::asyncrt::blocking(crate::node_addrs::try_interfaces).await {
+                Ok(Ok(listed)) => node.learn_interfaces(listed),
+                Ok(Err(error)) => {
                     tracing::warn!(%error, "could not re-read this node's interface addresses, keeping the last list");
+                }
+                Err(_) => {
+                    tracing::warn!("re-reading this node's interface addresses panicked, keeping the last list");
                 }
             }
         }
