@@ -32,6 +32,57 @@ APIs, and Wrangler configuration.
   hold isolates, and the age in milliseconds of the oldest. A cell that has not
   yet moved to the new deployment keeps its isolate until it does.
 
+## Storage limits
+
+Each cell and each D1 database has its own SQLite file. Two limits bound it,
+and both match Cloudflare where Cloudflare documents a value.
+
+| Limit | Default | Setting | At the limit |
+| --- | --- | --- | --- |
+| Time of one SQL statement | 30 seconds | `CELLD_SQL_STATEMENT_TIMEOUT_MS` | SQLite interrupts the statement. The call fails with `SQL statement exceeded the time limit of N ms and was interrupted`. |
+| Size of one database | 10 GiB | `CELLD_MAX_DATABASE_BYTES` | The write that would grow the file past the limit fails with `storage limit exceeded`. Deleting rows makes room again. |
+
+A value of `0` removes the limit. A setting that is not a whole number, or a
+size below one 4096-byte page, stops celld at startup and names the variable
+and its value.
+
+- The time bound covers application SQL: `ctx.storage.sql.exec()`, a cursor
+  step, and each statement of a D1 `prepare`, `batch`, `exec`, or migration.
+  It does not cover the key-value API or celld's own statements. The clock
+  starts when the statement is handed to SQLite, so time spent before
+  SQLite's first check counts.
+- A statement interrupted outside a transaction, or a read inside one, is an
+  ordinary error and the cell keeps serving. A write interrupted inside a
+  `transaction()` or `transactionSync()` makes SQLite discard the whole
+  transaction, so the cell restarts as described in
+  [Guarantees](guarantees.md). A D1 `batch`, `exec`, or migration rolls back
+  and the database keeps serving.
+- The check runs between SQLite's virtual-machine instructions, so one long
+  instruction (a large sort, `CREATE INDEX`, an extension's scan) can run past
+  the bound before it is interrupted.
+- The size limit counts database pages, so it includes indexes and free pages
+  inside the file. The write-ahead log is not counted: it is transient and
+  reclaimed at checkpoints. A write that would grow the file past the limit
+  fails with the message above and SQLite rolls back the statement. Outside an
+  application transaction that restarts nothing: the database stays consistent
+  and keeps serving reads and writes that fit. Only the engine's own D1 `batch`,
+  `exec` and migration brackets roll back without a restart; see the next item
+  for a transaction the application opens.
+- A cap hit inside an application `transaction()` or `transactionSync()`
+  makes SQLite discard the whole transaction, so the object restarts as
+  described in [Guarantees](guarantees.md): the application could otherwise
+  catch the error and commit later writes outside the transaction. A Workflow
+  cell at its cap therefore restarts repeatedly until space is freed; it cannot
+  write anyway. A full disk, which raises the same error code while the file is
+  below the limit, fails the cell closed the same way.
+- Each database has its own limit: a Durable Object, each of its facets, and
+  each D1 database.
+- A limit set below the size of an existing database does not stop it opening,
+  for a Durable Object or a facet. celld's own opening writes (the schema, a
+  facet's scope rewrite) are not refused, and neither are the first pages of a
+  new database, even under a tiny limit. Reads work, and an application write
+  that needs a new page fails until deletes free pages inside the file.
+
 ## Networking and security
 
 - celld does not terminate TLS. Terminate public TLS at an ingress proxy, and

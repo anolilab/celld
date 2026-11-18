@@ -99,3 +99,24 @@ async fn rows_persist_across_a_restart() {
         "{out}"
     );
 }
+
+#[tokio::test]
+async fn a_statement_over_the_time_bound_fails_and_the_object_keeps_serving() {
+    let server = Server::start("do-sql", &[("CELLD_SQL_STATEMENT_TIMEOUT_MS", "300")]).await;
+    let out = run(&server, "endless").await;
+    let message = out["message"].as_str().unwrap_or_default();
+    assert!(message.contains("time limit of 300 ms"), "{out}");
+    assert_eq!(out["rows"], json!([{"v": 1}]), "{out}");
+}
+
+#[tokio::test]
+async fn a_write_past_the_size_cap_fails_naming_the_limit() {
+    let server = Server::start("do-sql", &[("CELLD_MAX_DATABASE_BYTES", "1048576")]).await;
+    let out = run(&server, "fill").await;
+    let sql = out["sqlMessage"].as_str().unwrap_or_default();
+    assert!(sql.contains("storage limit exceeded"), "{out}");
+    assert!(sql.contains("1048576 bytes"), "{out}");
+    let put = out["putMessage"].as_str().unwrap_or_default();
+    assert!(put.contains("storage limit exceeded"), "{out}");
+    assert_eq!(out["small"], "fits", "{out}");
+}

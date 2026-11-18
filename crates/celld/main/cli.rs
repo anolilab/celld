@@ -405,6 +405,8 @@ TUNING:
   CELLD_MAX_CELLS_PER_ISOLATE     Cells one V8 isolate may host (default: 32)
   CELLD_MAX_REQUEST_BODY_BYTES    Ingress request body limit (default: 1 GiB)
   CELLD_MAX_ASSET_FILE_BYTES      Per-file asset limit (default: 25 MiB)
+  CELLD_MAX_DATABASE_BYTES        Per-database size cap (default: 10 GiB; 0 disables)
+  CELLD_SQL_STATEMENT_TIMEOUT_MS  SQL statement time bound (default: 30000; 0 disables)
   CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES  Loaded module total (default: 64 MiB)
   CELLD_PRESSURE_OWNERSHIP        release to rebalance, sticky to cache locally
   CELLD_MAX_RSS_MB                Active-memory shed threshold (default: 80%; 0 disables)

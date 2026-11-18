@@ -414,6 +414,9 @@ isolate holds a dead heap until something allocates, so celld forces a
 collection when a measurement is above that share. A restart of the process
 is not necessary.
 
+A single SQL statement runs for at most 30 seconds, and each Durable Object
+database, each facet's database and each D1 database holds at most 10 GiB. See [Storage limits](docs/limitations.md#storage-limits).
+
 ## Contributions
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and the [roadmap](docs/roadmap.md).

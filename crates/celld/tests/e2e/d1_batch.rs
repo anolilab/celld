@@ -111,3 +111,24 @@ async fn a_malformed_batch_is_refused_without_running() {
     }
     assert_eq!(count(&server).await, before);
 }
+
+#[tokio::test]
+async fn a_d1_write_over_the_time_bound_fails_and_the_database_keeps_serving() {
+    let server = Server::start("d1", &[("CELLD_SQL_STATEMENT_TIMEOUT_MS", "300")]).await;
+    let out = server.get_json::<Value>("/endless-write").await;
+    let message = out["message"].as_str().unwrap_or_default();
+    assert!(message.contains("time limit of 300 ms"), "{out}");
+    assert_eq!(
+        out["count"], 0,
+        "the interrupted write was not rolled back: {out}"
+    );
+}
+
+#[tokio::test]
+async fn a_d1_write_past_the_size_cap_fails_naming_the_limit() {
+    let server = Server::start("d1", &[("CELLD_MAX_DATABASE_BYTES", "1048576")]).await;
+    let out = server.get_json::<Value>("/fill").await;
+    let message = out["message"].as_str().unwrap_or_default();
+    assert!(message.contains("storage limit exceeded"), "{out}");
+    assert!(out["count"].as_i64().unwrap_or(0) > 0, "{out}");
+}
