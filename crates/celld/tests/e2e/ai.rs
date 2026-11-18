@@ -250,6 +250,19 @@ fn raw_reply(prompt: &str) -> Option<Vec<u8>> {
             reply.extend(head("application/json", "").bytes());
             reply.extend(br#"{"choices":[{"message":{"content":"key \u0073k-test-key-123"}}]}"#);
         }
+        "usage-key" => {
+            reply.extend(head("application/json", "").bytes());
+            reply.extend(
+                br#"{"choices":[{"message":{"content":"ok"}}],"usage":{"total_tokens":5,"note":"sk-test-key-123","extra":{"k":"sk-test-key-123"}}}"#,
+            );
+        }
+        "stream-usage-key" => {
+            reply.extend(head("text/event-stream", "").bytes());
+            reply.extend(
+                br#"data: {"choices":[{"delta":{"content":"ok"}}],"usage":{"total_tokens":5,"note":"sk-test-key-123"}}"#,
+            );
+            reply.extend(b"\n\ndata: [DONE]\n\n");
+        }
         "stream-escaped-key" => {
             reply.extend(head("text/event-stream", "").bytes());
             reply
@@ -613,4 +626,17 @@ async fn an_event_without_data_is_dropped() {
         result["text"],
         "data: {\"response\":\"Hel\"}\n\ndata: [DONE]\n\n"
     );
+}
+
+#[tokio::test]
+async fn only_token_counts_of_usage_reach_the_worker() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    let chat: Value = server.get_json("/usage-key").await;
+    assert_eq!(chat["ok"], true, "{chat}");
+    assert_eq!(chat["value"]["usage"], json!({ "total_tokens": 5 }));
+    let stream = server.get_text("/stream-usage-key").await;
+    assert!(!stream.contains(KEY), "{stream}");
+    assert!(stream.contains(r#""usage":{"total_tokens":5}"#), "{stream}");
 }

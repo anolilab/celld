@@ -41,15 +41,28 @@ function __aiChatBody(model, inputs) {
   return body;
 }
 
+// The token counts of an upstream `usage` and nothing else: any other field
+// could carry text, such as the node's key, past the redaction of the answer.
+function __aiUsage(usage) {
+  const out = {};
+  for (const name of ["prompt_tokens", "completion_tokens", "total_tokens"]) {
+    if (typeof usage?.[name] === "number" && Number.isFinite(usage[name])) {
+      out[name] = usage[name];
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 // One upstream server-sent event in Workers AI's shape, or null when it
 // carries nothing the Worker reads (a role-only first chunk, a keep-alive).
 function __aiEventLine(event) {
   const delta = event?.choices?.[0]?.delta?.content;
   const text = typeof delta === "string" ? delta : "";
-  if (text === "" && !event?.usage) return null;
+  const usage = __aiUsage(event?.usage);
+  if (text === "" && !usage) return null;
   // The node's key may be written with escapes the raw text did not match.
   const out = { response: __ai_redact(text) };
-  if (event.usage) out.usage = event.usage;
+  if (usage) out.usage = usage;
   return `data: ${JSON.stringify(out)}\n\n`;
 }
 
@@ -201,7 +214,8 @@ __celld.__makeAi = () => ({
       }
       // The node's key may be written with escapes the raw text did not match.
       const out = { response: __ai_redact(content) };
-      if (answer.usage) out.usage = answer.usage;
+      const usage = __aiUsage(answer.usage);
+      if (usage) out.usage = usage;
       return out;
     }
     const text = inputs.text;

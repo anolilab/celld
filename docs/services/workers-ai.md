@@ -137,4 +137,6 @@ node makes no call.
   A call whose input has none of `messages`, `prompt`, or `text` throws.
 - Tool calls, `raw` prompts, LoRA, AI Gateway options, and `returnRawResponse`
   are not supported. `env.AI.models()` and `toMarkdown()` do not exist.
+- `usage` carries only the endpoint's `prompt_tokens`, `completion_tokens` and
+  `total_tokens`, when they are numbers; any other field is dropped.
 - A stream carries `usage` only when the endpoint sends it in the stream.
