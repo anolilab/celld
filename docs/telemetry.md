@@ -162,8 +162,9 @@ statements of `ctx.storage.sql.ingest`, which run application SQL too.
 - Time runs from the start of preparing the statement to the end of its last
   step, summed over a cursor's steps. It excludes the time the Worker spends
   between steps. D1 counts the same span.
-  The per-statement time bound covers execution, not preparing, so a slow
-  prepare is reported in the time but is not interrupted.
+  The per-statement time bound is a separate clock that does not always start
+  at the same point (for D1 it starts after preparing), so the time recorded
+  here can exceed the bound for a statement that was not interrupted.
 - A query reads as many rows as it returns, so a cursor that is closed early
   counts only the rows it produced. D1 counts the rows its statement stepped.
 - Rows written are the changes the statement's own steps made, so a cursor
