@@ -4728,12 +4728,22 @@ mod recycle_tests {
         close(scope);
     }
 
-    #[derive(Clone, Default)]
-    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+    thread_local! {
+        /// What the running test's thread has logged, while `logged` runs.
+        static CAPTURE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    }
+
+    /// Writes a thread's log lines to its `CAPTURE`, and drops the rest.
+    #[derive(Clone, Copy)]
+    struct Captured;
 
     impl std::io::Write for Captured {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
+            CAPTURE.with(|capture| {
+                if let Some(buffer) = capture.borrow_mut().as_mut() {
+                    buffer.extend_from_slice(bytes);
+                }
+            });
             Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -4744,19 +4754,30 @@ mod recycle_tests {
     impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
         type Writer = Self;
         fn make_writer(&'a self) -> Self {
-            self.clone()
+            *self
         }
     }
 
     /// Run `body` and return what it logged.
+    ///
+    /// One subscriber for the whole process, installed once, and a buffer per
+    /// thread. A subscriber per call (`with_default`) races other threads that
+    /// register and drop theirs: tracing recomputes its global level and each
+    /// callsite's verdict from the subscribers alive at that moment, and a
+    /// stale result leaves the statistics line disabled for this test.
     fn logged(body: impl FnOnce()) -> String {
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, body);
-        let bytes = captured.0.lock().unwrap().clone();
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(Captured)
+                .with_ansi(false)
+                .finish();
+            // Another test may already have set one; it then logs to itself.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+        CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+        body();
+        let bytes = CAPTURE.with(|capture| capture.borrow_mut().take().unwrap());
         String::from_utf8(bytes).unwrap()
     }
 
