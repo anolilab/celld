@@ -222,6 +222,7 @@ pub async fn activate(
         // A secret put after this version was uploaded may use a name this
         // version binds, and activation would shadow it.
         crate::secrets::ensure_no_clash(bucket, manifest).await?;
+        crate::secrets::ensure_store_secrets(bucket, manifest, false).await?;
     }
 
     let read = crate::deploy::read_fleet_pointer(bucket).await?;

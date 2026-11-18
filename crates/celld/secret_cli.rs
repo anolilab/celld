@@ -40,9 +40,26 @@ enum Step {
 struct Command {
     action: Action,
     script: Option<String>,
+    /// A Secrets Store id, in place of a script.
+    store: Option<String>,
     config: Option<PathBuf>,
     fleet: FleetFlags,
     json: bool,
+}
+
+/// What holds the secrets: a Worker, or a Secrets Store that Workers bind.
+enum Owner {
+    Script(String),
+    Store(String),
+}
+
+impl std::fmt::Display for Owner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Script(script) => write!(formatter, "{script}"),
+            Self::Store(store) => write!(formatter, "store {store}"),
+        }
+    }
 }
 
 struct Name(String);
@@ -64,10 +81,13 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     };
     // Settle everything that needs no bucket first, so a missing key or an
     // empty stdin fails before any request.
-    let script = match &command.script {
-        Some(script) => script.clone(),
-        None => crate::deploy::read_script_name(command.config.clone())
-            .context("name the Worker with --script, or run in its project")?,
+    let owner = match (&command.store, &command.script) {
+        (Some(store), _) => Owner::Store(store.clone()),
+        (None, Some(script)) => Owner::Script(script.clone()),
+        (None, None) => Owner::Script(
+            crate::deploy::read_script_name(command.config.clone())
+                .context("name the Worker with --script, or run in its project")?,
+        ),
     };
     let step = match command.action {
         Action::Put(name) => {
@@ -89,18 +109,28 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let bucket = storage.open().await?;
     match step {
         Step::Put { key, name, value } => {
-            let bindings = current_bindings(&bucket, &script).await?;
-            secrets::put(&bucket, key, &script, &name, &value, &bindings).await?;
+            match &owner {
+                Owner::Script(script) => {
+                    let bindings = current_bindings(&bucket, script).await?;
+                    secrets::put(&bucket, key, script, &name, &value, &bindings).await?;
+                }
+                Owner::Store(store) => {
+                    secrets::put_store(&bucket, key, store, &name, &value).await?;
+                }
+            }
             note!(
-                "Stored secret {name} for {script}. A node serves it from its next load of the \
+                "Stored secret {name} for {owner}. A node serves it from its next load of the \
                  deployment: a deploy, `POST /reload`, or a restart."
             );
             Ok(())
         }
         Step::Delete(name) => {
-            secrets::delete(&bucket, &script, &name).await?;
+            match &owner {
+                Owner::Script(script) => secrets::delete(&bucket, script, &name).await?,
+                Owner::Store(store) => secrets::delete_store(&bucket, store, &name).await?,
+            }
             note!(
-                "Deleted secret {name} of {script}. A node stops serving it at its next load of \
+                "Deleted secret {name} of {owner}. A node stops serving it at its next load of \
                  the deployment."
             );
             Ok(())
@@ -111,7 +141,11 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             } else {
                 Format::Text
             });
-            for name in secrets::names(&bucket, &script).await? {
+            let names = match &owner {
+                Owner::Script(script) => secrets::names(&bucket, script).await?,
+                Owner::Store(store) => secrets::store_names(&bucket, store).await?,
+            };
+            for name in names {
                 output.row(&Name(name))?;
             }
             output.finish()
@@ -175,6 +209,7 @@ impl Command {
         };
         let mut name = None;
         let mut script = None;
+        let mut store = None;
         let mut config = None;
         let mut fleet = FleetFlags::default();
         let mut json = false;
@@ -188,6 +223,7 @@ impl Command {
                 "--help" | "-h" => return Ok(None),
                 "--json" => json = true,
                 "--script" => script = Some(value("--script")?),
+                "--store" => store = Some(value("--store")?),
                 "--config" => config = Some(PathBuf::from(value("--config")?)),
                 other => {
                     if fleet.consume(other, &mut value)? {
@@ -210,12 +246,16 @@ impl Command {
             (verb, None) => bail!("`celld secret {verb}` needs a secret name"),
             _ => unreachable!("the verb was matched above"),
         };
+        if store.is_some() && (script.is_some() || config.is_some()) {
+            bail!("--store names a Secrets Store; it takes no --script or --config");
+        }
         if json && !matches!(action, Action::List) {
             bail!("--json applies to `celld secret list`");
         }
         Ok(Some(Self {
             action,
             script,
+            store,
             config,
             fleet: fleet.with_environment(),
             json,
@@ -231,8 +271,12 @@ USAGE
   celld secret put    NAME [--script SCRIPT] [fleet options] < value
   celld secret list        [--script SCRIPT] [fleet options] [--json]
   celld secret delete NAME [--script SCRIPT] [fleet options]
+  celld secret put|list|delete ... --store STORE_ID    (a Secrets Store's secrets)
 
-The Worker reads a secret as `env.NAME`. The value is read from standard input,
+The Worker reads a secret as `env.NAME`. With --store, the secrets belong to the
+Secrets Store STORE_ID instead of one Worker: a Worker binds one with
+`secrets_store_secrets` (`binding`, `store_id`, `secret_name`) and reads it with
+`await env.BINDING.get()`. Put the secret before you deploy the Worker. The value is read from standard input,
 without its final line break, and is encrypted with the secrets key before it
 leaves this command. `list` prints names only.
 
@@ -279,6 +323,14 @@ mod tests {
             .unwrap();
         assert!(matches!(command.action, Action::Put(name) if name == "TOKEN"));
         assert_eq!(command.script.as_deref(), Some("app"));
+    }
+
+    #[test]
+    fn a_store_is_named_with_store_and_not_with_a_script() {
+        let command = parse(&["put", "KEY", "--store", "st1"]).unwrap().unwrap();
+        assert_eq!(command.store.as_deref(), Some("st1"));
+        assert!(parse(&["put", "KEY", "--store", "st1", "--script", "app"]).is_err());
+        assert!(parse(&["list", "--store"]).is_err());
     }
 
     #[test]

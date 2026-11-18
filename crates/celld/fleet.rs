@@ -947,6 +947,18 @@ async fn load_worker_at_pointer(
         )
         .await?,
     );
+    // Store secrets are bindings of their own, not vars, so `process.env`
+    // never holds them. One more bucket read per distinct store.
+    // `.dev.vars` is read only for a binding that `celld dev` marked, so an
+    // unreadable file cannot stop a Worker that has none.
+    let dev_values = crate::secrets::dev_values_for(&manifest, crate::dev::store_values)?;
+    let secret_stores = crate::secrets::load_stores(
+        bucket,
+        &manifest,
+        &dev_values,
+        crate::secrets::SecretsKey::from_environment,
+    )
+    .await?;
     let compat = crate::worker_compat(&manifest.raw_metadata);
     let assets = match &manifest.assets {
         Some(reference) => Some(
@@ -1003,6 +1015,7 @@ async fn load_worker_at_pointer(
         asset_binding,
         loader_bindings,
         version_metadata,
+        secret_stores,
         assets,
         services,
         crons,
@@ -1023,6 +1036,8 @@ pub struct LoadedDeployment {
     pub loader_bindings: Vec<String>,
     /// The deployment's `version_metadata` binding, if it declares one.
     pub version_metadata: Option<crate::engine_api::VersionMetadata>,
+    /// The deployment's Secrets Store bindings, decrypted at load.
+    pub secret_stores: Vec<crate::secrets::StoreSecret>,
     pub assets: Option<crate::assets::AssetResolver>,
     pub services: Vec<(String, String, Option<String>)>,
     /// `triggers.crons` from the manifest, driving the reserved cron cell.

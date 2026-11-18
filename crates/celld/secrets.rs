@@ -15,6 +15,13 @@
 //! deployment, decrypts it there, and serves the values as string bindings of
 //! `env`; a request costs nothing extra.
 //!
+//! A Secrets Store binding reads from a second object of the same shape, one
+//! per store: `stores/<store_id>/secrets.json`. A store is shared by every
+//! Worker whose config names its `store_id`, as it is on Cloudflare, so its
+//! values are sealed under the store and the secret name. The load reads one
+//! more object for each distinct store a Worker binds, and a Worker with no
+//! `secrets_store_secrets` reads nothing extra.
+//!
 //! No error or log line in this module names a value. Names are not secret and
 //! are stored in the clear, so `list` and the clash check at deploy need no key.
 
@@ -158,7 +165,7 @@ impl SecretsKey {
         Aes256Gcm::new_from_slice(&self.bytes).expect("a 32-byte key")
     }
 
-    fn seal(&self, script: &str, name: &str, value: &[u8]) -> anyhow::Result<Sealed> {
+    fn seal(&self, scope: Scope<'_>, name: &str, value: &[u8]) -> anyhow::Result<Sealed> {
         let mut nonce = [0u8; NONCE_BYTES];
         getrandom::fill(&mut nonce).map_err(|_| anyhow!("the OS random source is unavailable"))?;
         let ciphertext = self
@@ -167,7 +174,7 @@ impl SecretsKey {
                 &Nonce::from(nonce),
                 Payload {
                     msg: value,
-                    aad: &associated_data(script, name),
+                    aad: &associated_data(&scope.aad(), name),
                 },
             )
             .map_err(|_| anyhow!("encrypt secret {name}"))?;
@@ -178,12 +185,13 @@ impl SecretsKey {
         })
     }
 
-    fn open(&self, script: &str, name: &str, sealed: &Sealed) -> anyhow::Result<Vec<u8>> {
+    fn open(&self, scope: Scope<'_>, name: &str, sealed: &Sealed) -> anyhow::Result<Vec<u8>> {
         let wrong = || {
             anyhow!(
-                "secret {name} of script {script} does not open under the secrets key {} \
+                "secret {name} of {} does not open under the secrets key {} \
                  (it was sealed under key {}, was altered, or was copied from another \
-                 name or script)",
+                 name or owner)",
+                scope.label(),
                 self.id,
                 sealed.kid
             )
@@ -199,7 +207,7 @@ impl SecretsKey {
                 &Nonce::from(nonce),
                 Payload {
                     msg: &ciphertext,
-                    aad: &associated_data(script, name),
+                    aad: &associated_data(&scope.aad(), name),
                 },
             )
             .map_err(|_| wrong())
@@ -257,20 +265,87 @@ impl Default for SecretSet {
     }
 }
 
+/// Whose secrets an object holds: one script's, or one Secrets Store's.
+#[derive(Clone, Copy)]
+enum Scope<'a> {
+    Script(&'a str),
+    Store(&'a str),
+}
+
+impl Scope<'_> {
+    fn object_key(self) -> String {
+        match self {
+            Self::Script(script) => format!("deploy/{script}/secrets.json"),
+            Self::Store(store) => format!("stores/{store}/secrets.json"),
+        }
+    }
+
+    /// How an error names the owner.
+    fn label(self) -> String {
+        match self {
+            Self::Script(script) => format!("script {script}"),
+            Self::Store(store) => format!("store {store}"),
+        }
+    }
+
+    /// The owner as the associated data of a sealed value. A script name has
+    /// no `:`, so a store never shares it with a script.
+    fn aad(self) -> String {
+        match self {
+            Self::Script(script) => script.to_string(),
+            Self::Store(store) => format!("store:{store}"),
+        }
+    }
+
+    fn check(self) -> anyhow::Result<()> {
+        match self {
+            Self::Script(script) => anyhow::ensure!(
+                crate::deploy::valid_script_name(script),
+                "{script:?} is not a valid Worker name"
+            ),
+            Self::Store(store) => anyhow::ensure!(
+                crate::deploy::valid_resource_name(store),
+                "{store:?} is not a valid store id; use letters, digits, `-` and `_`, at most 64 characters"
+            ),
+        }
+        Ok(())
+    }
+
+    fn check_name(self, name: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Script(_) => {
+                anyhow::ensure!(
+                    crate::deploy::valid_binding(name),
+                    "{name:?} is not a valid secret name; use letters, digits, `_` and `$`, not starting with a digit"
+                );
+                crate::deploy::check_env_name(name)
+            }
+            Self::Store(_) => {
+                anyhow::ensure!(
+                    crate::deploy::valid_resource_name(name),
+                    "{name:?} is not a valid store secret name; use letters, digits, `-` and `_`, at most 64 characters"
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
 pub fn object_key(script: &str) -> String {
-    format!("deploy/{script}/secrets.json")
+    Scope::Script(script).object_key()
 }
 
 /// The secret object of `script` and its CAS token, or `None` when the script
 /// has none.
-async fn read(bucket: &Bucket, script: &str) -> anyhow::Result<Option<(SecretSet, String)>> {
-    let key = object_key(script);
+async fn read(bucket: &Bucket, scope: Scope<'_>) -> anyhow::Result<Option<(SecretSet, String)>> {
+    let key = scope.object_key();
+    let label = scope.label();
     let Some((body, token)) = bucket.get(&key).await? else {
         return Ok(None);
     };
     anyhow::ensure!(
         body.len() <= MAX_OBJECT_BYTES,
-        "{key} is {} bytes, over the {MAX_OBJECT_BYTES}-byte limit; delete secrets of script {script}",
+        "{key} is {} bytes, over the {MAX_OBJECT_BYTES}-byte limit; delete secrets of {label}",
         body.len()
     );
     let set: SecretSet =
@@ -282,26 +357,10 @@ async fn read(bucket: &Bucket, script: &str) -> anyhow::Result<Option<(SecretSet
     );
     anyhow::ensure!(
         set.secrets.len() <= MAX_ENTRIES,
-        "{key} holds {} secrets, over the limit of {MAX_ENTRIES}; delete secrets of script {script}",
+        "{key} holds {} secrets, over the limit of {MAX_ENTRIES}; delete secrets of {label}",
         set.secrets.len()
     );
     Ok(Some((set, token)))
-}
-
-fn check_script(script: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        crate::deploy::valid_script_name(script),
-        "{script:?} is not a valid Worker name"
-    );
-    Ok(())
-}
-
-fn check_name(name: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        crate::deploy::valid_binding(name),
-        "{name:?} is not a valid secret name; use letters, digits, `_` and `$`, not starting with a digit"
-    );
-    crate::deploy::check_env_name(name)
 }
 
 fn clash(script: &str, name: &str) -> anyhow::Error {
@@ -310,16 +369,57 @@ fn clash(script: &str, name: &str) -> anyhow::Error {
 
 /// The secret names of `script`, sorted. Needs no key.
 pub async fn names(bucket: &Bucket, script: &str) -> anyhow::Result<Vec<String>> {
-    check_script(script)?;
-    Ok(read(bucket, script)
+    names_in(bucket, Scope::Script(script)).await
+}
+
+/// The secret names of the Secrets Store `store`, sorted. Needs no key.
+pub async fn store_names(bucket: &Bucket, store: &str) -> anyhow::Result<Vec<String>> {
+    names_in(bucket, Scope::Store(store)).await
+}
+
+async fn names_in(bucket: &Bucket, scope: Scope<'_>) -> anyhow::Result<Vec<String>> {
+    scope.check()?;
+    Ok(read(bucket, scope)
         .await?
         .map(|(set, _)| set.secrets.into_keys().collect())
         .unwrap_or_default())
 }
 
+/// Refuse bindings that share a name. `build_env` installs every binding into
+/// one JavaScript object, so the one added last would silently replace the
+/// others; a Secrets Store binding and a var of the same name is the case a
+/// hand-written manifest can reach.
+pub fn ensure_unique_binding_names(bindings: &[serde_json::Value]) -> anyhow::Result<()> {
+    let mut seen = std::collections::BTreeMap::new();
+    for binding in bindings {
+        let name = binding
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let kind = binding
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if let Some(previous) = seen.insert(name, kind) {
+            anyhow::bail!(
+                "binding name {name:?} is declared by both a {previous} and a {kind} \
+                 binding; every name in `env` must be unique"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a deployment whose bindings use the name of a stored secret. Reads
 /// names only, so a deploy needs no key.
 pub async fn ensure_no_clash(bucket: &Bucket, manifest: &Manifest) -> anyhow::Result<()> {
+    if let Some(bindings) = manifest
+        .raw_metadata
+        .get("bindings")
+        .and_then(serde_json::Value::as_array)
+    {
+        ensure_unique_binding_names(bindings)?;
+    }
     let bindings = binding_names(&manifest.raw_metadata);
     for name in names(bucket, &manifest.script_name).await? {
         if bindings.contains(&name) {
@@ -345,29 +445,52 @@ pub async fn put(
     value: &str,
     bindings: &BTreeSet<String>,
 ) -> anyhow::Result<()> {
-    check_script(script)?;
-    check_name(name)?;
+    if bindings.contains(name) {
+        return Err(clash(script, name));
+    }
+    put_in(bucket, key, Scope::Script(script), name, value).await
+}
+
+/// Store `value` as the secret `name` of the Secrets Store `store`. A store
+/// name is not an `env` name, so no binding can clash with it.
+pub async fn put_store(
+    bucket: &Bucket,
+    key: &SecretsKey,
+    store: &str,
+    name: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    put_in(bucket, key, Scope::Store(store), name, value).await
+}
+
+async fn put_in(
+    bucket: &Bucket,
+    key: &SecretsKey,
+    scope: Scope<'_>,
+    name: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    scope.check()?;
+    scope.check_name(name)?;
     anyhow::ensure!(!value.is_empty(), "a secret value cannot be empty");
     anyhow::ensure!(
         value.len() <= MAX_VALUE_BYTES,
         "a secret value is at most {MAX_VALUE_BYTES} bytes"
     );
-    if bindings.contains(name) {
-        return Err(clash(script, name));
-    }
-    let sealed = key.seal(script, name, value.as_bytes())?;
-    update(bucket, script, |set| {
+    let label = scope.label();
+    let sealed = key.seal(scope, name, value.as_bytes())?;
+    update(bucket, scope, |set| {
         anyhow::ensure!(
             set.secrets
                 .values()
                 .all(|existing| existing.kid == key.id()),
             "the secrets key differs from the one these secrets were sealed with; \
-             use that key, or delete the secrets of script {script} first"
+             use that key, or delete the secrets of {label} first"
         );
         set.secrets.insert(name.to_string(), sealed.clone());
         anyhow::ensure!(
             set.secrets.len() <= MAX_ENTRIES,
-            "script {script} can hold at most {MAX_ENTRIES} secrets; delete one first"
+            "{label} can hold at most {MAX_ENTRIES} secrets; delete one first"
         );
         Ok(())
     })
@@ -375,26 +498,36 @@ pub async fn put(
 }
 
 pub async fn delete(bucket: &Bucket, script: &str, name: &str) -> anyhow::Result<()> {
-    check_script(script)?;
-    update(bucket, script, |set| {
+    delete_in(bucket, Scope::Script(script), name).await
+}
+
+pub async fn delete_store(bucket: &Bucket, store: &str, name: &str) -> anyhow::Result<()> {
+    delete_in(bucket, Scope::Store(store), name).await
+}
+
+async fn delete_in(bucket: &Bucket, scope: Scope<'_>, name: &str) -> anyhow::Result<()> {
+    scope.check()?;
+    let label = scope.label();
+    update(bucket, scope, |set| {
         set.secrets
             .remove(name)
             .map(drop)
-            .ok_or_else(|| anyhow!("script {script} has no secret {name}"))
+            .ok_or_else(|| anyhow!("{label} has no secret {name}"))
     })
     .await
 }
 
-/// Apply `change` to the script's object with a conditional write, and read
+/// Apply `change` to the owner's object with a conditional write, and read
 /// again when another writer got there first.
 async fn update(
     bucket: &Bucket,
-    script: &str,
+    scope: Scope<'_>,
     mut change: impl FnMut(&mut SecretSet) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let key = object_key(script);
+    let key = scope.object_key();
+    let label = scope.label();
     for _ in 0..WRITE_ATTEMPTS {
-        let (mut set, token) = match read(bucket, script).await? {
+        let (mut set, token) = match read(bucket, scope).await? {
             Some((set, token)) => (set, Some(token)),
             None => (SecretSet::default(), None),
         };
@@ -402,7 +535,7 @@ async fn update(
         let body = serde_json::to_vec(&set)?;
         anyhow::ensure!(
             body.len() <= MAX_OBJECT_BYTES,
-            "the secrets of script {script} would take {} bytes, over the {MAX_OBJECT_BYTES}-byte \
+            "the secrets of {label} would take {} bytes, over the {MAX_OBJECT_BYTES}-byte \
              limit for all of them; delete one first",
             body.len()
         );
@@ -433,7 +566,7 @@ pub async fn load<'k>(
         return Ok(Vec::new());
     }
     let script = manifest.script_name.as_str();
-    let Some((set, _)) = read(bucket, script).await? else {
+    let Some((set, _)) = read(bucket, Scope::Script(script)).await? else {
         return Ok(Vec::new());
     };
     if set.secrets.is_empty() {
@@ -454,11 +587,270 @@ pub async fn load<'k>(
             if bindings.contains(name) {
                 return Err(clash(script, name));
             }
-            let value = String::from_utf8(key.open(script, name, sealed)?)
+            let value = String::from_utf8(key.open(Scope::Script(script), name, sealed)?)
                 .map_err(|_| anyhow!("secret {name} of script {script} is not UTF-8"))?;
             Ok((name.clone(), value))
         })
         .collect()
+}
+
+/// One `secrets_store_secrets` entry of a deployment.
+struct StoreBinding<'a> {
+    binding: &'a str,
+    store_id: &'a str,
+    secret_name: &'a str,
+    /// `celld dev` found an entry for this binding in `.dev.vars` or a dotenv
+    /// file. The value is not in the deployment, which lives on disk; the node
+    /// reads the file when it loads the deployment. Only `celld dev` honours
+    /// the mark: a manifest from the control plane or a staged version can
+    /// carry it, and there the binding is an ordinary one.
+    dev_value: bool,
+}
+
+/// The Secrets Store bindings of a deployment. A manifest that the config
+/// parser did not write can hold a malformed entry; that fails the load and
+/// names the binding, where skipping it would leave `env.<binding>` undefined.
+fn store_bindings(manifest: &Manifest) -> anyhow::Result<Vec<StoreBinding<'_>>> {
+    let bindings = manifest
+        .raw_metadata
+        .get("bindings")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|binding| {
+            binding.get("type").and_then(serde_json::Value::as_str) == Some(STORE_BINDING_TYPE)
+        })
+        .collect::<Vec<_>>();
+    // A node that does not know the binding would start the Worker without it,
+    // so the manifest has to say it needs one that does.
+    if !bindings.is_empty()
+        && !manifest
+            .required_features
+            .iter()
+            .any(|feature| feature == crate::protocol::FEATURE_SECRETS_STORE_V1)
+    {
+        bail!(
+            "the deployment has Secrets Store bindings but does not require the {} feature",
+            crate::protocol::FEATURE_SECRETS_STORE_V1
+        );
+    }
+    bindings
+        .into_iter()
+        .map(|binding| {
+            let named = binding
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<unnamed>");
+            let text = |field: &str| {
+                binding
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .with_context(|| {
+                        format!(
+                            "Secrets Store binding {named} of the deployment has no string `{field}`"
+                        )
+                    })
+            };
+            let name = text("name")?;
+            // The name becomes a property of `env` in generated JavaScript.
+            if !crate::deploy::valid_binding(name) {
+                bail!("Secrets Store binding {named} of the deployment has an invalid binding name");
+            }
+            crate::deploy::check_env_name(name)
+                .with_context(|| format!("Secrets Store binding {named} of the deployment"))?;
+            let store_id = text("store_id")?;
+            // A marked binding never reads its store, but the id is still
+            // checked: the mark is data in a manifest, not proof of `celld dev`.
+            Scope::Store(store_id)
+                .check()
+                .with_context(|| format!("Secrets Store binding {named} of the deployment"))?;
+            Ok(StoreBinding {
+                binding: name,
+                store_id,
+                secret_name: text("secret_name")?,
+                dev_value: binding.get("dev_value") == Some(&serde_json::Value::Bool(true)),
+            })
+        })
+        .collect()
+}
+
+/// Whether the deployment marks a Secrets Store binding as filled by `celld
+/// dev`. Only then does a node read `.dev.vars` when it loads the deployment.
+fn has_dev_value_binding(manifest: &Manifest) -> bool {
+    manifest
+        .raw_metadata
+        .get("bindings")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|binding| {
+            binding.get("type").and_then(serde_json::Value::as_str) == Some(STORE_BINDING_TYPE)
+                && binding.get("dev_value") == Some(&serde_json::Value::Bool(true))
+        })
+}
+
+/// The dev values for `manifest`: `read` runs only when a binding is marked, so
+/// an unreadable `.dev.vars` cannot stop a Worker that has none.
+pub fn dev_values_for(
+    manifest: &Manifest,
+    read: impl FnOnce() -> anyhow::Result<BTreeMap<String, String>>,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    if has_dev_value_binding(manifest) {
+        read()
+    } else {
+        Ok(BTreeMap::new())
+    }
+}
+
+/// The `type` of a Secrets Store binding in a deployment's metadata.
+pub const STORE_BINDING_TYPE: &str = "secrets_store_secret";
+
+fn store_missing(binding: &StoreBinding<'_>) -> String {
+    format!(
+        "Secrets Store secret {} was not found in store {} (binding {}); \
+         `celld secret put {} --store {}`, or for `celld dev` set {} in .dev.vars",
+        binding.secret_name,
+        binding.store_id,
+        binding.binding,
+        binding.secret_name,
+        binding.store_id,
+        binding.binding
+    )
+}
+
+/// Refuse a deployment whose Secrets Store binding names a secret that its
+/// store does not hold, so the failure is the deploy's and not a Worker's first
+/// `get()`. Reads names only, one object for each distinct store, and needs no
+/// key. With `honour_dev_value`, set only for a manifest that `celld dev` built
+/// itself, a binding that it fills from `.dev.vars` needs no store.
+pub async fn ensure_store_secrets(
+    bucket: &Bucket,
+    manifest: &Manifest,
+    honour_dev_value: bool,
+) -> anyhow::Result<()> {
+    let mut stores: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    let bindings = store_bindings(manifest)?;
+    for binding in bindings
+        .iter()
+        .filter(|binding| !(honour_dev_value && binding.dev_value))
+    {
+        if !stores.contains_key(binding.store_id) {
+            stores.insert(
+                binding.store_id,
+                store_names(bucket, binding.store_id).await?,
+            );
+        }
+        if !stores[binding.store_id]
+            .iter()
+            .any(|name| name == binding.secret_name)
+        {
+            bail!(store_missing(binding));
+        }
+    }
+    Ok(())
+}
+
+/// A Secrets Store binding as the Worker sees it: `env.<binding>.get()` returns
+/// the value, or rejects with the message.
+#[derive(Clone)]
+pub struct StoreSecret {
+    pub binding: String,
+    pub value: Result<String, String>,
+}
+
+/// The value is never in a log line, even through a derived `Debug`.
+impl std::fmt::Debug for StoreSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoreSecret")
+            .field("binding", &self.binding)
+            .field("value", &self.value.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// The Secrets Store bindings of the deployment, decrypted. One bucket read for
+/// each distinct store the deployment binds, none when it binds no store; the
+/// values are served from memory afterwards.
+///
+/// `dev_values` holds what `celld dev` read from `.dev.vars` or a dotenv file
+/// just now, by name; a fleet passes none. A binding that the deployment marks
+/// with a dev value takes its entry from there, and falls back to the store
+/// when the entry has gone since the deploy.
+///
+/// A secret the store lacks becomes a `get()` that rejects, since it can vanish
+/// after the deploy that checked it. A store with a secret and no key is an
+/// error, as it is for a script's secrets; `key` runs only then.
+pub async fn load_stores<'k>(
+    bucket: &Bucket,
+    manifest: &Manifest,
+    dev_values: &BTreeMap<String, String>,
+    key: impl FnOnce() -> anyhow::Result<Option<&'k SecretsKey>>,
+) -> anyhow::Result<Vec<StoreSecret>> {
+    if manifest.main_module.is_none() {
+        return Ok(Vec::new());
+    }
+    let bindings = store_bindings(manifest)?;
+    let dev_value = |binding: &StoreBinding<'_>| {
+        binding
+            .dev_value
+            .then(|| dev_values.get(binding.binding))
+            .flatten()
+    };
+    let mut sets: BTreeMap<&str, Option<SecretSet>> = BTreeMap::new();
+    for binding in bindings
+        .iter()
+        .filter(|binding| dev_value(binding).is_none())
+    {
+        if !sets.contains_key(binding.store_id) {
+            let set = read(bucket, Scope::Store(binding.store_id))
+                .await?
+                .map(|(set, _)| set);
+            sets.insert(binding.store_id, set);
+        }
+    }
+    let found = |binding: &StoreBinding<'_>| {
+        sets.get(binding.store_id)
+            .and_then(Option::as_ref)
+            .and_then(|set| set.secrets.get(binding.secret_name))
+    };
+    let mut key = Some(key);
+    let mut opener: Option<&SecretsKey> = None;
+    let mut loaded = Vec::with_capacity(bindings.len());
+    for binding in &bindings {
+        let value = match (dev_value(binding), found(binding)) {
+            (Some(value), _) => Ok(value.clone()),
+            (None, None) => Err(store_missing(binding)),
+            (None, Some(sealed)) => {
+                if opener.is_none() {
+                    let resolve = key.take().expect("the key is resolved once");
+                    opener = Some(resolve()?.with_context(|| {
+                        format!(
+                            "a Secrets Store binding of script {} needs the secrets key, and none \
+                             is configured; set {KEY_VARIABLE} or {KEY_FILE_VARIABLE} to the key \
+                             the secrets were put under",
+                            manifest.script_name
+                        )
+                    })?);
+                }
+                let opener = opener.expect("set above");
+                let scope = Scope::Store(binding.store_id);
+                let opened = opener.open(scope, binding.secret_name, sealed)?;
+                Ok(String::from_utf8(opened).map_err(|_| {
+                    anyhow!(
+                        "secret {} of {} is not UTF-8",
+                        binding.secret_name,
+                        scope.label()
+                    )
+                })?)
+            }
+        };
+        loaded.push(StoreSecret {
+            binding: binding.binding.to_string(),
+            value,
+        });
+    }
+    Ok(loaded)
 }
 
 /// The binding names of a deployment's metadata: every `bindings` entry.
@@ -483,8 +875,11 @@ mod tests {
     #[test]
     fn a_value_round_trips() {
         let key = key(7);
-        let sealed = key.seal("app", "TOKEN", b"s3cret").unwrap();
-        assert_eq!(key.open("app", "TOKEN", &sealed).unwrap(), b"s3cret");
+        let sealed = key.seal(Scope::Script("app"), "TOKEN", b"s3cret").unwrap();
+        assert_eq!(
+            key.open(Scope::Script("app"), "TOKEN", &sealed).unwrap(),
+            b"s3cret"
+        );
         assert_eq!(sealed.kid, key.id());
         assert!(!sealed.ct.contains("s3cret"));
     }
@@ -492,16 +887,20 @@ mod tests {
     #[test]
     fn each_value_has_its_own_nonce() {
         let key = key(7);
-        let a = key.seal("app", "TOKEN", b"same").unwrap();
-        let b = key.seal("app", "TOKEN", b"same").unwrap();
+        let a = key.seal(Scope::Script("app"), "TOKEN", b"same").unwrap();
+        let b = key.seal(Scope::Script("app"), "TOKEN", b"same").unwrap();
         assert_ne!(a.nonce, b.nonce);
         assert_ne!(a.ct, b.ct);
     }
 
     #[test]
     fn another_key_does_not_open_it() {
-        let sealed = key(7).seal("app", "TOKEN", b"s3cret").unwrap();
-        let error = key(8).open("app", "TOKEN", &sealed).unwrap_err();
+        let sealed = key(7)
+            .seal(Scope::Script("app"), "TOKEN", b"s3cret")
+            .unwrap();
+        let error = key(8)
+            .open(Scope::Script("app"), "TOKEN", &sealed)
+            .unwrap_err();
         let text = format!("{error:#}");
         assert!(
             text.contains(key(7).id()) && text.contains(key(8).id()),
@@ -513,25 +912,25 @@ mod tests {
     #[test]
     fn a_tampered_value_does_not_open() {
         let key = key(7);
-        let mut sealed = key.seal("app", "TOKEN", b"s3cret").unwrap();
+        let mut sealed = key.seal(Scope::Script("app"), "TOKEN", b"s3cret").unwrap();
         let mut ciphertext = STANDARD.decode(&sealed.ct).unwrap();
         ciphertext[0] ^= 1;
         sealed.ct = STANDARD.encode(ciphertext);
-        assert!(key.open("app", "TOKEN", &sealed).is_err());
+        assert!(key.open(Scope::Script("app"), "TOKEN", &sealed).is_err());
 
-        let mut sealed = key.seal("app", "TOKEN", b"s3cret").unwrap();
+        let mut sealed = key.seal(Scope::Script("app"), "TOKEN", b"s3cret").unwrap();
         let mut nonce = STANDARD.decode(&sealed.nonce).unwrap();
         nonce[0] ^= 1;
         sealed.nonce = STANDARD.encode(nonce);
-        assert!(key.open("app", "TOKEN", &sealed).is_err());
+        assert!(key.open(Scope::Script("app"), "TOKEN", &sealed).is_err());
     }
 
     #[test]
     fn a_value_does_not_open_under_another_name_or_script() {
         let key = key(7);
-        let sealed = key.seal("app", "TOKEN", b"s3cret").unwrap();
-        assert!(key.open("app", "OTHER", &sealed).is_err());
-        assert!(key.open("other", "TOKEN", &sealed).is_err());
+        let sealed = key.seal(Scope::Script("app"), "TOKEN", b"s3cret").unwrap();
+        assert!(key.open(Scope::Script("app"), "OTHER", &sealed).is_err());
+        assert!(key.open(Scope::Script("other"), "TOKEN", &sealed).is_err());
         // The separators keep two (script, name) pairs apart.
         assert_ne!(associated_data("a", "b$c"), associated_data("a-b", "$c"));
     }
@@ -617,6 +1016,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_managed_manifest_with_two_bindings_of_one_name_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let mut manifest = manifest(&["A"]);
+        manifest.raw_metadata["bindings"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": STORE_BINDING_TYPE, "name": "A", "store_id": "s", "secret_name": "n",
+            }));
+        let error = ensure_no_clash(&bucket, &manifest).await.unwrap_err();
+        assert!(format!("{error:#}").contains("must be unique"), "{error:#}");
+    }
+
+    #[tokio::test]
     async fn a_name_that_a_binding_uses_is_refused_by_put_deploy_and_load() {
         let directory = tempfile::tempdir().unwrap();
         let bucket = bucket(&directory);
@@ -685,7 +1099,7 @@ mod tests {
         put(&bucket, &key, "app", "A", "v", &BTreeSet::new())
             .await
             .unwrap();
-        let (mut set, token) = read(&bucket, "app").await.unwrap().unwrap();
+        let (mut set, token) = read(&bucket, Scope::Script("app")).await.unwrap().unwrap();
         let moved = set.secrets["A"].clone();
         set.secrets.insert("__proto__".into(), moved);
         bucket
@@ -771,7 +1185,7 @@ mod tests {
         put(&bucket, &key, "app", "A", "v", &BTreeSet::new())
             .await
             .unwrap();
-        let (mut set, token) = read(&bucket, "app").await.unwrap().unwrap();
+        let (mut set, token) = read(&bucket, Scope::Script("app")).await.unwrap().unwrap();
         let entry = set.secrets["A"].clone();
         for index in 0..=MAX_ENTRIES {
             set.secrets.insert(format!("S{index}"), entry.clone());
@@ -833,7 +1247,7 @@ mod tests {
         put(&bucket, &key, "app", "A", "one", &BTreeSet::new())
             .await
             .unwrap();
-        let (mut set, token) = read(&bucket, "app").await.unwrap().unwrap();
+        let (mut set, token) = read(&bucket, Scope::Script("app")).await.unwrap().unwrap();
         let moved = set.secrets.remove("A").unwrap();
         set.secrets.insert("B".into(), moved);
         bucket
@@ -847,7 +1261,296 @@ mod tests {
             .unwrap();
         // The node's own key path is exercised by the e2e test; here the
         // sealed entry is opened directly.
-        let (set, _) = read(&bucket, "app").await.unwrap().unwrap();
-        assert!(key.open("app", "B", &set.secrets["B"]).is_err());
+        let (set, _) = read(&bucket, Scope::Script("app")).await.unwrap().unwrap();
+        assert!(key
+            .open(Scope::Script("app"), "B", &set.secrets["B"])
+            .is_err());
+    }
+
+    fn store_manifest(bindings: serde_json::Value) -> Manifest {
+        let mut manifest = manifest(&[]);
+        manifest.raw_metadata = serde_json::json!({ "bindings": bindings });
+        manifest.required_features = vec![crate::protocol::FEATURE_SECRETS_STORE_V1.to_string()];
+        manifest
+    }
+
+    #[tokio::test]
+    async fn a_store_binding_needs_the_feature_a_valid_name_and_is_refused_otherwise() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let mut manifest = store_manifest(serde_json::json!([store_binding("A", "st1", "k")]));
+        manifest.required_features.clear();
+        let error = ensure_store_secrets(&bucket, &manifest, true)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("secrets-store-v1"),
+            "{error:#}"
+        );
+        let error = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(None))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("secrets-store-v1"),
+            "{error:#}"
+        );
+
+        for name in ["__proto__", "a\"b", "x'); evil(); ('", "1A", "", "a-b"] {
+            let manifest = store_manifest(serde_json::json!([store_binding(name, "st1", "k")]));
+            let error = ensure_store_secrets(&bucket, &manifest, true)
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("binding"),
+                "{name}: {error:#}"
+            );
+            assert!(
+                load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(None))
+                    .await
+                    .is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_values_are_read_only_for_a_marked_binding() {
+        let unmarked = store_manifest(serde_json::json!([store_binding("A", "st1", "k")]));
+        let none = store_manifest(serde_json::json!([]));
+        for manifest in [&unmarked, &none] {
+            let values = dev_values_for(manifest, || anyhow::bail!("unreadable .dev.vars"));
+            assert!(values.unwrap().is_empty());
+        }
+        let marked = store_manifest(serde_json::json!([{
+            "type": STORE_BINDING_TYPE, "name": "A", "store_id": "st1",
+            "secret_name": "k", "dev_value": true,
+        }]));
+        assert!(dev_values_for(&marked, || anyhow::bail!("unreadable .dev.vars")).is_err());
+        let read = || Ok(BTreeMap::from([("A".to_string(), "v".to_string())]));
+        assert_eq!(dev_values_for(&marked, read).unwrap()["A"], "v");
+    }
+
+    fn store_binding(name: &str, store: &str, secret: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": STORE_BINDING_TYPE, "name": name, "store_id": store, "secret_name": secret
+        })
+    }
+
+    #[tokio::test]
+    async fn a_store_secret_loads_by_binding_and_is_shared_between_scripts() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let key = key(3);
+        put_store(&bucket, &key, "st1", "api-key", "planted-store-value")
+            .await
+            .unwrap();
+        assert_eq!(store_names(&bucket, "st1").await.unwrap(), ["api-key"]);
+        // The script's own secrets are untouched.
+        assert!(names(&bucket, "app").await.unwrap().is_empty());
+
+        let manifest = store_manifest(serde_json::json!([
+            store_binding("A", "st1", "api-key"),
+            store_binding("B", "st1", "api-key"),
+        ]));
+        ensure_store_secrets(&bucket, &manifest, false)
+            .await
+            .unwrap();
+        let loaded = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(Some(&key)))
+            .await
+            .unwrap();
+        let values: Vec<_> = loaded
+            .iter()
+            .map(|secret| (secret.binding.as_str(), secret.value.clone().unwrap()))
+            .collect();
+        assert_eq!(
+            values,
+            [
+                ("A", "planted-store-value".to_string()),
+                ("B", "planted-store-value".to_string())
+            ]
+        );
+        let debug = format!("{loaded:?}");
+        assert!(!debug.contains("planted-store-value"), "{debug}");
+
+        let stored = String::from_utf8(
+            bucket
+                .get("stores/st1/secrets.json")
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!stored.contains("planted-store-value"), "{stored}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_store_secret_is_refused_at_deploy_and_rejects_at_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let key = key(3);
+        let manifest = store_manifest(serde_json::json!([store_binding("A", "st1", "gone")]));
+        let error = ensure_store_secrets(&bucket, &manifest, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("gone") && error.contains("st1"), "{error}");
+
+        // It can vanish after the deploy: the load still succeeds, and `get()`
+        // is what fails.
+        put_store(&bucket, &key, "st1", "gone", "v").await.unwrap();
+        delete_store(&bucket, "st1", "gone").await.unwrap();
+        let loaded = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(Some(&key)))
+            .await
+            .unwrap();
+        assert!(loaded[0].value.as_ref().unwrap_err().contains("gone"));
+    }
+
+    #[tokio::test]
+    async fn a_store_load_needs_the_key_only_when_a_store_secret_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let manifest = store_manifest(serde_json::json!([store_binding("A", "st1", "k")]));
+        // Nothing stored: no key is asked for.
+        assert!(load_stores(&bucket, &manifest, &BTreeMap::new(), || panic!(
+            "no key needed"
+        ))
+        .await
+        .unwrap()[0]
+            .value
+            .is_err());
+        put_store(&bucket, &key(3), "st1", "k", "v").await.unwrap();
+        let error = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(None))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(KEY_VARIABLE), "{error:#}");
+        // A deployment that binds no store reads nothing and needs no key.
+        let plain = store_manifest(serde_json::json!([]));
+        assert!(load_stores(&bucket, &plain, &BTreeMap::new(), || panic!(
+            "no key needed"
+        ))
+        .await
+        .unwrap()
+        .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_store_value_does_not_open_as_a_script_secret_or_in_another_store() {
+        let key = key(7);
+        let sealed = key.seal(Scope::Store("st1"), "k", b"v").unwrap();
+        assert!(key.open(Scope::Store("st1"), "k", &sealed).is_ok());
+        assert!(key.open(Scope::Store("st2"), "k", &sealed).is_err());
+        assert!(key.open(Scope::Script("st1"), "k", &sealed).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_dev_value_needs_no_store_and_is_read_at_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let manifest = store_manifest(serde_json::json!([{
+            "type": STORE_BINDING_TYPE, "name": "A", "store_id": "st1",
+            "secret_name": "k", "dev_value": true,
+        }]));
+        ensure_store_secrets(&bucket, &manifest, true)
+            .await
+            .unwrap();
+        let dev = |value: &str| BTreeMap::from([("A".to_string(), value.to_string())]);
+        let loaded = load_stores(&bucket, &manifest, &dev("first"), || {
+            panic!("no key needed")
+        })
+        .await
+        .unwrap();
+        assert_eq!(loaded[0].value.as_deref().unwrap(), "first");
+        // The deployment holds no value, so the next load sees the new one.
+        assert!(!manifest.raw_metadata.to_string().contains("first"));
+        let loaded = load_stores(&bucket, &manifest, &dev("second"), || {
+            panic!("no key needed")
+        })
+        .await
+        .unwrap();
+        assert_eq!(loaded[0].value.as_deref().unwrap(), "second");
+        // An entry that has gone since the deploy falls back to the store,
+        // which here lacks the secret.
+        let loaded = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(None))
+            .await
+            .unwrap();
+        assert!(loaded[0].value.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_dev_value_mark_is_ignored_outside_dev() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let manifest = store_manifest(serde_json::json!([{
+            "type": STORE_BINDING_TYPE, "name": "A", "store_id": "st1",
+            "secret_name": "k", "dev_value": true,
+        }]));
+        // A staged or managed manifest may carry the mark; the secret must exist.
+        let error = ensure_store_secrets(&bucket, &manifest, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains('k') && error.contains("st1"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_marked_binding_still_has_its_store_id_checked() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let manifest = store_manifest(serde_json::json!([{
+            "type": STORE_BINDING_TYPE, "name": "A", "store_id": "../x",
+            "secret_name": "k", "dev_value": true,
+        }]));
+        for honour in [true, false] {
+            let error = ensure_store_secrets(&bucket, &manifest, honour)
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("not a valid store id"),
+                "{error:#}"
+            );
+        }
+        let dev = BTreeMap::from([("A".to_string(), "v".to_string())]);
+        let error = load_stores(&bucket, &manifest, &dev, || Ok(None))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a valid store id"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_store_binding_fails_the_load_and_names_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        for entry in [
+            serde_json::json!({ "type": STORE_BINDING_TYPE, "name": "A", "secret_name": "k" }),
+            serde_json::json!({ "type": STORE_BINDING_TYPE, "name": "A", "store_id": "s" }),
+            serde_json::json!({
+                "type": STORE_BINDING_TYPE, "name": "A", "store_id": 1, "secret_name": "k"
+            }),
+        ] {
+            let manifest = store_manifest(serde_json::json!([entry]));
+            let error = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(None))
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("binding A"), "{error:#}");
+            let error = ensure_store_secrets(&bucket, &manifest, false)
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("binding A"), "{error:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn store_ids_and_names_are_validated() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let key = key(3);
+        assert!(put_store(&bucket, &key, "../x", "k", "v").await.is_err());
+        assert!(put_store(&bucket, &key, "st1", "a/b", "v").await.is_err());
+        assert!(put_store(&bucket, &key, "st1", "k", "").await.is_err());
     }
 }
