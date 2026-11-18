@@ -90,15 +90,16 @@ pub(super) fn op_ai_run(
             let detail = if matches!(status.as_u16(), 401 | 403) {
                 String::new()
             } else {
+                let limit = config.error_read_limit(ERROR_BODY_BYTES);
                 let mut text = Vec::new();
-                while text.len() < ERROR_BODY_BYTES {
+                while text.len() < limit {
                     match response.chunk().await {
                         Ok(Some(chunk)) => text.extend_from_slice(&chunk),
                         _ => break,
                     }
                 }
-                text.truncate(ERROR_BODY_BYTES);
-                format!(": {}", config.redact(String::from_utf8_lossy(&text).trim()))
+                text.truncate(limit);
+                format!(": {}", config.error_detail(&text, ERROR_BODY_BYTES))
             };
             return Err(format!(
                 "AiError: the upstream answered {}{detail}",

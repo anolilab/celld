@@ -108,6 +108,38 @@ impl Config {
     }
 }
 
+impl Config {
+    /// How many bytes of an upstream error to read so that `error_detail` can
+    /// still see a whole key that starts inside the first `max`.
+    pub fn error_read_limit(&self, max: usize) -> usize {
+        max + self.key.as_ref().map_or(0, |key| key.len())
+    }
+
+    /// The first `max` bytes of an upstream error `raw`, read to
+    /// `error_read_limit`, with the key removed before the cut so that no part
+    /// of it survives at the edge.
+    pub fn error_detail(&self, raw: &[u8], max: usize) -> String {
+        let mut raw = raw;
+        if let Some(key) = &self.key {
+            if raw.len() >= self.error_read_limit(max) {
+                // The read stopped mid-text, so its end may hold a cut key.
+                let cut = (1..key.len())
+                    .rev()
+                    .find(|&n| raw.ends_with(&key.as_bytes()[..n]))
+                    .unwrap_or(0);
+                raw = &raw[..raw.len() - cut];
+            }
+        }
+        let mut text = self.redact(String::from_utf8_lossy(raw).trim());
+        let mut end = max.min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text
+    }
+}
+
 /// The node's configuration, read once. `None` when `CELLD_AI_BASE_URL` is
 /// unset. A malformed setting is an error here and at startup, never a silent
 /// default.
@@ -257,6 +289,24 @@ mod tests {
         let config = config(Some("sk-secret"));
         assert!(!format!("{config:?}").contains("sk-secret"));
         assert_eq!(config.redact("bad key sk-secret"), "bad key [redacted]");
+    }
+
+    #[test]
+    fn a_key_at_the_edge_of_an_error_leaves_no_prefix() {
+        let key = "sk-secret-key-0123456789";
+        let config = config(Some(key));
+        let max = 64;
+        for start in max - key.len()..=max + 2 {
+            let mut raw = "x".repeat(start).into_bytes();
+            raw.extend_from_slice(key.as_bytes());
+            raw.extend_from_slice("y".repeat(max * 2).as_bytes());
+            raw.truncate(config.error_read_limit(max));
+            let detail = config.error_detail(&raw, max);
+            assert!(detail.len() <= max, "{start}");
+            for n in 4..=key.len() {
+                assert!(!detail.contains(&key[..n]), "{start}: {detail}");
+            }
+        }
     }
 
     #[test]
