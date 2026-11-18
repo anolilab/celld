@@ -135,6 +135,7 @@ the Cloudflare service.
 - [Durable Object Facets](services/durable-object-facets.md)
 - [KV](services/kv.md)
 - [Queues](services/queues.md)
+- [Rate Limiting](services/ratelimit.md)
 - [D1](services/d1.md)
 - [R2](services/r2.md)
 - [Workflows](services/workflows.md)

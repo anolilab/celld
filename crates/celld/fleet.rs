@@ -918,6 +918,7 @@ async fn load_worker_at_pointer(
             })
         })
         .collect();
+    let ratelimit_bindings = crate::protocol::validate_ratelimit_manifest(&manifest)?;
     let workflow_bindings = bindings(&manifest, "workflow")
         .filter_map(|binding| {
             Some(crate::js::WorkflowBinding {
@@ -1002,6 +1003,7 @@ async fn load_worker_at_pointer(
             d1_bindings,
             kv_bindings,
             queue_bindings,
+            ratelimit_bindings,
             queue_consumers: manifest.queue_consumers,
             workflow_bindings,
             vars,

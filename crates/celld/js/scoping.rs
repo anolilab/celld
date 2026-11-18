@@ -39,6 +39,9 @@ impl Declared {
         for binding in &config.queue_bindings {
             shared.insert(crate::engine_api::queue_cell_scope(&binding.queue));
         }
+        for binding in &config.ratelimit_bindings {
+            shared.insert(crate::engine_api::ratelimit_cell_scope(&binding.namespace));
+        }
         Self {
             script: config.script_name.clone(),
             classes: config.do_classes.iter().cloned().collect(),

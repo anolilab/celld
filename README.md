@@ -52,6 +52,7 @@ fleet bucket. Each row links to a project that deploys as-is:
 | Durable Objects: SQLite storage, alarms, hibernating WebSockets | [`counter`](examples/counter) |
 | KV: list, metadata, expiration, bulk import | [`kv`](examples/kv) |
 | Queues: producers, batching consumers, retries, dead letters | [`queues`](examples/queues) |
+| Rate Limiting: an exact fixed-window counter per key | [`ratelimit`](examples/ratelimit) |
 | D1: SQL databases, batches, migrations | [`d1`](examples/d1) |
 | R2: reads, writes, lists, multipart uploads | [`r2`](examples/r2) |
 | Workflows: durable steps, sleeps, events, pause and restart | [`workflow`](examples/workflow) |

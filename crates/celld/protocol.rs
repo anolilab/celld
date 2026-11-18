@@ -123,6 +123,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_D1_V1,
     FEATURE_KV_V1,
     FEATURE_QUEUES_V1,
+    FEATURE_RATELIMIT_V1,
     FEATURE_SQLITE_VEC_V1,
     FEATURE_R2_V1,
     FEATURE_WASM_V1,
@@ -187,6 +188,10 @@ pub const FEATURE_KV_V1: &str = "kv-v1";
 /// A deployment with a Queue producer or consumer. A node without the broker
 /// would otherwise omit a producer binding or silently stop consuming.
 pub const FEATURE_QUEUES_V1: &str = "queues-v1";
+
+/// A deployment with `ratelimits` bindings. A node without the rate limit cell
+/// would build an `env` missing the binding and fail on the first `limit()`.
+pub const FEATURE_RATELIMIT_V1: &str = "ratelimit-v1";
 
 pub const QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION: u32 = 1;
 
@@ -253,6 +258,46 @@ pub struct QueueConsumerConfig {
     pub max_concurrency: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_delay: Option<u32>,
+}
+
+/// Validate the Rate Limiting bindings of a manifest and return them.
+///
+/// A deployment with a `ratelimit` binding must require `ratelimit-v1` and
+/// install the reserved SQLite class that counts for it, as a Queue deployment
+/// must: without either a node would serve it with no counter behind the
+/// binding.
+#[doc(hidden)]
+pub fn validate_ratelimit_manifest(
+    manifest: &Manifest,
+) -> anyhow::Result<Vec<crate::engine_api::RateLimitBinding>> {
+    let bindings = manifest
+        .raw_metadata
+        .get("bindings")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|binding| {
+            binding.get("type").and_then(serde_json::Value::as_str) == Some("ratelimit")
+        })
+        .map(crate::engine_api::RateLimitBinding::from_manifest)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if bindings.is_empty() {
+        return Ok(bindings);
+    }
+    anyhow::ensure!(
+        manifest
+            .required_features
+            .iter()
+            .any(|feature| feature == FEATURE_RATELIMIT_V1),
+        "Rate Limiting deployment does not require {FEATURE_RATELIMIT_V1}"
+    );
+    let class = celld_logic::ratelimit::RESERVED_CLASS;
+    anyhow::ensure!(
+        manifest.do_classes.iter().any(|name| name == class)
+            && manifest.sqlite_classes.iter().any(|name| name == class),
+        "Rate Limiting deployment does not install the reserved SQLite {class} class"
+    );
+    Ok(bindings)
 }
 
 /// Validate every Queue value before a deployment becomes runtime state.
@@ -642,5 +687,62 @@ mod version_metadata_tests {
             version_metadata_id("v", &[a.clone(), b.clone()]),
             version_metadata_id("v", &[b, a])
         );
+    }
+}
+
+#[cfg(test)]
+mod ratelimit_manifest_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn manifest(features: &[&str], classes: &[&str], sqlite: &[&str]) -> Manifest {
+        serde_json::from_value(json!({
+            "version": "v", "script_name": "s", "main_module": "index.js",
+            "do_classes": classes, "sqlite_classes": sqlite, "modules": [],
+            "required_features": features,
+            "raw_metadata": { "bindings": [{
+                "type": "ratelimit", "name": "LIMITER", "namespace_id": "1",
+                "simple": { "limit": 5, "period": 10 }
+            }] },
+        }))
+        .expect("a manifest")
+    }
+
+    #[test]
+    fn a_complete_deployment_yields_its_bindings() {
+        let ok = manifest(&["ratelimit-v1"], &["__RateLimit"], &["__RateLimit"]);
+        let bindings = validate_ratelimit_manifest(&ok).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            (bindings[0].environment.as_str(), bindings[0].limit),
+            ("LIMITER", 5)
+        );
+    }
+
+    #[test]
+    fn the_feature_and_the_class_are_both_required() {
+        let no_feature = manifest(&[], &["__RateLimit"], &["__RateLimit"]);
+        let error = validate_ratelimit_manifest(&no_feature).unwrap_err();
+        assert!(error.to_string().contains("ratelimit-v1"), "{error}");
+        for (classes, sqlite) in [(&[][..], &[][..]), (&["__RateLimit"], &[])] {
+            let missing = manifest(&["ratelimit-v1"], classes, sqlite);
+            let error = validate_ratelimit_manifest(&missing).unwrap_err();
+            assert!(error.to_string().contains("__RateLimit"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_deployment_without_bindings_needs_nothing() {
+        let mut none = manifest(&[], &[], &[]);
+        none.raw_metadata = json!({ "bindings": [] });
+        assert!(validate_ratelimit_manifest(&none).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_incomplete_binding_is_refused() {
+        let mut broken = manifest(&["ratelimit-v1"], &["__RateLimit"], &["__RateLimit"]);
+        broken.raw_metadata["bindings"][0]["simple"]["period"] = json!(30);
+        let error = validate_ratelimit_manifest(&broken).unwrap_err();
+        assert!(error.to_string().contains("invalid ratelimit binding"));
     }
 }

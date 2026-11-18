@@ -61,6 +61,7 @@ pub use crate::engine_api::QueueMetrics;
 pub use crate::engine_api::QueueOutcome;
 pub use crate::engine_api::QueueRetryBatch;
 pub use crate::engine_api::QueueRetryMessage;
+pub use crate::engine_api::RateLimitBinding;
 pub use crate::engine_api::RequestBody;
 pub use crate::engine_api::RequestId;
 pub use crate::engine_api::RpcData;
@@ -1654,6 +1655,7 @@ pub struct WorkerConfig {
     /// [[kv]].
     kv_bindings: Vec<(String, String)>,
     queue_bindings: Vec<QueueBinding>,
+    ratelimit_bindings: Vec<RateLimitBinding>,
     pub(crate) queue_consumers: Vec<QueueConsumerRegistration>,
     /// This script declared a consumer in its own manifest. The deployment-
     /// wide catalog later replaces `queue_consumers` in every isolate, so the
@@ -1781,6 +1783,7 @@ impl WorkerConfig {
             d1_bindings,
             kv_bindings,
             queue_bindings,
+            ratelimit_bindings,
             queue_consumers,
             workflow_bindings,
             vars,
@@ -1811,6 +1814,7 @@ impl WorkerConfig {
             d1_bindings,
             kv_bindings,
             queue_bindings,
+            ratelimit_bindings,
             queue_consumers,
             declares_queue_consumer,
             workflow_bindings,
@@ -1858,6 +1862,7 @@ impl WorkerConfig {
             d1_bindings: Vec::new(),
             kv_bindings: Vec::new(),
             queue_bindings: Vec::new(),
+            ratelimit_bindings: Vec::new(),
             queue_consumers: Vec::new(),
             workflow_bindings: Vec::new(),
             vars: Vec::new(),
@@ -5979,6 +5984,7 @@ impl Worker {
             inject_workflows(scope, script_name, &config.workflow_bindings)?;
             inject_containers(scope, &config.containers)?;
             inject_kv_limits(scope)?;
+            inject_ratelimit_limits(scope)?;
             inject_queue_config(scope, &config)?;
             populate_cf_exports(scope, ns, do_classes)?;
             register_entrypoints(scope, ns)?;
@@ -7595,6 +7601,7 @@ fn op_loader_load(
             d1_bindings: Vec::new(),
             kv_bindings: Vec::new(),
             queue_bindings: Vec::new(),
+            ratelimit_bindings: Vec::new(),
             queue_consumers: Vec::new(),
             workflow_bindings: Vec::new(),
             vars: Vec::new(),
@@ -12211,13 +12218,16 @@ fn op_text_decoder_free(
 #[doc(hidden)]
 pub mod bootstrap;
 pub mod modules;
+#[cfg(test)]
+mod ratelimit_tests;
 mod v8_strings;
 use bootstrap::{
     adopt_cell, adopt_embedded_cell, begin_event_context, build_env, end_event_context,
     harness_env, inject_compatibility_flags, inject_containers, inject_crons, inject_kv_limits,
-    inject_namespace_keys, inject_queue_config, inject_routing, inject_storage_compatibility,
-    inject_workflows, install_harness, install_prelude, populate_cf_exports, populate_process_env,
-    register_class, register_entrypoints, validate_workflow_classes, EmbeddedStartup,
+    inject_namespace_keys, inject_queue_config, inject_ratelimit_limits, inject_routing,
+    inject_storage_compatibility, inject_workflows, install_harness, install_prelude,
+    populate_cf_exports, populate_process_env, register_class, register_entrypoints,
+    validate_workflow_classes, EmbeddedStartup,
 };
 use modules::{
     compile_module, host_import_module_dynamically, install_lazy_globals, op_builtin_module,

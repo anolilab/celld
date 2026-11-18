@@ -6462,6 +6462,12 @@ const __runtimeClasses = new Set();
 // The methods a stub may call over RPC on a runtime class that names them.
 // A class without an entry keeps every method callable.
 const __runtimeRpcMethods = new Map();
+// The base class of a runtime cell, standing in for `DurableObject`.
+class __RuntimeCellBase {
+  constructor(ctx) {
+    this.ctx = ctx;
+  }
+}
 const __runtimeClass = (name, cls, rpcMethods) => {
   __cell.classes[name] = cls;
   __cell.doExports[name] = true;
@@ -6477,11 +6483,7 @@ const {
   cellSweepBatch: __cellSweepBatch,
 } = kvService({
   // RPC on a runtime class is granted by `__runtimeClass` below.
-  DurableObject: class {
-    constructor(ctx) {
-      this.ctx = ctx;
-    }
-  },
+  DurableObject: __RuntimeCellBase,
   limits: () => __cell.kvLimits,
   // Set by the host for the signed operator route alone; see `__operatorRequests`.
   operator: (request) => __operatorRequests.has(request),
@@ -6510,6 +6512,23 @@ __runtimeClass("__KvNamespace", __KvNamespaceCell, [
 
 const __makeKvNamespace = __celld.__makeKvNamespace = (id, cellName) =>
   new __KvNamespace(() => __cell.makeNamespace("__KvNamespace"), cellName);
+
+// ---- Rate limits ---------------------------------------------------------
+// The namespace cell and the binding's client are `services/ratelimit.js`. The
+// cell counts in memory, so a call is one RPC to the namespace's owner.
+const {
+  RateLimitCell: __RateLimitCell,
+  Ratelimit: __Ratelimit,
+} = ratelimitService({
+  DurableObject: __RuntimeCellBase,
+  limits: () => __cell.ratelimitLimits,
+  now: () => Date.now(),
+});
+
+__runtimeClass("__RateLimit", __RateLimitCell, ["__ratelimitHit"]);
+
+__celld.__makeRateLimit = (cellName, limit, period) =>
+  new __Ratelimit(() => __cell.makeNamespace("__RateLimit"), cellName, limit, period);
 
 // ---- Queues --------------------------------------------------------------
 // A Queue is one runtime-supplied Durable Object. The producer binding writes

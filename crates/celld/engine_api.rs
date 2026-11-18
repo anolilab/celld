@@ -327,6 +327,86 @@ pub struct QueueBinding {
     pub delivery_delay: u32,
 }
 
+/// One Rate Limiting binding in a Worker environment: its `env` name, the
+/// namespace whose cell counts for it, and the `simple` limit and period.
+#[derive(Clone, Debug)]
+pub struct RateLimitBinding {
+    pub environment: String,
+    pub namespace: String,
+    pub limit: u32,
+    pub period: u32,
+}
+
+impl RateLimitBinding {
+    /// The manifest entry for this binding: the one place its shape is written.
+    pub fn to_manifest(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "ratelimit",
+            "name": self.environment,
+            "namespace_id": self.namespace,
+            "simple": { "limit": self.limit, "period": self.period },
+        })
+    }
+
+    /// Reads a manifest entry back, refusing one `to_manifest` could not have
+    /// written: a deploy writes only complete bindings, and a missing
+    /// `env.LIMITER` would otherwise surface when the Worker first calls it.
+    pub fn from_manifest(entry: &serde_json::Value) -> anyhow::Result<Self> {
+        // A manifest holds what `to_manifest` writes and nothing else, as a
+        // deploy refuses an unmodelled field.
+        if let Some(key) = entry.as_object().and_then(|object| {
+            object
+                .keys()
+                .find(|key| !matches!(key.as_str(), "type" | "name" | "namespace_id" | "simple"))
+        }) {
+            anyhow::bail!("the manifest has a ratelimit binding with an unknown field `{key}`");
+        }
+        let text = |field: &str| entry.get(field).and_then(serde_json::Value::as_str);
+        let simple = entry.get("simple");
+        if let Some(key) = simple
+            .and_then(serde_json::Value::as_object)
+            .and_then(|simple| {
+                simple
+                    .keys()
+                    .find(|key| !matches!(key.as_str(), "limit" | "period"))
+            })
+        {
+            anyhow::bail!(
+                "the manifest has a ratelimit binding whose `simple` has an unknown field `{key}`"
+            );
+        }
+        let number = |field: &str| {
+            simple
+                .and_then(|simple| simple.get(field))
+                .and_then(serde_json::Value::as_u64)
+        };
+        match (
+            text("name"),
+            text("namespace_id"),
+            number("limit").filter(|limit| celld_logic::ratelimit::valid_limit(*limit)),
+            number("period").filter(|period| celld_logic::ratelimit::valid_period(*period)),
+        ) {
+            (Some(name), Some(namespace), Some(limit), Some(period)) => {
+                // The names a deploy accepts, so a manifest cannot install a
+                // binding such as `__proto__` that `env` would not hold.
+                anyhow::ensure!(
+                    crate::deploy::valid_binding(name),
+                    "the manifest has an invalid ratelimit binding name: {name:?}"
+                );
+                crate::deploy::check_env_name(name)?;
+                Ok(Self {
+                    environment: name.to_string(),
+                    namespace: namespace.to_string(),
+                    // Both were validated against bounds that fit a `u32`.
+                    limit: u32::try_from(limit)?,
+                    period: u32::try_from(period)?,
+                })
+            }
+            _ => anyhow::bail!("the manifest has an invalid ratelimit binding: {entry}"),
+        }
+    }
+}
+
 /// The `version_metadata` binding of a deployment: the `env` name and the
 /// values it reports. They are fixed for the deployment, so the binding is one
 /// frozen object and costs nothing per request.
@@ -347,6 +427,7 @@ pub struct WorkerConfigOptions {
     pub d1_bindings: Vec<(String, String)>,
     pub kv_bindings: Vec<(String, String)>,
     pub queue_bindings: Vec<QueueBinding>,
+    pub ratelimit_bindings: Vec<RateLimitBinding>,
     pub queue_consumers: Vec<crate::protocol::QueueConsumerConfig>,
     pub workflow_bindings: Vec<WorkflowBinding>,
     pub vars: Vec<(String, String)>,
@@ -560,6 +641,10 @@ pub(crate) const KV_NAMESPACE_KEY: &str = "cells:v1:kv:__KvNamespace";
 /// scripts must derive the same cell id.
 pub(crate) const QUEUE_NAMESPACE_KEY: &str = "cells:v1:queue:__Queue";
 
+/// The fleet-wide namespace for rate limit cells. A namespace is a resource
+/// several Workers can bind, and they must reach one counter.
+pub(crate) const RATELIMIT_NAMESPACE_KEY: &str = "cells:v1:ratelimit:__RateLimit";
+
 /// A shared reserved class addresses one set of cells for the whole fleet; every
 /// other class, reserved or not, is scoped to the script that exports it.
 ///
@@ -573,6 +658,7 @@ fn shared_namespace_key(class_name: &str) -> Option<&'static str> {
         crate::deploy::D1_CLASS => Some(D1_NAMESPACE_KEY),
         crate::deploy::KV_CLASS => Some(KV_NAMESPACE_KEY),
         crate::deploy::QUEUE_CLASS => Some(QUEUE_NAMESPACE_KEY),
+        crate::deploy::RATELIMIT_CLASS => Some(RATELIMIT_NAMESPACE_KEY),
         _ => {
             debug_assert!(
                 !crate::deploy::is_shared_reserved_class(class_name),
@@ -590,38 +676,49 @@ pub(crate) fn namespace_key(script_name: &str, class_name: &str) -> String {
     }
 }
 
-/// The cell scope a D1 database lives at, for a caller outside any isolate.
-/// `celld d1` addresses a database over the operator route, which takes a
-/// scope, so this derives what `getByName` derives in the harness, from the
-/// same key and the same HMAC.
-pub fn d1_cell_scope(database_identity: &str) -> String {
-    let id = durable_object_id_for_name(D1_NAMESPACE_KEY, database_identity);
-    format!("{}:{}", crate::deploy::D1_CLASS, durable_object_id_hex(&id))
+/// The cell scope `name` has in a shared reserved `class`, for a caller outside
+/// any isolate: what `getByName` derives in the harness, from the same key, the
+/// same name, and the same HMAC. A name that is formatted differently here does
+/// not fail; it silently addresses a second, empty cell.
+fn shared_cell_scope(class: &str, name: &str) -> String {
+    let key = shared_namespace_key(class).expect("a shared reserved class has a namespace key");
+    format!(
+        "{class}:{}",
+        durable_object_id_hex(&durable_object_id_for_name(key, name))
+    )
 }
 
-/// The cell scope one shard of a KV namespace lives at, for a caller outside
-/// any isolate. `celld kv` addresses a namespace over the operator route, and
-/// this derives what `getByName` derives in the harness -- from the same key,
-/// the same name, and the same HMAC.
+/// The cell scope a D1 database lives at. `celld d1` addresses a database over
+/// the operator route, which takes a scope.
+pub fn d1_cell_scope(database_identity: &str) -> String {
+    shared_cell_scope(crate::deploy::D1_CLASS, database_identity)
+}
+
+/// The cell scope one shard of a KV namespace lives at. `celld kv` addresses a
+/// namespace over the operator route.
 ///
 /// The name comes from `celld_logic::kv::cell_name`, which is also what the
-/// binding is handed at `build_env`. Neither side formats it, because a
-/// formatting disagreement here does not fail: it silently addresses a second,
-/// empty namespace.
+/// binding is handed at `build_env`. Neither side formats it.
 pub fn kv_cell_scope(namespace_id: &str, shard: u32) -> String {
-    let name = celld_logic::kv::cell_name(namespace_id, shard);
-    let id = durable_object_id_for_name(KV_NAMESPACE_KEY, &name);
-    format!("{}:{}", crate::deploy::KV_CLASS, durable_object_id_hex(&id))
+    shared_cell_scope(
+        crate::deploy::KV_CLASS,
+        &celld_logic::kv::cell_name(namespace_id, shard),
+    )
+}
+
+/// The cell scope that counts for a rate limit namespace.
+pub fn ratelimit_cell_scope(namespace_id: &str) -> String {
+    shared_cell_scope(
+        crate::deploy::RATELIMIT_CLASS,
+        celld_logic::ratelimit::cell_name(namespace_id),
+    )
 }
 
 /// The Queue broker scope for callers outside a Worker isolate.
 pub fn queue_cell_scope(queue: &str) -> String {
-    let name = celld_logic::queue::cell_name(queue);
-    let id = durable_object_id_for_name(QUEUE_NAMESPACE_KEY, name);
-    format!(
-        "{}:{}",
+    shared_cell_scope(
         crate::deploy::QUEUE_CLASS,
-        durable_object_id_hex(&id)
+        celld_logic::queue::cell_name(queue),
     )
 }
 
@@ -912,4 +1009,45 @@ pub fn handler_budget() -> std::time::Duration {
                 .expect("validated CELLD_HANDLER_BUDGET_S"),
         )
     })
+}
+
+#[cfg(test)]
+mod ratelimit_binding_tests {
+    use super::RateLimitBinding;
+    use serde_json::json;
+
+    fn entry(name: &str) -> serde_json::Value {
+        json!({
+            "type": "ratelimit", "name": name, "namespace_id": "1",
+            "simple": { "limit": 5, "period": 60 }
+        })
+    }
+
+    #[test]
+    fn a_manifest_binding_needs_a_name_env_can_hold() {
+        assert_eq!(
+            RateLimitBinding::from_manifest(&entry("LIMITER"))
+                .unwrap()
+                .environment,
+            "LIMITER"
+        );
+        for name in ["__proto__", "bad name", "1st", ""] {
+            assert!(
+                RateLimitBinding::from_manifest(&entry(name)).is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_manifest_binding_refuses_fields_a_deploy_would() {
+        let mut extra = entry("LIMITER");
+        extra["burst"] = json!(3);
+        let error = RateLimitBinding::from_manifest(&extra).unwrap_err();
+        assert!(error.to_string().contains("`burst`"), "{error}");
+        let mut extra = entry("LIMITER");
+        extra["simple"]["burst"] = json!(3);
+        let error = RateLimitBinding::from_manifest(&extra).unwrap_err();
+        assert!(error.to_string().contains("`burst`"), "{error}");
+    }
 }

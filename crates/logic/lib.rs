@@ -28,6 +28,7 @@ mod output_gate;
 pub mod peer;
 pub mod pressure;
 pub mod queue;
+pub mod ratelimit;
 pub mod rebalance;
 pub mod restore;
 pub mod routing;

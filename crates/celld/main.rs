@@ -4116,6 +4116,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 d1_bindings,
                 kv_bindings,
                 queue_bindings,
+                ratelimit_bindings: Vec::new(),
                 queue_consumers: Vec::new(),
                 workflow_bindings,
                 vars: Vec::new(),

@@ -121,7 +121,11 @@ static HARNESS_SOURCE: v8::OneByteConst =
 
 /// The harness and the services it shares with the workerd engine, which
 /// each end in a function declaration the harness calls.
-const HARNESS: &str = concat!(include_str!("harness.js"), include_str!("services/kv.js"));
+const HARNESS: &str = concat!(
+    include_str!("harness.js"),
+    include_str!("services/kv.js"),
+    include_str!("services/ratelimit.js")
+);
 
 fn bootstrap_code_cache() -> &'static std::sync::Mutex<BootstrapCache> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<BootstrapCache>> =
@@ -503,6 +507,44 @@ pub(super) fn inject_kv_limits(scope: &mut v8::PinScope) -> Result<()> {
     Ok(())
 }
 
+/// `__cell.ratelimitLimits`: every bound `celld_logic::ratelimit` declares, as
+/// data, so the cell and the deploy-time validation cannot disagree. Built
+/// through the V8 object API, like `inject_kv_limits`, because it runs on every
+/// isolate load.
+pub(super) fn inject_ratelimit_limits(scope: &mut v8::PinScope) -> Result<()> {
+    use celld_logic::ratelimit::{
+        COUNTER_BUDGET_BYTES, COUNTER_OVERHEAD_BYTES, MAX_LIMIT, PERIODS,
+    };
+    let cell = cell_state(scope)?;
+    let limits = v8::Object::new(scope);
+    let periods: Vec<v8::Local<v8::Value>> = PERIODS
+        .iter()
+        .map(|period| v8::Number::new(scope, f64::from(*period)).into())
+        .collect();
+    let periods = v8::Array::new_with_elements(scope, &periods);
+    for (name, value) in [
+        ("periods", periods.into()),
+        (
+            "maxLimit",
+            v8::Number::new(scope, f64::from(MAX_LIMIT)).into(),
+        ),
+        (
+            "budgetBytes",
+            v8::Number::new(scope, COUNTER_BUDGET_BYTES as f64).into(),
+        ),
+        (
+            "overheadBytes",
+            v8::Number::new(scope, COUNTER_OVERHEAD_BYTES as f64).into(),
+        ),
+    ] {
+        let key = v8::String::new(scope, name).unwrap();
+        limits.set(scope, key.into(), value);
+    }
+    let key = v8::String::new(scope, "ratelimitLimits").unwrap();
+    cell.set(scope, key.into(), limits.into());
+    Ok(())
+}
+
 /// `globalThis.Cloudflare.compatibilityFlags`. Only flags Cells actually
 /// honours are listed; a flag Cells does not model is absent (falsy) rather
 /// than reported as enabled.
@@ -574,6 +616,7 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
     let d1_bindings = config.d1_bindings.as_slice();
     let kv_bindings = config.kv_bindings.as_slice();
     let queue_bindings = config.queue_bindings.as_slice();
+    let ratelimit_bindings = config.ratelimit_bindings.as_slice();
     let workflow_bindings = config.workflow_bindings.as_slice();
     let vars = config.vars.as_slice();
     let services = config.services.as_slice();
@@ -606,6 +649,15 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 binding,
                 id,
                 celld_logic::kv::cell_name(id, 0),
+            ));
+        }
+        for binding in ratelimit_bindings {
+            lines.push_str(&format!(
+                "e[{:?}] = __celld.__makeRateLimit({:?}, {}, {});\n",
+                binding.environment,
+                celld_logic::ratelimit::cell_name(&binding.namespace),
+                binding.limit,
+                binding.period,
             ));
         }
         for binding in queue_bindings {

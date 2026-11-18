@@ -19,9 +19,9 @@ use crate::protocol::{
     DeployPointer, Manifest, ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig,
     QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1,
     FEATURE_CONTAINER_IMAGES_V1, FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_KV_V1,
-    FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SECRETS_STORE_V1,
-    FEATURE_SQLITE_VEC_V1, FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
-    QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+    FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_RATELIMIT_V1,
+    FEATURE_SECRETS_STORE_V1, FEATURE_SQLITE_VEC_V1, FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1,
+    FEATURE_WORKFLOWS_V1, QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 
 mod node_imports;
 mod python;
+mod ratelimit;
 mod sourcemap;
 
 /// Config keys we understand. Anything else is an error: refusing is
@@ -57,6 +58,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "d1_databases",
     "kv_namespaces",
     "queues",
+    "ratelimits",
     "workflows",
     "r2_buckets",
     "worker_loaders",
@@ -90,8 +92,17 @@ pub const KV_CLASS: &str = celld_logic::kv::RESERVED_CLASS;
 /// The Durable Object class every Queue broker runs as.
 pub const QUEUE_CLASS: &str = celld_logic::queue::RESERVED_CLASS;
 
+/// The Durable Object class every Rate Limiting namespace runs as.
+pub const RATELIMIT_CLASS: &str = celld_logic::ratelimit::RESERVED_CLASS;
+
 /// Every runtime-supplied Durable Object class.
-pub const RESERVED_CLASSES: &[&str] = &[D1_CLASS, WORKFLOW_CLASS, KV_CLASS, QUEUE_CLASS];
+pub const RESERVED_CLASSES: &[&str] = &[
+    D1_CLASS,
+    WORKFLOW_CLASS,
+    KV_CLASS,
+    QUEUE_CLASS,
+    RATELIMIT_CLASS,
+];
 
 /// The Durable Object class a script's workflow instances run as.
 ///
@@ -126,7 +137,7 @@ pub fn workflow_class(script_name: &str) -> String {
 /// both is correct rather than merely tolerated. A workflow class carries its
 /// script, so it is never shared and a collision there is a real one.
 pub fn is_shared_reserved_class(class: &str) -> bool {
-    class == D1_CLASS || class == KV_CLASS || class == QUEUE_CLASS
+    class == D1_CLASS || class == KV_CLASS || class == QUEUE_CLASS || class == RATELIMIT_CLASS
 }
 
 /// Whether a class name is a script-scoped workflow class.
@@ -336,6 +347,7 @@ struct Project {
     has_kv: bool,
     queue_consumers: Vec<QueueConsumerConfig>,
     has_queues: bool,
+    has_ratelimits: bool,
     has_r2: bool,
     containers: Vec<ContainerDecl>,
     /// Set when `main` is a `.py` file: the Python behavior its
@@ -560,6 +572,10 @@ impl Built {
                     Some("kv") => {
                         let id = binding.get("id").and_then(Value::as_str)?;
                         Some((format!("env.{name} (KV)"), id.to_string()))
+                    }
+                    Some("ratelimit") => {
+                        let namespace = binding.get("namespace_id").and_then(Value::as_str)?;
+                        Some((format!("env.{name} (Rate Limit)"), namespace.to_string()))
                     }
                     Some("queue") => {
                         let queue = binding.get("queue").and_then(Value::as_str)?;
@@ -819,6 +835,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if project.has_queues {
                 features.push(FEATURE_QUEUES_V1.to_string());
+            }
+            if project.has_ratelimits {
+                features.push(FEATURE_RATELIMIT_V1.to_string());
             }
             if project.has_r2 {
                 features.push(FEATURE_R2_V1.to_string());
@@ -2122,6 +2141,14 @@ fn read_project(
         do_classes.push(QUEUE_CLASS.to_string());
         sqlite_classes.push(QUEUE_CLASS.to_string());
     }
+    let ratelimits = ratelimit::read_ratelimits(object.get("ratelimits"))?;
+    bindings.extend(ratelimits.iter().cloned());
+    if !ratelimits.is_empty() {
+        // A namespace is a cell of a runtime-supplied class, like KV's, and
+        // stays out of `ctx.exports`.
+        do_classes.push(RATELIMIT_CLASS.to_string());
+        sqlite_classes.push(RATELIMIT_CLASS.to_string());
+    }
     let workflows = match object.get("workflows") {
         None => &[][..],
         Some(Value::Array(workflows)) => workflows.as_slice(),
@@ -2521,6 +2548,7 @@ fn read_project(
         has_workflows: !workflows.is_empty(),
         has_kv: !kv_namespaces.is_empty(),
         has_queues: !queue_producers.is_empty() || !queue_consumers.is_empty(),
+        has_ratelimits: !ratelimits.is_empty(),
         queue_consumers,
         has_r2: !r2_buckets.is_empty(),
         containers,
