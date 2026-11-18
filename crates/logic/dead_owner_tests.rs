@@ -47,6 +47,7 @@ fn peer(node: &str, expires_ms: u64) -> CapacityPeer {
         paced_handoff: true,
         rebalance_paused: false,
         draining: false,
+        ingress_only: false,
     }
 }
 

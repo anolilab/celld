@@ -162,6 +162,7 @@ impl NodeLeaseWire {
             paced_handoff: self.paced_handoff,
             rebalance_paused: self.load.rebalance_paused.unwrap_or(false),
             draining: self.load.draining.unwrap_or(false),
+            ingress_only: self.load.ingress_only.unwrap_or(false),
         }
     }
 }
@@ -304,6 +305,11 @@ pub struct NodeLoadWire {
     /// The node is draining. `None` from a node that predates the field.
     #[serde(default)]
     pub draining: Option<bool>,
+    /// The node hosts no cells (`max_resident = 0`), so no peer hands it
+    /// one. `None` from a node that predates the field, which reads as a
+    /// node that hosts cells.
+    #[serde(default)]
+    pub ingress_only: Option<bool>,
     /// The running containers this node holds, per class. Peers sum this
     /// across the fleet sample to enforce a class's `max_instances`. Absent
     /// from a node with no running container, and from one that predates the
@@ -510,6 +516,8 @@ pub struct LiveLoad {
     /// Set for the rest of the process once a drain begins, so a peer never
     /// hands a cell to a node that is giving its own away.
     pub draining: AtomicBool,
+    /// Set once from the configured residency; the node hosts no cells.
+    pub ingress_only: AtomicBool,
 }
 
 impl LiveLoad {
@@ -1314,6 +1322,7 @@ pub(crate) fn process_load(live: &LiveLoad) -> NodeLoadWire {
         restoring: live.restoring.load(Ordering::Relaxed),
         rebalance_paused: Some(live.rebalance_paused.load(Ordering::Relaxed)),
         draining: Some(live.draining.load(Ordering::Relaxed)),
+        ingress_only: Some(live.ingress_only.load(Ordering::Relaxed)),
         // Published each renewal, so a peer sees a start or stop within a
         // renewal and a sample refresh. Empty on a node with no engine.
         container_instances: crate::container::running_instances_by_class(),

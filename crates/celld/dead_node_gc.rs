@@ -94,11 +94,13 @@ impl DeadNodeGc {
         &mut self,
         bucket: &Bucket,
         node: &str,
+        hosts_cells: bool,
         tick_ms: u64,
     ) -> Option<BTreeSet<String>> {
         crate::wake::while_holding_waker(
             bucket,
             node,
+            hosts_cells,
             tick_ms,
             "dead-node GC",
             self.run_pass(bucket, tick_ms),

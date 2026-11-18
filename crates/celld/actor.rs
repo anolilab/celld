@@ -2394,6 +2394,9 @@ impl Actor {
         live_load
             .placement_weight
             .store(limits.placement_weight.max(1), Ordering::Relaxed);
+        live_load
+            .ingress_only
+            .store(limits.resident == 0, Ordering::Relaxed);
         if matches!(&ownership, Ownership::Bucket(_)) {
             crate::ownership_store::set_node_load(live_load.clone());
         }
@@ -4487,3 +4490,7 @@ mod resume_fallback_tests;
 #[cfg(test)]
 #[path = "actor/lost_record_claim_tests.rs"]
 mod lost_record_claim_tests;
+
+#[cfg(test)]
+#[path = "actor/ingress_handoff_tests.rs"]
+mod ingress_handoff_tests;
