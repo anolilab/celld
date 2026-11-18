@@ -582,7 +582,7 @@ impl Built {
                         let namespace = binding.get("namespace_id").and_then(Value::as_str)?;
                         Some((format!("env.{name} (Rate Limit)"), namespace.to_string()))
                     }
-                    Some("send_email") => Some((
+                    Some(crate::email::BINDING_TYPE) => Some((
                         format!("env.{name} (Send Email)"),
                         "SMTP relay of the node".to_string(),
                     )),
@@ -797,7 +797,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         has_binding_type(&project.metadata, crate::secrets::STORE_BINDING_TYPE);
     let uses_hyperdrive = has_binding_type(&project.metadata, crate::hyperdrive::BINDING_TYPE);
     let uses_ai = has_binding_type(&project.metadata, "ai");
-    let uses_send_email = has_binding_type(&project.metadata, "send_email");
+    let uses_send_email = has_binding_type(&project.metadata, crate::email::BINDING_TYPE);
     let manifest = Manifest {
         schema_version: if asset_reference.is_some() { 2 } else { 1 },
         version: version.clone(),

@@ -33,10 +33,9 @@
 //! `DATA`, `QUIT`. A server's reply text is never passed on, because a server
 //! may echo what it was sent; a failure carries the stage and the reply code.
 
-use anyhow::{anyhow, bail};
+use crate::email::EmailError;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::{
@@ -44,21 +43,14 @@ use tokio::io::{
 };
 use zeroize::Zeroizing;
 
-pub const HOST: &str = "CELLD_SMTP_HOST";
-pub const PORT: &str = "CELLD_SMTP_PORT";
-pub const TLS: &str = "CELLD_SMTP_TLS";
-pub const USERNAME: &str = "CELLD_SMTP_USERNAME";
-pub const PASSWORD: &str = "CELLD_SMTP_PASSWORD";
-pub const PASSWORD_FILE: &str = "CELLD_SMTP_PASSWORD_FILE";
-pub const HELO_NAME: &str = "CELLD_SMTP_HELO_NAME";
+mod settings;
 
-/// How a password file that other users can read is reported.
-const SHARED_FILE: crate::credential_file::SharedWarning = crate::credential_file::SharedWarning {
-    event: "smtp_password_file_shared",
-    subject: "SMTP password file",
+pub use settings::{
+    settings, validate, Settings, TlsMode, HELO_NAME, HOST, PASSWORD, PASSWORD_FILE, PORT, TLS,
+    USERNAME,
 };
-const PASSWORD_FILE_MAX_BYTES: u64 = 1024;
-const MAX_CREDENTIAL_BYTES: usize = 255;
+
+use settings::Credentials;
 
 /// How long one connection attempt may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -74,244 +66,25 @@ const MAX_REPLY_LINES: usize = 100;
 /// unbounded number of connections to the relay.
 const MAX_CONCURRENT: usize = 16;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TlsMode {
-    /// Connect in the clear, then upgrade with `STARTTLS`.
-    StartTls,
-    /// TLS from the first byte.
-    Tls,
-    /// No TLS at all. The operator chose it by name.
-    Off,
-}
-
-impl TlsMode {
-    fn default_port(self) -> u16 {
-        match self {
-            Self::StartTls => 587,
-            Self::Tls => 465,
-            Self::Off => 25,
-        }
-    }
-}
-
-/// The relay's settings, with the password in hand.
-pub struct Settings {
-    host: String,
-    port: u16,
-    tls: TlsMode,
-    helo: String,
-    credentials: Option<Credentials>,
-}
-
-struct Credentials {
-    username: String,
-    password: Zeroizing<String>,
-}
-
-// The password never appears in `Debug`, so a log of the settings cannot leak it.
-impl std::fmt::Debug for Settings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Settings")
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("tls", &self.tls)
-            .field("helo", &self.helo)
-            .field(
-                "credentials",
-                &self
-                    .credentials
-                    .as_ref()
-                    .map(|c| format!("{} / <redacted>", c.username)),
-            )
-            .finish()
-    }
-}
-
-impl Settings {
-    pub fn host(&self) -> &str {
-        &self.host
-    }
-
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-
-    pub fn tls(&self) -> TlsMode {
-        self.tls
-    }
-}
-
-fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 253
-        && name.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        })
-}
-
-fn parse_host(variable: &str, text: &str) -> anyhow::Result<String> {
-    let bare = text.trim_start_matches('[').trim_end_matches(']');
-    anyhow::ensure!(
-        bare.parse::<IpAddr>().is_ok() || valid_name(bare),
-        "{variable} is not a host name or an IP address"
-    );
-    Ok(bare.to_string())
-}
-
-fn credential_text(variable: &str, text: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !text.is_empty()
-            && text.len() <= MAX_CREDENTIAL_BYTES
-            && !text.contains(['\r', '\n', '\0']),
-        "{variable} must be 1 to {MAX_CREDENTIAL_BYTES} bytes without a line break"
-    );
-    Ok(())
-}
-
-/// The settings in `get`, checked, with the password read. Nothing here caches
-/// or logs, so startup can call it before logging exists. A variable that is
-/// set while `CELLD_SMTP_HOST` is not is an error, since it would otherwise be
-/// ignored without a word.
-fn parse(get: &dyn Fn(&str) -> anyhow::Result<Option<String>>) -> anyhow::Result<Option<Settings>> {
-    let set = |name: &str| -> anyhow::Result<Option<String>> {
-        Ok(get(name)?.filter(|value| !value.trim().is_empty()))
-    };
-    let Some(host) = set(HOST)? else {
-        for name in [PORT, TLS, USERNAME, PASSWORD, PASSWORD_FILE, HELO_NAME] {
-            if set(name)?.is_some() {
-                bail!("{name} is set but {HOST} is not");
-            }
-        }
-        return Ok(None);
-    };
-    let host = parse_host(HOST, host.trim())?;
-    let tls = match set(TLS)?.as_deref().map(str::trim) {
-        None | Some("starttls") => TlsMode::StartTls,
-        Some("tls") => TlsMode::Tls,
-        Some("off") => TlsMode::Off,
-        Some(other) => bail!("{TLS} must be starttls, tls or off, not {other:?}"),
-    };
-    let port = match set(PORT)? {
-        None => tls.default_port(),
-        Some(text) => text
-            .trim()
-            .parse::<u16>()
-            .ok()
-            .filter(|port| *port != 0)
-            .ok_or_else(|| anyhow!("{PORT} must be a port number from 1 to 65535"))?,
-    };
-    let helo = match set(HELO_NAME)? {
-        None => "localhost".to_string(),
-        Some(text) => {
-            let name = parse_host(HELO_NAME, text.trim())?;
-            // An address literal is written in brackets in `EHLO`.
-            match name.parse::<IpAddr>() {
-                Ok(IpAddr::V6(_)) => format!("[IPv6:{name}]"),
-                Ok(IpAddr::V4(_)) => format!("[{name}]"),
-                Err(_) => name,
-            }
-        }
-    };
-    let username = set(USERNAME)?;
-    let password = crate::credential_file::choose(
-        (PASSWORD, get(PASSWORD)?),
-        (PASSWORD_FILE, get(PASSWORD_FILE)?),
-        PASSWORD_FILE_MAX_BYTES,
-        &SHARED_FILE,
-    )?;
-    let credentials = match (username, password) {
-        (None, None) => None,
-        (Some(username), Some(password)) => {
-            credential_text(USERNAME, &username)?;
-            // A file ends in a line end that its editor wrote; a variable is
-            // taken as it is, so one with a line break is refused.
-            let text = if password.origin == PASSWORD {
-                password.text.as_str()
-            } else {
-                password.text.trim_end_matches(['\r', '\n'])
-            };
-            credential_text(&password.origin, text)?;
-            Some(Credentials {
-                username,
-                password: Zeroizing::new(text.to_string()),
-            })
-        }
-        (Some(_), None) => bail!("{USERNAME} is set without {PASSWORD} or {PASSWORD_FILE}"),
-        (None, Some(_)) => bail!("{PASSWORD} or {PASSWORD_FILE} is set without {USERNAME}"),
-    };
-    Ok(Some(Settings {
-        host,
-        port,
-        tls,
-        helo,
-        credentials,
-    }))
-}
-
-/// Check the node's SMTP settings, for startup. The log is not set up yet, so a
-/// warning about the password file goes nowhere; the first real `settings` call
-/// repeats it.
-pub fn validate() -> anyhow::Result<()> {
-    parse(&|name| crate::env_vars::value(name)).map(|_| ())
-}
-
-/// The node's relay, or `None` when `CELLD_SMTP_HOST` is unset. The result,
-/// the password file's text included, is kept for the process.
-pub fn settings() -> Result<Option<&'static Settings>, &'static str> {
-    static SETTINGS: OnceLock<Result<Option<Settings>, String>> = OnceLock::new();
-    SETTINGS
-        .get_or_init(|| {
-            load().map_err(|error| {
-                // Once, so the operator can read the cause: it names a
-                // variable or a path, never a value.
-                let cause = format!("{error:#}");
-                tracing::error!(event = "smtp_settings_invalid", error = %cause);
-                cause
-            })
-        })
-        .as_ref()
-        .map(Option::as_ref)
-        .map_err(String::as_str)
-}
-
-fn load() -> anyhow::Result<Option<Settings>> {
-    parse(&|name| crate::env_vars::value(name))
-}
-
 // ---- The client ------------------------------------------------------------
 
-/// Why a transaction failed, as a Worker may read it.
-#[derive(Debug, PartialEq, Eq)]
-pub struct SendError {
-    pub code: &'static str,
-    pub message: String,
+fn failed(stage: &str, detail: impl std::fmt::Display) -> EmailError {
+    EmailError::new(
+        "E_DELIVERY_FAILED",
+        format!("the SMTP transaction failed at {stage}: {detail}"),
+    )
 }
 
-impl SendError {
-    fn failed(stage: &str, detail: impl std::fmt::Display) -> Self {
-        Self {
-            code: "E_DELIVERY_FAILED",
-            message: format!("the SMTP transaction failed at {stage}: {detail}"),
-        }
-    }
-
-    fn refused(stage: &str, reply: &Reply) -> Self {
-        let code = if reply.code == 552 {
-            "E_CONTENT_TOO_LARGE"
-        } else {
-            "E_DELIVERY_FAILED"
-        };
-        Self {
-            code,
-            message: format!("the SMTP server answered {} at {stage}", reply.code),
-        }
-    }
+fn refused(stage: &str, reply: &Reply) -> EmailError {
+    let code = if reply.code == 552 {
+        "E_CONTENT_TOO_LARGE"
+    } else {
+        "E_DELIVERY_FAILED"
+    };
+    EmailError::new(
+        code,
+        format!("the SMTP server answered {} at {stage}", reply.code),
+    )
 }
 
 trait Duplex: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -335,38 +108,32 @@ impl Connection {
         }
     }
 
-    async fn send(&mut self, stage: &str, bytes: &[u8]) -> Result<(), SendError> {
+    async fn send(&mut self, stage: &str, bytes: &[u8]) -> Result<(), EmailError> {
         let write = async {
             self.stream.get_mut().write_all(bytes).await?;
             self.stream.get_mut().flush().await
         };
         match crate::asyncrt::timeout(REPLY_TIMEOUT, write).await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(SendError::failed(
-                stage,
-                format!("write failed ({})", error.kind()),
-            )),
-            Err(_) => Err(SendError::failed(stage, "write timed out")),
+            Ok(Err(error)) => Err(failed(stage, format!("write failed ({})", error.kind()))),
+            Err(_) => Err(failed(stage, "write timed out")),
         }
     }
 
-    async fn command(&mut self, stage: &str, line: &str) -> Result<Reply, SendError> {
+    async fn command(&mut self, stage: &str, line: &str) -> Result<Reply, EmailError> {
         debug_assert!(!line.contains(['\r', '\n']));
         self.send(stage, format!("{line}\r\n").as_bytes()).await?;
         self.reply(stage).await
     }
 
-    async fn reply(&mut self, stage: &str) -> Result<Reply, SendError> {
+    async fn reply(&mut self, stage: &str) -> Result<Reply, EmailError> {
         match crate::asyncrt::timeout(REPLY_TIMEOUT, self.read_reply(stage)).await {
             Ok(reply) => reply,
-            Err(_) => Err(SendError::failed(
-                stage,
-                "the server did not answer in time",
-            )),
+            Err(_) => Err(failed(stage, "the server did not answer in time")),
         }
     }
 
-    async fn read_reply(&mut self, stage: &str) -> Result<Reply, SendError> {
+    async fn read_reply(&mut self, stage: &str) -> Result<Reply, EmailError> {
         let mut lines = Vec::new();
         loop {
             let mut line = Vec::new();
@@ -374,19 +141,14 @@ impl Connection {
                 .take(MAX_REPLY_LINE)
                 .read_until(b'\n', &mut line)
                 .await
-                .map_err(|error| {
-                    SendError::failed(stage, format!("read failed ({})", error.kind()))
-                })?;
+                .map_err(|error| failed(stage, format!("read failed ({})", error.kind())))?;
             if read == 0 {
-                return Err(SendError::failed(stage, "the server closed the connection"));
+                return Err(failed(stage, "the server closed the connection"));
             }
             if !line.ends_with(b"\n") {
-                return Err(SendError::failed(
-                    stage,
-                    "the server sent an overlong reply line",
-                ));
+                return Err(failed(stage, "the server sent an overlong reply line"));
             }
-            let malformed = || SendError::failed(stage, "the server sent a malformed reply");
+            let malformed = || failed(stage, "the server sent a malformed reply");
             // The code is read from bytes: the line is the server's, and a
             // multi-byte character in its first three bytes is not a code.
             let text = line.strip_suffix(b"\n").unwrap_or(&line);
@@ -407,7 +169,7 @@ impl Connection {
             let body = String::from_utf8_lossy(body);
             lines.push(body.to_ascii_uppercase());
             if lines.len() > MAX_REPLY_LINES {
-                return Err(SendError::failed(stage, "the server sent too long a reply"));
+                return Err(failed(stage, "the server sent too long a reply"));
             }
             if !more {
                 return Ok(Reply { code, lines });
@@ -421,9 +183,9 @@ impl Connection {
         self,
         host: &str,
         connector: &tokio_rustls::TlsConnector,
-    ) -> Result<Self, SendError> {
+    ) -> Result<Self, EmailError> {
         if !self.stream.buffer().is_empty() {
-            return Err(SendError::failed(
+            return Err(failed(
                 "starttls",
                 "the server sent data before the TLS handshake",
             ));
@@ -437,26 +199,26 @@ async fn handshake(
     stream: Box<dyn Duplex>,
     host: &str,
     connector: &tokio_rustls::TlsConnector,
-) -> Result<Box<dyn Duplex>, SendError> {
+) -> Result<Box<dyn Duplex>, EmailError> {
     let name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .map_err(|_| SendError::failed("tls", "the relay's name is not valid for TLS"))?;
+        .map_err(|_| failed("tls", "the relay's name is not valid for TLS"))?;
     let tls = connector.connect(name, stream);
     match crate::asyncrt::timeout(REPLY_TIMEOUT, tls).await {
         Ok(Ok(stream)) => Ok(Box::new(stream)),
-        Ok(Err(_)) => Err(SendError::failed(
+        Ok(Err(_)) => Err(failed(
             "tls",
             "the TLS handshake failed or the relay's certificate was not accepted",
         )),
-        Err(_) => Err(SendError::failed("tls", "the TLS handshake timed out")),
+        Err(_) => Err(failed("tls", "the TLS handshake timed out")),
     }
 }
 
 /// Connect to `host:port` on the addresses the egress policy for this binding
 /// allows, and to nothing else.
-async fn dial(host: &str, port: u16) -> Result<tokio::net::TcpStream, SendError> {
+async fn dial(host: &str, port: u16) -> Result<tokio::net::TcpStream, EmailError> {
     let addresses = crate::egress_filter::smtp_addresses(host, port)
         .await
-        .map_err(|refused| SendError::failed("connect", refused))?;
+        .map_err(|refused| failed("connect", refused))?;
     match crate::asyncrt::timeout(
         CONNECT_TIMEOUT,
         tokio::net::TcpStream::connect(&addresses[..]),
@@ -464,14 +226,11 @@ async fn dial(host: &str, port: u16) -> Result<tokio::net::TcpStream, SendError>
     .await
     {
         Ok(Ok(stream)) => Ok(stream),
-        Ok(Err(error)) => Err(SendError::failed(
+        Ok(Err(error)) => Err(failed(
             "connect",
             format!("could not connect to the relay ({})", error.kind()),
         )),
-        Err(_) => Err(SendError::failed(
-            "connect",
-            "the connection to the relay timed out",
-        )),
+        Err(_) => Err(failed("connect", "the connection to the relay timed out")),
     }
 }
 
@@ -505,7 +264,7 @@ pub async fn deliver(
     from: &str,
     recipients: &[String],
     data: &[u8],
-) -> Result<(), SendError> {
+) -> Result<(), EmailError> {
     deliver_with(
         settings,
         &crate::tls_roots::bundled_connector(),
@@ -524,18 +283,13 @@ async fn deliver_with(
     from: &str,
     recipients: &[String],
     data: &[u8],
-) -> Result<(), SendError> {
+) -> Result<(), EmailError> {
     // A send that finds every slot taken waits a bounded time, so a burst
     // cannot leave messages queued for good.
     let _permit = match crate::asyncrt::timeout(REPLY_TIMEOUT, semaphore().acquire()).await {
         Ok(Ok(permit)) => permit,
-        Ok(Err(_)) => return Err(SendError::failed("connect", "the node is shutting down")),
-        Err(_) => {
-            return Err(SendError::failed(
-                "connect",
-                "the node is sending too many messages",
-            ))
-        }
+        Ok(Err(_)) => return Err(failed("connect", "the node is shutting down")),
+        Err(_) => return Err(failed("connect", "the node is sending too many messages")),
     };
     match crate::asyncrt::timeout(
         TRANSACTION_TIMEOUT,
@@ -544,10 +298,7 @@ async fn deliver_with(
     .await
     {
         Ok(result) => result,
-        Err(_) => Err(SendError::failed(
-            "transaction",
-            "it did not finish in time",
-        )),
+        Err(_) => Err(failed("transaction", "it did not finish in time")),
     }
 }
 
@@ -557,7 +308,7 @@ async fn transaction(
     from: &str,
     recipients: &[String],
     data: &[u8],
-) -> Result<(), SendError> {
+) -> Result<(), EmailError> {
     let tcp = dial(&settings.host, settings.port).await?;
     let mut connection = Connection::new(Box::new(tcp));
     if settings.tls == TlsMode::Tls {
@@ -566,13 +317,13 @@ async fn transaction(
     }
     let greeting = connection.reply("greeting").await?;
     if greeting.code != 220 {
-        return Err(SendError::refused("greeting", &greeting));
+        return Err(refused("greeting", &greeting));
     }
     let ehlo = format!("EHLO {}", settings.helo);
     let mut capabilities = expect(&mut connection, "ehlo", &ehlo, &[250]).await?;
     if settings.tls == TlsMode::StartTls {
         if !has_extension(&capabilities, "STARTTLS") {
-            return Err(SendError::failed(
+            return Err(failed(
                 "starttls",
                 "the relay does not offer STARTTLS, and CELLD_SMTP_TLS requires TLS",
             ));
@@ -587,10 +338,10 @@ async fn transaction(
     }
     let size = extension_value(&capabilities, "SIZE").and_then(|value| value.parse::<usize>().ok());
     if size.is_some_and(|limit| limit != 0 && data.len() > limit) {
-        return Err(SendError {
-            code: "E_CONTENT_TOO_LARGE",
-            message: "the message is larger than the relay accepts".to_string(),
-        });
+        return Err(EmailError::new(
+            "E_CONTENT_TOO_LARGE",
+            "the message is larger than the relay accepts",
+        ));
     }
     let mail = match size {
         Some(_) => format!("MAIL FROM:<{from}> SIZE={}", data.len()),
@@ -610,7 +361,7 @@ async fn transaction(
     connection.send("body", &dot_stuff(data)).await?;
     let accepted = connection.reply("body").await?;
     if accepted.code != 250 {
-        return Err(SendError::refused("body", &accepted));
+        return Err(refused("body", &accepted));
     }
     // The message is the relay's now; whether it says goodbye is of no matter.
     let _ = connection.command("quit", "QUIT").await;
@@ -623,12 +374,12 @@ async fn expect(
     stage: &str,
     line: &str,
     codes: &[u16],
-) -> Result<Reply, SendError> {
+) -> Result<Reply, EmailError> {
     let reply = connection.command(stage, line).await?;
     if codes.contains(&reply.code) {
         Ok(reply)
     } else {
-        Err(SendError::refused(stage, &reply))
+        Err(refused(stage, &reply))
     }
 }
 
@@ -654,7 +405,7 @@ async fn authenticate(
     connection: &mut Connection,
     capabilities: &Reply,
     credentials: &Credentials,
-) -> Result<(), SendError> {
+) -> Result<(), EmailError> {
     let mechanisms: Vec<&str> = capabilities
         .lines
         .iter()
@@ -691,7 +442,7 @@ async fn authenticate(
         )
         .await?;
     } else {
-        return Err(SendError::failed(
+        return Err(failed(
             "auth",
             "the relay offers neither AUTH PLAIN nor AUTH LOGIN",
         ));
@@ -700,165 +451,23 @@ async fn authenticate(
 }
 
 /// The node's relay, or the error a Worker reads when there is none.
-pub fn relay() -> Result<&'static Settings, SendError> {
+pub fn relay() -> Result<&'static Settings, EmailError> {
     match settings() {
         Ok(Some(relay)) => Ok(relay),
-        Ok(None) => Err(SendError {
-            code: "E_INTERNAL_SERVER_ERROR",
-            message: format!("this node has no SMTP relay configured ({HOST})"),
-        }),
-        Err(_) => Err(SendError {
-            code: "E_INTERNAL_SERVER_ERROR",
-            message: "this node's SMTP relay settings are invalid".to_string(),
-        }),
+        Ok(None) => Err(EmailError::new(
+            "E_INTERNAL_SERVER_ERROR",
+            format!("this node has no SMTP relay configured ({HOST})"),
+        )),
+        Err(_) => Err(EmailError::new(
+            "E_INTERNAL_SERVER_ERROR",
+            "this node's SMTP relay settings are invalid",
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-
-    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    fn parsed(pairs: &[(&str, &str)]) -> anyhow::Result<Option<Settings>> {
-        let map = env(pairs);
-        parse(&|name| Ok(map.get(name).cloned()))
-    }
-
-    fn refusal(pairs: &[(&str, &str)]) -> String {
-        format!("{:#}", parsed(pairs).expect_err("the settings are refused"))
-    }
-
-    #[test]
-    fn no_host_means_no_relay_and_a_stray_setting_is_refused() {
-        assert!(parsed(&[]).unwrap().is_none());
-        assert!(parsed(&[(HOST, "  ")]).unwrap().is_none());
-        for name in [PORT, TLS, USERNAME, PASSWORD, PASSWORD_FILE, HELO_NAME] {
-            let error = refusal(&[(name, "x")]);
-            assert!(error.contains(name) && error.contains(HOST), "{error}");
-        }
-    }
-
-    #[test]
-    fn tls_is_starttls_unless_the_operator_says_otherwise() {
-        let relay = parsed(&[(HOST, "mail.example.com")]).unwrap().unwrap();
-        assert_eq!(
-            (relay.tls, relay.port, relay.helo.as_str()),
-            (TlsMode::StartTls, 587, "localhost")
-        );
-        for (mode, tls, port) in [
-            ("tls", TlsMode::Tls, 465),
-            ("off", TlsMode::Off, 25),
-            ("starttls", TlsMode::StartTls, 587),
-        ] {
-            let relay = parsed(&[(HOST, "mail.example.com"), (TLS, mode)])
-                .unwrap()
-                .unwrap();
-            assert_eq!((relay.tls, relay.port), (tls, port), "{mode}");
-        }
-        let relay = parsed(&[(HOST, "127.0.0.1"), (PORT, "2525"), (TLS, "off")])
-            .unwrap()
-            .unwrap();
-        assert_eq!(relay.port, 2525);
-        for bad in ["TLS", "plain", "true", "no"] {
-            assert!(refusal(&[(HOST, "h"), (TLS, bad)]).contains(TLS), "{bad}");
-        }
-    }
-
-    #[test]
-    fn host_port_and_helo_are_validated() {
-        for bad in [
-            "bad host",
-            "a/b",
-            "mail.example.com:25",
-            "-x",
-            "a..b",
-            "héllo.com",
-        ] {
-            assert!(refusal(&[(HOST, bad)]).contains(HOST), "{bad}");
-        }
-        for bad in ["0", "65536", "smtp", "-1", "25 26"] {
-            assert!(refusal(&[(HOST, "h"), (PORT, bad)]).contains(PORT), "{bad}");
-        }
-        let relay = parsed(&[(HOST, "[::1]"), (HELO_NAME, "10.0.0.1")])
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            (relay.host.as_str(), relay.helo.as_str()),
-            ("::1", "[10.0.0.1]")
-        );
-        assert!(refusal(&[(HOST, "h"), (HELO_NAME, "a b")]).contains(HELO_NAME));
-    }
-
-    #[test]
-    fn credentials_need_both_halves_and_one_password_source() {
-        assert!(refusal(&[(HOST, "h"), (USERNAME, "u")]).contains("without"));
-        assert!(refusal(&[(HOST, "h"), (PASSWORD, "p")]).contains("without"));
-        let both = refusal(&[
-            (HOST, "h"),
-            (USERNAME, "u"),
-            (PASSWORD, "p"),
-            (PASSWORD_FILE, "/x"),
-        ]);
-        assert!(
-            both.contains(PASSWORD) && both.contains(PASSWORD_FILE),
-            "{both}"
-        );
-        for bad in ["a\nb", "a\r", &"x".repeat(256)] {
-            assert!(refusal(&[(HOST, "h"), (USERNAME, bad), (PASSWORD, "p")]).contains(USERNAME));
-            assert!(refusal(&[(HOST, "h"), (USERNAME, "u"), (PASSWORD, bad)]).contains(PASSWORD));
-        }
-        let ok = parsed(&[(HOST, "h"), (USERNAME, "u"), (PASSWORD, "p")])
-            .unwrap()
-            .unwrap();
-        assert!(ok.credentials.is_some());
-        // A password file is read with the settings, and a line end is dropped.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pw");
-        #[allow(clippy::disallowed_methods)] // The test writes a credential file.
-        std::fs::write(&path, "from-file\r\n").unwrap();
-        let file = parsed(&[
-            (HOST, "h"),
-            (USERNAME, "u"),
-            (PASSWORD_FILE, path.to_str().unwrap()),
-        ])
-        .unwrap()
-        .unwrap();
-        assert_eq!(file.credentials.unwrap().password.as_str(), "from-file");
-        let missing = refusal(&[
-            (HOST, "h"),
-            (USERNAME, "u"),
-            (PASSWORD_FILE, "/nonexistent/pw"),
-        ]);
-        assert!(missing.contains(PASSWORD_FILE), "{missing}");
-    }
-
-    #[test]
-    fn the_password_is_absent_from_debug_output_and_errors() {
-        let relay = Settings {
-            host: "h".into(),
-            port: 25,
-            tls: TlsMode::Off,
-            helo: "localhost".into(),
-            credentials: Some(Credentials {
-                username: "user".into(),
-                password: Zeroizing::new("hunter2-secret".into()),
-            }),
-        };
-        let debug = format!("{relay:?}");
-        assert!(
-            !debug.contains("hunter2-secret") && debug.contains("<redacted>"),
-            "{debug}"
-        );
-        let error = refusal(&[(HOST, "h"), (USERNAME, "u"), (PASSWORD, "hunter2-secret\n")]);
-        assert!(!error.contains("hunter2-secret"), "{error}");
-    }
 
     #[tokio::test]
     async fn a_reply_with_a_multibyte_character_in_its_code_is_malformed_not_a_panic() {

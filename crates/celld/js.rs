@@ -1867,19 +1867,9 @@ impl WorkerConfig {
             src: RUNTIME_CELL_ENTRY.to_string(),
             script_name: RUNTIME_CELL_SCRIPT.to_string(),
             do_classes: classes,
-            bindings: Vec::new(),
-            r2_bindings: Vec::new(),
-            d1_bindings: Vec::new(),
-            kv_bindings: Vec::new(),
-            queue_bindings: Vec::new(),
-            ratelimit_bindings: Vec::new(),
-            send_email_bindings: Vec::new(),
-            queue_consumers: Vec::new(),
-            workflow_bindings: Vec::new(),
-            vars: Vec::new(),
             node: primary.node.clone(),
-            modules: Vec::new(),
             compat: primary.compat,
+            ..Default::default()
         })
         .with_queue_consumers(queue_catalog)
         .with_generation(generation)
@@ -7626,22 +7616,12 @@ fn op_loader_load(
         WorkerConfig::new(WorkerConfigOptions {
             src,
             script_name: format!("__loader:{id}"),
-            do_classes: Vec::new(),
-            bindings: Vec::new(),
-            r2_bindings: Vec::new(),
             // A loaded worker reaches D1 only if its parent injects a stub;
-            // ambient bindings are exactly what Code Mode withholds.
-            d1_bindings: Vec::new(),
-            kv_bindings: Vec::new(),
-            queue_bindings: Vec::new(),
-            ratelimit_bindings: Vec::new(),
-            send_email_bindings: Vec::new(),
-            queue_consumers: Vec::new(),
-            workflow_bindings: Vec::new(),
-            vars: Vec::new(),
-            node: String::new(),
+            // ambient bindings are exactly what Code Mode withholds, so every
+            // binding is left empty.
             modules,
             compat,
+            ..Default::default()
         })
         .into_dynamic_worker()
         .with_main_module_name(main.to_string())

@@ -418,6 +418,7 @@ pub struct VersionMetadata {
     pub timestamp: String,
 }
 
+#[derive(Default)]
 pub struct WorkerConfigOptions {
     pub src: String,
     pub script_name: String,

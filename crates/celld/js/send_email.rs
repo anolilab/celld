@@ -53,11 +53,11 @@ fn prepare(
     }
 }
 
-fn answer(result: Result<String, (&'static str, String)>) -> String {
+fn answer(result: Result<String, EmailError>) -> String {
     match result {
         Ok(message_id) => serde_json::json!({ "ok": true, "messageId": message_id }),
-        Err((code, message)) => {
-            serde_json::json!({ "ok": false, "code": code, "message": message })
+        Err(error) => {
+            serde_json::json!({ "ok": false, "code": error.code, "message": error.message })
         }
     }
     .to_string()
@@ -94,7 +94,7 @@ pub(super) fn op_email_send(
     let async_id = asyncrt::enqueue(async move {
         let prepared = match prepared {
             Ok(prepared) => prepared,
-            Err(error) => return Ok::<String, String>(answer(Err((error.code, error.message)))),
+            Err(error) => return Ok::<String, String>(answer(Err(error))),
         };
         await_egress_gate(gate).await?;
         let sent = match crate::smtp::relay() {
@@ -109,10 +109,7 @@ pub(super) fn op_email_send(
             // own text is never logged or passed on.
             tracing::warn!(event = "send_email_failed", code = error.code, detail = %error.message);
         }
-        Ok(answer(
-            sent.map(|()| prepared.message_id)
-                .map_err(|error| (error.code, error.message)),
-        ))
+        Ok(answer(sent.map(|()| prepared.message_id)))
     });
     rv.set(promise_for(scope, async_id));
 }

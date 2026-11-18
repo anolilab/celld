@@ -945,20 +945,7 @@ pub(crate) mod tests {
         let config = Arc::new(js::WorkerConfig::new(js::WorkerConfigOptions {
             src: "export default { fetch() { return new Response('ok'); } };".to_string(),
             script_name: "retire-test".to_string(),
-            do_classes: Vec::new(),
-            bindings: Vec::new(),
-            r2_bindings: Vec::new(),
-            d1_bindings: Vec::new(),
-            kv_bindings: Vec::new(),
-            queue_bindings: Vec::new(),
-            ratelimit_bindings: Vec::new(),
-            send_email_bindings: Vec::new(),
-            queue_consumers: Vec::new(),
-            workflow_bindings: Vec::new(),
-            vars: Vec::new(),
-            node: String::new(),
-            modules: Vec::new(),
-            compat: js::Compat::default(),
+            ..Default::default()
         }));
         Pool::new(
             crate::runtime::pool_limits(),

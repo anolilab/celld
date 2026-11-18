@@ -365,10 +365,15 @@ pub fn ai_binding(manifest: &Manifest) -> anyhow::Result<Option<String>> {
 pub fn validate_send_email_manifest(
     manifest: &Manifest,
 ) -> anyhow::Result<Vec<crate::email::SendEmailBinding>> {
-    crate::secrets::typed_bindings(manifest, "send_email", FEATURE_SEND_EMAIL_V1, "send_email")?
-        .into_iter()
-        .map(|(_, binding)| crate::email::SendEmailBinding::from_manifest(binding))
-        .collect()
+    crate::secrets::typed_bindings(
+        manifest,
+        crate::email::BINDING_TYPE,
+        FEATURE_SEND_EMAIL_V1,
+        "send_email",
+    )?
+    .into_iter()
+    .map(|(_, binding)| crate::email::SendEmailBinding::from_manifest(binding))
+    .collect()
 }
 
 /// Validate every Queue value before a deployment becomes runtime state.

@@ -24,7 +24,7 @@ use celld::generation::{
     DeploymentGraph, Generation, GenerationOptions, ReloadOutcome, ReloadRequest, FIRST_GENERATION,
 };
 use celld::js::{
-    ArmGate, AssetCallReq, Compat, DoCallReq, HttpResponse, HttpResponseWebSocket, QueueBinding,
+    ArmGate, AssetCallReq, DoCallReq, HttpResponse, HttpResponseWebSocket, QueueBinding,
     QueueDispatchReq, RpcCallReq, SvcCallReq, SvcRpcReq, WorkerConfigOptions, WorkflowBinding,
 };
 use celld::ownership_store::{now_ms, BucketOwnership};
@@ -4116,14 +4116,9 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 d1_bindings,
                 kv_bindings,
                 queue_bindings,
-                ratelimit_bindings: Vec::new(),
-                send_email_bindings: Vec::new(),
-                queue_consumers: Vec::new(),
                 workflow_bindings,
-                vars: Vec::new(),
                 node: node.clone(),
-                modules: Vec::new(),
-                compat: Compat::default(),
+                ..Default::default()
             };
             let (ownership, peer_key, wake, wake_scan) = if settings.bucket.is_some() {
                 let client = node_bucket(&settings, managed_storage.as_ref(), false)?;

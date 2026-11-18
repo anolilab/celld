@@ -3,7 +3,6 @@
 //! The `send_email` of a config, checked and written as manifest bindings.
 
 use crate::email::SendEmailBinding;
-use anyhow::bail;
 use serde_json::Value;
 
 /// The `send_email` of a config as manifest bindings.
@@ -28,12 +27,9 @@ pub(super) fn read_send_email(
             "allowed_sender_addresses",
         ],
     )? {
-        let name = super::entry_text(entry, "send_email", "name")?;
-        if !super::valid_binding(name) {
-            bail!("invalid send_email binding name: {name:?}");
-        }
+        super::entry_text(entry, "send_email", "name")?;
         let mut manifest = Value::Object(entry.clone());
-        manifest["type"] = Value::from("send_email");
+        manifest["type"] = Value::from(crate::email::BINDING_TYPE);
         // The one reader of the shape, shared with the node.
         let binding = SendEmailBinding::from_manifest(&manifest)?;
         bindings.push(binding.to_manifest());
