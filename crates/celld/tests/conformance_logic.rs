@@ -1,7 +1,7 @@
 //! Unit tests for the pure part of the conformance runner. The bench target has
 //! no test harness of its own, so this file includes its module.
 
-#![allow(dead_code)]
+#![allow(dead_code, clippy::disallowed_methods)]
 
 #[path = "../benches/conformance/logic.rs"]
 mod logic;
@@ -9,8 +9,8 @@ mod logic;
 use std::path::Path;
 
 use logic::{
-    apply_allow_list, check_wrangler, diff, parse_allow_list, resolve_path, stale_entries, Body,
-    Normaliser, Observed, Script,
+    apply_allow_list, check_wrangler, diff, fixture_names, parse_allow_list, resolve_path,
+    stale_entries, Body, Normaliser, Observed, Script,
 };
 use serde_json::{json, Value};
 
@@ -237,4 +237,35 @@ fn nested_wrangler_keys_are_checked() {
     ] {
         assert!(check_wrangler(&bad).is_err(), "{bad}");
     }
+}
+
+#[test]
+fn a_null_json_body_is_sent_and_still_clashes_with_body() {
+    let step = |extra: &str| {
+        format!(r#"{{ "requests": [{{ "name": "n", "method": "POST", "path": "/" {extra} }}] }}"#)
+    };
+    let parsed = Script::parse(&step(r#", "json": null"#)).unwrap();
+    assert_eq!(
+        parsed.requests[0].body_bytes().unwrap(),
+        Some(b"null".to_vec())
+    );
+    assert!(Script::parse(&step(r#", "json": null, "body": "x""#)).is_err());
+    let none = Script::parse(&step("")).unwrap();
+    assert_eq!(none.requests[0].body_bytes().unwrap(), None);
+}
+
+#[test]
+fn every_directory_of_the_corpus_is_a_fixture() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("b-ok")).unwrap();
+    std::fs::write(root.path().join("b-ok/script.json"), "{}").unwrap();
+    // No `script.json`: the run reports it as an error instead of skipping it.
+    std::fs::create_dir(root.path().join("a-misnamed")).unwrap();
+    std::fs::write(root.path().join("a-misnamed/scripts.json"), "{}").unwrap();
+    std::fs::write(root.path().join("allowlist.json"), "{}").unwrap();
+    assert_eq!(
+        fixture_names(root.path(), None).unwrap(),
+        ["a-misnamed", "b-ok"]
+    );
+    assert_eq!(fixture_names(root.path(), Some("ok")).unwrap(), ["b-ok"]);
 }

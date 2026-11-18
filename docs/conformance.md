@@ -48,6 +48,9 @@ my-fixture/
   script.json      the request script and the nondeterminism annotations
 ```
 
+Every directory of the corpus is a fixture. One without a `script.json` is
+reported as an error and fails the run; it is not skipped.
+
 The Worker must answer `GET /__ready` with `ready`; both runtimes are probed
 with it. It must be a single ES module file, because workerd is given it
 without a bundler (`"no_bundle": true`). The runner turns the wrangler config

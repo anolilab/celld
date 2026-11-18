@@ -105,14 +105,7 @@ fn main() {
         .build()
         .expect("build tokio runtime");
 
-    let mut names: Vec<String> = fs::read_dir(&root)
-        .expect("read the corpus directory")
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().join("script.json").is_file())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| filter.as_deref().is_none_or(|f| n.contains(f)))
-        .collect();
-    names.sort();
+    let names = logic::fixture_names(&root, filter.as_deref()).expect("read the corpus directory");
 
     let mut used = vec![false; allow.len()];
     let mut errored = Vec::new();

@@ -96,8 +96,18 @@ pub struct Step {
     pub headers: BTreeMap<String, String>,
     pub body: Option<String>,
     /// Kept as written, so `-0`, number spelling and key order reach the
-    /// Worker exactly as the fixture has them.
+    /// Worker exactly as the fixture has them. `"json": null` is the body
+    /// `null`; only a missing key means no JSON body.
+    #[serde(default, deserialize_with = "present")]
     pub json: Option<Box<RawValue>>,
+}
+
+/// Wraps a present value, `null` included, in `Some`; serde would turn it into
+/// `None`, as if the key were missing.
+fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Box<RawValue>>, D::Error> {
+    Box::<RawValue>::deserialize(deserializer).map(Some)
 }
 
 impl Script {
@@ -128,6 +138,26 @@ impl Step {
             (None, None) => Ok(None),
         }
     }
+}
+
+/// The fixtures of a corpus: every directory in it, sorted and narrowed by
+/// `filter`. A directory without a readable `script.json` is a fixture that
+/// errors when it runs, so a misnamed script cannot drop a fixture silently.
+#[allow(clippy::disallowed_methods)]
+pub fn fixture_names(root: &Path, filter: Option<&str>) -> std::io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.path().is_dir() {
+            if let Ok(name) = entry.file_name().into_string() {
+                if filter.is_none_or(|f| name.contains(f)) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 /// What differs between runs and must not count as a difference.
