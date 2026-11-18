@@ -569,8 +569,9 @@ struct StoreBinding<'a> {
     secret_name: &'a str,
     /// `celld dev` found an entry for this binding in `.dev.vars` or a dotenv
     /// file. The value is not in the deployment, which lives on disk; the node
-    /// reads the file when it loads the deployment. A deployment to a fleet
-    /// never has the mark, so its value always comes from the store.
+    /// reads the file when it loads the deployment. Only `celld dev` honours
+    /// the mark: a manifest from the control plane or a staged version can
+    /// carry it, and there the binding is an ordinary one.
     dev_value: bool,
 }
 
@@ -601,9 +602,15 @@ fn store_bindings(metadata: &serde_json::Value) -> anyhow::Result<Vec<StoreBindi
                         )
                     })
             };
+            let store_id = text("store_id")?;
+            // A marked binding never reads its store, but the id is still
+            // checked: the mark is data in a manifest, not proof of `celld dev`.
+            Scope::Store(store_id)
+                .check()
+                .with_context(|| format!("Secrets Store binding {named} of the deployment"))?;
             Ok(StoreBinding {
                 binding: text("name")?,
-                store_id: text("store_id")?,
+                store_id,
                 secret_name: text("secret_name")?,
                 dev_value: binding.get("dev_value") == Some(&serde_json::Value::Bool(true)),
             })
@@ -630,11 +637,19 @@ fn store_missing(binding: &StoreBinding<'_>) -> String {
 /// Refuse a deployment whose Secrets Store binding names a secret that its
 /// store does not hold, so the failure is the deploy's and not a Worker's first
 /// `get()`. Reads names only, one object for each distinct store, and needs no
-/// key. A binding that `celld dev` fills from `.dev.vars` needs no store.
-pub async fn ensure_store_secrets(bucket: &Bucket, manifest: &Manifest) -> anyhow::Result<()> {
+/// key. With `honour_dev_value`, set only for a manifest that `celld dev` built
+/// itself, a binding that it fills from `.dev.vars` needs no store.
+pub async fn ensure_store_secrets(
+    bucket: &Bucket,
+    manifest: &Manifest,
+    honour_dev_value: bool,
+) -> anyhow::Result<()> {
     let mut stores: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     let bindings = store_bindings(&manifest.raw_metadata)?;
-    for binding in bindings.iter().filter(|binding| !binding.dev_value) {
+    for binding in bindings
+        .iter()
+        .filter(|binding| !(honour_dev_value && binding.dev_value))
+    {
         if !stores.contains_key(binding.store_id) {
             stores.insert(
                 binding.store_id,
@@ -1181,7 +1196,9 @@ mod tests {
             store_binding("A", "st1", "api-key"),
             store_binding("B", "st1", "api-key"),
         ]));
-        ensure_store_secrets(&bucket, &manifest).await.unwrap();
+        ensure_store_secrets(&bucket, &manifest, false)
+            .await
+            .unwrap();
         let loaded = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(Some(&key)))
             .await
             .unwrap();
@@ -1218,7 +1235,7 @@ mod tests {
         let bucket = bucket(&directory);
         let key = key(3);
         let manifest = store_manifest(serde_json::json!([store_binding("A", "st1", "gone")]));
-        let error = ensure_store_secrets(&bucket, &manifest)
+        let error = ensure_store_secrets(&bucket, &manifest, false)
             .await
             .unwrap_err()
             .to_string();
@@ -1279,7 +1296,9 @@ mod tests {
             "type": STORE_BINDING_TYPE, "name": "A", "store_id": "st1",
             "secret_name": "k", "dev_value": true,
         }]));
-        ensure_store_secrets(&bucket, &manifest).await.unwrap();
+        ensure_store_secrets(&bucket, &manifest, true)
+            .await
+            .unwrap();
         let dev = |value: &str| BTreeMap::from([("A".to_string(), value.to_string())]);
         let loaded = load_stores(&bucket, &manifest, &dev("first"), || {
             panic!("no key needed")
@@ -1304,6 +1323,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_dev_value_mark_is_ignored_outside_dev() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let manifest = store_manifest(serde_json::json!([{
+            "type": STORE_BINDING_TYPE, "name": "A", "store_id": "st1",
+            "secret_name": "k", "dev_value": true,
+        }]));
+        // A staged or managed manifest may carry the mark; the secret must exist.
+        let error = ensure_store_secrets(&bucket, &manifest, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains('k') && error.contains("st1"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_marked_binding_still_has_its_store_id_checked() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let manifest = store_manifest(serde_json::json!([{
+            "type": STORE_BINDING_TYPE, "name": "A", "store_id": "../x",
+            "secret_name": "k", "dev_value": true,
+        }]));
+        for honour in [true, false] {
+            let error = ensure_store_secrets(&bucket, &manifest, honour)
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("not a valid store id"),
+                "{error:#}"
+            );
+        }
+        let dev = BTreeMap::from([("A".to_string(), "v".to_string())]);
+        let error = load_stores(&bucket, &manifest, &dev, || Ok(None))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a valid store id"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_malformed_store_binding_fails_the_load_and_names_it() {
         let directory = tempfile::tempdir().unwrap();
         let bucket = bucket(&directory);
@@ -1319,7 +1381,9 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(format!("{error:#}").contains("binding A"), "{error:#}");
-            let error = ensure_store_secrets(&bucket, &manifest).await.unwrap_err();
+            let error = ensure_store_secrets(&bucket, &manifest, false)
+                .await
+                .unwrap_err();
             assert!(format!("{error:#}").contains("binding A"), "{error:#}");
         }
     }

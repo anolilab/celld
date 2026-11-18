@@ -128,8 +128,8 @@ deploy, `POST /reload`, or a restart, and not on the poll.
 A secret cannot have the name of a variable or binding of the Worker, or be
 named `__proto__`. `celld secret put` refuses a name that the deployment the
 fleet serves uses; it does not look at staged or retained versions.
-`celld deploy` and `celld activate` refuse a version whose bindings use the
-name of a stored secret, so a rollback to an older version cannot shadow a
+`celld deploy`, `celld activate` and a deployment that the control plane sends
+refuse a version whose bindings use the name of a stored secret, so a rollback to an older version cannot shadow a
 secret. A secret's value does not appear in a log, in `/state`, in an error
 message, or in the output of `celld deploy`.
 
@@ -184,9 +184,12 @@ encrypted as a script's are, and bound to the store and the secret name.
   `.env`, and then needs no store. Without that entry it reads the dev store,
   as a fleet does. The node reads the file each time it loads the deployment
   and keeps the value in memory, so the value is never written to the dev state
-  and a change reaches the next reload.
+  and a change reaches the next reload. Only `celld dev` honours that entry: a
+  staged or managed deployment that claims one still needs the secret in its
+  store.
 - A deployment whose Secrets Store binding lacks its `store_id`, `secret_name`
-  or `name` as a string fails to load, and the error names the binding.
+  or `name` as a string, or whose `store_id` is not a valid store id, fails to
+  load, and the error names the binding.
 - A binding cannot have the name of another binding, variable or secret of the
   Worker, or be named `__proto__`. A deployment that declares one requires the
   `secrets-store-v1` feature, so a node that predates it refuses the

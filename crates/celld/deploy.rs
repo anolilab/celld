@@ -1044,7 +1044,7 @@ pub async fn write(
     crate::secrets::ensure_no_clash(bucket, &built.manifest).await?;
     // A Secrets Store binding names a secret its store must already hold, so
     // a missing one is the deploy's error and not a Worker's first `get()`.
-    crate::secrets::ensure_store_secrets(bucket, &built.manifest).await?;
+    crate::secrets::ensure_store_secrets(bucket, &built.manifest, true).await?;
 
     // Images are fleet-wide and content-addressed like asset bodies, and
     // they are what a node loads before a container class can start.

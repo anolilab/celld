@@ -1757,10 +1757,12 @@ pub async fn apply_deployment(
     // leaving a prefix that looks publishable.
     let queue_attachments =
         crate::deploy::prepare_queue_attachments(bucket, &deployment.manifest).await?;
-    // The same refusal as `celld deploy` and `celld activate`: a Secrets Store
-    // binding names a secret its store must hold, or the Worker starts with a
-    // binding that rejects at once.
-    crate::secrets::ensure_store_secrets(bucket, &deployment.manifest).await?;
+    // The same refusals as `celld deploy` and `celld activate`: a stored secret
+    // must not shadow a binding, and a Secrets Store binding names a secret its
+    // store must hold, or the Worker starts with a binding that rejects at
+    // once. A `dev_value` mark in a managed manifest is not honoured.
+    crate::secrets::ensure_no_clash(bucket, &deployment.manifest).await?;
+    crate::secrets::ensure_store_secrets(bucket, &deployment.manifest, false).await?;
 
     let mut asset_files = 0_u32;
     let mut asset_bytes = 0_u64;
@@ -2835,6 +2837,13 @@ mod store_secret_tests {
 
     /// A managed deployment whose binding names a secret that no store holds.
     fn deployment() -> AgentDeployment {
+        deployment_binding(serde_json::json!({
+            "type": "secrets_store_secret", "name": "KEY",
+            "store_id": "st1", "secret_name": "api-key"
+        }))
+    }
+
+    fn deployment_binding(binding: serde_json::Value) -> AgentDeployment {
         let sha256 = "0".repeat(64);
         serde_json::from_value(serde_json::json!({
             "script_name": "app",
@@ -2847,10 +2856,7 @@ mod store_secret_tests {
                 "sqlite_classes": [],
                 "modules": [{ "name": "index.js", "bytes": 1, "sha256": sha256 }],
                 "required_features": ["secrets-store-v1"],
-                "raw_metadata": { "bindings": [{
-                    "type": "secrets_store_secret", "name": "KEY",
-                    "store_id": "st1", "secret_name": "api-key"
-                }] },
+                "raw_metadata": { "bindings": [binding] },
             },
             "pointer": {
                 "script_name": "app", "version": "v1",
@@ -2878,6 +2884,62 @@ mod store_secret_tests {
             "{error}"
         );
         // Nothing was published.
+        assert!(bucket.get("deploy/current.json").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_managed_deployment_is_refused_when_a_secret_shadows_a_binding() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = Bucket::open_dev(&directory.path().join("objects.sqlite3")).unwrap();
+        let key = crate::secrets::SecretsKey::parse(&format!("{}=", "A".repeat(43))).unwrap();
+        crate::secrets::put_store(&bucket, &key, "st1", "api-key", "v")
+            .await
+            .unwrap();
+        crate::secrets::put(&bucket, &key, "app", "KEY", "v", &Default::default())
+            .await
+            .unwrap();
+        let error = apply_deployment(&reqwest::Client::new(), "token", &bucket, &deployment())
+            .await
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("KEY") && error.contains("binding"),
+            "{error}"
+        );
+        assert!(bucket.get("deploy/current.json").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_managed_dev_value_mark_does_not_skip_the_store_checks() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = Bucket::open_dev(&directory.path().join("objects.sqlite3")).unwrap();
+        // The secret is missing: the mark must not excuse it.
+        let missing = deployment_binding(serde_json::json!({
+            "type": "secrets_store_secret", "name": "KEY", "store_id": "st1",
+            "secret_name": "api-key", "dev_value": true
+        }));
+        let error = apply_deployment(&reqwest::Client::new(), "token", &bucket, &missing)
+            .await
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("api-key") && error.contains("st1"),
+            "{error}"
+        );
+        // An invalid store id is refused, marked or not.
+        let invalid = deployment_binding(serde_json::json!({
+            "type": "secrets_store_secret", "name": "KEY", "store_id": "../x",
+            "secret_name": "api-key", "dev_value": true
+        }));
+        let error = apply_deployment(&reqwest::Client::new(), "token", &bucket, &invalid)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a valid store id"),
+            "{error:#}"
+        );
         assert!(bucket.get("deploy/current.json").await.unwrap().is_none());
     }
 }
