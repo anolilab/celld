@@ -228,6 +228,36 @@ const fsChecks = {
     await new Promise((resolve) => setTimeout(resolve, 5));
     is(called, false);
   },
+  readdirBuffer: async () => {
+    fs.mkdirSync("/tmp/bn/sub", { recursive: true });
+    fs.writeFileSync("/tmp/bn/sub/f", "1");
+    const text = (names) => names.map((name) => [Buffer.isBuffer(name), name.toString()]);
+    is(text(fs.readdirSync("/tmp/bn", { encoding: "buffer" })), [[true, "sub"]]);
+    is(text(fs.readdirSync("/tmp/bn", "buffer")), [[true, "sub"]]);
+    is(text(fs.readdirSync("/tmp/bn", { encoding: "buffer", recursive: true })), [[true, "sub"], [true, "sub/f"]]);
+    const call = (run) => new Promise((resolve) => run((error, value) => resolve(value)));
+    is(text(await call((cb) => fs.readdir("/tmp/bn", { encoding: "buffer" }, cb))), [[true, "sub"]]);
+    is(text(await fsp.readdir("/tmp/bn", { encoding: "buffer" })), [[true, "sub"]]);
+    is(fs.readdirSync("/tmp/bn"), ["sub"]);
+  },
+  readdirManyEntries: () => {
+    fs.mkdirSync("/tmp/many");
+    for (let index = 0; index < 150000; index++) fs.mkdirSync(`/tmp/many/${index}`);
+    is(fs.readdirSync("/tmp/many", { recursive: true }).length, 150000);
+    is(fs.readdirSync("/tmp", { recursive: true }).filter((name) => name.startsWith("many/")).length, 150000);
+    fs.rmSync("/tmp/many", { recursive: true });
+  },
+  readdirRootAndBundle: () => {
+    is(fs.readdirSync("/"), ["bundle", "dev", "tmp"]);
+    for (const name of fs.readdirSync("/")) is(fs.statSync(`/${name}`).isDirectory(), true);
+    is(fs.readdirSync("/dev"), []);
+    is(fs.readdirSync("/bundle").includes("worker.js"), true);
+    is(fs.statSync("/bundle/worker.js").isFile(), true);
+    is(fs.readdirSync("/", { withFileTypes: true }).map((entry) => entry.isDirectory()), [true, true, true]);
+    is(fs.readdirSync("/", { recursive: true }).includes("bundle/worker.js"), true);
+    throwsCodeSync("ENOTDIR", () => fs.readdirSync("/bundle/worker.js"));
+    throwsCodeSync("ENOENT", () => fs.readdirSync("/bundle/missing"));
+  },
 };
 
 // Fills the request's `/tmp` until it refuses, reports how much it took, then
