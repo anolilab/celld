@@ -11955,24 +11955,35 @@ const __fsReaddirSync = (value, options) => {
   const path = __fsPath(value);
   if (typeof options === "string") options = { encoding: options };
   options = __fsOptions(options, ["withFileTypes", "recursive"]);
-  const walk = (directory, prefix) => {
+  const asBuffer = options.encoding === "buffer";
+  const label = (name) => asBuffer ? Buffer.from(name) : name;
+  const out = [];
+  // An explicit stack: a deep tree must not overflow the call stack, and every
+  // entry goes into `out` one at a time, never as the arguments of one call.
+  const stack = [];
+  const open = (directory, prefix) => {
     const names = __vfs_readdir(directory);
     if (typeof names === "string") throw __fsError(names, "scandir", directory);
-    const out = [];
-    for (const name of names) {
-      const full = directory + "/" + name;
-      const kind = __vfs_stat(full)[0];
-      const isDirectory = kind === 1 || kind === 2;
-      out.push(options.withFileTypes
-        ? new __FsDirent(name, directory, isDirectory)
-        : prefix + name);
-      if (options.recursive && isDirectory) {
-        out.push(...walk(full, prefix + name + "/"));
-      }
-    }
-    return out;
+    stack.push({ directory, prefix, names, index: 0 });
   };
-  return walk(path, "");
+  open(path, "");
+  while (stack.length) {
+    const frame = stack[stack.length - 1];
+    if (frame.index === frame.names.length) {
+      stack.pop();
+      continue;
+    }
+    const { directory, prefix } = frame;
+    const name = frame.names[frame.index++];
+    const full = (directory === "/" ? "" : directory) + "/" + name;
+    const kind = __vfs_stat(full)[0];
+    const isDirectory = kind === 1 || kind === 2;
+    out.push(options.withFileTypes
+      ? new __FsDirent(label(name), directory, isDirectory)
+      : label(prefix + name));
+    if (options.recursive && isDirectory) open(full, prefix + name + "/");
+  }
+  return out;
 };
 const __fsUnlinkSync = (value) => {
   const path = __fsPath(value);

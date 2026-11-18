@@ -32,6 +32,10 @@ const VFS_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Charged for each entry on top of its path and bytes.
 const VFS_NODE_OVERHEAD: usize = 64;
 
+/// The most spare capacity one append may claim beyond the bytes it needs, so
+/// a single append to a large file cannot take the rest of the request's `/tmp`.
+const VFS_APPEND_SLACK: usize = 1024 * 1024;
+
 /// A file has no kind but its bytes; a path-only set would make a file
 /// indistinguishable from its parent directory.
 enum VfsNode {
@@ -61,7 +65,10 @@ impl Default for RequestVfs {
             .into_iter()
             .map(|(path, writable)| (path.to_string(), VfsNode::Directory { writable }))
             .collect(),
-            children: HashMap::new(),
+            children: HashMap::from([(
+                "/".to_string(),
+                ["bundle", "dev", "tmp"].map(String::from).into(),
+            )]),
             used: 0,
         }
     }
@@ -202,16 +209,21 @@ impl RequestVfs {
         }
     }
 
-    /// The capacity an append needs: unchanged while it fits, otherwise
-    /// doubled, so n small appends reallocate O(log n) times. Doubling stops
-    /// at `budget`, the most capacity the file may take, so an append whose
-    /// bytes fit is never refused for the room its growth would have wanted.
+    /// The capacity an append needs: unchanged while it fits, otherwise the
+    /// bytes needed plus an equal amount of slack, at most `VFS_APPEND_SLACK`,
+    /// so n small appends reallocate O(log n) times and one append to a large
+    /// file claims a bounded extra. The slack stops at `budget`, the most
+    /// capacity the file may take, so an append whose bytes fit is never
+    /// refused for the room its growth would have wanted.
     fn grown_capacity(capacity: usize, len: usize, extra: usize, budget: usize) -> usize {
         let needed = len.saturating_add(extra);
         if needed <= capacity {
             capacity
         } else {
-            needed.max(capacity.saturating_mul(2).min(budget))
+            needed
+                .saturating_add(needed.min(VFS_APPEND_SLACK))
+                .min(budget)
+                .max(needed)
         }
     }
 
@@ -236,6 +248,8 @@ impl RequestVfs {
         let remaining = VFS_MAX_BYTES - self.used;
         Ok(match self.nodes.get(path) {
             Some(VfsNode::File(old)) if !append => remaining.saturating_add(old.capacity()),
+            // An append fills the file's unused capacity before it is charged.
+            Some(VfsNode::File(old)) => remaining.saturating_add(old.capacity() - old.len()),
             None => remaining.saturating_sub(Self::node_cost(path)),
             Some(_) => remaining,
         })
@@ -248,11 +262,9 @@ impl RequestVfs {
         }
     }
 
-    /// The names directly inside a directory of the writable tree, sorted.
+    /// The names directly inside a directory of the tree, sorted. `/bundle`
+    /// is listed from the module tree by `op_vfs_readdir`.
     fn readdir(&self, path: &str) -> Result<Vec<String>, &'static str> {
-        if !Self::writable_path(path) {
-            return Err("ENOENT");
-        }
         match self.nodes.get(path) {
             None => return Err("ENOENT"),
             Some(VfsNode::File(_)) => return Err("ENOTDIR"),
@@ -399,15 +411,47 @@ pub(super) fn op_vfs_write(
     rv.set(v8::String::new(scope, code).unwrap().into());
 }
 
-/// The names in a directory of the request's `/tmp` as an array, or a Node
-/// error code as a string.
+/// The entries of a `/bundle` directory, sorted, or the error for a bundle
+/// path that is not one. `None` for a path outside the bundle projection, and
+/// for `/bundle` itself when the isolate has no bundle.
+fn bundle_children(
+    scope: &mut v8::PinScope,
+    path: &str,
+) -> Option<Result<Vec<String>, &'static str>> {
+    if path != "/bundle" && !path.starts_with("/bundle/") {
+        return None;
+    }
+    let bundle = scope.get_slot::<Arc<BundleFs>>().cloned()?;
+    let tree = bundle.tree();
+    match tree.nodes.get(path) {
+        None => return Some(Err("ENOENT")),
+        Some(BundleNode::File(_)) => return Some(Err("ENOTDIR")),
+        Some(BundleNode::Directory) => {}
+    }
+    let below = format!("{path}/");
+    let mut names: Vec<String> = tree
+        .nodes
+        .keys()
+        .filter_map(|key| key.strip_prefix(&below))
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    Some(Ok(names))
+}
+
+/// The names in a directory as an array, or a Node error code as a string.
 pub(super) fn op_vfs_readdir(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let path = args.get(0).to_rust_string_lossy(scope);
-    match read_vfs(scope, |vfs| vfs.readdir(&path)) {
+    let listed = match bundle_children(scope, &path) {
+        Some(listed) => listed,
+        None => read_vfs(scope, |vfs| vfs.readdir(&path)),
+    };
+    match listed {
         Ok(names) => {
             let array = v8::Array::new(scope, names.len() as i32);
             for (index, name) in names.iter().enumerate() {
@@ -576,6 +620,56 @@ mod tests {
             vfs.write("/tmp/big", vec![0; VFS_MAX_BYTES], true),
             Err("ENOSPC")
         );
+    }
+
+    #[test]
+    fn an_append_may_use_the_files_own_unused_capacity() {
+        let mut vfs = RequestVfs::default();
+        // A file holding 10 MiB in 40 MiB of capacity, and a second file
+        // that takes all the room left.
+        let mut spare = vec![0; 10 * 1024 * 1024];
+        spare.reserve_exact(30 * 1024 * 1024);
+        let capacity = spare.capacity();
+        vfs.write("/tmp/spare", spare, false).unwrap();
+        let room = vfs.write_limit("/tmp/fill", false).unwrap();
+        vfs.write("/tmp/fill", vec![0; room], false).unwrap();
+        let limit = vfs.write_limit("/tmp/spare", true).unwrap();
+        assert!(limit >= capacity - 10 * 1024 * 1024, "limit {limit}");
+        let used = vfs.used;
+        vfs.write("/tmp/spare", vec![1; 20 * 1024 * 1024], true)
+            .unwrap();
+        assert_eq!(vfs.used, used, "the spare capacity was already charged");
+    }
+
+    #[test]
+    fn one_append_claims_a_bounded_slack() {
+        let mut vfs = RequestVfs::default();
+        let len = 20 * 1024 * 1024;
+        vfs.write("/tmp/big", vec![0; len], false).unwrap();
+        vfs.write("/tmp/big", b"x".to_vec(), true).unwrap();
+        let Some(VfsNode::File(bytes)) = vfs.nodes.get("/tmp/big") else {
+            panic!("/tmp/big is not a file");
+        };
+        assert_eq!(bytes.len(), len + 1);
+        assert!(
+            bytes.capacity() <= len + 1 + super::VFS_APPEND_SLACK,
+            "capacity {}",
+            bytes.capacity()
+        );
+    }
+
+    #[test]
+    fn the_root_and_the_read_only_directories_list_as_stat_shows_them() {
+        let vfs = RequestVfs::default();
+        assert_eq!(vfs.readdir("/").unwrap(), ["bundle", "dev", "tmp"]);
+        for name in vfs.readdir("/").unwrap() {
+            assert!(matches!(
+                vfs.stat(&format!("/{name}")),
+                Some(super::VfsStat::Directory { .. })
+            ));
+        }
+        assert_eq!(vfs.readdir("/dev").unwrap(), Vec::<String>::new());
+        assert_eq!(vfs.readdir("/nowhere"), Err("ENOENT"));
     }
 
     #[test]
