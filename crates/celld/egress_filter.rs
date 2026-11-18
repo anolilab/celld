@@ -56,7 +56,7 @@ use crate::startup::Advertise;
 use anyhow::{anyhow, bail, Context};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 pub const MODE_ENV: &str = "CELLD_EGRESS";
 pub const ALLOW_ENV: &str = "CELLD_EGRESS_ALLOW";
@@ -814,13 +814,21 @@ fn dev_mode_for(mode_set: bool, allow_set: bool) -> Option<&'static str> {
 }
 
 /// The node's own addresses and the ports its listeners bind.
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default)]
 struct NodeAddrs {
+    /// Fixed at startup: the advertised, pinned and specifically bound addresses.
     addrs: Vec<IpAddr>,
+    /// The interface addresses a wildcard bind serves, re-read while the node
+    /// runs, and only ever added to. A lookup holds the read lock only to clone the `Arc`; the
+    /// refresher takes the write lock only to swap in a changed list.
+    interfaces: RwLock<Arc<Vec<IpAddr>>>,
     listener_ports: Vec<u16>,
     /// The advertised hostname, lower-case without a trailing dot.
     name: Option<String>,
 }
+
+/// How often a node with a wildcard bind re-reads its interface addresses.
+const INTERFACE_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long startup waits for the advertised name to resolve.
 const ADVERTISED_NAME_LOOKUP: std::time::Duration = std::time::Duration::from_secs(2);
@@ -840,20 +848,20 @@ impl NodeAddrs {
     ) -> Self {
         let mut addrs: Vec<IpAddr> = advertised.iter().map(SocketAddr::ip).collect();
         addrs.extend(pinned);
-        let mut interfaces = Some(interfaces);
+        let mut wildcard = false;
         for listener in listeners {
             if listener.ip().is_unspecified() {
-                addrs.extend(interfaces.take().map(|list| list()).unwrap_or_default());
+                wildcard = true;
             } else {
                 addrs.push(listener.ip());
             }
         }
-        let mut addrs: Vec<IpAddr> = addrs
-            .into_iter()
-            .flat_map(|ip| [ip, canonical(ip)])
-            .collect();
-        addrs.sort();
-        addrs.dedup();
+        let addrs = with_canonical(addrs);
+        let interfaces = if wildcard {
+            with_canonical(interfaces())
+        } else {
+            Vec::new()
+        };
         // The advertised port is a listener port: behind a port mapping it
         // reaches a listener of this node, on the advertised address and on
         // every other address of the node.
@@ -866,9 +874,36 @@ impl NodeAddrs {
         listener_ports.dedup();
         Self {
             addrs,
+            interfaces: RwLock::new(Arc::new(interfaces)),
             listener_ports,
             name: None,
         }
+    }
+
+    /// Add the addresses of a fresh listing to the known ones. The set only
+    /// grows: an address the host loses stays the node's own, because a
+    /// partial listing must never weaken the fence, and the worst a stale
+    /// address costs is a refused dial to whoever holds it next.
+    fn learn_interfaces(&self, listed: Vec<IpAddr>) {
+        let mut all = self.interfaces_now().as_ref().clone();
+        all.extend(with_canonical(listed));
+        all.sort();
+        all.dedup();
+        if all.len() != self.interfaces_now().len() {
+            *self
+                .interfaces
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = Arc::new(all);
+        }
+    }
+
+    fn interfaces_now(&self) -> Arc<Vec<IpAddr>> {
+        Arc::clone(
+            &self
+                .interfaces
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
     }
 
     /// Record the advertised hostname and its port, which stay known when the
@@ -886,8 +921,12 @@ impl NodeAddrs {
     }
 
     fn endpoint(&self, addr: SocketAddr) -> NodeEndpoint {
+        let interfaces = self.interfaces_now();
         let own = |ip: IpAddr| {
-            ip.is_loopback() || ip.is_unspecified() || self.addrs.binary_search(&ip).is_ok()
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || self.addrs.binary_search(&ip).is_ok()
+                || interfaces.binary_search(&ip).is_ok()
         };
         let ip = addr.ip();
         // An IPv4 address carried in IPv6 is the node's own when it is.
@@ -911,6 +950,39 @@ impl NodeAddrs {
     }
 }
 
+/// Each address with its canonical form, sorted, without duplicates.
+fn with_canonical(addrs: Vec<IpAddr>) -> Vec<IpAddr> {
+    let mut addrs: Vec<IpAddr> = addrs
+        .into_iter()
+        .flat_map(|ip| [ip, canonical(ip)])
+        .collect();
+    addrs.sort();
+    addrs.dedup();
+    addrs
+}
+
+/// Re-read the interface addresses every [`INTERFACE_REFRESH`] for as long as
+/// the node runs. A failed read changes nothing, and an address is never forgotten.
+fn keep_interfaces_current(node: &'static NodeAddrs) {
+    crate::asyncrt::spawn(async move {
+        loop {
+            crate::asyncrt::sleep(INTERFACE_REFRESH).await;
+            // The listing is a system call; it runs on the blocking pool so a
+            // slow one never holds a runtime worker.
+            match crate::asyncrt::blocking(crate::node_addrs::try_interfaces).await {
+                Ok(Ok(listed)) => node.learn_interfaces(listed),
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "could not re-read this node's interface addresses, keeping the last list");
+                }
+                Err(_) => {
+                    tracing::warn!("re-reading this node's interface addresses panicked, keeping the last list");
+                }
+            }
+        }
+    })
+    .detach();
+}
+
 /// The node's own endpoints, as [`register_node_addresses`] recorded them.
 /// Loopback is the node's own before and after.
 pub fn node_endpoint(addr: SocketAddr) -> NodeEndpoint {
@@ -930,7 +1002,8 @@ pub fn node_name(host: &str, port: u16) -> bool {
 /// Tell the policy which addresses are the node's own, once its listeners are
 /// bound: what they bind, what the node advertises and what an operator pinned
 /// in `CELLD_FENCE_NODE_ADDRS`. The addresses and the listener ports come from
-/// one snapshot taken here, so an address the node gains later is not known.
+/// one snapshot taken here. With a wildcard bind the interface addresses are
+/// then re-read every few seconds, so an address the node gains later is learned and none is forgotten.
 /// A public address that a NAT or an elastic IP maps to the node is on no
 /// interface, so it is known only when advertised or pinned.
 ///
@@ -950,10 +1023,10 @@ pub async fn register_node_addresses(
     if active().is_none() {
         return Ok(());
     }
-    let interfaces = if listeners
+    let wildcard = listeners
         .iter()
-        .any(|listener| listener.ip().is_unspecified())
-    {
+        .any(|listener| listener.ip().is_unspecified());
+    let interfaces = if wildcard {
         crate::node_addrs::try_interfaces().map_err(|error| {
             anyhow!(
                 "could not list this node's interface addresses ({error}), so Worker egress \
@@ -996,7 +1069,11 @@ pub async fn register_node_addresses(
     if let Advertise::Name { host, port } = advertise {
         node = node.with_name(host, *port);
     }
-    let _ = NODE.set(node);
+    if NODE.set(node).is_ok() && wildcard {
+        if let Some(node) = NODE.get() {
+            keep_interfaces_current(node);
+        }
+    }
     Ok(())
 }
 
@@ -1476,6 +1553,27 @@ mod tests {
         assert_eq!(at("127.0.0.9:80"), NodeEndpoint::Address);
         assert_eq!(at("127.0.0.9:0"), NodeEndpoint::Listener);
         assert_eq!(at("[::1]:9000"), NodeEndpoint::Listener);
+    }
+
+    #[test]
+    fn an_address_gained_after_startup_is_refused_and_one_lost_stays_refused() {
+        let node = NodeAddrs::new(
+            &[sock("0.0.0.0:8787")],
+            vec![sock("198.51.100.7:9100")],
+            vec![ip("203.0.113.9")],
+            || vec![ip("172.17.0.2")],
+        );
+        let at = |text: &str| node.endpoint(sock(text));
+        assert_eq!(at("10.9.9.9:8787"), NodeEndpoint::Elsewhere);
+        // The host gains 10.9.9.9 and then lists only that address.
+        node.learn_interfaces(vec![ip("10.9.9.9")]);
+        assert_eq!(at("10.9.9.9:8787"), NodeEndpoint::Listener);
+        assert_eq!(at("10.9.9.9:80"), NodeEndpoint::Address);
+        // 172.17.0.2 is no longer listed but is still the node's own.
+        assert_eq!(at("172.17.0.2:8787"), NodeEndpoint::Listener);
+        // The advertised and pinned addresses stay whatever the interfaces say.
+        assert_eq!(at("198.51.100.7:8787"), NodeEndpoint::Listener);
+        assert_eq!(at("203.0.113.9:8787"), NodeEndpoint::Listener);
     }
 
     #[test]
