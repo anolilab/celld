@@ -67,6 +67,8 @@ read. The warning about a shared file is logged at the first `send()`.
   must chain to the bundled public roots. `CELLD_EXTRA_CA_CERTS` is for what
   Workers dial and does not apply here.
 - Login uses `AUTH PLAIN`, or `AUTH LOGIN` when the relay offers only that.
+  A user name and password too long for one command line (512 bytes) are sent
+  after the relay's `334`, as RFC 4954 allows.
   With `off` the login is sent in the clear: use it for a relay on the same
   host or a trusted network.
 - The host makes the connection. A private or loopback address is fine on every
@@ -127,6 +129,8 @@ message as a string or a `ReadableStream` of bytes. celld requires that
   header is `addr`, `"Display Name" <addr>` or `plain words <addr>`, with
   nothing after the `>`. A comment, a backslash or any other text is refused,
   because mail programs disagree about where a comment ends;
+- a `Sender:`, `Resent-From:` or `Resent-Sender:` header, if there is one, has
+  that same single address too; any other address is refused;
 - it has no `Received:` header;
 - every line end is CRLF: a bare LF or CR is changed to CRLF.
 
@@ -156,7 +160,7 @@ header. `send()` resolves to `{ messageId }` in both forms.
   plus those 10 minutes, plus the time the body needs at 64 KiB a second.
 - A call costs a subrequest, as a `fetch()` does. An isolate has at most four
   messages in flight: the call after that rejects at once with
-  `E_RATE_LIMIT_EXCEEDED`, before the message is read. A script has at most four
+  `E_RATE_LIMIT_EXCEEDED`, before a stream is read from. A script has at most four
   transactions running on a node, and a node runs at most 16. A call beyond
   either waits up to 60 seconds, and then rejects with `E_RATE_LIMIT_EXCEEDED`
   (for a script) or `E_DELIVERY_FAILED` (for the node).
@@ -185,9 +189,9 @@ base64) for such a relay.
 `E_HEADER_VALUE_INVALID`, `E_HEADERS_TOO_MANY`, `E_HEADERS_TOO_LARGE`,
 `E_CONTENT_TOO_LARGE`, `E_LINE_TOO_LONG`, `E_8BIT_NOT_SUPPORTED`,
 `E_RATE_LIMIT_EXCEEDED`, `E_DELIVERY_FAILED` and `E_INTERNAL_SERVER_ERROR` (no
-relay, or a relay setting that is invalid). celld
-connects only after the writes the handler made so far are durable, as it does
-for `fetch()`.
+relay, a relay setting that is invalid, or a send that was not made because the
+writes the handler made before it could not be made durable). celld
+connects only after those writes are durable, as it does for `fetch()`.
 
 ## Differences from Cloudflare
 

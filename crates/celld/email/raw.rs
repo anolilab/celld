@@ -64,6 +64,20 @@ pub fn prepare_raw(
     if single_address(&from_header.value).as_deref() != Some(from) {
         return Err(EmailError::invalid("From: header does not match mail from"));
     }
+    // A mail client shows Sender: and the Resent-* headers next to or instead
+    // of From:, so each must name the envelope sender too.
+    for header in headers.iter().filter(|header| {
+        ["sender", "resent-from", "resent-sender"]
+            .iter()
+            .any(|name| header.name_is(name))
+    }) {
+        if single_address(&header.value).as_deref() != Some(from) {
+            return Err(EmailError::invalid(format!(
+                "{}: header does not match mail from",
+                header.name
+            )));
+        }
+    }
     if headers.iter().any(|header| header.name_is("received")) {
         return Err(EmailError::invalid("invalid headers set"));
     }
@@ -309,6 +323,29 @@ mod tests {
             "From: ann@example.com\nFrom: ann@example.com\n\nbody",
         );
         assert!(two.is_err());
+    }
+
+    #[test]
+    fn sender_and_resent_headers_must_name_the_envelope_sender_too() {
+        for header in [
+            "Sender: eve@example.com",
+            "sender: Eve <eve@example.com>",
+            "Resent-From: eve@example.com",
+            "Resent-Sender: eve@example.com",
+            "Resent-From: ann@example.com, eve@example.com",
+            "Sender:",
+        ] {
+            let message = format!("From: ann@example.com\n{header}\nSubject: x\n\nbody");
+            let error =
+                raw(&binding(), "ann@example.com", "bob@example.com", &message).unwrap_err();
+            assert!(
+                error.message.contains("does not match"),
+                "{header}: {error}"
+            );
+        }
+        let message = "From: ann@example.com\nSender: Ann <ann@example.com>\n\
+             Resent-From: ann@example.com\nResent-To: bob@example.com\nReply-To: eve@example.com\n\nbody";
+        raw(&binding(), "ann@example.com", "bob@example.com", message).unwrap();
     }
 
     #[test]

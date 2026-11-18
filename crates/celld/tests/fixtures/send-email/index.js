@@ -4,6 +4,9 @@
 //                answers { messageId } or { error, code, message }
 //   POST /burst  { count, binding? } sends count builder messages at once and
 //                answers one { ok } or { code } for each
+//   POST /streams { count } sends count raw stream messages at once and
+//                answers { results, reads }: one { ok } or { code } for each, and
+//                how many streams were read from at all
 //   GET  /env    what a Worker can see of its environment
 import { EmailMessage } from "cloudflare:email";
 import process from "node:process";
@@ -50,6 +53,30 @@ export default {
       return Response.json(
         results.map((result) => (result.status === "fulfilled" ? { ok: true } : { code: result.reason.code })),
       );
+    }
+    if (url.pathname === "/streams") {
+      const { count } = await request.json();
+      let reads = 0;
+      const results = await Promise.allSettled(
+        Array.from({ length: count }, () => {
+          // A zero high-water mark: nothing is pulled until a reader asks.
+          const stream = new ReadableStream(
+            {
+              pull(controller) {
+                reads += 1;
+                controller.enqueue(new TextEncoder().encode("From: ann@example.com\n\nbody\n"));
+                controller.close();
+              },
+            },
+            { highWaterMark: 0 },
+          );
+          return env.EMAIL.send(new EmailMessage("ann@example.com", "bob@example.com", stream));
+        }),
+      );
+      return Response.json({
+        results: results.map((result) => (result.status === "fulfilled" ? { ok: true } : { code: result.reason.code })),
+        reads,
+      });
     }
     if (url.pathname === "/send") {
       const spec = await request.json();

@@ -124,11 +124,29 @@
     async send(message) {
       let answer;
       if (message instanceof EmailMessage) {
-        const bytes = await readRaw(raws.get(message));
-        answer = await __email_send(
-          JSON.stringify({ binding: this.#name, kind: "raw", from: message.from, to: message.to }),
-          bytes,
-        );
+        const raw = raws.get(message);
+        // A stream is buffered while it is read, so the slot and the
+        // subrequest are taken first: sends past the limit never read theirs.
+        const streamed = typeof raw !== "string";
+        if (streamed) {
+          const refusal = __email_reserve();
+          if (refusal) {
+            const result = JSON.parse(refusal);
+            throw fail(result.code, result.message);
+          }
+        }
+        let handedOver = false;
+        try {
+          const bytes = await readRaw(raw);
+          handedOver = streamed;
+          answer = await __email_send(
+            JSON.stringify({ binding: this.#name, kind: "raw", from: message.from, to: message.to }),
+            bytes,
+            streamed,
+          );
+        } finally {
+          if (streamed && !handedOver) __email_release();
+        }
       } else if (message !== null && typeof message === "object") {
         answer = await __email_send(
           JSON.stringify({ binding: this.#name, kind: "builder", message: shapeBuilder(message) }),

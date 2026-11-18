@@ -854,6 +854,41 @@ async fn an_isolate_may_have_a_few_messages_in_flight_and_gets_each_slot_back() 
 }
 
 #[tokio::test]
+async fn streams_past_the_in_flight_limit_are_refused_before_they_are_read() {
+    let sink = Sink::start(Behaviour {
+        slow_body_reply: Some(std::time::Duration::from_millis(300)),
+        ..Default::default()
+    })
+    .await;
+    let server = start(&sink, &[]).await;
+    let answer: Value = client()
+        .post(server.url("/streams"))
+        .json(&json!({ "count": 10 }))
+        .send()
+        .await
+        .expect("POST /streams")
+        .json()
+        .await
+        .expect("a JSON answer");
+    let results = answer["results"].as_array().unwrap();
+    assert_eq!(
+        results.iter().filter(|r| r["ok"] == true).count(),
+        4,
+        "{answer}"
+    );
+    assert!(
+        results
+            .iter()
+            .filter(|r| r["ok"] != true)
+            .all(|r| r["code"] == "E_RATE_LIMIT_EXCEEDED"),
+        "{answer}"
+    );
+    // Only the sends that hold a slot buffer their stream.
+    assert_eq!(answer["reads"], 4, "{answer}");
+    assert_eq!(sink.delivered().len(), 4);
+}
+
+#[tokio::test]
 async fn a_relay_that_never_says_goodbye_does_not_hold_the_send() {
     let sink = Sink::start(Behaviour {
         hang_on_quit: true,

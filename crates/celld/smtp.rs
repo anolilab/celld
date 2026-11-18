@@ -70,6 +70,9 @@ const MIN_BODY_RATE: usize = 64 * 1024;
 const BODY_CHUNK: usize = 64 * 1024;
 /// How long the `QUIT` that ends a delivered message may take to be written.
 const QUIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// The longest command line, its CRLF included (RFC 5321).
+const MAX_COMMAND_LINE: usize = 512;
+
 /// The longest reply line read; RFC 5321 allows 512.
 const MAX_REPLY_LINE: u64 = 2048;
 /// The most lines one reply may have.
@@ -600,8 +603,16 @@ async fn authenticate(
         plain.extend_from_slice(credentials.username.as_bytes());
         plain.push(0);
         plain.extend_from_slice(credentials.password.as_bytes());
-        let line = Zeroizing::new(format!("AUTH PLAIN {}", encode(&plain).as_str()));
-        expect(connection, "auth", &line, &[235]).await?;
+        let encoded = encode(&plain);
+        let line = Zeroizing::new(format!("AUTH PLAIN {}", encoded.as_str()));
+        if line.len() + 2 <= MAX_COMMAND_LINE {
+            expect(connection, "auth", &line, &[235]).await?;
+        } else {
+            // Long credentials do not fit the command line. The response
+            // goes on its own line after the server's `334`.
+            expect(connection, "auth", "AUTH PLAIN", &[334]).await?;
+            expect(connection, "auth", encoded.as_str(), &[235]).await?;
+        }
     } else if mechanisms.contains(&"LOGIN") {
         expect(connection, "auth", "AUTH LOGIN", &[334]).await?;
         expect(
@@ -1032,6 +1043,92 @@ mod tests {
             message,
         )
         .await
+    }
+
+    /// A relay that accepts `AUTH PLAIN` only as the RFC 5321 command line
+    /// allows: a longer line is a `500`, and an initial response may follow a
+    /// bare `AUTH PLAIN` after a `334`. Returns what authenticated.
+    #[allow(clippy::disallowed_methods)] // The test drives a real loopback socket.
+    async fn auth_relay() -> (u16, Arc<Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(Mutex::new(Vec::new()));
+        let record = accepted.clone();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut stream = BufReader::new(stream);
+            stream.get_mut().write_all(b"220 sink\r\n").await.unwrap();
+            let mut line = String::new();
+            let mut awaiting_response = false;
+            loop {
+                line.clear();
+                if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let reply: &[u8] = if awaiting_response {
+                    awaiting_response = false;
+                    record.lock().unwrap().push(line.trim_end().to_string());
+                    b"235 ok\r\n"
+                } else if line.len() > 512 {
+                    b"500 line too long\r\n"
+                } else if line.trim_end().eq_ignore_ascii_case("AUTH PLAIN") {
+                    awaiting_response = true;
+                    b"334 \r\n"
+                } else if line.to_ascii_uppercase().starts_with("AUTH PLAIN ") {
+                    record
+                        .lock()
+                        .unwrap()
+                        .push(line.trim_end()[11..].to_string());
+                    b"235 ok\r\n"
+                } else if line.to_ascii_uppercase().starts_with("EHLO") {
+                    b"250-sink\r\n250 AUTH PLAIN\r\n"
+                } else if line.to_ascii_uppercase().starts_with("DATA") {
+                    stream.get_mut().write_all(b"354 go\r\n").await.unwrap();
+                    loop {
+                        line.clear();
+                        if stream.read_line(&mut line).await.unwrap_or(0) == 0 || line == ".\r\n" {
+                            break;
+                        }
+                    }
+                    b"250 queued\r\n"
+                } else if line.to_ascii_uppercase().starts_with("QUIT") {
+                    return;
+                } else {
+                    b"250 ok\r\n"
+                };
+                stream.get_mut().write_all(reply).await.unwrap();
+            }
+        });
+        (port, accepted)
+    }
+
+    #[tokio::test]
+    async fn credentials_too_long_for_one_command_line_go_after_a_334() {
+        crate::asyncrt::install_test_host_runtime();
+        for (user, password) in [
+            ("user".to_string(), "pass".to_string()),
+            ("u".repeat(255), "p".repeat(255)),
+        ] {
+            let (port, accepted) = auth_relay().await;
+            let mut settings = open_settings(port);
+            settings.credentials = Some(Credentials {
+                username: user.clone(),
+                password: password.clone().into(),
+            });
+            let authority = authority();
+            let timeouts = Timeouts {
+                reply: Duration::from_secs(5),
+                ..quick(Duration::from_secs(5), Duration::from_secs(5))
+            };
+            deliver_with(&settings, &authority.connector, timeouts, &message())
+                .await
+                .unwrap_or_else(|error| panic!("{} bytes: {error}", user.len()));
+            let expected = STANDARD.encode(format!("\0{user}\0{password}"));
+            assert_eq!(*accepted.lock().unwrap(), [expected]);
+        }
     }
 
     #[tokio::test]

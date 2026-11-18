@@ -70,15 +70,79 @@ fn refuse(scope: &mut v8::PinScope, mut rv: v8::ReturnValue<v8::Value>, error: E
     rv.set(promise_for(scope, async_id));
 }
 
+fn rate_limited() -> EmailError {
+    EmailError::new(
+        "E_RATE_LIMIT_EXCEEDED",
+        format!(
+            "at most {} messages may be in flight at once",
+            crate::smtp::MAX_PER_ISOLATE
+        ),
+    )
+}
+
+/// Take the isolate's slot and charge the subrequest for a send whose raw
+/// stream the binding is about to read, before it reads any of it. Answers ""
+/// or the refusal as `send()` shall reject with it.
+pub(super) fn op_email_reserve(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let context = event_context(scope);
+    if let Err(error) = context.charge_subrequest() {
+        return loader_throw(scope, &error);
+    }
+    let reserved = actor_runtime_state(scope).declared.reserve_send_slot();
+    let text = if reserved {
+        String::new()
+    } else {
+        answer(Err(rate_limited()))
+    };
+    let text = v8::String::new(scope, &text).unwrap();
+    rv.set(text.into());
+}
+
+/// Give back a slot [`op_email_reserve`] took, when the send did not start.
+pub(super) fn op_email_release(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    drop(
+        actor_runtime_state(scope)
+            .declared
+            .take_reserved_send_slot(),
+    );
+}
+
 pub(super) fn op_email_send(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    // A send whose stream was read took its slot and paid its subrequest
+    // first; it holds that slot from here, and any early refusal gives it back.
+    let reserved = args.get(2).is_true();
+    let held = reserved
+        .then(|| {
+            actor_runtime_state(scope)
+                .declared
+                .take_reserved_send_slot()
+        })
+        .flatten();
+    if reserved && held.is_none() {
+        return refuse(
+            scope,
+            rv,
+            EmailError::new("E_VALIDATION_ERROR", "the call is malformed"),
+        );
+    }
     // A send costs a subrequest, as a fetch or a Workers AI call does.
     let context = event_context(scope);
-    if let Err(error) = context.charge_subrequest() {
-        return loader_throw(scope, &error);
+    if held.is_none() {
+        if let Err(error) = context.charge_subrequest() {
+            return loader_throw(scope, &error);
+        }
     }
     // Bound what the host copies before it copies it: the JavaScript side
     // limits a message, but this op is the boundary.
@@ -91,18 +155,8 @@ pub(super) fn op_email_send(
     }
     // The slot comes before anything is copied or built, so an isolate that
     // sends faster than the relay takes messages holds no more than a few.
-    let Some(slot) = actor_runtime_state(scope).declared.take_send_slot() else {
-        return refuse(
-            scope,
-            rv,
-            EmailError::new(
-                "E_RATE_LIMIT_EXCEEDED",
-                format!(
-                    "at most {} messages may be in flight at once",
-                    crate::smtp::MAX_PER_ISOLATE
-                ),
-            ),
-        );
+    let Some(slot) = held.or_else(|| actor_runtime_state(scope).declared.take_send_slot()) else {
+        return refuse(scope, rv, rate_limited());
     };
     let raw_call = args.get(0).to_rust_string_lossy(scope);
     let call: Call = match serde_json::from_str(&raw_call) {
@@ -125,7 +179,13 @@ pub(super) fn op_email_send(
             Ok(prepared) => prepared,
             Err(error) => return Ok::<String, String>(answer(Err(error))),
         };
-        await_egress_gate(gate).await?;
+        // The refusal reaches `send()` with a code, like any other failure.
+        if let Err(message) = await_egress_gate(gate).await {
+            return Ok(answer(Err(EmailError::new(
+                "E_INTERNAL_SERVER_ERROR",
+                message,
+            ))));
+        }
         let sent = match crate::smtp::relay() {
             Ok(relay) => crate::smtp::deliver(relay, &script, &prepared).await,
             Err(error) => Err(error),
