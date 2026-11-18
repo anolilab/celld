@@ -73,18 +73,48 @@ const BOUNDS_US: [u64; 13] = [
 
 const BUCKETS: usize = BOUNDS_US.len() + 1;
 
+/// A histogram of relaxed atomics: one count per bucket, the last of them
+/// `+Inf`, and the sum of the values. Several families share it, each with its
+/// own bounds and its own copies per shard.
+pub(crate) struct Histogram<const BUCKETS: usize> {
+    buckets: [AtomicU64; BUCKETS],
+    sum: AtomicU64,
+}
+
+impl<const BUCKETS: usize> Histogram<BUCKETS> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            buckets: [const { AtomicU64::new(0) }; BUCKETS],
+            sum: AtomicU64::new(0),
+        }
+    }
+
+    /// Count `value` in the first bucket whose bound is not below it.
+    pub(crate) fn add(&self, bounds: &[u64], value: u64) {
+        let bucket = bounds.partition_point(|bound| *bound < value);
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        self.sum.fetch_add(value, Ordering::Relaxed);
+    }
+
+    /// Add this shard's counts to a scrape's totals.
+    pub(crate) fn sum_into(&self, buckets: &mut [u64; BUCKETS], sum: &mut u64) {
+        for (total, count) in buckets.iter_mut().zip(&self.buckets) {
+            *total += count.load(Ordering::Relaxed);
+        }
+        *sum += self.sum.load(Ordering::Relaxed);
+    }
+}
+
 struct Requests {
     by_class: [AtomicU64; CLASSES.len()],
-    buckets: [AtomicU64; BUCKETS],
-    sum_us: AtomicU64,
+    latency: Histogram<BUCKETS>,
 }
 
 impl Requests {
     const fn new() -> Self {
         Self {
             by_class: [const { AtomicU64::new(0) }; CLASSES.len()],
-            buckets: [const { AtomicU64::new(0) }; BUCKETS],
-            sum_us: AtomicU64::new(0),
+            latency: Histogram::new(),
         }
     }
 }
@@ -102,18 +132,21 @@ static REQUESTS: [Shard; SHARDS] = [const { Shard([const { Requests::new() }; 3]
 static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
-    /// Threads take shards in turn. More threads than shards share one, which
-    /// stays correct: the counters are atomic.
-    static SHARD: usize = NEXT_SHARD.fetch_add(1, Ordering::Relaxed) % SHARDS;
+    /// Threads take shards in turn.
+    static THREAD: usize = NEXT_SHARD.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The shard of this thread among `shards`. More threads than shards share
+/// one, which stays correct: the counters are atomic.
+pub(crate) fn shard(shards: usize) -> usize {
+    THREAD.with(|thread| *thread % shards)
 }
 
 fn record(listener: Listener, class: usize, elapsed: Duration) {
-    let requests = &REQUESTS[SHARD.with(|shard| *shard)].0[listener as usize];
+    let requests = &REQUESTS[shard(SHARDS)].0[listener as usize];
     let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
-    let bucket = BOUNDS_US.partition_point(|bound| *bound < micros);
     requests.by_class[class].fetch_add(1, Ordering::Relaxed);
-    requests.buckets[bucket].fetch_add(1, Ordering::Relaxed);
-    requests.sum_us.fetch_add(micros, Ordering::Relaxed);
+    requests.latency.add(&BOUNDS_US, micros);
 }
 
 /// Count one answered request. The latency runs from the start of handling
@@ -444,6 +477,7 @@ pub fn family_names() -> impl Iterator<Item = &'static str> {
         .iter()
         .map(|family| family.name)
         .chain(REQUEST_FAMILIES)
+        .chain(crate::sql_stats::FAMILIES)
 }
 
 /// Render the exposition from the actor's counts, the storage counters and
@@ -479,6 +513,7 @@ fn render_reading(reading: &Reading) -> String {
         }
     }
     requests(&mut out);
+    crate::sql_stats::render(&mut out);
     out
 }
 
@@ -505,10 +540,9 @@ fn totals(listener: Listener) -> Totals {
         for (total, count) in totals.by_class.iter_mut().zip(&requests.by_class) {
             *total += count.load(Ordering::Relaxed);
         }
-        for (total, count) in totals.buckets.iter_mut().zip(&requests.buckets) {
-            *total += count.load(Ordering::Relaxed);
-        }
-        totals.sum_us += requests.sum_us.load(Ordering::Relaxed);
+        requests
+            .latency
+            .sum_into(&mut totals.buckets, &mut totals.sum_us);
     }
     totals
 }
@@ -537,28 +571,48 @@ fn requests(out: &mut String) {
         "Time from the start of handling a request to its response head, or to its abandonment.",
     );
     for (listener, totals) in Listener::ALL.iter().zip(&totals) {
-        let name = listener.name();
-        let mut cumulative = 0;
-        for (index, count) in totals.buckets.iter().enumerate() {
-            cumulative += count;
-            let le = BOUNDS_US
-                .get(index)
-                .map_or_else(|| "+Inf".to_owned(), |us| (*us as f64 / 1e6).to_string());
-            let _ = writeln!(
-                out,
-                "celld_http_request_duration_seconds_bucket{{listener=\"{name}\",le=\"{le}\"}} {cumulative}"
-            );
-        }
-        let _ = writeln!(
+        write_histogram(
             out,
-            "celld_http_request_duration_seconds_sum{{listener=\"{name}\"}} {}",
-            totals.sum_us as f64 / 1e6
-        );
-        let _ = writeln!(
-            out,
-            "celld_http_request_duration_seconds_count{{listener=\"{name}\"}} {cumulative}"
+            REQUEST_FAMILIES[1],
+            &format!("listener=\"{}\"", listener.name()),
+            &BOUNDS_US,
+            &totals.buckets,
+            totals.sum_us,
+            true,
         );
     }
+}
+
+/// Write the `_bucket`, `_sum` and `_count` lines of one histogram series.
+/// `buckets` holds a count per bound and then the `+Inf` one, not yet
+/// cumulative. `seconds` says the bounds and the sum are microseconds to print
+/// as seconds.
+pub(crate) fn write_histogram(
+    out: &mut String,
+    name: &str,
+    labels: &str,
+    bounds: &[u64],
+    buckets: &[u64],
+    sum: u64,
+    seconds: bool,
+) {
+    let scale = |value: u64| {
+        if seconds {
+            (value as f64 / 1e6).to_string()
+        } else {
+            value.to_string()
+        }
+    };
+    let mut cumulative = 0;
+    for (index, count) in buckets.iter().take(bounds.len() + 1).enumerate() {
+        cumulative += count;
+        let le = bounds
+            .get(index)
+            .map_or_else(|| "+Inf".to_owned(), |bound| scale(*bound));
+        let _ = writeln!(out, "{name}_bucket{{{labels},le=\"{le}\"}} {cumulative}");
+    }
+    let _ = writeln!(out, "{name}_sum{{{labels}}} {}", scale(sum));
+    let _ = writeln!(out, "{name}_count{{{labels}}} {cumulative}");
 }
 
 #[cfg(test)]

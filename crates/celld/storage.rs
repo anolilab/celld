@@ -67,7 +67,7 @@ pub struct Cells {
     alarm_moves: RefCell<HashMap<String, celld_logic::wake::AlarmSnapshot>>,
     alarm_dirty: RefCell<HashSet<String>>,
     sync_list_cursors: RefCell<HashMap<u64, SyncListCursor>>,
-    sql_cursors: RefCell<HashMap<u64, SqlCursor>>,
+    sql_cursors: RefCell<HashMap<u64, SqlCursor<'static>>>,
     sql_statement_caches: RefCell<HashMap<String, SqlStatementCache>>,
     sql_critical_errors: RefCell<HashMap<String, String>>,
     /// The root cell each open database belongs to. A facet's own scope names
@@ -262,7 +262,7 @@ fn sync_list_cursors<T>(f: impl FnOnce(&RefCell<HashMap<u64, SyncListCursor>>) -
     cells(|c| f(&c.sync_list_cursors))
 }
 
-fn sql_cursors<T>(f: impl FnOnce(&RefCell<HashMap<u64, SqlCursor>>) -> T) -> T {
+fn sql_cursors<T>(f: impl FnOnce(&RefCell<HashMap<u64, SqlCursor<'static>>>) -> T) -> T {
     cells(|c| f(&c.sql_cursors))
 }
 
@@ -335,12 +335,117 @@ struct SyncListCursor {
     reverse: bool,
 }
 
-struct SqlCursor {
-    scope: String,
+/// A stepped statement. However it goes away -- drained, closed, closed with
+/// its cell, or dropped after an error -- it is recorded once in the statement
+/// statistics, with whatever it had used by then.
+struct SqlCursor<'a> {
+    scope: std::borrow::Cow<'a, str>,
     database: *mut rusqlite::ffi::sqlite3,
     statement: *mut rusqlite::ffi::sqlite3_stmt,
+    /// The change count at the start of the whole `exec`: what the cursor's
+    /// `rowsWritten` counts from.
     changes_before: u64,
+    /// The rows this statement wrote, summed over its own steps. Another
+    /// statement can write between two steps of an open cursor, so the
+    /// connection's count since the first step is not the cursor's.
+    written: u64,
+    /// The statement cannot write, so its steps need not read the count.
+    readonly: bool,
     cache_query: Option<Arc<str>>,
+    stats: crate::sql_stats::Running,
+}
+
+impl<'a> SqlCursor<'a> {
+    /// A statement about to be stepped for the first time. It starts
+    /// borrowing `scope`, so a statement that ends within its call allocates
+    /// nothing; [`Self::into_owned`] makes it outlive the call.
+    fn new(
+        scope: &'a str,
+        database: *mut rusqlite::ffi::sqlite3,
+        statement: *mut rusqlite::ffi::sqlite3_stmt,
+        changes_before: u64,
+        cache_query: Option<Arc<str>>,
+    ) -> Self {
+        Self {
+            scope: std::borrow::Cow::Borrowed(scope),
+            database,
+            statement,
+            changes_before,
+            written: 0,
+            // SAFETY: the caller hands over a live statement.
+            readonly: unsafe { rusqlite::ffi::sqlite3_stmt_readonly(statement) != 0 },
+            cache_query,
+            stats: crate::sql_stats::Running::default(),
+        }
+    }
+
+    /// Step the statement, adding to `written` what this step changed. A
+    /// statement that cannot write reads no count; one that can reads it
+    /// before and after, because only a read right around the step leaves out
+    /// the writes of other statements.
+    ///
+    /// # Safety
+    /// The statement and its connection are live.
+    unsafe fn step(&mut self) -> i32 {
+        if self.readonly {
+            return rusqlite::ffi::sqlite3_step(self.statement);
+        }
+        let before = total_changes_for_handle(self.database);
+        let code = rusqlite::ffi::sqlite3_step(self.statement);
+        self.written += total_changes_for_handle(self.database).saturating_sub(before);
+        code
+    }
+
+    fn into_owned(mut self) -> SqlCursor<'static> {
+        SqlCursor {
+            scope: std::borrow::Cow::Owned(self.scope.as_ref().to_owned()),
+            database: self.database,
+            // The statement moves: what is left behind owns nothing, so its
+            // drop neither records nor finalizes.
+            statement: std::mem::replace(&mut self.statement, std::ptr::null_mut()),
+            changes_before: self.changes_before,
+            written: self.written,
+            readonly: self.readonly,
+            cache_query: self.cache_query.take(),
+            stats: self.stats,
+        }
+    }
+
+    /// The statement failed: it must not go back to the cache.
+    fn discard_cache_slot(&mut self) {
+        if let Some(query) = self.cache_query.take() {
+            discard_cached_sql_statement(&self.scope, &query);
+        }
+    }
+}
+
+/// Record a statement that ended, having written `rows_written` rows.
+///
+/// # Safety
+/// `statement` is live.
+unsafe fn record_sql_statement(
+    scope: &str,
+    statement: *mut rusqlite::ffi::sqlite3_stmt,
+    rows_written: u64,
+    stats: crate::sql_stats::Running,
+) {
+    stats.finish(scope, rows_written, || sql_statement_text(statement));
+}
+
+/// Record a statement whose parameters were refused before it ran: the wrong
+/// number of them, or one SQLite would not bind.
+///
+/// # Safety
+/// `statement` is live.
+unsafe fn record_refused_bind(
+    scope: &str,
+    elapsed: std::time::Duration,
+    statement: *mut rusqlite::ffi::sqlite3_stmt,
+    code: i32,
+) {
+    crate::sql_stats::record_refused(scope, elapsed, sql_outcome(code), code, || {
+        sql_statement_text(statement)
+    });
 }
 
 #[derive(Default)]
@@ -368,12 +473,32 @@ impl Drop for CachedSqlStatement {
     }
 }
 
-impl Drop for SqlCursor {
+impl Drop for SqlCursor<'_> {
     fn drop(&mut self) {
         if self.statement.is_null() {
             return;
         }
         let statement = std::mem::replace(&mut self.statement, std::ptr::null_mut());
+        // SAFETY: the cursor owns its live statement, and its connection stays
+        // open until `close()`, which drops the cursors first.
+        unsafe {
+            // A statement stopped before its last row has not added its
+            // changes to the connection's count: reset it first, so the count
+            // is what the statement wrote. A reset that fails, such as the
+            // commit of a write stopped early, fails the statement.
+            let before = (!self.readonly).then(|| total_changes_for_handle(self.database));
+            let reset = rusqlite::ffi::sqlite3_reset(statement);
+            if let Some(before) = before {
+                self.written += total_changes_for_handle(self.database).saturating_sub(before);
+            }
+            if reset != rusqlite::ffi::SQLITE_OK {
+                if self.stats.is_ok() {
+                    self.stats.fail(sql_outcome(reset), reset);
+                }
+                self.discard_cache_slot();
+            }
+            record_sql_statement(&self.scope, statement, self.written, self.stats);
+        }
         if let Some(query) = self.cache_query.take() {
             recycle_sql_statement(&self.scope, &query, statement);
         } else {
@@ -1465,6 +1590,9 @@ pub fn sql_ingest(scope: &str, input: &str) -> Result<(String, u64, u64), String
                 let mut statement_count = 0_u64;
 
                 loop {
+                    // Each statement has its own clock, from before it is
+                    // prepared, and its own writes.
+                    crate::sql_limits::arm();
                     let offset = source.offset_from(start) as usize;
                     let remainder = input
                         .get(offset..)
@@ -1489,6 +1617,13 @@ pub fn sql_ingest(scope: &str, input: &str) -> Result<(String, u64, u64), String
                                 statement_count,
                             ));
                         }
+                        crate::sql_stats::record_refused(
+                            scope,
+                            crate::sql_limits::elapsed(),
+                            sql_outcome(prepare),
+                            prepare,
+                            || Some(remainder.to_owned()),
+                        );
                         return Err(sqlite_operation_failure(
                             scope,
                             database,
@@ -1523,26 +1658,29 @@ pub fn sql_ingest(scope: &str, input: &str) -> Result<(String, u64, u64), String
                         ));
                     }
 
-                    crate::sql_limits::arm();
+                    // Recorded, and finalized, when it drops.
+                    let mut run = SqlCursor::new(scope, database, statement, changes_before, None);
+                    let mut rows = 0;
                     loop {
-                        let step = rusqlite::ffi::sqlite3_step(statement);
+                        let step = run.step();
                         match step {
-                            rusqlite::ffi::SQLITE_ROW => {}
+                            rusqlite::ffi::SQLITE_ROW => rows += 1,
                             rusqlite::ffi::SQLITE_DONE => break,
                             _ => {
-                                let error = sqlite_operation_failure(
+                                run.stats.step(crate::sql_limits::elapsed(), rows, 0);
+                                run.stats.fail(sql_outcome(step), step);
+                                return Err(sqlite_operation_failure(
                                     scope,
                                     database,
                                     started_in_transaction,
                                     step,
                                     "step ingested SQL",
-                                );
-                                rusqlite::ffi::sqlite3_finalize(statement);
-                                return Err(error);
+                                ));
                             }
                         }
                     }
-                    rusqlite::ffi::sqlite3_finalize(statement);
+                    run.stats.step(crate::sql_limits::elapsed(), rows, 0);
+                    drop(run);
                     statement_count += 1;
                     source = tail;
                 }
@@ -1582,6 +1720,37 @@ pub enum SqlValue {
     Real(f64),
     Text(String),
     Blob(Vec<u8>),
+}
+
+/// The bytes of one result row, as the statement statistics count them: the
+/// length of text and blob values, eight for the rest.
+fn sql_row_bytes(row: &[SqlValue]) -> u64 {
+    row.iter()
+        .map(|value| match value {
+            SqlValue::Text(text) => text.len() as u64,
+            SqlValue::Blob(bytes) => bytes.len() as u64,
+            SqlValue::Integer(_) | SqlValue::Real(_) => 8,
+            SqlValue::Null => 0,
+        })
+        .sum()
+}
+
+/// How a failed step ended, for the statement statistics.
+fn sql_outcome(code: i32) -> crate::sql_stats::Outcome {
+    if code & 0xff == rusqlite::ffi::SQLITE_INTERRUPT && crate::sql_limits::statement_expired() {
+        crate::sql_stats::Outcome::Timeout
+    } else {
+        crate::sql_stats::Outcome::Error
+    }
+}
+
+/// The text a prepared statement was compiled from, without bound values.
+///
+/// # Safety
+/// `statement` is a live prepared statement.
+unsafe fn sql_statement_text(statement: *mut rusqlite::ffi::sqlite3_stmt) -> Option<String> {
+    let text = rusqlite::ffi::sqlite3_sql(statement);
+    (!text.is_null()).then(|| CStr::from_ptr(text).to_string_lossy().into_owned())
 }
 
 unsafe fn sql_cursor_row(statement: *mut rusqlite::ffi::sqlite3_stmt) -> Vec<SqlValue> {
@@ -1852,6 +2021,14 @@ fn discard_in_use_sql_statement(
 /// from starting a SQL cursor.
 type SqlCursorStart = (u64, Vec<String>, Option<Vec<SqlValue>>, u64, bool);
 
+/// What the first step of a statement left behind.
+struct SqlStarted<'a> {
+    cursor: SqlCursor<'a>,
+    columns: Vec<String>,
+    row: Option<Vec<SqlValue>>,
+    rows_written: u64,
+}
+
 /// Prepare and step a SQL statement once. The returned cursor owns the native
 /// statement and yields at most one copied row per subsequent call.
 pub fn sql_cursor_start(
@@ -1884,7 +2061,7 @@ pub(crate) fn sql_cursor_start_values(
             } => (statement, Some(query), false, reused),
         };
     let sql = CString::new(query).map_err(|error| error.to_string())?;
-    let result = with(scope, |connection| -> anyhow::Result<_> {
+    let started = with(scope, |connection| -> anyhow::Result<SqlStarted<'_>> {
         // `storage.sql.exec` reaches SQLite here, so this is where the `_cf_`
         // reservation has to hold -- the statement is prepared inside, and
         // preparation is when SQLite consults the authorizer.
@@ -1894,11 +2071,16 @@ pub(crate) fn sql_cursor_start_values(
             unsafe {
                 let database = connection.handle();
                 let started_in_transaction = rusqlite::ffi::sqlite3_get_autocommit(database) == 0;
-                let changes_before = total_changes_for_handle(database);
+                let exec_changes_before = total_changes_for_handle(database);
                 let start = sql.as_ptr();
                 let mut source = start;
                 let mut saw_prefix = false;
                 loop {
+                    // Each statement is its own: its own clock, from before it
+                    // is prepared, and its own writes.
+                    if saw_prefix {
+                        crate::sql_limits::arm();
+                    }
                     let using_cached = source == start && !cached_statement.is_null();
                     let mut cache_query = using_cached
                         .then(|| cached_query.as_ref().expect("cached query key").clone());
@@ -1917,6 +2099,13 @@ pub(crate) fn sql_cursor_start_values(
                             &mut tail,
                         );
                         if prepare != rusqlite::ffi::SQLITE_OK {
+                            crate::sql_stats::record_refused(
+                                scope,
+                                crate::sql_limits::elapsed(),
+                                sql_outcome(prepare),
+                                prepare,
+                                || Some(CStr::from_ptr(source).to_string_lossy().into_owned()),
+                            );
                             discard_in_use_sql_statement(scope, cache_query.as_deref(), statement);
                             return Err(sqlite_operation_failure(
                                 scope,
@@ -1939,35 +2128,42 @@ pub(crate) fn sql_cursor_start_values(
                             .any(|byte| !byte.is_ascii_whitespace());
                     if has_more {
                         if rusqlite::ffi::sqlite3_bind_parameter_count(statement) != 0 {
+                            record_refused_bind(
+                                scope,
+                                crate::sql_limits::elapsed(),
+                                statement,
+                                rusqlite::ffi::SQLITE_RANGE,
+                            );
                             discard_in_use_sql_statement(scope, None, statement);
                             return Err(anyhow::anyhow!(
                                 "Wrong number of parameter bindings for SQL query."
                             ));
                         }
-                        if saw_prefix {
-                            // The first statement runs under `as_user_sql`'s
-                            // arm; later ones start their own clock.
-                            crate::sql_limits::arm();
-                        }
+                        // A prefix statement is recorded when it drops, like any
+                        // other: its rows are read and discarded.
+                        let mut prefix =
+                            SqlCursor::new(scope, database, statement, exec_changes_before, None);
+                        let mut rows = 0;
                         loop {
-                            let step = rusqlite::ffi::sqlite3_step(statement);
+                            let step = prefix.step();
                             match step {
-                                rusqlite::ffi::SQLITE_ROW => {}
+                                rusqlite::ffi::SQLITE_ROW => rows += 1,
                                 rusqlite::ffi::SQLITE_DONE => break,
                                 _ => {
-                                    let error = sqlite_operation_failure(
+                                    prefix.stats.step(crate::sql_limits::elapsed(), rows, 0);
+                                    prefix.stats.fail(sql_outcome(step), step);
+                                    return Err(sqlite_operation_failure(
                                         scope,
                                         database,
                                         started_in_transaction,
                                         step,
                                         "step SQL prefix",
-                                    );
-                                    discard_in_use_sql_statement(scope, None, statement);
-                                    return Err(error);
+                                    ));
                                 }
                             }
                         }
-                        rusqlite::ffi::sqlite3_finalize(statement);
+                        prefix.stats.step(crate::sql_limits::elapsed(), rows, 0);
+                        drop(prefix);
                         source = tail;
                         saw_prefix = true;
                         continue;
@@ -1975,13 +2171,25 @@ pub(crate) fn sql_cursor_start_values(
 
                     let expected = rusqlite::ffi::sqlite3_bind_parameter_count(statement) as usize;
                     if expected != binds.len() {
+                        record_refused_bind(
+                            scope,
+                            crate::sql_limits::elapsed(),
+                            statement,
+                            rusqlite::ffi::SQLITE_RANGE,
+                        );
                         discard_in_use_sql_statement(scope, cache_query.as_deref(), statement);
                         return Err(anyhow::anyhow!(
                             "Wrong number of parameter bindings for SQL query."
                         ));
                     }
                     for (offset, value) in binds.iter().enumerate() {
-                        if bind_cursor_value(statement, offset as i32 + 1, value).is_err() {
+                        if let Err(code) = bind_cursor_value(statement, offset as i32 + 1, value) {
+                            record_refused_bind(
+                                scope,
+                                crate::sql_limits::elapsed(),
+                                statement,
+                                code,
+                            );
                             let error = sqlite_failure(database, "bind sync KV cursor");
                             discard_in_use_sql_statement(scope, cache_query.as_deref(), statement);
                             return Err(error);
@@ -1990,41 +2198,41 @@ pub(crate) fn sql_cursor_start_values(
                     if cache_query.is_none() && !cache_busy && !saw_prefix {
                         cache_query = register_cached_sql_statement(scope, query, statement);
                     }
-                    if saw_prefix {
-                        crate::sql_limits::arm();
-                    }
-                    let step = rusqlite::ffi::sqlite3_step(statement);
+                    // `rowsWritten` counts the whole `exec`.
+                    let mut cursor = SqlCursor::new(
+                        scope,
+                        database,
+                        statement,
+                        exec_changes_before,
+                        cache_query,
+                    );
+                    let step = cursor.step();
+                    cursor.stats.step(crate::sql_limits::elapsed(), 0, 0);
                     return match step {
                         rusqlite::ffi::SQLITE_ROW => {
                             // Read metadata after the first step so SQLite has
                             // automatically recompiled an expired cached statement.
                             let columns = sql_cursor_columns(statement);
                             let row = sql_cursor_row(statement);
-                            Ok((
-                                database,
-                                statement,
-                                changes_before,
+                            cursor
+                                .stats
+                                .step(std::time::Duration::ZERO, 1, sql_row_bytes(&row));
+                            Ok(SqlStarted {
+                                cursor,
                                 columns,
-                                Some(row),
-                                0,
-                                cache_query,
-                            ))
+                                row: Some(row),
+                                rows_written: 0,
+                            })
                         }
-                        rusqlite::ffi::SQLITE_DONE => {
-                            let columns = sql_cursor_columns(statement);
-                            let rows_written =
-                                total_changes_for_handle(database).saturating_sub(changes_before);
-                            Ok((
-                                database,
-                                statement,
-                                changes_before,
-                                columns,
-                                None,
-                                rows_written,
-                                cache_query,
-                            ))
-                        }
+                        rusqlite::ffi::SQLITE_DONE => Ok(SqlStarted {
+                            columns: sql_cursor_columns(statement),
+                            row: None,
+                            rows_written: total_changes_for_handle(database)
+                                .saturating_sub(exec_changes_before),
+                            cursor,
+                        }),
                         _ => {
+                            cursor.stats.fail(sql_outcome(step), step);
                             let error = sqlite_operation_failure(
                                 scope,
                                 database,
@@ -2032,7 +2240,7 @@ pub(crate) fn sql_cursor_start_values(
                                 step,
                                 "step SQL cursor",
                             );
-                            discard_in_use_sql_statement(scope, cache_query.as_deref(), statement);
+                            cursor.discard_cache_slot();
                             Err(error)
                         }
                     };
@@ -2043,28 +2251,19 @@ pub(crate) fn sql_cursor_start_values(
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
     .map_err(|error| error.to_string())?;
 
-    let (database, statement, changes_before, columns, row, rows_written, cache_query) = result;
+    let SqlStarted {
+        cursor,
+        columns,
+        row,
+        rows_written,
+    } = started;
     if row.is_none() {
-        if let Some(query) = cache_query.as_deref() {
-            recycle_sql_statement(scope, query, statement);
-        } else {
-            discard_in_use_sql_statement(scope, None, statement);
-        }
+        // Done: the drop records the statement and returns it to the cache.
+        drop(cursor);
         return Ok((0, columns, row, rows_written, reused_cached_query));
     }
     let id = NEXT_SQL_CURSOR.fetch_add(1, Ordering::Relaxed);
-    sql_cursors(|cursors| {
-        cursors.borrow_mut().insert(
-            id,
-            SqlCursor {
-                scope: scope.to_string(),
-                database,
-                statement,
-                changes_before,
-                cache_query,
-            },
-        );
-    });
+    sql_cursors(|cursors| cursors.borrow_mut().insert(id, cursor.into_owned()));
     Ok((id, columns, row, rows_written, reused_cached_query))
 }
 
@@ -2088,18 +2287,27 @@ pub fn sql_cursor_next(cursor_id: u64) -> Result<(Option<Vec<SqlValue>>, u64), S
             unsafe { rusqlite::ffi::sqlite3_get_autocommit(cursor.database) == 0 };
         // The bound is per step, and this step runs outside `as_user_sql`.
         crate::sql_limits::arm();
-        let step = unsafe { rusqlite::ffi::sqlite3_step(cursor.statement) };
+        let step = unsafe { cursor.step() };
+        let elapsed = crate::sql_limits::elapsed();
         crate::sql_limits::disarm();
         match step {
-            rusqlite::ffi::SQLITE_ROW => Ok((Some(unsafe { sql_cursor_row(cursor.statement) }), 0)),
+            rusqlite::ffi::SQLITE_ROW => {
+                let row = unsafe { sql_cursor_row(cursor.statement) };
+                cursor.stats.step(elapsed, 1, sql_row_bytes(&row));
+                Ok((Some(row), 0))
+            }
             rusqlite::ffi::SQLITE_DONE => {
                 let rows_written = unsafe {
                     total_changes_for_handle(cursor.database).saturating_sub(cursor.changes_before)
                 };
+                cursor.stats.step(elapsed, 0, 0);
+                // Removing it records the statement.
                 cursors.remove(&cursor_id);
                 Ok((None, rows_written))
             }
             _ => {
+                cursor.stats.step(elapsed, 0, 0);
+                cursor.stats.fail(sql_outcome(step), step);
                 let error = sqlite_operation_failure(
                     &cursor.scope,
                     cursor.database,
@@ -2108,9 +2316,7 @@ pub fn sql_cursor_next(cursor_id: u64) -> Result<(Option<Vec<SqlValue>>, u64), S
                     "step SQL cursor",
                 )
                 .to_string();
-                if let Some(query) = cursor.cache_query.take() {
-                    discard_cached_sql_statement(&cursor.scope, &query);
-                }
+                cursor.discard_cache_slot();
                 cursors.remove(&cursor_id);
                 Err(error)
             }
@@ -2124,7 +2330,7 @@ pub fn sql_cursor_scope(cursor_id: u64) -> Option<String> {
         cursors
             .borrow()
             .get(&cursor_id)
-            .map(|cursor| cursor.scope.clone())
+            .map(|cursor| cursor.scope.to_string())
     })
 }
 
@@ -2474,6 +2680,59 @@ fn d1_result_limit_error() -> String {
     )
 }
 
+/// Where a D1 statement began: the clock before it was prepared, and the
+/// connection's change count.
+#[derive(Clone, Copy)]
+struct D1Start {
+    at: std::time::Instant,
+    changes: u64,
+}
+
+impl D1Start {
+    unsafe fn now(database: *mut rusqlite::ffi::sqlite3) -> Self {
+        Self {
+            at: std::time::Instant::now(),
+            changes: total_changes_for_handle(database),
+        }
+    }
+}
+
+/// Records one D1 statement, once, when [`d1_step_to_done`] is over with it.
+struct D1Recording<'a> {
+    scope: &'a str,
+    database: *mut rusqlite::ffi::sqlite3,
+    statement: *mut rusqlite::ffi::sqlite3_stmt,
+    changes_before: u64,
+    stats: crate::sql_stats::Running,
+}
+
+impl Drop for D1Recording<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `d1_step_to_done` finalizes nothing, so the statement and
+        // its connection are live until it returns.
+        unsafe {
+            record_sql_statement(
+                self.scope,
+                self.statement,
+                total_changes_for_handle(self.database).saturating_sub(self.changes_before),
+                self.stats,
+            );
+        }
+    }
+}
+
+/// The bytes of one D1 result value as the statement statistics count them,
+/// the same as a Durable Object row: the length of text and of a BLOB, eight
+/// for a number.
+fn d1_value_bytes(value: &serde_json::Value) -> u64 {
+    match value {
+        serde_json::Value::String(text) => text.len() as u64,
+        serde_json::Value::Array(bytes) => bytes.len() as u64,
+        serde_json::Value::Null => 0,
+        _ => 8,
+    }
+}
+
 /// What stepping one statement to completion left behind.
 struct D1Stepped {
     rows: Vec<Vec<serde_json::Value>>,
@@ -2489,7 +2748,8 @@ struct D1Stepped {
 /// charging kept bytes against `budget`. The caller finalizes the statement
 /// on every path. `keep` below the row cap means the caller asked for fewer
 /// rows (`first()` keeps one), so rows past it are dropped without an error;
-/// at the cap, overflow is a refusal.
+/// at the cap, overflow is a refusal. The statement is recorded when this
+/// returns, from `start`.
 unsafe fn d1_step_to_done(
     scope: &str,
     database: *mut rusqlite::ffi::sqlite3,
@@ -2497,8 +2757,17 @@ unsafe fn d1_step_to_done(
     started_in_transaction: bool,
     keep: usize,
     budget: &mut usize,
+    start: D1Start,
 ) -> Result<D1Stepped, String> {
     crate::sql_limits::arm();
+    let mut recording = D1Recording {
+        scope,
+        database,
+        statement,
+        changes_before: start.changes,
+        stats: crate::sql_stats::Running::default(),
+    };
+    let mut returned_bytes = 0;
     let column_count = rusqlite::ffi::sqlite3_column_count(statement);
     let mut stepped = D1Stepped {
         rows: Vec::new(),
@@ -2524,6 +2793,7 @@ unsafe fn d1_step_to_done(
                 }
                 let mut row = Vec::with_capacity(column_count as usize);
                 let mut row_bytes = 0usize;
+                let mut raw_bytes = 0;
                 let mut row_over = false;
                 for index in 0..column_count {
                     let available = budget.saturating_sub(row_bytes);
@@ -2535,6 +2805,7 @@ unsafe fn d1_step_to_done(
                         }
                     };
                     row_bytes += size;
+                    raw_bytes += d1_value_bytes(&value);
                     row.push(value);
                 }
                 if row_over {
@@ -2548,13 +2819,25 @@ unsafe fn d1_step_to_done(
                     continue;
                 };
                 *budget = remaining;
+                returned_bytes += raw_bytes;
                 stepped.rows.push(row);
             }
             rusqlite::ffi::SQLITE_DONE => {
+                recording
+                    .stats
+                    .step(start.at.elapsed(), stepped.rows_read, returned_bytes);
+                // The statement ran, but its result is refused: a failure.
+                if stepped.over.is_some() {
+                    recording.stats.refuse();
+                }
                 crate::sql_limits::disarm();
                 return Ok(stepped);
             }
             code => {
+                recording
+                    .stats
+                    .step(start.at.elapsed(), stepped.rows_read, returned_bytes);
+                recording.stats.fail(sql_outcome(code), code);
                 // Whatever runs next is engine SQL (the failure's own probes,
                 // a migration's bookkeeping): the deadline does not reach it.
                 crate::sql_limits::disarm();
@@ -2675,6 +2958,7 @@ unsafe fn d1_run_statements(
     let mut count = 0_u64;
     let mut results = Vec::new();
     loop {
+        let start = D1Start::now(database);
         let mut statement = std::ptr::null_mut();
         let mut tail = std::ptr::null();
         let prepare =
@@ -2683,6 +2967,13 @@ unsafe fn d1_run_statements(
             if !statement.is_null() {
                 rusqlite::ffi::sqlite3_finalize(statement);
             }
+            crate::sql_stats::record_refused(
+                scope,
+                start.at.elapsed(),
+                sql_outcome(prepare),
+                prepare,
+                || Some(CStr::from_ptr(source_ptr).to_string_lossy().into_owned()),
+            );
             // An unterminated construct -- an open quote, a statement cut
             // mid-token -- is refused as incomplete rather than reported as
             // whatever syntax error the cut happened to produce, because the
@@ -2724,6 +3015,7 @@ unsafe fn d1_run_statements(
             started_in_transaction,
             keep,
             &mut budget,
+            start,
         );
         rusqlite::ffi::sqlite3_finalize(statement);
         let stepped = stepped.map_err(failure)?;
@@ -2758,8 +3050,8 @@ unsafe fn d1_run_prepared(
         CString::new(sql).map_err(|error| d1_error(format!("invalid SQL text: {error}")))?;
     let database = connection.handle();
     let started_in_transaction = rusqlite::ffi::sqlite3_get_autocommit(database) == 0;
-    let changes_before = total_changes_for_handle(database);
     let schema_before = d1_schema_version(connection);
+    let start = D1Start::now(database);
     let mut statement = std::ptr::null_mut();
     let mut tail = std::ptr::null();
     let prepare =
@@ -2768,6 +3060,13 @@ unsafe fn d1_run_prepared(
         if !statement.is_null() {
             rusqlite::ffi::sqlite3_finalize(statement);
         }
+        crate::sql_stats::record_refused(
+            scope,
+            start.at.elapsed(),
+            sql_outcome(prepare),
+            prepare,
+            || Some(sql.to_owned()),
+        );
         return Err(d1_error(d1_sqlite_failure(
             scope,
             database,
@@ -2786,6 +3085,12 @@ unsafe fn d1_run_prepared(
     }
     let expected = rusqlite::ffi::sqlite3_bind_parameter_count(statement) as usize;
     if expected != binds.len() {
+        record_refused_bind(
+            scope,
+            start.at.elapsed(),
+            statement,
+            rusqlite::ffi::SQLITE_RANGE,
+        );
         rusqlite::ffi::sqlite3_finalize(statement);
         return Err(d1_error(
             "Wrong number of parameter bindings for SQL query.",
@@ -2793,6 +3098,7 @@ unsafe fn d1_run_prepared(
     }
     for (offset, value) in binds.iter().enumerate() {
         if let Err(code) = bind_cursor_value(statement, offset as i32 + 1, value) {
+            record_refused_bind(scope, start.at.elapsed(), statement, code);
             let failure = d1_sqlite_failure(scope, database, started_in_transaction, code);
             rusqlite::ffi::sqlite3_finalize(statement);
             return Err(d1_error(failure));
@@ -2807,6 +3113,7 @@ unsafe fn d1_run_prepared(
         started_in_transaction,
         keep,
         budget,
+        start,
     );
     let rows_read = stepped
         .as_ref()
@@ -2817,7 +3124,7 @@ unsafe fn d1_run_prepared(
     if let Some(over) = stepped.over {
         return Err(d1_error(over));
     }
-    let rows_written = total_changes_for_handle(database).saturating_sub(changes_before);
+    let rows_written = total_changes_for_handle(database).saturating_sub(start.changes);
     let (last_row_id, changes) = if readonly {
         (0, 0)
     } else {
@@ -4418,6 +4725,507 @@ mod recycle_tests {
             "mode": "prepared", "sql": "SELECT count(*) AS n FROM t", "first": true,
         }));
         assert_eq!(count["ok"]["rows"], serde_json::json!([[0]]), "{count}");
+        close(scope);
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Run `body` and return what it logged.
+    fn logged(body: impl FnOnce()) -> String {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let bytes = captured.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Slow and failed statements are logged by fingerprint, and nothing a
+    /// reader could use to identify the statement's text, a bound value or the
+    /// cell leaves the node: not in the log, not in the metrics.
+    #[test]
+    fn statement_statistics_never_carry_sql_text_a_value_or_a_cell_id() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        limit(Some(30_000), None);
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "Counter:feedfacecafebeef0123";
+        open_in(&dir, "cell.sqlite", scope);
+        let run = |query: &str, binds: &[serde_json::Value]| -> Result<_, String> {
+            let (id, _, row, _, _) = sql_cursor_start(scope, query, binds)?;
+            if row.is_some() {
+                while sql_cursor_next(id)?.0.is_some() {}
+            }
+            Ok(())
+        };
+        run("CREATE TABLE notes (secret_col TEXT)", &[]).unwrap();
+
+        crate::sql_stats::set_threshold_for_test(None);
+        let quiet = logged(|| {
+            run("INSERT INTO notes VALUES ('hunter2-literal')", &[]).unwrap();
+            run("SELECT * FROM missing_table_xyz", &[]).unwrap_err();
+        });
+        assert_eq!(quiet, "", "a line was written with the threshold unset");
+
+        crate::sql_stats::set_threshold_for_test(Some(std::time::Duration::ZERO));
+        let output = logged(|| {
+            run("INSERT INTO notes VALUES ('hunter2-literal')", &[]).unwrap();
+            run(
+                "INSERT INTO notes VALUES (?)",
+                &[serde_json::json!("bound-value-9876")],
+            )
+            .unwrap();
+            run(
+                "SELECT * FROM missing_table_xyz WHERE a = 'hunter2-literal'",
+                &[],
+            )
+            .unwrap_err();
+            // A double-quoted token that names no column is a string literal.
+            run(r#"INSERT INTO notes VALUES ("dq-secret-one")"#, &[]).unwrap();
+            run(r#"INSERT INTO notes VALUES ("dq-secret-two")"#, &[]).unwrap();
+        });
+        let mut metrics = String::new();
+        crate::sql_stats::render(&mut metrics);
+
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 5, "{output}");
+        assert!(lines[0].contains("slow SQL statement") && lines[0].contains("class=Counter"));
+        assert!(lines[2].contains("failed SQL statement") && lines[2].contains("sqlite_code=1"));
+        let fingerprint = |line: &str| {
+            line.split("fingerprint=")
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next())
+                .map(str::to_owned)
+        };
+        assert!(
+            fingerprint(lines[0]).is_some_and(|f| f.len() == 16),
+            "{output}"
+        );
+        // Two statements that differ only in a double-quoted value are one shape.
+        assert_eq!(fingerprint(lines[3]), fingerprint(lines[4]), "{output}");
+        for secret in [
+            "hunter2",
+            "dq-secret",
+            "bound-value",
+            "missing_table",
+            "secret_col",
+            "notes",
+            "feedface",
+            "cafebeef",
+        ] {
+            assert!(
+                !output.contains(secret),
+                "{secret} reached the log:\n{output}"
+            );
+            assert!(!metrics.contains(secret), "{secret} reached the metrics");
+        }
+        assert!(metrics.contains("celld_sql_statement_duration_seconds_count{outcome=\"error\"}"));
+        assert!(metrics.contains("celld_sql_statement_bytes_count{outcome=\"ok\"}"));
+        close(scope);
+    }
+
+    /// A statement the time bound interrupts is counted as a timeout.
+    #[test]
+    fn a_statement_the_time_bound_interrupts_is_logged_as_a_timeout() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        limit(Some(30), None);
+        crate::sql_stats::set_threshold_for_test(Some(std::time::Duration::from_secs(3600)));
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "Counter:timeout";
+        open_in(&dir, "cell.sqlite", scope);
+        let output = logged(|| {
+            sql_cursor_start(scope, &format!("{ENDLESS}SELECT count(*) FROM c"), &[])
+                .expect_err("an endless statement finished");
+        });
+        assert!(output.contains("outcome=timeout"), "{output}");
+        close(scope);
+    }
+
+    /// A D1 statement is recorded like a Durable Object one.
+    #[test]
+    fn a_d1_statement_is_logged_by_fingerprint_with_its_rows() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        limit(Some(30_000), None);
+        crate::sql_stats::set_threshold_for_test(Some(std::time::Duration::ZERO));
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "__D1Database:0f0f0f0f";
+        open_in(&dir, "cell.sqlite", scope);
+        let output = logged(|| {
+            let made = d1_run_json(
+                scope,
+                &serde_json::json!({"mode": "exec", "sql": "CREATE TABLE t (x INTEGER)"})
+                    .to_string(),
+            );
+            assert!(made.contains("\"ok\""), "{made}");
+            let wrote = d1_run_json(
+                scope,
+                &serde_json::json!({"mode": "exec", "sql": "INSERT INTO t VALUES (424242)"})
+                    .to_string(),
+            );
+            assert!(wrote.contains("\"ok\""), "{wrote}");
+        });
+        assert!(
+            output.contains("rows_written=1") && output.contains("class=__D1Database"),
+            "{output}"
+        );
+        assert!(!output.contains("424242"), "{output}");
+        close(scope);
+    }
+
+    /// The value of `name=` in a statistics line.
+    fn field<'a>(line: &'a str, name: &str) -> &'a str {
+        let rest = line
+            .split(&format!("{name}="))
+            .nth(1)
+            .unwrap_or_else(|| panic!("no {name} in {line}"));
+        rest.split(' ').next().unwrap()
+    }
+
+    /// Open a cell with a table `t (x INTEGER PRIMARY KEY)` and log every
+    /// statement. `run` starts a statement and drains it.
+    fn logged_cell(dir: &tempfile::TempDir, scope: &str) -> impl Fn(&str) -> Result<(), String> {
+        let scope = scope.to_owned();
+        open_in(dir, "cell.sqlite", &scope);
+        crate::sql_stats::set_threshold_for_test(None);
+        sql_cursor_start(&scope, "CREATE TABLE t (x INTEGER PRIMARY KEY)", &[]).unwrap();
+        crate::sql_stats::set_threshold_for_test(Some(std::time::Duration::ZERO));
+        move |query| {
+            let (id, _, row, _, _) = sql_cursor_start(&scope, query, &[])?;
+            if row.is_some() {
+                while sql_cursor_next(id)?.0.is_some() {}
+            }
+            Ok(())
+        }
+    }
+
+    /// Every statement of one `exec` is recorded on its own: its writes are
+    /// its own, a prefix that fails is counted, and a statement that does not
+    /// prepare is fingerprinted from its own text, not from the input.
+    #[test]
+    fn each_statement_of_a_multi_statement_exec_is_recorded_on_its_own() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        let run = logged_cell(&dir, "Counter:multi");
+
+        let output = logged(|| {
+            run("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3); SELECT x FROM t")
+                .unwrap();
+        });
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 4, "{output}");
+        let written: Vec<&str> = lines
+            .iter()
+            .map(|line| field(line, "rows_written"))
+            .collect();
+        assert_eq!(written, ["1", "1", "1", "0"], "{output}");
+        assert_eq!(field(lines[3], "rows_read"), "3", "{output}");
+
+        let output = logged(|| {
+            run("INSERT INTO t VALUES (10); INSERT INTO t VALUES (10); SELECT 1").unwrap_err();
+        });
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2, "{output}");
+        assert!(lines[0].contains("slow SQL statement"), "{output}");
+        assert!(lines[1].contains("outcome=error"), "{output}");
+
+        let output = logged(|| {
+            run("SELECT 1; SELECT * FROM missing_x WHERE a = 7").unwrap_err();
+        });
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2, "{output}");
+        assert!(lines[1].contains("outcome=error"), "{output}");
+        let alone = format!(
+            "{:016x}",
+            crate::sql_fingerprint::fingerprint("SELECT * FROM missing_x WHERE a = 7")
+        );
+        assert_eq!(field(lines[1], "fingerprint"), alone, "{output}");
+        close("Counter:multi");
+    }
+
+    /// The `rowsWritten` a Worker reads still counts the whole `exec`.
+    #[test]
+    fn a_multi_statement_exec_still_reports_the_writes_of_the_whole_exec() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "Counter:whole";
+        let _run = logged_cell(&dir, scope);
+        let (_, _, row, written, _) = sql_cursor_start(
+            scope,
+            "INSERT INTO t VALUES (21); INSERT INTO t VALUES (22)",
+            &[],
+        )
+        .unwrap();
+        assert!(row.is_none());
+        assert_eq!(written, 2);
+        let (id, _, row, _, _) = sql_cursor_start(
+            scope,
+            "INSERT INTO t VALUES (31); INSERT INTO t VALUES (32); \
+             INSERT INTO t VALUES (33) RETURNING x",
+            &[],
+        )
+        .unwrap();
+        assert!(row.is_some());
+        assert_eq!(sql_cursor_next(id).unwrap(), (None, 3));
+        close(scope);
+    }
+
+    /// A cursor that is never drained is recorded when its cell closes.
+    #[test]
+    fn a_cursor_is_recorded_when_its_cell_closes() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "Counter:abandoned";
+        let run = logged_cell(&dir, scope);
+        run("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)").unwrap();
+
+        let output = logged(|| {
+            let (_, _, row, _, _) = sql_cursor_start(scope, "SELECT x FROM t", &[]).unwrap();
+            assert!(row.is_some());
+            close(scope);
+        });
+        assert_eq!(output.lines().count(), 1, "{output}");
+        assert_eq!(field(output.trim_end(), "rows_read"), "1", "{output}");
+    }
+
+    /// A cursor closed early reports the rows its statement had written.
+    #[test]
+    fn a_cursor_closed_early_reports_the_rows_it_wrote() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "Counter:early";
+        let _run = logged_cell(&dir, scope);
+
+        let output = logged(|| {
+            let (id, _, row, _, _) = sql_cursor_start(
+                scope,
+                "INSERT INTO t VALUES (101), (102), (103) RETURNING x",
+                &[],
+            )
+            .unwrap();
+            assert!(row.is_some());
+            sql_cursor_close(id);
+        });
+        assert_eq!(output.lines().count(), 1, "{output}");
+        assert_eq!(field(output.trim_end(), "rows_written"), "3", "{output}");
+        close(scope);
+    }
+
+    /// A statement whose parameters are refused before it runs is recorded as
+    /// an error, on every path.
+    #[test]
+    fn a_statement_whose_parameters_are_refused_is_recorded_as_an_error() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "Counter:binds";
+        let _run = logged_cell(&dir, scope);
+        for (query, binds) in [
+            ("SELECT x FROM t WHERE x = ?", vec![]),
+            (
+                "SELECT x FROM t WHERE x = ?",
+                vec![serde_json::json!(1), serde_json::json!(2)],
+            ),
+            (
+                "SELECT x FROM t WHERE x = ?; SELECT 1",
+                vec![serde_json::json!(1)],
+            ),
+        ] {
+            let output = logged(|| {
+                sql_cursor_start(scope, query, &binds).unwrap_err();
+            });
+            assert_eq!(output.lines().count(), 1, "{query}: {output}");
+            assert!(
+                output.contains("failed SQL statement outcome=error"),
+                "{query}: {output}"
+            );
+        }
+        close(scope);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (_, run) = d1_cell(&dir);
+        let output = logged(|| {
+            let response = run(serde_json::json!({
+                "mode": "prepared", "sql": "SELECT ?", "params": [1, 2],
+            }));
+            assert!(response.get("error").is_some(), "{response}");
+        });
+        assert!(
+            output.contains("failed SQL statement outcome=error"),
+            "{output}"
+        );
+    }
+
+    /// A cursor counts the rows its own steps wrote, not what other
+    /// statements wrote while it stayed open.
+    #[test]
+    fn a_cursor_does_not_count_the_writes_of_other_statements() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "Counter:interleaved";
+        let run = logged_cell(&dir, scope);
+        run("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)").unwrap();
+
+        let drain = |query: &str, first: u32| {
+            let output = logged(|| {
+                let (id, _, row, _, _) = sql_cursor_start(scope, query, &[]).unwrap();
+                assert!(row.is_some());
+                run(&format!("INSERT INTO t VALUES ({first}), ({})", first + 1)).unwrap();
+                while sql_cursor_next(id).unwrap().0.is_some() {}
+            });
+            output.lines().last().unwrap().to_owned()
+        };
+        let read = drain("SELECT x FROM t", 50);
+        assert_eq!(field(&read, "rows_written"), "0", "{read}");
+        let write = drain("INSERT INTO t VALUES (201), (202) RETURNING x", 60);
+        assert_eq!(field(&write, "rows_written"), "2", "{write}");
+        close(scope);
+    }
+
+    /// A statement that fails to prepare is fingerprinted alone, whatever
+    /// follows it in the input.
+    #[test]
+    fn a_statement_that_does_not_prepare_is_fingerprinted_without_what_follows() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        let run = logged_cell(&dir, "Counter:tail");
+        let fingerprint_of =
+            |output: &str| field(output.lines().last().unwrap(), "fingerprint").to_owned();
+        let one = logged(|| {
+            run("SELECT * FROM missing_x WHERE a = 7; SELECT 1").unwrap_err();
+        });
+        let other = logged(|| {
+            run("SELECT * FROM missing_x WHERE a = 8; INSERT INTO t VALUES (9); SELECT 'x'")
+                .unwrap_err();
+        });
+        assert_eq!(fingerprint_of(&one), fingerprint_of(&other), "{one}{other}");
+        close("Counter:tail");
+
+        let scope = "Counter:ingest";
+        open_in(&dir, "ingest.sqlite", scope);
+        let ingest = |input: &str| {
+            logged(|| {
+                sql_ingest(scope, input).unwrap_err();
+            })
+        };
+        let one = ingest("SELEC 1; SELECT 1;");
+        let other = ingest("SELEC 2; INSERT INTO nothing VALUES ('y'); SELECT 3;");
+        assert_eq!(fingerprint_of(&one), fingerprint_of(&other), "{one}{other}");
+        close(scope);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (scope, d1) = d1_cell(&dir);
+        let batch = |sql: &str| {
+            logged(|| {
+                d1(serde_json::json!({"mode": "exec", "sql": sql}));
+            })
+        };
+        let one = batch("SELEC 1; SELECT 1;");
+        let other = batch("SELEC 2; SELECT 2, 3;");
+        assert_eq!(fingerprint_of(&one), fingerprint_of(&other), "{one}{other}");
+        close(scope);
+    }
+
+    fn d1_cell(
+        dir: &tempfile::TempDir,
+    ) -> (
+        &'static str,
+        impl Fn(serde_json::Value) -> serde_json::Value,
+    ) {
+        let cells_scope = "__D1Database:0a0b0c0d";
+        crate::sql_stats::set_threshold_for_test(Some(std::time::Duration::ZERO));
+        open_in(dir, "cell.sqlite", cells_scope);
+        (cells_scope, move |request: serde_json::Value| {
+            serde_json::from_str(&d1_run_json(cells_scope, &request.to_string())).unwrap()
+        })
+    }
+
+    /// A D1 statement that does not prepare is recorded as an error.
+    #[test]
+    fn a_d1_statement_that_does_not_prepare_is_recorded_as_an_error() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, run) = d1_cell(&dir);
+        for request in [
+            serde_json::json!({"mode": "prepared", "sql": "SELEC 1"}),
+            serde_json::json!({"mode": "exec", "sql": "SELEC 1"}),
+            serde_json::json!({"mode": "exec", "sql": "SELECT 1; SELEC 2"}),
+        ] {
+            let output = logged(|| {
+                assert!(run(request.clone()).get("error").is_some());
+            });
+            let last = output.lines().last().unwrap_or_default();
+            assert!(
+                last.contains("failed SQL statement outcome=error"),
+                "{request}: {output}"
+            );
+        }
+    }
+
+    /// A D1 result over the cap fails the request, so it is not a success.
+    #[test]
+    fn a_d1_result_over_the_cap_is_recorded_as_an_error() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, run) = d1_cell(&dir);
+        let output = logged(|| {
+            let over = run(serde_json::json!({
+                "mode": "prepared", "sql": "SELECT zeroblob(1200000)", "params": [],
+            }));
+            assert!(over.get("error").is_some(), "{over}");
+        });
+        assert!(
+            output.contains("failed SQL statement outcome=error"),
+            "{output}"
+        );
+    }
+
+    /// One histogram has one unit: D1 counts the bytes a Durable Object
+    /// counts, the raw length of each value, not the result-budget charge.
+    #[test]
+    fn d1_counts_bytes_as_a_durable_object_does() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        let (scope, run) = d1_cell(&dir);
+        let query = "SELECT zeroblob(1000), 'abc', 7";
+        let d1 = logged(|| {
+            run(serde_json::json!({"mode": "prepared", "sql": query, "params": []}));
+        });
+        let (id, _, row, _, _) = sql_cursor_start(scope, query, &[]).unwrap();
+        assert!(row.is_some());
+        let durable = logged(|| sql_cursor_close(id));
+        assert_eq!(field(durable.trim_end(), "bytes"), "1011", "{durable}");
+        assert_eq!(field(d1.trim_end(), "bytes"), "1011", "{d1}");
         close(scope);
     }
 

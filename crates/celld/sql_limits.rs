@@ -121,8 +121,16 @@ pub(crate) fn set_limits_for_test(limits: Limits) {
 pub(crate) fn arm() {
     let timeout = limits().statement_timeout;
     TIMEOUT.with(|slot| slot.set(timeout));
-    STARTED.with(|slot| slot.set(timeout.map(|_| Instant::now())));
+    STARTED.with(|slot| slot.set(Some(Instant::now())));
     EXPIRED.with(|flag| flag.set(false));
+}
+
+/// Time since the last [`arm`]: what the statement now running has used. The
+/// per-statement statistics read the clock the time bound already keeps.
+pub(crate) fn elapsed() -> Duration {
+    STARTED
+        .with(Cell::get)
+        .map_or(Duration::ZERO, |started| started.elapsed())
 }
 
 pub(crate) fn disarm() {
