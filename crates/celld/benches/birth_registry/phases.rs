@@ -41,6 +41,7 @@ pub async fn run(phase: &str) {
         "race" => race::race().await,
         "flap" => faults::flap().await,
         "real" => load_phase(Cfg::real()).await,
+        "selftest" => selftest(),
         other => panic!("unknown CELLD_REG_PHASE {other:?}"),
     }
 }
@@ -996,6 +997,64 @@ async fn registry_listing(rig: &Rig) -> Listing {
 }
 
 /// The gates one load phase can decide on its own.
+/// G-t's third clause: the requested pass -> covered p99 stays within the
+/// backstop's bound. `covered` holds only the waits that succeeded, so a wait
+/// that ended at the bound is counted here as a sample above any bound: the
+/// p99 is a failure when more waits failed than the top 1 % of all waits can
+/// hold. Returns the verdict, the failed waits and all waits.
+pub fn backstop_waits(covered: &Value, waits: &Value) -> (bool, u64, u64) {
+    let failed = waits
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| {
+                    row[2]
+                        .as_str()
+                        .is_some_and(|outcome| outcome.ends_with(":bound"))
+                })
+                .count() as u64
+        })
+        .unwrap_or(0);
+    let succeeded = covered["n"].as_u64().unwrap_or(0);
+    let total = succeeded + failed;
+    if total == 0 {
+        return (true, 0, 0);
+    }
+    let rank = (0.99 * total as f64).ceil() as u64;
+    let room = total - rank;
+    let within = succeeded == 0 || covered["p99"].as_f64().is_some_and(|p99| p99 <= 4_000.0);
+    (failed <= room && within, failed, total)
+}
+
+fn selftest() {
+    let covered = |n: u64, p99: f64| json!({ "n": n, "p99": p99 });
+    let waits = |failed: usize| {
+        Value::Array(
+            (0..failed)
+                .map(|i| json!([format!("{i}"), 4_700, "lookup:bound"]))
+                .chain(std::iter::once(json!(["ok", 300, "lookup:covered"])))
+                .collect(),
+        )
+    };
+    // The run that was wrongly passed: 54 waits covered (p99 3,993 ms), 3 at the bound.
+    assert_eq!(
+        backstop_waits(&covered(54, 3_993.0), &waits(3)),
+        (false, 3, 57)
+    );
+    // A clean run, and no wait at all, still hold.
+    assert_eq!(
+        backstop_waits(&covered(59, 560.0), &waits(0)),
+        (true, 0, 59)
+    );
+    assert_eq!(backstop_waits(&covered(0, 0.0), &Value::Null), (true, 0, 0));
+    // A single failure among fewer than 100 waits is the p99; among 200 it is not.
+    assert!(!backstop_waits(&covered(56, 500.0), &waits(1)).0);
+    assert!(backstop_waits(&covered(199, 500.0), &waits(1)).0);
+    // Successes slower than the bound fail on their own.
+    assert!(!backstop_waits(&covered(59, 4_200.0), &waits(0)).0);
+    say!("selftest: backstop_waits ok");
+}
+
 fn gates_of(cfg: &Cfg, result: &Value, gates: &mut Gates) {
     let hold = |ok: bool| Some(ok);
     let n = |value: &Value| value.as_f64().unwrap_or(f64::NAN);
@@ -1016,13 +1075,14 @@ fn gates_of(cfg: &Cfg, result: &Value, gates: &mut Gates) {
         if cfg.name == "real" {
             // G-t: the absolute latency is reported, not gated.
             let covered = &result["node_samples"]["pass_to_covered_ms"];
+            let (waits_hold, failed_waits, waits) =
+                backstop_waits(covered, &result["node_samples"]["waits"]);
             gates.add(
                 "G-t (docker stand-in)",
-                json!({ "lookup_p99_ms": p99, "lookup_p50_ms": lookups["node_p50_ms"], "list_p99_ms": list_p99, "list_p50_ms": result["guard"]["list_ms"]["p50"], "guard_lookup_p99_ms": result["guard"]["lookup_ms"]["p99"], "gets_mean": lookups["gets_mean"], "bytes_mean": lookups["bytes_mean"], "bytes_max": lookups["bytes_max"], "pass_to_covered_ms": covered, "pass_to_covered_measured": n(&covered["n"]) > 0.0, "heavy_lookups": lookups["heavy"], "light_lookups": lookups["light"] }),
+                json!({ "lookup_p99_ms": p99, "lookup_p50_ms": lookups["node_p50_ms"], "list_p99_ms": list_p99, "list_p50_ms": result["guard"]["list_ms"]["p50"], "guard_lookup_p99_ms": result["guard"]["lookup_ms"]["p99"], "gets_mean": lookups["gets_mean"], "bytes_mean": lookups["bytes_mean"], "bytes_max": lookups["bytes_max"], "pass_to_covered_ms": covered, "pass_to_covered_measured": n(&covered["n"]) > 0.0, "backstop_waits": waits, "backstop_waits_failed_at_the_bound": failed_waits, "heavy_lookups": lookups["heavy"], "light_lookups": lookups["light"] }),
                 "lookup p99 <= the LIST's p99; <= 3.05 GETs, <= 16 KiB; requested pass -> covered p99 <= 4 s; absolute latencies reported",
-                // With no sample of a requested pass that clause is not measured; the
-                // others decide.
-                hold(list_p99.is_none_or(|l| p99 <= l) && shape && (n(&covered["n"]) == 0.0 || n(&covered["p99"]) <= 4_000.0)),
+                // With no wait at all that clause is not measured; the others decide.
+                hold(list_p99.is_none_or(|l| p99 <= l) && shape && waits_hold),
             );
         } else {
             gates.add(
