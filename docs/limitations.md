@@ -42,11 +42,15 @@ and both match Cloudflare where Cloudflare documents a value.
 | Time of one SQL statement | 30 seconds | `CELLD_SQL_STATEMENT_TIMEOUT_MS` | SQLite interrupts the statement. The call fails with `SQL statement exceeded the time limit of N ms and was interrupted`. |
 | Size of one database | 10 GB | `CELLD_MAX_DATABASE_BYTES` | The write that would grow the file past the limit fails with `storage limit exceeded`. Deleting rows makes room again. |
 
-A value of `0` removes the limit.
+A value of `0` removes the limit. A setting that is not a whole number, or a
+size below one 4096-byte page, stops celld at startup and names the variable
+and its value.
 
 - The time bound covers application SQL: `ctx.storage.sql.exec()`, a cursor
   step, and each statement of a D1 `prepare`, `batch`, `exec`, or migration.
-  It does not cover the key-value API or celld's own statements.
+  It does not cover the key-value API or celld's own statements. The clock
+  starts when the statement is handed to SQLite, so time spent before
+  SQLite's first check counts.
 - A statement interrupted outside a transaction, or a read inside one, is an
   ordinary error and the cell keeps serving. A write interrupted inside a
   `transaction()` or `transactionSync()` makes SQLite discard the whole
@@ -72,9 +76,11 @@ A value of `0` removes the limit.
   below the limit, fails the cell closed the same way.
 - Each database has its own limit: a Durable Object, each of its facets, and
   each D1 database.
-- A limit set below the size of an existing database does not stop it opening.
-  Reads work, and a write that needs a new page fails until deletes free
-  pages inside the file.
+- A limit set below the size of an existing database does not stop it opening,
+  for a Durable Object or a facet. celld's own opening writes (the schema, a
+  facet's scope rewrite) are not refused, and neither are the first pages of a
+  new database, even under a tiny limit. Reads work, and an application write
+  that needs a new page fails until deletes free pages inside the file.
 
 ## Networking and security
 

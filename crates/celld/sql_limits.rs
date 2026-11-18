@@ -49,26 +49,46 @@ pub(crate) struct Limits {
     pub max_database_bytes: Option<u64>,
 }
 
+/// SQLite's default page size, which celld does not change.
+const PAGE_SIZE: u64 = 4096;
+
+/// Read both limits from `value`, which maps a variable name to its setting.
+/// A value that does not parse, or a positive size cap below one page, is an
+/// error: it must not turn into a default the operator did not choose.
+fn parse(value: impl Fn(&str) -> Option<String>) -> anyhow::Result<Limits> {
+    let read = |name: &str| crate::env_vars::parse_optional::<u64>(name, value(name));
+    let statement_timeout = match read("CELLD_SQL_STATEMENT_TIMEOUT_MS")? {
+        Some(0) => None,
+        Some(ms) => Some(Duration::from_millis(ms)),
+        None => Some(DEFAULT_STATEMENT_TIMEOUT),
+    };
+    let max_database_bytes = match read("CELLD_MAX_DATABASE_BYTES")? {
+        Some(0) => None,
+        Some(bytes) if bytes < PAGE_SIZE => anyhow::bail!(
+            "CELLD_MAX_DATABASE_BYTES must be 0 or at least one {PAGE_SIZE}-byte page, not {bytes}"
+        ),
+        Some(bytes) => Some(bytes),
+        None => Some(DEFAULT_MAX_DATABASE_BYTES),
+    };
+    Ok(Limits {
+        statement_timeout,
+        max_database_bytes,
+    })
+}
+
+/// Refuse a malformed setting at startup; [`limits`] then reads them without
+/// a way to fail.
+pub(crate) fn validate() -> anyhow::Result<()> {
+    parse(|name| std::env::var(name).ok()).map(drop)
+}
+
 fn from_env() -> Limits {
     static LIMITS: OnceLock<Limits> = OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let read = |name: &str| {
-            std::env::var(name)
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok())
-        };
-        Limits {
-            statement_timeout: match read("CELLD_SQL_STATEMENT_TIMEOUT_MS") {
-                Some(0) => None,
-                Some(ms) => Some(Duration::from_millis(ms)),
-                None => Some(DEFAULT_STATEMENT_TIMEOUT),
-            },
-            max_database_bytes: match read("CELLD_MAX_DATABASE_BYTES") {
-                Some(0) => None,
-                Some(bytes) => Some(bytes),
-                None => Some(DEFAULT_MAX_DATABASE_BYTES),
-            },
-        }
+        parse(|name| std::env::var(name).ok()).unwrap_or(Limits {
+            statement_timeout: Some(DEFAULT_STATEMENT_TIMEOUT),
+            max_database_bytes: Some(DEFAULT_MAX_DATABASE_BYTES),
+        })
     })
 }
 
@@ -78,9 +98,9 @@ thread_local! {
     static OVERRIDE: Cell<Option<Limits>> = const { Cell::new(None) };
     /// How long the statement now running may take, if one is armed.
     static TIMEOUT: Cell<Option<Duration>> = const { Cell::new(None) };
-    /// When the handler first saw that statement: the clock is read there and
-    /// not at `arm`, so a statement that ends before its first check never
-    /// reads it.
+    /// When the statement now running was armed. The handler's first call
+    /// comes only after [`PROGRESS_INTERVAL`] instructions, so the clock is
+    /// read at `arm`, or an expensive prefix would not be charged.
     static STARTED: Cell<Option<Instant>> = const { Cell::new(None) };
     /// Set by the handler when it interrupted a statement, until the failure
     /// is reported.
@@ -99,8 +119,9 @@ pub(crate) fn set_limits_for_test(limits: Limits) {
 /// Start the clock for the next statement. Called again before each statement
 /// of a batch, so the bound is per statement and not per call.
 pub(crate) fn arm() {
-    TIMEOUT.with(|slot| slot.set(limits().statement_timeout));
-    STARTED.with(|slot| slot.set(None));
+    let timeout = limits().statement_timeout;
+    TIMEOUT.with(|slot| slot.set(timeout));
+    STARTED.with(|slot| slot.set(timeout.map(|_| Instant::now())));
     EXPIRED.with(|flag| flag.set(false));
 }
 
@@ -112,15 +133,10 @@ fn handler() -> bool {
     let Some(timeout) = TIMEOUT.with(Cell::get) else {
         return false;
     };
-    let now = Instant::now();
-    let started = STARTED.with(|slot| match slot.get() {
-        Some(started) => started,
-        None => {
-            slot.set(Some(now));
-            now
-        }
-    });
-    let expired = now.duration_since(started) >= timeout;
+    let Some(started) = STARTED.with(Cell::get) else {
+        return false;
+    };
+    let expired = started.elapsed() >= timeout;
     if expired {
         EXPIRED.with(|flag| flag.set(true));
     }
@@ -230,5 +246,63 @@ pub(crate) unsafe fn explain(
             })
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lookup<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
+    /// The handler's first call comes only after thousands of instructions,
+    /// so a statement's time before it counts: the clock starts at `arm`.
+    #[test]
+    fn the_deadline_counts_from_arming_not_from_the_first_check() {
+        set_limits_for_test(Limits {
+            statement_timeout: Some(Duration::from_millis(20)),
+            max_database_bytes: None,
+        });
+        arm();
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(handler(), "the time before the first check was not charged");
+        assert!(statement_expired());
+        disarm();
+        assert!(!handler(), "a disarmed handler interrupted");
+    }
+
+    #[test]
+    fn unset_settings_take_the_defaults_and_zero_removes_a_limit() {
+        let limits = parse(lookup(&[])).unwrap();
+        assert_eq!(limits.statement_timeout, Some(DEFAULT_STATEMENT_TIMEOUT));
+        assert_eq!(limits.max_database_bytes, Some(DEFAULT_MAX_DATABASE_BYTES));
+        let limits = parse(lookup(&[
+            ("CELLD_SQL_STATEMENT_TIMEOUT_MS", "0"),
+            ("CELLD_MAX_DATABASE_BYTES", "0"),
+        ]))
+        .unwrap();
+        assert_eq!(limits.statement_timeout, None);
+        assert_eq!(limits.max_database_bytes, None);
+    }
+
+    /// A malformed value or a cap below one page is refused, not replaced by
+    /// a default or a one-page cap.
+    #[test]
+    fn a_malformed_setting_is_an_error_naming_the_variable_and_value() {
+        for (name, value) in [
+            ("CELLD_SQL_STATEMENT_TIMEOUT_MS", "30s"),
+            ("CELLD_MAX_DATABASE_BYTES", "10GB"),
+            ("CELLD_MAX_DATABASE_BYTES", "100"),
+        ] {
+            let error = parse(lookup(&[(name, value)])).unwrap_err().to_string();
+            assert!(error.contains(name) && error.contains(value), "{error}");
+        }
     }
 }

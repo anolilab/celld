@@ -1099,9 +1099,10 @@ pub(crate) fn open_embedded(
     let mut facet_path = parent.facet_path.clone();
     facet_path.push(name.to_string());
     let stream = crate::engine_api::facet_cell(&parent.root_scope, &facet_path);
-    let mut connection = Connection::open(path)?;
-    // The size cap bounds these writes too, so it goes on first.
-    crate::sql_limits::install(&mut connection)?;
+    let connection = Connection::open(path)?;
+    // The cap and the statement bound go on in `finish_open`, after these
+    // opening writes, as for a root cell: opening never fails because the cap
+    // was lowered below the file.
     schema(&connection)?;
     // Each run of a facet has its own scope, so a continuation from an
     // aborted instance cannot enter its replacement. The database is one
@@ -4524,11 +4525,12 @@ mod recycle_tests {
         close(scope);
     }
 
-    /// Opening an existing facet after the cap was lowered: the writes that
-    /// run before the connection is handed out (moving the rows to this run's
-    /// scope) are bounded by the cap too.
+    /// Opening an existing facet after the cap was lowered still succeeds: the
+    /// engine's own opening writes (the scope rewrite) run before the cap is
+    /// installed, as for a root cell. An application write that needs a new
+    /// page then fails with the cap error.
     #[test]
-    fn opening_a_facet_under_a_lowered_cap_bounds_its_own_writes() {
+    fn opening_a_facet_under_a_lowered_cap_still_opens_and_refuses_new_pages() {
         let cells = Cells::default();
         let _installed = cells.install();
         let _ = reports();
@@ -4554,8 +4556,16 @@ mod recycle_tests {
         // A cap of exactly the file's size: longer scope names need new pages.
         limit(None, Some(pages as u64 * 4096));
         let longer = format!("Child:{}", "0".repeat(400));
-        let opened = open_embedded(&longer, &parent, "child", &facet_path, false);
-        assert!(opened.is_err(), "the scope rewrite ignored the cap");
+        open_embedded(&longer, &parent, "child", &facet_path, false)
+            .expect("a lowered cap stopped a facet opening");
+        let failure = (0..64)
+            .find_map(|i| put_serialized(&longer, &format!("new-{i}"), &[2u8; 4096]).err())
+            .expect("the cap never refused a write");
+        assert!(
+            failure.to_string().contains("storage limit exceeded"),
+            "{failure:#}"
+        );
+        close(&longer);
         close(root);
     }
 }
