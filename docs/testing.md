@@ -25,6 +25,15 @@ every pull request:
   JWK, PKCS#8 and SPKI round trips for generated keys. A `node:crypto` test
   runs the same deterministic code under Node and celld and compares the
   answers (`tests/fixtures/node-crypto/gen-reference.mjs`).
+- **Hyperdrive tests** (`crates/celld/tests/e2e/hyperdrive.rs`): a Worker reads
+  its binding and dials a local TCP server through it, under the public egress
+  policy. One more test runs the `postgres` driver, unchanged, against a real
+  database. It runs when `CELLD_TEST_POSTGRES_URL` names a database that the
+  test may create a table in, and `CELLD_TEST_POSTGRES_DRIVER` names a
+  directory whose `node_modules` holds `postgres@3.4.5`, and it needs esbuild
+  (`CELLD_ESBUILD`). Otherwise it skips. For example, start
+  `docker run -d -p 127.0.0.1:55432:5432 -e POSTGRES_USER=app -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=shop postgres:16-alpine`
+  and use `postgres://app:pw@127.0.0.1:55432/shop`.
 - **Container tests** (`crates/celld/tests/e2e/`): fixture Workers with a
   `containers` class run against a fake container engine
   (`tests/e2e/fake_engine.rs`), which speaks the part of the Docker Engine API

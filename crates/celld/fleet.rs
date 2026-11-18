@@ -960,6 +960,15 @@ async fn load_worker_at_pointer(
         crate::secrets::SecretsKey::from_environment,
     )
     .await?;
+    // Hyperdrive connection strings are script secrets, or `celld dev` values
+    // read now. One bucket read when a binding needs the secrets.
+    let hyperdrive = crate::hyperdrive::load(
+        bucket,
+        &manifest,
+        crate::dev::local_values,
+        crate::secrets::SecretsKey::from_environment,
+    )
+    .await?;
     let compat = crate::worker_compat(&manifest.raw_metadata);
     let assets = match &manifest.assets {
         Some(reference) => Some(
@@ -1018,6 +1027,7 @@ async fn load_worker_at_pointer(
         loader_bindings,
         version_metadata,
         secret_stores,
+        hyperdrive,
         assets,
         services,
         crons,
@@ -1040,6 +1050,8 @@ pub struct LoadedDeployment {
     pub version_metadata: Option<crate::engine_api::VersionMetadata>,
     /// The deployment's Secrets Store bindings, decrypted at load.
     pub secret_stores: Vec<crate::secrets::StoreSecret>,
+    /// The deployment's Hyperdrive bindings, with their connection strings.
+    pub hyperdrive: Vec<crate::hyperdrive::HyperdriveBinding>,
     pub assets: Option<crate::assets::AssetResolver>,
     pub services: Vec<(String, String, Option<String>)>,
     /// `triggers.crons` from the manifest, driving the reserved cron cell.

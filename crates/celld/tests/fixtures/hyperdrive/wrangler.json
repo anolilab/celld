@@ -1,0 +1,9 @@
+{
+  "name": "hyperdrive",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": { "PLAIN": "plain" },
+  "hyperdrive": [{ "binding": "HD", "id": "db-1" }]
+}

@@ -33,7 +33,7 @@ An unsupported feature that does not cause an error is a defect.
 | [Secrets Store](services/workers.md#secrets-store) | **Yes** — a `secrets_store_secrets` binding reads a store that `celld secret --store` fills; the store is the fleet bucket's, not an account's |
 | Workers AI | **No** |
 | Vectorize | **No** |
-| Hyperdrive | **No** |
+| [Hyperdrive](services/hyperdrive.md) | **Partial** — a `hyperdrive` binding hands the Worker a direct connection to its own Postgres or MySQL; no pooling and no query cache, and `host` and `port` name the database itself |
 | Browser Rendering | **No** |
 | Email Workers | **No** |
 | [Python Workers](services/workers.md#python-workers) | **Partial** — `fetch` handlers on the Pyodide 0.28 runtime line |
@@ -475,7 +475,8 @@ The accepted top-level keys:
 - `assets`, `services`, `triggers`, and `vars`
 - `d1_databases`, `kv_namespaces`, `queues`, `ratelimits`, `workflows`, and
   `r2_buckets`
-- `worker_loaders`, `version_metadata`, `secrets_store_secrets`, and `containers`
+- `worker_loaders`, `version_metadata`, `secrets_store_secrets`, `hyperdrive`, and
+  `containers`
 - `define` and `rules`
 
 Any other top-level key, including `routes`, stops the deployment.

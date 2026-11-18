@@ -276,7 +276,12 @@ USAGE
 The Worker reads a secret as `env.NAME`. With --store, the secrets belong to the
 Secrets Store STORE_ID instead of one Worker: a Worker binds one with
 `secrets_store_secrets` (`binding`, `store_id`, `secret_name`) and reads it with
-`await env.BINDING.get()`. Put the secret before you deploy the Worker. The value is read from standard input,
+`await env.BINDING.get()`. Put the secret before you deploy the Worker.
+A `hyperdrive` binding takes its connection string from the secret named
+HYPERDRIVE_ and the binding name (`celld secret put HYPERDRIVE_DB`), which `env`
+does not hold.
+
+The value is read from standard input,
 without its final line break, and is encrypted with the secrets key before it
 leaves this command. `list` prints names only.
 

@@ -718,6 +718,23 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 secret.binding
             ));
         }
+        for binding in &config.hyperdrive {
+            let connection = &binding.connection;
+            // JSON is valid JavaScript for any value. The object holds the
+            // credential in memory only; the harness hides it from enumeration.
+            let info = serde_json::json!({
+                "connectionString": connection.connection_string,
+                "host": connection.host,
+                "port": connection.port,
+                "user": connection.user,
+                "password": connection.password,
+                "database": connection.database,
+            });
+            lines.push_str(&format!(
+                "e[{:?}] = __celld.__makeHyperdrive({info});\n",
+                binding.binding
+            ));
+        }
         if let Some(name) = asset_binding {
             lines.push_str(&format!(
                 "e[{:?}] = __celld.__makeAssetsBinding({:?});\n",

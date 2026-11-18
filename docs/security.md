@@ -212,13 +212,18 @@ is checked as a new request.
 
 `CELLD_EGRESS_ALLOW` lists exceptions, separated by commas or whitespace. The
 list applies to every Worker on the node; an exception cannot be limited to one
-Worker or binding yet.
+Worker or binding yet, except through a Hyperdrive binding (below).
 
 | Entry | Effect |
 | --- | --- |
 | `10.0.0.0/8`, `fd00::/8` | Permits every address in the range on every port, however the Worker names it. A name that resolves into the range needs the range here: use `10.0.0.5/32` for one address. |
 | `10.0.0.5:5432`, `[fd00::5]:5432` | Permits that address on that port when the request names the address itself. |
 | `db.internal:5432` | Permits any address the name resolves to, on that port only. The name is refused on every other port, so the exception does not open the rest of the host. |
+
+A [Hyperdrive](services/hyperdrive.md) binding is the one exception that
+belongs to a single Worker: that Worker's `connect()` to the host and port of
+its own binding skips the check, because the operator put the connection
+string there, and no other Worker or destination gains from it.
 
 A destination that is one of the node's own addresses and a port celld
 listens on (the ingress and internal listeners) is always refused, whatever

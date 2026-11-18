@@ -132,13 +132,24 @@ pub(super) fn op_tcp_connect(
     let id = next_id();
     current_context().tcp_sockets.lock().unwrap().push(id);
     let owner = event_context(scope).owner_id();
+    // The address of one of this Worker's own Hyperdrive bindings is the
+    // operator's choice, so it is not held to the policy. It is per isolate:
+    // another Worker on the node has no such binding, and every other address
+    // of this one still goes through the filter.
+    let own_database = {
+        let host = crate::hyperdrive::normalize_host(&request.hostname);
+        actor_runtime_state(scope)
+            .hyperdrive_destinations
+            .iter()
+            .any(|(bound, port)| *bound == host && *port == request.port)
+    };
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
         // With `CELLD_EGRESS=public`, connect to the addresses the policy
         // permits and to nothing else: the check and the connection use the
         // same resolved addresses.
-        let connected = match crate::egress_filter::active() {
+        let connected = match crate::egress_filter::active().filter(|_| !own_database) {
             Some(filter) => {
                 let addrs = filter
                     .resolve(&request.hostname, request.port)

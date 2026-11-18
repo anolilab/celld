@@ -26,6 +26,7 @@ mod e2e {
     pub mod fake_engine;
     pub mod fetch_compat;
     pub mod harness;
+    pub mod hyperdrive;
     pub mod invoke;
     pub mod isolates;
     pub mod loader_defects;

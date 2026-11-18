@@ -204,6 +204,10 @@ nothing per request. A node that has no key does not load a deployment whose
 store holds a secret it binds, and says why. A change reaches a node at its
 next load of the deployment, as a script's secrets do.
 
+A `hyperdrive` binding keeps its connection string as a secret of the script,
+named `HYPERDRIVE_` and the binding name. It is not a variable of `env`. See
+[Hyperdrive](hyperdrive.md#the-connection-string).
+
 ## Differences from Cloudflare
 
 - celld does not manage a custom domain or terminate TLS.

@@ -756,6 +756,18 @@ pub fn store_values() -> anyhow::Result<BTreeMap<String, String>> {
     })
 }
 
+/// The local values of a `celld dev` node, read now, and `None` on any other
+/// node, so a manifest from a fleet never reads local files or the local
+/// Hyperdrive variables.
+pub fn local_values() -> anyhow::Result<Option<BTreeMap<String, String>>> {
+    if std::env::var_os("CELLD_INTERNAL_DEV_STORE").is_none()
+        || std::env::var_os(CONFIG_ENV).is_none()
+    {
+        return Ok(None);
+    }
+    store_values().map(Some)
+}
+
 /// The contents of `path`, or `None` when it does not exist. One read, not an
 /// existence probe and then a read, so a file that vanishes between the two
 /// cannot fail the build.

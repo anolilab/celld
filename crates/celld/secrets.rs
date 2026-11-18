@@ -580,13 +580,55 @@ pub async fn load<'k>(
         )
     })?;
     let bindings = binding_names(&manifest.raw_metadata);
+    // A Hyperdrive binding consumes its secret; it is not a variable of `env`.
+    let consumed = crate::hyperdrive::secret_names(&manifest.raw_metadata);
     set.secrets
         .iter()
+        .filter(|(name, _)| !consumed.contains(*name))
         .map(|(name, sealed)| {
             crate::deploy::check_env_name(name)?;
             if bindings.contains(name) {
                 return Err(clash(script, name));
             }
+            let value = String::from_utf8(key.open(Scope::Script(script), name, sealed)?)
+                .map_err(|_| anyhow!("secret {name} of script {script} is not UTF-8"))?;
+            Ok((name.clone(), value))
+        })
+        .collect()
+}
+
+/// The decrypted values of the script secrets `wanted`, by name: one bucket
+/// read, none when `wanted` is empty. A name the script does not hold is left
+/// out of the answer. `key` runs only when a wanted secret exists.
+pub async fn load_named<'k>(
+    bucket: &Bucket,
+    manifest: &Manifest,
+    wanted: &BTreeSet<String>,
+    key: impl FnOnce() -> anyhow::Result<Option<&'k SecretsKey>>,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    if wanted.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let script = manifest.script_name.as_str();
+    let Some((set, _)) = read(bucket, Scope::Script(script)).await? else {
+        return Ok(BTreeMap::new());
+    };
+    let held = set
+        .secrets
+        .iter()
+        .filter(|(name, _)| wanted.contains(*name))
+        .collect::<Vec<_>>();
+    if held.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let key = key()?.with_context(|| {
+        format!(
+            "script {script} has secrets that its bindings need, and no secrets key is \
+             configured; set {KEY_VARIABLE} or {KEY_FILE_VARIABLE} to the key they were put under"
+        )
+    })?;
+    held.into_iter()
+        .map(|(name, sealed)| {
             let value = String::from_utf8(key.open(Scope::Script(script), name, sealed)?)
                 .map_err(|_| anyhow!("secret {name} of script {script} is not UTF-8"))?;
             Ok((name.clone(), value))
