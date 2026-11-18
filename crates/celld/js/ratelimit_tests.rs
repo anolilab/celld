@@ -201,3 +201,45 @@ fn expired_windows_give_their_bytes_back() {
     ));
     assert_eq!(result, serde_json::json!([false, true, 1, cost]));
 }
+
+#[test]
+fn the_binding_exposes_only_limit() {
+    // The stub, the cell name and the config are private: nothing but `limit()`
+    // is reachable from code holding the binding, so it cannot call the
+    // namespace cell with a limit of its own.
+    let result = run("const client = new Ratelimit(() => ({ getByName: () => ({}) }), 'cell', 1, 10);
+         const names = new Set(Object.getOwnPropertyNames(client));
+         for (let o = Object.getPrototypeOf(client); o !== Object.prototype; o = Object.getPrototypeOf(o)) {
+           for (const name of Object.getOwnPropertyNames(o)) names.add(name);
+         }
+         const symbols = Object.getOwnPropertySymbols(client).length;
+         return [[...names].sort(), symbols, client._namespace, client._cellName, client._limit];");
+    assert_eq!(
+        result,
+        serde_json::json!([["constructor", "limit"], 0, null, null, null])
+    );
+}
+
+#[test]
+fn a_refused_new_key_looks_at_no_expired_counter_when_none_can_have_expired() {
+    // With the cell full and every window live, a refused call peeks at the
+    // oldest entry of each period and stops there: the sweep never walks the
+    // map. Counted by wrapping each period's iterator.
+    let cost = celld_logic::ratelimit::COUNTER_OVERHEAD_BYTES + 2;
+    let result = run(&format!(
+        "const c = new RateLimitCounters({});
+         for (let i = 0; i < 20; i++) hit(c, String.fromCharCode(65 + i), 5);
+         let visits = 0;
+         for (const map of c._periods.values()) {{
+           const iterator = map[Symbol.iterator].bind(map);
+           map[Symbol.iterator] = function* () {{
+             for (const entry of iterator()) {{ visits += 1; yield entry; }}
+           }};
+         }}
+         const refused = [];
+         for (let i = 0; i < 50; i++) refused.push(hit(c, 'new' + i, 6));
+         return [refused.every((r) => r === false), visits <= 50 * 2];",
+        20 * cost
+    ));
+    assert_eq!(result, serde_json::json!([true, true]));
+}

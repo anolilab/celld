@@ -60,9 +60,9 @@ The cell drops the counters of past windows as calls arrive, so memory follows
 the keys of the current windows and not the history.
 
 A cell holds at most 32 MiB of counters, in one budget across both periods. A
-counter costs its key (two bytes per character) plus 96 bytes, so the number of
-keys that fit depends on their length: about 250,000 keys of 60 characters, far
-fewer long ones. A call with a key the cell does not hold, when the budget is
+counter costs 2 bytes per UTF-16 code unit of its key plus 96 bytes, so the
+number of keys that fit depends on their length: a key of 60 characters costs
+216 bytes, so about 155,000 such keys fit in 32 MiB, and far fewer long ones. A call with a key the cell does not hold, when the budget is
 full, does not throw: `limit()` resolves to `{ success: false }`, so a Worker
 that answers 429 on `success: false` refuses it. Keys the cell already holds
 keep counting. Expired counters are dropped first to make room, so the cell

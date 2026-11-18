@@ -15,9 +15,11 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use celld::bucket::Bucket;
+use futures_util::FutureExt as _;
 use serde_json::Value;
 
-use super::harness::{client, fixture_dir, signal_group, wait_until};
+use super::harness::{client, fixture_dir, signal_group, until_next_window, wait_until};
 
 const CELLD: &str = env!("CARGO_BIN_EXE_celld");
 const TOKEN: &str = "ratelimit-fleet-token";
@@ -126,7 +128,9 @@ async fn two_nodes_share_one_counter() {
             .unwrap()
             .as_nanos()
     );
-    let bucket = format!("{}/{run}", bucket.trim_end_matches('/'));
+    let prefix = run.clone();
+    let spec = format!("{}/{run}", bucket.trim_end_matches('/'));
+    let bucket = spec.clone();
     let home = tempfile::TempDir::new().expect("create a temp dir");
     let deployed = Command::new(CELLD)
         .arg("deploy")
@@ -143,36 +147,63 @@ async fn two_nodes_share_one_counter() {
         String::from_utf8_lossy(&deployed.stderr)
     );
 
-    let nodes = [
-        Node::spawn(home.path(), 0, &bucket, &endpoint),
-        Node::spawn(home.path(), 1, &bucket, &endpoint),
-    ];
-    let client = client();
-    for node in &nodes {
-        node.wait_ready(&client).await;
-    }
-
-    // Limit 3 per 60 seconds, 12 calls alternating between the nodes: exactly
-    // three succeed, whichever node owns the cell and wherever each call lands.
-    // The window can only change under the run by crossing a minute boundary,
-    // so the calls wait for the start of one when it is near.
-    let into_window = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        % 60;
-    if into_window > 40 {
-        tokio::time::sleep(Duration::from_secs(61 - into_window)).await;
-    }
-    let mut successes = 0;
-    for call in 0..12 {
-        if limit(&client, &nodes[call % 2], "LIMITER", "shared").await {
-            successes += 1;
+    // The nodes live inside the block, so they are stopped (and write nothing
+    // more) before the run's objects are deleted, also when an assertion fails.
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let nodes = [
+            Node::spawn(home.path(), 0, &bucket, &endpoint),
+            Node::spawn(home.path(), 1, &bucket, &endpoint),
+        ];
+        let client = client();
+        for node in &nodes {
+            node.wait_ready(&client).await;
         }
+
+        // Limit 3 per 60 seconds, 12 calls alternating between the nodes: exactly
+        // three succeed, whichever node owns the cell and wherever each call lands.
+        // The window can only change under the run by crossing a minute boundary,
+        // so the calls wait for the start of a fresh one when under 30 seconds are
+        // left; the 14 requests then finish well inside it.
+        let left = until_next_window(60);
+        if left < Duration::from_secs(30) {
+            tokio::time::sleep(left + Duration::from_millis(200)).await;
+        }
+        let mut successes = 0;
+        for call in 0..12 {
+            if limit(&client, &nodes[call % 2], "LIMITER", "shared").await {
+                successes += 1;
+            }
+        }
+        assert_eq!(successes, 3, "the two nodes did not share one counter");
+        // The other binding of the namespace, through the other node, sees the same
+        // exhausted counter.
+        assert!(!limit(&client, &nodes[1], "SAME", "shared").await);
+        assert!(!limit(&client, &nodes[0], "SAME", "shared").await);
+    })
+    .catch_unwind()
+    .await;
+    clean(&spec, &prefix).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
     }
-    assert_eq!(successes, 3, "the two nodes did not share one counter");
-    // The other binding of the namespace, through the other node, sees the same
-    // exhausted counter.
-    assert!(!limit(&client, &nodes[1], "SAME", "shared").await);
-    assert!(!limit(&client, &nodes[0], "SAME", "shared").await);
+}
+
+/// Deletes every object the run wrote under its prefix.
+async fn clean(spec: &str, prefix: &str) {
+    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into());
+    let bucket = Bucket::open(spec, None, &region, None, Some("ratelimit-fleet"))
+        .unwrap_or_else(|error| panic!("open {spec}: {error:#}"));
+    let keys: Vec<String> = bucket
+        .list("")
+        .await
+        .unwrap_or_else(|error| panic!("list {prefix}: {error:#}"))
+        .into_iter()
+        .map(|meta| meta.location.to_string())
+        .collect();
+    let deleted = bucket.delete_many(&keys).await;
+    assert_eq!(
+        deleted.len(),
+        keys.len(),
+        "cleanup left objects under {prefix}"
+    );
 }

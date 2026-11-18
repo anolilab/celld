@@ -365,13 +365,22 @@ impl RateLimitBinding {
             number("limit").filter(|limit| celld_logic::ratelimit::valid_limit(*limit)),
             number("period").filter(|period| celld_logic::ratelimit::valid_period(*period)),
         ) {
-            (Some(name), Some(namespace), Some(limit), Some(period)) => Ok(Self {
-                environment: name.to_string(),
-                namespace: namespace.to_string(),
-                // Both were validated against bounds that fit a `u32`.
-                limit: u32::try_from(limit)?,
-                period: u32::try_from(period)?,
-            }),
+            (Some(name), Some(namespace), Some(limit), Some(period)) => {
+                // The names a deploy accepts, so a manifest cannot install a
+                // binding such as `__proto__` that `env` would not hold.
+                anyhow::ensure!(
+                    crate::deploy::valid_binding(name),
+                    "the manifest has an invalid ratelimit binding name: {name:?}"
+                );
+                crate::deploy::check_env_name(name)?;
+                Ok(Self {
+                    environment: name.to_string(),
+                    namespace: namespace.to_string(),
+                    // Both were validated against bounds that fit a `u32`.
+                    limit: u32::try_from(limit)?,
+                    period: u32::try_from(period)?,
+                })
+            }
             _ => anyhow::bail!("the manifest has an invalid ratelimit binding: {entry}"),
         }
     }
@@ -979,4 +988,33 @@ pub fn handler_budget() -> std::time::Duration {
                 .expect("validated CELLD_HANDLER_BUDGET_S"),
         )
     })
+}
+
+#[cfg(test)]
+mod ratelimit_binding_tests {
+    use super::RateLimitBinding;
+    use serde_json::json;
+
+    fn entry(name: &str) -> serde_json::Value {
+        json!({
+            "type": "ratelimit", "name": name, "namespace_id": "1",
+            "simple": { "limit": 5, "period": 60 }
+        })
+    }
+
+    #[test]
+    fn a_manifest_binding_needs_a_name_env_can_hold() {
+        assert_eq!(
+            RateLimitBinding::from_manifest(&entry("LIMITER"))
+                .unwrap()
+                .environment,
+            "LIMITER"
+        );
+        for name in ["__proto__", "bad name", "1st", ""] {
+            assert!(
+                RateLimitBinding::from_manifest(&entry(name)).is_err(),
+                "{name}"
+            );
+        }
+    }
 }

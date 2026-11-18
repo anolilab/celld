@@ -150,13 +150,20 @@ function ratelimitService(host) {
   class Ratelimit {
     // `namespace()` answers the namespace of rate limit cells, and `cellName`
     // names this binding's one cell (`celld_logic::ratelimit::cell_name`).
+    //
+    // All four are private fields: code holding the binding (or handed `env`)
+    // can reach `limit()` and nothing else, so it cannot call the namespace
+    // stub itself with a limit of its own choosing.
+    #namespace;
+    #cellName;
+    #limit;
+    #period;
+
     constructor(namespace, cellName, limit, period) {
-      Object.defineProperties(this, {
-        _namespace: { value: namespace },
-        _cellName: { value: cellName },
-        _limit: { value: limit },
-        _period: { value: period },
-      });
+      this.#namespace = namespace;
+      this.#cellName = cellName;
+      this.#limit = limit;
+      this.#period = period;
     }
 
     async limit(options) {
@@ -171,10 +178,10 @@ function ratelimitService(host) {
       if (typeof options.key !== "string") {
         throw new TypeError("RateLimit.limit() needs a string `key`");
       }
-      const success = await this._namespace().getByName(this._cellName).__ratelimitHit({
+      const success = await this.#namespace().getByName(this.#cellName).__ratelimitHit({
         key: options.key,
-        limit: this._limit,
-        period: this._period,
+        limit: this.#limit,
+        period: this.#period,
       });
       return { success };
     }
