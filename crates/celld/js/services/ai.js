@@ -47,7 +47,8 @@ function __aiEventLine(event) {
   const delta = event?.choices?.[0]?.delta?.content;
   const text = typeof delta === "string" ? delta : "";
   if (text === "" && !event?.usage) return null;
-  const out = { response: text };
+  // The node's key may be written with escapes the raw text did not match.
+  const out = { response: __ai_redact(text) };
   if (event.usage) out.usage = event.usage;
   return `data: ${JSON.stringify(out)}\n\n`;
 }
@@ -72,7 +73,7 @@ function __aiStreamError(event) {
 // event before it is read.
 function __aiEventStream(streamId) {
   const reader = new CelldHttpBodyStream(streamId).getReader();
-  const decoder = new TextDecoder();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
   let buffer = "";
   let ended = false;
   let received = 0;
@@ -93,6 +94,8 @@ function __aiEventStream(streamId) {
     const data = __ai_redact(dataLines.join("\n")).trim();
     dataLines = [];
     dataSize = 0;
+    // An event with no data, such as a bare `data:` line, carries nothing.
+    if (data === "") return false;
     if (data === "[DONE]") {
       finish(controller);
       return true;
@@ -143,19 +146,29 @@ function __aiEventStream(streamId) {
           if (dataLines.length > 0 && dispatch(controller)) return;
           return fail(controller, __aiError("the upstream stream ended before [DONE]"));
         }
-        const { done, value } = await reader.read();
-        if (done) {
-          ended = true;
-          buffer += decoder.decode();
-          if (buffer !== "") buffer += "\n";
-        } else {
-          received += value.byteLength;
-          if (received > __AI_MAX_STREAM) {
-            return fail(
-              controller,
-              __aiError("the upstream stream is larger than 32 MiB"));
+        let done, value;
+        try {
+          ({ done, value } = await reader.read());
+        } catch {
+          // The read error names the request URL, whose path may hold a credential.
+          return fail(controller, __aiError("reading the upstream stream failed"));
+        }
+        try {
+          if (done) {
+            ended = true;
+            buffer += decoder.decode();
+            if (buffer !== "") buffer += "\n";
+          } else {
+            received += value.byteLength;
+            if (received > __AI_MAX_STREAM) {
+              return fail(
+                controller,
+                __aiError("the upstream stream is larger than 32 MiB"));
+            }
+            buffer += decoder.decode(value, { stream: true });
           }
-          buffer += decoder.decode(value, { stream: true });
+        } catch {
+          return fail(controller, __aiError("the upstream stream is not valid UTF-8"));
         }
       }
     },
@@ -186,7 +199,8 @@ __celld.__makeAi = () => ({
         throw __aiError(
           "the upstream answer has no choices[0].message.content text");
       }
-      const out = { response: content };
+      // The node's key may be written with escapes the raw text did not match.
+      const out = { response: __ai_redact(content) };
       if (answer.usage) out.usage = answer.usage;
       return out;
     }
@@ -206,6 +220,14 @@ __celld.__makeAi = () => ({
       const data = [...answer.data]
         .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
         .map((item) => item.embedding);
+      if (
+        !data.every((vector) =>
+          vector.length === data[0].length &&
+          vector.every((value) => typeof value === "number" && Number.isFinite(value)))
+      ) {
+        throw __aiError(
+          "the upstream embeddings are not finite numbers of one length");
+      }
       return { shape: [data.length, data[0]?.length ?? 0], data };
     }
     throw new TypeError(

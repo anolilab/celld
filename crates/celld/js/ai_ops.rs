@@ -80,7 +80,8 @@ pub(super) fn op_ai_run(
             builder = builder.header(reqwest::header::AUTHORIZATION, bearer);
         }
         let mut response = builder.send().await.map_err(|error| {
-            // The error names the URL, which carries no credential.
+            // The URL stays out: the base URL's path may carry a credential.
+            let error = error.without_url();
             config.redact(&format!("AiError: the upstream request failed: {error}"))
         })?;
         let status = response.status();
@@ -120,6 +121,7 @@ pub(super) fn op_ai_run(
         }
         let mut answer = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|error| {
+            let error = error.without_url();
             config.redact(&format!("AiError: reading the upstream answer: {error}"))
         })? {
             if answer.len() + chunk.len() > crate::ai::MAX_BODY_BYTES {
@@ -127,8 +129,10 @@ pub(super) fn op_ai_run(
             }
             answer.extend_from_slice(&chunk);
         }
+        let answer = String::from_utf8(answer)
+            .map_err(|_| "AiError: the upstream answer is not valid UTF-8".to_string())?;
         // An endpoint may echo the key it was sent.
-        Ok(config.redact(&String::from_utf8_lossy(&answer)))
+        Ok(config.redact(&answer))
     });
     rv.set(promise_for(scope, id));
 }

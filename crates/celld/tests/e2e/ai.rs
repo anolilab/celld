@@ -88,8 +88,26 @@ async fn serve(mut stream: tokio::net::TcpStream, log: Arc<Mutex<Vec<Seen>>>) {
         authorization: header("authorization"),
         body: body.clone(),
     });
+    let last = body["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .and_then(|message| message["content"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    if let Some(raw) = raw_reply(&last) {
+        let _ = stream.write_all(&raw).await;
+        let _ = stream.shutdown().await;
+        return;
+    }
+    let embedding = |data: &str| http(200, "application/json", &format!(r#"{{"data":{data}}}"#));
     let reply = if path.ends_with("/embeddings") && body["input"] == "bad-shape" {
         http(200, "application/json", r#"{"data":[{"index":0}]}"#)
+    } else if path.ends_with("/embeddings") && body["input"] == "embed-ragged" {
+        embedding(r#"[{"index":0,"embedding":[1,2]},{"index":1,"embedding":[1]}]"#)
+    } else if path.ends_with("/embeddings") && body["input"] == "embed-nonnumber" {
+        embedding(r#"[{"index":0,"embedding":[1,"x"]}]"#)
+    } else if path.ends_with("/embeddings") && body["input"] == "embed-infinite" {
+        embedding(r#"[{"index":0,"embedding":[1,1e999]}]"#)
     } else if path.ends_with("/embeddings") {
         let inputs = match &body["input"] {
             Value::String(text) => vec![text.clone()],
@@ -113,12 +131,6 @@ async fn serve(mut stream: tokio::net::TcpStream, log: Arc<Mutex<Vec<Seen>>>) {
             &json!({ "data": data }).to_string(),
         )
     } else {
-        let last = body["messages"]
-            .as_array()
-            .and_then(|messages| messages.last())
-            .and_then(|message| message["content"].as_str())
-            .unwrap_or_default()
-            .to_string();
         if last == "big" {
             // An answer past the host's limit.
             http(200, "application/json", &"x".repeat(33 << 20))
@@ -129,6 +141,11 @@ async fn serve(mut stream: tokio::net::TcpStream, log: Arc<Mutex<Vec<Seen>>>) {
                 "data: {}\n\ndata: {{not json\n\ndata: [DONE]\n\n",
                 json!({ "choices": [{ "delta": { "content": "Hel" } }] })
             );
+            http(200, "text/event-stream", &text)
+        } else if last == "stream-empty-data" {
+            // A bare `data:` and a data line of spaces, then a real event.
+            let event = json!({ "choices": [{ "delta": { "content": "Hel" } }] });
+            let text = format!("data:\n\ndata:  \n\ndata: {event}\n\ndata: [DONE]\n\n");
             http(200, "text/event-stream", &text)
         } else if last == "stream-multiline" {
             // One event whose JSON is split across two `data:` lines, after a
@@ -206,6 +223,49 @@ async fn serve(mut stream: tokio::net::TcpStream, log: Arc<Mutex<Vec<Seen>>>) {
     let _ = stream.shutdown().await;
 }
 
+/// Replies a `&str` cannot carry: bytes that are not UTF-8, or a body that
+/// ends before its `content-length`.
+fn raw_reply(prompt: &str) -> Option<Vec<u8>> {
+    let head = |content_type: &str, extra: &str| {
+        format!(
+            "HTTP/1.1 200 X\r\ncontent-type: {content_type}\r\n{extra}connection: close\r\n\r\n"
+        )
+    };
+    let mut reply = Vec::new();
+    match prompt {
+        "bad-utf8" => {
+            reply.extend(head("application/json", "").bytes());
+            reply.extend(br#"{"choices":[{"message":{"content":"a"#);
+            reply.extend([0xff]);
+            reply.extend(br#"b"}}]}"#);
+        }
+        "stream-bad-utf8" => {
+            reply.extend(head("text/event-stream", "").bytes());
+            reply.extend(br#"data: {"choices":[{"delta":{"content":"a"#);
+            reply.extend([0xff]);
+            reply.extend(b"b\"}}]}\n\ndata: [DONE]\n\n");
+        }
+        // The key with one character written as a JSON escape.
+        "escaped-key" => {
+            reply.extend(head("application/json", "").bytes());
+            reply.extend(br#"{"choices":[{"message":{"content":"key \u0073k-test-key-123"}}]}"#);
+        }
+        "stream-escaped-key" => {
+            reply.extend(head("text/event-stream", "").bytes());
+            reply
+                .extend(br#"data: {"choices":[{"delta":{"content":"key \u0073k-test-key-123"}}]}"#);
+            reply.extend(b"\n\ndata: [DONE]\n\n");
+        }
+        // A body cut short of its length.
+        "stream-reset" => {
+            reply.extend(head("text/event-stream", "content-length: 100000\r\n").bytes());
+            reply.extend(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n");
+        }
+        _ => return None,
+    }
+    Some(reply)
+}
+
 fn http(status: u16, content_type: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {status} X\r\ncontent-type: {content_type}\r\nconnection: close\r\n\r\n{body}"
@@ -213,14 +273,17 @@ fn http(status: u16, content_type: &str, body: &str) -> String {
 }
 
 async fn start(stub: &Stub) -> (Server, tempfile::TempDir) {
+    start_at(&stub.base()).await
+}
+
+async fn start_at(base: &str) -> (Server, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let key_file = dir.path().join("ai-key");
     std::fs::write(&key_file, format!("{KEY}\n")).unwrap();
-    let base = stub.base();
     let server = Server::start(
         "ai",
         &[
-            ("CELLD_AI_BASE_URL", &base),
+            ("CELLD_AI_BASE_URL", base),
             ("CELLD_AI_API_KEY_FILE", key_file.to_str().unwrap()),
             ("CELLD_AI_MODELS", MODELS),
         ],
@@ -471,4 +534,83 @@ async fn an_upstream_that_echoes_the_key_in_an_answer_does_not_hand_it_over() {
         assert!(!result.contains(KEY), "{path}: {result}");
         assert!(result.contains("key [redacted]"), "{path}: {result}");
     }
+}
+
+#[tokio::test]
+async fn a_key_written_with_json_escapes_does_not_reach_the_worker() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    let chat: Value = server.get_json("/escaped-key").await;
+    assert_eq!(chat["ok"], true, "{chat}");
+    assert_eq!(chat["value"]["response"], "key [redacted]");
+    let stream = server.get_text("/stream-escaped-key").await;
+    assert!(!stream.contains(KEY), "{stream}");
+    assert!(stream.contains("key [redacted]"), "{stream}");
+}
+
+#[tokio::test]
+async fn a_request_error_does_not_show_the_base_url_path() {
+    // Nothing listens on this port.
+    let closed = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let (server, _key) = start_at(&format!("http://127.0.0.1:{closed}/pathsecret/v1")).await;
+    let result: Value = server.get_json("/echo-key").await;
+    assert_eq!(result["ok"], false, "{result}");
+    let message = result["message"].as_str().unwrap();
+    assert!(message.contains("AiError"), "{message}");
+    assert!(!message.contains("pathsecret"), "{message}");
+
+    // A body that fails after the head names the URL too, unless it is cut.
+    let stub = Stub::start().await;
+    let (server, _key) = start_at(&format!("{}/pathsecret", stub.base())).await;
+    let result: Value = server.get_json("/stream-reset").await;
+    assert_eq!(result["ok"], false, "{result}");
+    assert!(!result.to_string().contains("pathsecret"), "{result}");
+}
+
+#[tokio::test]
+async fn embeddings_that_are_not_finite_numbers_of_one_length_fail_the_call() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    for path in ["/embed-ragged", "/embed-nonnumber", "/embed-infinite"] {
+        let result: Value = server.get_json(path).await;
+        assert_eq!(result["ok"], false, "{path}: {result}");
+        assert!(
+            result["message"].as_str().unwrap().contains("finite"),
+            "{path}: {result}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_answer_that_is_not_utf8_fails_instead_of_being_repaired() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    for path in ["/bad-utf8", "/stream-bad-utf8"] {
+        let result: Value = server.get_json(path).await;
+        assert_eq!(result["ok"], false, "{path}: {result}");
+        assert!(
+            result["message"].as_str().unwrap().contains("UTF-8"),
+            "{path}: {result}"
+        );
+        assert!(!result.to_string().contains('\u{fffd}'), "{path}: {result}");
+    }
+}
+
+#[tokio::test]
+async fn an_event_without_data_is_dropped() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    let result: Value = server.get_json("/stream-empty-data").await;
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(
+        result["text"],
+        "data: {\"response\":\"Hel\"}\n\ndata: [DONE]\n\n"
+    );
 }

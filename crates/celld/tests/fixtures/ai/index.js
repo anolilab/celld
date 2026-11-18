@@ -36,6 +36,10 @@ export default {
           headers: { "content-type": "text/event-stream" },
         });
       }
+      case "/stream-empty-data":
+      case "/stream-bad-utf8":
+      case "/stream-escaped-key":
+      case "/stream-reset":
       case "/stream-multiline":
       case "/stream-cr":
       case "/stream-too-big":
@@ -56,6 +60,15 @@ export default {
         });
         return Response.json({ ...result, text });
       }
+      case "/escaped-key":
+      case "/bad-utf8":
+        return Response.json(
+          await attempt(() => env.AI.run(CHAT, { prompt: url.pathname.slice(1) })));
+      case "/embed-ragged":
+      case "/embed-nonnumber":
+      case "/embed-infinite":
+        return Response.json(
+          await attempt(() => env.AI.run(EMBED, { text: url.pathname.slice(1) })));
       case "/echo-key":
         return Response.json(await attempt(() => env.AI.run(CHAT, { prompt: "echo-key" })));
       case "/bad-shape":

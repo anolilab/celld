@@ -44,8 +44,11 @@ another endpoint or model. `celld dev` reads the same settings.
 
 The node makes the HTTP call, so the key never enters a Worker. celld does not
 log it, and it removes the key from what the endpoint sends back, an error, an
-answer or a stream event, before the Worker sees it. A `401` or `403` from the
-endpoint reaches the Worker without the body.
+answer or a stream event, before the Worker sees it, and again from the text it
+decodes, so a key the endpoint writes with JSON escapes is removed too. A `401`
+or `403` from the endpoint reaches the Worker without the body. An error from
+the connection to the endpoint does not name its URL, because the path of the
+base URL may carry a credential.
 
 A request body from the Worker and an answer from the endpoint may each be up
 to 32 MiB. A larger request is refused without a call, and a larger answer
@@ -56,8 +59,9 @@ longer than the Worker's.
 
 An answer must have the shape the route promises: `choices[0].message.content`
 as a string for text generation, and a `data` array whose items each carry an
-`embedding` array for embeddings. Any other 2xx answer fails the call with an
-`AiError` and does not become an empty result.
+`embedding` array of finite numbers for embeddings, all of one length. An answer
+that is not valid UTF-8 fails the call too, and is not repaired. Any other 2xx
+answer fails the call with an `AiError` and does not become an empty result.
 
 The endpoint is the operator's own, so the egress policy (`CELLD_EGRESS`) does
 not apply to it and a private or loopback address works. celld does not follow
@@ -95,10 +99,11 @@ return new Response(stream, { headers: { "content-type": "text/event-stream" } }
 
 The endpoint's stream is read as server-sent events: lines may end in CRLF, LF
 or CR, an event is its `data:` lines joined with a line feed, and comments and
-other fields are ignored.
+other fields are ignored. An event with no data, such as a keep-alive `data:`
+line, is dropped.
 
-A stream that the endpoint cuts short, that carries an error event or an event
-that is not JSON, that sends one event longer than 1 MiB, or that is longer than
+A stream that the endpoint cuts short, that is not valid UTF-8, that carries an
+error event or an event that is not JSON, that sends one event longer than 1 MiB, or that is longer than
 32 MiB in all, does not end with
 `[DONE]`. The stream errors instead, and reading it throws an
 `AiError` with the endpoint's message (without the key), so a Worker cannot
