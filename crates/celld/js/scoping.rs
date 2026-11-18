@@ -23,6 +23,9 @@ pub(super) struct Declared {
     /// key is the same for the whole fleet, so a class check would admit every
     /// database, namespace and queue in it.
     shared: HashSet<String>,
+    /// The `send_email` bindings: their restrictions are the deployment's, so
+    /// the op reads them here and never from the call.
+    send_email: Vec<crate::email::SendEmailBinding>,
 }
 
 impl Declared {
@@ -46,7 +49,16 @@ impl Declared {
             script: config.script_name.clone(),
             classes: config.do_classes.iter().cloned().collect(),
             shared,
+            send_email: config.send_email_bindings.clone(),
         }
+    }
+
+    /// The `send_email` binding named `name`, if the script declared one.
+    pub(super) fn send_email(&self, name: &str) -> Option<crate::email::SendEmailBinding> {
+        self.send_email
+            .iter()
+            .find(|binding| binding.environment == name)
+            .cloned()
     }
 
     /// Whether the script may route to `target`: a cell of a class it

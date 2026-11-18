@@ -451,6 +451,26 @@ async fn activate_refuses_a_version_with_an_invalid_ratelimit_binding() {
     assert_eq!(fleet_pointer(&fleet).await.1, token);
 }
 
+#[tokio::test]
+async fn activate_refuses_a_version_with_an_invalid_send_email_binding() {
+    let fleet = fleet();
+    serving_pair(&fleet).await;
+    let (_, token) = fleet_pointer(&fleet).await;
+    // The binding needs `send-email-v1`, which this version does not require.
+    let mut staged = built("back", "v9", &[]);
+    staged.manifest.raw_metadata = serde_json::json!({ "bindings": [{
+        "type": "send_email", "name": "EMAIL"
+    }] });
+    crate::deploy::write(&fleet.bucket, &staged, false)
+        .await
+        .expect("stage");
+    let error = activate(&fleet.bucket, &[target("back", "v9")], None)
+        .await
+        .expect_err("refused");
+    assert!(format!("{error:#}").contains("send-email-v1"), "{error:#}");
+    assert_eq!(fleet_pointer(&fleet).await.1, token);
+}
+
 #[test]
 fn the_primary_script_is_chosen_by_an_explicit_rule() {
     let two = [target("front", "v2"), target("back", "v2")];

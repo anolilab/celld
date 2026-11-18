@@ -124,6 +124,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_KV_V1,
     FEATURE_QUEUES_V1,
     FEATURE_RATELIMIT_V1,
+    FEATURE_SEND_EMAIL_V1,
     FEATURE_SQLITE_VEC_V1,
     FEATURE_R2_V1,
     FEATURE_WASM_V1,
@@ -202,6 +203,10 @@ pub const FEATURE_QUEUES_V1: &str = "queues-v1";
 /// A deployment with `ratelimits` bindings. A node without the rate limit cell
 /// would build an `env` missing the binding and fail on the first `limit()`.
 pub const FEATURE_RATELIMIT_V1: &str = "ratelimit-v1";
+
+/// A deployment with `send_email` bindings. A node without the binding would
+/// build an `env` missing it and fail on the first `send()`.
+pub const FEATURE_SEND_EMAIL_V1: &str = "send-email-v1";
 
 pub const QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION: u32 = 1;
 
@@ -349,6 +354,21 @@ pub fn ai_binding(manifest: &Manifest) -> anyhow::Result<Option<String>> {
         "Workers AI deployment does not require {FEATURE_AI_V1}"
     );
     Ok(name)
+}
+
+/// Validate the `send_email` bindings of a manifest and return them.
+///
+/// A deployment with a `send_email` binding must require `send-email-v1`, and
+/// every binding must be one a deploy writes: a node that took a hand-written
+/// manifest would otherwise enforce a restriction it misread, or none.
+#[doc(hidden)]
+pub fn validate_send_email_manifest(
+    manifest: &Manifest,
+) -> anyhow::Result<Vec<crate::email::SendEmailBinding>> {
+    crate::secrets::typed_bindings(manifest, "send_email", FEATURE_SEND_EMAIL_V1, "send_email")?
+        .into_iter()
+        .map(|(_, binding)| crate::email::SendEmailBinding::from_manifest(binding))
+        .collect()
 }
 
 /// Validate every Queue value before a deployment becomes runtime state.
@@ -843,5 +863,63 @@ mod ai_manifest_tests {
         ]));
         let error = ai_binding(&two).unwrap_err().to_string();
         assert!(error.contains("one Workers AI binding"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod send_email_manifest_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn manifest(features: &[&str], bindings: serde_json::Value) -> Manifest {
+        serde_json::from_value(json!({
+            "version": "v", "script_name": "s", "main_module": "index.js",
+            "do_classes": [], "sqlite_classes": [], "modules": [],
+            "required_features": features,
+            "raw_metadata": { "bindings": bindings },
+        }))
+        .expect("a manifest")
+    }
+
+    fn entry() -> serde_json::Value {
+        json!({ "type": "send_email", "name": "EMAIL", "destination_address": "ops@example.com" })
+    }
+
+    #[test]
+    fn a_complete_deployment_yields_its_bindings() {
+        let ok = manifest(&["send-email-v1"], json!([entry()]));
+        let bindings = validate_send_email_manifest(&ok).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].destination_address.as_deref(),
+            Some("ops@example.com")
+        );
+    }
+
+    #[test]
+    fn the_feature_is_required_so_an_older_node_refuses_the_deployment() {
+        let error = validate_send_email_manifest(&manifest(&[], json!([entry()]))).unwrap_err();
+        assert!(error.to_string().contains("send-email-v1"), "{error}");
+        assert!(SUPPORTED_DEPLOYMENT_FEATURES.contains(&FEATURE_SEND_EMAIL_V1));
+        assert!(validate_send_email_manifest(&manifest(&[], json!([])))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_hand_written_binding_is_refused() {
+        for change in [
+            json!({ "extra": 1 }),
+            json!({ "name": "__proto__" }),
+            json!({ "allowed_destination_addresses": ["a@b.co"] }),
+            json!({ "allowed_sender_addresses": ["not an address"] }),
+        ] {
+            let mut broken = entry();
+            for (key, value) in change.as_object().unwrap() {
+                broken[key] = value.clone();
+            }
+            let manifest = manifest(&["send-email-v1"], json!([broken]));
+            assert!(validate_send_email_manifest(&manifest).is_err(), "{change}");
+        }
     }
 }

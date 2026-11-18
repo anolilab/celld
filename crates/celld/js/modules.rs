@@ -581,6 +581,7 @@ fn install_lazy_module(scope: &mut v8::PinScope, spec: &str) -> Option<&'static 
 fn stub_source(spec: &str, names: &std::collections::BTreeSet<String>) -> String {
     let cf = spec == "cloudflare:workers";
     let cf_sockets = spec == "cloudflare:sockets";
+    let cf_email = spec == "cloudflare:email";
     // `cloudflare:workflows` is real, not a pass-through proxy: its one
     // export is `NonRetryableError`, and a proxy standing in for an Error
     // subclass would make `throw new NonRetryableError(...)` throw a value
@@ -593,6 +594,8 @@ fn stub_source(spec: &str, names: &std::collections::BTreeSet<String>) -> String
         "__celld.__cf".to_string()
     } else if cf_sockets {
         "__celld.__cfSockets".to_string()
+    } else if cf_email {
+        "__celld.__cfEmail".to_string()
     } else if cf_workflows {
         "__celld.__cfWorkflows".to_string()
     } else if python_host {
@@ -929,6 +932,9 @@ fn builtin_source(scope: &mut v8::PinScope, spec: &str) -> Option<String> {
     }
     if spec == "cloudflare:sockets" {
         return Some("__celld.__cfSockets".into());
+    }
+    if spec == "cloudflare:email" {
+        return Some("__celld.__cfEmail".into());
     }
     if spec == "cloudflare:workflows" {
         return Some("__celld.__cfWorkflows".into());

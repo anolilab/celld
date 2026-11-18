@@ -136,6 +136,7 @@ the Cloudflare service.
 - [KV](services/kv.md)
 - [Queues](services/queues.md)
 - [Rate Limiting](services/ratelimit.md)
+- [Email](services/email.md)
 - [D1](services/d1.md)
 - [R2](services/r2.md)
 - [Hyperdrive](services/hyperdrive.md)
@@ -795,6 +796,13 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_AI_API_KEY_FILE`, `CELLD_AI_API_KEY` | The bearer token for the endpoint, read from a file or taken from the variable; set at most one. Neither is needed for an endpoint that takes no key. celld never logs the key and never hands it to a Worker |
 | `CELLD_EGRESS_ALLOW` | Exceptions to `CELLD_EGRESS=public`, separated by commas: CIDR ranges and `host:port` destinations. Setting it with `CELLD_EGRESS=open` is an error |
 | `CELLD_EXTRA_CA_CERTS` | A PEM file of certificates that outbound TLS trusts in addition to the bundled public roots, for a Worker's `fetch()`, `connect()` and `startTls()` and outbound `wss://`. celld reads it once and refuses to start when the file is unreadable, holds no certificate, or holds one that cannot be a trust anchor. Only Workers' dials trust them: celld's own connections, the control-plane WebSocket and the HTTP clients that reach storage, the control plane API and telemetry, trust the bundled roots only |
+| `CELLD_SMTP_HOST` | The SMTP server that the `send_email` binding delivers through. Unset means the node has no relay. A `CELLD_SMTP_*` variable set without it is an error. See [Email](services/email.md) |
+| `CELLD_SMTP_PORT` | The relay's port (default: 587 for `starttls`, 465 for `tls`, 25 for `off`) |
+| `CELLD_SMTP_TLS` | `starttls` (default), `tls` or `off`. TLS is required unless this is `off`, and the relay's certificate must chain to the bundled public roots |
+| `CELLD_SMTP_USERNAME` | The relay account. Set it with `CELLD_SMTP_PASSWORD` or `CELLD_SMTP_PASSWORD_FILE` |
+| `CELLD_SMTP_PASSWORD` | The relay password. A Worker never sees it, and it is kept out of logs and errors |
+| `CELLD_SMTP_PASSWORD_FILE` | The path of a file that holds the relay password, in place of `CELLD_SMTP_PASSWORD`. Setting both is an error. celld reads it at the first `send()` and warns when other users can read it |
+| `CELLD_SMTP_HELO_NAME` | The name celld gives in `EHLO` (default: `localhost`) |
 | `CELLD_NODE` | An explicit node-session ID: 1 to 128 ASCII letters, numbers, dots, dashes, or underscores, but not `.` or `..` |
 | `CELLD_WATCH` | The local work directory for SQLite and replication |
 | `CELLD_ESBUILD` | The path of the esbuild executable |

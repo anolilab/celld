@@ -1754,6 +1754,7 @@ pub async fn apply_deployment(
     crate::protocol::validate_queue_manifest(&deployment.manifest)?;
     crate::protocol::ai_binding(&deployment.manifest)?;
     crate::protocol::validate_ratelimit_manifest(&deployment.manifest)?;
+    crate::protocol::validate_send_email_manifest(&deployment.manifest)?;
     // Read the current owner before writing this deployment's immutable
     // objects. A competing Queue consumer must refuse the deployment without
     // leaving a prefix that looks publishable.
@@ -2962,6 +2963,23 @@ mod store_secret_tests {
             .unwrap_err();
         let error = format!("{error:#}");
         assert!(error.contains("Rate Limiting"), "{error}");
+        assert!(bucket.get("deploy/current.json").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_managed_deployment_with_an_invalid_send_email_binding_is_refused() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = Bucket::open_dev(&directory.path().join("objects.sqlite3")).unwrap();
+        // The binding needs `send-email-v1`, which this manifest does not require.
+        let deployment = deployment_binding(serde_json::json!({
+            "type": "send_email", "name": "EMAIL"
+        }));
+        let error = apply_deployment(&reqwest::Client::new(), "token", &bucket, &deployment)
+            .await
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("send-email-v1"), "{error}");
         assert!(bucket.get("deploy/current.json").await.unwrap().is_none());
     }
 }

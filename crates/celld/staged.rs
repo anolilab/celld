@@ -112,6 +112,7 @@ async fn staged_manifest(bucket: &Bucket, target: &Target) -> anyhow::Result<Man
     crate::protocol::validate_queue_manifest(&manifest)?;
     crate::protocol::ai_binding(&manifest)?;
     crate::protocol::validate_ratelimit_manifest(&manifest)?;
+    crate::protocol::validate_send_email_manifest(&manifest)?;
     Ok(manifest)
 }
 

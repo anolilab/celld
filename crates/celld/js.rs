@@ -1656,6 +1656,7 @@ pub struct WorkerConfig {
     kv_bindings: Vec<(String, String)>,
     queue_bindings: Vec<QueueBinding>,
     ratelimit_bindings: Vec<RateLimitBinding>,
+    send_email_bindings: Vec<crate::email::SendEmailBinding>,
     pub(crate) queue_consumers: Vec<QueueConsumerRegistration>,
     /// This script declared a consumer in its own manifest. The deployment-
     /// wide catalog later replaces `queue_consumers` in every isolate, so the
@@ -1789,6 +1790,7 @@ impl WorkerConfig {
             kv_bindings,
             queue_bindings,
             ratelimit_bindings,
+            send_email_bindings,
             queue_consumers,
             workflow_bindings,
             vars,
@@ -1820,6 +1822,7 @@ impl WorkerConfig {
             kv_bindings,
             queue_bindings,
             ratelimit_bindings,
+            send_email_bindings,
             queue_consumers,
             declares_queue_consumer,
             workflow_bindings,
@@ -1870,6 +1873,7 @@ impl WorkerConfig {
             kv_bindings: Vec::new(),
             queue_bindings: Vec::new(),
             ratelimit_bindings: Vec::new(),
+            send_email_bindings: Vec::new(),
             queue_consumers: Vec::new(),
             workflow_bindings: Vec::new(),
             vars: Vec::new(),
@@ -6712,6 +6716,7 @@ ops! { OP_NAMES, install_op_functions,
         "__hr_event" => html_rewriter::op_hr_event,
         "__hr_take" => html_rewriter::op_hr_take,
         "__hr_free" => html_rewriter::op_hr_free,
+        "__email_send" => send_email::op_email_send,
         "__tcp_connect" => tcp::op_tcp_connect,
         "__tcp_read" => tcp::op_tcp_read,
         "__tcp_write" => tcp::op_tcp_write,
@@ -7630,6 +7635,7 @@ fn op_loader_load(
             kv_bindings: Vec::new(),
             queue_bindings: Vec::new(),
             ratelimit_bindings: Vec::new(),
+            send_email_bindings: Vec::new(),
             queue_consumers: Vec::new(),
             workflow_bindings: Vec::new(),
             vars: Vec::new(),
@@ -10157,6 +10163,7 @@ fn webcrypto_return_bytes(
 mod container;
 mod crypto;
 mod html_rewriter;
+mod send_email;
 mod tcp;
 mod zlib;
 

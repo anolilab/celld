@@ -1,0 +1,17 @@
+{
+  "name": "send-email",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": { "MARKER": "visible" },
+  "send_email": [
+    { "name": "EMAIL" },
+    { "name": "OPS", "destination_address": "ops@example.com" },
+    {
+      "name": "TEAM",
+      "allowed_destination_addresses": ["bob@example.com", "carol@example.com"],
+      "allowed_sender_addresses": ["ann@example.com"]
+    }
+  ]
+}
