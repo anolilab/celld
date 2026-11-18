@@ -153,7 +153,12 @@ pub fn fleet_status(
         .filter(|peer| peer.node != node && !peer.ingress_only)
         .collect::<Vec<_>>();
     let count = incumbents.len();
-    if count > 1 {
+    // An ingress-only joiner takes no cells, so the skew is no reason to hold
+    // its rollout: its predecessor has nothing to hand it.
+    let joining_hosts = live
+        .iter()
+        .any(|peer| peer.node == node && !peer.ingress_only);
+    if count > 1 && joining_hosts {
         let total = incumbents
             .iter()
             .fold(0_usize, |sum, peer| sum.saturating_add(peer.resident_cells));
@@ -227,15 +232,22 @@ mod fleet_tests {
     }
 
     #[test]
-    fn an_ingress_only_joiner_does_not_open_the_gate_past_a_skew() {
-        let peers = [
-            peer("a", 90, false),
-            peer("b", 10, false),
-            peer("c", 10, false),
-            peer("new", 0, true),
-        ];
+    fn an_ingress_only_joiner_is_not_held_by_a_skew_it_cannot_repair() {
+        let skewed = |joiner: CapacityPeer| {
+            [
+                peer("a", 90, false),
+                peer("b", 10, false),
+                peer("c", 10, false),
+                joiner,
+            ]
+        };
+        assert_eq!(
+            fleet_status(None, "new", 50_000, &skewed(peer("new", 0, true)), 8),
+            Ok(())
+        );
+        // A hosting joiner that is full still has to wait for the skew to settle.
         assert!(matches!(
-            fleet_status(None, "new", 50_000, &peers, 8),
+            fleet_status(None, "new", 50_000, &skewed(peer("new", 90, false)), 8),
             Err(FleetUnsettled::OwnershipSkew { .. })
         ));
     }
