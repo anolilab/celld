@@ -1099,7 +1099,9 @@ pub(crate) fn open_embedded(
     let mut facet_path = parent.facet_path.clone();
     facet_path.push(name.to_string());
     let stream = crate::engine_api::facet_cell(&parent.root_scope, &facet_path);
-    let connection = Connection::open(path)?;
+    let mut connection = Connection::open(path)?;
+    // The size cap bounds these writes too, so it goes on first.
+    crate::sql_limits::install(&mut connection)?;
     schema(&connection)?;
     // Each run of a facet has its own scope, so a continuation from an
     // aborted instance cannot enter its replacement. The database is one
@@ -2547,14 +2549,20 @@ unsafe fn d1_step_to_done(
                 *budget = remaining;
                 stepped.rows.push(row);
             }
-            rusqlite::ffi::SQLITE_DONE => return Ok(stepped),
+            rusqlite::ffi::SQLITE_DONE => {
+                crate::sql_limits::disarm();
+                return Ok(stepped);
+            }
             code => {
+                // Whatever runs next is engine SQL (the failure's own probes,
+                // a migration's bookkeeping): the deadline does not reach it.
+                crate::sql_limits::disarm();
                 return Err(d1_sqlite_failure(
                     scope,
                     database,
                     started_in_transaction,
                     code,
-                ))
+                ));
             }
         }
     }
@@ -2604,7 +2612,8 @@ fn d1_sqlite_failure(
     // The message is read before the failure is recorded, which may run
     // statements and clear it.
     let detail = unsafe { failure_detail(database) };
-    let _ = sqlite_operation_failure(scope, database, counts_as_open, result_code, "d1");
+    let error = format!("d1: {detail}");
+    record_sqlite_operation_failure(scope, database, counts_as_open, true, result_code, &error);
     detail
 }
 
@@ -3384,6 +3393,7 @@ fn with_application_storage_write<T>(
                     scope,
                     database,
                     started_in_transaction,
+                    false,
                     result_code,
                     &error.to_string(),
                 );
@@ -3566,6 +3576,7 @@ fn record_sqlite_operation_failure(
     scope: &str,
     database: *mut rusqlite::ffi::sqlite3,
     started_in_transaction: bool,
+    engine_owned: bool,
     result_code: i32,
     error: &str,
 ) {
@@ -3579,10 +3590,15 @@ fn record_sqlite_operation_failure(
             && celld_logic::sqlite::SQLITE_INTERRUPT == rusqlite::ffi::SQLITE_INTERRUPT,
     );
     let now_autocommit = unsafe { rusqlite::ffi::sqlite3_get_autocommit(database) != 0 };
-    // A write the size cap refused leaves the database consistent: SQLite
-    // rolled the statement or transaction back, and nothing needs a restart.
+    // A cap hit inside the engine's own D1 bracket is a plain failure: the
+    // caller rolls the bracket back and nothing needs a restart. Inside an
+    // application transaction SQLite has discarded the transaction, so later
+    // writes the application makes after catching the error would commit
+    // outside it; that keeps the latch. The free-space test in `full_is_cap`
+    // is a heuristic, and only here is a wrong answer safe either way.
     if celld_logic::sqlite::poisons_actor(result_code, started_in_transaction, now_autocommit)
-        && !(result_code & 0xff == rusqlite::ffi::SQLITE_FULL
+        && !(engine_owned
+            && result_code & 0xff == rusqlite::ffi::SQLITE_FULL
             && unsafe { crate::sql_limits::full_is_cap(database) })
     {
         latch_sql_critical_error(scope, error.to_string());
@@ -3601,6 +3617,7 @@ fn sqlite_operation_failure(
         scope,
         database,
         started_in_transaction,
+        false,
         result_code,
         &error.to_string(),
     );
@@ -4467,17 +4484,19 @@ mod recycle_tests {
         close(scope);
     }
 
-    /// An application transaction that hits the cap is a statement error as
-    /// well: the cell is not latched, and the next write runs.
+    /// An application transaction that hits the cap is discarded by SQLite,
+    /// and the application can catch the error and keep writing outside it. So
+    /// it keeps the critical-error latch, as an interrupt does: the cell
+    /// restarts, and the database stays consistent.
     #[test]
-    fn a_transaction_past_the_size_cap_fails_without_a_restart() {
+    fn a_transaction_past_the_size_cap_latches_and_the_database_stays_consistent() {
         let cells = Cells::default();
         let _installed = cells.install();
         let _ = reports();
         limit(None, Some(256 * 1024));
         let dir = tempfile::tempdir().unwrap();
         let scope = "capped-transaction";
-        open_in(&dir, "cell.sqlite", scope);
+        let path = open_in(&dir, "cell.sqlite", scope);
         put_serialized(scope, "kept", b"small").unwrap();
 
         transaction_control(scope, "start", false, "").unwrap();
@@ -4489,10 +4508,54 @@ mod recycle_tests {
             failure.to_string().contains("storage limit exceeded"),
             "{failure:#}"
         );
-        assert!(sql_critical_error(scope).is_none(), "the cell latched");
-        assert!(reported(scope).is_empty(), "the actor was told");
-        put_serialized(scope, "after", b"fits").unwrap();
-        assert!(get_stored(scope, "kept").unwrap().is_some());
+        assert!(
+            sql_critical_error(scope).is_some(),
+            "the cell did not latch"
+        );
+        assert_eq!(reported(scope).len(), 1, "the actor was not told once");
+        assert!(put_serialized(scope, "after", b"x").is_err());
+
         close(scope);
+        open(scope, &path).unwrap();
+        assert!(sql_critical_error(scope).is_none());
+        assert!(get_stored(scope, "kept").unwrap().is_some());
+        assert!(get_stored(scope, "big-0").unwrap().is_none());
+        put_serialized(scope, "after", b"fits").unwrap();
+        close(scope);
+    }
+
+    /// Opening an existing facet after the cap was lowered: the writes that
+    /// run before the connection is handed out (moving the rows to this run's
+    /// scope) are bounded by the cap too.
+    #[test]
+    fn opening_a_facet_under_a_lowered_cap_bounds_its_own_writes() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let _ = reports();
+        let dir = tempfile::tempdir().unwrap();
+        let root = "facet-cap-root";
+        let root_path = open_in(&dir, "root.sqlite", root);
+        let parent = StorageIdentity {
+            root_path,
+            root_scope: root.to_string(),
+            facet_path: Vec::new(),
+            epoch: 1,
+            root_position: 0,
+            root_observed: None,
+        };
+        let facet_path = dir.path().join("facet.sqlite");
+        open_embedded("Child:00", &parent, "child", &facet_path, false).unwrap();
+        for i in 0..200 {
+            put_serialized("Child:00", &format!("k{i}"), &[1u8; 100]).unwrap();
+        }
+        let pages = page_count("Child:00");
+        close("Child:00");
+
+        // A cap of exactly the file's size: longer scope names need new pages.
+        limit(None, Some(pages as u64 * 4096));
+        let longer = format!("Child:{}", "0".repeat(400));
+        let opened = open_embedded(&longer, &parent, "child", &facet_path, false);
+        assert!(opened.is_err(), "the scope rewrite ignored the cap");
+        close(root);
     }
 }

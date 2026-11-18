@@ -57,13 +57,19 @@ A value of `0` removes the limit.
   instruction (a large sort, `CREATE INDEX`, an extension's scan) can run past
   the bound before it is interrupted.
 - The size limit counts database pages, so it includes indexes and free pages
-  inside the file. A write that would grow the file past it fails with the
-  message above, SQLite rolls back the statement or the transaction, and
-  nothing restarts: the database stays consistent and keeps serving reads and
-  writes that fit. This holds for SQL, key-value, D1, `transaction()` and
-  `transactionSync()`, and a Workflow's own storage. A full disk, which raises
-  the same error code while the file is below the limit, still fails the cell
-  closed as described in [Guarantees](guarantees.md).
+  inside the file. The write-ahead log is not counted: it is transient and
+  reclaimed at checkpoints. A write that would grow the file past the limit
+  fails with the message above, SQLite rolls back the statement, and nothing
+  restarts: the database stays consistent and keeps serving reads and writes
+  that fit. This holds for SQL, key-value, D1 `batch`, `exec` and migrations,
+  and a Workflow's own storage.
+- A cap hit inside an application `transaction()` or `transactionSync()`
+  makes SQLite discard the whole transaction, so the object restarts as
+  described in [Guarantees](guarantees.md): the application could otherwise
+  catch the error and commit later writes outside the transaction. A Workflow
+  cell at its cap therefore restarts repeatedly until space is freed; it cannot
+  write anyway. A full disk, which raises the same error code while the file is
+  below the limit, fails the cell closed the same way.
 - Each database has its own limit: a Durable Object, each of its facets, and
   each D1 database.
 - A limit set below the size of an existing database does not stop it opening.
