@@ -9,8 +9,15 @@
 /// `` `...` `` and `[...]`). A double-quoted token that names no column is a
 /// string to SQLite, so it can hold user data like a single-quoted one; the
 /// fingerprint cannot tell which it is, and treats all of them as literals.
+/// A named parameter (`:name`, `@name`, `$name`) is a placeholder like `?`.
 /// A list after `IN` of only placeholders is one placeholder. Two statements
 /// that differ only in those get the same value. Nothing is allocated.
+///
+/// The fingerprint is of the first statement only: it ends at the first `;`
+/// outside a quote or comment. A caller that hands over the rest of a script
+/// after a statement that failed to prepare gets the failing statement's shape,
+/// whatever follows it. (A `CREATE TRIGGER` body holds `;`, so a trigger's
+/// shape is the part up to its first one.)
 pub(crate) fn fingerprint(sql: &str) -> u64 {
     let bytes = sql.as_bytes();
     let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80;
@@ -61,6 +68,16 @@ pub(crate) fn fingerprint(sql: &str) -> u64 {
                 at += 1;
             }
             shape.placeholder();
+        } else if matches!(byte, b':' | b'@' | b'$') && bytes.get(at + 1).is_some_and(|b| word(*b))
+        {
+            // A named parameter.
+            at += 1;
+            while at < bytes.len() && word(bytes[at]) {
+                at += 1;
+            }
+            shape.placeholder();
+        } else if byte == b';' {
+            break;
         } else if byte.is_ascii_digit()
             || (byte == b'.' && bytes.get(at + 1).is_some_and(u8::is_ascii_digit))
         {
@@ -235,11 +252,22 @@ mod tests {
                 "SELECT `a` FROM [b] WHERE c = `d`",
                 "SELECT `z` FROM [y x] WHERE c = `w``v`",
             ],
-            // Parameters, numbered or not, are placeholders too.
+            // Parameters, numbered or named, are placeholders too.
             &[
                 "SELECT * FROM t WHERE a = ? AND b = ?2",
+                "SELECT * FROM t WHERE a = :a AND b = @b",
+                "SELECT * FROM t WHERE a = $first AND b = :other_name",
                 "SELECT * FROM t WHERE a = 1 AND b = 'x'",
             ],
+            // A statement ends at its first top-level `;`: what follows it,
+            // and a `;` inside a quote or comment, are not part of it.
+            &[
+                "SELECT * FROM missing WHERE a = 7",
+                "SELECT * FROM missing WHERE a = 7;",
+                "SELECT * FROM missing WHERE a = 7; SELECT 1",
+                "SELECT * FROM missing WHERE a = 7 ; DROP TABLE other; SELECT 'x'",
+            ],
+            &["SELECT ';' /* ; */ -- ;\n, 1; SELECT 2", "SELECT 'a;b', 2"],
             // Unterminated input is read to its end, never past it.
             &["SELECT 'abc", "SELECT 'xyz"],
             &[r#"SELECT "abc"#, r#"SELECT "xyz"#],
@@ -289,10 +317,6 @@ mod tests {
                 "SELECT * FROM t WHERE a = 1 AND b = 'x'",
                 "SELECT * FROM t WHERE a = 1 OR b = 'x'",
                 "SELECT * FROM u WHERE a = 1 AND b = 'x'",
-                "SELECT * FROM t WHERE a = :a AND b = 'x'",
-                "SELECT * FROM t WHERE a = @a AND b = 'x'",
-                "SELECT * FROM t WHERE a = $a AND b = 'x'",
-                "SELECT * FROM t WHERE a = :b AND b = 'x'",
             ],
             // A digit inside a name is part of the name.
             &["SELECT 1 FROM t1", "SELECT 1 FROM t2"],

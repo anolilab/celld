@@ -153,7 +153,9 @@ per-statement time bound interrupted.
 
 Each statement counts once, however it ends: run to its end, a cursor closed
 early or by the garbage collector, a cell that closed with the cursor still
-open, or a statement that failed, including one that did not prepare. An
+open, or a statement that failed, including one that did not prepare or
+whose parameters were refused (the wrong number of them, or one SQLite would
+not bind). An
 `exec` of several statements counts each of them on its own. So do the
 statements of `ctx.storage.sql.ingest`, which run application SQL too.
 
@@ -162,9 +164,11 @@ statements of `ctx.storage.sql.ingest`, which run application SQL too.
   between steps. D1 counts the same span.
 - A query reads as many rows as it returns, so a cursor that is closed early
   counts only the rows it produced. D1 counts the rows its statement stepped.
-- Rows written are the connection's change count over the statement, read when
-  it ends, so a cursor closed early reports what the statement had written. A
-  failed statement reports none, because SQLite rolled it back.
+- Rows written are the changes the statement's own steps made, so a cursor
+  closed early reports what the statement had written, and a cursor that stayed
+  open while other statements wrote counts none of their rows. A failed
+  statement reports none, because SQLite rolled it back. A statement that
+  cannot write reads no change count; one that can reads it around each step.
 - Bytes are the length of every text and BLOB value returned and eight for each
   number, the same in a Durable Object and in D1.
 - A D1 result over the row or byte cap fails the request, and is an `error`.
@@ -189,7 +193,7 @@ replaced by one placeholder. Statements of the same shape have the same
 fingerprint, on every node. These are literals:
 
 - string, blob and number literals, with the sign of an exponent (`1e-5`);
-- parameters (`?`, `?1`);
+- parameters (`?`, `?1`, `:name`, `@name`, `$name`);
 - every quoted token, `"..."`, `` `...` `` and `[...]`. SQLite reads a
   double-quoted token that names no column as a string, so it can hold user
   data. The fingerprint cannot tell it from a quoted name, and so a quoted
@@ -197,8 +201,9 @@ fingerprint, on every node. These are literals:
 - a list after `IN` of only literals: `IN (1, 2, 3)` has the shape of `IN (1)`.
 
 celld reads the text from the prepared statement, so a bound value is never
-part of it. A statement that does not prepare is hashed from its own text
-onward. A fingerprint is computed only for a line that passes the rate limit;
+part of it. A fingerprint covers one statement: it ends at the first `;` outside a quote
+or comment. A statement that does not prepare is hashed from its own text, not
+from the statements after it in the same input. A fingerprint is computed only for a line that passes the rate limit;
 with the variable unset it is never computed, and a statement adds a few
 relaxed atomic increments and one clock read.
 
