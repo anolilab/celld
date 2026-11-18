@@ -27,7 +27,7 @@
 //! | `a3_lost_ack` | a restore misses a write acknowledged at a lower epoch |
 //! | `a4_epoch1_foreign` | a record at epoch 1 of a tagged id, written by another than its minting session |
 //! | `a5_claim_over_gap` | a claim lands over a cell whose newest record was written and is gone |
-//! | `a6_standard_window` | a first claim of the standard path (a waived or shadow id) acts over a record that is gone: the window of today's design, reported and not failed |
+//! | `a6_standard_window` | a first claim of the standard path (a waived or shadow id) acts over a record that is gone: the window of today's design, reported and not failed. Revision 3 reaches it. Revision 4 reaches it only when a declared loss took the session's `Grant` and its acknowledged row, one writer (`r4a`, `handoff_shadow`, `handoff_read`) |
 //! | `a6_stalled_first_record` | a stalled create-only write of the minting session lands after its header was sealed, and two writers follow |
 //! | `a7_taken_leave` | a leave-form record is taken over against the sealed chunk |
 //! | `a8_sealed_chunk_incomplete` | a sealed chunk misses a grant or a confirmed leave that the bucket depends on |
@@ -49,8 +49,12 @@
 //!   age matters: the record, header and chunk reads of a taker and a sealer are
 //!   steps of their own.
 //! - The ensemble is two followers, each with a tail; a session without an
-//!   ensemble keeps its marks in the chunk. A session does not acknowledge on a
-//!   bucket proof.
+//!   ensemble keeps its marks in the chunk. The minting node acknowledges on a
+//!   bucket proof only in a scenario that gives it the budget for one.
+//! - A taker claims before the seal in two cases only: a waived id that the
+//!   session placed on it, while the session's lease is live, and, in a
+//!   scenario with `early_handoff`, a record that the session released while
+//!   it lives. Otherwise the peer's claim is taken after the seal.
 //! - A sealed session's log is sealed by the fence; the node record is one
 //!   record with the log state of the latest process.
 //! - The read-only variant of the design (the birth-form record and P3) is not
@@ -92,6 +96,8 @@ enum Purp {
     MStd(Cell),
     MPut(Cell),
     TFirst,
+    /// The first-form record of a new cell: the standard path with the mark.
+    TNew,
     TMark,
     TPlain,
     SClose,
@@ -179,6 +185,8 @@ enum Cs {
     Active {
         ep: Epoch,
         lazy: bool,
+        /// A trace of the cell is in the bucket: its left entry in the chunk,
+        /// which a release and a reload marker wait for.
         synced: bool,
     },
     Leaving {
@@ -212,6 +220,11 @@ struct Proc {
     marks: BTreeSet<Entry>,
     rows: [BTreeSet<Wid>; CELLS],
     next_nonce: Nonce,
+    /// The grants that a bundle held when the session read its header as
+    /// open, after that bundle was written.
+    covered: [bool; CELLS],
+    /// The waived ids that the session placed on a peer.
+    placed: [bool; CELLS],
 }
 
 #[derive(Clone, Debug)]
@@ -307,6 +320,12 @@ pub(crate) struct Budget {
     pub wakes: u8,
     pub partial: u8,
     pub hdr_losses: u8,
+    /// Placements of a waived id on a peer while the session lives.
+    pub places: u8,
+    /// Second decisions of the session about an id it placed.
+    pub reclaims: u8,
+    /// Acknowledgements of the minting node on a bucket proof.
+    pub bproofs: u8,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -353,7 +372,16 @@ pub(crate) enum Act {
     Start(u8),
     Boot(u8),
     Mint(Cell, u8),
+    /// The session waives an id and places it on a peer.
+    Place(Cell),
+    /// The session decides again about an id it placed, or claimed and
+    /// released, and claims it.
+    Reclaim(Cell),
+    /// The session reads its header after a bundle write.
+    Confirm(u8),
     Serve(Cell),
+    /// An acknowledgement of the minting node on a bucket proof.
+    ServeBucket(Cell),
     K3Begin(Cell, Epoch),
     K3Step(Cell),
     K3Partial(Cell),
@@ -410,6 +438,18 @@ pub(crate) struct LazyConfig {
     /// A taker reads the record and the chunk in one step, which leaves out
     /// the windows that come from a read that is older than the decision.
     pub fresh_reads: bool,
+    /// A taker may claim over a released record while the session that
+    /// released it lives: a handoff.
+    pub early_handoff: bool,
+    /// The minting node never has an ensemble, so it grants nothing: every id
+    /// it mints is waived.
+    pub no_ensemble: bool,
+    /// A taker that read no record goes on once the header of the id's tag is
+    /// sealed, also while a successor of the minting node lives. Without it a
+    /// taker waits for every session of that node, which hides what a peer
+    /// does beside a successor of a preserved restart. It overrides the design's
+    /// `gate_keyed_by_node` for a taker that read no record.
+    pub sealed_header_final: bool,
     /// Invariants whose failures are not reported: a scenario that wants a
     /// deeper failure than the one a rule's removal shows at once.
     pub ignore: Vec<&'static str>,
@@ -430,6 +470,9 @@ impl LazyConfig {
             late_takers: false,
             late_session: false,
             fresh_reads: false,
+            early_handoff: false,
+            no_ensemble: false,
+            sealed_header_final: false,
             ignore: Vec::new(),
         }
     }
@@ -449,6 +492,8 @@ fn fresh_proc(mode: Mode) -> Proc {
         marks: BTreeSet::new(),
         rows: [BTreeSet::new(), BTreeSet::new()],
         next_nonce: 1,
+        covered: [false; CELLS],
+        placed: [false; CELLS],
     }
 }
 
@@ -675,7 +720,8 @@ impl Lazy {
             );
         }
         // A claim over a cell whose newest record is gone.
-        let standard = matches!(purp, Purp::MStd(_) | Purp::TPlain) && guard == Guard::Absent;
+        let standard =
+            matches!(purp, Purp::MStd(_) | Purp::TPlain | Purp::TNew) && guard == Guard::Absent;
         if matches!(actor, Actor::T(_))
             && guard == Guard::Absent
             && w.s.own[c].is_none()
@@ -757,7 +803,7 @@ impl Lazy {
                     .bucket
                     .iter()
                     .any(|((cell, e), rows)| *cell == c && *e == 1 && !rows.is_empty())
-                    && w.ps[usize::from(tag) - 1].granted[c]
+                    && self.granted_in_log(w, tag, c)
                     && !new.granted[c]
                 {
                     Self::violate(
@@ -926,7 +972,9 @@ impl Lazy {
                     for (c, ep, tag, confirmed) in m.cells {
                         let rec = w.s.own[c].clone();
                         let granted_by_pred = self.cfg.minter == m.from && m.mode_on;
-                        if rec.is_none() || (granted_by_pred && !confirmed) {
+                        // A record that was written and is lost is not this
+                        // invariant's: the resume reads no record.
+                        if !w.g.ever_rec[c] || (granted_by_pred && !confirmed) {
                             Self::violate(
                                 w,
                                 "a11_resume",
@@ -1047,13 +1095,100 @@ impl Lazy {
         w.ps[ki].cs[c] = Cs::Active {
             ep: 1,
             lazy: false,
-            synced: true,
+            // A release, and a reload marker, wait for a trace in the bucket.
+            synced: !self.d().needs_trace(),
         };
+        let mut proven = false;
         if w.ps[ki].mode != Mode::On
             && w.ps[ki].granted[c]
             && self.append(w, k, &[Entry::Grant(c)], 0)
         {
             Self::mark_proven(w, k, &[Entry::Grant(c)]);
+            proven = true;
+        }
+        // The record may have landed after the seal. The session acts on it
+        // only with evidence that it was unsealed after the write applied: a
+        // fleet proof of a mark appended since, or its header read as open.
+        let open = w.s.hdr[usize::from(k)]
+            .as_ref()
+            .is_some_and(|h| h.state == HState::Open);
+        if self.d().session_acts_after_open_header && !proven && !open {
+            w.ps[ki].cs[c] = Cs::Waived;
+        }
+    }
+
+    /// Whether the session granted the id. In mode `on` the bit is set with
+    /// the append. In the other modes the mark follows the record, so the id
+    /// is granted once its `Grant` was proven.
+    fn granted_in_log(&self, w: &World, k: u8, c: Cell) -> bool {
+        let p = &w.ps[usize::from(k) - 1];
+        if p.mode == Mode::On {
+            p.granted[c]
+        } else {
+            p.granted[c] && w.g.proven.contains(&Entry::Grant(c))
+        }
+    }
+
+    /// The session waives an id and places it on a peer. It writes nothing.
+    fn place(&self, w: &mut World, k: u8, c: Cell, labels: &mut Vec<&'static str>) {
+        let ki = usize::from(k) - 1;
+        w.b.mints -= 1;
+        w.b.places -= 1;
+        w.ps[ki].waived[c] = true;
+        w.ps[ki].placed[c] = true;
+        w.ps[ki].cs[c] = Cs::Waived;
+        labels.push("placed");
+    }
+
+    /// Whether the session has placed the waived id `c` on a peer.
+    fn placed_waived(p: &Proc, c: Cell) -> bool {
+        p.placed[c] && p.cs[c] == Cs::Waived
+    }
+
+    /// Whether a peer may claim cell `c` as a placement: the session placed
+    /// the id and a live lease has the id's tag as its own.
+    fn placement_live(&self, w: &World, c: Cell) -> bool {
+        let k = self.cfg.minter;
+        w.ps[usize::from(k) - 1].placed[c] && w.s.node.live && w.s.node.gen == k
+    }
+
+    /// Whether a record is a handoff: released by a session that lives, in a
+    /// scenario that lets a peer claim over it before the seal.
+    fn handed_off(&self, w: &World, rec: Option<&Rec>) -> bool {
+        self.cfg.early_handoff
+            && w.s.node.live
+            && rec.is_some_and(|r| r.released && w.s.node.carried.contains(&r.by))
+    }
+
+    /// Whether a task that read the record may go on without waiting for the
+    /// seal: the gate holds, the id is placed on a peer, or it is a handoff.
+    fn past_gate(&self, w: &World, t: &Task) -> bool {
+        self.gate_ok(w, t.rec.as_ref())
+            || self.placement_live(w, t.c)
+            || self.handed_off(w, t.rec.as_ref())
+    }
+
+    /// An acknowledgement on a bucket proof: the row is uploaded under the
+    /// epoch prefix, then the record is read and must name this process.
+    fn serve_bucket(&self, w: &mut World, k: u8, c: Cell, labels: &mut Vec<&'static str>) {
+        let ki = usize::from(k) - 1;
+        let Cs::Active { ep, .. } = w.ps[ki].cs[c] else {
+            return;
+        };
+        w.b.writes -= 1;
+        w.b.bproofs -= 1;
+        let wid = w.g.next_w;
+        w.g.next_w += 1;
+        Self::put_bucket(w, c, ep, wid, MINTER_WRITER);
+        let named = w.s.own[c].as_ref().is_some_and(|r| {
+            (r.by == k || w.s.node.carried.contains(&r.by)) && r.epoch == ep && !r.released
+        });
+        if named {
+            w.g.acked.insert(wid, (c, ep, MINTER_WRITER));
+            self.act(w, c, MINTER_WRITER, ep);
+            labels.push("acknowledged_by_bucket");
+        } else {
+            labels.push("verify_refused");
         }
     }
 
@@ -1293,12 +1428,29 @@ impl Lazy {
         if ch.sealed {
             return;
         }
-        let Some(&Entry::Left(_, n)) = w.ps[ki]
-            .marks
-            .iter()
-            .find(|m| matches!(m, Entry::Left(cc, _) if *cc == c))
-        else {
-            return;
+        let left_mark = w.ps[ki].marks.iter().find_map(|m| match m {
+            Entry::Left(cc, n) if *cc == c => Some(*n),
+            _ => None,
+        });
+        let n = match left_mark {
+            Some(n) => n,
+            // A cell with a plain record of the minting session: the entry is
+            // made for the release, under a nonce of its own.
+            None if self.d().needs_trace() && k == self.cfg.minter => {
+                if ch.left[c].as_ref().is_some_and(|l| l.done.is_some()) {
+                    // The chunk holds the confirmed leave already.
+                    w.ps[ki].cs[c] = Cs::Active {
+                        ep,
+                        lazy,
+                        synced: true,
+                    };
+                    return;
+                }
+                let n = w.ps[ki].next_nonce;
+                w.ps[ki].next_nonce += 1;
+                n
+            }
+            None => return,
         };
         ch.granted[c] = true;
         let left = ch.left[c].get_or_insert(Left {
@@ -1593,7 +1745,7 @@ impl Lazy {
             }
             SSt::CasChunk => {
                 let snap = s.chunk_snap.clone().expect("snapshot");
-                let new = seal_chunk(&snap, &s.gather);
+                let new = seal_chunk(self.d(), &snap, &s.gather);
                 let blind = !self.d().first_seal_fixes_chunk;
                 let kind = WK::Chunk {
                     tag: s.target,
@@ -1809,6 +1961,8 @@ impl Lazy {
                         chunk: chunk.as_ref(),
                         flag: self.cfg.taker_flag,
                         author_live,
+                        minter,
+                        placed: self.placement_live(w, c) && !self.gate_ok(w, t.rec.as_ref()),
                     },
                 );
                 t.plan = Some(plan);
@@ -1918,6 +2072,28 @@ impl Lazy {
                     None => labels.push("taker_put_in_flight"),
                 }
             }
+            Take::FirstNew { epoch } => {
+                // The guard of the standard path, then the first-form record.
+                if t.saw_rows {
+                    labels.push("refused");
+                    t.st = TSt::Done;
+                    w.tk[ii].task = Some(t);
+                    return;
+                }
+                t.epoch = epoch;
+                let kind = WK::Own {
+                    c,
+                    guard: Guard::Absent,
+                    rec: first_form(tag, epoch, t.nonce, Vec::new()),
+                };
+                t.st = TSt::AwaitFirst;
+                w.tk[ii].task = Some(t);
+                labels.push("new_cell_claim_marked");
+                match self.issue(w, Actor::T(i), Purp::TNew, kind, true) {
+                    Some(o) => self.taker_first_answer(w, i, Ok(o), labels),
+                    None => labels.push("taker_put_in_flight"),
+                }
+            }
             Take::FirstFromNothing { epoch }
             | Take::FirstOverRecord { epoch }
             | Take::ReplaceFirst { epoch } => {
@@ -1986,6 +2162,7 @@ impl Lazy {
             t.plan,
             Some(
                 Take::FirstFromNothing { .. }
+                    | Take::FirstNew { .. }
                     | Take::FirstOverRecord { .. }
                     | Take::ReplaceFirst { .. }
             )
@@ -2071,7 +2248,7 @@ impl Lazy {
                 .filter(|((cell, _), r)| *cell == c && !r.is_empty())
                 .map(|((_, e), _)| *e)
                 .max();
-        let takeover = !matches!(t.plan, Some(Take::Standard { .. }));
+        let takeover = !matches!(t.plan, Some(Take::Standard { .. } | Take::FirstNew { .. }));
         if newest.is_some_and(|e| e >= t.epoch) && takeover {
             labels.push("restore_refused_used_epoch");
             t.st = TSt::Done;
@@ -2164,6 +2341,14 @@ impl Lazy {
             return;
         }
         w.b.ckpts -= 1;
+        let from_memory = !self.d().session_merges_chunk;
+        if from_memory {
+            // The session writes the chunk it holds in memory over whatever
+            // another writer put there.
+            let rev = ch.rev;
+            ch = Chunk::open();
+            ch.rev = rev;
+        }
         for m in w.ps[ki].marks.clone() {
             match m {
                 Entry::Grant(c) => ch.granted[c] = true,
@@ -2188,7 +2373,7 @@ impl Lazy {
             }
         }
         ch.rev += 1;
-        let tok = ch.token;
+        let tok = w.s.chunk[usize::from(k)].as_ref().map_or(0, |c| c.token);
         self.apply(
             w,
             Actor::M(k),
@@ -2196,7 +2381,7 @@ impl Lazy {
             &WK::Chunk {
                 tag: k,
                 guard: Some(tok),
-                blind: false,
+                blind: from_memory,
                 new: ch,
             },
         );
@@ -2275,8 +2460,21 @@ impl Lazy {
             return true;
         }
         let ki = usize::from(k);
-        w.s.log[ki].bundle.contains(&Entry::Grant(c))
-            || w.s.chunk[ki].as_ref().is_some_and(|ch| ch.granted[c])
+        let in_bundle = if self.d().bundle_counts_after_open_header {
+            w.ps[ki - 1].covered[c]
+        } else {
+            w.s.log[ki].bundle.contains(&Entry::Grant(c))
+        };
+        in_bundle || w.s.chunk[ki].as_ref().is_some_and(|ch| ch.granted[c])
+    }
+
+    /// The grants of a written bundle that the session has not yet confirmed
+    /// by a read of its header.
+    fn unconfirmed(&self, w: &World, k: u8) -> Vec<Cell> {
+        let ki = usize::from(k);
+        (0..CELLS)
+            .filter(|c| w.s.log[ki].bundle.contains(&Entry::Grant(*c)) && !w.ps[ki - 1].covered[*c])
+            .collect()
     }
 
     // ---- a preserved restart ----
@@ -2301,8 +2499,11 @@ impl Lazy {
         let Ph::Quiesce(step) = w.ps[ki].phase else {
             return false;
         };
-        if step == 0 && self.d().leave_before_log_seal {
-            return (0..CELLS).all(|c| match w.ps[ki].cs[c] {
+        if step != 0 {
+            return true;
+        }
+        let left = !self.d().leave_before_log_seal
+            || ((0..CELLS).all(|c| match w.ps[ki].cs[c] {
                 Cs::Active { lazy, .. } => !lazy,
                 Cs::Leaving { .. } | Cs::Pending | Cs::StdPut => false,
                 _ => true,
@@ -2311,9 +2512,20 @@ impl Lazy {
                     || !w.ps[ki].granted[c]
                     || w.ps[ki].mode != Mode::On
                     || w.g.confirmed[c]
+            }));
+        // A cell of the process's own tag that was never granted has its left
+        // entry in the chunk before the log seal.
+        let traced = !self.d().trace_before_marker
+            || k != self.cfg.minter
+            || (0..CELLS).all(|c| match w.ps[ki].cs[c] {
+                Cs::Active {
+                    lazy: false,
+                    synced,
+                    ..
+                } => synced || self.granted_in_log(w, k, c),
+                _ => true,
             });
-        }
-        true
+        left && traced
     }
 
     fn pr_step(&self, w: &mut World, k: u8, labels: &mut Vec<&'static str>) {
@@ -2409,7 +2621,8 @@ impl Lazy {
                     ) {
                         ok = false;
                     }
-                    cells.push((c, ep, rec.map(|r| r.by), confirmed));
+                    // A cell that this process did not grant needs no leave.
+                    cells.push((c, ep, rec.map(|r| r.by), confirmed || !granted_here));
                 }
                 if ok {
                     labels.push("marker_written");
@@ -2565,7 +2778,7 @@ impl Lazy {
                     }
                 }
             }
-            (Actor::T(i), Purp::TFirst | Purp::TPlain) => {
+            (Actor::T(i), Purp::TFirst | Purp::TNew | Purp::TPlain) => {
                 self.taker_first_answer(w, i, res, labels)
             }
             (Actor::T(i), Purp::TMark) => match res {
@@ -2680,7 +2893,7 @@ impl Model for Lazy {
             ],
             sl: [None, None],
             wr: Vec::new(),
-            ens: true,
+            ens: !self.cfg.no_ensemble,
             marker: None,
             b: self.cfg.b.clone(),
             g: Ghost::default(),
@@ -2716,6 +2929,22 @@ impl Model for Lazy {
                         if w.b.partial > 0 && p.mode == Mode::On {
                             a.push(Act::Mint(c, 1));
                         }
+                        if w.b.places > 0 {
+                            a.push(Act::Place(c));
+                        }
+                    }
+                }
+            }
+            // The session decides again about an id it placed, or about one
+            // it claimed and released, and finds no record. The design places
+            // the first again, which is a claim of a peer, and refuses the
+            // second; without the rule the session claims the id itself.
+            if w.b.reclaims > 0 && self.can_mint(w, k) {
+                for c in 0..CELLS {
+                    if (Self::placed_waived(p, c) || p.cs[c] == Cs::Released)
+                        && w.s.own[c].is_none()
+                    {
+                        a.push(Act::Reclaim(c));
                     }
                 }
             }
@@ -2726,6 +2955,14 @@ impl Model for Lazy {
                             if w.b.writes > 0 {
                                 a.push(Act::Serve(c));
                             }
+                            // A bucket proof uploads under the epoch prefix, so
+                            // for a granted cell it waits as an upload does (K7).
+                            let held = k == self.cfg.minter
+                                && self.granted_in_log(w, k, c)
+                                && !self.upload_allowed(w, k, c);
+                            if w.b.writes > 0 && w.b.bproofs > 0 && !lazy && !held {
+                                a.push(Act::ServeBucket(c));
+                            }
                             if lazy && p.mode == Mode::On && k == self.cfg.minter {
                                 if w.b.handoffs > 0 {
                                     a.push(Act::K3Begin(c, 1));
@@ -2734,11 +2971,34 @@ impl Model for Lazy {
                                     a.push(Act::K3Begin(c, 2));
                                 }
                             }
-                            if !lazy && !synced && p.mode == Mode::On {
+                            let for_release = self.d().trace_before_release && w.b.handoffs > 0;
+                            let for_marker =
+                                self.d().trace_before_marker && p.phase == Ph::Quiesce(0);
+                            if !lazy
+                                && !synced
+                                && (p.mode == Mode::On
+                                    || (k == self.cfg.minter && (for_release || for_marker)))
+                            {
                                 a.push(Act::K3ChunkLeft(c));
                             }
+                            // A granted cell of a session that is not `on` has
+                            // its trace once its `Grant` is in the bucket: in
+                            // a bundle that counts (K7) or in the chunk.
+                            let grant_in_bucket = self.d().trace_before_release
+                                && k == self.cfg.minter
+                                && p.mode != Mode::On
+                                && self.granted_in_log(w, k, c)
+                                && self.upload_allowed(w, k, c);
+                            // Without the rule, a cell that never left the lazy
+                            // state is released as it was before it.
+                            let untraced = !self.d().trace_before_release
+                                && k == self.cfg.minter
+                                && !w.g.confirmed[c];
                             if !lazy
-                                && (synced || !self.d().left_in_chunk_before_release)
+                                && (synced
+                                    || grant_in_bucket
+                                    || untraced
+                                    || !self.d().left_in_chunk_before_release)
                                 && w.b.handoffs > 0
                             {
                                 a.push(Act::Release(c));
@@ -2787,6 +3047,15 @@ impl Model for Lazy {
                 {
                     a.push(Act::Flush(k));
                 }
+                if self.d().bundle_counts_after_open_header
+                    && !silent
+                    && !self.unconfirmed(w, k).is_empty()
+                    && w.s.hdr[usize::from(k)]
+                        .as_ref()
+                        .is_some_and(|h| h.state == HState::Open)
+                {
+                    a.push(Act::Confirm(k));
+                }
             }
             if p.phase == Ph::Up && w.b.preserved > 0 && k >= self.cfg.minter && k < 3 {
                 a.push(Act::PrBegin(k));
@@ -2828,7 +3097,9 @@ impl Model for Lazy {
                     if w.b.takes > 0 {
                         for c in 0..CELLS {
                             if self.minted(w, c)
-                                && self.taker_may_start(w)
+                                && (self.taker_may_start(w)
+                                    || self.placement_live(w, c)
+                                    || self.handed_off(w, w.s.own[c].as_ref()))
                                 && self.cfg.takers & (1 << i) != 0
                             {
                                 a.push(Act::TkStart(i, c));
@@ -2840,7 +3111,9 @@ impl Model for Lazy {
                     if w.b.takes > 0 {
                         for c in 0..CELLS {
                             if self.minted(w, c)
-                                && self.taker_may_start(w)
+                                && (self.taker_may_start(w)
+                                    || self.placement_live(w, c)
+                                    || self.handed_off(w, w.s.own[c].as_ref()))
                                 && self.cfg.takers & (1 << i) != 0
                             {
                                 a.push(Act::TkStart(i, c));
@@ -2851,7 +3124,7 @@ impl Model for Lazy {
                 Some(task) => {
                     let waits = task.st == TSt::ReadChunk
                         && self.d().taker_waits_for_seal
-                        && !self.gate_ok(w, task.rec.as_ref());
+                        && !self.past_gate(w, task);
                     if matches!(
                         task.st,
                         TSt::ReadRec | TSt::ReadChunk | TSt::MarkChunk | TSt::Settle
@@ -2915,7 +3188,7 @@ impl Model for Lazy {
         if w.b.degrades > 0 && w.ens {
             a.push(Act::Degrade);
         }
-        if !w.ens {
+        if !w.ens && !self.cfg.no_ensemble {
             a.push(Act::Heal);
         }
         if w.b.losses > 0 {
@@ -2976,9 +3249,37 @@ impl Model for Lazy {
                     w.b.partial -= 1;
                 }
             }
+            Act::Place(c) => {
+                let k = self.cfg.minter;
+                self.place(&mut w, k, *c, &mut l);
+            }
+            Act::Reclaim(c) => {
+                let k = self.cfg.minter;
+                w.b.reclaims -= 1;
+                if !self.d().session_claims_once {
+                    l.push("session_claims_again");
+                    self.std_put(&mut w, k, *c, &mut l);
+                } else if Self::placed_waived(&w.ps[usize::from(k) - 1], *c) {
+                    // A placement writes nothing: the peer decides.
+                    l.push("placed_again");
+                } else {
+                    l.push("claimed_again_refused");
+                }
+            }
+            Act::Confirm(k) => {
+                // The header was open after the bundle was written.
+                for c in self.unconfirmed(&w, *k) {
+                    w.ps[usize::from(*k) - 1].covered[c] = true;
+                }
+                l.push("bundle_confirmed");
+            }
             Act::Serve(c) => {
                 let k = self.active_k(&w, *c);
                 self.serve(&mut w, k, *c, &mut l);
+            }
+            Act::ServeBucket(c) => {
+                let k = self.active_k(&w, *c);
+                self.serve_bucket(&mut w, k, *c, &mut l);
             }
             Act::K3Begin(c, e) => {
                 let k = self.active_k(&w, *c);
@@ -3071,14 +3372,7 @@ impl Model for Lazy {
                     w.tk[usize::from(*i)]
                         .task
                         .as_ref()
-                        .is_some_and(|t| t.st == TSt::ReadChunk)
-                        && self.gate_ok(
-                            w,
-                            w.tk[usize::from(*i)]
-                                .task
-                                .as_ref()
-                                .and_then(|t| t.rec.as_ref()),
-                        )
+                        .is_some_and(|t| t.st == TSt::ReadChunk && self.past_gate(w, t))
                 };
                 if self.cfg.fresh_reads && ready(&w) {
                     self.taker_step(&mut w, *i, &mut l);
@@ -3190,7 +3484,9 @@ impl Lazy {
     /// rows is sealed. It is keyed by the node, so it covers the session of a
     /// successor too.
     fn gate_ok(&self, w: &World, rec: Option<&Rec>) -> bool {
-        let tags: Vec<Tag> = if self.d().gate_keyed_by_node {
+        let tags: Vec<Tag> = if self.cfg.sealed_header_final && rec.is_none() {
+            vec![self.minter_tag()]
+        } else if self.d().gate_keyed_by_node {
             (1..=w.s.node.gen.max(self.minter_tag())).collect()
         } else {
             vec![rec.map_or(self.minter_tag(), |r| {

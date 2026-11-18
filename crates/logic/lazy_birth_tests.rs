@@ -2,7 +2,7 @@
 //!
 //! Each scenario is a small configuration of the adversary: which events may
 //! happen, and how often. A design runs in a scenario with its control, the
-//! design as it stands (revision 3), in the same configuration: the control
+//! design as it stands (revision 4), in the same configuration: the control
 //! must pass and the variant or mutant must fail. A run says which invariant
 //! fired and prints the shortest trace.
 //!
@@ -38,355 +38,7 @@ use crate::explorer::{explore, Limits, Report};
 use crate::lazy_birth::*;
 use crate::lazy_birth_model::*;
 
-const STANDARD_WINDOW: &str = "a6_standard_window";
-
-type Build = fn(Design) -> LazyConfig;
-
-fn base(design: Design) -> LazyConfig {
-    let mut c = LazyConfig::base(design);
-    c.ignore = vec![STANDARD_WINDOW];
-    c
-}
-
-/// A taker acts at the epoch after a sealed session's, then its record is lost
-/// and another taker's stale read creates over the gap. The leave of a cell
-/// is announced, written late and confirmed late.
-fn r1(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.late_takers = true;
-    c.fresh_reads = true;
-    c.b.mints = 1;
-    c.b.handoffs = 1;
-    c.b.takes = 2;
-    c.b.seals = 1;
-    c.b.expiries = 1;
-    c.b.losses = 1;
-    c.b.stalls = 1;
-    c
-}
-
-/// Two sealers gather different tails, one holding an unproven leave.
-fn r2(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.late_takers = true;
-    c.fresh_reads = true;
-    c.b.writes = 1;
-    c.b.mints = 1;
-    c.b.handoffs = 1;
-    c.b.partial = 1;
-    c.b.takes = 2;
-    c.b.seals = 2;
-    c.b.expiries = 1;
-    c.b.losses = 1;
-    c
-}
-
-/// A session in `shadow` mode hands a cell off; the takers run with the flag
-/// `on`.
-fn r3(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.late_takers = true;
-    c.fresh_reads = true;
-    c.modes = [Mode::Shadow; 3];
-    c.taker_flag = Mode::On;
-    c.b.mints = 1;
-    c.b.handoffs = 1;
-    c.b.takes = 2;
-    c.b.writes = 1;
-    c.b.seals = 1;
-    c.b.expiries = 1;
-    c.b.losses = 1;
-    c
-}
-
-fn r3_read(d: Design) -> LazyConfig {
-    let mut c = r3(d);
-    c.modes = [Mode::Read; 3];
-    c
-}
-
-/// A declared loss removes the confirmed leave of a released cell.
-fn r4a_chunk(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.b.mints = 1;
-    c.b.handoffs = 2;
-    c.b.seals = 1;
-    c.b.declared = 1;
-    c.b.expiries = 1;
-    c
-}
-
-/// A declared loss removes the marks of a leave that the bucket depends on.
-fn r4a(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.late_takers = true;
-    c.fresh_reads = true;
-    c.b.mints = 1;
-    c.b.ckpts = 1;
-    c.b.handoffs = 2;
-    c.b.takes = 2;
-    c.b.writes = 1;
-    c.b.seals = 1;
-    c.b.declared = 1;
-    c.b.expiries = 1;
-    c.b.losses = 1;
-    c
-}
-
-/// A declared loss removes a grant whose cell already has a per-cell object.
-fn r4b(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.b.mints = 1;
-    c.b.writes = 1;
-    c.b.flushes = 2;
-    c.b.crashes = 1;
-    c.b.seals = 1;
-    c.b.declared = 1;
-    c.b.expiries = 1;
-    c
-}
-
-/// A grant whose proof fails, then a handoff and a lost record.
-fn q1(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.late_takers = true;
-    c.fresh_reads = true;
-    c.b.mints = 1;
-    c.b.partial = 1;
-    c.b.handoffs = 1;
-    c.b.takes = 2;
-    c.b.writes = 1;
-    c.b.seals = 1;
-    c.b.expiries = 1;
-    c.b.losses = 1;
-    c
-}
-
-/// A preserved restart over a lazy cell.
-fn q2(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.b.mints = 1;
-    c.b.handoffs = 1;
-    c.b.preserved = 1;
-    c.b.restarts = 1;
-    c.b.takes = 1;
-    c.b.writes = 2;
-    c.b.seals = 1;
-    c
-}
-
-/// Two preserved restarts in a row over a cell with a plain record.
-fn q3(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.modes = [Mode::Shadow; 3];
-    c.b.mints = 1;
-    c.b.preserved = 2;
-    c.b.restarts = 2;
-    c.b.seals = 2;
-    c
-}
-
-/// The close of a header without a fence, while the process installs.
-fn q4(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.minter = 2;
-    c.fast_boot = false;
-    c.b.mints = 1;
-    c.b.writes = 2;
-    c.b.takes = 1;
-    c.b.seals = 1;
-    c
-}
-
-/// A taker claims an id of a session that is not sealed.
-fn live(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.b.mints = 1;
-    c.b.writes = 2;
-    c.b.takes = 1;
-    c
-}
-
-/// A cell that was waived and never got a record, taken after its session.
-fn waived(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.b.mints = 1;
-    c.b.degrades = 1;
-    c.b.crashes = 1;
-    c.b.takes = 1;
-    c.b.seals = 1;
-    c.b.expiries = 1;
-    c.b.stalls = 1;
-    c
-}
-
-/// A write whose answer is an error is sent again.
-fn retry(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.b.mints = 1;
-    c.b.handoffs = 1;
-    c.b.stalls = 1;
-    c.b.ambiguous = 1;
-    c
-}
-
-/// The plain claim of a taker whose answer was an error is settled by name,
-/// while a second process of its node claims the same epoch.
-fn settle(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.modes = [Mode::Shadow; 3];
-    c.takers = 0b110;
-    c.late_takers = true;
-    c.b.mints = 1;
-    c.b.handoffs = 1;
-    c.b.takes = 2;
-    c.b.writes = 2;
-    c.b.seals = 1;
-    c.b.expiries = 1;
-    c.b.stalls = 2;
-    c.b.ambiguous = 1;
-    c.b.restarts = 1;
-    c
-}
-
-/// Two takers read before one acts: the mark decides.
-fn paused(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.b.mints = 1;
-    c.b.crashes = 1;
-    c.b.takes = 2;
-    c.b.writes = 2;
-    c.b.seals = 1;
-    c.b.expiries = 1;
-    c.b.losses = 1;
-    c
-}
-
-/// A successor of a preserved restart acknowledges, then ends; a taker takes
-/// the cell after both.
-fn gate(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.modes = [Mode::Shadow; 3];
-    c.late_takers = true;
-    c.b.mints = 1;
-    c.b.preserved = 1;
-    c.b.restarts = 1;
-    c.b.writes = 1;
-    c.b.takes = 1;
-    c.b.seals = 2;
-    c.b.expiries = 1;
-    c
-}
-
-/// A first-form record of a taker lies over the mark of another taker.
-fn foreign(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.takers = 0b111;
-    c.late_takers = true;
-    c.b.mints = 1;
-    c.b.takes = 3;
-    c.b.writes = 2;
-    c.b.restarts = 1;
-    c.b.seals = 1;
-    c.b.expiries = 1;
-    c.b.losses = 1;
-    c
-}
-
-/// The stalled first record of a waived id: the session's create-only write
-/// lands after another node claimed the id and the record was lost.
-fn stalled_std(d: Design) -> LazyConfig {
-    let mut c = LazyConfig::base(d);
-    c.modes = [Mode::Shadow; 3];
-    c.late_takers = true;
-    c.fresh_reads = true;
-    c.b.mints = 1;
-    c.b.stalls = 1;
-    c.b.takes = 2;
-    c.b.writes = 2;
-    c.b.seals = 1;
-    c.b.expiries = 1;
-    c.b.losses = 1;
-    c
-}
-
-/// A fenced session writes a bundle and a per-cell object after a sealer
-/// gathered, under a declared loss.
-fn late_bundle(d: Design) -> LazyConfig {
-    let mut c = r4b(d);
-    c.late_session = true;
-    c
-}
-
-/// Every kind of step, with one of each: the pass run of CI.
-fn broad(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.late_takers = true;
-    c.fresh_reads = true;
-    c.b.mints = 1;
-    c.b.writes = 1;
-    c.b.handoffs = 1;
-    c.b.takes = 1;
-    c.b.seals = 1;
-    c.b.expiries = 1;
-    c.b.ckpts = 1;
-    c.b.losses = 1;
-    c.b.stalls = 1;
-    c
-}
-
-/// The same with a failed grant, a wake, a flush and a degraded ensemble:
-/// the pass run behind `CELLD_EXPLORE=large`.
-fn broad_large(d: Design) -> LazyConfig {
-    let mut c = broad(d);
-    c.b.partial = 1;
-    c.b.wakes = 1;
-    c.b.flushes = 1;
-    c.b.degrades = 1;
-    c.b.ambiguous = 1;
-    c.b.takes = 2;
-    c
-}
-
-/// A restore after a sealed session.
-fn restore(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.b.mints = 1;
-    c.b.writes = 1;
-    c.b.crashes = 1;
-    c.b.takes = 1;
-    c.b.seals = 1;
-    c.b.expiries = 1;
-    c
-}
-
-/// The paths that release a bundle or a batch.
-fn release(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.b.mints = 1;
-    c.b.writes = 1;
-    c.b.flushes = 3;
-    c.b.gcs = 2;
-    c.b.crashes = 1;
-    c.b.restarts = 1;
-    c.b.seals = 1;
-    c.b.declared = 1;
-    c.b.expiries = 1;
-    c
-}
-
-/// A sealer pauses between its rows and its bits; another sealer proceeds
-/// with a declared loss.
-fn bits(d: Design) -> LazyConfig {
-    let mut c = base(d);
-    c.b.mints = 1;
-    c.b.writes = 1;
-    c.b.crashes = 1;
-    c.b.seals = 2;
-    c.b.declared = 1;
-    c.b.expiries = 1;
-    c
-}
+use crate::lazy_birth_scenarios::{design_named, scenario, STANDARD_WINDOW};
 
 fn run(name: &str, cfg: LazyConfig, stop_at_first: bool, max: usize) -> Report {
     run_expecting(name, cfg, stop_at_first, max, &[])
@@ -420,49 +72,6 @@ fn config_line(cfg: &LazyConfig) -> String {
         "  config: 1 minting node (up to 3 processes, process {} mints), takers {:#05b} of 3, 2 sealers, 2 cells, 2 followers; adversary {:?}",
         cfg.minter, cfg.takers, cfg.b
     )
-}
-
-fn design_named(which: &str) -> Design {
-    match which {
-        "rev1" => Design::rev1(),
-        "rev2" => Design::rev2(),
-        "rev3" => Design::rev3(),
-        m => {
-            let (n, f) = m[1..].split_once('f').unwrap_or((&m[1..], "0"));
-            Design::mutant(n.parse().unwrap(), f.parse().unwrap())
-        }
-    }
-}
-
-fn scenario(name: &str) -> Build {
-    match name {
-        "r1" => r1,
-        "r2" => r2,
-        "r3" => r3,
-        "r3_read" => r3_read,
-        "r4a" => r4a,
-        "r4a_chunk" => r4a_chunk,
-        "r4b" => r4b,
-        "q1" => q1,
-        "q2" => q2,
-        "q3" => q3,
-        "q4" => q4,
-        "live" => live,
-        "waived" => waived,
-        "retry" => retry,
-        "settle" => settle,
-        "paused" => paused,
-        "restore" => restore,
-        "release" => release,
-        "bits" => bits,
-        "gate" => gate,
-        "foreign" => foreign,
-        "stalled_std" => stalled_std,
-        "late_bundle" => late_bundle,
-        "broad" => broad,
-        "broad_large" => broad_large,
-        other => panic!("no scenario {other}"),
-    }
 }
 
 /// Run a design in a scenario with some invariants left unreported.
@@ -517,13 +126,14 @@ const CI_CONTROLS: &[&str] = &[
     "live",
     "retry",
     "restore",
+    "placed",
 ];
 
 #[test]
 fn the_design_holds_every_invariant_in_every_scenario() {
     let mut labels = std::collections::BTreeSet::new();
     for scn in CI_CONTROLS {
-        let r = run_design(&format!("control {scn}"), scn, "rev3", &[], false, CAP);
+        let r = run_design(&format!("control {scn}"), scn, "rev4", &[], false, CAP);
         assert!(
             r.passed(),
             "{scn}: {}",
@@ -549,6 +159,8 @@ fn the_design_holds_every_invariant_in_every_scenario() {
         "late_landing_after_seal",
         "acknowledged_by_fleet",
         "declared_loss",
+        "placed",
+        "new_cell_claim_marked",
     ] {
         eprintln!("  reached {needed}: {}", labels.contains(needed));
         assert!(
@@ -622,6 +234,63 @@ const PAST: &[Past] = &[
         &["a8_sealed_chunk_incomplete", "a1_one_acting_writer"],
         &[],
     ),
+    (
+        "a late bundle, on revision 3",
+        "rev3",
+        "late_bundle",
+        &["a8_sealed_chunk_incomplete"],
+        &[],
+    ),
+    (
+        "standard path, on revision 3, a stalled first record",
+        "rev3",
+        "stalled_std",
+        &["a6_stalled_first_record"],
+        &[],
+    ),
+    (
+        "standard path, on revision 3, a waived id in mode on",
+        "rev3",
+        "stalled_std_on",
+        TWO_WRITERS,
+        &[],
+    ),
+    (
+        "standard path, on revision 3, a placed id",
+        "rev3",
+        "placed",
+        TWO_WRITERS,
+        &[],
+    ),
+    (
+        "standard path, on revision 3, a waived id handed off live",
+        "rev3",
+        "handoff_std",
+        TWO_WRITERS,
+        &[],
+    ),
+    (
+        "standard path, on revision 3, a waived id carried over a preserved restart",
+        "rev3",
+        "resume_std",
+        TWO_WRITERS,
+        &[],
+    ),
+    (
+        "standard path, on revision 3, the session acts on its late record",
+        "rev3",
+        "late_std",
+        TWO_WRITERS,
+        &[],
+    ),
+];
+
+/// Two writers of one cell: in one prefix, or acting at once. The model names
+/// both `a6_stalled_first_record` once a stalled first record landed late.
+const TWO_WRITERS: &[&str] = &[
+    "a1_one_acting_writer",
+    "a2_prefix_two_writers",
+    "a6_stalled_first_record",
 ];
 
 #[test]
@@ -690,12 +359,63 @@ const MUTANTS: &[(&str, &str, &[&str])] = &[
         "q4",
         &["a8_sealed_chunk_incomplete", "a1_one_acting_writer"],
     ),
+    ("M32", "late_bundle", &["a8_sealed_chunk_incomplete"]),
+    ("M33", "stalled_std", TWO_WRITERS),
+    ("M33", "stalled_std_on", TWO_WRITERS),
+    ("M34", "stalled_std", TWO_WRITERS),
+    ("M35", "stalled_std", TWO_WRITERS),
+    ("M36", "placed", TWO_WRITERS),
+    ("M37", "placed_ckpt", TWO_WRITERS),
+    ("M38", "placed_reclaim", SECOND_WRITER),
+    ("M39", "late_std", SECOND_WRITER),
+    ("M40", "handoff_std", TWO_WRITERS),
+    ("M40", "handoff_shadow", HANDOFF_GRANTED),
+    ("M40", "handoff_read", HANDOFF_GRANTED),
+    ("M41", "resume_std", RESUMED_BESIDE),
+    ("M42", "stalled_std", TWO_WRITERS),
+    ("M43", "placed", TWO_WRITERS),
+];
+
+/// What a missing trace before a release shows for a granted cell: two writers,
+/// or a sealed chunk without the grant of a cell that has an object.
+const HANDOFF_GRANTED: &[&str] = &[
+    "a8_sealed_chunk_incomplete",
+    "a1_one_acting_writer",
+    "a2_prefix_two_writers",
+];
+
+/// What a missing trace before the reload marker shows first: a peer claims
+/// the cell between the seal and the successor's start, and the successor
+/// resumes it under the peer's record.
+const RESUMED_BESIDE: &[&str] = &[
+    "a11_resume",
+    "a3_lost_ack",
+    "a1_one_acting_writer",
+    "a2_prefix_two_writers",
+];
+
+/// What a second writer shows first in a scenario where the first writer
+/// acknowledged: the new cell starts empty beside that write.
+const SECOND_WRITER: &[&str] = &[
+    "a3_lost_ack",
+    "a1_one_acting_writer",
+    "a2_prefix_two_writers",
+    "a6_stalled_first_record",
 ];
 
 fn check_mutants(table: &[(&str, &str, &[&str])], cap: usize) {
     let mut survivors = Vec::new();
     for (m, scn, any_of) in table {
-        let r = run_design(&format!("{m} in {scn}"), scn, m, &[], true, cap);
+        // The window of the standard path is a report; a mutant is killed by
+        // an invariant that fails.
+        let r = run_design(
+            &format!("{m} in {scn}"),
+            scn,
+            m,
+            &[STANDARD_WINDOW],
+            true,
+            cap,
+        );
         if !found(&format!("{m} in {scn}"), &r, any_of) {
             survivors.push(*m);
         }
@@ -708,6 +428,29 @@ fn each_mutant_breaks_an_invariant_its_control_keeps() {
     check_mutants(MUTANTS, CAP);
 }
 
+/// `M38` and `M39` stop first at a lost acknowledgement, and `M41` at a resume
+/// beside a peer. Explored to the end, each also reaches the two acting writers
+/// that its rule is there to stop.
+#[test]
+fn a_session_that_claims_twice_or_acts_on_a_late_record_is_a_second_writer() {
+    for (m, scn) in [
+        ("M38", "placed_reclaim"),
+        ("M38", "handoff_reclaim"),
+        ("M39", "late_std"),
+        ("M41", "resume_std"),
+    ] {
+        let r = run_design(
+            &format!("{m} in {scn}, to the end"),
+            scn,
+            m,
+            &[],
+            false,
+            CAP,
+        );
+        assert!(found(&format!("{m} in {scn}"), &r, TWO_WRITERS));
+    }
+}
+
 /// The invariant that a rule's removal fires is the one the rule serves:
 /// `M30` fails invariant 11 and not one of the first ten.
 #[test]
@@ -717,54 +460,115 @@ fn the_carried_set_is_what_invariant_eleven_asks_for() {
     assert!(r.violations.keys().all(|n| *n == "a11_resume"));
 }
 
-/// A finding on revision 3: a fenced session that continues writes a bundle
-/// and a per-cell object after a sealer gathered under a declared loss, so a
-/// sealed chunk lacks a grant that the bucket depends on. A reader refuses the
-/// cell (the standard path finds rows); no second writer follows.
+/// A finding on revision 3, a late bundle: a fenced session that continues
+/// writes a bundle and a per-cell object after a sealer gathered under a
+/// declared loss, so a sealed chunk lacks a grant that the bucket depends on.
+/// Revision 4 lets the object through only after the session read its header
+/// as open, after the bundle was written.
 #[test]
-fn finding_a_late_bundle_leaves_a_sealed_chunk_without_its_grant() {
-    let r = run_design(
-        "late bundle on revision 3",
-        "late_bundle",
+fn a_late_bundle_no_longer_leaves_a_sealed_chunk_without_its_grant() {
+    for scn in ["late_bundle", "late_bundle_ckpt"] {
+        let before = run_design(
+            &format!("{scn} on revision 3"),
+            scn,
+            "rev3",
+            &[],
+            false,
+            CAP,
+        );
+        assert!(found(
+            "late bundle on revision 3",
+            &before,
+            &["a8_sealed_chunk_incomplete"]
+        ));
+        assert!(before.passed_except(&["a8_sealed_chunk_incomplete"]));
+        let after = run_design(
+            &format!("{scn} on revision 4"),
+            scn,
+            "rev4",
+            &[],
+            false,
+            CAP,
+        );
+        assert!(after.passed() && after.complete(), "{scn} on revision 4");
+        // The rule still lets a live session write its objects.
+        assert!(after.labels.contains_key("bundle_confirmed"));
+    }
+}
+
+/// The scenarios of the standard path of a tagged id, run with every
+/// invariant reported, the window of the standard path included. `placed`
+/// runs the same way among the controls, and the larger ones run behind
+/// `CELLD_EXPLORE=large`.
+const STANDARD_PATH: &[&str] = &[
+    "stalled_std",
+    "stalled_std_on",
+    "stalled_std_read",
+    "stalled_std_late",
+    "late_std",
+    "r3",
+    "r3_read",
+    "placed_shadow",
+    "placed_reclaim",
+    "handoff_std",
+    "handoff_reclaim",
+    "resume_std",
+    "q2_final",
+];
+
+fn run_unfiltered(name: &str, scn: &str, design: &str, cap: usize) -> Report {
+    let mut cfg = scenario(scn)(design_named(design));
+    cfg.ignore.clear();
+    run(name, cfg, false, cap)
+}
+
+/// A finding on revision 3, the standard path: on the standard path of a
+/// tagged id (a waived id, or any id of a `shadow` session) two writers reach
+/// one epoch prefix,
+/// with the stalled first record of the minting session and without it.
+/// Revision 4 leaves a trace in the chunk for every such claim, and no
+/// scenario of the standard path reports anything, the window included.
+#[test]
+fn the_standard_path_of_a_tagged_id_has_one_writer() {
+    let before = run_unfiltered(
+        "stalled first record on revision 3",
+        "stalled_std",
         "rev3",
-        &[],
-        false,
         CAP,
     );
     assert!(found(
-        "finding F-A on revision 3",
-        &r,
-        &["a8_sealed_chunk_incomplete"]
+        "standard path on revision 3",
+        &before,
+        &["a6_stalled_first_record"]
     ));
-    assert!(r.passed_except(&["a8_sealed_chunk_incomplete"]));
-}
-
-/// The case that the design leaves to the explorer: a stalled create-only
-/// write of a waived or `shadow` id lands after a peer claimed the id at epoch
-/// 2 and the record was lost, and a reader takes the late record over.
-#[test]
-fn finding_a_stalled_first_record_puts_two_writers_in_one_prefix() {
-    let mut cfg = scenario("stalled_std")(Design::rev3());
-    cfg.ignore.clear();
-    let r = run("stalled first record on revision 3", cfg, false, CAP);
-    assert!(
-        found(
-            "finding F-B on revision 3",
-            &r,
-            &["a6_stalled_first_record"]
-        ),
-        "the stalled first record did not reach two writers"
-    );
-    // Two writers in one prefix are also reached without the stalled write: a
-    // lost record before the first writer has an object in the bucket gives the
-    // same outcome, under the window of the standard path.
-    assert!(r.violations.contains_key("a2_prefix_two_writers"));
-    // Today's rule, which puts the first record of every cell at epoch 1, gives the same
-    // two acting writers in two prefixes.
+    // The same two writers without the stalled write.
+    assert!(before.violations.contains_key("a2_prefix_two_writers"));
+    for scn in STANDARD_PATH {
+        let after = run_unfiltered(&format!("{scn} on revision 4"), scn, "rev4", CAP);
+        after.print_violations();
+        assert!(after.passed(), "{scn} on revision 4");
+        assert!(after.complete(), "{scn} on revision 4 hit a bound");
+        // The session's second decision about an id reaches both of its
+        // answers and writes nothing: it places the id again, or refuses a
+        // claim of its own.
+        let answer = match *scn {
+            "placed_reclaim" => Some("placed_again"),
+            "handoff_reclaim" => Some("claimed_again_refused"),
+            _ => None,
+        };
+        if let Some(label) = answer {
+            assert!(
+                after.labels.contains_key(label),
+                "{scn} never reached {label}"
+            );
+        }
+    }
+    // Today's rule, which puts the first record of every cell at epoch 1,
+    // gives the same two acting writers in two prefixes.
     let today = run_design(
         "stalled first record, first record at epoch 1",
         "stalled_std",
-        "M2",
+        "rev3e1",
         &["a4_epoch1_foreign"],
         false,
         CAP,
@@ -776,17 +580,28 @@ fn finding_a_stalled_first_record_puts_two_writers_in_one_prefix() {
     ));
 }
 
+/// Mode `read` takes the standard path for an id that was never granted, and
+/// refuses a granted id without a record. Every scenario of the standard path
+/// holds in it.
+#[test]
+fn the_standard_path_holds_in_mode_read() {
+    for scn in STANDARD_PATH
+        .iter()
+        .filter(|n| !n.ends_with("_read") && !n.ends_with("_on"))
+        .filter(|n| !STANDARD_PATH.contains(&format!("{n}_read").as_str()))
+    {
+        let mut cfg = scenario(scn)(Design::rev4());
+        cfg.ignore.clear();
+        cfg.modes = [Mode::Read; 3];
+        let r = run(&format!("{scn} in mode read"), cfg, false, CAP);
+        r.print_violations();
+        assert!(r.passed(), "{scn} in mode read");
+        assert!(r.complete(), "{scn} in mode read hit a bound");
+    }
+}
+
 /// The invariants the standard path's known window fires.
 const WINDOW_ONLY: &[&str] = &[STANDARD_WINDOW];
-
-/// What the stalled-record scenario of revision 3 fires: the finding, and the
-/// invariants that the same faults fire without the stalled write.
-const STALLED_STD_FINDINGS: &[&str] = &[
-    "a1_one_acting_writer",
-    "a2_prefix_two_writers",
-    "a6_stalled_first_record",
-    STANDARD_WINDOW,
-];
 
 /// `CELLD_EXPLORE=large cargo test -p celld-logic --lib explore_large -- --ignored --nocapture`
 #[test]
@@ -807,16 +622,28 @@ fn explore_large() {
         "foreign",
         "settle",
         "stalled_std",
+        "stalled_std_on",
+        "stalled_std_read",
+        "stalled_std_late",
+        "late_std",
+        "late_std_stale",
+        "placed_ckpt",
+        "placed_shadow",
+        "placed_stall",
+        "placed_reclaim",
+        "handoff_shadow",
+        "handoff_read",
+        "q3_final",
     ] {
-        // The window of the standard path is the one the model reports and
-        // does not fail. The stalled-record scenario carries the finding it is
-        // named for, and nothing else.
-        let known = if scn == "stalled_std" {
-            STALLED_STD_FINDINGS
-        } else {
+        // Every invariant is reported here. Only these scenarios may reach
+        // the window of the standard path; anywhere else it fails the run.
+        let known: &[&str] = if matches!(scn, "r4a" | "handoff_shadow" | "handoff_read") {
             WINDOW_ONLY
+        } else {
+            &[]
         };
-        let cfg = scenario(scn)(design_named("rev3"));
+        let mut cfg = scenario(scn)(design_named("rev4"));
+        cfg.ignore.clear();
         let r = run_expecting(&format!("control {scn}"), cfg, false, 3_000_000, known);
         r.print_violations();
         assert!(r.passed_except(known), "control {scn} fails");
@@ -826,6 +653,20 @@ fn explore_large() {
             "control {scn} hit a bound"
         );
     }
+    // A granted cell of a shadow session carried over two preserved restarts:
+    // on revision 3 a peer that finds its record lost claims it beside the
+    // successor.
+    let r = run_unfiltered(
+        "a lost record beside a successor, on revision 3",
+        "q3_final",
+        "rev3",
+        3_000_000,
+    );
+    assert!(found(
+        "a lost record beside a successor, on revision 3",
+        &r,
+        TWO_WRITERS
+    ));
     let r = run_design(
         "R2 on revision 1",
         "r2",
@@ -882,7 +723,7 @@ fn explore_large() {
 #[ignore]
 fn explore_scenario() {
     let scn = std::env::var("SCN").unwrap_or_else(|_| "r1".into());
-    let design = std::env::var("DESIGN").unwrap_or_else(|_| "rev3".into());
+    let design = std::env::var("DESIGN").unwrap_or_else(|_| "rev4".into());
     let r = run_design(
         &format!("{scn} {design}"),
         &scn,
