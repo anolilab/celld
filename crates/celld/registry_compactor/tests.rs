@@ -172,6 +172,57 @@ async fn a_first_write_waits_for_coverage_and_fails_at_its_bound_when_nothing_fo
 }
 
 #[tokio::test]
+async fn a_first_write_fails_at_its_bound_even_when_a_read_inside_the_wait_never_returns() {
+    let (scripted, bucket) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_on(&store, "node-a");
+    let _holding = holder_of(&registry_on(&bucket, "holder")).await;
+    let name = cell(8);
+    // This node created the cell, so the wait skips the lookup and goes
+    // straight to the loop that reads the root after each pass request.
+    node.register_at_claim(&name, 1);
+    scripted.hold("/root");
+    let began = crate::asyncrt::mono_ms();
+    let outcome = crate::asyncrt::timeout(Duration::from_secs(3), node.ensure_covered(&name))
+        .await
+        .expect("the wait ends at its bound, whatever a read inside it does");
+    let error = outcome.expect_err("nothing covers the cell");
+    assert!(error.to_string().contains("not covered"));
+    assert!(
+        crate::asyncrt::mono_ms() - began < 1_200,
+        "the bound is 600 ms and the wait overran it"
+    );
+    assert_eq!(node.counters.bound_hits.load(Ordering::Relaxed), 1);
+    assert_eq!(node.waiters.load(Ordering::Relaxed), 0);
+    scripted.release("/root");
+}
+
+#[tokio::test]
+async fn a_wait_cut_at_its_bound_inside_the_segment_write_keeps_the_cell_queued_for_the_retry() {
+    let (scripted, bucket) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_on(&store, "node-a");
+    let holder = registry_on(&bucket, "holder");
+    let mut holding = holder_of(&holder).await;
+    let name = cell(9);
+    node.register_at_claim(&name, 1);
+    scripted.hold("/seg/");
+    let error = node
+        .ensure_covered(&name)
+        .await
+        .expect_err("the segment write never returns inside the bound");
+    assert!(error.to_string().contains("not covered"));
+    scripted.release("/seg/");
+    // The retry: the cell must still be queued, so its segment is written and
+    // the next pass covers it.
+    node.flush_now().await.unwrap();
+    assert!(holder.pass(&mut holding).await.unwrap());
+    node.ensure_covered(&name)
+        .await
+        .expect("the retry finds the cell covered");
+}
+
+#[tokio::test]
 async fn exists_from_a_lookup_lets_the_first_write_go_on_at_once() {
     let store = memory();
     let first = registry_on(&store, "node-a");
@@ -582,7 +633,7 @@ mod store {
             }
         }
 
-        /// Hold every read of a key that contains `pattern` until `release`.
+        /// Hold every read or write of a key that contains `pattern` until `release`.
         pub(super) fn hold(&self, pattern: &str) {
             self.held
                 .lock()
@@ -645,6 +696,17 @@ mod store {
             payload: PutPayload,
             options: PutOptions,
         ) -> object_store::Result<PutResult> {
+            let key = location.to_string();
+            let gate = self
+                .held
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(pattern, _)| key.contains(pattern.as_str()))
+                .map(|(_, gate)| gate.clone());
+            if let Some(gate) = gate {
+                gate.acquire().await.expect("the gate stays open").forget();
+            }
             self.inner.put_opts(location, payload, options).await
         }
 
