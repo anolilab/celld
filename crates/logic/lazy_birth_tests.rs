@@ -428,8 +428,9 @@ fn each_mutant_breaks_an_invariant_its_control_keeps() {
     check_mutants(MUTANTS, CAP);
 }
 
-/// `M38`, `M39` and `M41` stop first at a lost acknowledgement. Explored to the end,
-/// each also reaches the two acting writers that its rule is there to stop.
+/// `M38` and `M39` stop first at a lost acknowledgement, and `M41` at a resume
+/// beside a peer. Explored to the end, each also reaches the two acting writers
+/// that its rule is there to stop.
 #[test]
 fn a_session_that_claims_twice_or_acts_on_a_late_record_is_a_second_writer() {
     for (m, scn) in [
@@ -633,17 +634,17 @@ fn explore_large() {
         "handoff_read",
         "q3_final",
     ] {
-        // Every invariant is reported here. The window of the standard path
-        // is the one the model reports and does not fail.
-        let known = WINDOW_ONLY;
+        // Every invariant is reported here. Only these scenarios may reach
+        // the window of the standard path; anywhere else it fails the run.
+        let known: &[&str] = if matches!(scn, "r4a" | "handoff_shadow" | "handoff_read") {
+            WINDOW_ONLY
+        } else {
+            &[]
+        };
         let mut cfg = scenario(scn)(design_named("rev4"));
         cfg.ignore.clear();
         let r = run_expecting(&format!("control {scn}"), cfg, false, 3_000_000, known);
         r.print_violations();
-        eprintln!(
-            "  control {scn}: the window of the standard path was reported: {}",
-            r.violations.contains_key(STANDARD_WINDOW)
-        );
         assert!(r.passed_except(known), "control {scn} fails");
         // Only the widest scenario is cut off by its bound, and says so.
         assert!(
