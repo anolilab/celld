@@ -210,6 +210,8 @@ impl Connection {
 
     async fn read_reply(&mut self, stage: &str) -> Result<Reply, EmailError> {
         let mut lines = Vec::new();
+        // Every line of a multiline reply carries the same code.
+        let mut code_of_first: Option<u16> = None;
         loop {
             let mut line = Vec::new();
             let read = (&mut self.stream)
@@ -241,6 +243,10 @@ impl Connection {
                 None => (false, &text[3..]),
                 Some(_) => return Err(malformed()),
             };
+            if code_of_first.is_some_and(|first| first != code) {
+                return Err(malformed());
+            }
+            code_of_first = Some(code);
             let body = String::from_utf8_lossy(body);
             lines.push(body.to_ascii_uppercase());
             if lines.len() > MAX_REPLY_LINES {
@@ -711,6 +717,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((reply.code, reply.lines.len()), (250, 2));
+        for reply in ["550-refused\r\n250 ok\r\n", "250-a\r\n250-b\r\n251 c\r\n"] {
+            let (client, mut server) = tokio::io::duplex(1024);
+            tokio::io::AsyncWriteExt::write_all(&mut server, reply.as_bytes())
+                .await
+                .unwrap();
+            let mut connection = Connection::new(Box::new(client), Timeouts::NODE);
+            let error = match connection.read_reply("rcpt").await {
+                Ok(_) => panic!("{reply:?} was accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                error.message.contains("malformed reply"),
+                "{reply:?}: {error:?}"
+            );
+        }
     }
 
     #[test]

@@ -450,20 +450,35 @@ fn encoded_words(text: &str) -> String {
 }
 
 /// One header line, folded at white space so no line passes 76 bytes where a
-/// space allows it.
+/// space allows it. Unfolding gives the value back unchanged.
 fn fold_header(name: &str, value: &str) -> String {
-    let mut out = format!("{name}:");
+    let mut out = format!("{name}: ");
     let mut line = out.len();
-    // Runs of white space collapse, so a fold never leaves a line with
-    // nothing but white space on it.
-    for word in value.split_ascii_whitespace() {
-        if line + 1 + word.len() > 76 && line > name.len() + 1 {
+    let mut placed = false;
+    let mut rest = value;
+    // The value keeps its white space. A fold goes before a run of white
+    // space, which then leads the next line with its word, so no line holds
+    // white space only.
+    while !rest.is_empty() {
+        let (space, tail) = rest.split_at(
+            rest.len()
+                - rest
+                    .trim_start_matches(|c: char| c.is_ascii_whitespace())
+                    .len(),
+        );
+        let end = tail
+            .find(|c: char| c.is_ascii_whitespace())
+            .unwrap_or(tail.len());
+        let (word, next) = tail.split_at(end);
+        if placed && !word.is_empty() && line + space.len() + word.len() > 76 {
             out.push_str("\r\n");
             line = 0;
         }
-        out.push(' ');
+        out.push_str(space);
         out.push_str(word);
-        line += 1 + word.len();
+        line += space.len() + word.len();
+        placed |= !word.is_empty();
+        rest = next;
     }
     out.push_str("\r\n");
     out
@@ -512,11 +527,12 @@ fn text_part(media_type: &str, body: &str) -> String {
     )
 }
 
+/// An RFC 2045 token: printable US-ASCII, no space, no tspecial.
 fn is_token(text: &str) -> bool {
     !text.is_empty()
         && text
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "!#$&^_.+-".contains(c))
+            .all(|c| c.is_ascii_graphic() && !"()<>@,;:\\\"/[]?=".contains(c))
 }
 
 fn attachment_part(attachment: &Attachment) -> Result<(String, bool), EmailError> {
@@ -742,7 +758,9 @@ mod tests {
             "html": "<p>x</p>",
             "attachments": [
                 { "content": "aGk=", "filename": "a.txt", "type": "text/plain", "disposition": "attachment" },
-                { "content": "aGk=", "filename": "p\u{e9}.png", "type": "image/png", "disposition": "inline", "contentId": "logo" }
+                { "content": "aGk=", "filename": "p\u{e9}.png", "type": "image/png", "disposition": "inline", "contentId": "logo" },
+                { "content": "aGk=", "filename": "b", "type": "application/vnd.a*b", "disposition": "attachment" },
+                { "content": "aGk=", "filename": "c", "type": "application/x-%~'{}|`", "disposition": "attachment" }
             ]
         }))
         .unwrap();
@@ -755,6 +773,8 @@ mod tests {
             "filename=\"a.txt\"",
             "filename*=UTF-8''p%C3%A9.png",
             "Content-ID: <logo>",
+            "application/vnd.a*b",
+            "application/x-%~'{}|`",
         ] {
             assert!(text.contains(needle), "{needle} in {text}");
         }
@@ -818,6 +838,10 @@ mod tests {
             (
                 json!({ "content": "aGk=", "filename": "a", "type": "text", "disposition": "attachment" }),
                 "type",
+            ),
+            (
+                json!({ "content": "aGk=", "filename": "a", "type": "x/y(z)", "disposition": "attachment" }),
+                "tspecial",
             ),
             (
                 json!({ "content": "aGk=", "filename": "a", "type": "x/y", "disposition": "inline" }),
@@ -928,6 +952,12 @@ mod tests {
                 assert!(!line.trim().is_empty(), "{head:?}");
             }
         }
-        assert_eq!(fold_header("X-A", "a  b\t c"), "X-A: a b c\r\n");
+        // White space inside the value survives, folded or not.
+        assert_eq!(fold_header("X-A", "a  b\t c"), "X-A: a  b\t c\r\n");
+        let long = format!("{}  {}", "a".repeat(70), "b".repeat(20));
+        assert_eq!(
+            fold_header("X-A", &long),
+            format!("X-A: {}\r\n  {}\r\n", "a".repeat(70), "b".repeat(20))
+        );
     }
 }
