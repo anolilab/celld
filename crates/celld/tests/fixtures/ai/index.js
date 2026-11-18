@@ -37,7 +37,9 @@ export default {
         });
       }
       case "/stream-error":
-      case "/stream-cut": {
+      case "/stream-cut":
+      case "/stream-bad-json":
+      case "/stream-long-line": {
         // Read the stream to its end, keeping what arrived before it failed.
         let text = "";
         const result = await attempt(async () => {
@@ -50,6 +52,10 @@ export default {
         });
         return Response.json({ ...result, text });
       }
+      case "/bad-shape":
+        return Response.json(await attempt(() => env.AI.run(CHAT, { prompt: "bad-shape" })));
+      case "/bad-embedding":
+        return Response.json(await attempt(() => env.AI.run(EMBED, { text: "bad-shape" })));
       case "/big-answer":
         return Response.json(await attempt(() => env.AI.run(CHAT, { prompt: "big" })));
       case "/big-request":

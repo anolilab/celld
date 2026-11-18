@@ -9,6 +9,9 @@ const __AI_SAMPLING = [
   "max_tokens", "temperature", "top_p", "seed",
   "frequency_penalty", "presence_penalty",
 ];
+// The most of one upstream event line a stream holds while it waits for the
+// line's end; a longer line errors the stream.
+const __AI_MAX_LINE = 1 << 20;
 const __aiEncoder = new TextEncoder();
 const __aiError = (message) => new Error("AiError: " + message);
 
@@ -58,8 +61,9 @@ function __aiStreamError(event) {
 
 // The upstream's OpenAI stream as Workers AI's: `data: {"response":"..."}`
 // events, then `data: [DONE]`. It reads upstream only as the Worker reads it.
-// An error event, or an upstream that ends without `[DONE]`, errors the
-// stream: a Worker must not take a cut-off answer for a finished one.
+// An error event, an event that is not JSON, a line past 1 MiB, or an upstream
+// that ends without `[DONE]` errors the stream: a Worker must not take a
+// damaged or cut-off answer for a finished one.
 function __aiEventStream(streamId) {
   const reader = new CelldHttpBodyStream(streamId).getReader();
   const decoder = new TextDecoder();
@@ -78,6 +82,11 @@ function __aiEventStream(streamId) {
     async pull(controller) {
       for (;;) {
         const newline = buffer.indexOf("\n");
+        if (newline > __AI_MAX_LINE || (newline < 0 && buffer.length > __AI_MAX_LINE)) {
+          return fail(
+            controller,
+            __aiError("the upstream sent an event line larger than 1 MiB"));
+        }
         if (newline < 0) {
           if (ended) {
             return fail(
@@ -102,7 +111,8 @@ function __aiEventStream(streamId) {
         try {
           event = JSON.parse(data);
         } catch {
-          continue;
+          return fail(
+            controller, __aiError("the upstream sent a stream event that is not JSON"));
         }
         if (event?.error !== undefined && event.error !== null) {
           return fail(controller, __aiStreamError(event));
@@ -136,7 +146,12 @@ __celld.__makeAi = () => ({
       }
       const answer = __aiJson(
         await __ai_run("chat", model, JSON.stringify(body), false));
-      const out = { response: answer.choices?.[0]?.message?.content ?? "" };
+      const content = answer?.choices?.[0]?.message?.content;
+      if (typeof content !== "string") {
+        throw __aiError(
+          "the upstream answer has no choices[0].message.content text");
+      }
+      const out = { response: content };
       if (answer.usage) out.usage = answer.usage;
       return out;
     }
@@ -147,8 +162,11 @@ __celld.__makeAi = () => ({
     ) {
       const answer = __aiJson(
         await __ai_run("embeddings", model, JSON.stringify({ input: text }), false));
-      if (!Array.isArray(answer.data)) {
-        throw __aiError("the upstream answered no embeddings");
+      if (
+        !Array.isArray(answer?.data) ||
+        !answer.data.every((item) => Array.isArray(item?.embedding))
+      ) {
+        throw __aiError("the upstream answer has no data[].embedding vectors");
       }
       const data = [...answer.data]
         .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))

@@ -48,7 +48,14 @@ it. A `401` or `403` from the endpoint reaches the Worker without the body.
 
 A request body from the Worker and an answer from the endpoint may each be up
 to 32 MiB. A larger request is refused without a call, and a larger answer
-fails the call with an error that names the limit.
+fails the call with an error that names the limit. The limit applies to the body
+celld sends, which carries the endpoint's model name and so can be a few bytes
+longer than the Worker's.
+
+An answer must have the shape the route promises: `choices[0].message.content`
+as a string for text generation, and a `data` array whose items each carry an
+`embedding` array for embeddings. Any other 2xx answer fails the call with an
+`AiError` and does not become an empty result.
 
 The endpoint is the operator's own, so the egress policy (`CELLD_EGRESS`) does
 not apply to it and a private or loopback address works. celld does not follow
@@ -78,8 +85,9 @@ const stream = await env.AI.run(model, { prompt, stream: true });
 return new Response(stream, { headers: { "content-type": "text/event-stream" } });
 ```
 
-A stream that the endpoint cuts short, or that carries an error event, does not
-end with `[DONE]`. The stream errors instead, and reading it throws an
+A stream that the endpoint cuts short, that carries an error event or an event
+that is not JSON, or that sends one line longer than 1 MiB, does not end with
+`[DONE]`. The stream errors instead, and reading it throws an
 `AiError` with the endpoint's message (without the key), so a Worker cannot
 take a partial answer for a complete one.
 

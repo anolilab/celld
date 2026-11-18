@@ -88,7 +88,9 @@ async fn serve(mut stream: tokio::net::TcpStream, log: Arc<Mutex<Vec<Seen>>>) {
         authorization: header("authorization"),
         body: body.clone(),
     });
-    let reply = if path.ends_with("/embeddings") {
+    let reply = if path.ends_with("/embeddings") && body["input"] == "bad-shape" {
+        http(200, "application/json", r#"{"data":[{"index":0}]}"#)
+    } else if path.ends_with("/embeddings") {
         let inputs = match &body["input"] {
             Value::String(text) => vec![text.clone()],
             other => other
@@ -120,6 +122,21 @@ async fn serve(mut stream: tokio::net::TcpStream, log: Arc<Mutex<Vec<Seen>>>) {
         if last == "big" {
             // An answer past the host's limit.
             http(200, "application/json", &"x".repeat(33 << 20))
+        } else if last == "bad-shape" {
+            http(200, "application/json", r#"{"choices":[]}"#)
+        } else if last == "stream-bad-json" {
+            let text = format!(
+                "data: {}\n\ndata: {{not json\n\ndata: [DONE]\n\n",
+                json!({ "choices": [{ "delta": { "content": "Hel" } }] })
+            );
+            http(200, "text/event-stream", &text)
+        } else if last == "stream-long-line" {
+            // One event line that never ends, past the stream's line limit.
+            http(
+                200,
+                "text/event-stream",
+                &format!("data: {}", "x".repeat(2 << 20)),
+            )
         } else if last == "stream-error" || last == "stream-cut" {
             let mut text = format!(
                 "data: {}\n\n",
@@ -335,4 +352,51 @@ async fn bodies_past_the_limit_fail_the_call() {
         "{request}"
     );
     assert_eq!(stub.requests().len(), 1, "the oversized request was sent");
+}
+
+#[tokio::test]
+async fn a_stream_event_that_is_not_json_errors_the_stream() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    let result: Value = server.get_json("/stream-bad-json").await;
+    assert_eq!(result["ok"], false, "{result}");
+    assert_eq!(result["text"], "data: {\"response\":\"Hel\"}\n\n");
+    assert!(
+        result["message"].as_str().unwrap().contains("not JSON"),
+        "{result}"
+    );
+}
+
+#[tokio::test]
+async fn an_event_line_past_the_limit_errors_the_stream() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    let result: Value = server.get_json("/stream-long-line").await;
+    assert_eq!(result["ok"], false, "{result}");
+    assert_eq!(result["text"], "");
+    assert!(
+        result["message"].as_str().unwrap().contains("1 MiB"),
+        "{result}"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_without_the_expected_shape_fails_the_call() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    let chat: Value = server.get_json("/bad-shape").await;
+    assert_eq!(chat["ok"], false, "{chat}");
+    assert!(
+        chat["message"].as_str().unwrap().contains("choices[0]"),
+        "{chat}"
+    );
+    let embed: Value = server.get_json("/bad-embedding").await;
+    assert_eq!(embed["ok"], false, "{embed}");
+    assert!(
+        embed["message"].as_str().unwrap().contains("embedding"),
+        "{embed}"
+    );
 }

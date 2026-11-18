@@ -56,6 +56,13 @@ impl Route {
     }
 }
 
+fn too_large() -> String {
+    format!(
+        "AI request body is larger than {} MiB",
+        MAX_BODY_BYTES >> 20
+    )
+}
+
 pub struct Config {
     base: String,
     key: Option<Zeroizing<String>>,
@@ -87,10 +94,7 @@ impl Config {
     /// `model` field, whatever the Worker put there.
     pub fn request(&self, route: Route, model: &str, body: &str) -> Result<Request, String> {
         if body.len() > MAX_BODY_BYTES {
-            return Err(format!(
-                "AI request body is larger than {} MiB",
-                MAX_BODY_BYTES >> 20
-            ));
+            return Err(too_large());
         }
         let upstream = self.models.get(model).ok_or_else(|| {
             format!("Workers AI model {model:?} is not mapped; add it to {MODELS} on this node")
@@ -101,9 +105,14 @@ impl Config {
             .as_object_mut()
             .ok_or("AI request body must be a JSON object")?;
         object.insert("model".into(), upstream.clone().into());
+        let body = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
+        // The model name makes the body longer than the Worker's.
+        if body.len() > MAX_BODY_BYTES {
+            return Err(too_large());
+        }
         Ok(Request {
             url: format!("{}{}", self.base, route.path()),
-            body: serde_json::to_vec(&body).map_err(|error| error.to_string())?,
+            body,
             bearer: self.bearer.clone(),
         })
     }
@@ -344,6 +353,21 @@ mod tests {
     #[test]
     fn an_oversized_request_body_is_refused() {
         let body = format!(r#"{{"prompt":"{}"}}"#, "x".repeat(MAX_BODY_BYTES));
+        let error = config(None)
+            .request(Route::Chat, "@cf/meta/llama-3.1-8b-instruct", &body)
+            .err()
+            .unwrap();
+        assert!(error.contains("larger than"), "{error}");
+    }
+
+    #[test]
+    fn a_body_the_model_name_pushes_past_the_limit_is_refused() {
+        // Under the limit as the Worker sent it, over it with the model added.
+        let head = r#"{"prompt":""#;
+        let tail = r#""}"#;
+        let fill = MAX_BODY_BYTES - head.len() - tail.len() - 2;
+        let body = format!("{head}{}{tail}", "x".repeat(fill));
+        assert_eq!(body.len(), MAX_BODY_BYTES - 2);
         let error = config(None)
             .request(Route::Chat, "@cf/meta/llama-3.1-8b-instruct", &body)
             .err()
