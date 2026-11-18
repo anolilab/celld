@@ -222,8 +222,10 @@ Worker or binding yet, except through a Hyperdrive binding (below).
 
 A [Hyperdrive](services/hyperdrive.md) binding is the one exception that
 belongs to a single Worker: that Worker's `connect()` to the host and port of
-its own binding skips the check, because the operator put the connection
-string there, and no other Worker or destination gains from it.
+its own binding may use a private address, because the operator put the
+connection string there. Loopback (outside `celld dev`), link-local, metadata
+and the node's own listeners stay refused, and no other Worker or destination
+gains from it.
 
 A destination that is one of the node's own addresses and a port celld
 listens on (the ingress and internal listeners) is always refused, whatever

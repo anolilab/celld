@@ -133,9 +133,11 @@ pub(super) fn op_tcp_connect(
     current_context().tcp_sockets.lock().unwrap().push(id);
     let owner = event_context(scope).owner_id();
     // The address of one of this Worker's own Hyperdrive bindings is the
-    // operator's choice, so it is not held to the policy. It is per isolate:
-    // another Worker on the node has no such binding, and every other address
-    // of this one still goes through the filter.
+    // operator's choice, so a private address is allowed under the policy;
+    // loopback, link-local and the node's own listeners are not (see
+    // `Filter::resolve_database`). It is per isolate: another Worker on the
+    // node has no such binding, and every other address of this one still goes
+    // through the filter.
     let own_database = {
         let host = crate::hyperdrive::normalize_host(&request.hostname);
         actor_runtime_state(scope)
@@ -149,7 +151,16 @@ pub(super) fn op_tcp_connect(
         // With `CELLD_EGRESS=public`, connect to the addresses the policy
         // permits and to nothing else: the check and the connection use the
         // same resolved addresses.
-        let connected = match crate::egress_filter::active().filter(|_| !own_database) {
+        let connected = match crate::egress_filter::active() {
+            // The binding's database: resolved once, held to the rules for a
+            // database address, and dialed on exactly those addresses.
+            Some(filter) if own_database => {
+                let addrs = filter
+                    .resolve_database(&request.hostname, request.port, crate::dev::is_dev_node())
+                    .await
+                    .map_err(|refused| refused.to_string())?;
+                tokio::net::TcpStream::connect(&addrs[..]).await
+            }
             Some(filter) => {
                 let addrs = filter
                     .resolve(&request.hostname, request.port)

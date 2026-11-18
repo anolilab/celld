@@ -760,12 +760,15 @@ pub fn store_values() -> anyhow::Result<BTreeMap<String, String>> {
 /// node, so a manifest from a fleet never reads local files or the local
 /// Hyperdrive variables.
 pub fn local_values() -> anyhow::Result<Option<BTreeMap<String, String>>> {
-    if std::env::var_os("CELLD_INTERNAL_DEV_STORE").is_none()
-        || std::env::var_os(CONFIG_ENV).is_none()
-    {
+    if !is_dev_node() {
         return Ok(None);
     }
     store_values().map(Some)
+}
+
+/// Whether this process is the node of a `celld dev` run.
+pub fn is_dev_node() -> bool {
+    std::env::var_os("CELLD_INTERNAL_DEV_STORE").is_some() && std::env::var_os(CONFIG_ENV).is_some()
 }
 
 /// The contents of `path`, or `None` when it does not exist. One read, not an

@@ -16,9 +16,11 @@
 //!
 //! The Worker gets `connectionString` and the fields parsed from it. `host` and
 //! `port` name the database itself: there is no pooling and no query cache in
-//! between. The Worker's `connect()` to exactly that host and port skips the
-//! egress policy, because the operator chose the address; every other
-//! destination still goes through it.
+//! between. The Worker's `connect()` to exactly that host and port may use a
+//! private address that the egress policy refuses, because the operator chose
+//! it; loopback (outside `celld dev`), link-local and the node's own listeners
+//! stay refused, and every other destination goes through the policy
+//! (`Filter::resolve_database`).
 //!
 //! No error or log line in this module names a connection string.
 

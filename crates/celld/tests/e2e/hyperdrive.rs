@@ -211,6 +211,7 @@ async fn the_config_string_and_the_environment_fill_the_binding_in_dev() {
     let info: Value = server.get_json("/info").await;
     assert_eq!(info["host"], "127.0.0.1");
     assert_eq!(info["port"], database.port);
+    assert_nothing_leaks(&server, &[PASSWORD]).await;
     // The environment of the dev process wins over the config.
     let other = Database::start().await;
     let value = other.string();
@@ -340,4 +341,42 @@ async fn a_postgres_driver_runs_unchanged_over_the_binding() {
     if let Some(password) = parsed.password() {
         assert_nothing_leaks(&server, &[password]).await;
     }
+}
+
+#[tokio::test]
+async fn a_binding_at_the_nodes_own_listener_is_refused_even_in_dev() {
+    let database = Database::start().await;
+    let server = Server::start_with_files("hyperdrive", &[("CELLD_EGRESS", "public")], |project| {
+        write_dev_vars(project, &database)
+    })
+    .await;
+    // Loopback is allowed in `celld dev`, and the node's internal listener is
+    // loopback, but it carries the operator API and stays refused.
+    let internal = url::Url::parse(&server.internal_url("/").await).unwrap();
+    std::fs::write(
+        server.project().join(".dev.vars"),
+        format!(
+            "{LOCAL_VARIABLE}=postgres://app:pw@127.0.0.1:{}/shop\n",
+            internal.port().expect("the internal listener port")
+        ),
+    )
+    .unwrap();
+    let token = server.operator_token().await;
+    let status = client()
+        .post(server.internal_url("/reload").await)
+        .header(reqwest::header::AUTHORIZATION, token.bearer())
+        .send()
+        .await
+        .expect("send /reload")
+        .status();
+    assert_eq!(status, 200);
+    let result: Value = server.get_json("/via-binding").await;
+    assert_eq!(result["ok"], false, "{result}");
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap()
+            .contains("egress refused"),
+        "{result}"
+    );
 }

@@ -59,7 +59,7 @@ and `Object.keys(env.HD)` show nothing.
 `env.HD.connect(options)` returns a socket to that host and port, as
 `connect()` of `cloudflare:sockets` does, and takes the same options
 (`secureTransport`, `allowHalfOpen`). A driver that takes the connection string,
-such as `postgres` or `pg`, needs only the string.
+such as `postgres`, needs only the string.
 
 Each `connect()` opens one TCP connection, as a `connect()` to any address
 does. The binding adds one comparison of the address and costs nothing when a
@@ -111,22 +111,33 @@ the output of `celld deploy`.
 
 ## Egress
 
-The operator chose the database address, so the Worker may dial it even when
-the [egress policy](../security.md#limit-worker-egress) refuses it, for example a
-private address with `CELLD_EGRESS=public`. The exemption is narrow:
+The operator chose the database address, so a Worker may dial its own
+binding's address where the [egress policy](../security.md#limit-worker-egress)
+refuses private ranges. The exemption is narrow, and is not an `allow` entry:
 
-- It covers the host and port of that Worker's own binding. It does not depend
-  on `CELLD_EGRESS_ALLOW`.
-- It applies to any `connect()` of that Worker to that host and port, whether
-  through `env.HD.connect()` or through a driver that dials the host and port
-  from the string. The Worker already holds the string, so the address gives it
-  nothing more. The same host on another port, or the same port on another
-  host name, goes through the policy.
+- It covers the host and port of that Worker's own binding, whether the Worker
+  dials through `env.HD.connect()` or a driver dials the host and port from the
+  string. The Worker already holds the string, so the address gives it nothing
+  more. The same host on another port, or the same port on another host name,
+  goes through the policy.
+- The node resolves the host once, checks every address, and connects to
+  exactly the addresses that passed, so a second DNS answer cannot change the
+  destination.
+- A private (`10/8`, `172.16/12`, `192.168/16`), carrier-grade NAT, unique-local
+  or public address is allowed. Unspecified, link-local (including the cloud
+  metadata addresses), multicast and reserved addresses are refused.
+- Loopback is allowed only on a `celld dev` node, where a local database is the
+  normal case. A fleet node refuses it.
+- A listener of the node (its ingress and internal ports, and the name it
+  advertises) is refused everywhere, in `celld dev` too, whatever the string
+  says.
 - It belongs to the Worker that has the binding. Other Workers on the node,
   and Workers loaded by a Worker Loader, are held to the policy and gain
   nothing.
 - A Worker whose outbound access is denied or brokered stays denied.
 - `fetch()` and WebSocket dials are not exempt.
+- With `CELLD_EGRESS=open`, which `celld dev` defaults to, there is no policy
+  to exempt from.
 
 ## TLS
 

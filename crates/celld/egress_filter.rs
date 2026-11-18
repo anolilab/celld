@@ -557,6 +557,58 @@ impl Filter {
         self.filter_resolved(bare, port, resolved.collect())
     }
 
+    /// Resolve the host of a Hyperdrive binding once and keep the addresses
+    /// its Worker may dial; connect to these and nothing else.
+    ///
+    /// The operator chose the database, so a private, carrier-grade or
+    /// unique-local address is allowed where the public policy refuses it.
+    /// Loopback is allowed only with `allow_loopback`, which `celld dev` sets.
+    /// Unspecified, link-local, metadata, multicast and reserved addresses
+    /// are refused, and so is a listener of this node (or the name it
+    /// advertises), whatever `CELLD_EGRESS_ALLOW` says.
+    pub async fn resolve_database(
+        &self,
+        host: &str,
+        port: u16,
+        allow_loopback: bool,
+    ) -> Result<Vec<SocketAddr>, Refused> {
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        if (self.node_name)(&bare.trim_end_matches('.').to_ascii_lowercase(), port) {
+            return Err(Refused::own_name(bare));
+        }
+        let resolved = match bare.parse::<IpAddr>() {
+            Ok(ip) => vec![SocketAddr::new(ip, port)],
+            Err(_) => tokio::net::lookup_host((bare, port))
+                .await
+                .map_err(|error| Refused(format!("egress: could not resolve {bare}: {error}")))?
+                .collect(),
+        };
+        let mut first_refusal = None;
+        let kept: Vec<SocketAddr> = resolved
+            .into_iter()
+            .filter(|addr| match self.database_address(*addr, allow_loopback) {
+                Ok(()) => true,
+                Err(refusal) => {
+                    first_refusal.get_or_insert(refusal);
+                    false
+                }
+            })
+            .collect();
+        self.kept_or_refused(bare, kept, first_refusal)
+    }
+
+    fn database_address(&self, addr: SocketAddr, allow_loopback: bool) -> Result<(), Refused> {
+        let ip = canonical(addr.ip());
+        if (self.node_endpoint)(SocketAddr::new(ip, addr.port())) == NodeEndpoint::Listener {
+            return Err(Refused::address(addr.ip(), Class::Own));
+        }
+        match classify(ip) {
+            Class::Public | Class::Private | Class::Cgnat | Class::UniqueLocal => Ok(()),
+            Class::Loopback if allow_loopback => Ok(()),
+            class => Err(Refused::address(addr.ip(), class)),
+        }
+    }
+
     /// Keep the resolved addresses a Worker may dial. A hostname with an
     /// exception keeps all of them; any other keeps the permitted ones.
     pub fn filter_resolved(
@@ -1288,6 +1340,59 @@ mod tests {
             NodeEndpoint::Elsewhere
         );
         assert!(filter.permits(sock("[64:ff9b::808:808]:8080")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_database_address_may_be_private_but_not_loopback_or_a_listener() {
+        fn node(addr: SocketAddr) -> NodeEndpoint {
+            if addr.port() == 8081 {
+                NodeEndpoint::Listener
+            } else {
+                NodeEndpoint::Elsewhere
+            }
+        }
+        let filter = Filter::public().with_node_endpoints(node);
+        for private in [
+            "10.1.2.3",
+            "172.16.0.9",
+            "192.168.1.5",
+            "100.64.0.1",
+            "fd00::5",
+        ] {
+            let addrs = filter.resolve_database(private, 5432, false).await.unwrap();
+            assert_eq!(addrs.len(), 1, "{private}");
+        }
+        for refused in [
+            "127.0.0.1",
+            "[::1]",
+            "169.254.169.254",
+            "169.254.1.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                filter.resolve_database(refused, 5432, false).await.is_err(),
+                "{refused}"
+            );
+        }
+        // Loopback only where the caller allows it, and never a listener.
+        assert!(filter
+            .resolve_database("127.0.0.1", 5432, true)
+            .await
+            .is_ok());
+        assert!(filter
+            .resolve_database("169.254.169.254", 5432, true)
+            .await
+            .is_err());
+        assert!(filter
+            .resolve_database("127.0.0.1", 8081, true)
+            .await
+            .is_err());
+        assert!(filter
+            .resolve_database("10.0.0.5", 8081, false)
+            .await
+            .is_err());
     }
 
     #[test]
