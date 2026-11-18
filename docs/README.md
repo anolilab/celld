@@ -807,7 +807,7 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_MAX_CELL_REQUESTS` | Concurrent fetch events for one Durable Object (default: 64) |
 | `CELLD_MAX_CELLS_PER_ISOLATE` | Cells that one V8 isolate may host before celld starts another isolate (default: 32). Lower it for heavy objects that share a heap badly |
 | `CELLD_MAX_REQUEST_BODY_BYTES` | The body limit for a public Worker request or a direct Durable Object request (default: 1 GiB) |
-| `CELLD_MAX_RESIDENT_CELLS` | The hard limit for resident cells, enforced at admission. `0` makes an ingress-only node: it serves and forwards requests, never holds the waker role, and never receives a drained cell |
+| `CELLD_MAX_RESIDENT_CELLS` | The hard limit for resident cells, enforced at admission. `0` makes an ingress-only node: it serves and forwards requests, never holds the waker role, and never receives a placed, drained or rebalanced cell |
 | `CELLD_MAX_DATABASE_BYTES` | The size cap of each Durable Object, facet and D1 database; a write that needs a page past it fails with `storage limit exceeded` (default: 10 GiB; 0 disables). See [limitations](limitations.md#storage-limits) |
 | `CELLD_SQL_STATEMENT_TIMEOUT_MS` | The time bound of one application SQL statement in a Durable Object or D1 (default: 30000; 0 disables). See [limitations](limitations.md#storage-limits) |
 | `CELLD_SQL_SLOW_LOG_MS` | Log a Durable Object or D1 statement that ran at least this many milliseconds, or that failed, as one line with its fingerprint. Unset: nothing is logged (`0` logs every statement). See [telemetry](telemetry.md#sql-statements) |

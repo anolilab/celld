@@ -83,7 +83,14 @@ impl<'a> Fleet<'a> {
             members.push(Member {
                 peer,
                 owned: peer.owned_cells? as u128,
-                weight: u128::from(peer.placement_weight?.max(1)),
+                // An ingress-only node can hold nothing, so it carries no
+                // share of the fleet's cells; counting its weight would
+                // leave the hosting nodes' targets short of even.
+                weight: if peer.ingress_only {
+                    0
+                } else {
+                    u128::from(peer.placement_weight?.max(1))
+                },
             });
         }
         if !members.iter().any(|member| member.peer.node == self_node) {
@@ -97,6 +104,9 @@ impl<'a> Fleet<'a> {
     }
 
     fn target(&self, member: &Member<'_>) -> u128 {
+        if self.weight == 0 {
+            return 0;
+        }
         (self.owned * member.weight).div_ceil(self.weight)
     }
 
@@ -165,4 +175,47 @@ pub fn receivers(
         .into_iter()
         .map(|member| member.peer.node.clone())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(node: &str, owned: usize, ingress_only: bool) -> CapacityPeer {
+        CapacityPeer {
+            node: node.into(),
+            addr: format!("{node}:8081"),
+            expires_ms: 100_000,
+            peer_protocol: 1,
+            sampled_ms: 10_000,
+            owned_cells: Some(owned),
+            placement_weight: Some(1),
+            bucket_format: None,
+            resident_cells: owned,
+            host_websockets: 0,
+            rss_bytes: 0,
+            in_use_bytes: None,
+            pressured: false,
+            memory_headroom: None,
+            restoring: 0,
+            paced_handoff: true,
+            rebalance_paused: false,
+            draining: false,
+            ingress_only,
+        }
+    }
+
+    #[test]
+    fn an_ingress_only_node_takes_no_share_of_the_targets() {
+        let peers = [
+            peer("a", 70, false),
+            peer("b", 30, false),
+            peer("edge", 0, true),
+        ];
+        let fleet = Fleet::observe(&peers, "a", 50_000, 60_000, 0).expect("fleet");
+        let targets: Vec<u128> = fleet.members.iter().map(|m| fleet.target(m)).collect();
+        assert_eq!(targets, [50, 50, 0]);
+        // The densest node still has a surplus to give, to the one hosting peer.
+        assert!(surplus(&peers, "a", 50_000, 60_000, 0, 100).is_some_and(|n| n > 0));
+    }
 }
