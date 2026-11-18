@@ -225,7 +225,9 @@ belongs to a single Worker: that Worker's `connect()` to the host and port of
 its own binding may use a private address, because the operator put the
 connection string there. Loopback (outside `celld dev`), link-local, metadata
 and the node's own listeners stay refused, and no other Worker or destination
-gains from it.
+gains from it. A database on the node's own host needs an explicit
+`CELLD_EGRESS_ALLOW` entry on a fleet node, as for any destination; `celld dev`
+allows it.
 
 A destination that is one of the node's own addresses and a port celld
 listens on (the ingress and internal listeners) is always refused, whatever

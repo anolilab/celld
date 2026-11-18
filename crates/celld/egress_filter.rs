@@ -564,7 +564,9 @@ impl Filter {
     /// Loopback is allowed only with `allow_loopback`, which `celld dev` sets.
     /// Unspecified, link-local, metadata, multicast and reserved addresses
     /// are refused, and so is a listener of this node (or the name it
-    /// advertises), whatever `CELLD_EGRESS_ALLOW` says.
+    /// advertises), whatever `CELLD_EGRESS_ALLOW` says. Another port of the
+    /// node's own address is refused unless `CELLD_EGRESS_ALLOW` names it, and
+    /// `celld dev` allows it.
     pub async fn resolve_database(
         &self,
         host: &str,
@@ -583,8 +585,16 @@ impl Filter {
 
     fn database_address(&self, addr: SocketAddr, allow_loopback: bool) -> Result<(), Refused> {
         let ip = canonical(addr.ip());
-        if (self.node_endpoint)(SocketAddr::new(ip, addr.port())) == NodeEndpoint::Listener {
-            return Err(Refused::address(addr.ip(), Class::Own));
+        match (self.node_endpoint)(SocketAddr::new(ip, addr.port())) {
+            NodeEndpoint::Listener => return Err(Refused::address(addr.ip(), Class::Own)),
+            // Another port of this node reaches other daemons and published
+            // container ports on the host: a fleet node needs the exception
+            // that the general policy asks for. `celld dev` allows it, as it
+            // allows loopback. Loopback stays refused here, as before.
+            NodeEndpoint::Address if !allow_loopback && classify(ip) != Class::Loopback => {
+                return self.permits_on(addr, addr.port());
+            }
+            NodeEndpoint::Address | NodeEndpoint::Elsewhere => {}
         }
         match classify(ip) {
             Class::Public | Class::Private | Class::Cgnat | Class::UniqueLocal => Ok(()),
@@ -1387,6 +1397,51 @@ mod tests {
             .resolve_database("10.0.0.5", 8081, false)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_database_on_the_nodes_own_address_needs_an_exception_outside_dev() {
+        fn node(addr: SocketAddr) -> NodeEndpoint {
+            match addr.port() {
+                8081 => NodeEndpoint::Listener,
+                _ if addr.ip().to_string() == "10.0.0.5" => NodeEndpoint::Address,
+                _ => NodeEndpoint::Elsewhere,
+            }
+        }
+        let filter = Filter::public().with_node_endpoints(node);
+        assert!(filter
+            .resolve_database("10.0.0.5", 5432, false)
+            .await
+            .is_err());
+        // An exception for the address, or a range that holds it, allows it.
+        for allow in ["10.0.0.5:5432", "10.0.0.0/24"] {
+            let allowed = Filter::public()
+                .with_node_endpoints(node)
+                .with_exceptions(allow)
+                .unwrap();
+            assert!(
+                allowed
+                    .resolve_database("10.0.0.5", 5432, false)
+                    .await
+                    .is_ok(),
+                "{allow}"
+            );
+            // The listener stays refused whatever the exception says.
+            assert!(allowed
+                .resolve_database("10.0.0.5", 8081, false)
+                .await
+                .is_err());
+        }
+        // `celld dev` allows it, as it allows loopback.
+        assert!(filter
+            .resolve_database("10.0.0.5", 5432, true)
+            .await
+            .is_ok());
+        // Another private address of the network is unchanged.
+        assert!(filter
+            .resolve_database("10.0.0.6", 5432, false)
+            .await
+            .is_ok());
     }
 
     #[test]

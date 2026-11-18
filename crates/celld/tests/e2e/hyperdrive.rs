@@ -81,6 +81,36 @@ fn write_dev_vars(project: &std::path::Path, database: &Database) {
     .expect("write .dev.vars");
 }
 
+/// Whether any file under the dev state directory holds `value`.
+fn state_holds(project: &std::path::Path, value: &str) -> bool {
+    fn walk(directory: &std::path::Path, value: &[u8], found: &mut bool) {
+        for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, value, found);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                *found |= bytes.windows(value.len()).any(|window| window == value);
+            }
+        }
+    }
+    let mut found = false;
+    walk(&project.join(".celld"), value.as_bytes(), &mut found);
+    found
+}
+
+fn write_config(project: &std::path::Path, local: &str) {
+    std::fs::write(
+        project.join("wrangler.json"),
+        format!(
+            r#"{{ "name": "hyperdrive", "main": "index.js", "no_bundle": true,
+                "compatibility_date": "2026-01-01",
+                "hyperdrive": [{{ "binding": "HD", "id": "db-1",
+                                 "localConnectionString": "{local}" }}] }}"#
+        ),
+    )
+    .unwrap();
+}
+
 async fn assert_nothing_leaks(server: &Server, values: &[&str]) {
     let state = server
         .internal_get("/state")
@@ -226,24 +256,33 @@ async fn a_worker_without_the_binding_gains_nothing_from_it() {
 async fn the_config_string_and_the_environment_fill_the_binding_in_dev() {
     let database = Database::start().await;
     // `localConnectionString` of the config.
-    let server = Server::start_with_files("hyperdrive", &[], |project| {
-        std::fs::write(
-            project.join("wrangler.json"),
-            format!(
-                r#"{{ "name": "hyperdrive", "main": "index.js", "no_bundle": true,
-                    "compatibility_date": "2026-01-01",
-                    "hyperdrive": [{{ "binding": "HD", "id": "db-1",
-                                     "localConnectionString": "{}" }}] }}"#,
-                database.string()
-            ),
-        )
-        .unwrap();
-    })
-    .await;
+    let first = database.string();
+    let server =
+        Server::start_with_files("hyperdrive", &[], |project| write_config(project, &first)).await;
     let info: Value = server.get_json("/info").await;
     assert_eq!(info["host"], "127.0.0.1");
     assert_eq!(info["port"], database.port);
     assert_nothing_leaks(&server, &[PASSWORD]).await;
+    // The string is not at rest in the dev state, and a changed config reaches
+    // the next load.
+    assert!(
+        !state_holds(server.project(), PASSWORD),
+        "the dev state on disk holds the connection string"
+    );
+    let changed = Database::start().await;
+    write_config(server.project(), &changed.string());
+    let token = server.operator_token().await;
+    let status = client()
+        .post(server.internal_url("/reload").await)
+        .header(reqwest::header::AUTHORIZATION, token.bearer())
+        .send()
+        .await
+        .expect("send /reload")
+        .status();
+    assert_eq!(status, 200);
+    let info: Value = server.get_json("/info").await;
+    assert_eq!(info["port"], changed.port, "{info}");
+    assert!(!state_holds(server.project(), PASSWORD));
     // The environment of the dev process wins over the config.
     let other = Database::start().await;
     let value = other.string();
@@ -253,6 +292,21 @@ async fn the_config_string_and_the_environment_fill_the_binding_in_dev() {
     .await;
     let info: Value = server.get_json("/info").await;
     assert_eq!(info["port"], other.port);
+}
+
+#[tokio::test]
+async fn an_empty_higher_source_does_not_hide_a_lower_one() {
+    let database = Database::start().await;
+    let first = database.string();
+    // An empty variable in the environment and an empty entry in `.dev.vars`
+    // both fall through to the config.
+    let server = Server::start_with_files("hyperdrive", &[(LOCAL_VARIABLE, "")], |project| {
+        write_config(project, &first);
+        std::fs::write(project.join(".dev.vars"), format!("{LOCAL_VARIABLE}=\n")).unwrap();
+    })
+    .await;
+    let info: Value = server.get_json("/info").await;
+    assert_eq!(info["port"], database.port, "{info}");
 }
 
 #[tokio::test]

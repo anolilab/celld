@@ -12,7 +12,7 @@
 //! - in `celld dev`, from `CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_<BINDING>`
 //!   in the environment, `.dev.vars` or a dotenv file, or from the config's
 //!   `localConnectionString`, in that order. The value is read at each load and
-//!   is not part of what a fleet stores.
+//!   is never written to the deployment, which sits on disk.
 //!
 //! The Worker gets `connectionString` and the fields parsed from it. `host` and
 //! `port` name the database itself: there is no pooling and no query cache in
@@ -48,13 +48,12 @@ pub fn secret_name(binding: &str) -> String {
 /// One `hyperdrive` entry of a deployment.
 struct Entry<'a> {
     binding: &'a str,
-    /// `celld dev` found a source for the string when it built the deployment.
+    /// `celld dev` found a source for the string when it built the deployment;
+    /// the node reads it again at each load.
     /// Only a `celld dev` node honours the mark; a manifest from the control
     /// plane or a staged version can carry it, and there the binding is an
     /// ordinary one.
     dev_value: bool,
-    /// `localConnectionString` of the config, kept by `celld dev` only.
-    local: Option<&'a str>,
 }
 
 /// The Hyperdrive bindings of a deployment. A manifest that the config parser
@@ -72,9 +71,6 @@ fn entries(manifest: &Manifest) -> anyhow::Result<Vec<Entry<'_>>> {
         .map(|(name, binding)| Entry {
             binding: name,
             dev_value: binding.get("dev_value") == Some(&serde_json::Value::Bool(true)),
-            local: binding
-                .get("local_connection_string")
-                .and_then(serde_json::Value::as_str),
         })
         .collect(),
     )
@@ -216,15 +212,20 @@ pub struct HyperdriveBinding {
 }
 
 /// The value for `binding` in `celld dev`, if one is set: the environment
-/// first, then `.dev.vars` or the dotenv files, then the config. An empty value
-/// is no source.
+/// first, then `dev_vars`, which holds `.dev.vars` or the dotenv files and
+/// then the config's `localConnectionString` (`dev::store_values`). An empty
+/// value is skipped, as the build does when it marks the binding.
 fn dev_value(entry: &Entry<'_>, dev_vars: &BTreeMap<String, String>) -> Option<String> {
     let name = local_variable(entry.binding);
     std::env::var(&name)
         .ok()
-        .or_else(|| dev_vars.get(&name).cloned())
-        .or_else(|| entry.local.map(str::to_string))
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            dev_vars
+                .get(&name)
+                .cloned()
+                .filter(|value| !value.is_empty())
+        })
 }
 
 /// The Hyperdrive bindings of the deployment, with their connection strings.
@@ -472,19 +473,14 @@ mod tests {
     }
 
     #[test]
-    fn a_dev_node_prefers_the_variable_then_dev_vars_then_the_config() {
-        let manifest = one_binding(serde_json::json!({
-            "dev_value": true,
-            "local_connection_string": "postgres://u:p@from-config/d",
-        }));
+    fn a_dev_node_prefers_the_variable_then_dev_vars() {
+        let manifest = one_binding(serde_json::json!({ "dev_value": true }));
         let vars = BTreeMap::from([(
             local_variable("HD"),
             "postgres://u:p@from-dev-vars/d".to_string(),
         )]);
         let loaded = load(&manifest, BTreeMap::new(), Some(&vars)).unwrap();
         assert_eq!(loaded[0].connection.host, "from-dev-vars");
-        let loaded = load(&manifest, BTreeMap::new(), Some(&BTreeMap::new())).unwrap();
-        assert_eq!(loaded[0].connection.host, "from-config");
         // An empty value is no source: the secret fills the binding.
         let empty = BTreeMap::from([(local_variable("HD"), String::new())]);
         let secret = BTreeMap::from([("HYPERDRIVE_HD".to_string(), URL.to_string())]);

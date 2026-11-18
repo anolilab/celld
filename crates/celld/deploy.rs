@@ -1536,7 +1536,7 @@ pub struct D1Declaration {
 }
 
 /// The config file at `given` (a directory or a config), parsed as JSONC.
-fn read_config(given: Option<PathBuf>) -> anyhow::Result<(PathBuf, Value)> {
+pub(crate) fn read_config(given: Option<PathBuf>) -> anyhow::Result<(PathBuf, Value)> {
     let path = resolve_config(given)?;
     let source =
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -1752,15 +1752,6 @@ fn entry_text<'a>(
         None => bail!("a `{key}` entry has no `{field}`"),
         Some(Value::String(text)) => Ok(text.as_str()),
         Some(_) => bail!("`{key}` `{field}` must be a string"),
-    }
-}
-
-fn set_local_connection_string(bindings: &mut [Value], name: &str, value: &str) {
-    if let Some(binding) = bindings
-        .iter_mut()
-        .find(|binding| binding.get("name").and_then(Value::as_str) == Some(name))
-    {
-        binding["local_connection_string"] = json!(value);
     }
 }
 
@@ -2559,8 +2550,9 @@ fn read_project(
         }
     }
     // `celld dev` fills a Hyperdrive binding locally. The mark tells the node
-    // to look; `localConnectionString` travels with the deployment of a dev
-    // node only, and `celld deploy` drops it.
+    // to look. The string itself, `localConnectionString` included, stays out
+    // of the deployment, which is written to disk; the node reads it from the
+    // config at each load.
     if let (true, VarOverrides::DevVars(entries) | VarOverrides::DotEnv(entries)) =
         (main.is_some(), overrides)
     {
@@ -2578,9 +2570,6 @@ fn read_project(
                     .is_some_and(|value| !value.is_empty())
             {
                 mark_dev_value(&mut bindings, binding);
-                if let Some(local) = local {
-                    set_local_connection_string(&mut bindings, binding, local);
-                }
             }
         }
     }
@@ -4360,17 +4349,15 @@ mod hyperdrive_config_tests {
     }
 
     #[test]
-    fn celld_dev_marks_the_binding_for_a_local_source_and_keeps_the_config_string_only_there() {
+    fn celld_dev_marks_the_binding_for_a_local_source_and_keeps_the_string_out() {
         let entry = r#""hyperdrive": [{ "binding": "HD", "id": "db-1",
-            "localConnectionString": "postgres://u:p@localhost/d" }]"#;
+            "localConnectionString": "postgres://u:hunter2@localhost/d" }]"#;
         let dev = VarOverrides::DevVars(BTreeMap::new());
         let project = read(entry, &dev).unwrap();
         let binding = &project.metadata["bindings"][0];
         assert_eq!(binding["dev_value"], true);
-        assert_eq!(
-            binding["local_connection_string"],
-            "postgres://u:p@localhost/d"
-        );
+        assert!(binding.get("local_connection_string").is_none());
+        assert!(!project.metadata.to_string().contains("hunter2"));
         // No source: no mark, so the deploy needs the secret.
         let project = read(ENTRY, &dev).unwrap();
         assert!(project.metadata["bindings"][0].get("dev_value").is_none());

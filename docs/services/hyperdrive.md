@@ -107,7 +107,9 @@ An empty value counts as not set.
 Without any of them, `celld dev` reads the secret from its dev store, like a
 fleet. The node reads the files each time it loads the deployment and keeps
 the string in memory, so a `.dev.vars` entry is not written to the dev state.
-Only a `celld dev` node honours these sources; a staged or managed deployment
+`localConnectionString` is read from the config at each load too, and the
+deployment on disk marks only that the binding has a source. Only a `celld dev`
+node honours these sources; a staged or managed deployment
 still needs the secret. The entry is not a variable of the Worker.
 
 The string does not appear in a log, in `/state`, in an error message, or in
@@ -132,6 +134,11 @@ refuses private ranges. The exemption is narrow, and is not an `allow` entry:
   metadata addresses), multicast and reserved addresses are refused.
 - Loopback is allowed only on a `celld dev` node, where a local database is the
   normal case. A fleet node refuses it.
+- A database on the node's own host, at one of its own addresses on a port
+  celld does not listen on, is refused on a fleet node like any private
+  address: it could be another daemon or a published container port. Allow it
+  with an explicit `CELLD_EGRESS_ALLOW` entry (`10.0.0.5:5432`, or a range that
+  holds the address). `celld dev` allows it, as it allows loopback.
 - A listener of the node (its ingress and internal ports, and the name it
   advertises) is refused everywhere, in `celld dev` too, whatever the string
   says.
