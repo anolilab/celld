@@ -234,6 +234,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_CELL_DIRECTORY_SHADOW",
         "CELLD_CLOUD",
         "CELLD_REGISTRY_DEBUG_API",
+        "CELLD_REGISTRY_JOB_PACING",
         "CELLD_REGISTRY_WAIT",
         "CELLD_LTX_COMPACTION",
         "CELLD_LTX_PAGED",
@@ -292,6 +293,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_REGISTRY_BATCH_MS",
         "CELLD_REGISTRY_PARTITIONS",
         "CELLD_REGISTRY_PASS_MS",
+        "CELLD_REGISTRY_PASS_READ_MS",
         "CELLD_REGISTRY_SPILL_MS",
         "CELLD_REBALANCE_INTERVAL_MS",
     ] {

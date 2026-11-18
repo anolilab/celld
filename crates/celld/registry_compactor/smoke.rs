@@ -93,6 +93,8 @@ async fn lookup_against_list_smoke() {
             base_ms: 3 * 86_400_000,
             wait: true,
             bound: Duration::from_secs(4),
+            job_pacing: true,
+            pass_read: Duration::from_secs(1),
         },
     );
     // The first lookup loads the live deltas and the map and is not timed.
