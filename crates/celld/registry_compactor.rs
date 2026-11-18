@@ -34,7 +34,7 @@ const GRACE_MS: u64 = 300_000;
 const MAX_SEGMENTS: usize = 4_000;
 /// Segments fetched at a time.
 const FETCH_CONCURRENCY: usize = 16;
-/// Partitions a spill prepares at a time.
+/// Partitions a spill prepares at a time when it is not paced.
 const SPILL_CONCURRENCY: usize = 16;
 /// The size a multipart part has.
 const PART_BYTES: usize = 8 << 20;
@@ -45,6 +45,10 @@ const CHUNK_BUCKETS: u32 = 1_024;
 const SAMPLER_EVERY_MS: u64 = 60_000;
 const SAMPLER_CELLS: usize = 16;
 const SWEEP_EVERY_MS: u64 = 120_000;
+/// A budget that never runs out in practice.
+const NO_LIMIT_MS: u64 = 365 * 86_400_000;
+/// The least wait between two passes when the last one left segments unread.
+const RETRY_GAP_MS: u64 = 100;
 
 // ---------------------------------------------------------------------------
 // Runs: reading as a stream, writing as a multipart upload
@@ -375,6 +379,7 @@ pub(crate) async fn prepare_spill(
     map: &Map,
     consumed: &HashMap<DeltaId, Arc<crate::registry::Loaded>>,
     next_run: &mut u64,
+    partitions_at_a_time: usize,
 ) -> anyhow::Result<Prepared> {
     let started = crate::asyncrt::mono_ms();
     let all: Vec<Record> = consumed
@@ -431,7 +436,7 @@ pub(crate) async fn prepare_spill(
                     Ok((index, partition.l1, run, stats))
                 }
             })
-            .buffer_unordered(SPILL_CONCURRENCY)
+            .buffer_unordered(partitions_at_a_time)
             .collect()
             .await;
     let mut partitions = Vec::new();
@@ -635,6 +640,8 @@ struct Holding {
     running: Arc<AtomicUsize>,
     prepared: Arc<Mutex<Vec<Prepared>>>,
     abandon: Arc<AtomicBool>,
+    /// The last fold left segments unread because its budget ran out.
+    deferred: bool,
     /// The delta the last fold wrote, with its content, until its root is written.
     fresh_delta: Option<(DeltaId, crate::registry::Loaded)>,
 }
@@ -819,6 +826,7 @@ impl Registry {
             running: Arc::new(AtomicUsize::new(0)),
             prepared: Arc::new(Mutex::new(Vec::new())),
             abandon: Arc::new(AtomicBool::new(false)),
+            deferred: false,
             fresh_delta: None,
         }))
     }
@@ -859,7 +867,13 @@ impl Registry {
     ) -> Ended {
         let mut gap_from = crate::asyncrt::mono_ms();
         loop {
-            let pass_ms = Duration::from_millis(self.cfg.pass_ms);
+            // A pass that left segments unread is followed by another at once
+            // (after a short gap), not a whole period later.
+            let pass_ms = Duration::from_millis(if holding.deferred {
+                RETRY_GAP_MS.min(self.cfg.pass_ms)
+            } else {
+                self.cfg.pass_ms
+            });
             crate::asyncrt::select_biased! {
                 "a stop request ends the holding after a graceful release";
                 _ = stop.stopped() => {
@@ -969,6 +983,7 @@ impl Registry {
     /// One pass. `Ok(false)` when this holder was displaced.
     async fn pass(self: &Arc<Self>, holding: &mut Holding) -> anyhow::Result<bool> {
         self.counters.passes.fetch_add(1, Ordering::Relaxed);
+        holding.deferred = false;
         let mut changed = self.commit_prepared(holding).await?;
         let live: u64 = holding.counts.values().sum();
         let capped = reg::at_cap(holding.root.deltas.len(), live);
@@ -1000,7 +1015,14 @@ impl Registry {
             }
             self.push_root(holding);
         }
-        objects::delete_many(self.store.as_ref(), &folded).await;
+        // The root already names the delta, so coverage does not wait for the
+        // deletes, and neither does the next pass.
+        if !folded.is_empty() {
+            let registry = self.clone();
+            crate::asyncrt::spawn(async move {
+                objects::delete_many(registry.store.as_ref(), &folded).await;
+            });
+        }
         holding.last_pass_ms = crate::asyncrt::mono_ms();
         self.schedule(holding);
         self.housekeeping(holding);
@@ -1011,12 +1033,27 @@ impl Registry {
     /// root in memory. Returns the segments folded, to delete once the root
     /// that names the delta is durable.
     async fn fold_segments(&self, holding: &mut Holding) -> anyhow::Result<Vec<String>> {
+        // One stalled request must not hold the whole fold: the listing and the
+        // reads share a budget, and a segment not read inside it is left for
+        // the next pass, as an unreadable one is.
+        let budget = if self.cfg.pass_read.is_zero() {
+            NO_LIMIT_MS
+        } else {
+            self.cfg.pass_read.as_millis() as u64
+        };
+        let deadline = crate::asyncrt::mono_ms().saturating_add(budget);
+        holding.deferred = false;
         self.counters.list_requests.fetch_add(1, Ordering::Relaxed);
         let mut listing = self
             .store
             .list(Some(&Path::from(objects::segments_root(&self.prefix))));
         let mut keys = Vec::new();
-        while let Some(meta) = listing.next().await {
+        loop {
+            let Ok(next) = crate::asyncrt::timeout_at(deadline, listing.next()).await else {
+                holding.deferred = true;
+                break;
+            };
+            let Some(meta) = next else { break };
             let key = meta.context("list registry segments")?.location.to_string();
             if !holding.seen.contains(&key) {
                 keys.push(key);
@@ -1028,7 +1065,8 @@ impl Registry {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let fetched: Vec<(String, anyhow::Result<Vec<Record>>)> = futures_util::stream::iter(keys)
+        let wanted = keys.len();
+        let mut reads = futures_util::stream::iter(keys)
             .map(|key| async move {
                 self.counters.get_requests.fetch_add(1, Ordering::Relaxed);
                 let body = async {
@@ -1046,9 +1084,18 @@ impl Registry {
                 .await;
                 (key, body)
             })
-            .buffer_unordered(FETCH_CONCURRENCY)
-            .collect()
-            .await;
+            .buffer_unordered(FETCH_CONCURRENCY);
+        let mut fetched: Vec<(String, anyhow::Result<Vec<Record>>)> = Vec::new();
+        while let Ok(Some(read)) = crate::asyncrt::timeout_at(deadline, reads.next()).await {
+            fetched.push(read);
+        }
+        drop(reads);
+        if fetched.len() < wanted {
+            holding.deferred = true;
+            self.counters
+                .reads_deferred
+                .fetch_add((wanted - fetched.len()) as u64, Ordering::Relaxed);
+        }
         let mut segments = Vec::new();
         let mut records = Vec::new();
         for (key, body) in fetched {
@@ -1225,7 +1272,14 @@ impl Registry {
         let Some((kind, partition)) = kind else {
             return;
         };
-        let store = self.store.clone();
+        // Jobs read and write through the paced store; the pass and the lookups
+        // keep the plain one.
+        let store = self.job_store.clone();
+        let spill_partitions = if self.cfg.job_pacing {
+            crate::registry_pace::PACED_SPILL_PARTITIONS
+        } else {
+            SPILL_CONCURRENCY
+        };
         let prefix = self.prefix.clone();
         let (epoch, map) = (holding.epoch, holding.map.clone());
         let mut next_run = holding.next_run;
@@ -1250,9 +1304,17 @@ impl Registry {
                     if snapshot.deltas_ok {
                         let consumed: HashMap<DeltaId, Arc<crate::registry::Loaded>> =
                             root.deltas.iter().copied().zip(snapshot.deltas).collect();
-                        prepare_spill(&store, &prefix, epoch, &map, &consumed, &mut next_run)
-                            .await
-                            .map(Some)
+                        prepare_spill(
+                            &store,
+                            &prefix,
+                            epoch,
+                            &map,
+                            &consumed,
+                            &mut next_run,
+                            spill_partitions,
+                        )
+                        .await
+                        .map(Some)
                     } else {
                         Ok(None)
                     }

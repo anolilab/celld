@@ -319,9 +319,17 @@ async fn synthetic_aged_registry() {
             }),
         );
     }
-    let spill = prepare_spill(&store, &prefix, epoch, &map, &spill_deltas, &mut next_run)
-        .await
-        .expect("the spill ran and passed its self-check");
+    let spill = prepare_spill(
+        &store,
+        &prefix,
+        epoch,
+        &map,
+        &spill_deltas,
+        &mut next_run,
+        SPILL_CONCURRENCY,
+    )
+    .await
+    .expect("the spill ran and passed its self-check");
     let (spilled_root, spilled_map) =
         reg::apply_job(&root, &map, &spill.job).expect("apply the spill");
     root = spilled_root;

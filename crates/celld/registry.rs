@@ -39,6 +39,13 @@ pub(crate) struct Config {
     pub wait: bool,
     /// The longest a first write waits for coverage.
     pub bound: Duration,
+    /// `CELLD_REGISTRY_JOB_PACING`: limit the requests and bytes per second of
+    /// spills and base merges, so they do not stall the store the lookups read.
+    pub job_pacing: bool,
+    /// `CELLD_REGISTRY_PASS_READ_MS`: the longest a pass spends listing and
+    /// reading segments. A segment not read in that time stays for the next
+    /// pass, which starts at once. Zero: no limit.
+    pub pass_read: Duration,
 }
 
 impl Config {
@@ -49,6 +56,9 @@ impl Config {
         let spill_ms = crate::env_vars::with_default("CELLD_REGISTRY_SPILL_MS", 900_000)? as u64;
         let base_days = crate::env_vars::with_default("CELLD_REGISTRY_BASE_DAYS", 3)? as u64;
         let wait = crate::env_vars::flag("CELLD_REGISTRY_WAIT", true)?;
+        let job_pacing = crate::env_vars::flag("CELLD_REGISTRY_JOB_PACING", true)?;
+        let pass_read_ms =
+            crate::env_vars::with_default("CELLD_REGISTRY_PASS_READ_MS", 1_000)? as u64;
         let bound = Duration::from_millis(4_000.min(durability_ms.saturating_sub(1_000) / 2));
         anyhow::ensure!(
             partitions >= 1 && pass_ms >= 1 && batch_ms >= 1,
@@ -69,6 +79,8 @@ impl Config {
             base_ms: base_days * 86_400_000,
             wait,
             bound,
+            job_pacing,
+            pass_read: Duration::from_millis(pass_read_ms),
         })
     }
 }
@@ -151,6 +163,8 @@ pub(crate) struct Counters {
     pub spills_timer: AtomicU64,
     pub base_merges: AtomicU64,
     pub jobs_discarded: AtomicU64,
+    /// Segments a pass left for the next one because its read budget ran out.
+    pub reads_deferred: AtomicU64,
     pub merge_check_failures: AtomicU64,
     pub takeovers: AtomicU64,
     pub stand_downs: AtomicU64,
@@ -237,6 +251,9 @@ pub(crate) struct PeerCall {
 
 pub struct Registry {
     pub(crate) store: Arc<dyn ObjectStore>,
+    /// What the spill and base merge read and write through: `store`, paced
+    /// when the config says so.
+    pub(crate) job_store: Arc<dyn ObjectStore>,
     pub(crate) prefix: String,
     pub(crate) node: String,
     pub(crate) session: String,
@@ -286,8 +303,20 @@ impl Registry {
         session: String,
         cfg: Config,
     ) -> Arc<Self> {
+        let job_store: Arc<dyn ObjectStore> = if cfg.job_pacing {
+            crate::registry_pace::PacedStore::new(
+                store.clone(),
+                crate::registry_pace::Pace::new(
+                    crate::registry_pace::JOB_REQUESTS,
+                    crate::registry_pace::JOB_BYTES_PER_S,
+                ),
+            )
+        } else {
+            store.clone()
+        };
         Arc::new(Self {
             store,
+            job_store,
             prefix,
             node,
             session,
@@ -805,6 +834,7 @@ impl Registry {
             ("spills_timer", &counters.spills_timer),
             ("base_merges", &counters.base_merges),
             ("jobs_discarded", &counters.jobs_discarded),
+            ("reads_deferred", &counters.reads_deferred),
             ("merge_check_failures", &counters.merge_check_failures),
             ("takeovers", &counters.takeovers),
             ("stand_downs", &counters.stand_downs),

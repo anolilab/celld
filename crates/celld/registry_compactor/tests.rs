@@ -17,17 +17,23 @@ fn config() -> Config {
         base_ms: 86_400_000,
         wait: true,
         bound: Duration::from_millis(600),
+        job_pacing: false,
+        pass_read: Duration::ZERO,
     }
 }
 
 fn registry_on(store: &Arc<dyn ObjectStore>, node: &str) -> Arc<Registry> {
+    registry_with(store, node, config())
+}
+
+fn registry_with(store: &Arc<dyn ObjectStore>, node: &str, cfg: Config) -> Arc<Registry> {
     crate::asyncrt::install_test_host_runtime();
     Registry::new(
         store.clone(),
         PREFIX.to_owned(),
         node.to_owned(),
         format!("session-{node}"),
-        config(),
+        cfg,
     )
 }
 
@@ -343,12 +349,13 @@ async fn spill_now(node: &Arc<Registry>, holding: &mut Holding) -> Prepared {
         .zip(snapshot.deltas)
         .collect();
     prepare_spill(
-        &node.store,
+        &node.job_store,
         PREFIX,
         holding.epoch,
         &holding.map,
         &consumed,
         &mut holding.next_run,
+        SPILL_CONCURRENCY,
     )
     .await
     .unwrap()
@@ -1268,6 +1275,246 @@ async fn pushes_cannot_fill_the_cache_with_deltas_that_no_root_names() {
 }
 
 // ---------------------------------------------------------------------------
+// A pass is bounded: a segment it cannot read in time waits for the next one
+// ---------------------------------------------------------------------------
+
+/// Two nodes with one segment each, and a holder whose store holds back the
+/// reads of the second node's segment.
+struct TwoSegments {
+    holder: Arc<Registry>,
+    scripted: Arc<Scripted>,
+    reader: Arc<Registry>,
+    first: String,
+    second: String,
+}
+
+async fn two_segments(pass_ms: u64, pass_read_ms: u64) -> TwoSegments {
+    let (scripted, bucket) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let cfg = Config {
+        pass_ms,
+        pass_read: Duration::from_millis(pass_read_ms),
+        ..config()
+    };
+    let holder = registry_with(&store, "holder", cfg);
+    let (first, second) = (cell(1), cell(2));
+    for (node, name) in [("node-a", &first), ("node-b", &second)] {
+        let writer = registry_on(&bucket, node);
+        writer.register_at_claim(name, 1);
+        writer.flush_now().await.unwrap();
+    }
+    scripted.hold("/seg/node-b/");
+    TwoSegments {
+        holder,
+        scripted,
+        reader: registry_on(&bucket, "reader"),
+        first,
+        second,
+    }
+}
+
+#[tokio::test]
+async fn a_segment_that_cannot_be_read_in_time_does_not_hold_the_pass() {
+    let t = two_segments(50, 300).await;
+    let mut holding = holder_of(&t.holder).await;
+    let began = crate::asyncrt::mono_ms();
+    let outcome = crate::asyncrt::timeout(Duration::from_secs(3), t.holder.pass(&mut holding))
+        .await
+        .expect("the pass ends inside its read budget, whatever one read does");
+    assert!(outcome.unwrap());
+    assert!(
+        crate::asyncrt::mono_ms() - began < 1_500,
+        "the budget is 300 ms and the pass overran it"
+    );
+    assert!(holding.deferred, "the pass knows it left a segment");
+    assert_eq!(
+        holding.root.deltas.len(),
+        1,
+        "the segment it read is folded"
+    );
+    assert!(matches!(
+        answer(&t.reader, &t.first).await,
+        Answer::Exists(_)
+    ));
+    assert_eq!(answer(&t.reader, &t.second).await, Answer::New);
+    assert_eq!(t.holder.counters.reads_deferred.load(Ordering::Relaxed), 1);
+    t.scripted.release("/seg/node-b/");
+}
+
+#[tokio::test]
+async fn a_segment_left_by_a_pass_is_neither_named_nor_deleted_and_the_next_pass_folds_it() {
+    let t = two_segments(50, 300).await;
+    let mut holding = holder_of(&t.holder).await;
+    let first = crate::asyncrt::timeout(Duration::from_secs(3), t.holder.pass(&mut holding))
+        .await
+        .expect("the pass ends inside its read budget");
+    assert!(first.unwrap());
+    let (root, _) = t.holder.read_root(&Io::default()).await.unwrap().unwrap();
+    let loaded = t.holder.load(root, &Io::default()).await;
+    assert_eq!(loaded.deltas.len(), 1);
+    assert_eq!(
+        loaded.deltas[0].segments.len(),
+        1,
+        "the delta names one segment"
+    );
+    assert!(loaded.deltas[0]
+        .segments
+        .iter()
+        .all(|key| key.contains("/seg/node-a/")));
+    let left: Vec<_> = t.holder.store.list(None).collect().await;
+    assert!(
+        left.iter()
+            .flatten()
+            .any(|meta| meta.location.as_ref().contains("/seg/node-b/")),
+        "the segment it left is still in the bucket"
+    );
+    t.scripted.release("/seg/node-b/");
+    assert!(t.holder.pass(&mut holding).await.unwrap());
+    assert!(!holding.deferred);
+    assert!(matches!(
+        answer(&t.reader, &t.second).await,
+        Answer::Exists(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_pass_that_left_a_segment_is_followed_by_another_at_once() {
+    // A period of 30 s: only the retry after a deferred pass can fold the
+    // second segment inside the test's 3 s.
+    let t = two_segments(30_000, 200).await;
+    let holding = holder_of(&t.holder).await;
+    let stop = crate::ltx_repl::StopToken::new();
+    let running = {
+        let (holder, stop) = (t.holder.clone(), stop.clone());
+        crate::asyncrt::spawn(async move { holder.hold(holding, &stop).await })
+    };
+    t.holder.pass_now.notify_one();
+    // Release the held read only after the first pass gave up on it.
+    crate::asyncrt::timeout(Duration::from_secs(3), async {
+        while t.holder.counters.reads_deferred.load(Ordering::Relaxed) == 0 {
+            crate::asyncrt::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first pass left the held segment");
+    t.scripted.release("/seg/node-b/");
+    crate::asyncrt::timeout(Duration::from_secs(3), async {
+        while !matches!(answer(&t.reader, &t.second).await, Answer::Exists(_)) {
+            crate::asyncrt::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the pass that left the segment was followed by one that folded it");
+    stop.request_stop();
+    let _ = running.await;
+}
+
+// ---------------------------------------------------------------------------
+// Jobs are paced: bounded requests in flight and bytes per second
+// ---------------------------------------------------------------------------
+
+use crate::registry_pace::{Pace, PacedStore};
+
+#[tokio::test]
+async fn a_paced_store_never_has_more_job_requests_in_flight_than_its_cap() {
+    crate::asyncrt::install_test_host_runtime();
+    let (scripted, bucket) = scripted();
+    for index in 0..4 {
+        bucket
+            .put(&Path::from(format!("obj/{index}")), vec![1_u8; 16].into())
+            .await
+            .unwrap();
+    }
+    let paced = PacedStore::new(scripted.clone(), Pace::new(2, 1 << 30));
+    scripted.hold("obj/");
+    let reads: Vec<_> = (0..4)
+        .map(|index| {
+            let paced = paced.clone();
+            crate::asyncrt::spawn(
+                async move { paced.get(&Path::from(format!("obj/{index}"))).await },
+            )
+        })
+        .collect();
+    scripted.started("obj/", 2).await;
+    crate::asyncrt::sleep(Duration::from_millis(100)).await;
+    assert_eq!(scripted.reads("obj/"), 2, "the third read waits for a slot");
+    scripted.release("obj/");
+    for read in reads {
+        read.await.unwrap().unwrap();
+    }
+    assert_eq!(scripted.reads("obj/"), 4);
+}
+
+#[tokio::test]
+async fn a_paced_store_moves_bytes_no_faster_than_its_rate() {
+    crate::asyncrt::install_test_host_runtime();
+    let bucket: Arc<dyn ObjectStore> = memory();
+    // 1 MiB a second: the fourth 256 KiB write may start 0.75 s after the first.
+    let paced = PacedStore::new(bucket.clone(), Pace::new(4, 1 << 20));
+    let body = vec![7_u8; 256 << 10];
+    let began = crate::asyncrt::mono_ms();
+    for index in 0..4 {
+        paced
+            .put(&Path::from(format!("obj/{index}")), body.clone().into())
+            .await
+            .unwrap();
+    }
+    let wrote = crate::asyncrt::mono_ms() - began;
+    assert!(wrote >= 700, "four writes took {wrote} ms at 1 MiB/s");
+    let began = crate::asyncrt::mono_ms();
+    for index in 0..4 {
+        let read = paced
+            .get(&Path::from(format!("obj/{index}")))
+            .await
+            .unwrap();
+        assert_eq!(read.bytes().await.unwrap().len(), body.len());
+    }
+    let read = crate::asyncrt::mono_ms() - began;
+    assert!(read >= 700, "four reads took {read} ms at 1 MiB/s");
+}
+
+#[tokio::test]
+async fn a_spill_and_a_base_merge_through_the_paced_store_lose_no_key() {
+    let store = memory();
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            job_pacing: true,
+            ..config()
+        },
+    );
+    let mut holding = holder_of(&node).await;
+    let first: Vec<String> = (0..300).map(cell).collect();
+    let second: Vec<String> = (300..500).map(cell).collect();
+    aged(&node, &mut holding, &[first.clone(), second.clone()]).await;
+    let spill = spill_now(&node, &mut holding).await;
+    run_job(&node, &mut holding, spill).await;
+    let index = (0..holding.map.partitions.len())
+        .find(|index| holding.map.partitions[*index].l1 != Level::Empty)
+        .expect("a spill wrote a level 1");
+    let merge = prepare_base_merge(
+        &node.job_store,
+        PREFIX,
+        holding.epoch,
+        &holding.map,
+        index,
+        &mut holding.next_run,
+    )
+    .await
+    .unwrap()
+    .expect("a base merge");
+    run_job(&node, &mut holding, merge).await;
+    assert!(node.refresh(&Io::default()).await.is_some());
+    for name in first.iter().chain(&second) {
+        assert!(
+            matches!(answer(&node, name).await, Answer::Exists(_)),
+            "{name} is lost"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // One DeleteObjects per pass
 // ---------------------------------------------------------------------------
 
@@ -1283,6 +1530,14 @@ async fn a_pass_deletes_every_segment_it_folded_in_one_request() {
     }
     scripted.reset();
     assert!(node.pass(&mut holding).await.unwrap());
+    // The deletes run beside the pass, so wait for them.
+    crate::asyncrt::timeout(Duration::from_secs(2), async {
+        while scripted.delete_batches().is_empty() {
+            crate::asyncrt::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the pass deleted what it folded");
     assert_eq!(
         scripted.delete_batches(),
         vec![5],
