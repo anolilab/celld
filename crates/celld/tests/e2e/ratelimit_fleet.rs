@@ -24,6 +24,11 @@ use super::harness::{client, fixture_dir, signal_group, until_next_window, wait_
 const CELLD: &str = env!("CARGO_BIN_EXE_celld");
 const TOKEN: &str = "ratelimit-fleet-token";
 
+/// The one region the deploy, both nodes and the cleanup use.
+fn region() -> String {
+    std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into())
+}
+
 struct Node {
     child: Child,
     public: String,
@@ -37,7 +42,7 @@ impl Node {
         let log = std::fs::File::create(home.join("celld.log")).expect("create the node log");
         let child = Command::new(CELLD)
             .args(["--bucket", bucket, "--endpoint", endpoint])
-            .args(["--region", "us-east-1"])
+            .args(["--region", &region()])
             .args(["--listen", &format!("127.0.0.1:{public}")])
             .args(["--internal-listen", &format!("127.0.0.1:{internal}")])
             .args(["--advertise", &format!("127.0.0.1:{internal}")])
@@ -136,7 +141,7 @@ async fn two_nodes_share_one_counter() {
         .arg("deploy")
         .arg(fixture_dir("ratelimit"))
         .args(["--bucket", &bucket, "--endpoint", &endpoint])
-        .args(["--region", "us-east-1"])
+        .args(["--region", &region()])
         .env("CELLD_CONFIG_DIR", home.path().join("deploy"))
         .current_dir(home.path())
         .output()
@@ -190,7 +195,7 @@ async fn two_nodes_share_one_counter() {
 
 /// Deletes every object the run wrote under its prefix.
 async fn clean(spec: &str, prefix: &str) {
-    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into());
+    let region = region();
     let bucket = Bucket::open(spec, None, &region, None, Some("ratelimit-fleet"))
         .unwrap_or_else(|error| panic!("open {spec}: {error:#}"));
     let keys: Vec<String> = bucket

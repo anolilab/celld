@@ -352,8 +352,29 @@ impl RateLimitBinding {
     /// written: a deploy writes only complete bindings, and a missing
     /// `env.LIMITER` would otherwise surface when the Worker first calls it.
     pub fn from_manifest(entry: &serde_json::Value) -> anyhow::Result<Self> {
+        // A manifest holds what `to_manifest` writes and nothing else, as a
+        // deploy refuses an unmodelled field.
+        if let Some(key) = entry.as_object().and_then(|object| {
+            object
+                .keys()
+                .find(|key| !matches!(key.as_str(), "type" | "name" | "namespace_id" | "simple"))
+        }) {
+            anyhow::bail!("the manifest has a ratelimit binding with an unknown field `{key}`");
+        }
         let text = |field: &str| entry.get(field).and_then(serde_json::Value::as_str);
         let simple = entry.get("simple");
+        if let Some(key) = simple
+            .and_then(serde_json::Value::as_object)
+            .and_then(|simple| {
+                simple
+                    .keys()
+                    .find(|key| !matches!(key.as_str(), "limit" | "period"))
+            })
+        {
+            anyhow::bail!(
+                "the manifest has a ratelimit binding whose `simple` has an unknown field `{key}`"
+            );
+        }
         let number = |field: &str| {
             simple
                 .and_then(|simple| simple.get(field))
@@ -1016,5 +1037,17 @@ mod ratelimit_binding_tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn a_manifest_binding_refuses_fields_a_deploy_would() {
+        let mut extra = entry("LIMITER");
+        extra["burst"] = json!(3);
+        let error = RateLimitBinding::from_manifest(&extra).unwrap_err();
+        assert!(error.to_string().contains("`burst`"), "{error}");
+        let mut extra = entry("LIMITER");
+        extra["simple"]["burst"] = json!(3);
+        let error = RateLimitBinding::from_manifest(&extra).unwrap_err();
+        assert!(error.to_string().contains("`burst`"), "{error}");
     }
 }
