@@ -480,7 +480,9 @@ thread_local! {
 /// Run `callback` with application-SQL restrictions in force.
 fn as_user_sql<T>(callback: impl FnOnce() -> T) -> T {
     USER_SQL.with(|flag| flag.set(true));
+    crate::sql_limits::arm();
     let result = callback();
+    crate::sql_limits::disarm();
     USER_SQL.with(|flag| flag.set(false));
     result
 }
@@ -852,6 +854,8 @@ fn finish_open(
             rusqlite::ffi::sqlite3_limit(database, category, limit);
         }
     }
+    // Before the authorizer: the size cap is set with a pragma it denies.
+    crate::sql_limits::install(&mut c)?;
     c.authorizer(Some(authorize_sql))?;
     // rusqlite's default holds 16 statements; the KV texts plus a cell's
     // few hot user statements fit in 64 without evicting each other.
@@ -1512,6 +1516,7 @@ pub fn sql_ingest(scope: &str, input: &str) -> Result<(String, u64, u64), String
                         ));
                     }
 
+                    crate::sql_limits::arm();
                     loop {
                         let step = rusqlite::ffi::sqlite3_step(statement);
                         match step {
@@ -1932,6 +1937,7 @@ pub(crate) fn sql_cursor_start_values(
                                 "Wrong number of parameter bindings for SQL query."
                             ));
                         }
+                        crate::sql_limits::arm();
                         loop {
                             let step = rusqlite::ffi::sqlite3_step(statement);
                             match step {
@@ -1973,6 +1979,7 @@ pub(crate) fn sql_cursor_start_values(
                     if cache_query.is_none() && !cache_busy && !saw_prefix {
                         cache_query = register_cached_sql_statement(scope, query, statement);
                     }
+                    crate::sql_limits::arm();
                     let step = rusqlite::ffi::sqlite3_step(statement);
                     return match step {
                         rusqlite::ffi::SQLITE_ROW => {
@@ -2066,7 +2073,10 @@ pub fn sql_cursor_next(cursor_id: u64) -> Result<(Option<Vec<SqlValue>>, u64), S
         // live until the cursor is removed.
         let started_in_transaction =
             unsafe { rusqlite::ffi::sqlite3_get_autocommit(cursor.database) == 0 };
+        // The bound is per step, and this step runs outside `as_user_sql`.
+        crate::sql_limits::arm();
         let step = unsafe { rusqlite::ffi::sqlite3_step(cursor.statement) };
+        crate::sql_limits::disarm();
         match step {
             rusqlite::ffi::SQLITE_ROW => Ok((Some(unsafe { sql_cursor_row(cursor.statement) }), 0)),
             rusqlite::ffi::SQLITE_DONE => {
@@ -2475,6 +2485,7 @@ unsafe fn d1_step_to_done(
     keep: usize,
     budget: &mut usize,
 ) -> Result<D1Stepped, String> {
+    crate::sql_limits::arm();
     let column_count = rusqlite::ffi::sqlite3_column_count(statement);
     let mut stepped = D1Stepped {
         rows: Vec::new(),
@@ -2573,13 +2584,15 @@ fn d1_sqlite_failure(
     started_in_transaction: bool,
     result_code: i32,
 ) -> String {
-    let _ = sqlite_operation_failure(scope, database, started_in_transaction, result_code, "d1");
+    // A statement the time bound interrupted inside the engine's own bracket
+    // is a statement failure: the caller rolls the bracket back, so the
+    // lost transaction is no reason to restart the cell.
+    let counts_as_open = started_in_transaction
+        && !(result_code & 0xff == rusqlite::ffi::SQLITE_INTERRUPT
+            && crate::sql_limits::statement_expired());
+    let _ = sqlite_operation_failure(scope, database, counts_as_open, result_code, "d1");
     // SAFETY: database is the live handle owned by the scope's Connection.
-    unsafe {
-        CStr::from_ptr(rusqlite::ffi::sqlite3_errmsg(database))
-            .to_string_lossy()
-            .into_owned()
-    }
+    unsafe { failure_detail(database) }
 }
 
 /// Whether `tail` holds another statement. Trivia -- whitespace and comments,
@@ -3339,7 +3352,7 @@ fn with_application_storage_write<T>(
     require_sql_healthy(scope).map_err(anyhow::Error::msg)?;
     with_mut(scope, |connection| {
         let started_in_transaction = !connection.is_autocommit();
-        write(connection).inspect_err(|error| {
+        write(connection).map_err(|error| {
             let result_code = error.chain().find_map(|cause| {
                 let rusqlite::Error::SqliteFailure(failure, _) =
                     cause.downcast_ref::<rusqlite::Error>()?
@@ -3358,7 +3371,11 @@ fn with_application_storage_write<T>(
                     result_code,
                     &error.to_string(),
                 );
+                if let Some(limit) = crate::sql_limits::explain(result_code & 0xff) {
+                    return anyhow::anyhow!(limit);
+                }
             }
+            error
         })
     })
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
@@ -3501,13 +3518,23 @@ fn list_query(
     (query, parameters)
 }
 
-fn sqlite_failure(database: *mut rusqlite::ffi::sqlite3, operation: &str) -> anyhow::Error {
-    // SAFETY: database is the live handle owned by the scope's Connection.
-    let detail = unsafe {
+/// SQLite's message for the last failure on `database`; a statement the time
+/// bound interrupted, or a write the size cap refused, says so instead.
+///
+/// # Safety
+/// `database` is the live handle of a scope's connection.
+unsafe fn failure_detail(database: *mut rusqlite::ffi::sqlite3) -> String {
+    let primary = rusqlite::ffi::sqlite3_extended_errcode(database) & 0xff;
+    crate::sql_limits::explain(primary).unwrap_or_else(|| {
         CStr::from_ptr(rusqlite::ffi::sqlite3_errmsg(database))
             .to_string_lossy()
             .into_owned()
-    };
+    })
+}
+
+fn sqlite_failure(database: *mut rusqlite::ffi::sqlite3, operation: &str) -> anyhow::Error {
+    // SAFETY: database is the live handle owned by the scope's Connection.
+    let detail = unsafe { failure_detail(database) };
     anyhow::anyhow!("{operation}: {detail}")
 }
 
@@ -4226,5 +4253,153 @@ mod recycle_tests {
         );
         close(facet);
         close(root);
+    }
+
+    fn limit(timeout_ms: Option<u64>, max_database_bytes: Option<u64>) {
+        crate::sql_limits::set_limits_for_test(crate::sql_limits::Limits {
+            statement_timeout: timeout_ms.map(std::time::Duration::from_millis),
+            max_database_bytes,
+        });
+    }
+
+    const ENDLESS: &str = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) ";
+
+    /// A statement that never finishes is interrupted at its bound. That is a
+    /// statement error: the cell is not latched, the actor is not told, and
+    /// the next statement runs.
+    #[test]
+    fn a_statement_over_the_time_bound_fails_and_the_cell_stays_usable() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let _ = reports();
+        limit(Some(50), None);
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "bounded-cell";
+        open_in(&dir, "cell.sqlite", scope);
+
+        let started = std::time::Instant::now();
+        let error = sql_cursor_start(scope, &format!("{ENDLESS}SELECT count(*) FROM c"), &[])
+            .expect_err("an endless statement finished");
+        assert!(error.contains("time limit of 50 ms"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        assert!(sql_critical_error(scope).is_none(), "the cell latched");
+        assert!(reported(scope).is_empty(), "the actor was told");
+        let (_, _, row, _, _) = sql_cursor_start(scope, "SELECT 1", &[]).unwrap();
+        assert!(matches!(row.as_deref(), Some([SqlValue::Integer(1)])));
+        put_serialized(scope, "k", b"v").unwrap();
+        close(scope);
+    }
+
+    /// The bound is per step: a cursor that yields a row quickly and then
+    /// stalls on the next one is interrupted there.
+    #[test]
+    fn a_cursor_step_over_the_time_bound_fails() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        limit(Some(50), None);
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "bounded-cursor";
+        open_in(&dir, "cell.sqlite", scope);
+
+        let query = format!("{ENDLESS}SELECT x FROM c WHERE x = 1 OR x < 0");
+        let (id, _, row, _, _) = sql_cursor_start(scope, &query, &[]).unwrap();
+        assert!(row.is_some());
+        let error = sql_cursor_next(id).expect_err("the stalled step finished");
+        assert!(error.contains("time limit of 50 ms"), "{error}");
+        assert!(sql_critical_error(scope).is_none());
+        close(scope);
+    }
+
+    /// Engine statements, the key-value reads and writes, are never bounded,
+    /// however tight the bound on application SQL.
+    #[test]
+    fn engine_statements_are_never_time_bounded() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        limit(Some(1), None);
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "unbounded-engine";
+        open_in(&dir, "cell.sqlite", scope);
+        for i in 0..200 {
+            put_serialized(scope, &format!("k{i}"), &[7u8; 4096]).unwrap();
+        }
+        close(scope);
+    }
+
+    /// A bound hit inside a D1 call's own transaction bracket fails the call,
+    /// rolls the bracket back and leaves the database usable: the engine, not
+    /// the application, owns that transaction.
+    #[test]
+    fn a_d1_write_over_the_time_bound_rolls_back_without_a_restart() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let _ = reports();
+        limit(Some(50), None);
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "bounded-d1";
+        open_in(&dir, "cell.sqlite", scope);
+        let run = |request: serde_json::Value| -> serde_json::Value {
+            serde_json::from_str(&d1_run_json(scope, &request.to_string())).unwrap()
+        };
+        let made = run(serde_json::json!({"mode": "exec", "sql": "CREATE TABLE t (x INTEGER)"}));
+        assert!(made.get("ok").is_some(), "{made}");
+
+        let slow = format!("{ENDLESS}INSERT INTO t SELECT x FROM c");
+        let failed = run(serde_json::json!({"mode": "exec", "sql": slow}));
+        let message = failed["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("time limit of 50 ms"), "{failed}");
+        let failed = run(serde_json::json!({
+            "mode": "batch",
+            "statements": [{"sql": slow}],
+        }));
+        let message = failed["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("time limit of 50 ms"), "{failed}");
+
+        assert!(sql_critical_error(scope).is_none(), "the database latched");
+        assert!(reported(scope).is_empty(), "the actor was told");
+        let count = run(serde_json::json!({
+            "mode": "prepared", "sql": "SELECT count(*) AS n FROM t", "first": true,
+        }));
+        assert_eq!(count["ok"]["rows"], serde_json::json!([[0]]), "{count}");
+        close(scope);
+    }
+
+    /// A write that would grow the database past its cap fails at that write
+    /// with a message naming the limit. Outside a transaction that is a
+    /// statement error; what was stored before stays, and deleting frees room.
+    #[test]
+    fn a_write_past_the_size_cap_fails_clearly_and_the_cell_stays_usable() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let _ = reports();
+        limit(None, Some(256 * 1024));
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "capped-cell";
+        open_in(&dir, "cell.sqlite", scope);
+        put_serialized(scope, "kept", b"small").unwrap();
+
+        let big = vec![7u8; 16 * 1024];
+        let failure = (0..64)
+            .find_map(|i| put_serialized(scope, &format!("big-{i}"), &big).err())
+            .expect("the cap never produced an error");
+        let message = failure.to_string();
+        assert!(message.contains("storage limit exceeded"), "{message}");
+        assert!(message.contains("262144 bytes"), "{message}");
+
+        delete(scope, "big-0").unwrap();
+        sql_cursor_start(scope, "CREATE TABLE t (b BLOB)", &[]).unwrap();
+        let failure = (0..64)
+            .find_map(|_| {
+                sql_cursor_start(scope, "INSERT INTO t VALUES (zeroblob(16384))", &[]).err()
+            })
+            .expect("the cap never refused an SQL write");
+        assert!(failure.contains("storage limit exceeded"), "{failure}");
+        assert!(sql_critical_error(scope).is_none(), "the cell latched");
+        assert!(reported(scope).is_empty(), "the actor was told");
+        assert!(get_stored(scope, "kept").unwrap().is_some());
+        sql_cursor_start(scope, "DELETE FROM t", &[]).unwrap();
+        put_serialized(scope, "after", b"fits").unwrap();
+        close(scope);
     }
 }

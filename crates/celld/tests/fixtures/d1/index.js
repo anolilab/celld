@@ -80,6 +80,31 @@ export default {
     }
     if (url.pathname === "/count") return Response.json({ count: await count(env) });
 
+    // A write that never ends, then proof the database still answers.
+    if (url.pathname === "/endless-write") {
+      let message = null;
+      try {
+        await env.DB.prepare(
+          "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) " +
+            "INSERT INTO notes (body) SELECT x FROM c",
+        ).run();
+      } catch (error) {
+        message = String(error && error.message);
+      }
+      return Response.json({ message, count: await count(env) });
+    }
+    if (url.pathname === "/fill") {
+      let message = null;
+      try {
+        for (let i = 0; i < 200 && message === null; i++) {
+          await env.DB.prepare("INSERT INTO notes (body) VALUES (?)").bind("x".repeat(60000)).run();
+        }
+      } catch (error) {
+        message = String(error && error.message);
+      }
+      return Response.json({ message, count: await count(env) });
+    }
+
     if (url.pathname === "/seed") {
       await env.DB.exec(SEED);
       return Response.json({ seeded: true });

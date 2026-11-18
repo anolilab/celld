@@ -32,6 +32,31 @@ APIs, and Wrangler configuration.
   hold isolates, and the age in milliseconds of the oldest. A cell that has not
   yet moved to the new deployment keeps its isolate until it does.
 
+## Storage limits
+
+Each cell and each D1 database has its own SQLite file. Two limits bound it,
+and both match Cloudflare where Cloudflare documents a value.
+
+| Limit | Default | Setting | At the limit |
+| --- | --- | --- | --- |
+| Time of one SQL statement | 30 seconds | `CELLD_SQL_STATEMENT_TIMEOUT_MS` | SQLite interrupts the statement. The call fails with `SQL statement exceeded the time limit of N ms and was interrupted`. |
+| Size of one database | 10 GB | `CELLD_MAX_DATABASE_BYTES` | The write that would grow the file past the limit fails with `storage limit exceeded`. Deleting rows makes room again. |
+
+A value of `0` removes the limit.
+
+- The time bound covers application SQL: `ctx.storage.sql.exec()`, a cursor
+  step, and each statement of a D1 `prepare`, `batch`, `exec`, or migration.
+  It does not cover the key-value API or celld's own statements.
+- A statement interrupted outside a transaction, or a read inside one, is an
+  ordinary error and the cell keeps serving. A write interrupted inside a
+  `transaction()` or `transactionSync()` makes SQLite discard the whole
+  transaction, so the cell restarts as described in
+  [Guarantees](guarantees.md). A D1 `batch`, `exec`, or migration rolls back
+  and the database keeps serving.
+- The size limit counts database pages, so it includes indexes and free pages
+  inside the file. A full disk raises the same error code, and its message
+  names the limit too.
+
 ## Networking and security
 
 - celld does not terminate TLS. Terminate public TLS at an ingress proxy, and

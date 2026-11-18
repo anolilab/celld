@@ -84,6 +84,40 @@ const scenarios = {
     );
     return { columnNames: [...cursor.columnNames], rows: cursor.toArray() };
   },
+  endless(sql) {
+    sql.exec("CREATE TABLE t (v INTEGER)");
+    sql.exec("INSERT INTO t VALUES (1)");
+    let message = null;
+    try {
+      sql.exec(
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c",
+      ).toArray();
+    } catch (error) {
+      message = error.message;
+    }
+    return { message, rows: sql.exec("SELECT v FROM t").toArray() };
+  },
+  async fill(sql, storage) {
+    sql.exec("CREATE TABLE t (b BLOB)");
+    sql.exec("INSERT INTO t VALUES (zeroblob(100))");
+    let sqlMessage = null;
+    try {
+      for (let i = 0; i < 400 && sqlMessage === null; i++) {
+        sql.exec("INSERT INTO t VALUES (zeroblob(60000))");
+      }
+    } catch (error) {
+      sqlMessage = error.message;
+    }
+    let putMessage = null;
+    try {
+      await storage.put("big", "y".repeat(2_000_000));
+    } catch (error) {
+      putMessage = error.message;
+    }
+    sql.exec("DELETE FROM t");
+    await storage.put("small", "fits");
+    return { sqlMessage, putMessage, small: await storage.get("small") };
+  },
   write(sql) {
     seed(sql);
     return { written: true };
@@ -98,7 +132,7 @@ export class Cell extends DurableObject {
     const name = new URL(request.url).pathname.slice(1);
     const scenario = scenarios[name];
     if (!scenario) return new Response("unknown scenario " + name, { status: 404 });
-    return Response.json(scenario(this.ctx.storage.sql, this.ctx.storage));
+    return Response.json(await scenario(this.ctx.storage.sql, this.ctx.storage));
   }
 }
 
