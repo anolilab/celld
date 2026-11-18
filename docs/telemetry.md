@@ -149,10 +149,28 @@ Every application SQL statement of a Durable Object (`ctx.storage.sql.exec`)
 and of D1 feeds four histograms: its time, the rows it read, the rows it wrote
 and the bytes of the values it returned (see Metrics). They are split by
 outcome only. `error` is a failed statement and `timeout` is one that the
-per-statement time bound interrupted. A query reads as many rows as it
-returns, so a cursor that is closed early counts only the rows it produced.
-The statement's time is its prepare and step time, summed over the cursor's
-steps, and excludes the time the Worker spends between steps.
+per-statement time bound interrupted.
+
+Each statement counts once, however it ends: run to its end, a cursor closed
+early or by the garbage collector, a cell that closed with the cursor still
+open, or a statement that failed, including one that did not prepare. An
+`exec` of several statements counts each of them on its own. So do the
+statements of `ctx.storage.sql.ingest`, which run application SQL too.
+
+- Time runs from the start of preparing the statement to the end of its last
+  step, summed over a cursor's steps. It excludes the time the Worker spends
+  between steps. D1 counts the same span.
+- A query reads as many rows as it returns, so a cursor that is closed early
+  counts only the rows it produced. D1 counts the rows its statement stepped.
+- Rows written are the connection's change count over the statement, read when
+  it ends, so a cursor closed early reports what the statement had written. A
+  failed statement reports none, because SQLite rolled it back.
+- Bytes are the length of every text and BLOB value returned and eight for each
+  number, the same in a Durable Object and in D1.
+- A D1 result over the row or byte cap fails the request, and is an `error`.
+  The statement ran to its end, so its writes count. Its `sqlite_code` is 18
+  (`SQLITE_TOOBIG`), a code SQLite did not return: celld uses it to mark the
+  refusal.
 
 A failed statement, and one that ran at least `CELLD_SQL_SLOW_LOG_MS`
 milliseconds, also writes one `WARN` line (target `celld::sql`):
@@ -166,17 +184,27 @@ With the variable unset nothing is logged. `0` logs every statement. At most
 `suppressed=N`, the number of statements it dropped.
 
 The fingerprint is a 64-bit hash of the statement text with whitespace and
-comments collapsed, keywords and names folded to lower case, and string, blob
-and number literals replaced by one placeholder. Statements of the same shape
-have the same fingerprint, on every node. celld reads the text from the
-prepared statement, so a bound value is never part of it. A fingerprint is
-computed only for a line that passes the rate limit; with the variable unset it
-is never computed, and a statement adds a few relaxed atomic increments and one
-clock read.
+comments collapsed, keywords and names folded to lower case, and every literal
+replaced by one placeholder. Statements of the same shape have the same
+fingerprint, on every node. These are literals:
+
+- string, blob and number literals, with the sign of an exponent (`1e-5`);
+- parameters (`?`, `?1`);
+- every quoted token, `"..."`, `` `...` `` and `[...]`. SQLite reads a
+  double-quoted token that names no column as a string, so it can hold user
+  data. The fingerprint cannot tell it from a quoted name, and so a quoted
+  table or column name is a placeholder too;
+- a list after `IN` of only literals: `IN (1, 2, 3)` has the shape of `IN (1)`.
+
+celld reads the text from the prepared statement, so a bound value is never
+part of it. A statement that does not prepare is hashed from its own text
+onward. A fingerprint is computed only for a line that passes the rate limit;
+with the variable unset it is never computed, and a statement adds a few
+relaxed atomic increments and one clock read.
 
 What is recorded: the fingerprint, outcome, time, rows read, rows written,
 bytes, SQLite's result code of a failure, and the cell class (the Durable
-Object class name, or `d1`).
+Object class name, or `__D1Database` for D1).
 
 What is never recorded: the SQL text, a bound value, a result value, an error
 message (which can name a table, a column or a value), a table or column name,
