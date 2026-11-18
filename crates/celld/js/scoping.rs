@@ -26,6 +26,8 @@ pub(super) struct Declared {
     /// The `send_email` bindings: their restrictions are the deployment's, so
     /// the op reads them here and never from the call.
     send_email: Vec<crate::email::SendEmailBinding>,
+    /// The messages this isolate has in flight, counted for [`crate::smtp::InFlight`].
+    send_in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Declared {
@@ -50,7 +52,18 @@ impl Declared {
             classes: config.do_classes.iter().cloned().collect(),
             shared,
             send_email: config.send_email_bindings.clone(),
+            send_in_flight: Default::default(),
         }
+    }
+
+    /// A slot for one more message of this isolate, if it has one free.
+    pub(super) fn take_send_slot(&self) -> Option<crate::smtp::InFlight> {
+        crate::smtp::InFlight::take(&self.send_in_flight)
+    }
+
+    /// The name of the script this isolate runs.
+    pub(super) fn script(&self) -> &str {
+        &self.script
     }
 
     /// The `send_email` binding named `name`, if the script declared one.

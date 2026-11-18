@@ -197,6 +197,20 @@ impl SendEmailBinding {
     }
 }
 
+/// Refuses two bindings of one name. `env` holds one, and the other's
+/// restrictions would be ignored without a word.
+pub fn ensure_unique(bindings: &[SendEmailBinding]) -> anyhow::Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for binding in bindings {
+        anyhow::ensure!(
+            seen.insert(binding.environment.as_str()),
+            "send_email binding {} is declared twice; every name in `env` must be unique",
+            binding.environment
+        );
+    }
+    Ok(())
+}
+
 fn address_field(binding: &str, field: &str, value: &Value) -> anyhow::Result<String> {
     match value.as_str() {
         Some(address) if valid_address(address) => Ok(address.to_string()),
@@ -257,6 +271,27 @@ pub struct Prepared {
     pub data: Vec<u8>,
     /// The `Message-ID` the message carries, without angle brackets.
     pub message_id: String,
+    /// A byte of the message is 8-bit, so the relay must take `8BITMIME`.
+    pub eight_bit: bool,
+    /// A header holds a non-ASCII byte, so the relay must take `SMTPUTF8`.
+    pub smtputf8: bool,
+}
+
+impl Prepared {
+    pub fn new(from: String, recipients: Vec<String>, data: Vec<u8>, message_id: String) -> Self {
+        let head_end = data
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap_or(data.len());
+        Self {
+            from,
+            recipients,
+            eight_bit: !data.is_ascii(),
+            smtputf8: !data[..head_end].is_ascii(),
+            data,
+            message_id,
+        }
+    }
 }
 
 fn new_message_id(from: &str) -> String {
@@ -268,7 +303,7 @@ fn new_message_id(from: &str) -> String {
     format!("{}@{domain}", hex(&random))
 }
 
-fn too_large() -> EmailError {
+pub(crate) fn too_large() -> EmailError {
     EmailError::new(
         "E_CONTENT_TOO_LARGE",
         format!("the message exceeds {MAX_MESSAGE_BYTES} bytes"),

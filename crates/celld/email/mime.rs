@@ -305,12 +305,7 @@ pub fn prepare_builder(binding: &SendEmailBinding, builder: Value) -> Result<Pre
     if data.len() > MAX_MESSAGE_BYTES {
         return Err(too_large());
     }
-    Ok(Prepared {
-        from,
-        recipients,
-        data,
-        message_id,
-    })
+    Ok(Prepared::new(from, recipients, data, message_id))
 }
 
 fn custom_headers(
@@ -441,12 +436,14 @@ fn encoded_words(text: &str) -> String {
         .join(" ")
 }
 
-/// One header line, folded at spaces so no line passes 76 bytes where a space
-/// allows it.
+/// One header line, folded at white space so no line passes 76 bytes where a
+/// space allows it.
 fn fold_header(name: &str, value: &str) -> String {
     let mut out = format!("{name}:");
     let mut line = out.len();
-    for word in value.split(' ') {
+    // Runs of white space collapse, so a fold never leaves a line with
+    // nothing but white space on it.
+    for word in value.split_ascii_whitespace() {
         if line + 1 + word.len() > 76 && line > name.len() + 1 {
             out.push_str("\r\n");
             line = 0;
@@ -879,5 +876,25 @@ mod tests {
         };
         let error = prepare_builder(&senders, builder(json!({}))).unwrap_err();
         assert_eq!(error.code, "E_SENDER_NOT_VERIFIED");
+    }
+
+    #[test]
+    fn a_folded_header_never_has_a_line_of_white_space_only() {
+        crate::asyncrt::install_test_host_runtime();
+        // A word that fills the line and spaces after it would fold into a
+        // line with nothing on it.
+        for subject in [
+            format!("{}   ", "a".repeat(70)),
+            format!("{}   b", "a".repeat(70)),
+            format!("{} \t  {}", "a".repeat(30), "b".repeat(60)),
+        ] {
+            let prepared = build(json!({ "subject": subject })).unwrap();
+            let text = text_of(&prepared);
+            let head = text.split("\r\n\r\n").next().unwrap();
+            for line in head.split("\r\n") {
+                assert!(!line.trim().is_empty(), "{head:?}");
+            }
+        }
+        assert_eq!(fold_header("X-A", "a  b\t c"), "X-A: a b c\r\n");
     }
 }

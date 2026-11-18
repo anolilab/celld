@@ -2,6 +2,8 @@
 //   POST /send   { binding, kind: "raw", from, to, raw, pad?, stream? }
 //                { binding, kind: "builder", message }
 //                answers { messageId } or { error, code, message }
+//   POST /burst  { count, binding? } sends count builder messages at once and
+//                answers one { ok } or { code } for each
 //   GET  /env    what a Worker can see of its environment
 import { EmailMessage } from "cloudflare:email";
 import process from "node:process";
@@ -13,6 +15,14 @@ const streamOf = (text) =>
       controller.close();
     },
   });
+
+// `size` characters: lines of 100 by default, or `size` of one wide
+// character, whose UTF-8 form is longer than its length says.
+const padding = (size, wide) => {
+  if (wide) return "\u00e9".repeat(size);
+  const line = "x".repeat(99) + "\n";
+  return line.repeat(Math.floor(size / 100)) + "x".repeat(size % 100);
+};
 
 export default {
   async fetch(request, env) {
@@ -30,6 +40,17 @@ export default {
         ],
       });
     }
+    if (url.pathname === "/burst") {
+      const { count, binding = "EMAIL" } = await request.json();
+      const results = await Promise.allSettled(
+        Array.from({ length: count }, (_, index) =>
+          env[binding].send({ from: "ann@example.com", to: "bob@example.com", subject: `m${index}`, text: "t" }),
+        ),
+      );
+      return Response.json(
+        results.map((result) => (result.status === "fulfilled" ? { ok: true } : { code: result.reason.code })),
+      );
+    }
     if (url.pathname === "/send") {
       const spec = await request.json();
       try {
@@ -38,7 +59,7 @@ export default {
           message = spec.message;
         } else {
           let raw = spec.raw ?? "";
-          if (spec.pad) raw += "x".repeat(spec.pad);
+          if (spec.pad) raw += padding(spec.pad, spec.wide);
           message = new EmailMessage(spec.from, spec.to, spec.stream ? streamOf(raw) : raw);
         }
         return Response.json(await env[spec.binding].send(message));

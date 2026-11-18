@@ -27,6 +27,12 @@ struct Behaviour {
     echo_in_535: bool,
     /// Advertise `SIZE`.
     size: Option<usize>,
+    /// Leave `8BITMIME` out of what `EHLO` offers.
+    no_8bitmime: bool,
+    /// Wait this long before the answer to the end of the body.
+    slow_body_reply: Option<std::time::Duration>,
+    /// Never answer `QUIT`, and keep the connection open.
+    hang_on_quit: bool,
 }
 
 /// One connection to the sink.
@@ -35,6 +41,8 @@ struct Transaction {
     commands: Vec<String>,
     auth_args: Vec<String>,
     mail_from: Option<String>,
+    /// The whole `MAIL` line, parameters included.
+    mail_line: Option<String>,
     recipients: Vec<String>,
     /// The body as it came over the wire, dots stuffed.
     wire: Option<Vec<u8>>,
@@ -121,7 +129,11 @@ async fn serve(
                 if behaviour.auth.is_some() {
                     reply.push_str("250-AUTH PLAIN LOGIN\r\n");
                 }
-                reply.push_str("250 8BITMIME\r\n");
+                if behaviour.no_8bitmime {
+                    reply.push_str("250 PIPELINING\r\n");
+                } else {
+                    reply.push_str("250 8BITMIME\r\n");
+                }
                 reply
             }
             "AUTH" => {
@@ -147,6 +159,7 @@ async fn serve(
                     .and_then(|(_, rest)| rest.split_once('>'))
                     .map(|(address, _)| address.to_string());
                 record(&|t| t.mail_from = address.clone());
+                record(&|t| t.mail_line = Some(text.clone()));
                 "250 ok\r\n".to_string()
             }
             "RCPT" => {
@@ -179,9 +192,15 @@ async fn serve(
                     t.wire = Some(wire.clone());
                     t.body = Some(body.clone());
                 });
+                if let Some(delay) = behaviour.slow_body_reply {
+                    tokio::time::sleep(delay).await;
+                }
                 "250 queued\r\n".to_string()
             }
             "QUIT" => {
+                if behaviour.hang_on_quit {
+                    std::future::pending::<()>().await;
+                }
                 let _ = write.write_all(b"221 bye\r\n").await;
                 return;
             }
@@ -260,9 +279,11 @@ async fn a_raw_message_is_delivered_in_one_transaction_with_dots_stuffed() {
         .iter()
         .map(|c| c.split(' ').next().unwrap())
         .collect();
-    assert_eq!(
-        commands,
-        ["EHLO", "MAIL", "RCPT", "DATA", "QUIT"],
+    // `QUIT` is written as the transaction ends, so the sink may not have read
+    // it yet.
+    assert!(
+        commands == ["EHLO", "MAIL", "RCPT", "DATA"]
+            || commands == ["EHLO", "MAIL", "RCPT", "DATA", "QUIT"],
         "{:?}",
         transaction.commands
     );
@@ -491,10 +512,9 @@ async fn a_builder_call_that_is_far_over_the_limit_is_refused_before_it_is_parse
         json!({ "binding": "EMAIL", "kind": "builder", "message": message }),
     )
     .await;
-    assert!(
-        out["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("too large")),
+    assert_eq!(
+        out["code"],
+        "E_CONTENT_TOO_LARGE",
         "{}",
         out.to_string().chars().take(300).collect::<String>()
     );
@@ -771,4 +791,151 @@ fn the_node_refuses_to_start_on_a_malformed_relay_setting_without_naming_the_pas
         "{}",
         exited.output
     );
+}
+
+#[tokio::test]
+async fn a_message_over_the_limit_in_bytes_is_refused_with_its_code() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, &[]).await;
+    // 13.2 million characters are under the limit as a count and over it as
+    // UTF-8, which is what a relay is sent.
+    for stream in [false, true] {
+        let mut wide = raw(
+            "EMAIL",
+            "ann@example.com",
+            "bob@example.com",
+            "From: ann@example.com\n\n",
+        );
+        wide["pad"] = json!(13_200_000);
+        wide["wide"] = json!(true);
+        wide["stream"] = json!(stream);
+        let out = send(&server, wide).await;
+        assert_eq!(out["code"], "E_CONTENT_TOO_LARGE", "stream={stream}: {out}");
+    }
+    assert!(sink.transactions().is_empty());
+}
+
+#[tokio::test]
+async fn an_isolate_may_have_a_few_messages_in_flight_and_gets_each_slot_back() {
+    let sink = Sink::start(Behaviour {
+        slow_body_reply: Some(std::time::Duration::from_millis(300)),
+        ..Default::default()
+    })
+    .await;
+    let server = start(&sink, &[]).await;
+    let burst = || async {
+        client()
+            .post(server.url("/burst"))
+            .json(&json!({ "count": 10 }))
+            .send()
+            .await
+            .expect("POST /burst")
+            .json::<Vec<Value>>()
+            .await
+            .expect("a JSON list")
+    };
+    let results = burst().await;
+    let sent = results.iter().filter(|r| r["ok"] == true).count();
+    let refused: Vec<_> = results.iter().filter_map(|r| r["code"].as_str()).collect();
+    assert_eq!(sent, 4, "{results:?}");
+    assert_eq!(refused.len(), 6, "{results:?}");
+    assert!(
+        refused.iter().all(|code| *code == "E_RATE_LIMIT_EXCEEDED"),
+        "{refused:?}"
+    );
+    assert_eq!(sink.delivered().len(), 4);
+    // Every slot is back once the sends are over.
+    let again = burst().await;
+    assert_eq!(
+        again.iter().filter(|r| r["ok"] == true).count(),
+        4,
+        "{again:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_relay_that_never_says_goodbye_does_not_hold_the_send() {
+    let sink = Sink::start(Behaviour {
+        hang_on_quit: true,
+        ..Default::default()
+    })
+    .await;
+    let server = start(&sink, &[]).await;
+    let started = std::time::Instant::now();
+    let out = send(
+        &server,
+        sent_as("EMAIL", "ann@example.com", "bob@example.com"),
+    )
+    .await;
+    assert!(out["messageId"].is_string(), "{out}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "the send waited {:?} for QUIT",
+        started.elapsed()
+    );
+    assert_eq!(sink.delivered().len(), 1);
+}
+
+#[tokio::test]
+async fn eight_bit_content_goes_with_8bitmime_or_is_refused_before_a_message_is_started() {
+    let message = |binding: &str| {
+        raw(
+            binding,
+            "ann@example.com",
+            "bob@example.com",
+            "From: ann@example.com\nSubject: s\n\ncaf\u{e9}\n",
+        )
+    };
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, &[]).await;
+    let out = send(&server, message("EMAIL")).await;
+    assert!(out["messageId"].is_string(), "{out}");
+    assert_eq!(
+        sink.delivered()[0].mail_line.as_deref(),
+        Some("MAIL FROM:<ann@example.com> BODY=8BITMIME")
+    );
+    // The same message to a relay that has no `8BITMIME`.
+    let plain = Sink::start(Behaviour {
+        no_8bitmime: true,
+        ..Default::default()
+    })
+    .await;
+    let server = start(&plain, &[]).await;
+    let out = send(&server, message("EMAIL")).await;
+    assert_eq!(out["code"], "E_8BIT_NOT_SUPPORTED", "{out}");
+    assert!(plain.delivered().is_empty());
+    assert!(
+        plain.transactions().iter().all(|t| t.mail_from.is_none()),
+        "{:?}",
+        plain.transactions()
+    );
+    // A message of plain ASCII goes to it as before.
+    let out = send(
+        &server,
+        sent_as("EMAIL", "ann@example.com", "bob@example.com"),
+    )
+    .await;
+    assert!(out["messageId"].is_string(), "{out}");
+    assert_eq!(
+        plain.delivered()[0].mail_line.as_deref(),
+        Some("MAIL FROM:<ann@example.com>")
+    );
+}
+
+#[tokio::test]
+async fn a_body_line_over_998_bytes_is_refused() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, &[]).await;
+    let out = send(
+        &server,
+        raw(
+            "EMAIL",
+            "ann@example.com",
+            "bob@example.com",
+            &format!("From: ann@example.com\n\n{}\n", "x".repeat(2000)),
+        ),
+    )
+    .await;
+    assert_eq!(out["code"], "E_LINE_TOO_LONG", "{out}");
+    assert!(sink.transactions().is_empty());
 }

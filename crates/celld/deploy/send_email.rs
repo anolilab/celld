@@ -31,10 +31,10 @@ pub(super) fn read_send_email(
         let mut manifest = Value::Object(entry.clone());
         manifest["type"] = Value::from(crate::email::BINDING_TYPE);
         // The one reader of the shape, shared with the node.
-        let binding = SendEmailBinding::from_manifest(&manifest)?;
-        bindings.push(binding.to_manifest());
+        bindings.push(SendEmailBinding::from_manifest(&manifest)?);
     }
-    Ok(bindings)
+    crate::email::ensure_unique(&bindings)?;
+    Ok(bindings.iter().map(SendEmailBinding::to_manifest).collect())
 }
 
 #[cfg(test)]
@@ -50,6 +50,10 @@ mod send_email_config_tests {
 
     fn read(entry: Value) -> anyhow::Result<Vec<Value>> {
         read_send_email(&config(json!([entry])))
+    }
+
+    fn refused_all(entries: Value) -> String {
+        format!("{:#}", read_send_email(&config(entries)).unwrap_err())
     }
 
     fn refused(entry: Value) -> String {
@@ -100,6 +104,10 @@ mod send_email_config_tests {
             "name": "E", "destination_address": "a@b.co", "allowed_destination_addresses": ["a@b.co"]
         }))
         .contains("use one"));
+        assert!(refused_all(
+            json!([{ "name": "E" }, { "name": "E", "destination_address": "a@b.co" }])
+        )
+        .contains("declared twice"));
         assert!(read_send_email(&config(json!({}))).is_err());
         assert!(read_send_email(&config(json!(["EMAIL"]))).is_err());
     }

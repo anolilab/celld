@@ -197,23 +197,24 @@ pub fn validate() -> anyhow::Result<()> {
     load().map(|_| ())
 }
 
-/// The node's relay, or `None` when `CELLD_SMTP_HOST` is unset. The result,
-/// the password file's text included, is kept for the process.
-pub fn settings() -> Result<Option<&'static Settings>, &'static str> {
-    static SETTINGS: OnceLock<Result<Option<Settings>, String>> = OnceLock::new();
-    SETTINGS
-        .get_or_init(|| {
-            load().map_err(|error| {
-                // Once, so the operator can read the cause: it names a
-                // variable or a path, never a value.
-                let cause = format!("{error:#}");
-                tracing::error!(event = "smtp_settings_invalid", error = %cause);
-                cause
-            })
-        })
-        .as_ref()
-        .map(Option::as_ref)
-        .map_err(String::as_str)
+/// The node's relay, or `None` when `CELLD_SMTP_HOST` is unset. A good result,
+/// the password file's text included, is kept for the process. A failure is
+/// not: it is a file that could not be read this time, and the next send reads
+/// it again.
+pub fn settings() -> anyhow::Result<Option<&'static Settings>> {
+    static SETTINGS: OnceLock<Option<Settings>> = OnceLock::new();
+    cached(&SETTINGS, load)
+}
+
+fn cached(
+    cell: &OnceLock<Option<Settings>>,
+    read: impl FnOnce() -> anyhow::Result<Option<Settings>>,
+) -> anyhow::Result<Option<&Settings>> {
+    if let Some(settings) = cell.get() {
+        return Ok(settings.as_ref());
+    }
+    let settings = read()?;
+    Ok(cell.get_or_init(|| settings).as_ref())
 }
 
 fn load() -> anyhow::Result<Option<Settings>> {
@@ -364,5 +365,17 @@ mod tests {
         );
         let error = refusal(&[(HOST, "h"), (USERNAME, "u"), (PASSWORD, "hunter2-secret\n")]);
         assert!(!error.contains("hunter2-secret"), "{error}");
+    }
+
+    #[test]
+    fn a_failed_read_is_not_kept_and_a_good_one_is() {
+        let cell = OnceLock::new();
+        let failing = || -> anyhow::Result<Option<Settings>> { bail!("the file is not there") };
+        assert!(cached(&cell, failing).is_err());
+        assert!(cached(&cell, failing).is_err());
+        let good = || parsed(&[(HOST, "mail.example.com")]);
+        assert!(cached(&cell, good).unwrap().is_some());
+        // Read once: a later failing reader is not asked.
+        assert!(cached(&cell, failing).unwrap().is_some());
     }
 }

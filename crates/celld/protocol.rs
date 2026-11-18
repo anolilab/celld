@@ -365,7 +365,7 @@ pub fn ai_binding(manifest: &Manifest) -> anyhow::Result<Option<String>> {
 pub fn validate_send_email_manifest(
     manifest: &Manifest,
 ) -> anyhow::Result<Vec<crate::email::SendEmailBinding>> {
-    crate::secrets::typed_bindings(
+    let bindings: Vec<_> = crate::secrets::typed_bindings(
         manifest,
         crate::email::BINDING_TYPE,
         FEATURE_SEND_EMAIL_V1,
@@ -373,7 +373,9 @@ pub fn validate_send_email_manifest(
     )?
     .into_iter()
     .map(|(_, binding)| crate::email::SendEmailBinding::from_manifest(binding))
-    .collect()
+    .collect::<anyhow::Result<_>>()?;
+    crate::email::ensure_unique(&bindings)?;
+    Ok(bindings)
 }
 
 /// Validate every Queue value before a deployment becomes runtime state.
@@ -909,6 +911,14 @@ mod send_email_manifest_tests {
         assert!(validate_send_email_manifest(&manifest(&[], json!([])))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn two_bindings_of_one_name_are_refused() {
+        let other = json!({ "type": "send_email", "name": "EMAIL", "destination_address": "x@example.com" });
+        let manifest = manifest(&["send-email-v1"], json!([entry(), other]));
+        let error = validate_send_email_manifest(&manifest).unwrap_err();
+        assert!(error.to_string().contains("declared twice"), "{error}");
     }
 
     #[test]

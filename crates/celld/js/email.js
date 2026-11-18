@@ -35,7 +35,12 @@
       if (raw.length > MAX_MESSAGE_BYTES) {
         throw fail("E_CONTENT_TOO_LARGE", "the message is too large");
       }
-      return new TextEncoder().encode(raw);
+      // The limit is in bytes, and a character is up to three of them.
+      const bytes = new TextEncoder().encode(raw);
+      if (bytes.byteLength > MAX_MESSAGE_BYTES) {
+        throw fail("E_CONTENT_TOO_LARGE", "the message is too large");
+      }
+      return bytes;
     }
     const reader = raw.getReader();
     const chunks = [];

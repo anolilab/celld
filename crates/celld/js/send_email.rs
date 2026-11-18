@@ -11,7 +11,7 @@
 //! durable, as for any effect that leaves the node.
 
 use super::*;
-use crate::email::{EmailError, Prepared, SendEmailBinding};
+use crate::email::{too_large, EmailError, Prepared, SendEmailBinding};
 
 /// The longest call, in UTF-16 units of its JSON: a message is at most 25 MiB,
 /// and the rest of the call (addresses, headers, quoting) is small. A message
@@ -63,22 +63,47 @@ fn answer(result: Result<String, EmailError>) -> String {
     .to_string()
 }
 
+/// The answer of a call the op refused: a Worker reads its `code` like that of
+/// any other failure of `send()`.
+fn refuse(scope: &mut v8::PinScope, mut rv: v8::ReturnValue<v8::Value>, error: EmailError) {
+    let async_id = asyncrt::enqueue(async move { Ok::<String, String>(answer(Err(error))) });
+    rv.set(promise_for(scope, async_id));
+}
+
 pub(super) fn op_email_send(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    // A send costs a subrequest, as a fetch or a Workers AI call does.
+    let context = event_context(scope);
+    if let Err(error) = context.charge_subrequest() {
+        return loader_throw(scope, &error);
+    }
     // Bound what the host copies before it copies it: the JavaScript side
     // limits a message, but this op is the boundary.
     let too_long = |length: usize| length > MAX_CALL_UNITS;
-    if v8::Local::<v8::String>::try_from(args.get(0)).map_or(true, |text| too_long(text.length())) {
-        return loader_throw(scope, "send(): the message is too large");
-    }
-    if v8::Local::<v8::ArrayBufferView>::try_from(args.get(1))
-        .is_ok_and(|view| view.byte_length() > crate::email::MAX_MESSAGE_BYTES)
+    if v8::Local::<v8::String>::try_from(args.get(0)).map_or(true, |text| too_long(text.length()))
+        || v8::Local::<v8::ArrayBufferView>::try_from(args.get(1))
+            .is_ok_and(|view| view.byte_length() > crate::email::MAX_MESSAGE_BYTES)
     {
-        return loader_throw(scope, "send(): the message is too large");
+        return refuse(scope, rv, too_large());
     }
+    // The slot comes before anything is copied or built, so an isolate that
+    // sends faster than the relay takes messages holds no more than a few.
+    let Some(slot) = actor_runtime_state(scope).declared.take_send_slot() else {
+        return refuse(
+            scope,
+            rv,
+            EmailError::new(
+                "E_RATE_LIMIT_EXCEEDED",
+                format!(
+                    "at most {} messages may be in flight at once",
+                    crate::smtp::MAX_PER_ISOLATE
+                ),
+            ),
+        );
+    };
     let raw_call = args.get(0).to_rust_string_lossy(scope);
     let call: Call = match serde_json::from_str(&raw_call) {
         Ok(call) => call,
@@ -86,22 +111,23 @@ pub(super) fn op_email_send(
     };
     let raw = view_bytes(args.get(1));
     let name = call.binding.clone();
-    let Some(binding) = actor_runtime_state(scope).declared.send_email(&name) else {
+    let declared = &actor_runtime_state(scope).declared;
+    let script = declared.script().to_string();
+    let Some(binding) = declared.send_email(&name) else {
         return loader_throw(scope, "send(): this Worker has no such send_email binding");
     };
     let prepared = prepare(&binding, call, raw);
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Fetch);
+    let gate = egress_gate_request(&context, celld_logic::Channel::Fetch);
     let async_id = asyncrt::enqueue(async move {
+        // Held until the send ends, and given back if it is dropped.
+        let _slot = slot;
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => return Ok::<String, String>(answer(Err(error))),
         };
         await_egress_gate(gate).await?;
         let sent = match crate::smtp::relay() {
-            Ok(relay) => {
-                crate::smtp::deliver(relay, &prepared.from, &prepared.recipients, &prepared.data)
-                    .await
-            }
+            Ok(relay) => crate::smtp::deliver(relay, &script, &prepared).await,
             Err(error) => Err(error),
         };
         if let Err(error) = &sent {

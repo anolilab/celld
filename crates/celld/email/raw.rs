@@ -43,6 +43,17 @@ pub fn prepare_raw(
             format!("the message headers exceed {MAX_HEADER_SECTION_BYTES} bytes"),
         ));
     }
+    // A line longer than RFC 5321 allows is refused, not folded: folding a
+    // body would change it.
+    if body
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.strip_suffix(b"\r").unwrap_or(line).len() > MAX_LINE_BYTES)
+    {
+        return Err(EmailError::new(
+            "E_LINE_TOO_LONG",
+            format!("a line of the message body exceeds {MAX_LINE_BYTES} bytes"),
+        ));
+    }
     let headers = parse_headers(head)?;
     let mut from_headers = headers.iter().filter(|header| header.name_is("from"));
     let (Some(from_header), None) = (from_headers.next(), from_headers.next()) else {
@@ -72,12 +83,12 @@ pub fn prepare_raw(
     if data.len() > MAX_MESSAGE_BYTES {
         return Err(too_large());
     }
-    Ok(Prepared {
-        from: from.to_string(),
-        recipients: vec![to.to_string()],
+    Ok(Prepared::new(
+        from.to_string(),
+        vec![to.to_string()],
         data,
         message_id,
-    })
+    ))
 }
 
 /// `raw` with every line end, `\r\n`, `\n` or a lone `\r`, as `\r\n`.
@@ -395,5 +406,39 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.message, "email from eve@example.com not allowed");
+    }
+
+    #[test]
+    fn a_body_line_over_998_bytes_is_refused_and_8_bit_content_is_flagged() {
+        let head = "From: ann@example.com\n\n";
+        let ok = raw(
+            &binding(),
+            "ann@example.com",
+            "bob@example.com",
+            &format!("{head}{}\n", "x".repeat(998)),
+        )
+        .unwrap();
+        assert!(!ok.eight_bit && !ok.smtputf8);
+        for line_end in ["\n", "\r\n", ""] {
+            let long = format!("{head}ok\n{}{line_end}", "x".repeat(999));
+            let error = raw(&binding(), "ann@example.com", "bob@example.com", &long).unwrap_err();
+            assert_eq!(error.code, "E_LINE_TOO_LONG", "{line_end:?}");
+        }
+        let body = raw(
+            &binding(),
+            "ann@example.com",
+            "bob@example.com",
+            &format!("{head}caf\u{e9}\n"),
+        )
+        .unwrap();
+        assert!(body.eight_bit && !body.smtputf8);
+        let header = raw(
+            &binding(),
+            "ann@example.com",
+            "bob@example.com",
+            "From: ann@example.com\nSubject: caf\u{e9}\n\nbody\n",
+        )
+        .unwrap();
+        assert!(header.eight_bit && header.smtputf8);
     }
 }

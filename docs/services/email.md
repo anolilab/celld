@@ -140,18 +140,52 @@ header. `send()` resolves to `{ messageId }` in both forms.
   as fields is also refused when its call, as JSON, is more than about 25 MiB.
 - At most 50 recipients, `to`, `cc` and `bcc` together, and 32 attachments.
 - The header section of a raw message is at most 64 KiB, and a header line at
-  most 998 bytes. A subject has at most 998 characters.
+  most 998 bytes. A line of a raw body is at most 998 bytes too, and a longer
+  one is refused with `E_LINE_TOO_LONG`: celld does not fold a body. A subject
+  has at most 998 characters.
+- The size is counted in bytes of the message as sent, not in characters: a
+  string of 14 million characters of two bytes each is over the limit, and
+  rejects with `E_CONTENT_TOO_LARGE` like any other message that is too large.
 - Each address is at most 254 bytes, and each list in the configuration holds
   at most 1,000 addresses.
 - A relay that announces a `SIZE` smaller than the message is not sent the
   message.
-- A transaction takes at most five minutes, and a relay has 60 seconds to answer
-  one command. A node runs at most 16 transactions at once, and a call beyond
-  that waits.
+- A relay has 60 seconds to answer one command and 60 seconds for each 64 KiB
+  chunk of the body it is sent, then 10 minutes to answer the end of the body,
+  as it may scan the message first. A whole transaction may take five minutes,
+  plus those 10 minutes, plus the time the body needs at 64 KiB a second.
+- A call costs a subrequest, as a `fetch()` does. An isolate has at most four
+  messages in flight: the call after that rejects at once with
+  `E_RATE_LIMIT_EXCEEDED`, before the message is read. A script has at most four
+  transactions running on a node, and a node runs at most 16. A call beyond
+  either waits up to 60 seconds, and then rejects with `E_RATE_LIMIT_EXCEEDED`
+  (for a script) or `E_DELIVERY_FAILED` (for the node).
 
 Each `send()` is one SMTP transaction on a new connection: `EHLO`, `STARTTLS`,
 `AUTH`, `MAIL FROM`, one `RCPT TO` for each recipient, `DATA` with dot-stuffing,
-and `QUIT`. A relay that refuses one recipient fails the whole message. celld
+and `QUIT`. `send()` resolves when the relay has accepted the message: `QUIT`
+is written after that and not waited for. A relay that refuses one recipient
+fails the whole message.
+
+## 8-bit and non-ASCII content
+
+A message built from fields is plain ASCII on the wire: the body is base64, and
+a non-ASCII subject, name or file name is encoded. A raw message may hold any
+bytes. If it has a byte of 128 or more, `MAIL FROM` carries `BODY=8BITMIME`, and
+if a header has one it carries `SMTPUTF8` too. A relay that does not offer what
+the message needs is not sent it: `send()` rejects with `E_8BIT_NOT_SUPPORTED`
+before any message is started. Encode the message as 7-bit (quoted-printable or
+base64) for such a relay.
+
+## Error codes
+
+`E_VALIDATION_ERROR`, `E_FIELD_MISSING`, `E_RECIPIENT_NOT_ALLOWED`,
+`E_SENDER_NOT_VERIFIED`, `E_TOO_MANY_RECIPIENTS`, `E_TOO_MANY_ATTACHMENTS`,
+`E_HEADER_NAME_INVALID`, `E_HEADER_NOT_ALLOWED`, `E_HEADER_USE_API_FIELD`,
+`E_HEADER_VALUE_INVALID`, `E_HEADERS_TOO_MANY`, `E_HEADERS_TOO_LARGE`,
+`E_CONTENT_TOO_LARGE`, `E_LINE_TOO_LONG`, `E_8BIT_NOT_SUPPORTED`,
+`E_RATE_LIMIT_EXCEEDED`, `E_DELIVERY_FAILED` and `E_INTERNAL_SERVER_ERROR` (no
+relay, or a relay setting that is invalid). celld
 connects only after the writes the handler made so far are durable, as it does
 for `fetch()`.
 
@@ -164,8 +198,9 @@ for `fetch()`.
   `message.reply()`.
 - A message is sent when `send()` resolves, once the relay has accepted it. That
   is not a delivery to the recipient.
-- `E_RATE_LIMIT_EXCEEDED`, `E_DAILY_LIMIT_EXCEEDED`, `E_ACCOUNT_SUSPENDED`,
-  `E_RECIPIENT_SUPPRESSED` and `E_SENDER_DOMAIN_NOT_AVAILABLE` are never raised.
+- `E_DAILY_LIMIT_EXCEEDED`, `E_ACCOUNT_SUSPENDED`, `E_RECIPIENT_SUPPRESSED`
+  and `E_SENDER_DOMAIN_NOT_AVAILABLE` are never raised. `E_RATE_LIMIT_EXCEEDED`
+  means the in-flight limits above, not an account quota.
 
 The [Cloudflare compatibility](../cloudflare-compat.md#services) page lists the
 runtime APIs and the unsupported services.
