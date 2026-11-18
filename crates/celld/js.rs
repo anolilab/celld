@@ -1182,8 +1182,8 @@ fn wake_gate_waiters(cell: &str, outcome: Result<(), String>) {
 }
 
 const ABANDONED_INPUT_GATE: &str = "the cell's critical section ended without releasing";
-/// How many live events are ended. Every host op reads this, so a process
-/// with none pays one load and never looks up the caller's event.
+/// How many ended events isolates remember. Every host op reads this, so a
+/// process with none pays one load and never looks up the caller's event.
 static ENDED_CONTEXTS: AtomicUsize = AtomicUsize::new(0);
 const ENDED_EVENT_OP: &str = "the event that started this operation has ended";
 const RETIRED_INPUT_GATE: &str = "the cell event ended before it could acquire an input gate";
@@ -2241,6 +2241,9 @@ struct ActorRuntimeState {
     termination: std::sync::Mutex<Option<ExecutionTermination>>,
     pending_puts: std::sync::Mutex<PendingPuts>,
     io_contexts: std::sync::Mutex<HashMap<u64, Weak<IoContext>>>,
+    /// The events that ended, by context id. A continuation keeps its id
+    /// after its `IoContext` is dropped, so the record outlives the context.
+    ended_contexts: EndedContexts,
     /// Set once the Worker imports `node:fs`. From then on every stateless
     /// request installs a `/tmp` token (see [`install_tmp_token`]); a Worker
     /// that never touches the filesystem keeps the empty continuation slot.
@@ -2329,6 +2332,10 @@ impl ActorRuntimeState {
         context
     }
 
+    fn ended_reason(&self, id: u64) -> Option<String> {
+        self.ended_contexts.0.lock().unwrap().get(&id).cloned()
+    }
+
     fn io_context(&self, id: u64) -> Option<Arc<IoContext>> {
         let mut contexts = self.io_contexts.lock().unwrap();
         let context = contexts.get(&id)?.upgrade();
@@ -2336,6 +2343,35 @@ impl ActorRuntimeState {
             contexts.remove(&id);
         }
         context
+    }
+}
+
+/// How many ended events one isolate remembers. Ids are never reused, so a
+/// record cannot be mistaken for a later event; the oldest are forgotten
+/// first, because a continuation that old has long since run or been dropped.
+const ENDED_CONTEXT_RECORDS: usize = 4096;
+
+/// The reasons events ended, oldest id first, counted in `ENDED_CONTEXTS`
+/// while they are held.
+#[derive(Default)]
+struct EndedContexts(std::sync::Mutex<std::collections::BTreeMap<u64, String>>);
+
+impl EndedContexts {
+    fn record(&self, id: u64, reason: &str) {
+        let mut records = self.0.lock().unwrap();
+        if records.insert(id, reason.to_string()).is_none() {
+            ENDED_CONTEXTS.fetch_add(1, Ordering::Relaxed);
+        }
+        while records.len() > ENDED_CONTEXT_RECORDS {
+            records.pop_first();
+            ENDED_CONTEXTS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for EndedContexts {
+    fn drop(&mut self) {
+        ENDED_CONTEXTS.fetch_sub(self.0.get_mut().unwrap().len(), Ordering::Relaxed);
     }
 }
 
@@ -3895,9 +3931,15 @@ fn operation_continuation_id(scope: &mut v8::PinScope) -> Option<u64> {
 
 /// Whether a host op reads or writes the cell's storage, or sets its alarm.
 fn touches_storage(op: &str) -> bool {
-    ["__storage_", "__sql_", "__d1_", "__alarm_"]
-        .iter()
-        .any(|prefix| op.starts_with(prefix))
+    [
+        "__storage_",
+        "__sql_",
+        "__d1_",
+        "__alarm_",
+        "__queue_alarm_",
+    ]
+    .iter()
+    .any(|prefix| op.starts_with(prefix))
 }
 
 /// Refuse a storage op called by an event that has ended, by throwing the
@@ -3909,13 +3951,10 @@ fn ended_event_refuses(scope: &mut v8::PinScope) -> bool {
     let Some(id) = operation_continuation_id(scope) else {
         return false;
     };
-    let Some(context) = actor_runtime_state(scope).io_context(id) else {
+    let Some(reason) = actor_runtime_state(scope).ended_reason(id) else {
         return false;
     };
-    let Some(reason) = context.ended() else {
-        return false;
-    };
-    loader_throw(scope, reason);
+    loader_throw(scope, &reason);
     true
 }
 
@@ -11043,7 +11082,11 @@ impl IoContext {
     /// afterwards, with `reason`.
     fn end(&self, reason: &str) {
         if self.ended.set(reason.to_string()).is_ok() {
-            ENDED_CONTEXTS.fetch_add(1, Ordering::Relaxed);
+            if let Some((id, runtime_state)) = &self.continuation {
+                if let Some(runtime_state) = runtime_state.upgrade() {
+                    runtime_state.ended_contexts.record(*id, reason);
+                }
+            }
         }
     }
 
@@ -11249,9 +11292,6 @@ impl IoContext {
 impl Drop for IoContext {
     fn drop(&mut self) {
         let already_panicking = std::thread::panicking();
-        if self.ended.get().is_some() {
-            ENDED_CONTEXTS.fetch_sub(1, Ordering::Relaxed);
-        }
         // The drive loop also abandons these while it still owns the isolate,
         // because that path resets the JavaScript actor state. Drop is the
         // final host-side invariant for an earlier exit: no request context
@@ -12649,5 +12689,46 @@ mod facet_file_tests {
             .join("root.sqlite.facets-b.sqlite");
         remove_facet_files(&missing).unwrap();
         remove_facet_files(&directory.path().join("root.sqlite.facets-c.sqlite")).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod storage_guard_tests {
+    use super::*;
+
+    /// A name that suggests storage, alarm or queue-alarm access must be
+    /// refused for an ended event, so a new storage op cannot slip past
+    /// `touches_storage` by its name. Ops named here do not touch the cell.
+    #[test]
+    fn every_op_named_for_storage_is_guarded() {
+        const NOT_CELL_STORAGE: &[&str] = &[
+            // Structured-clone codecs, not storage access.
+            "__sc_encode",
+            "__sc_decode",
+            // The object-store (KV) binding's blob path, not the cell's storage.
+            "__kv_blob",
+        ];
+        let named = ["storage", "sql", "d1", "alarm", "queue_alarm", "kv"];
+        let unguarded: Vec<_> = op_names()
+            .filter(|op| named.iter().any(|word| op.contains(word)))
+            .filter(|op| !NOT_CELL_STORAGE.contains(op) && !touches_storage(op))
+            .collect();
+        assert!(unguarded.is_empty(), "unguarded storage ops: {unguarded:?}");
+        assert!(touches_storage("__queue_alarm_set_wait"));
+    }
+
+    #[test]
+    fn an_ended_event_is_remembered_by_id_and_the_record_is_bounded() {
+        let ended = EndedContexts::default();
+        for id in 1..=(ENDED_CONTEXT_RECORDS as u64 + 10) {
+            ended.record(id, "over");
+        }
+        let records = ended.0.lock().unwrap();
+        assert_eq!(records.len(), ENDED_CONTEXT_RECORDS);
+        assert!(
+            !records.contains_key(&1) && records.contains_key(&(ENDED_CONTEXT_RECORDS as u64 + 10))
+        );
+        drop(records);
+        drop(ended);
     }
 }

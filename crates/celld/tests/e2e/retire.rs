@@ -495,6 +495,37 @@ async fn an_event_ended_by_a_hang_up_writes_and_starts_nothing_while_it_unwinds(
     assert_eq!(outcome["rows"], 0, "{body}");
 }
 
+/// A continuation of an ended event keeps its context id after the context
+/// itself is dropped, and must still be refused when it runs later.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continuation_that_outlives_its_ended_events_context_cannot_write() {
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_HANDLER_BUDGET_S", "3"),
+        ],
+    )
+    .await;
+    let _ = reqwest::Client::new()
+        .get(server.url("/do-late-write"))
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await;
+    // Long enough for the ended event's context to be dropped.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let (status, body) =
+        get_within_budget(&reqwest::Client::new(), &server.url("/do-late-release")).await;
+    assert!(status.is_success(), "{status} {body}");
+    let outcome: Value = serde_json::from_str(&body).expect("outcome json");
+    assert_eq!(
+        outcome["write"], "The client has disconnected",
+        "the late write was not refused: {body}"
+    );
+    assert_eq!(outcome["rows"], 0, "{body}");
+}
+
 /// Storage work a leftover timer starts after the handler returned either
 /// completes or leaves nothing behind when its object is moved to the new
 /// deployment mid-way: a transaction is never half written.

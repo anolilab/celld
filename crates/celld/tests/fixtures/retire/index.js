@@ -73,6 +73,30 @@ export class Pinned extends DurableObject {
         .one().n;
       return new Response(JSON.stringify({ ...this.outcome, rows }));
     }
+    // Waits for `/late-release`, which runs in another event. When the client
+    // has hung up by then, this handler's event is over and its context gone.
+    if (url.pathname === "/do-late-write") {
+      this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS late (k TEXT)");
+      this.lateWrite = {};
+      await new Promise((resolve) => {
+        this.release = resolve;
+      });
+      try {
+        this.ctx.storage.sql.exec("INSERT INTO late VALUES ('after')");
+        this.lateWrite.write = "written";
+      } catch (refused) {
+        this.lateWrite.write = refused.message;
+      }
+      return new Response("late");
+    }
+    if (url.pathname === "/late-release") {
+      this.release?.();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const rows = this.ctx.storage.sql
+        .exec("SELECT count(*) AS n FROM late")
+        .one().n;
+      return new Response(JSON.stringify({ ...this.lateWrite, rows }));
+    }
     if (url.pathname === "/nap") {
       await new Promise((resolve) => setTimeout(resolve, 200));
       return new Response("napped");
@@ -124,6 +148,12 @@ export default {
       case "/do-guarded-outcome":
         return env.PIN.get(env.PIN.idFromName("guarded")).fetch(
           new Request("http://do/guarded-outcome"),
+        );
+      case "/do-late-write":
+        return env.PIN.get(env.PIN.idFromName("late-write")).fetch(request);
+      case "/do-late-release":
+        return env.PIN.get(env.PIN.idFromName("late-write")).fetch(
+          new Request("http://do/late-release"),
         );
       case "/do-late":
       case "/do-late-outcome":
