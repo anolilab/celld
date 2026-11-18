@@ -1713,6 +1713,48 @@ fn mark_dev_value(bindings: &mut [Value], name: &str) {
     }
 }
 
+/// The entries of the array-valued config key `key`, each an object with only
+/// the `allowed` options.
+fn config_entries<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+    allowed: &[&str],
+) -> anyhow::Result<Vec<&'a serde_json::Map<String, Value>>> {
+    let entries = match object.get(key) {
+        None => return Ok(Vec::new()),
+        Some(Value::Array(entries)) => entries,
+        Some(_) => bail!("config `{key}` must be an array"),
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            let entry = entry
+                .as_object()
+                .ok_or_else(|| anyhow!("each `{key}` entry must be an object"))?;
+            if let Some(option) = entry
+                .keys()
+                .find(|option| !allowed.contains(&option.as_str()))
+            {
+                bail!("`{key}` sets `{option}`, which is not a supported option");
+            }
+            Ok(entry)
+        })
+        .collect()
+}
+
+/// The string `field` of an entry of `config_entries`.
+fn entry_text<'a>(
+    entry: &'a serde_json::Map<String, Value>,
+    key: &str,
+    field: &str,
+) -> anyhow::Result<&'a str> {
+    match entry.get(field) {
+        None => bail!("a `{key}` entry has no `{field}`"),
+        Some(Value::String(text)) => Ok(text.as_str()),
+        Some(_) => bail!("`{key}` `{field}` must be a string"),
+    }
+}
+
 fn set_local_connection_string(bindings: &mut [Value], name: &str, value: &str) {
     if let Some(binding) = bindings
         .iter_mut()
@@ -2376,52 +2418,37 @@ fn read_project(
     // the store in the fleet bucket (`celld secret put --store`), or from
     // `.dev.vars` under the binding name in `celld dev`.
     let mut secret_store_bindings = BTreeSet::new();
-    match object.get("secrets_store_secrets") {
-        None => {}
-        Some(Value::Array(entries)) => {
-            for entry in entries {
-                let entry = entry.as_object().ok_or_else(|| {
-                    anyhow!("each `secrets_store_secrets` entry must be an object")
-                })?;
-                if let Some(key) = entry
-                    .keys()
-                    .find(|key| !["binding", "store_id", "secret_name"].contains(&key.as_str()))
-                {
-                    bail!("`secrets_store_secrets` sets `{key}`, which is not a supported option");
-                }
-                let text = |field: &str| match entry.get(field) {
-                    None => bail!("a `secrets_store_secrets` entry has no `{field}`"),
-                    Some(Value::String(text)) => Ok(text.as_str()),
-                    Some(_) => bail!("`secrets_store_secrets` `{field}` must be a string"),
-                };
-                let binding = text("binding")?;
-                let store_id = text("store_id")?;
-                let secret_name = text("secret_name")?;
-                if !valid_binding(binding) {
-                    bail!("invalid secrets_store_secrets binding name: {binding:?}");
-                }
-                if !valid_resource_name(store_id) {
-                    bail!(
-                        "invalid secrets store id {store_id:?}: use letters, digits, `-` and `_`, \
-                         at most 64 characters"
-                    );
-                }
-                if !valid_resource_name(secret_name) {
-                    bail!(
-                        "invalid secrets store secret name {secret_name:?}: use letters, digits, \
-                         `-` and `_`, at most 64 characters"
-                    );
-                }
-                secret_store_bindings.insert(binding.to_string());
-                bindings.push(json!({
-                    "type": crate::secrets::STORE_BINDING_TYPE,
-                    "name": binding,
-                    "store_id": store_id,
-                    "secret_name": secret_name,
-                }));
-            }
+    for entry in config_entries(
+        object,
+        "secrets_store_secrets",
+        &["binding", "store_id", "secret_name"],
+    )? {
+        let text = |field| entry_text(entry, "secrets_store_secrets", field);
+        let binding = text("binding")?;
+        let store_id = text("store_id")?;
+        let secret_name = text("secret_name")?;
+        if !valid_binding(binding) {
+            bail!("invalid secrets_store_secrets binding name: {binding:?}");
         }
-        Some(_) => bail!("config `secrets_store_secrets` must be an array"),
+        if !valid_resource_name(store_id) {
+            bail!(
+                "invalid secrets store id {store_id:?}: use letters, digits, `-` and `_`, \
+                 at most 64 characters"
+            );
+        }
+        if !valid_resource_name(secret_name) {
+            bail!(
+                "invalid secrets store secret name {secret_name:?}: use letters, digits, \
+                 `-` and `_`, at most 64 characters"
+            );
+        }
+        secret_store_bindings.insert(binding.to_string());
+        bindings.push(json!({
+            "type": crate::secrets::STORE_BINDING_TYPE,
+            "name": binding,
+            "store_id": store_id,
+            "secret_name": secret_name,
+        }));
     }
     // `hyperdrive` binds the operator's own database. The config keeps
     // Cloudflare's `binding` and `id`; the connection string comes from a
@@ -2429,50 +2456,35 @@ fn read_project(
     // `celld dev` from `localConnectionString` or the local variable.
     let mut hyperdrive_bindings = BTreeSet::new();
     let mut hyperdrive_local = BTreeMap::new();
-    match object.get("hyperdrive") {
-        None => {}
-        Some(Value::Array(entries)) => {
-            for entry in entries {
-                let entry = entry
-                    .as_object()
-                    .ok_or_else(|| anyhow!("each `hyperdrive` entry must be an object"))?;
-                if let Some(key) = entry
-                    .keys()
-                    .find(|key| !["binding", "id", "localConnectionString"].contains(&key.as_str()))
-                {
-                    bail!("`hyperdrive` sets `{key}`, which is not a supported option");
-                }
-                let text = |field: &str| match entry.get(field) {
-                    None => bail!("a `hyperdrive` entry has no `{field}`"),
-                    Some(Value::String(text)) => Ok(text.as_str()),
-                    Some(_) => bail!("`hyperdrive` `{field}` must be a string"),
-                };
-                let binding = text("binding")?;
-                let id = text("id")?;
-                if !valid_binding(binding) {
-                    bail!("invalid hyperdrive binding name: {binding:?}");
-                }
-                if !valid_resource_name(id) {
-                    bail!(
-                        "invalid hyperdrive id {id:?}: use letters, digits, `-` and `_`, \
-                         at most 64 characters"
-                    );
-                }
-                if let Some(local) = entry.get("localConnectionString") {
-                    let local = local.as_str().ok_or_else(|| {
-                        anyhow!("`hyperdrive` `localConnectionString` must be a string")
-                    })?;
-                    hyperdrive_local.insert(binding.to_string(), local.to_string());
-                }
-                hyperdrive_bindings.insert(binding.to_string());
-                bindings.push(json!({
-                    "type": crate::hyperdrive::BINDING_TYPE,
-                    "name": binding,
-                    "id": id,
-                }));
-            }
+    for entry in config_entries(
+        object,
+        "hyperdrive",
+        &["binding", "id", "localConnectionString"],
+    )? {
+        let text = |field| entry_text(entry, "hyperdrive", field);
+        let binding = text("binding")?;
+        let id = text("id")?;
+        if !valid_binding(binding) {
+            bail!("invalid hyperdrive binding name: {binding:?}");
         }
-        Some(_) => bail!("config `hyperdrive` must be an array"),
+        if !valid_resource_name(id) {
+            bail!(
+                "invalid hyperdrive id {id:?}: use letters, digits, `-` and `_`, \
+                 at most 64 characters"
+            );
+        }
+        if let Some(local) = entry.get("localConnectionString") {
+            let local = local
+                .as_str()
+                .ok_or_else(|| anyhow!("`hyperdrive` `localConnectionString` must be a string"))?;
+            hyperdrive_local.insert(binding.to_string(), local.to_string());
+        }
+        hyperdrive_bindings.insert(binding.to_string());
+        bindings.push(json!({
+            "type": crate::hyperdrive::BINDING_TYPE,
+            "name": binding,
+            "id": id,
+        }));
     }
     let mut vars = BTreeMap::new();
     match object.get("vars") {
@@ -2487,7 +2499,8 @@ fn read_project(
         }
         Some(_) => bail!("config `vars` must be an object"),
     }
-    // The local variables of the Hyperdrive bindings are not Worker variables.
+    // The local variables of the Hyperdrive bindings are not Worker variables;
+    // the node reads them when it loads the deployment.
     let hyperdrive_locals = hyperdrive_bindings
         .iter()
         .map(|binding| crate::hyperdrive::local_variable(binding))
@@ -2503,9 +2516,7 @@ fn read_project(
                 for (name, value) in entries {
                     if secret_store_bindings.contains(name) {
                         mark_dev_value(&mut bindings, name);
-                    } else if hyperdrive_locals.contains(name) {
-                        // Read by the node when it loads the deployment.
-                    } else {
+                    } else if !hyperdrive_locals.contains(name) {
                         vars.insert(name.as_str(), value.as_str());
                     }
                 }
@@ -2533,12 +2544,12 @@ fn read_project(
                         note!("warning: skipped the dotenv entry {name:?}, which is not a valid binding name");
                     } else if secret_store_bindings.contains(name) {
                         store_values.push(name);
-                    } else if hyperdrive_locals.contains(name) {
-                        // Read by the node when it loads the deployment.
-                    } else if taken.contains(name.as_str()) {
-                        note!("warning: skipped the dotenv entry {name:?}, whose name another binding uses");
-                    } else {
-                        vars.insert(name, value);
+                    } else if !hyperdrive_locals.contains(name) {
+                        if taken.contains(name.as_str()) {
+                            note!("warning: skipped the dotenv entry {name:?}, whose name another binding uses");
+                        } else {
+                            vars.insert(name, value);
+                        }
                     }
                 }
                 for name in store_values {
@@ -2555,10 +2566,16 @@ fn read_project(
     {
         for binding in &hyperdrive_bindings {
             let variable = crate::hyperdrive::local_variable(binding);
-            let local = hyperdrive_local.get(binding);
+            // An empty value is no source: the node ignores it, so the deploy
+            // must still ask for the secret.
+            let local = hyperdrive_local
+                .get(binding)
+                .filter(|local| !local.is_empty());
             if local.is_some()
-                || std::env::var_os(&variable).is_some()
-                || entries.contains_key(&variable)
+                || std::env::var_os(&variable).is_some_and(|value| !value.is_empty())
+                || entries
+                    .get(&variable)
+                    .is_some_and(|value| !value.is_empty())
             {
                 mark_dev_value(&mut bindings, binding);
                 if let Some(local) = local {
@@ -2606,6 +2623,20 @@ fn read_project(
         let name = binding.get("name").and_then(Value::as_str).unwrap_or("");
         let kind = binding.get("type").and_then(Value::as_str).unwrap_or("");
         check_env_name(name).map_err(|error| anyhow!("a {kind} binding: {error}"))?;
+    }
+    // The secret of a Hyperdrive binding is not an `env` name, so no binding
+    // may take it: the secret could never be put.
+    for binding in &hyperdrive_bindings {
+        let secret = crate::hyperdrive::secret_name(binding);
+        if bindings
+            .iter()
+            .any(|other| other.get("name").and_then(Value::as_str) == Some(secret.as_str()))
+        {
+            bail!(
+                "hyperdrive binding {binding} takes its connection string from the secret \
+                 {secret}, so no var or binding may be named {secret}; rename it"
+            );
+        }
     }
     crate::secrets::ensure_unique_binding_names(&bindings)?;
     let mut metadata = Map::new();
@@ -4364,6 +4395,51 @@ mod hyperdrive_config_tests {
             assert!(bindings[0].get("local_connection_string").is_none());
             assert!(!project.metadata.to_string().contains("postgres://h/d"));
             assert!(bindings.iter().all(|binding| binding["name"] != name));
+        }
+    }
+
+    #[test]
+    fn an_empty_value_is_no_source_for_the_binding() {
+        let name = "CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HD";
+        let empty_local = r#""hyperdrive": [{ "binding": "HD", "id": "db-1",
+            "localConnectionString": "" }]"#;
+        for (entry, overrides) in [
+            (
+                ENTRY,
+                VarOverrides::DevVars(BTreeMap::from([(name.to_string(), String::new())])),
+            ),
+            (
+                ENTRY,
+                VarOverrides::DotEnv(BTreeMap::from([(name.to_string(), String::new())])),
+            ),
+            (empty_local, VarOverrides::DevVars(BTreeMap::new())),
+        ] {
+            let project = read(entry, &overrides).unwrap();
+            let binding = &project.metadata["bindings"][0];
+            assert!(binding.get("dev_value").is_none(), "{binding}");
+            assert!(
+                binding.get("local_connection_string").is_none(),
+                "{binding}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_binding_named_like_the_secret_of_a_hyperdrive_binding_is_refused() {
+        for extra in [
+            format!(r#""vars": {{ "HYPERDRIVE_HD": "x" }}, {ENTRY}"#),
+            r#""hyperdrive": [{ "binding": "HD", "id": "a" },
+                { "binding": "HYPERDRIVE_HD", "id": "b" }]"#
+                .to_string(),
+        ] {
+            let error = read(&extra, &VarOverrides::None)
+                .err()
+                .expect("refused")
+                .to_string();
+            assert!(
+                error.contains("HYPERDRIVE_HD") && error.contains("rename"),
+                "{error}"
+            );
         }
     }
 

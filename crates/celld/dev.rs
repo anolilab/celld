@@ -744,26 +744,13 @@ const CONFIG_ENV: &str = "CELLD_INTERNAL_DEV_CONFIG";
 /// reaches the deployment on disk and a changed file reaches the next load.
 /// Empty outside a `celld dev` node.
 pub fn store_values() -> anyhow::Result<BTreeMap<String, String>> {
-    let (Some(_), Some(config)) = (
-        std::env::var_os("CELLD_INTERNAL_DEV_STORE"),
-        std::env::var_os(CONFIG_ENV),
-    ) else {
+    let Some(config) = std::env::var_os(CONFIG_ENV).filter(|_| is_dev_node()) else {
         return Ok(BTreeMap::new());
     };
     Ok(match read_dev_vars(Path::new(&config))? {
         deploy::VarOverrides::DevVars(entries) | deploy::VarOverrides::DotEnv(entries) => entries,
         deploy::VarOverrides::None => BTreeMap::new(),
     })
-}
-
-/// The local values of a `celld dev` node, read now, and `None` on any other
-/// node, so a manifest from a fleet never reads local files or the local
-/// Hyperdrive variables.
-pub fn local_values() -> anyhow::Result<Option<BTreeMap<String, String>>> {
-    if !is_dev_node() {
-        return Ok(None);
-    }
-    store_values().map(Some)
 }
 
 /// Whether this process is the node of a `celld dev` run.

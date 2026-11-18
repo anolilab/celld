@@ -80,7 +80,9 @@ printf %s 'postgres://app:pw@db.internal:5432/shop' \
 
 It is stored as [Worker secrets](workers.md#secrets) are: encrypted under the
 secrets key, one object per script, read once when a node loads the deployment.
-The secret does not appear in `env` or `process.env`; only the binding holds it.
+The secret does not appear in `env` or `process.env`; only the binding holds it,
+so no var or other binding may be named `HYPERDRIVE_` and the binding name, and
+the config is refused if one is.
 A change reaches a node at its next load of the deployment (a deploy,
 `POST /reload`, or a restart).
 
@@ -99,6 +101,8 @@ A change reaches a node at its next load of the deployment (a deploy,
 2. the same name in `.dev.vars`, or without that file in `.env.local` and then
    `.env`;
 3. `localConnectionString` in the config.
+
+An empty value counts as not set.
 
 Without any of them, `celld dev` reads the secret from its dev store, like a
 fleet. The node reads the files each time it loads the deployment and keeps

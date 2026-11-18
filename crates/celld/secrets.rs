@@ -550,9 +550,32 @@ async fn update(
     bail!("{key} kept changing under this write; try again")
 }
 
-/// The decrypted secrets of the script of `manifest`, as `env` bindings. One
-/// bucket read; empty when the script has none or the deployment has no Worker
-/// module.
+/// The decrypted secrets of a script.
+#[derive(Default)]
+pub struct ScriptSecrets {
+    /// The secrets that become `env` bindings.
+    pub env: Vec<(String, String)>,
+    /// The secrets that bindings consume (a Hyperdrive connection string), by
+    /// name. They are not `env` names.
+    pub consumed: BTreeMap<String, String>,
+}
+
+/// The values are never in a log line.
+impl std::fmt::Debug for ScriptSecrets {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScriptSecrets")
+            .field(
+                "env",
+                &self.env.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            )
+            .field("consumed", &self.consumed.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// The decrypted secrets of the script of `manifest`. One bucket read; empty
+/// when the script has none or the deployment has no Worker module.
 ///
 /// A script with secrets and no key is an error, so a node never serves a
 /// Worker that silently lacks a credential. `key` runs only when the script
@@ -561,16 +584,16 @@ pub async fn load<'k>(
     bucket: &Bucket,
     manifest: &Manifest,
     key: impl FnOnce() -> anyhow::Result<Option<&'k SecretsKey>>,
-) -> anyhow::Result<Vec<(String, String)>> {
+) -> anyhow::Result<ScriptSecrets> {
     if manifest.main_module.is_none() {
-        return Ok(Vec::new());
+        return Ok(ScriptSecrets::default());
     }
     let script = manifest.script_name.as_str();
     let Some((set, _)) = read(bucket, Scope::Script(script)).await? else {
-        return Ok(Vec::new());
+        return Ok(ScriptSecrets::default());
     };
     if set.secrets.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ScriptSecrets::default());
     }
     let key = key()?.with_context(|| {
         format!(
@@ -580,58 +603,77 @@ pub async fn load<'k>(
         )
     })?;
     let bindings = binding_names(&manifest.raw_metadata);
-    // A Hyperdrive binding consumes its secret; it is not a variable of `env`.
-    let consumed = crate::hyperdrive::secret_names(&manifest.raw_metadata);
-    set.secrets
-        .iter()
-        .filter(|(name, _)| !consumed.contains(*name))
-        .map(|(name, sealed)| {
+    let consumed_names = crate::hyperdrive::secret_names(&manifest.raw_metadata);
+    let mut loaded = ScriptSecrets::default();
+    for (name, sealed) in &set.secrets {
+        let consumed = consumed_names.contains(name);
+        if !consumed {
             crate::deploy::check_env_name(name)?;
             if bindings.contains(name) {
                 return Err(clash(script, name));
             }
-            let value = String::from_utf8(key.open(Scope::Script(script), name, sealed)?)
-                .map_err(|_| anyhow!("secret {name} of script {script} is not UTF-8"))?;
-            Ok((name.clone(), value))
-        })
-        .collect()
+        }
+        let value = String::from_utf8(key.open(Scope::Script(script), name, sealed)?)
+            .map_err(|_| anyhow!("secret {name} of script {script} is not UTF-8"))?;
+        if consumed {
+            loaded.consumed.insert(name.clone(), value);
+        } else {
+            loaded.env.push((name.clone(), value));
+        }
+    }
+    Ok(loaded)
 }
 
-/// The decrypted values of the script secrets `wanted`, by name: one bucket
-/// read, none when `wanted` is empty. A name the script does not hold is left
-/// out of the answer. `key` runs only when a wanted secret exists.
-pub async fn load_named<'k>(
-    bucket: &Bucket,
-    manifest: &Manifest,
-    wanted: &BTreeSet<String>,
-    key: impl FnOnce() -> anyhow::Result<Option<&'k SecretsKey>>,
-) -> anyhow::Result<BTreeMap<String, String>> {
-    if wanted.is_empty() {
-        return Ok(BTreeMap::new());
+/// The bindings of `metadata` whose `type` is `binding_type`.
+pub(crate) fn raw_bindings<'a>(
+    metadata: &'a serde_json::Value,
+    binding_type: &'a str,
+) -> impl Iterator<Item = &'a serde_json::Value> {
+    metadata
+        .get("bindings")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(move |binding| {
+            binding.get("type").and_then(serde_json::Value::as_str) == Some(binding_type)
+        })
+}
+
+/// The bindings of `binding_type` of a deployment, each with its checked name.
+/// A manifest that the config parser did not write can hold a malformed entry;
+/// that fails the load and names the binding, where skipping it would leave
+/// `env.<binding>` undefined. `label` names the kind in errors.
+pub(crate) fn typed_bindings<'a>(
+    manifest: &'a Manifest,
+    binding_type: &'a str,
+    feature: &str,
+    label: &str,
+) -> anyhow::Result<Vec<(&'a str, &'a serde_json::Value)>> {
+    let bindings = raw_bindings(&manifest.raw_metadata, binding_type).collect::<Vec<_>>();
+    // A node that does not know the binding would start the Worker without it,
+    // so the manifest has to say it needs one that does.
+    if !bindings.is_empty()
+        && !manifest
+            .required_features
+            .iter()
+            .any(|have| have == feature)
+    {
+        bail!("the deployment has {label} bindings but does not require the {feature} feature");
     }
-    let script = manifest.script_name.as_str();
-    let Some((set, _)) = read(bucket, Scope::Script(script)).await? else {
-        return Ok(BTreeMap::new());
-    };
-    let held = set
-        .secrets
-        .iter()
-        .filter(|(name, _)| wanted.contains(*name))
-        .collect::<Vec<_>>();
-    if held.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let key = key()?.with_context(|| {
-        format!(
-            "script {script} has secrets that its bindings need, and no secrets key is \
-             configured; set {KEY_VARIABLE} or {KEY_FILE_VARIABLE} to the key they were put under"
-        )
-    })?;
-    held.into_iter()
-        .map(|(name, sealed)| {
-            let value = String::from_utf8(key.open(Scope::Script(script), name, sealed)?)
-                .map_err(|_| anyhow!("secret {name} of script {script} is not UTF-8"))?;
-            Ok((name.clone(), value))
+    bindings
+        .into_iter()
+        .map(|binding| {
+            let name = binding
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<unnamed>");
+            // The name becomes a property of `env` in generated JavaScript.
+            if !crate::deploy::valid_binding(name) {
+                bail!("{label} binding {name} of the deployment has an invalid binding name");
+            }
+            crate::deploy::check_env_name(name)
+                .with_context(|| format!("{label} binding {name} of the deployment"))?;
+            Ok((name, binding))
         })
         .collect()
 }
@@ -649,95 +691,54 @@ struct StoreBinding<'a> {
     dev_value: bool,
 }
 
-/// The Secrets Store bindings of a deployment. A manifest that the config
-/// parser did not write can hold a malformed entry; that fails the load and
-/// names the binding, where skipping it would leave `env.<binding>` undefined.
+/// The Secrets Store bindings of a deployment.
 fn store_bindings(manifest: &Manifest) -> anyhow::Result<Vec<StoreBinding<'_>>> {
-    let bindings = manifest
-        .raw_metadata
-        .get("bindings")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|binding| {
-            binding.get("type").and_then(serde_json::Value::as_str) == Some(STORE_BINDING_TYPE)
-        })
-        .collect::<Vec<_>>();
-    // A node that does not know the binding would start the Worker without it,
-    // so the manifest has to say it needs one that does.
-    if !bindings.is_empty()
-        && !manifest
-            .required_features
-            .iter()
-            .any(|feature| feature == crate::protocol::FEATURE_SECRETS_STORE_V1)
-    {
-        bail!(
-            "the deployment has Secrets Store bindings but does not require the {} feature",
-            crate::protocol::FEATURE_SECRETS_STORE_V1
-        );
-    }
-    bindings
-        .into_iter()
-        .map(|binding| {
-            let named = binding
-                .get("name")
+    typed_bindings(
+        manifest,
+        STORE_BINDING_TYPE,
+        crate::protocol::FEATURE_SECRETS_STORE_V1,
+        "Secrets Store",
+    )?
+    .into_iter()
+    .map(|(name, binding)| {
+        let text = |field: &str| {
+            binding
+                .get(field)
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("<unnamed>");
-            let text = |field: &str| {
-                binding
-                    .get(field)
-                    .and_then(serde_json::Value::as_str)
-                    .with_context(|| {
-                        format!(
-                            "Secrets Store binding {named} of the deployment has no string `{field}`"
-                        )
-                    })
-            };
-            let name = text("name")?;
-            // The name becomes a property of `env` in generated JavaScript.
-            if !crate::deploy::valid_binding(name) {
-                bail!("Secrets Store binding {named} of the deployment has an invalid binding name");
-            }
-            crate::deploy::check_env_name(name)
-                .with_context(|| format!("Secrets Store binding {named} of the deployment"))?;
-            let store_id = text("store_id")?;
-            // A marked binding never reads its store, but the id is still
-            // checked: the mark is data in a manifest, not proof of `celld dev`.
-            Scope::Store(store_id)
-                .check()
-                .with_context(|| format!("Secrets Store binding {named} of the deployment"))?;
-            Ok(StoreBinding {
-                binding: name,
-                store_id,
-                secret_name: text("secret_name")?,
-                dev_value: binding.get("dev_value") == Some(&serde_json::Value::Bool(true)),
-            })
+                .with_context(|| {
+                    format!(
+                        "Secrets Store binding {name} of the deployment has no string `{field}`"
+                    )
+                })
+        };
+        let store_id = text("store_id")?;
+        // A marked binding never reads its store, but the id is still
+        // checked: the mark is data in a manifest, not proof of `celld dev`.
+        Scope::Store(store_id)
+            .check()
+            .with_context(|| format!("Secrets Store binding {name} of the deployment"))?;
+        Ok(StoreBinding {
+            binding: name,
+            store_id,
+            secret_name: text("secret_name")?,
+            dev_value: binding.get("dev_value") == Some(&serde_json::Value::Bool(true)),
         })
-        .collect()
+    })
+    .collect()
 }
 
-/// Whether the deployment marks a Secrets Store binding as filled by `celld
-/// dev`. Only then does a node read `.dev.vars` when it loads the deployment.
-fn has_dev_value_binding(manifest: &Manifest) -> bool {
-    manifest
-        .raw_metadata
-        .get("bindings")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|binding| {
-            binding.get("type").and_then(serde_json::Value::as_str) == Some(STORE_BINDING_TYPE)
-                && binding.get("dev_value") == Some(&serde_json::Value::Bool(true))
-        })
-}
-
-/// The dev values for `manifest`: `read` runs only when a binding is marked, so
-/// an unreadable `.dev.vars` cannot stop a Worker that has none.
+/// The dev values for `manifest`: `read` runs only when a Secrets Store or
+/// Hyperdrive binding is marked, so an unreadable `.dev.vars` cannot stop a
+/// Worker that has none, and the files are read once for both.
 pub fn dev_values_for(
     manifest: &Manifest,
     read: impl FnOnce() -> anyhow::Result<BTreeMap<String, String>>,
 ) -> anyhow::Result<BTreeMap<String, String>> {
-    if has_dev_value_binding(manifest) {
+    let marked = |binding_type| {
+        raw_bindings(&manifest.raw_metadata, binding_type)
+            .any(|binding| binding.get("dev_value") == Some(&serde_json::Value::Bool(true)))
+    };
+    if marked(STORE_BINDING_TYPE) || marked(crate::hyperdrive::BINDING_TYPE) {
         read()
     } else {
         Ok(BTreeMap::new())
@@ -1096,7 +1097,8 @@ mod tests {
         assert_eq!(
             load(&bucket, &manifest(&["DB"]), || Ok(Some(&key)))
                 .await
-                .unwrap(),
+                .unwrap()
+                .env,
             [("TOKEN".to_string(), "v".to_string())]
         );
     }
@@ -1109,6 +1111,7 @@ mod tests {
         assert!(load(&bucket, &manifest, || Ok(None))
             .await
             .unwrap()
+            .env
             .is_empty());
         put(&bucket, &key(3), "app", "TOKEN", "v", &BTreeSet::new())
             .await

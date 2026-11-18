@@ -27,11 +27,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail, Context};
-use zeroize::Zeroize;
 
 use crate::bucket::Bucket;
 use crate::protocol::{Manifest, FEATURE_HYPERDRIVE_V1};
-use crate::secrets::SecretsKey;
 
 /// The `type` of a Hyperdrive binding in a deployment's metadata.
 pub const BINDING_TYPE: &str = "hyperdrive";
@@ -59,68 +57,33 @@ struct Entry<'a> {
     local: Option<&'a str>,
 }
 
-fn raw_entries(manifest: &Manifest) -> impl Iterator<Item = &serde_json::Value> {
-    manifest
-        .raw_metadata
-        .get("bindings")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|binding| {
-            binding.get("type").and_then(serde_json::Value::as_str) == Some(BINDING_TYPE)
-        })
-}
-
 /// The Hyperdrive bindings of a deployment. A manifest that the config parser
 /// did not write can hold a malformed entry; that fails the load and names
 /// the binding.
 fn entries(manifest: &Manifest) -> anyhow::Result<Vec<Entry<'_>>> {
-    let raw = raw_entries(manifest).collect::<Vec<_>>();
-    // A node that does not know the binding would start the Worker without it,
-    // so the manifest has to say it needs one that does.
-    if !raw.is_empty()
-        && !manifest
-            .required_features
-            .iter()
-            .any(|feature| feature == FEATURE_HYPERDRIVE_V1)
-    {
-        bail!(
-            "the deployment has Hyperdrive bindings but does not require the {FEATURE_HYPERDRIVE_V1} feature"
-        );
-    }
-    raw.into_iter()
-        .map(|binding| {
-            let name = binding
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("<unnamed>");
-            if !crate::deploy::valid_binding(name) {
-                bail!("Hyperdrive binding {name} of the deployment has an invalid binding name");
-            }
-            crate::deploy::check_env_name(name)
-                .with_context(|| format!("Hyperdrive binding {name} of the deployment"))?;
-            Ok(Entry {
-                binding: name,
-                dev_value: binding.get("dev_value") == Some(&serde_json::Value::Bool(true)),
-                local: binding
-                    .get("local_connection_string")
-                    .and_then(serde_json::Value::as_str),
-            })
+    Ok(
+        crate::secrets::typed_bindings(
+            manifest,
+            BINDING_TYPE,
+            FEATURE_HYPERDRIVE_V1,
+            "Hyperdrive",
+        )?
+        .into_iter()
+        .map(|(name, binding)| Entry {
+            binding: name,
+            dev_value: binding.get("dev_value") == Some(&serde_json::Value::Bool(true)),
+            local: binding
+                .get("local_connection_string")
+                .and_then(serde_json::Value::as_str),
         })
-        .collect()
+        .collect(),
+    )
 }
 
 /// The script secrets that Hyperdrive bindings consume. `secrets::load` leaves
 /// them out of `env`.
 pub fn secret_names(metadata: &serde_json::Value) -> BTreeSet<String> {
-    metadata
-        .get("bindings")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|binding| {
-            binding.get("type").and_then(serde_json::Value::as_str) == Some(BINDING_TYPE)
-        })
+    crate::secrets::raw_bindings(metadata, BINDING_TYPE)
         .filter_map(|binding| binding.get("name")?.as_str().map(secret_name))
         .collect()
 }
@@ -181,13 +144,6 @@ impl std::fmt::Debug for Connection {
             .field("host", &self.host)
             .field("port", &self.port)
             .finish_non_exhaustive()
-    }
-}
-
-impl Drop for Connection {
-    fn drop(&mut self) {
-        self.connection_string.zeroize();
-        self.password.zeroize();
     }
 }
 
@@ -260,61 +216,41 @@ pub struct HyperdriveBinding {
 }
 
 /// The value for `binding` in `celld dev`, if one is set: the environment
-/// first, then `.dev.vars` or the dotenv files, then the config.
+/// first, then `.dev.vars` or the dotenv files, then the config. An empty value
+/// is no source.
 fn dev_value(entry: &Entry<'_>, dev_vars: &BTreeMap<String, String>) -> Option<String> {
     let name = local_variable(entry.binding);
     std::env::var(&name)
         .ok()
-        .filter(|value| !value.is_empty())
         .or_else(|| dev_vars.get(&name).cloned())
         .or_else(|| entry.local.map(str::to_string))
+        .filter(|value| !value.is_empty())
 }
 
 /// The Hyperdrive bindings of the deployment, with their connection strings.
-/// One bucket read when a binding needs the script's secrets, none otherwise.
 ///
-/// `dev_vars` runs only when a binding carries the dev mark, and answers `None`
-/// on a node that is not `celld dev`. A binding without a string is an error:
-/// the node does not start a Worker that lacks its database.
-pub async fn load<'k>(
-    bucket: &Bucket,
+/// `secrets` are the script secrets the bindings consume (`secrets::load`).
+/// `dev_vars` is what `celld dev` read from `.dev.vars` or a dotenv file, and
+/// `None` on any other node, which ignores a binding's dev mark. A binding
+/// without a string is an error: the node does not start a Worker that lacks
+/// its database.
+pub fn load(
     manifest: &Manifest,
-    dev_vars: impl FnOnce() -> anyhow::Result<Option<BTreeMap<String, String>>>,
-    key: impl FnOnce() -> anyhow::Result<Option<&'k SecretsKey>>,
+    mut secrets: BTreeMap<String, String>,
+    dev_vars: Option<&BTreeMap<String, String>>,
 ) -> anyhow::Result<Vec<HyperdriveBinding>> {
     if manifest.main_module.is_none() {
         return Ok(Vec::new());
     }
-    let entries = entries(manifest)?;
-    if entries.is_empty() {
-        return Ok(Vec::new());
-    }
-    let dev_vars = if entries.iter().any(|entry| entry.dev_value) {
-        dev_vars()?
-    } else {
-        None
-    };
-    let mut strings = BTreeMap::new();
-    let mut from_secrets = BTreeSet::new();
-    for entry in &entries {
-        if let Some(vars) = dev_vars.as_ref().filter(|_| entry.dev_value) {
-            if let Some(value) = dev_value(entry, vars) {
-                strings.insert(entry.binding, value);
-                continue;
-            }
-        }
-        from_secrets.insert(secret_name(entry.binding));
-    }
-    let mut secrets = crate::secrets::load_named(bucket, manifest, &from_secrets, key).await?;
-    entries
-        .iter()
+    entries(manifest)?
+        .into_iter()
         .map(|entry| {
-            let text = match strings.remove(entry.binding) {
-                Some(text) => text,
-                None => secrets
-                    .remove(&secret_name(entry.binding))
-                    .ok_or_else(|| anyhow!(missing(entry.binding)))?,
-            };
+            let local = dev_vars
+                .filter(|_| entry.dev_value)
+                .and_then(|vars| dev_value(&entry, vars));
+            let text = local
+                .or_else(|| secrets.remove(&secret_name(entry.binding)))
+                .ok_or_else(|| anyhow!(missing(entry.binding)))?;
             let connection = Connection::parse(&text).with_context(|| {
                 format!(
                     "Hyperdrive binding {} of script {}",
@@ -332,6 +268,7 @@ pub async fn load<'k>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::SecretsKey;
 
     #[test]
     fn a_postgres_url_gives_its_fields() {
@@ -500,17 +437,17 @@ mod tests {
             .await
             .unwrap();
         let manifest = one_binding(serde_json::json!({}));
-        let loaded = load(&bucket, &manifest, || Ok(None), || Ok(Some(&key)))
+        // One read of the script's secrets gives both the `env` pairs and the
+        // values the binding consumes.
+        let secrets = crate::secrets::load(&bucket, &manifest, || Ok(Some(&key)))
             .await
             .unwrap();
+        assert_eq!(secrets.env, [("TOKEN".to_string(), "t".to_string())]);
+        let loaded = load(&manifest, secrets.consumed, None).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].binding, "HD");
         assert_eq!(loaded[0].connection.connection_string, URL);
         assert_eq!(loaded[0].connection.host, "db.internal");
-        let vars = crate::secrets::load(&bucket, &manifest, || Ok(Some(&key)))
-            .await
-            .unwrap();
-        assert_eq!(vars, [("TOKEN".to_string(), "t".to_string())]);
     }
 
     #[tokio::test]
@@ -518,60 +455,44 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let bucket = bucket(&directory);
         let manifest = one_binding(serde_json::json!({}));
-        let error = load(&bucket, &manifest, || Ok(None), || Ok(None))
-            .await
-            .unwrap_err();
+        let error = load(&manifest, BTreeMap::new(), None).unwrap_err();
         assert!(format!("{error:#}").contains("HYPERDRIVE_HD"), "{error:#}");
-        let key = test_key();
-        crate::secrets::put(
-            &bucket,
-            &key,
-            "app",
-            "HYPERDRIVE_HD",
-            "mysql-ish hunter2",
-            &BTreeSet::new(),
-        )
-        .await
-        .unwrap();
-        let error = load(&bucket, &manifest, || Ok(None), || Ok(Some(&key)))
-            .await
-            .unwrap_err();
+        let consumed =
+            BTreeMap::from([("HYPERDRIVE_HD".to_string(), "mysql-ish hunter2".to_string())]);
+        let error = load(&manifest, consumed, None).unwrap_err();
         assert!(!format!("{error:#}").contains("hunter2"), "{error:#}");
-        let error = load(&bucket, &manifest, || Ok(None), || Ok(None))
+        let key = test_key();
+        crate::secrets::put(&bucket, &key, "app", "HYPERDRIVE_HD", URL, &BTreeSet::new())
             .await
-            .unwrap_err();
+            .unwrap();
+        let error = crate::secrets::load(&bucket, &manifest, || Ok(None))
+            .await
+            .expect_err("no key");
         assert!(format!("{error:#}").contains("secrets key"), "{error:#}");
     }
 
-    #[tokio::test]
-    async fn a_dev_node_prefers_the_variable_then_dev_vars_then_the_config() {
-        let directory = tempfile::tempdir().unwrap();
-        let bucket = bucket(&directory);
+    #[test]
+    fn a_dev_node_prefers_the_variable_then_dev_vars_then_the_config() {
         let manifest = one_binding(serde_json::json!({
             "dev_value": true,
             "local_connection_string": "postgres://u:p@from-config/d",
         }));
-        let vars = || {
-            Ok(Some(BTreeMap::from([(
-                local_variable("HD"),
-                "postgres://u:p@from-dev-vars/d".to_string(),
-            )])))
-        };
-        let loaded = load(&bucket, &manifest, vars, || Ok(None)).await.unwrap();
+        let vars = BTreeMap::from([(
+            local_variable("HD"),
+            "postgres://u:p@from-dev-vars/d".to_string(),
+        )]);
+        let loaded = load(&manifest, BTreeMap::new(), Some(&vars)).unwrap();
         assert_eq!(loaded[0].connection.host, "from-dev-vars");
-        let loaded = load(
-            &bucket,
-            &manifest,
-            || Ok(Some(BTreeMap::new())),
-            || Ok(None),
-        )
-        .await
-        .unwrap();
+        let loaded = load(&manifest, BTreeMap::new(), Some(&BTreeMap::new())).unwrap();
         assert_eq!(loaded[0].connection.host, "from-config");
+        // An empty value is no source: the secret fills the binding.
+        let empty = BTreeMap::from([(local_variable("HD"), String::new())]);
+        let secret = BTreeMap::from([("HYPERDRIVE_HD".to_string(), URL.to_string())]);
+        let manifest = one_binding(serde_json::json!({ "dev_value": true }));
+        let loaded = load(&manifest, secret, Some(&empty)).unwrap();
+        assert_eq!(loaded[0].connection.host, "db.internal");
         // A node that is not `celld dev` ignores the mark and wants the secret.
-        assert!(load(&bucket, &manifest, || Ok(None), || Ok(None))
-            .await
-            .is_err());
+        assert!(load(&manifest, BTreeMap::new(), None).is_err());
     }
 
     #[test]

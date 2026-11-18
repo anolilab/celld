@@ -22,13 +22,20 @@ const LOCAL_VARIABLE: &str = "CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HD";
 /// A TCP server that answers `pong:` and what it was sent, and counts the
 /// connections it accepts.
 struct Database {
+    /// The host as a URL writes it, with the brackets of an IPv6 literal.
+    host: &'static str,
     port: u16,
     connections: Arc<AtomicUsize>,
 }
 
 impl Database {
     async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::start_on("127.0.0.1").await
+    }
+
+    async fn start_on(host: &'static str) -> Self {
+        let bound = host.trim_start_matches('[').trim_end_matches(']');
+        let listener = TcpListener::bind((bound, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let connections = Arc::new(AtomicUsize::new(0));
         let counted = connections.clone();
@@ -47,13 +54,17 @@ impl Database {
                 });
             }
         });
-        Self { port, connections }
+        Self {
+            host,
+            port,
+            connections,
+        }
     }
 
     fn string(&self) -> String {
         format!(
-            "postgres://app:{PASSWORD}@127.0.0.1:{}/shop?sslmode=disable",
-            self.port
+            "postgres://app:{PASSWORD}@{}:{}/shop?sslmode=disable",
+            self.host, self.port
         )
     }
 
@@ -163,6 +174,27 @@ async fn the_exemption_is_the_bindings_own_address_and_nothing_else() {
     }
     assert_eq!(other.hits(), 0, "a refused destination was dialed");
     assert_eq!(database.hits(), 2);
+}
+
+#[tokio::test]
+async fn an_ipv6_database_is_dialed_by_the_binding_and_by_address() {
+    let database = Database::start_on("[::1]").await;
+    // Open egress dials the literal itself; the public policy resolves it
+    // first. Neither may see the brackets as part of the name.
+    for env in [&[][..], &[("CELLD_EGRESS", "public")][..]] {
+        let server = Server::start_with_files("hyperdrive", env, |project| {
+            write_dev_vars(project, &database)
+        })
+        .await;
+        let info: Value = server.get_json("/info").await;
+        assert_eq!(info["host"], "::1", "{info}");
+        let result: Value = server.get_json("/via-binding").await;
+        assert_eq!(result["reply"], "pong:ping", "{env:?}: {result}");
+        let result: Value = server
+            .get_json(&format!("/direct?host=%5B::1%5D&port={}", database.port))
+            .await;
+        assert_eq!(result["reply"], "pong:ping", "{env:?}: {result}");
+    }
 }
 
 #[tokio::test]

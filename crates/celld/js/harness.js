@@ -3843,7 +3843,7 @@ class Hyperdrive {
   connect(options) {
     const { host, port } = this.#info;
     return __celld.__cfSockets.connect(
-      { hostname: host.includes(":") ? "[" + host + "]" : host, port },
+      { hostname: host, port },
       options);
   }
 }

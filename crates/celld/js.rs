@@ -2267,9 +2267,7 @@ struct ActorRuntimeState {
     /// an event's lifetime merely to flush its output.
     ws_capture_touched: Mutex<Vec<Weak<IoContext>>>,
     egress: EgressPolicy,
-    /// The host and port of each Hyperdrive binding, in the form of
-    /// `hyperdrive::normalize_host`. A `connect()` to one of them skips the
-    /// egress filter; the list is empty for a Worker without the binding.
+    /// The host and port of each Hyperdrive binding (`Filter::resolve_database`).
     hyperdrive_destinations: Vec<(String, u16)>,
     resource_limits: Option<ResourceLimits>,
     tail_reporting: bool,

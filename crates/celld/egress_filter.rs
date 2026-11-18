@@ -548,13 +548,12 @@ impl Filter {
     pub async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, Refused> {
         self.check_host(host, port)?;
         let bare = host.trim_start_matches('[').trim_end_matches(']');
-        if let Ok(ip) = bare.parse::<IpAddr>() {
-            return Ok(vec![SocketAddr::new(ip, port)]);
+        let resolved = lookup(bare, port).await?;
+        // `check_host` checked an IP literal in full.
+        if bare.parse::<IpAddr>().is_ok() {
+            return Ok(resolved);
         }
-        let resolved = tokio::net::lookup_host((bare, port))
-            .await
-            .map_err(|error| Refused(format!("egress: could not resolve {bare}: {error}")))?;
-        self.filter_resolved(bare, port, resolved.collect())
+        self.filter_resolved(bare, port, resolved)
     }
 
     /// Resolve the host of a Hyperdrive binding once and keep the addresses
@@ -576,25 +575,10 @@ impl Filter {
         if (self.node_name)(&bare.trim_end_matches('.').to_ascii_lowercase(), port) {
             return Err(Refused::own_name(bare));
         }
-        let resolved = match bare.parse::<IpAddr>() {
-            Ok(ip) => vec![SocketAddr::new(ip, port)],
-            Err(_) => tokio::net::lookup_host((bare, port))
-                .await
-                .map_err(|error| Refused(format!("egress: could not resolve {bare}: {error}")))?
-                .collect(),
-        };
-        let mut first_refusal = None;
-        let kept: Vec<SocketAddr> = resolved
-            .into_iter()
-            .filter(|addr| match self.database_address(*addr, allow_loopback) {
-                Ok(()) => true,
-                Err(refusal) => {
-                    first_refusal.get_or_insert(refusal);
-                    false
-                }
-            })
-            .collect();
-        self.kept_or_refused(bare, kept, first_refusal)
+        let resolved = lookup(bare, port).await?;
+        keep(bare, resolved, |addr| {
+            self.database_address(addr, allow_loopback).map(|()| addr)
+        })
     }
 
     fn database_address(&self, addr: SocketAddr, allow_loopback: bool) -> Result<(), Refused> {
@@ -617,64 +601,74 @@ impl Filter {
         port: u16,
         resolved: Vec<SocketAddr>,
     ) -> Result<Vec<SocketAddr>, Refused> {
-        let mut first_refusal = None;
         if let Some(ports) = self.name_ports(name) {
             // A hostname with an exception keeps every address, except one
             // that is a listener of the node on a port it may be dialed on.
             // With the port unknown, that is any allowed port: fail closed.
             let dialed: Vec<u16> = if port == 0 { ports.clone() } else { vec![port] };
-            let kept: Vec<SocketAddr> = resolved
-                .into_iter()
-                .filter(|addr| {
-                    let listener = dialed.iter().any(|port| {
-                        let at = SocketAddr::new(canonical(addr.ip()), *port);
-                        (self.node_endpoint)(at) == NodeEndpoint::Listener
-                    });
-                    if listener {
-                        first_refusal.get_or_insert(Refused::address(addr.ip(), Class::Own));
-                    }
-                    !listener
-                })
-                .collect();
-            return self.kept_or_refused(name, kept, first_refusal);
-        }
-        let kept: Vec<SocketAddr> = resolved
-            .into_iter()
-            .filter_map(|addr| {
-                let dialed =
-                    SocketAddr::new(addr.ip(), if addr.port() == 0 { port } else { addr.port() });
-                // A `host:port` exception for an IP applies to a request that
-                // names the IP, never to a name that resolves to it, so a name
-                // needs a range. The port decides a listener and a published
-                // container port: `connect()` knows it, while `fetch()`
-                // resolves without one and treats every address of the node as
-                // a listener.
-                match self.permits_on(SocketAddr::new(addr.ip(), 0), port) {
-                    Ok(()) => Some(dialed),
-                    Err(refusal) => {
-                        first_refusal.get_or_insert(refusal);
-                        None
-                    }
+            return keep(name, resolved, |addr| {
+                let listener = dialed.iter().any(|port| {
+                    let at = SocketAddr::new(canonical(addr.ip()), *port);
+                    (self.node_endpoint)(at) == NodeEndpoint::Listener
+                });
+                if listener {
+                    Err(Refused::address(addr.ip(), Class::Own))
+                } else {
+                    Ok(addr)
                 }
-            })
-            .collect();
-        self.kept_or_refused(name, kept, first_refusal)
-    }
-
-    fn kept_or_refused(
-        &self,
-        name: &str,
-        kept: Vec<SocketAddr>,
-        first_refusal: Option<Refused>,
-    ) -> Result<Vec<SocketAddr>, Refused> {
-        if kept.is_empty() {
-            return Err(first_refusal.map_or_else(
-                || Refused(format!("egress: {name} did not resolve to any address")),
-                |refusal| Refused(format!("{refusal}; {name} resolves only to such addresses")),
-            ));
+            });
         }
-        Ok(kept)
+        keep(name, resolved, |addr| {
+            let dialed =
+                SocketAddr::new(addr.ip(), if addr.port() == 0 { port } else { addr.port() });
+            // A `host:port` exception for an IP applies to a request that
+            // names the IP, never to a name that resolves to it, so a name
+            // needs a range. The port decides a listener and a published
+            // container port: `connect()` knows it, while `fetch()`
+            // resolves without one and treats every address of the node as
+            // a listener.
+            self.permits_on(SocketAddr::new(addr.ip(), 0), port)
+                .map(|()| dialed)
+        })
     }
+}
+
+/// The addresses of `bare`, an IP literal or a name, resolved once.
+async fn lookup(bare: &str, port: u16) -> Result<Vec<SocketAddr>, Refused> {
+    match bare.parse::<IpAddr>() {
+        Ok(ip) => Ok(vec![SocketAddr::new(ip, port)]),
+        Err(_) => tokio::net::lookup_host((bare, port))
+            .await
+            .map(Iterator::collect)
+            .map_err(|error| Refused(format!("egress: could not resolve {bare}: {error}"))),
+    }
+}
+
+/// The addresses that `check` accepts, as it returns them. The first refusal
+/// explains an answer that is empty.
+fn keep(
+    name: &str,
+    resolved: Vec<SocketAddr>,
+    mut check: impl FnMut(SocketAddr) -> Result<SocketAddr, Refused>,
+) -> Result<Vec<SocketAddr>, Refused> {
+    let mut first_refusal = None;
+    let kept: Vec<SocketAddr> = resolved
+        .into_iter()
+        .filter_map(|addr| match check(addr) {
+            Ok(kept) => Some(kept),
+            Err(refusal) => {
+                first_refusal.get_or_insert(refusal);
+                None
+            }
+        })
+        .collect();
+    if kept.is_empty() {
+        return Err(first_refusal.map_or_else(
+            || Refused(format!("egress: {name} did not resolve to any address")),
+            |refusal| Refused(format!("{refusal}; {name} resolves only to such addresses")),
+        ));
+    }
+    Ok(kept)
 }
 
 fn name_key(name: &str) -> String {
