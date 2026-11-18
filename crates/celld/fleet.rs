@@ -952,6 +952,7 @@ async fn load_worker_at_pointer(
     let secret_stores = crate::secrets::load_stores(
         bucket,
         &manifest,
+        &crate::dev::store_values()?,
         crate::secrets::SecretsKey::from_environment,
     )
     .await?;

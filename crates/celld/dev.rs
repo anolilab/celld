@@ -734,6 +734,28 @@ fn read_dev_vars(config: &Path) -> anyhow::Result<deploy::VarOverrides> {
     Ok(deploy::VarOverrides::DotEnv(vars))
 }
 
+/// The config of the project that this `celld dev` node serves, so the node
+/// can read `.dev.vars` itself. Only the supervisor sets it.
+const CONFIG_ENV: &str = "CELLD_INTERNAL_DEV_CONFIG";
+
+/// The entries of `.dev.vars` or the dotenv files, read now, that fill the
+/// Secrets Store bindings of a deployment. The node calls it each time it
+/// loads a deployment, and keeps the values in memory only, so a secret never
+/// reaches the deployment on disk and a changed file reaches the next load.
+/// Empty outside a `celld dev` node.
+pub fn store_values() -> anyhow::Result<BTreeMap<String, String>> {
+    let (Some(_), Some(config)) = (
+        std::env::var_os("CELLD_INTERNAL_DEV_STORE"),
+        std::env::var_os(CONFIG_ENV),
+    ) else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(match read_dev_vars(Path::new(&config))? {
+        deploy::VarOverrides::DevVars(entries) | deploy::VarOverrides::DotEnv(entries) => entries,
+        deploy::VarOverrides::None => BTreeMap::new(),
+    })
+}
+
 /// The contents of `path`, or `None` when it does not exist. One read, not an
 /// existence probe and then a read, so a file that vanishes between the two
 /// cannot fail the build.
@@ -864,6 +886,7 @@ async fn run_stack(
     console.progress("building the application");
     deploy_project(config, store, options.logs, options.strict_compat_flags).await?;
     let mut running = start_node(
+        config,
         state,
         options.listener,
         options.logs,
@@ -899,8 +922,16 @@ async fn run_stack(
                 }
                 console.progress("restarting the application");
                 stop_running_node(running).await;
-                running =
-                    start_node(state, listener, options.logs, project_hash, store, console).await?;
+                running = start_node(
+                    config,
+                    state,
+                    listener,
+                    options.logs,
+                    project_hash,
+                    store,
+                    console,
+                )
+                .await?;
             }
         }
     }
@@ -925,6 +956,7 @@ enum NodeEvent {
 
 #[allow(clippy::disallowed_methods)] // Child supervision uses real host process and time APIs.
 async fn start_node(
+    config: &Path,
     state: &Path,
     listener: SocketAddr,
     logs: bool,
@@ -972,6 +1004,7 @@ async fn start_node(
             "127.0.0.1:0",
         ])
         .env("CELLD_INTERNAL_DEV_STORE", &store.database)
+        .env(CONFIG_ENV, config)
         .env("CELLD_WATCH", state.join("runtime"))
         .env(crate::operator_token::FILE_ENV, &token_file)
         .env("CELLD_NODE", format!("dev-{}", &project_hash[..12]))

@@ -173,14 +173,20 @@ A store id and a secret name use letters, digits, `-` and `_`, at most 64
 characters. The values are one object, `stores/<store_id>/secrets.json`,
 encrypted as a script's are, and bound to the store and the secret name.
 
-- `celld deploy` and `celld activate` refuse a version whose binding names a
-  secret that the store does not hold, so put the secret before the deploy.
-  The check reads names, and needs no key.
+- `celld deploy`, `celld activate` and a deployment that the control plane
+  sends refuse a version whose binding names a secret that the store does not
+  hold, so put the secret before the deploy. The check reads names, and needs
+  no key.
 - A secret that is deleted after the deploy does not stop the node. The binding
   stays, and `get()` rejects with an error that names the secret and the store.
-- `celld dev` takes the value from `.dev.vars`, from the entry that has the
-  binding's name (`STRIPE=...`), and then needs no store. Without that entry it
-  reads the dev store, as a fleet does.
+- `celld dev` takes the value from the entry that has the binding's name
+  (`STRIPE=...`) in `.dev.vars`, or without that file in `.env.local` and then
+  `.env`, and then needs no store. Without that entry it reads the dev store,
+  as a fleet does. The node reads the file each time it loads the deployment
+  and keeps the value in memory, so the value is never written to the dev state
+  and a change reaches the next reload.
+- A deployment whose Secrets Store binding lacks its `store_id`, `secret_name`
+  or `name` as a string fails to load, and the error names the binding.
 - A binding cannot have the name of another binding, variable or secret of the
   Worker, or be named `__proto__`. A deployment that declares one requires the
   `secrets-store-v1` feature, so a node that predates it refuses the

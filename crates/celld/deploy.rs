@@ -1669,6 +1669,18 @@ pub(crate) fn resolve_config(given: Option<PathBuf>) -> anyhow::Result<PathBuf> 
     )
 }
 
+/// Mark the Secrets Store binding `name` as one that `celld dev` fills from
+/// `.dev.vars` or a dotenv file. The value stays out of the deployment, which
+/// is written to disk; the node reads the file when it loads the deployment.
+fn mark_dev_value(bindings: &mut [Value], name: &str) {
+    if let Some(binding) = bindings
+        .iter_mut()
+        .find(|binding| binding.get("name").and_then(Value::as_str) == Some(name))
+    {
+        binding["dev_value"] = json!(true);
+    }
+}
+
 fn read_project(
     path: &Path,
     root: &Path,
@@ -2385,13 +2397,7 @@ fn read_project(
             VarOverrides::DevVars(entries) => {
                 for (name, value) in entries {
                     if secret_store_bindings.contains(name) {
-                        // The entry is the binding's value, not a var of
-                        // the same name.
-                        if let Some(binding) = bindings.iter_mut().find(|binding| {
-                            binding.get("name").and_then(Value::as_str) == Some(name.as_str())
-                        }) {
-                            binding["value"] = json!(value);
-                        }
+                        mark_dev_value(&mut bindings, name);
                     } else {
                         vars.insert(name.as_str(), value.as_str());
                     }
@@ -2399,9 +2405,14 @@ fn read_project(
             }
             VarOverrides::DotEnv(entries) => {
                 // A config var of the same name is the override the entry
-                // exists for; every other binding owns its name.
+                // exists for, and so is a Secrets Store binding's value;
+                // every other binding owns its name.
                 let taken = bindings
                     .iter()
+                    .filter(|binding| {
+                        binding.get("type").and_then(Value::as_str)
+                            != Some(crate::secrets::STORE_BINDING_TYPE)
+                    })
                     .filter_map(|binding| binding.get("name").and_then(Value::as_str))
                     .chain(
                         assets
@@ -2409,14 +2420,20 @@ fn read_project(
                             .and_then(|assets| assets.config.binding.as_deref()),
                     )
                     .collect::<BTreeSet<_>>();
+                let mut store_values = Vec::new();
                 for (name, value) in entries {
                     if !valid_binding(name) {
                         note!("warning: skipped the dotenv entry {name:?}, which is not a valid binding name");
+                    } else if secret_store_bindings.contains(name) {
+                        store_values.push(name);
                     } else if taken.contains(name.as_str()) {
                         note!("warning: skipped the dotenv entry {name:?}, whose name another binding uses");
                     } else {
                         vars.insert(name, value);
                     }
+                }
+                for name in store_values {
+                    mark_dev_value(&mut bindings, name);
                 }
             }
         }
@@ -4069,15 +4086,41 @@ mod secrets_store_config_tests {
     }
 
     #[test]
-    fn dev_vars_supply_the_value_under_the_binding_name() {
+    fn dev_vars_mark_the_binding_without_writing_the_value() {
         let overrides = VarOverrides::DevVars(BTreeMap::from([
             ("KEY".to_string(), "dev-value".to_string()),
             ("OTHER".to_string(), "plain".to_string()),
         ]));
         let project = read(ENTRY, &overrides).unwrap();
         let bindings = project.metadata["bindings"].as_array().unwrap();
-        assert_eq!(bindings[0]["value"], "dev-value");
+        assert_eq!(bindings[0]["dev_value"], true);
+        assert!(
+            !project.metadata.to_string().contains("dev-value"),
+            "the deployment on disk names the dev value"
+        );
         // The entry is not also a var of the same name.
+        assert_eq!(
+            bindings
+                .iter()
+                .filter(|binding| binding["name"] == "KEY")
+                .count(),
+            1
+        );
+        assert!(
+            bindings.contains(&json!({ "type": "plain_text", "name": "OTHER", "text": "plain" }))
+        );
+    }
+
+    #[test]
+    fn a_dotenv_entry_marks_the_binding_and_is_not_a_clash() {
+        let overrides = VarOverrides::DotEnv(BTreeMap::from([
+            ("KEY".to_string(), "env-value".to_string()),
+            ("OTHER".to_string(), "plain".to_string()),
+        ]));
+        let project = read(ENTRY, &overrides).unwrap();
+        let bindings = project.metadata["bindings"].as_array().unwrap();
+        assert_eq!(bindings[0]["dev_value"], true);
+        assert!(!project.metadata.to_string().contains("env-value"));
         assert_eq!(
             bindings
                 .iter()

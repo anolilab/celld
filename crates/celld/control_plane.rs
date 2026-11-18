@@ -1757,6 +1757,10 @@ pub async fn apply_deployment(
     // leaving a prefix that looks publishable.
     let queue_attachments =
         crate::deploy::prepare_queue_attachments(bucket, &deployment.manifest).await?;
+    // The same refusal as `celld deploy` and `celld activate`: a Secrets Store
+    // binding names a secret its store must hold, or the Worker starts with a
+    // binding that rejects at once.
+    crate::secrets::ensure_store_secrets(bucket, &deployment.manifest).await?;
 
     let mut asset_files = 0_u32;
     let mut asset_bytes = 0_u64;
@@ -2823,4 +2827,57 @@ fn print_credentials_help() {
 fn print_disconnect_help() {
     let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text)
         .help("Revoke and disconnect this Managed Control Plane installation.\n\nUSAGE:\n  celld disconnect --yes\n\nStop every celld process sharing this installation first. Other installations in the fleet are unaffected.");
+}
+
+#[cfg(test)]
+mod store_secret_tests {
+    use super::*;
+
+    /// A managed deployment whose binding names a secret that no store holds.
+    fn deployment() -> AgentDeployment {
+        let sha256 = "0".repeat(64);
+        serde_json::from_value(serde_json::json!({
+            "script_name": "app",
+            "version": "v1",
+            "manifest": {
+                "version": "v1",
+                "script_name": "app",
+                "main_module": "index.js",
+                "do_classes": [],
+                "sqlite_classes": [],
+                "modules": [{ "name": "index.js", "bytes": 1, "sha256": sha256 }],
+                "required_features": ["secrets-store-v1"],
+                "raw_metadata": { "bindings": [{
+                    "type": "secrets_store_secret", "name": "KEY",
+                    "store_id": "st1", "secret_name": "api-key"
+                }] },
+            },
+            "pointer": {
+                "script_name": "app", "version": "v1",
+                "prefix": "deploy/app/v1", "rollout": { "percent": 100 }
+            },
+            "modules": [{
+                "name": "index.js", "sha256": sha256,
+                "download_url": "http://127.0.0.1:1/index.js"
+            }],
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_managed_deployment_needs_the_store_secrets_it_binds() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = Bucket::open_dev(&directory.path().join("objects.sqlite3")).unwrap();
+        let error = apply_deployment(&reqwest::Client::new(), "token", &bucket, &deployment())
+            .await
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("api-key") && error.contains("st1"),
+            "{error}"
+        );
+        // Nothing was published.
+        assert!(bucket.get("deploy/current.json").await.unwrap().is_none());
+    }
 }

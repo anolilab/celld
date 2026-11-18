@@ -94,6 +94,62 @@ async fn celld_dev_reads_the_value_from_dev_vars_under_the_binding_name() {
     assert_nothing_leaks(&server, &[DEV_VALUE]).await;
 }
 
+/// Every byte under the dev state directory, to see whether a value is at rest.
+fn state_holds(project: &std::path::Path, value: &str) -> bool {
+    fn walk(directory: &std::path::Path, value: &[u8], found: &mut bool) {
+        for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, value, found);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                *found |= bytes.windows(value.len()).any(|window| window == value);
+            }
+        }
+    }
+    let mut found = false;
+    walk(&project.join(".celld"), value.as_bytes(), &mut found);
+    found
+}
+
+#[tokio::test]
+async fn a_dev_vars_value_is_not_at_rest_and_a_changed_file_reaches_the_next_load() {
+    let server = Server::start_with_files("secrets-store", &[], write_dev_vars).await;
+    let body: Value = server.get_json("/").await;
+    assert_eq!(body["value"], DEV_VALUE);
+    assert!(
+        !state_holds(server.project(), DEV_VALUE),
+        "the dev state on disk holds the .dev.vars value"
+    );
+    std::fs::write(
+        server.project().join(".dev.vars"),
+        "STORE_KEY=planted-changed-value-3e7a19\n",
+    )
+    .expect("rewrite .dev.vars");
+    assert_eq!(reload(&server).await, 200);
+    let body: Value = server.get_json("/").await;
+    assert_eq!(body["value"], "planted-changed-value-3e7a19", "{body}");
+    assert_nothing_leaks(&server, &[DEV_VALUE, "planted-changed-value-3e7a19"]).await;
+}
+
+#[tokio::test]
+async fn celld_dev_reads_the_value_from_a_dotenv_file() {
+    let server = Server::start_with_files("secrets-store", &[], |project| {
+        std::fs::write(project.join(".env"), "STORE_KEY=from-env-file\n").unwrap();
+        std::fs::write(
+            project.join(".env.local"),
+            format!("STORE_KEY={DEV_VALUE}\n"),
+        )
+        .unwrap();
+    })
+    .await;
+    let body: Value = server.get_json("/").await;
+    // `.env.local` wins over `.env`, and the entry is not a var clash.
+    assert_eq!(body["value"], DEV_VALUE, "{body}");
+    assert_eq!(body["error"], Value::Null);
+    assert!(!state_holds(server.project(), DEV_VALUE));
+    assert_nothing_leaks(&server, &[DEV_VALUE]).await;
+}
+
 #[tokio::test]
 async fn a_worker_reads_a_store_secret_and_a_vanished_one_rejects_get() {
     let key = key_text();
