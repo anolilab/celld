@@ -648,6 +648,24 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 metadata.binding, metadata.id, metadata.tag, metadata.timestamp
             ));
         }
+        for secret in &config.secret_stores {
+            // JSON string syntax is valid JavaScript for any value. `get()`
+            // answers from memory, so a call costs no request.
+            let (settle, text) = match &secret.value {
+                Ok(value) => ("resolve", value),
+                Err(message) => ("reject", message),
+            };
+            let text = serde_json::to_string(text)?;
+            let argument = if settle == "reject" {
+                format!("new Error({text})")
+            } else {
+                text
+            };
+            lines.push_str(&format!(
+                "e[{:?}] = Object.freeze({{ get: () => Promise.{settle}({argument}) }});\n",
+                secret.binding
+            ));
+        }
         if let Some(name) = asset_binding {
             lines.push_str(&format!(
                 "e[{:?}] = __celld.__makeAssetsBinding({:?});\n",

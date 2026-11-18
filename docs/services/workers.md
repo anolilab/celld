@@ -136,6 +136,65 @@ message, or in the output of `celld deploy`.
 Key rotation is not part of this release. To change the key, delete the
 script's secrets, give the new key to every node, and put them again.
 
+## Secrets Store
+
+A `secrets_store_secrets` binding gives a Worker one secret of a store, as it
+does on Cloudflare. The config keeps Cloudflare's three fields, and the Worker
+calls `get()`:
+
+```jsonc
+{
+  "secrets_store_secrets": [
+    { "binding": "STRIPE", "store_id": "billing", "secret_name": "stripe-key" }
+  ]
+}
+```
+
+```js
+const key = await env.STRIPE.get();
+```
+
+`get()` returns a promise for the string. It answers from memory, so a call
+costs nothing. The binding is an object, so `process.env` never holds the
+value.
+
+A store belongs to the fleet and not to a Worker, so every Worker that names
+the same `store_id` reads the same secrets. Fill it with `--store` in place of
+`--script`; the other rules of [Secrets](#secrets) hold (the same key, the
+value from standard input, 5 KiB a value, 128 secrets and 64 KiB a store):
+
+```sh
+printf %s "$STRIPE_KEY" | celld secret put stripe-key --store billing --bucket s3://my-cells-bucket
+celld secret list --store billing --bucket s3://my-cells-bucket
+celld secret delete stripe-key --store billing --bucket s3://my-cells-bucket
+```
+
+A store id and a secret name use letters, digits, `-` and `_`, at most 64
+characters. The values are one object, `stores/<store_id>/secrets.json`,
+encrypted as a script's are, and bound to the store and the secret name.
+
+- `celld deploy` and `celld activate` refuse a version whose binding names a
+  secret that the store does not hold, so put the secret before the deploy.
+  The check reads names, and needs no key.
+- A secret that is deleted after the deploy does not stop the node. The binding
+  stays, and `get()` rejects with an error that names the secret and the store.
+- `celld dev` takes the value from `.dev.vars`, from the entry that has the
+  binding's name (`STRIPE=...`), and then needs no store. Without that entry it
+  reads the dev store, as a fleet does.
+- A binding cannot have the name of another binding, variable or secret of the
+  Worker, or be named `__proto__`. A deployment that declares one requires the
+  `secrets-store-v1` feature, so a node that predates it refuses the
+  deployment.
+- The value does not appear in a log, in `/state`, in an error message, or in
+  the output of `celld deploy`.
+
+A node reads a store when it loads a deployment: one bucket request for each
+distinct store the Worker binds, and none for a Worker that binds none. That
+is in addition to the one request for the Worker's own secrets, and it adds
+nothing per request. A node that has no key does not load a deployment whose
+store holds a secret it binds, and says why. A change reaches a node at its
+next load of the deployment, as a script's secrets do.
+
 ## Differences from Cloudflare
 
 - celld does not manage a custom domain or terminate TLS.

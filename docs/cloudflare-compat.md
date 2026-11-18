@@ -29,6 +29,7 @@ An unsupported feature that does not cause an error is a defect.
 | [Workflows](services/workflows.md) | **Yes** |
 | [R2](services/r2.md) | **Yes** |
 | [Worker secrets](services/workers.md#secrets) | **Partial** — `celld secret` stores them encrypted under a secrets key; no key rotation yet, and a change reaches a node at its next deployment load |
+| [Secrets Store](services/workers.md#secrets-store) | **Yes** — a `secrets_store_secrets` binding reads a store that `celld secret --store` fills; the store is the fleet bucket's, not an account's |
 | Workers AI | **No** |
 | Vectorize | **No** |
 | Hyperdrive | **No** |
@@ -97,7 +98,9 @@ An unsupported feature that does not cause an error is a defect.
 
 Only the binding types in the [services table](#services) are available.
 A secret is a string binding like a `vars` entry; `celld dev` reads it from
-`.dev.vars` and a fleet reads it from `celld secret`.
+`.dev.vars` and a fleet reads it from `celld secret`. A
+[Secrets Store](services/workers.md#secrets-store) secret is an object with
+`get()`, not a string.
 
 ### [Context](https://developers.cloudflare.com/workers/runtime-apis/context/)
 
@@ -471,7 +474,7 @@ The accepted top-level keys:
 - `assets`, `services`, `triggers`, and `vars`
 - `d1_databases`, `kv_namespaces`, `queues`, `workflows`, and
   `r2_buckets`
-- `worker_loaders`, `version_metadata`, and `containers`
+- `worker_loaders`, `version_metadata`, `secrets_store_secrets`, and `containers`
 - `define` and `rules`
 
 Any other top-level key, including `routes`, stops the deployment.

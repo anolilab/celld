@@ -4180,6 +4180,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         .map(str::to_string)
                         .collect(),
                     version_metadata: None,
+                    secret_stores: Vec::new(),
                     assets: None,
                     services: Vec::new(),
                     crons,

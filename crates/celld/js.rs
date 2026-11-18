@@ -1676,6 +1676,9 @@ pub struct WorkerConfig {
     loader_bindings: Vec<String>,
     /// The deployment's `version_metadata` binding, if its config declares one.
     version_metadata: Option<crate::engine_api::VersionMetadata>,
+    /// The deployment's Secrets Store bindings, already resolved. Not in
+    /// `vars`, so `process.env` never holds them.
+    secret_stores: Vec<crate::secrets::StoreSecret>,
     /// Ambient outbound authority. Loaded workers may be denied.
     egress: EgressPolicy,
     /// Structured-clone values and host-minted service routes that a loaded
@@ -1818,6 +1821,7 @@ impl WorkerConfig {
             asset_binding: None,
             loader_bindings: Vec::new(),
             version_metadata: None,
+            secret_stores: Vec::new(),
             egress: EgressPolicy::Allow,
             loader_env: None,
             resource_limits: None,
@@ -1929,6 +1933,12 @@ impl WorkerConfig {
         metadata: Option<crate::engine_api::VersionMetadata>,
     ) -> Self {
         self.version_metadata = metadata;
+        self
+    }
+
+    /// Give this Worker its Secrets Store bindings.
+    pub fn with_secret_stores(mut self, secrets: Vec<crate::secrets::StoreSecret>) -> Self {
+        self.secret_stores = secrets;
         self
     }
 

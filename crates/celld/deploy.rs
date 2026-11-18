@@ -19,8 +19,8 @@ use crate::protocol::{
     DeployPointer, Manifest, ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig,
     QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1,
     FEATURE_CONTAINER_IMAGES_V1, FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_KV_V1,
-    FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1,
-    FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SECRETS_STORE_V1,
+    FEATURE_SQLITE_VEC_V1, FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
     QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
@@ -61,6 +61,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "r2_buckets",
     "worker_loaders",
     "version_metadata",
+    "secrets_store_secrets",
     "containers",
     "no_bundle",
     "define",
@@ -576,6 +577,10 @@ impl Built {
                         format!("env.{name} (Version Metadata)"),
                         "Deployment id, tag and timestamp".to_string(),
                     )),
+                    Some("secrets_store_secret") => {
+                        let secret = binding.get("secret_name").and_then(Value::as_str)?;
+                        Some((format!("env.{name} (Secrets Store)"), secret.to_string()))
+                    }
                     Some("plain_text") => Some((
                         format!("env.{name} (Text)"),
                         "Environment Variable".to_string(),
@@ -758,6 +763,8 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     let uses_d1 = project.do_classes.iter().any(|class| class == D1_CLASS);
     let python_runtime = project.python.is_some();
     let uses_version_metadata = has_binding_type(&project.metadata, "version_metadata");
+    let uses_secrets_store =
+        has_binding_type(&project.metadata, crate::secrets::STORE_BINDING_TYPE);
     let manifest = Manifest {
         schema_version: if asset_reference.is_some() { 2 } else { 1 },
         version: version.clone(),
@@ -827,6 +834,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if uses_version_metadata {
                 features.push(FEATURE_VERSION_METADATA_V1.to_string());
+            }
+            if uses_secrets_store {
+                features.push(FEATURE_SECRETS_STORE_V1.to_string());
             }
             features
         },
@@ -1032,6 +1042,9 @@ pub async fn write(
     // A secret is bound as `env.NAME`, so a binding of the same name would be
     // shadowed. Refuse before anything is uploaded; this reads names only.
     crate::secrets::ensure_no_clash(bucket, &built.manifest).await?;
+    // A Secrets Store binding names a secret its store must already hold, so
+    // a missing one is the deploy's error and not a Worker's first `get()`.
+    crate::secrets::ensure_store_secrets(bucket, &built.manifest).await?;
 
     // Images are fleet-wide and content-addressed like asset bodies, and
     // they are what a node loads before a container class can start.
@@ -2297,6 +2310,58 @@ fn read_project(
         }
         Some(_) => bail!("config `version_metadata` must be an object with a `binding` name"),
     }
+    // `secrets_store_secrets` binds one secret of a Secrets Store. The config
+    // keeps Cloudflare's `store_id` and `secret_name`; the value comes from
+    // the store in the fleet bucket (`celld secret put --store`), or from
+    // `.dev.vars` under the binding name in `celld dev`.
+    let mut secret_store_bindings = BTreeSet::new();
+    match object.get("secrets_store_secrets") {
+        None => {}
+        Some(Value::Array(entries)) => {
+            for entry in entries {
+                let entry = entry.as_object().ok_or_else(|| {
+                    anyhow!("each `secrets_store_secrets` entry must be an object")
+                })?;
+                if let Some(key) = entry
+                    .keys()
+                    .find(|key| !["binding", "store_id", "secret_name"].contains(&key.as_str()))
+                {
+                    bail!("`secrets_store_secrets` sets `{key}`, which is not a supported option");
+                }
+                let text = |field: &str| match entry.get(field) {
+                    None => bail!("a `secrets_store_secrets` entry has no `{field}`"),
+                    Some(Value::String(text)) => Ok(text.as_str()),
+                    Some(_) => bail!("`secrets_store_secrets` `{field}` must be a string"),
+                };
+                let binding = text("binding")?;
+                let store_id = text("store_id")?;
+                let secret_name = text("secret_name")?;
+                if !valid_binding(binding) {
+                    bail!("invalid secrets_store_secrets binding name: {binding:?}");
+                }
+                if !valid_resource_name(store_id) {
+                    bail!(
+                        "invalid secrets store id {store_id:?}: use letters, digits, `-` and `_`, \
+                         at most 64 characters"
+                    );
+                }
+                if !valid_resource_name(secret_name) {
+                    bail!(
+                        "invalid secrets store secret name {secret_name:?}: use letters, digits, \
+                         `-` and `_`, at most 64 characters"
+                    );
+                }
+                secret_store_bindings.insert(binding.to_string());
+                bindings.push(json!({
+                    "type": crate::secrets::STORE_BINDING_TYPE,
+                    "name": binding,
+                    "store_id": store_id,
+                    "secret_name": secret_name,
+                }));
+            }
+        }
+        Some(_) => bail!("config `secrets_store_secrets` must be an array"),
+    }
     let mut vars = BTreeMap::new();
     match object.get("vars") {
         None => {}
@@ -2317,11 +2382,21 @@ fn read_project(
     if main.is_some() {
         match overrides {
             VarOverrides::None => {}
-            VarOverrides::DevVars(entries) => vars.extend(
-                entries
-                    .iter()
-                    .map(|(name, value)| (name.as_str(), value.as_str())),
-            ),
+            VarOverrides::DevVars(entries) => {
+                for (name, value) in entries {
+                    if secret_store_bindings.contains(name) {
+                        // The entry is the binding's value, not a var of
+                        // the same name.
+                        if let Some(binding) = bindings.iter_mut().find(|binding| {
+                            binding.get("name").and_then(Value::as_str) == Some(name.as_str())
+                        }) {
+                            binding["value"] = json!(value);
+                        }
+                    } else {
+                        vars.insert(name.as_str(), value.as_str());
+                    }
+                }
+            }
             VarOverrides::DotEnv(entries) => {
                 // A config var of the same name is the override the entry
                 // exists for; every other binding owns its name.
@@ -2362,6 +2437,7 @@ fn read_project(
             || service_count > 0
             || declared_vars
             || declared_version_metadata
+            || !secret_store_bindings.is_empty()
             || !r2_binding_names.is_empty()
             || !worker_loaders.is_empty())
     {
@@ -3927,5 +4003,96 @@ mod d1_project_root_tests {
             .databases
             .iter()
             .all(|d| d.migrations_dir.starts_with(&target)));
+    }
+}
+
+#[cfg(test)]
+mod secrets_store_config_tests {
+    use super::*;
+
+    const ENTRY: &str = r#""secrets_store_secrets": [{ "binding": "KEY", "store_id": "st1", "secret_name": "api-key" }]"#;
+
+    fn read(extra: &str, overrides: &VarOverrides) -> anyhow::Result<Project> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
+        let path = dir.path().join("wrangler.jsonc");
+        std::fs::write(
+            &path,
+            format!(r#"{{ "name": "app", "main": "index.js", "no_bundle": true, {extra} }}"#),
+        )
+        .unwrap();
+        read_project(&path, dir.path(), overrides, false)
+    }
+
+    #[test]
+    fn the_entry_keeps_the_store_id_and_secret_name() {
+        let project = read(ENTRY, &VarOverrides::None).unwrap();
+        assert_eq!(
+            project.metadata["bindings"][0],
+            json!({
+                "type": "secrets_store_secret", "name": "KEY",
+                "store_id": "st1", "secret_name": "api-key",
+            })
+        );
+    }
+
+    #[test]
+    fn a_malformed_entry_is_refused() {
+        for entry in [
+            r#""secrets_store_secrets": {}"#,
+            r#""secrets_store_secrets": [1]"#,
+            r#""secrets_store_secrets": [{ "store_id": "s", "secret_name": "n" }]"#,
+            r#""secrets_store_secrets": [{ "binding": "K", "secret_name": "n" }]"#,
+            r#""secrets_store_secrets": [{ "binding": "K", "store_id": "s" }]"#,
+            r#""secrets_store_secrets": [{ "binding": "K", "store_id": 1, "secret_name": "n" }]"#,
+            r#""secrets_store_secrets": [{ "binding": "not valid", "store_id": "s", "secret_name": "n" }]"#,
+            r#""secrets_store_secrets": [{ "binding": "K", "store_id": "../s", "secret_name": "n" }]"#,
+            r#""secrets_store_secrets": [{ "binding": "K", "store_id": "s", "secret_name": "a/b" }]"#,
+            r#""secrets_store_secrets": [{ "binding": "K", "store_id": "s", "secret_name": "n", "x": 1 }]"#,
+        ] {
+            assert!(read(entry, &VarOverrides::None).is_err(), "{entry}");
+        }
+    }
+
+    #[test]
+    fn a_binding_name_another_binding_uses_is_refused() {
+        let clash = format!(r#""vars": {{ "KEY": "x" }}, {ENTRY}"#);
+        let error = read(&clash, &VarOverrides::None)
+            .err()
+            .expect("a clash")
+            .to_string();
+        assert!(error.contains("KEY") && error.contains("unique"), "{error}");
+        let twice = r#""secrets_store_secrets": [
+            { "binding": "K", "store_id": "s", "secret_name": "a" },
+            { "binding": "K", "store_id": "s", "secret_name": "b" }]"#;
+        assert!(read(twice, &VarOverrides::None).is_err());
+    }
+
+    #[test]
+    fn dev_vars_supply_the_value_under_the_binding_name() {
+        let overrides = VarOverrides::DevVars(BTreeMap::from([
+            ("KEY".to_string(), "dev-value".to_string()),
+            ("OTHER".to_string(), "plain".to_string()),
+        ]));
+        let project = read(ENTRY, &overrides).unwrap();
+        let bindings = project.metadata["bindings"].as_array().unwrap();
+        assert_eq!(bindings[0]["value"], "dev-value");
+        // The entry is not also a var of the same name.
+        assert_eq!(
+            bindings
+                .iter()
+                .filter(|binding| binding["name"] == "KEY")
+                .count(),
+            1
+        );
+        assert!(
+            bindings.contains(&json!({ "type": "plain_text", "name": "OTHER", "text": "plain" }))
+        );
+    }
+
+    #[test]
+    fn the_deployment_requires_the_secrets_store_feature() {
+        let project = read(ENTRY, &VarOverrides::None).unwrap();
+        assert!(has_binding_type(&project.metadata, "secrets_store_secret"));
     }
 }

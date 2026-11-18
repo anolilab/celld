@@ -73,6 +73,19 @@ impl Server {
         server
     }
 
+    /// [`Self::start`] after `setup` has added files to the project, such as
+    /// a `.dev.vars`.
+    pub async fn start_with_files(
+        fixture: &str,
+        env: &[(&str, &str)],
+        setup: impl FnOnce(&Path),
+    ) -> Server {
+        let mut server = Server::prepare(fixture, env);
+        setup(&server.project);
+        server.launch().await;
+        server
+    }
+
     fn prepare(fixture: &str, env: &[(&str, &str)]) -> Server {
         let dir = TempDir::new().expect("create temp dir");
         let project = dir.path().join("project");
