@@ -5,7 +5,9 @@
 
 /// A hash of `sql` as a shape. Whitespace and comments collapse, keywords and
 /// names fold to lower case, and every literal becomes one placeholder: a
-/// string, a blob, a number, a parameter, and any quoted token (`"..."`,
+/// string, a blob, a number (with its sign when the sign is unary, as in
+/// `a = -1`), `NULL`, `TRUE`, `FALSE` (except after `IS` or `IS NOT`, where
+/// they are part of the shape), a parameter, and any quoted token (`"..."`,
 /// `` `...` `` and `[...]`). A double-quoted token that names no column is a
 /// string to SQLite, so it can hold user data like a single-quoted one; the
 /// fingerprint cannot tell which it is, and treats all of them as literals.
@@ -80,10 +82,21 @@ pub(crate) fn fingerprint(sql: &str) -> u64 {
             break;
         } else if byte.is_ascii_digit()
             || (byte == b'.' && bytes.get(at + 1).is_some_and(u8::is_ascii_digit))
+            || (matches!(byte, b'+' | b'-')
+                && !shape.operand
+                && bytes.get(at + 1).is_some_and(|next| {
+                    next.is_ascii_digit()
+                        || (*next == b'.' && bytes.get(at + 2).is_some_and(u8::is_ascii_digit))
+                }))
         {
-            // Digits, a fraction, an exponent or a hex body. The sign of an
-            // exponent belongs to the number, but `0xe-1` is a subtraction.
-            let hex = byte == b'0' && matches!(bytes.get(at + 1), Some(b'x' | b'X'));
+            // Digits, a fraction, an exponent or a hex body. A sign where an
+            // operand is expected (`a = -1`) belongs to the number; after one
+            // (`a - 1`) it is an operator. The sign of an exponent belongs to
+            // the number, but `0xe-1` is a subtraction.
+            if matches!(byte, b'+' | b'-') {
+                at += 1;
+            }
+            let hex = bytes[at] == b'0' && matches!(bytes.get(at + 1), Some(b'x' | b'X'));
             at += 1;
             while at < bytes.len() {
                 let next = bytes[at];
@@ -135,10 +148,50 @@ struct Shape {
     list_depth: u32,
     /// The last token in the list was a placeholder.
     list_placeholder: bool,
+    /// The last token ended an operand: a name, a literal, a placeholder or
+    /// `)`. A `+` or `-` after one is binary; after anything else it is a sign.
+    operand: bool,
+    /// How far the last words were `IS` (1) or `IS NOT` (2): a `NULL` there
+    /// is part of the shape.
+    after_is: u8,
     /// A comma that followed one, not yet hashed: another placeholder drops
     /// it, and anything else brings it back.
     held_comma: bool,
 }
+
+/// Keywords after which a `+` or `-` is a sign, not an operator: they are
+/// followed by an operand.
+const OPERATOR_KEYWORDS: &[&str] = &[
+    "all",
+    "and",
+    "as",
+    "between",
+    "by",
+    "case",
+    "distinct",
+    "else",
+    "escape",
+    "glob",
+    "having",
+    "in",
+    "is",
+    "like",
+    "limit",
+    "match",
+    "not",
+    "offset",
+    "on",
+    "or",
+    "regexp",
+    "return",
+    "returning",
+    "select",
+    "set",
+    "then",
+    "values",
+    "when",
+    "where",
+];
 
 struct Hash(u64);
 
@@ -172,6 +225,7 @@ impl Shape {
         self.gap = false;
         self.atom = atom;
         self.after_in = false;
+        self.after_is = 0;
     }
 
     fn placeholder(&mut self) {
@@ -183,11 +237,25 @@ impl Shape {
         }
         self.begin(true);
         self.hash.feed(b'?');
+        self.operand = true;
         self.list_placeholder = self.list_depth == 1;
     }
 
     fn word(&mut self, word: &[u8]) {
+        let was_is = self.after_is;
+        let is = |name: &[u8]| word.eq_ignore_ascii_case(name);
+        if was_is == 0 && (is(b"null") || is(b"true") || is(b"false")) {
+            self.placeholder();
+            self.after_is = 0;
+            return;
+        }
         self.begin(true);
+        self.after_is = match (was_is, is(b"is"), is(b"not")) {
+            (_, true, _) => 1,
+            (1, _, true) => 2,
+            _ => 0,
+        };
+        self.operand = !OPERATOR_KEYWORDS.iter().any(|name| is(name.as_bytes()));
         self.list_placeholder = false;
         for byte in word {
             self.hash.feed(byte.to_ascii_lowercase());
@@ -200,10 +268,13 @@ impl Shape {
         let in_list_run = byte == b',' && self.list_depth == 1 && self.list_placeholder;
         if in_list_run {
             self.gap = false;
+            self.operand = false;
+            self.after_is = 0;
             self.held_comma = true;
             return;
         }
         self.begin(false);
+        self.operand = byte == b')';
         self.list_placeholder = false;
         self.hash.feed(byte);
         match byte {
@@ -297,6 +368,75 @@ mod tests {
                 "SELECT * FROM t WHERE a = 3",
             ],
         ]);
+    }
+
+    /// A sign that is unary belongs to its number; a binary one does not.
+    #[test]
+    fn a_unary_sign_is_part_of_its_literal() {
+        assert_one_shape(&[
+            &[
+                "SELECT * FROM t WHERE a = 1",
+                "SELECT * FROM t WHERE a = -1",
+                "SELECT * FROM t WHERE a = +2.5",
+                "SELECT * FROM t WHERE a = ?",
+            ],
+            &[
+                "SELECT * FROM t WHERE a > -.5 AND b < -3",
+                "SELECT * FROM t WHERE a > 1 AND b < 2",
+            ],
+            &[
+                "SELECT * FROM t WHERE a IN (1, 2)",
+                "SELECT * FROM t WHERE a IN (1, -2)",
+                "SELECT * FROM t WHERE a IN (-1, -2, -3)",
+            ],
+            &["SELECT * FROM t LIMIT 1", "SELECT * FROM t LIMIT -1"],
+            &["SELECT 1", "SELECT -1"],
+        ]);
+        // After an operand the sign is an operator, so a subtraction keeps
+        // its minus and differs from the bare operand.
+        assert_one_shape(&[
+            &["SELECT a - 1", "SELECT a -1", "SELECT a - 7"],
+            &["SELECT 1 - 1", "SELECT 2 -3", "SELECT ? - ?"],
+            &["SELECT (a) - 1", "SELECT (a) -2"],
+        ]);
+        for (subtraction, bare) in [
+            ("SELECT a - 1", "SELECT a 1"),
+            ("SELECT 1 - 1", "SELECT 1"),
+            ("SELECT (a) - 1", "SELECT (a) 1"),
+        ] {
+            assert_ne!(fingerprint(subtraction), fingerprint(bare), "{subtraction}");
+        }
+    }
+
+    /// `NULL`, `TRUE` and `FALSE` are literals, except after `IS` and `IS NOT`.
+    #[test]
+    fn null_and_booleans_are_literals_except_after_is() {
+        assert_one_shape(&[
+            &[
+                "SELECT * FROM t WHERE a = NULL",
+                "SELECT * FROM t WHERE a = 1",
+                "SELECT * FROM t WHERE a = true",
+                "SELECT * FROM t WHERE a = FALSE",
+            ],
+            &[
+                "INSERT INTO t VALUES (null, 1)",
+                "INSERT INTO t VALUES (1, 2)",
+            ],
+            &[
+                "SELECT * FROM t WHERE a IS NULL",
+                "SELECT * FROM t WHERE a is null",
+            ],
+        ]);
+        let shapes = [
+            "SELECT * FROM t WHERE a IS NULL",
+            "SELECT * FROM t WHERE a IS NOT NULL",
+            "SELECT * FROM t WHERE a = ?",
+            "SELECT * FROM t WHERE a IS NOT ?",
+        ];
+        let values: Vec<u64> = shapes.iter().map(|sql| fingerprint(sql)).collect();
+        for (index, value) in values.iter().enumerate() {
+            assert!(!values[..index].contains(value), "{}", shapes[index]);
+        }
     }
 
     fn assert_one_shape(groups: &[&[&str]]) {
