@@ -36,6 +36,10 @@ export default {
           headers: { "content-type": "text/event-stream" },
         });
       }
+      case "/stream-multiline":
+      case "/stream-cr":
+      case "/stream-too-big":
+      case "/stream-echo-key":
       case "/stream-error":
       case "/stream-cut":
       case "/stream-bad-json":
@@ -52,6 +56,8 @@ export default {
         });
         return Response.json({ ...result, text });
       }
+      case "/echo-key":
+        return Response.json(await attempt(() => env.AI.run(CHAT, { prompt: "echo-key" })));
       case "/bad-shape":
         return Response.json(await attempt(() => env.AI.run(CHAT, { prompt: "bad-shape" })));
       case "/bad-embedding":

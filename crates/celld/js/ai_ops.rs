@@ -6,13 +6,17 @@
 //! answer. The key stays here: it is neither an argument nor a result.
 //!
 //! The endpoint is the operator's own, so the egress policy does not apply to
-//! it, redirects are not followed, and the call leaves through its own client.
+//! it, redirects are not followed, and the call leaves through its own client,
+//! which trusts the bundled roots only.
 //! A call is a subrequest, and it waits on the output gate like a `fetch`.
 
 use super::*;
 
 thread_local! {
-    static CLIENT: reqwest::Client = crate::tls_roots::apply(reqwest::Client::builder())
+    // celld's own connection, with the bundled roots only: the call carries the
+    // node's credential, so a private authority the operator added for what
+    // Workers dial must not vouch for it.
+    static CLIENT: reqwest::Client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
@@ -123,7 +127,8 @@ pub(super) fn op_ai_run(
             }
             answer.extend_from_slice(&chunk);
         }
-        Ok(String::from_utf8_lossy(&answer).into_owned())
+        // An endpoint may echo the key it was sent.
+        Ok(config.redact(&String::from_utf8_lossy(&answer)))
     });
     rv.set(promise_for(scope, id));
 }

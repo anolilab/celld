@@ -130,6 +130,32 @@ async fn serve(mut stream: tokio::net::TcpStream, log: Arc<Mutex<Vec<Seen>>>) {
                 json!({ "choices": [{ "delta": { "content": "Hel" } }] })
             );
             http(200, "text/event-stream", &text)
+        } else if last == "stream-multiline" {
+            // One event whose JSON is split across two `data:` lines, after a
+            // comment and another field.
+            let text = ": keep-alive\nevent: message\ndata: {\"choices\":\ndata: [{\"delta\":{\"content\":\"Hel\"}}]}\n\ndata: [DONE]\n\n";
+            http(200, "text/event-stream", text)
+        } else if last == "stream-cr" {
+            // Lines that end in a bare CR, and a CRLF.
+            let event = json!({ "choices": [{ "delta": { "content": "Hel" } }] });
+            let text = format!("data: {event}\r\rdata: {event}\r\n\r\ndata: [DONE]\r\r");
+            http(200, "text/event-stream", &text)
+        } else if last == "stream-too-big" {
+            // Valid comment lines, never an event, past the stream's limit.
+            let line = format!(":{}\n", "x".repeat(60_000));
+            http(200, "text/event-stream", &line.repeat(580))
+        } else if last == "stream-echo-key" {
+            let event = json!({ "choices": [{ "delta": { "content": format!("key {KEY}") } }] });
+            http(
+                200,
+                "text/event-stream",
+                &format!("data: {event}\n\ndata: [DONE]\n\n"),
+            )
+        } else if last == "echo-key" {
+            let answer = json!({
+                "choices": [{ "message": { "role": "assistant", "content": format!("key {KEY}") } }],
+            });
+            http(200, "application/json", &answer.to_string())
         } else if last == "stream-long-line" {
             // One event line that never ends, past the stream's line limit.
             http(
@@ -399,4 +425,50 @@ async fn an_answer_without_the_expected_shape_fails_the_call() {
         embed["message"].as_str().unwrap().contains("embedding"),
         "{embed}"
     );
+}
+
+#[tokio::test]
+async fn a_stream_is_read_as_server_sent_events() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    // An event split over two `data:` lines, comments and other fields.
+    let multiline: Value = server.get_json("/stream-multiline").await;
+    assert_eq!(multiline["ok"], true, "{multiline}");
+    assert_eq!(
+        multiline["text"],
+        "data: {\"response\":\"Hel\"}\n\ndata: [DONE]\n\n"
+    );
+    // CR and CRLF line endings.
+    let cr: Value = server.get_json("/stream-cr").await;
+    assert_eq!(cr["ok"], true, "{cr}");
+    assert_eq!(
+        cr["text"],
+        "data: {\"response\":\"Hel\"}\n\ndata: {\"response\":\"Hel\"}\n\ndata: [DONE]\n\n"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_past_the_answer_limit_errors() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    let result: Value = server.get_json("/stream-too-big").await;
+    assert_eq!(result["ok"], false, "{result}");
+    assert!(
+        result["message"].as_str().unwrap().contains("32 MiB"),
+        "{result}"
+    );
+}
+
+#[tokio::test]
+async fn an_upstream_that_echoes_the_key_in_an_answer_does_not_hand_it_over() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    for path in ["/echo-key", "/stream-echo-key"] {
+        let result = server.get_text(path).await;
+        assert!(!result.contains(KEY), "{path}: {result}");
+        assert!(result.contains("key [redacted]"), "{path}: {result}");
+    }
 }

@@ -43,12 +43,14 @@ the node at startup. The settings belong to the node, so a Worker cannot choose
 another endpoint or model. `celld dev` reads the same settings.
 
 The node makes the HTTP call, so the key never enters a Worker. celld does not
-log it, and it removes the key from an upstream error before the Worker sees
-it. A `401` or `403` from the endpoint reaches the Worker without the body.
+log it, and it removes the key from what the endpoint sends back, an error, an
+answer or a stream event, before the Worker sees it. A `401` or `403` from the
+endpoint reaches the Worker without the body.
 
 A request body from the Worker and an answer from the endpoint may each be up
 to 32 MiB. A larger request is refused without a call, and a larger answer
-fails the call with an error that names the limit. The limit applies to the body
+fails the call with an error that names the limit. A stream counts toward the
+same 32 MiB in all. The limit applies to the body
 celld sends, which carries the endpoint's model name and so can be a few bytes
 longer than the Worker's.
 
@@ -61,6 +63,12 @@ The endpoint is the operator's own, so the egress policy (`CELLD_EGRESS`) does
 not apply to it and a private or loopback address works. celld does not follow
 redirects from the endpoint. The call counts as a subrequest, and its time
 limit is `CELLD_FETCH_TIMEOUT_S`.
+
+The call carries the node's key, so it is one of celld's own connections: an
+`https` endpoint must have a certificate from a publicly trusted authority.
+`CELLD_EXTRA_CA_CERTS` applies to what Workers dial and not to this call, so a
+private authority for the endpoint is not supported yet. Use a publicly trusted
+certificate, or plain `http` on a private network.
 
 ## Text generation
 
@@ -85,8 +93,13 @@ const stream = await env.AI.run(model, { prompt, stream: true });
 return new Response(stream, { headers: { "content-type": "text/event-stream" } });
 ```
 
+The endpoint's stream is read as server-sent events: lines may end in CRLF, LF
+or CR, an event is its `data:` lines joined with a line feed, and comments and
+other fields are ignored.
+
 A stream that the endpoint cuts short, that carries an error event or an event
-that is not JSON, or that sends one line longer than 1 MiB, does not end with
+that is not JSON, that sends one event longer than 1 MiB, or that is longer than
+32 MiB in all, does not end with
 `[DONE]`. The stream errors instead, and reading it throws an
 `AiError` with the endpoint's message (without the key), so a Worker cannot
 take a partial answer for a complete one.

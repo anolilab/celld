@@ -9,9 +9,11 @@ const __AI_SAMPLING = [
   "max_tokens", "temperature", "top_p", "seed",
   "frequency_penalty", "presence_penalty",
 ];
-// The most of one upstream event line a stream holds while it waits for the
-// line's end; a longer line errors the stream.
+// The most of one upstream event a stream holds while it waits for the
+// event's end; a longer one errors the stream.
 const __AI_MAX_LINE = 1 << 20;
+// The most of an upstream stream a call reads, as for a whole answer.
+const __AI_MAX_STREAM = 32 << 20;
 const __aiEncoder = new TextEncoder();
 const __aiError = (message) => new Error("AiError: " + message);
 
@@ -61,14 +63,21 @@ function __aiStreamError(event) {
 
 // The upstream's OpenAI stream as Workers AI's: `data: {"response":"..."}`
 // events, then `data: [DONE]`. It reads upstream only as the Worker reads it.
-// An error event, an event that is not JSON, a line past 1 MiB, or an upstream
-// that ends without `[DONE]` errors the stream: a Worker must not take a
-// damaged or cut-off answer for a finished one.
+// The upstream's events are read as server-sent events: lines end in CRLF, LF
+// or CR, an event is its `data:` lines up to a blank line joined with LF, and
+// comments and other fields are ignored. An error event, an event that is not
+// JSON, an event past 1 MiB, a stream past 32 MiB in all, or an upstream that
+// ends without `[DONE]` errors the stream: a Worker must not take a damaged or
+// cut-off answer for a finished one. The node's key is removed from each
+// event before it is read.
 function __aiEventStream(streamId) {
   const reader = new CelldHttpBodyStream(streamId).getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let ended = false;
+  let received = 0;
+  let dataLines = [];
+  let dataSize = 0;
   const finish = (controller) => {
     controller.enqueue(__aiEncoder.encode("data: [DONE]\n\n"));
     controller.close();
@@ -78,49 +87,75 @@ function __aiEventStream(streamId) {
     controller.error(error);
     reader.cancel().catch(() => {});
   };
+  // Reads one complete event; true when the pull is over (an event went out,
+  // the stream ended or it failed).
+  const dispatch = (controller) => {
+    const data = __ai_redact(dataLines.join("\n")).trim();
+    dataLines = [];
+    dataSize = 0;
+    if (data === "[DONE]") {
+      finish(controller);
+      return true;
+    }
+    let event;
+    try {
+      event = JSON.parse(data);
+    } catch {
+      fail(controller, __aiError("the upstream sent a stream event that is not JSON"));
+      return true;
+    }
+    if (event?.error !== undefined && event.error !== null) {
+      fail(controller, __aiStreamError(event));
+      return true;
+    }
+    const out = __aiEventLine(event);
+    if (out === null) return false;
+    controller.enqueue(__aiEncoder.encode(out));
+    return true;
+  };
+  const tooLarge = (controller) =>
+    fail(controller, __aiError("the upstream sent an event larger than 1 MiB"));
   return new ReadableStream({
     async pull(controller) {
       for (;;) {
-        const newline = buffer.indexOf("\n");
-        if (newline > __AI_MAX_LINE || (newline < 0 && buffer.length > __AI_MAX_LINE)) {
-          return fail(
-            controller,
-            __aiError("the upstream sent an event line larger than 1 MiB"));
-        }
-        if (newline < 0) {
-          if (ended) {
-            return fail(
-              controller, __aiError("the upstream stream ended before [DONE]"));
+        const end = /\r\n|\n|\r/.exec(buffer);
+        // A CR at the end of the buffer may be half of a CRLF.
+        if (end !== null && (ended || end.index + end[0].length < buffer.length)) {
+          if (end.index > __AI_MAX_LINE) return tooLarge(controller);
+          const line = buffer.slice(0, end.index);
+          buffer = buffer.slice(end.index + end[0].length);
+          if (line === "") {
+            if (dataLines.length > 0 && dispatch(controller)) return;
+            continue;
           }
-          const { done, value } = await reader.read();
-          if (done) {
-            ended = true;
-            buffer += decoder.decode();
-            if (buffer !== "") buffer += "\n";
-          } else {
-            buffer += decoder.decode(value, { stream: true });
-          }
+          const colon = line.indexOf(":");
+          if (colon === 0 || (colon < 0 ? line : line.slice(0, colon)) !== "data") continue;
+          let value = colon < 0 ? "" : line.slice(colon + 1);
+          if (value.startsWith(" ")) value = value.slice(1);
+          dataSize += value.length + 1;
+          if (dataSize > __AI_MAX_LINE) return tooLarge(controller);
+          dataLines.push(value);
           continue;
         }
-        const line = buffer.slice(0, newline).replace(/\r$/, "");
-        buffer = buffer.slice(newline + 1);
-        if (!line.startsWith("data:")) continue;
-        const data = line.slice(5).trim();
-        if (data === "[DONE]") return finish(controller);
-        let event;
-        try {
-          event = JSON.parse(data);
-        } catch {
-          return fail(
-            controller, __aiError("the upstream sent a stream event that is not JSON"));
+        if (buffer.length > __AI_MAX_LINE) return tooLarge(controller);
+        if (ended) {
+          // The last event may end with the stream and not with a blank line.
+          if (dataLines.length > 0 && dispatch(controller)) return;
+          return fail(controller, __aiError("the upstream stream ended before [DONE]"));
         }
-        if (event?.error !== undefined && event.error !== null) {
-          return fail(controller, __aiStreamError(event));
-        }
-        const out = __aiEventLine(event);
-        if (out !== null) {
-          controller.enqueue(__aiEncoder.encode(out));
-          return;
+        const { done, value } = await reader.read();
+        if (done) {
+          ended = true;
+          buffer += decoder.decode();
+          if (buffer !== "") buffer += "\n";
+        } else {
+          received += value.byteLength;
+          if (received > __AI_MAX_STREAM) {
+            return fail(
+              controller,
+              __aiError("the upstream stream is larger than 32 MiB"));
+          }
+          buffer += decoder.decode(value, { stream: true });
         }
       }
     },

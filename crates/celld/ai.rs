@@ -32,6 +32,10 @@ const KEY_FILE_MAX_BYTES: u64 = 4096;
 /// host reads. Both are held in host memory, outside the isolate's heap limit.
 pub const MAX_BODY_BYTES: usize = 32 << 20;
 
+/// The shortest start of the key that is dropped from the end of an error
+/// body that may have been cut inside the key.
+const MIN_KEY_PREFIX: usize = 4;
+
 /// Which OpenAI-compatible route a `run()` call goes to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Route {
@@ -154,14 +158,14 @@ impl Config {
     fn cut_detail(&self, raw: &[u8], max: usize) -> String {
         let mut raw = raw;
         if let Some(key) = &self.key {
-            if raw.len() >= self.error_read_limit(max) {
-                // The read stopped mid-text, so its end may hold a cut key.
-                let cut = (1..key.len())
-                    .rev()
-                    .find(|&n| raw.ends_with(&key.as_bytes()[..n]))
-                    .unwrap_or(0);
-                raw = &raw[..raw.len() - cut];
-            }
+            // A read that stopped at the limit, on an error or on a timeout
+            // ends mid-text, so its end may hold a cut key: drop a tail that
+            // is the start of the key.
+            let cut = (MIN_KEY_PREFIX.min(key.len())..key.len())
+                .rev()
+                .find(|&n| raw.ends_with(&key.as_bytes()[..n]))
+                .unwrap_or(0);
+            raw = &raw[..raw.len() - cut];
         }
         let mut text = self.redact(String::from_utf8_lossy(raw).trim());
         let mut end = max.min(text.len());
@@ -333,6 +337,16 @@ mod tests {
                 assert!(!detail.contains(&key[..n]), "{start}: {detail}");
             }
         }
+    }
+
+    #[test]
+    fn a_body_cut_inside_the_key_leaves_no_prefix() {
+        // The read ended early, on a reset or a timeout, not at the limit.
+        let key = "sk-secret-key-0123456789";
+        let config = config(Some(key));
+        let raw = format!("boom, your key {}", &key[..10]);
+        let detail = config.cut_detail(raw.as_bytes(), 2048);
+        assert_eq!(detail, "boom, your key");
     }
 
     #[test]
