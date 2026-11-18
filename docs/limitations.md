@@ -53,9 +53,22 @@ A value of `0` removes the limit.
   transaction, so the cell restarts as described in
   [Guarantees](guarantees.md). A D1 `batch`, `exec`, or migration rolls back
   and the database keeps serving.
+- The check runs between SQLite's virtual-machine instructions, so one long
+  instruction (a large sort, `CREATE INDEX`, an extension's scan) can run past
+  the bound before it is interrupted.
 - The size limit counts database pages, so it includes indexes and free pages
-  inside the file. A full disk raises the same error code, and its message
-  names the limit too.
+  inside the file. A write that would grow the file past it fails with the
+  message above, SQLite rolls back the statement or the transaction, and
+  nothing restarts: the database stays consistent and keeps serving reads and
+  writes that fit. This holds for SQL, key-value, D1, `transaction()` and
+  `transactionSync()`, and a Workflow's own storage. A full disk, which raises
+  the same error code while the file is below the limit, still fails the cell
+  closed as described in [Guarantees](guarantees.md).
+- Each database has its own limit: a Durable Object, each of its facets, and
+  each D1 database.
+- A limit set below the size of an existing database does not stop it opening.
+  Reads work, and a write that needs a new page fails until deletes free
+  pages inside the file.
 
 ## Networking and security
 

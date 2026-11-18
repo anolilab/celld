@@ -77,8 +77,16 @@ impl Out {
     }
 }
 
+/// A statement the time bound interrupted says so, with the limit.
 fn error(error: rusqlite::Error) -> String {
-    error.to_string()
+    match &error {
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.extended_code & 0xff == rusqlite::ffi::SQLITE_INTERRUPT =>
+        {
+            crate::sql_limits::interrupted().unwrap_or_else(|| error.to_string())
+        }
+        _ => error.to_string(),
+    }
 }
 
 fn quote_identifier(name: &str) -> String {
@@ -370,6 +378,8 @@ pub fn export(
     let mut rebuild = Vec::new();
     if options.data {
         for object in &chosen {
+            // The time bound is per statement: each table starts its own.
+            crate::sql_limits::arm();
             between(&object.name);
             let (kind, without_rowid) = table_kinds.get(&object.name).cloned().unwrap_or_default();
             let is_virtual = kind == "virtual";
@@ -515,7 +525,12 @@ fn dump_rows(
     let width = names.len();
     let mut rows = statement.query([]).map_err(error)?;
     let mut ordinal = 0_u64;
-    while let Some(row) = rows.next().map_err(error)? {
+    loop {
+        // And each step of a table's rows, as for a cursor.
+        crate::sql_limits::arm();
+        let Some(row) = rows.next().map_err(error)? else {
+            break;
+        };
         ordinal += 1;
         let line = if width == 0 {
             head.clone()

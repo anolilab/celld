@@ -33,9 +33,12 @@ const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_DATABASE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Virtual-machine instructions between two deadline checks. A check costs a
-/// thread-local read and, while a deadline is armed, one clock read, so at this
+/// thread-local read and, while a bound is armed, one clock read, so at this
 /// interval it is a fraction of a percent of a statement that runs for a
-/// millisecond, and a runaway statement overshoots by well under a millisecond.
+/// millisecond. The check runs between instructions, so a statement made of
+/// short instructions overshoots by well under a millisecond, but one long
+/// instruction (a large sort, `CREATE INDEX`, an extension's scan) runs to its
+/// end before the check can interrupt it.
 const PROGRESS_INTERVAL: std::os::raw::c_int = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,8 +76,12 @@ thread_local! {
     /// Replaces the environment's limits on this thread, for tests: cells are
     /// thread-local, so one test's limits do not reach another's.
     static OVERRIDE: Cell<Option<Limits>> = const { Cell::new(None) };
-    /// When the statement now running must have finished, if one is armed.
-    static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// How long the statement now running may take, if one is armed.
+    static TIMEOUT: Cell<Option<Duration>> = const { Cell::new(None) };
+    /// When the handler first saw that statement: the clock is read there and
+    /// not at `arm`, so a statement that ends before its first check never
+    /// reads it.
+    static STARTED: Cell<Option<Instant>> = const { Cell::new(None) };
     /// Set by the handler when it interrupted a statement, until the failure
     /// is reported.
     static EXPIRED: Cell<bool> = const { Cell::new(false) };
@@ -92,21 +99,28 @@ pub(crate) fn set_limits_for_test(limits: Limits) {
 /// Start the clock for the next statement. Called again before each statement
 /// of a batch, so the bound is per statement and not per call.
 pub(crate) fn arm() {
-    let deadline = limits()
-        .statement_timeout
-        .map(|timeout| Instant::now() + timeout);
-    DEADLINE.with(|slot| slot.set(deadline));
+    TIMEOUT.with(|slot| slot.set(limits().statement_timeout));
+    STARTED.with(|slot| slot.set(None));
     EXPIRED.with(|flag| flag.set(false));
 }
 
 pub(crate) fn disarm() {
-    DEADLINE.with(|slot| slot.set(None));
+    TIMEOUT.with(|slot| slot.set(None));
 }
 
 fn handler() -> bool {
-    let expired = DEADLINE
-        .with(Cell::get)
-        .is_some_and(|at| Instant::now() >= at);
+    let Some(timeout) = TIMEOUT.with(Cell::get) else {
+        return false;
+    };
+    let now = Instant::now();
+    let started = STARTED.with(|slot| match slot.get() {
+        Some(started) => started,
+        None => {
+            slot.set(Some(now));
+            now
+        }
+    });
+    let expired = now.duration_since(started) >= timeout;
     if expired {
         EXPIRED.with(|flag| flag.set(true));
     }
@@ -129,24 +143,92 @@ pub(crate) fn install(connection: &mut Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Free disk space below which a `SQLITE_FULL` is taken for a full disk and
+/// not for the size cap.
+const DISK_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Whether a `SQLITE_FULL` on `database` came from the size cap and not from
+/// a full disk. The cap is meant when one is set and either the committed
+/// size has reached it or the disk has room to spare. The second test covers a
+/// write that grew the file past what was committed and was rolled back
+/// before this runs. A cap hit leaves the database consistent, so it is a
+/// plain statement failure; only a full disk fails the cell closed.
+///
+/// # Safety
+/// `database` is the live handle of a cell's connection. Runs statements on
+/// it, which clears its error state: read the message first.
+pub(crate) unsafe fn full_is_cap(database: *mut rusqlite::ffi::sqlite3) -> bool {
+    if limits().max_database_bytes.is_none() {
+        return false;
+    }
+    let pragma = |sql: &std::ffi::CStr| -> Option<i64> {
+        let mut statement = std::ptr::null_mut();
+        let prepared = rusqlite::ffi::sqlite3_prepare_v2(
+            database,
+            sql.as_ptr(),
+            -1,
+            &mut statement,
+            std::ptr::null_mut(),
+        );
+        let value = (prepared == rusqlite::ffi::SQLITE_OK
+            && rusqlite::ffi::sqlite3_step(statement) == rusqlite::ffi::SQLITE_ROW)
+            .then(|| rusqlite::ffi::sqlite3_column_int64(statement, 0));
+        rusqlite::ffi::sqlite3_finalize(statement);
+        value
+    };
+    if matches!(
+        (pragma(c"PRAGMA page_count"), pragma(c"PRAGMA max_page_count")),
+        (Some(pages), Some(max)) if pages >= max
+    ) {
+        return true;
+    }
+    let file = rusqlite::ffi::sqlite3_db_filename(database, c"main".as_ptr());
+    if file.is_null() || *file == 0 {
+        return true;
+    }
+    let file = std::ffi::CStr::from_ptr(file)
+        .to_string_lossy()
+        .into_owned();
+    // The field types differ by platform.
+    #[allow(clippy::unnecessary_cast)]
+    let enough = |disk: nix::sys::statvfs::Statvfs| {
+        disk.blocks_available() as u64 * disk.fragment_size() as u64 >= DISK_MARGIN_BYTES
+    };
+    nix::sys::statvfs::statvfs(std::path::Path::new(&file)).is_ok_and(enough)
+}
+
+/// The message for a statement the time bound interrupted, if it was.
+pub(crate) fn interrupted() -> Option<String> {
+    if !statement_expired() {
+        return None;
+    }
+    let timeout = limits().statement_timeout?;
+    Some(format!(
+        "SQL statement exceeded the time limit of {} ms and was interrupted",
+        timeout.as_millis()
+    ))
+}
+
 /// The message for a failed statement or write that SQLite reports as
 /// `primary` (a primary result code), when one of the two bounds caused it.
-pub(crate) fn explain(primary: i32) -> Option<String> {
+///
+/// # Safety
+/// As for [`full_is_cap`], which this calls for `SQLITE_FULL`.
+pub(crate) unsafe fn explain(
+    primary: i32,
+    database: *mut rusqlite::ffi::sqlite3,
+) -> Option<String> {
     let limits = limits();
     match primary {
-        rusqlite::ffi::SQLITE_INTERRUPT if statement_expired() => {
-            let timeout = limits.statement_timeout?;
-            Some(format!(
-                "SQL statement exceeded the time limit of {} ms and was interrupted",
-                timeout.as_millis()
-            ))
+        rusqlite::ffi::SQLITE_INTERRUPT => interrupted(),
+        rusqlite::ffi::SQLITE_FULL if full_is_cap(database) => {
+            limits.max_database_bytes.map(|bytes| {
+                format!(
+                    "storage limit exceeded: a database cannot grow past {bytes} bytes \
+                     (SQLITE_FULL: database or disk is full)"
+                )
+            })
         }
-        rusqlite::ffi::SQLITE_FULL => limits.max_database_bytes.map(|bytes| {
-            format!(
-                "storage limit exceeded: a database cannot grow past {bytes} bytes \
-                 (SQLITE_FULL: database or disk is full)"
-            )
-        }),
         _ => None,
     }
 }

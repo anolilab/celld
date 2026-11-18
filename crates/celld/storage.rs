@@ -534,7 +534,11 @@ fn allowed_sql_pragma(name: &str, value: Option<&str>) -> bool {
         // and must not run concurrently with an active one — and
         // `write_position` is called from egress paths that can overlap a
         // cursor.
-        "data_version" | "table_list" | "schema_version" => value.is_none(),
+        // `page_count` and `max_page_count` (read-only) let the size-cap check
+        // run on a connection that has its authorizer installed.
+        "data_version" | "table_list" | "schema_version" | "page_count" | "max_page_count" => {
+            value.is_none()
+        }
         "case_sensitive_like"
         | "foreign_keys"
         | "defer_foreign_keys"
@@ -1937,7 +1941,11 @@ pub(crate) fn sql_cursor_start_values(
                                 "Wrong number of parameter bindings for SQL query."
                             ));
                         }
-                        crate::sql_limits::arm();
+                        if saw_prefix {
+                            // The first statement runs under `as_user_sql`'s
+                            // arm; later ones start their own clock.
+                            crate::sql_limits::arm();
+                        }
                         loop {
                             let step = rusqlite::ffi::sqlite3_step(statement);
                             match step {
@@ -1979,7 +1987,9 @@ pub(crate) fn sql_cursor_start_values(
                     if cache_query.is_none() && !cache_busy && !saw_prefix {
                         cache_query = register_cached_sql_statement(scope, query, statement);
                     }
-                    crate::sql_limits::arm();
+                    if saw_prefix {
+                        crate::sql_limits::arm();
+                    }
                     let step = rusqlite::ffi::sqlite3_step(statement);
                     return match step {
                         rusqlite::ffi::SQLITE_ROW => {
@@ -2590,9 +2600,12 @@ fn d1_sqlite_failure(
     let counts_as_open = started_in_transaction
         && !(result_code & 0xff == rusqlite::ffi::SQLITE_INTERRUPT
             && crate::sql_limits::statement_expired());
-    let _ = sqlite_operation_failure(scope, database, counts_as_open, result_code, "d1");
     // SAFETY: database is the live handle owned by the scope's Connection.
-    unsafe { failure_detail(database) }
+    // The message is read before the failure is recorded, which may run
+    // statements and clear it.
+    let detail = unsafe { failure_detail(database) };
+    let _ = sqlite_operation_failure(scope, database, counts_as_open, result_code, "d1");
+    detail
 }
 
 /// Whether `tail` holds another statement. Trivia -- whitespace and comments,
@@ -3364,6 +3377,9 @@ fn with_application_storage_write<T>(
             if let Some(result_code) = result_code {
                 // SAFETY: the handle belongs to this live connection.
                 let database = unsafe { connection.handle() };
+                // What the caller sees is also what a latch keeps.
+                let limit = unsafe { crate::sql_limits::explain(result_code & 0xff, database) };
+                let error = limit.map_or(error, |limit| anyhow::anyhow!(limit));
                 record_sqlite_operation_failure(
                     scope,
                     database,
@@ -3371,9 +3387,7 @@ fn with_application_storage_write<T>(
                     result_code,
                     &error.to_string(),
                 );
-                if let Some(limit) = crate::sql_limits::explain(result_code & 0xff) {
-                    return anyhow::anyhow!(limit);
-                }
+                return error;
             }
             error
         })
@@ -3525,11 +3539,10 @@ fn list_query(
 /// `database` is the live handle of a scope's connection.
 unsafe fn failure_detail(database: *mut rusqlite::ffi::sqlite3) -> String {
     let primary = rusqlite::ffi::sqlite3_extended_errcode(database) & 0xff;
-    crate::sql_limits::explain(primary).unwrap_or_else(|| {
-        CStr::from_ptr(rusqlite::ffi::sqlite3_errmsg(database))
-            .to_string_lossy()
-            .into_owned()
-    })
+    let message = CStr::from_ptr(rusqlite::ffi::sqlite3_errmsg(database))
+        .to_string_lossy()
+        .into_owned();
+    crate::sql_limits::explain(primary, database).unwrap_or(message)
 }
 
 fn sqlite_failure(database: *mut rusqlite::ffi::sqlite3, operation: &str) -> anyhow::Error {
@@ -3566,7 +3579,12 @@ fn record_sqlite_operation_failure(
             && celld_logic::sqlite::SQLITE_INTERRUPT == rusqlite::ffi::SQLITE_INTERRUPT,
     );
     let now_autocommit = unsafe { rusqlite::ffi::sqlite3_get_autocommit(database) != 0 };
-    if celld_logic::sqlite::poisons_actor(result_code, started_in_transaction, now_autocommit) {
+    // A write the size cap refused leaves the database consistent: SQLite
+    // rolled the statement or transaction back, and nothing needs a restart.
+    if celld_logic::sqlite::poisons_actor(result_code, started_in_transaction, now_autocommit)
+        && !(result_code & 0xff == rusqlite::ffi::SQLITE_FULL
+            && unsafe { crate::sql_limits::full_is_cap(database) })
+    {
         latch_sql_critical_error(scope, error.to_string());
     }
 }
@@ -4160,6 +4178,9 @@ mod recycle_tests {
     /// Open a transaction on a database with no room left, and write until
     /// SQLite reports a full disk and discards it.
     fn fill_until_full(scope: &str) {
+        // The page limit stands in for a full disk, so celld's own cap is off:
+        // a cap hit is a plain failure, a full disk is not.
+        limit(None, None);
         limit_pages(scope, page_count(scope) + 2);
         transaction_control(scope, "start", false, "").unwrap();
         let big = vec![7u8; 64 * 1024];
@@ -4400,6 +4421,78 @@ mod recycle_tests {
         assert!(get_stored(scope, "kept").unwrap().is_some());
         sql_cursor_start(scope, "DELETE FROM t", &[]).unwrap();
         put_serialized(scope, "after", b"fits").unwrap();
+        close(scope);
+    }
+
+    /// A D1 batch whose writes would pass the cap fails as a statement error:
+    /// SQLite rolled the bracket back, so nothing is latched or restarted, and
+    /// the database keeps serving reads and smaller writes.
+    #[test]
+    fn a_d1_batch_past_the_size_cap_fails_without_a_restart() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let _ = reports();
+        limit(None, Some(256 * 1024));
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "capped-d1";
+        open_in(&dir, "cell.sqlite", scope);
+        let run = |request: serde_json::Value| -> serde_json::Value {
+            serde_json::from_str(&d1_run_json(scope, &request.to_string())).unwrap()
+        };
+        let made = run(serde_json::json!({"mode": "exec", "sql": "CREATE TABLE t (b BLOB)"}));
+        assert!(made.get("ok").is_some(), "{made}");
+
+        let insert = serde_json::json!({"sql": "INSERT INTO t VALUES (zeroblob(16384))"});
+        let statements: Vec<_> = (0..64).map(|_| insert.clone()).collect();
+        for _ in 0..2 {
+            let failed = run(serde_json::json!({"mode": "batch", "statements": statements}));
+            let message = failed["error"]["message"].as_str().unwrap_or_default();
+            assert!(message.contains("storage limit exceeded"), "{failed}");
+        }
+        let exec = format!("{};", "INSERT INTO t VALUES (zeroblob(16384));".repeat(64));
+        let failed = run(serde_json::json!({"mode": "exec", "sql": exec}));
+        let message = failed["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("storage limit exceeded"), "{failed}");
+
+        assert!(sql_critical_error(scope).is_none(), "the database latched");
+        assert!(reported(scope).is_empty(), "the actor was told");
+        let count = run(serde_json::json!({
+            "mode": "prepared", "sql": "SELECT count(*) AS n FROM t", "first": true,
+        }));
+        assert_eq!(count["ok"]["rows"], serde_json::json!([[0]]), "{count}");
+        let small = run(serde_json::json!({
+            "mode": "prepared", "sql": "INSERT INTO t VALUES (zeroblob(10))", "params": [],
+        }));
+        assert!(small.get("ok").is_some(), "{small}");
+        close(scope);
+    }
+
+    /// An application transaction that hits the cap is a statement error as
+    /// well: the cell is not latched, and the next write runs.
+    #[test]
+    fn a_transaction_past_the_size_cap_fails_without_a_restart() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let _ = reports();
+        limit(None, Some(256 * 1024));
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "capped-transaction";
+        open_in(&dir, "cell.sqlite", scope);
+        put_serialized(scope, "kept", b"small").unwrap();
+
+        transaction_control(scope, "start", false, "").unwrap();
+        let big = vec![7u8; 16 * 1024];
+        let failure = (0..64)
+            .find_map(|i| put_serialized(scope, &format!("big-{i}"), &big).err())
+            .expect("the cap never produced an error");
+        assert!(
+            failure.to_string().contains("storage limit exceeded"),
+            "{failure:#}"
+        );
+        assert!(sql_critical_error(scope).is_none(), "the cell latched");
+        assert!(reported(scope).is_empty(), "the actor was told");
+        put_serialized(scope, "after", b"fits").unwrap();
+        assert!(get_stored(scope, "kept").unwrap().is_some());
         close(scope);
     }
 }
