@@ -135,6 +135,9 @@ pub fn surplus(
     let donor = fleet
         .members
         .iter()
+        // A weightless member ties with every other on the cross-product, so
+        // the node id could elect it; it can never be a donor.
+        .filter(|member| member.weight > 0)
         .max_by(|left, right| left.denser(right))?;
     if donor.peer.node != self_node {
         return None;
@@ -217,5 +220,22 @@ mod tests {
         assert_eq!(targets, [50, 50, 0]);
         // The densest node still has a surplus to give, to the one hosting peer.
         assert!(surplus(&peers, "a", 50_000, 60_000, 0, 100).is_some_and(|n| n > 0));
+    }
+
+    #[test]
+    fn an_ingress_only_node_is_never_elected_donor_by_the_id_tie_break() {
+        // "a-edge" sorts before every host and ties with them on density.
+        let peers = [
+            peer("a-edge", 0, true),
+            peer("b", 70, false),
+            peer("c", 30, false),
+        ];
+        assert!(surplus(&peers, "b", 50_000, 60_000, 0, 100).is_some_and(|n| n > 0));
+        assert_eq!(surplus(&peers, "c", 50_000, 60_000, 0, 100), None);
+        assert_eq!(surplus(&peers, "a-edge", 50_000, 60_000, 0, 100), None);
+        assert_eq!(
+            receivers(&peers, "b", 50_000, 60_000),
+            vec!["c".to_string()]
+        );
     }
 }
