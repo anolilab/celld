@@ -13,6 +13,7 @@ mod tokio_select;
 pub use tokio_select::__asyncrt_select_support;
 
 pub mod actor;
+pub mod ai;
 pub mod assets;
 pub mod asyncrt;
 pub mod bucket;

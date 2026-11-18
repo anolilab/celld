@@ -120,11 +120,13 @@ static HARNESS_SOURCE: v8::OneByteConst =
     v8::String::create_external_onebyte_const(HARNESS.as_bytes());
 
 /// The harness and the services it shares with the workerd engine, which
-/// each end in a function declaration the harness calls.
+/// each end in a function declaration the harness calls, then the Workers AI
+/// client, which is plain statements of the same function body.
 const HARNESS: &str = concat!(
     include_str!("harness.js"),
     include_str!("services/kv.js"),
-    include_str!("services/ratelimit.js")
+    include_str!("services/ratelimit.js"),
+    include_str!("services/ai.js")
 );
 
 fn bootstrap_code_cache() -> &'static std::sync::Mutex<BootstrapCache> {
@@ -734,6 +736,9 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 "e[{:?}] = __celld.__makeHyperdrive({info});\n",
                 binding.binding
             ));
+        }
+        if let Some(name) = &config.ai_binding {
+            lines.push_str(&format!("e[{name:?}] = __celld.__makeAi();\n"));
         }
         if let Some(name) = asset_binding {
             lines.push_str(&format!(

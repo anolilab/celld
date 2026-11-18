@@ -132,6 +132,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_VERSION_METADATA_V1,
     FEATURE_SECRETS_STORE_V1,
     FEATURE_HYPERDRIVE_V1,
+    FEATURE_AI_V1,
 ];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
@@ -176,6 +177,10 @@ pub const FEATURE_SECRETS_STORE_V1: &str = "secrets-store-v1";
 /// them would build an `env` missing the binding, and the application would
 /// fail only when it first reads `env.<name>.connectionString`.
 pub const FEATURE_HYPERDRIVE_V1: &str = "hyperdrive-v1";
+/// A deployment with an `ai` binding. Required because a node without it would
+/// build an `env` missing the binding, and the application would fail only
+/// when it first calls `env.AI.run()`.
+pub const FEATURE_AI_V1: &str = "ai-v1";
 /// A deployment with `workflows` bindings. Required because a build without
 /// the reserved workflow cell would load the manifest, build an `env` missing
 /// the binding, and fail only when the application first calls `create()` —
@@ -303,6 +308,47 @@ pub fn validate_ratelimit_manifest(
         "Rate Limiting deployment does not install the reserved SQLite {class} class"
     );
     Ok(bindings)
+}
+
+/// The name of the Workers AI binding of a manifest, `None` without one. A
+/// binding without a string name is an error: dropping it would leave the
+/// Worker without `env.AI` and a failure far from the cause. So is a second
+/// binding (a Worker has one `ai` binding, and only one would be installed) and
+/// a manifest that does not require [`FEATURE_AI_V1`].
+#[doc(hidden)]
+pub fn ai_binding(manifest: &Manifest) -> anyhow::Result<Option<String>> {
+    let mut name = None;
+    for (position, binding) in manifest
+        .raw_metadata
+        .get("bindings")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|binding| binding.get("type").and_then(serde_json::Value::as_str) == Some("ai"))
+        .enumerate()
+    {
+        let this = binding
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("the Workers AI binding #{position} has no string name")
+            })?;
+        anyhow::ensure!(
+            name.is_none(),
+            "a Worker has one Workers AI binding, and the manifest has more"
+        );
+        name = Some(this.to_string());
+    }
+    anyhow::ensure!(
+        name.is_none()
+            || manifest
+                .required_features
+                .iter()
+                .any(|f| f == FEATURE_AI_V1),
+        "Workers AI deployment does not require {FEATURE_AI_V1}"
+    );
+    Ok(name)
 }
 
 /// Validate every Queue value before a deployment becomes runtime state.
@@ -749,5 +795,53 @@ mod ratelimit_manifest_tests {
         broken.raw_metadata["bindings"][0]["simple"]["period"] = json!(30);
         let error = validate_ratelimit_manifest(&broken).unwrap_err();
         assert!(error.to_string().contains("invalid ratelimit binding"));
+    }
+}
+
+#[cfg(test)]
+mod ai_manifest_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn manifest(bindings: serde_json::Value) -> Manifest {
+        serde_json::from_value(json!({
+            "version": "v", "script_name": "s", "main_module": "index.js",
+            "do_classes": [], "sqlite_classes": [], "modules": [],
+            "required_features": [FEATURE_AI_V1],
+            "raw_metadata": { "bindings": bindings }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_ai_binding_is_named_and_a_nameless_one_is_refused() {
+        assert_eq!(ai_binding(&manifest(json!([]))).unwrap(), None);
+        let named = manifest(json!([{ "type": "ai", "name": "AI" }]));
+        assert_eq!(ai_binding(&named).unwrap().as_deref(), Some("AI"));
+        for bad in [json!({ "type": "ai" }), json!({ "type": "ai", "name": 3 })] {
+            let error = ai_binding(&manifest(json!([bad]))).unwrap_err().to_string();
+            assert!(error.contains("Workers AI binding #0"), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_ai_binding_needs_the_feature() {
+        let mut without = manifest(json!([{ "type": "ai", "name": "AI" }]));
+        without.required_features.clear();
+        let error = ai_binding(&without).unwrap_err().to_string();
+        assert!(error.contains(FEATURE_AI_V1), "{error}");
+        // No AI binding, no feature needed.
+        without.raw_metadata = json!({ "bindings": [] });
+        assert_eq!(ai_binding(&without).unwrap(), None);
+    }
+
+    #[test]
+    fn a_second_ai_binding_is_refused() {
+        let two = manifest(json!([
+            { "type": "ai", "name": "AI" },
+            { "type": "ai", "name": "OTHER" }
+        ]));
+        let error = ai_binding(&two).unwrap_err().to_string();
+        assert!(error.contains("one Workers AI binding"), "{error}");
     }
 }

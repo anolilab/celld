@@ -92,12 +92,13 @@ const REMOVED: &[Removed] = &[
     },
     Removed {
         name: "CELLD_AI_BINDING",
-        replacement: "remove this setting; call the AI provider from application code",
+        replacement:
+            "declare `ai` in the project config, and set CELLD_AI_BASE_URL and CELLD_AI_MODELS on the node",
         empty_was_inert: false,
     },
     Removed {
         name: "CELLD_AI_URL",
-        replacement: "remove this setting; call the AI provider from application code",
+        replacement: "set CELLD_AI_BASE_URL, CELLD_AI_MODELS and CELLD_AI_API_KEY_FILE",
         empty_was_inert: false,
     },
     Removed {
@@ -302,6 +303,7 @@ pub fn validate() -> anyhow::Result<()> {
     // load. The file is read at load, like the operator token file above.
     crate::secrets::SecretsKey::from_variable()?;
     crate::egress_filter::from_env()?;
+    crate::ai::validate()?;
     crate::tls_roots::extra()?;
     crate::container::FenceNodeNetns::from_env()?;
 

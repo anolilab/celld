@@ -9,7 +9,8 @@ use std::fs::File;
 use std::io::Read as _;
 use std::path::Path;
 
-use anyhow::Context as _;
+use anyhow::{bail, Context as _};
+use zeroize::Zeroizing;
 
 /// Open `path` for reading without blocking on a named pipe that has no
 /// writer. Whether it is a regular file is checked by the caller, on the open
@@ -64,6 +65,92 @@ pub(crate) fn read(path: &Path, max_bytes: u64) -> anyhow::Result<String> {
     read_open(file, path, max_bytes)
 }
 
+/// A credential taken from the environment, and where it came from.
+pub(crate) struct Credential {
+    pub text: Zeroizing<String>,
+    /// `NAME` for a variable, `NAME_FILE (path)` for a file, for an error.
+    pub origin: String,
+}
+
+/// How a credential file that other users can read is reported: the `event`
+/// field of the log line, so that a filter on it keeps working, and what the
+/// file holds, for its message.
+pub(crate) struct SharedWarning {
+    pub event: &'static str,
+    pub subject: &'static str,
+}
+
+/// The credential in the variable `variable` or in the file that the variable
+/// `file_variable` names, or `None` when neither is set. A blank value is
+/// unset. Setting both is refused, since a node and an operator that read
+/// different ones would disagree. A file that other users can read is a
+/// warning, as a container secret mount is often mode 0644.
+pub(crate) fn variable_or_file(
+    variable: &str,
+    file_variable: &str,
+    max_bytes: u64,
+    shared: &SharedWarning,
+) -> anyhow::Result<Option<Credential>> {
+    choose(
+        (variable, crate::env_vars::value(variable)?),
+        (file_variable, crate::env_vars::value(file_variable)?),
+        max_bytes,
+        shared,
+    )
+}
+
+pub(crate) fn choose(
+    (variable, text): (&str, Option<String>),
+    (file_variable, path): (&str, Option<String>),
+    max_bytes: u64,
+    shared: &SharedWarning,
+) -> anyhow::Result<Option<Credential>> {
+    let text = text
+        .map(Zeroizing::new)
+        .filter(|text| !text.trim().is_empty());
+    let path = path.filter(|path| !path.trim().is_empty());
+    match (text, path) {
+        (None, None) => Ok(None),
+        (Some(text), None) => Ok(Some(Credential {
+            text,
+            origin: variable.to_string(),
+        })),
+        (None, Some(path)) => {
+            let path = Path::new(&path);
+            let text = Zeroizing::new(
+                read(path, max_bytes).with_context(|| format!("read {file_variable}"))?,
+            );
+            warn_if_shared(shared, path);
+            Ok(Some(Credential {
+                text,
+                origin: format!("{file_variable} ({})", path.display()),
+            }))
+        }
+        (Some(_), Some(_)) => bail!("set only one of {variable} and {file_variable}"),
+    }
+}
+
+/// Log that the credential file can be read by other users.
+#[cfg(unix)]
+fn warn_if_shared(shared: &SharedWarning, path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                event = shared.event,
+                path = %path.display(),
+                mode = format!("{mode:o}"),
+                "the {} can be read by other users; restrict it to its owner",
+                shared.subject
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_shared(_shared: &SharedWarning, _path: &Path) {}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -96,5 +183,38 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
         let error = read(&path, 16).unwrap_err();
         assert!(format!("{error:#}").contains("not a regular file"));
+    }
+
+    #[test]
+    fn a_blank_variable_is_unset_and_both_set_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        std::fs::write(&path, "from-file\n").unwrap();
+        let path = path.to_str().unwrap().to_string();
+        let pick = |text: Option<&str>, file: Option<&str>| {
+            choose(
+                ("KEY", text.map(String::from)),
+                ("KEY_FILE", file.map(String::from)),
+                16,
+                &SharedWarning {
+                    event: "test_key_file_shared",
+                    subject: "test key file",
+                },
+            )
+        };
+        assert!(pick(None, None).unwrap().is_none());
+        assert!(pick(Some("  "), Some("")).unwrap().is_none());
+        let credential = pick(Some("abc"), Some(" ")).unwrap().unwrap();
+        assert_eq!(
+            (credential.text.as_str(), credential.origin.as_str()),
+            ("abc", "KEY")
+        );
+        let credential = pick(Some(""), Some(&path)).unwrap().unwrap();
+        assert_eq!(credential.text.trim(), "from-file");
+        assert!(credential.origin.starts_with("KEY_FILE ("));
+        let error = pick(Some("abc"), Some(&path)).err().unwrap().to_string();
+        assert!(error.contains("only one"), "{error}");
+        let error = format!("{:#}", pick(None, Some("/nonexistent/key")).err().unwrap());
+        assert!(error.contains("KEY_FILE"), "{error}");
     }
 }

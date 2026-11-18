@@ -17,10 +17,10 @@ use crate::note;
 use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, ComponentPointer,
     DeployPointer, Manifest, ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig,
-    QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1,
-    FEATURE_CONTAINER_IMAGES_V1, FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_HYPERDRIVE_V1,
-    FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1,
-    FEATURE_RATELIMIT_V1, FEATURE_SECRETS_STORE_V1, FEATURE_SQLITE_VEC_V1,
+    QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_AI_V1, FEATURE_ASSETS_V1,
+    FEATURE_CONTAINERS_V1, FEATURE_CONTAINER_IMAGES_V1, FEATURE_CRON_V1, FEATURE_D1_V1,
+    FEATURE_HYPERDRIVE_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1,
+    FEATURE_R2_V1, FEATURE_RATELIMIT_V1, FEATURE_SECRETS_STORE_V1, FEATURE_SQLITE_VEC_V1,
     FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
     QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
@@ -66,6 +66,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "version_metadata",
     "secrets_store_secrets",
     "hyperdrive",
+    "ai",
     "containers",
     "no_bundle",
     "define",
@@ -603,6 +604,7 @@ impl Built {
                         let id = binding.get("id").and_then(Value::as_str)?;
                         Some((format!("env.{name} (Hyperdrive)"), id.to_string()))
                     }
+                    Some("ai") => Some((format!("env.{name} (AI)"), "Workers AI".to_string())),
                     Some("plain_text") => Some((
                         format!("env.{name} (Text)"),
                         "Environment Variable".to_string(),
@@ -788,6 +790,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     let uses_secrets_store =
         has_binding_type(&project.metadata, crate::secrets::STORE_BINDING_TYPE);
     let uses_hyperdrive = has_binding_type(&project.metadata, crate::hyperdrive::BINDING_TYPE);
+    let uses_ai = has_binding_type(&project.metadata, "ai");
     let manifest = Manifest {
         schema_version: if asset_reference.is_some() { 2 } else { 1 },
         version: version.clone(),
@@ -866,6 +869,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if uses_hyperdrive {
                 features.push(FEATURE_HYPERDRIVE_V1.to_string());
+            }
+            if uses_ai {
+                features.push(FEATURE_AI_V1.to_string());
             }
             features
         },
@@ -1755,6 +1761,34 @@ fn entry_text<'a>(
     }
 }
 
+/// The binding name of a config key that declares one env binding and nothing
+/// else, as `{ "binding": "NAME" }`. `None` when the key is absent.
+fn single_binding<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> anyhow::Result<Option<&'a str>> {
+    let declaration = match object.get(key) {
+        None => return Ok(None),
+        Some(Value::Object(declaration)) => declaration,
+        Some(_) => bail!("config `{key}` must be an object with a `binding` name"),
+    };
+    if let Some(option) = declaration
+        .keys()
+        .find(|option| option.as_str() != "binding")
+    {
+        bail!("`{key}` sets `{option}`, which is not a supported option");
+    }
+    let binding = match declaration.get("binding") {
+        None => bail!("`{key}` has no `binding` name"),
+        Some(Value::String(binding)) => binding.as_str(),
+        Some(_) => bail!("`{key}` `binding` must be a string"),
+    };
+    if !valid_binding(binding) {
+        bail!("invalid {key} binding name: {binding:?}");
+    }
+    Ok(Some(binding))
+}
+
 fn read_project(
     path: &Path,
     root: &Path,
@@ -2381,28 +2415,13 @@ fn read_project(
     // `version_metadata` names one env binding that reports the deployment's
     // id, tag and creation time. The values come from the manifest at load
     // time; the config carries only the name.
-    let mut declared_version_metadata = false;
-    match object.get("version_metadata") {
-        None => {}
-        Some(Value::Object(metadata)) => {
-            if let Some(key) = metadata.keys().find(|key| key.as_str() != "binding") {
-                bail!("`version_metadata` sets `{key}`, which is not a supported option");
-            }
-            let binding = match metadata.get("binding") {
-                None => bail!("`version_metadata` has no `binding` name"),
-                Some(Value::String(binding)) => binding.as_str(),
-                Some(_) => bail!("`version_metadata` `binding` must be a string"),
-            };
-            if !valid_binding(binding) {
-                bail!("invalid version_metadata binding name: {binding:?}");
-            }
-            declared_version_metadata = true;
-            bindings.push(json!({
-                "type": "version_metadata",
-                "name": binding,
-            }));
-        }
-        Some(_) => bail!("config `version_metadata` must be an object with a `binding` name"),
+    let version_metadata = single_binding(object, "version_metadata")?;
+    let declared_version_metadata = version_metadata.is_some();
+    if let Some(binding) = version_metadata {
+        bindings.push(json!({
+            "type": "version_metadata",
+            "name": binding,
+        }));
     }
     // `secrets_store_secrets` binds one secret of a Secrets Store. The config
     // keeps Cloudflare's `store_id` and `secret_name`; the value comes from
@@ -2475,6 +2494,16 @@ fn read_project(
             "type": crate::hyperdrive::BINDING_TYPE,
             "name": binding,
             "id": id,
+        }));
+    }
+    // `ai` names one env binding for Workers AI. The endpoint, key and model
+    // map belong to the node, so the config carries only the name.
+    let ai = single_binding(object, "ai")?;
+    let declared_ai = ai.is_some();
+    if let Some(binding) = ai {
+        bindings.push(json!({
+            "type": "ai",
+            "name": binding,
         }));
     }
     let mut vars = BTreeMap::new();
@@ -2591,6 +2620,7 @@ fn read_project(
             || declared_version_metadata
             || !secret_store_bindings.is_empty()
             || !hyperdrive_bindings.is_empty()
+            || declared_ai
             || !r2_binding_names.is_empty()
             || !worker_loaders.is_empty())
     {
@@ -3928,7 +3958,7 @@ mod container_image_tests {
 mod version_metadata_config_tests {
     use super::*;
 
-    fn read(config: &str) -> anyhow::Result<Project> {
+    pub(super) fn read(config: &str) -> anyhow::Result<Project> {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
         let path = dir.path().join("wrangler.jsonc");
@@ -3936,7 +3966,7 @@ mod version_metadata_config_tests {
         read_project(&path, dir.path(), &VarOverrides::None, false)
     }
 
-    fn base(extra: &str) -> String {
+    pub(super) fn base(extra: &str) -> String {
         format!(r#"{{ "name": "app", "main": "index.js", "no_bundle": true, {extra} }}"#)
     }
 
@@ -4441,5 +4471,34 @@ mod hyperdrive_config_tests {
         )
         .unwrap();
         assert!(read_project(&path, dir.path(), &VarOverrides::None, false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod ai_config_tests {
+    use super::version_metadata_config_tests::{base, read};
+    use super::*;
+
+    #[test]
+    fn the_binding_becomes_an_ai_entry_and_requires_the_feature() {
+        let project = read(&base(r#""ai": { "binding": "AI" }"#)).unwrap();
+        assert!(project.metadata["bindings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({ "type": "ai", "name": "AI" })));
+    }
+
+    #[test]
+    fn a_malformed_declaration_is_refused() {
+        for extra in [
+            r#""ai": "AI""#,
+            r#""ai": {}"#,
+            r#""ai": { "binding": 1 }"#,
+            r#""ai": { "binding": "not valid" }"#,
+            r#""ai": { "binding": "AI", "staging": true }"#,
+            r#""ai": { "binding": "X" }, "vars": { "X": "y" }"#,
+        ] {
+            assert!(read(&base(extra)).is_err(), "{extra}");
+        }
     }
 }

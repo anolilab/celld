@@ -813,12 +813,6 @@ async fn load_worker_at_pointer(
     }
     crate::protocol::validate_required_features(&manifest.required_features)?;
     crate::protocol::validate_queue_manifest(&manifest)?;
-    // Old managed uploads can contain AI metadata without a required-feature
-    // gate. Refuse it before loading code, rather than serve a missing binding.
-    anyhow::ensure!(
-        bindings(&manifest, "ai").next().is_none(),
-        "AI bindings are not supported; call the provider from application code"
-    );
     let prefix = &pointer.prefix;
     let mut fetched =
         futures_util::future::try_join_all(manifest.modules.iter().map(|module| async move {
@@ -936,6 +930,7 @@ async fn load_worker_at_pointer(
     let version_metadata = bindings(&manifest, "version_metadata")
         .find_map(|binding| binding.get("name")?.as_str())
         .map(|binding| manifest.version_metadata(binding));
+    let ai_binding = crate::protocol::ai_binding(&manifest)?;
     let services = service_bindings(&manifest);
     let mut vars = worker_vars(&manifest);
     // Secrets are decrypted here, once per deployment load, and join the vars
@@ -1024,6 +1019,7 @@ async fn load_worker_at_pointer(
         version_metadata,
         secret_stores,
         hyperdrive,
+        ai_binding,
         assets,
         services,
         crons,
@@ -1048,6 +1044,8 @@ pub struct LoadedDeployment {
     pub secret_stores: Vec<crate::secrets::StoreSecret>,
     /// The deployment's Hyperdrive bindings, with their connection strings.
     pub hyperdrive: Vec<crate::hyperdrive::HyperdriveBinding>,
+    /// The `env` name of the deployment's `ai` binding, if it declares one.
+    pub ai_binding: Option<String>,
     pub assets: Option<crate::assets::AssetResolver>,
     pub services: Vec<(String, String, Option<String>)>,
     /// `triggers.crons` from the manifest, driving the reserved cron cell.
