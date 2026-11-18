@@ -418,6 +418,7 @@ pub struct VersionMetadata {
     pub timestamp: String,
 }
 
+#[derive(Default)]
 pub struct WorkerConfigOptions {
     pub src: String,
     pub script_name: String,
@@ -428,6 +429,7 @@ pub struct WorkerConfigOptions {
     pub kv_bindings: Vec<(String, String)>,
     pub queue_bindings: Vec<QueueBinding>,
     pub ratelimit_bindings: Vec<RateLimitBinding>,
+    pub send_email_bindings: Vec<crate::email::SendEmailBinding>,
     pub queue_consumers: Vec<crate::protocol::QueueConsumerConfig>,
     pub workflow_bindings: Vec<WorkflowBinding>,
     pub vars: Vec<(String, String)>,

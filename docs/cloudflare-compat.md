@@ -35,7 +35,7 @@ An unsupported feature that does not cause an error is a defect.
 | Vectorize | **No** |
 | [Hyperdrive](services/hyperdrive.md) | **Partial** — a `hyperdrive` binding hands the Worker a direct connection to its own Postgres or MySQL; no pooling and no query cache, and `host` and `port` name the database itself |
 | Browser Rendering | **No** |
-| Email Workers | **No** |
+| [Email](services/email.md) | **Partial** — `send_email` delivers through an SMTP server the operator configures; the `email()` handler is unavailable |
 | [Python Workers](services/workers.md#python-workers) | **Partial** — `fetch` handlers on the Pyodide 0.28 runtime line |
 
 ## Runtime APIs
@@ -110,7 +110,8 @@ A secret is a string binding like a `vars` entry; `celld dev` reads it from
 
 ### [Handlers](https://developers.cloudflare.com/workers/runtime-apis/handlers/)
 
-The `tail` and `email` handlers are unavailable.
+The `tail` and `email` handlers are unavailable. A Worker can send mail with the
+[`send_email` binding](services/email.md), but cannot receive it.
 
 ### [RPC](https://developers.cloudflare.com/workers/runtime-apis/rpc/)
 
@@ -476,8 +477,8 @@ The accepted top-level keys:
 - `compatibility_date` and `compatibility_flags`
 - `durable_objects` and `migrations`
 - `assets`, `services`, `triggers`, and `vars`
-- `d1_databases`, `kv_namespaces`, `queues`, `ratelimits`, `workflows`, and
-  `r2_buckets`
+- `d1_databases`, `kv_namespaces`, `queues`, `ratelimits`, `send_email`,
+  `workflows`, and `r2_buckets`
 - `worker_loaders`, `version_metadata`, `secrets_store_secrets`, `hyperdrive`, `ai`, and
   `containers`
 - `define` and `rules`

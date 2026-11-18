@@ -46,6 +46,7 @@ static_source!(MESSAGE_CHANNEL_SOURCE, "message_channel.js");
 static_source!(EVENT_SOURCE_SOURCE, "event_source.js");
 static_source!(CACHE_SOURCE, "cache.js");
 static_source!(SOCKETS_SOURCE, "sockets.js");
+static_source!(EMAIL_SOURCE, "email.js");
 static_source!(HTML_REWRITER_SOURCE, "html_rewriter.js");
 static_source!(CRYPTO_SOURCE, "crypto.js");
 
@@ -100,6 +101,10 @@ static POST_HARNESS: &[BootstrapSource] = &[
     BootstrapSource {
         name: "sockets.js",
         source: &SOCKETS_SOURCE,
+    },
+    BootstrapSource {
+        name: "email.js",
+        source: &EMAIL_SOURCE,
     },
     BootstrapSource {
         name: "html_rewriter.js",
@@ -619,6 +624,7 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
     let kv_bindings = config.kv_bindings.as_slice();
     let queue_bindings = config.queue_bindings.as_slice();
     let ratelimit_bindings = config.ratelimit_bindings.as_slice();
+    let send_email_bindings = config.send_email_bindings.as_slice();
     let workflow_bindings = config.workflow_bindings.as_slice();
     let vars = config.vars.as_slice();
     let services = config.services.as_slice();
@@ -660,6 +666,12 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 celld_logic::ratelimit::cell_name(&binding.namespace),
                 binding.limit,
                 binding.period,
+            ));
+        }
+        for binding in send_email_bindings {
+            lines.push_str(&format!(
+                "e[{:?}] = __celld.__makeSendEmail({:?});\n",
+                binding.environment, binding.environment
             ));
         }
         for binding in queue_bindings {

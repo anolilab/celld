@@ -20,8 +20,8 @@ use crate::protocol::{
     QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_AI_V1, FEATURE_ASSETS_V1,
     FEATURE_CONTAINERS_V1, FEATURE_CONTAINER_IMAGES_V1, FEATURE_CRON_V1, FEATURE_D1_V1,
     FEATURE_HYPERDRIVE_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1,
-    FEATURE_R2_V1, FEATURE_RATELIMIT_V1, FEATURE_SECRETS_STORE_V1, FEATURE_SQLITE_VEC_V1,
-    FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    FEATURE_R2_V1, FEATURE_RATELIMIT_V1, FEATURE_SECRETS_STORE_V1, FEATURE_SEND_EMAIL_V1,
+    FEATURE_SQLITE_VEC_V1, FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
     QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 mod node_imports;
 mod python;
 mod ratelimit;
+mod send_email;
 mod sourcemap;
 
 /// Config keys we understand. Anything else is an error: refusing is
@@ -60,6 +61,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "kv_namespaces",
     "queues",
     "ratelimits",
+    "send_email",
     "workflows",
     "r2_buckets",
     "worker_loaders",
@@ -580,6 +582,10 @@ impl Built {
                         let namespace = binding.get("namespace_id").and_then(Value::as_str)?;
                         Some((format!("env.{name} (Rate Limit)"), namespace.to_string()))
                     }
+                    Some(crate::email::BINDING_TYPE) => Some((
+                        format!("env.{name} (Send Email)"),
+                        "SMTP relay of the node".to_string(),
+                    )),
                     Some("queue") => {
                         let queue = binding.get("queue").and_then(Value::as_str)?;
                         Some((format!("env.{name} (Queue)"), queue.to_string()))
@@ -791,6 +797,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         has_binding_type(&project.metadata, crate::secrets::STORE_BINDING_TYPE);
     let uses_hyperdrive = has_binding_type(&project.metadata, crate::hyperdrive::BINDING_TYPE);
     let uses_ai = has_binding_type(&project.metadata, "ai");
+    let uses_send_email = has_binding_type(&project.metadata, crate::email::BINDING_TYPE);
     let manifest = Manifest {
         schema_version: if asset_reference.is_some() { 2 } else { 1 },
         version: version.clone(),
@@ -872,6 +879,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if uses_ai {
                 features.push(FEATURE_AI_V1.to_string());
+            }
+            if uses_send_email {
+                features.push(FEATURE_SEND_EMAIL_V1.to_string());
             }
             features
         },
@@ -2238,6 +2248,11 @@ fn read_project(
         do_classes.push(RATELIMIT_CLASS.to_string());
         sqlite_classes.push(RATELIMIT_CLASS.to_string());
     }
+    // A `send_email` binding is a host-side call into the node's SMTP relay: no
+    // cell and no class, only the restrictions the manifest carries.
+    let send_emails = send_email::read_send_email(object)?;
+    let declared_send_email = !send_emails.is_empty();
+    bindings.extend(send_emails);
     let workflows = match object.get("workflows") {
         None => &[][..],
         Some(Value::Array(workflows)) => workflows.as_slice(),
@@ -2622,7 +2637,8 @@ fn read_project(
             || !hyperdrive_bindings.is_empty()
             || declared_ai
             || !r2_binding_names.is_empty()
-            || !worker_loaders.is_empty())
+            || !worker_loaders.is_empty()
+            || declared_send_email)
     {
         bail!("an asset-only project cannot declare Worker bindings");
     }

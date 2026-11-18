@@ -1656,6 +1656,7 @@ pub struct WorkerConfig {
     kv_bindings: Vec<(String, String)>,
     queue_bindings: Vec<QueueBinding>,
     ratelimit_bindings: Vec<RateLimitBinding>,
+    send_email_bindings: Vec<crate::email::SendEmailBinding>,
     pub(crate) queue_consumers: Vec<QueueConsumerRegistration>,
     /// This script declared a consumer in its own manifest. The deployment-
     /// wide catalog later replaces `queue_consumers` in every isolate, so the
@@ -1789,6 +1790,7 @@ impl WorkerConfig {
             kv_bindings,
             queue_bindings,
             ratelimit_bindings,
+            send_email_bindings,
             queue_consumers,
             workflow_bindings,
             vars,
@@ -1820,6 +1822,7 @@ impl WorkerConfig {
             kv_bindings,
             queue_bindings,
             ratelimit_bindings,
+            send_email_bindings,
             queue_consumers,
             declares_queue_consumer,
             workflow_bindings,
@@ -1864,18 +1867,9 @@ impl WorkerConfig {
             src: RUNTIME_CELL_ENTRY.to_string(),
             script_name: RUNTIME_CELL_SCRIPT.to_string(),
             do_classes: classes,
-            bindings: Vec::new(),
-            r2_bindings: Vec::new(),
-            d1_bindings: Vec::new(),
-            kv_bindings: Vec::new(),
-            queue_bindings: Vec::new(),
-            ratelimit_bindings: Vec::new(),
-            queue_consumers: Vec::new(),
-            workflow_bindings: Vec::new(),
-            vars: Vec::new(),
             node: primary.node.clone(),
-            modules: Vec::new(),
             compat: primary.compat,
+            ..Default::default()
         })
         .with_queue_consumers(queue_catalog)
         .with_generation(generation)
@@ -6712,6 +6706,9 @@ ops! { OP_NAMES, install_op_functions,
         "__hr_event" => html_rewriter::op_hr_event,
         "__hr_take" => html_rewriter::op_hr_take,
         "__hr_free" => html_rewriter::op_hr_free,
+        "__email_send" => send_email::op_email_send,
+        "__email_reserve" => send_email::op_email_reserve,
+        "__email_release" => send_email::op_email_release,
         "__tcp_connect" => tcp::op_tcp_connect,
         "__tcp_read" => tcp::op_tcp_read,
         "__tcp_write" => tcp::op_tcp_write,
@@ -7621,21 +7618,12 @@ fn op_loader_load(
         WorkerConfig::new(WorkerConfigOptions {
             src,
             script_name: format!("__loader:{id}"),
-            do_classes: Vec::new(),
-            bindings: Vec::new(),
-            r2_bindings: Vec::new(),
             // A loaded worker reaches D1 only if its parent injects a stub;
-            // ambient bindings are exactly what Code Mode withholds.
-            d1_bindings: Vec::new(),
-            kv_bindings: Vec::new(),
-            queue_bindings: Vec::new(),
-            ratelimit_bindings: Vec::new(),
-            queue_consumers: Vec::new(),
-            workflow_bindings: Vec::new(),
-            vars: Vec::new(),
-            node: String::new(),
+            // ambient bindings are exactly what Code Mode withholds, so every
+            // binding is left empty.
             modules,
             compat,
+            ..Default::default()
         })
         .into_dynamic_worker()
         .with_main_module_name(main.to_string())
@@ -10157,6 +10145,7 @@ fn webcrypto_return_bytes(
 mod container;
 mod crypto;
 mod html_rewriter;
+mod send_email;
 mod tcp;
 mod zlib;
 
@@ -10932,6 +10921,10 @@ pub struct IoContext {
     /// marks the span as an error without failing the event, which would drop
     /// the frames and close the socket.
     listener_error: OnceLock<String>,
+    /// Send slots of this event that a `send_email` call took before reading
+    /// its stream. They are given back with the event, so a stream that never
+    /// yields cannot keep them when the event ends.
+    reserved_sends: Mutex<Vec<(u64, crate::smtp::InFlight)>>,
 }
 
 /// An op enqueued by one event's continuation during another event's turn: the
@@ -11044,6 +11037,26 @@ impl IoContext {
         Ok(())
     }
 
+    /// Keep `slot` for a send of this event that has not started yet, under a
+    /// token no other reservation has. The slot is given back by
+    /// [`Self::take_reserved_send`] with that token, or when the event ends.
+    fn reserve_send(&self, slot: crate::smtp::InFlight) -> u64 {
+        static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        self.reserved_sends.lock().unwrap().push((token, slot));
+        token
+    }
+
+    /// The slot kept under `token`, to be held by the send or dropped. A token
+    /// this event does not hold (its own event ended and the slot went with it,
+    /// or it was taken already) gives nothing, so a late call never takes the
+    /// slot of another request.
+    fn take_reserved_send(&self, token: u64) -> Option<crate::smtp::InFlight> {
+        let mut reserved = self.reserved_sends.lock().unwrap();
+        let at = reserved.iter().position(|(held, _)| *held == token)?;
+        Some(reserved.swap_remove(at).1)
+    }
+
     fn begin_cpu_turn(&self) {
         if self.cpu_limit_nanos.is_none() {
             return;
@@ -11126,6 +11139,7 @@ impl IoContext {
             tail_reporting,
             tail_logs: Mutex::new(TailLogCapture::default()),
             listener_error: OnceLock::new(),
+            reserved_sends: Mutex::new(Vec::new()),
         })
     }
 
@@ -11170,6 +11184,7 @@ impl IoContext {
             tail_reporting: false,
             tail_logs: Mutex::new(TailLogCapture::default()),
             listener_error: OnceLock::new(),
+            reserved_sends: Mutex::new(Vec::new()),
         });
         runtime_state
             .io_contexts

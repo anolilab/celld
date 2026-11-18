@@ -596,11 +596,8 @@ impl Filter {
             }
             NodeEndpoint::Address | NodeEndpoint::Elsewhere => {}
         }
-        match classify(ip) {
-            Class::Public | Class::Private | Class::Cgnat | Class::UniqueLocal => Ok(()),
-            Class::Loopback if allow_loopback => Ok(()),
-            class => Err(Refused::address(addr.ip(), class)),
-        }
+        operator_chosen(classify(ip), allow_loopback)
+            .map_err(|class| Refused::address(addr.ip(), class))
     }
 
     /// Keep the resolved addresses a Worker may dial. A hostname with an
@@ -640,6 +637,18 @@ impl Filter {
             self.permits_on(SocketAddr::new(addr.ip(), 0), port)
                 .map(|()| dialed)
         })
+    }
+}
+
+/// The class rule for a destination that the operator chose, a database or a
+/// mail relay, and not a Worker: private, carrier-grade and unique-local
+/// addresses are fine, loopback only with `allow_loopback`. Unspecified,
+/// link-local, metadata, multicast and reserved addresses are never one.
+fn operator_chosen(class: Class, allow_loopback: bool) -> Result<(), Class> {
+    match class {
+        Class::Public | Class::Private | Class::Cgnat | Class::UniqueLocal => Ok(()),
+        Class::Loopback if allow_loopback => Ok(()),
+        class => Err(class),
     }
 }
 
@@ -965,18 +974,28 @@ fn with_canonical(addrs: Vec<IpAddr>) -> Vec<IpAddr> {
 /// the node runs. A failed read changes nothing, and an address is never forgotten.
 fn keep_interfaces_current(node: &'static NodeAddrs) {
     crate::asyncrt::spawn(async move {
+        // A host that cannot list its interfaces usually cannot do so on any
+        // read, so the warning is logged when reading starts to fail, not on
+        // every read after.
+        let mut failing = false;
         loop {
             crate::asyncrt::sleep(INTERFACE_REFRESH).await;
             // The listing is a system call; it runs on the blocking pool so a
             // slow one never holds a runtime worker.
             match crate::asyncrt::blocking(crate::node_addrs::try_interfaces).await {
-                Ok(Ok(listed)) => node.learn_interfaces(listed),
-                Ok(Err(error)) => {
+                Ok(Ok(listed)) => {
+                    failing = false;
+                    node.learn_interfaces(listed);
+                }
+                Ok(Err(error)) if !failing => {
+                    failing = true;
                     tracing::warn!(%error, "could not re-read this node's interface addresses, keeping the last list");
                 }
-                Err(_) => {
+                Err(_) if !failing => {
+                    failing = true;
                     tracing::warn!("re-reading this node's interface addresses panicked, keeping the last list");
                 }
+                Ok(Err(_)) | Err(_) => {}
             }
         }
     })
@@ -1020,24 +1039,34 @@ pub async fn register_node_addresses(
     listeners: &[SocketAddr],
     advertise: &Advertise,
 ) -> anyhow::Result<()> {
-    if active().is_none() {
-        return Ok(());
-    }
+    // With `CELLD_EGRESS=open` a Worker's own dials are unfiltered, but the node
+    // still has to know its own listeners: a `send_email` binding refuses them.
+    let open = active().is_none();
     let wildcard = listeners
         .iter()
         .any(|listener| listener.ip().is_unspecified());
     let interfaces = if wildcard {
-        crate::node_addrs::try_interfaces().map_err(|error| {
-            anyhow!(
-                "could not list this node's interface addresses ({error}), so Worker egress \
-                 cannot refuse them; bind specific addresses or set {MODE_ENV}=open"
-            )
-        })?
+        match crate::node_addrs::try_interfaces() {
+            Ok(interfaces) => interfaces,
+            // Nothing is filtered here, so a node that cannot list its
+            // interfaces still starts; only loopback and the listener ports
+            // are then known to be its own.
+            Err(_) if open => Vec::new(),
+            Err(error) => {
+                return Err(anyhow!(
+                    "could not list this node's interface addresses ({error}), so Worker egress \
+                     cannot refuse them; bind specific addresses or set {MODE_ENV}=open"
+                ))
+            }
+        }
     } else {
         Vec::new()
     };
     let advertised = match advertise {
         Advertise::Addr(address) => vec![*address],
+        // The name's addresses only extend what an open node refuses, so it
+        // does not wait for a lookup at start.
+        Advertise::Name { .. } if open => Vec::new(),
         Advertise::Name { host, port } => {
             let lookup = tokio::net::lookup_host((host.as_str(), *port));
             match crate::asyncrt::timeout(ADVERTISED_NAME_LOOKUP, lookup).await {
@@ -1077,6 +1106,58 @@ pub async fn register_node_addresses(
     Ok(())
 }
 
+/// Resolve the operator's SMTP relay for a `send_email` binding and return the
+/// addresses it may dial: all but those that are never a mail relay.
+///
+/// The relay is chosen by the operator, not by a Worker, so a private address
+/// is fine for it, as is loopback, in every mode: a mail transfer agent on
+/// the same machine is a usual relay, and a Worker cannot name it. This does
+/// not follow `CELLD_EGRESS` and is on in `open` mode too. It refuses an
+/// unspecified, link-local, cloud metadata, multicast or reserved address, an
+/// address that is a listener of this node, and the name this node
+/// advertises. The caller dials the returned addresses and no others, so a
+/// second lookup cannot give a different answer.
+///
+/// The refusals name the class and never the relay's name or address: they
+/// reach the Worker, and the relay is not for it to learn.
+pub async fn smtp_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, Refused> {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let resolved = lookup(bare, port)
+        .await
+        .map_err(|_| Refused("egress: the SMTP relay's name did not resolve".into()))?;
+    smtp_addresses_with(host, port, resolved, node_endpoint, node_name)
+}
+
+fn smtp_addresses_with(
+    host: &str,
+    port: u16,
+    resolved: Vec<SocketAddr>,
+    endpoint: impl Fn(SocketAddr) -> NodeEndpoint,
+    node_name: impl Fn(&str, u16) -> bool,
+) -> Result<Vec<SocketAddr>, Refused> {
+    if node_name(&name_key(host), port) {
+        return Err(Refused(format!(
+            "egress refused: the SMTP relay is {}",
+            Class::Own.describe()
+        )));
+    }
+    keep("the SMTP relay", resolved, |addr| {
+        let ip = canonical(addr.ip());
+        let at = SocketAddr::new(ip, port);
+        let refused = |class: Class| {
+            Refused(format!(
+                "egress refused: the SMTP relay is {}",
+                class.describe()
+            ))
+        };
+        operator_chosen(classify(ip), true).map_err(refused)?;
+        if endpoint(at) == NodeEndpoint::Listener {
+            return Err(refused(Class::Own));
+        }
+        Ok(at)
+    })
+}
+
 /// The node's policy, read from the environment once. `None` means open.
 /// A value that fails to parse is refused at startup by `env_vars::validate`,
 /// so a failure here cannot happen in a running node; it closes egress
@@ -1102,6 +1183,75 @@ mod tests {
 
     fn sock(text: &str) -> SocketAddr {
         text.parse().unwrap()
+    }
+
+    fn smtp(host: &str, port: u16, addrs: &[&str]) -> Result<Vec<SocketAddr>, Refused> {
+        smtp_addresses_with(
+            host,
+            port,
+            addrs.iter().map(|a| sock(a)).collect(),
+            |addr| match (addr.ip().is_loopback(), addr.port()) {
+                (true, 7000) => NodeEndpoint::Listener,
+                (true, _) => NodeEndpoint::Address,
+                _ => NodeEndpoint::Elsewhere,
+            },
+            |name, port| name == "node.example" && port == 7000,
+        )
+    }
+
+    #[test]
+    fn an_smtp_relay_may_be_private_or_local_but_never_a_metadata_or_link_local_address() {
+        // An operator's relay is often on the private network or the same host.
+        assert_eq!(
+            smtp(
+                "relay",
+                25,
+                &[
+                    "10.0.0.5:25",
+                    "192.168.1.9:25",
+                    "127.0.0.1:25",
+                    "[fd00::5]:25",
+                    "93.184.216.34:25"
+                ]
+            )
+            .unwrap()
+            .len(),
+            5
+        );
+        for refused in [
+            "169.254.169.254:25",
+            "169.254.1.1:25",
+            "100.100.100.200:25",
+            "0.0.0.0:25",
+            "[::]:25",
+            "224.0.0.1:25",
+            "240.0.0.1:25",
+            "[fe80::1]:25",
+            "[ff02::1]:25",
+            "[::ffff:169.254.169.254]:25",
+            "[fd00:ec2::254]:25",
+        ] {
+            assert!(smtp("relay", 25, &[refused]).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn an_smtp_relay_keeps_only_checked_addresses_and_never_a_listener_of_the_node() {
+        let kept = smtp("relay", 25, &["169.254.169.254:25", "10.0.0.5:25"]).unwrap();
+        assert_eq!(kept, [sock("10.0.0.5:25")]);
+        // The port decides: loopback on a listener port is the node itself.
+        assert!(smtp("relay", 7000, &["127.0.0.1:7000"]).is_err());
+        assert!(smtp("relay", 25, &["127.0.0.1:25"]).is_ok());
+        assert!(smtp("node.example", 7000, &["93.184.216.34:7000"]).is_err());
+        assert!(smtp("NODE.example.", 7000, &["93.184.216.34:7000"]).is_err());
+        let error = smtp("relay", 25, &["169.254.169.254:25"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains("169.254"),
+            "the text names the class, not the address: {error}"
+        );
+        assert!(smtp("relay", 25, &[]).is_err());
     }
 
     #[test]

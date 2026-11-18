@@ -45,6 +45,7 @@ mod e2e {
     pub mod scoping;
     pub mod secrets;
     pub mod secrets_store;
+    pub mod send_email;
     pub mod sockets;
     pub mod telemetry_http;
     pub mod version;

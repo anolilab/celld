@@ -1,0 +1,185 @@
+// `cloudflare:email` and the `send_email` binding. The binding only shapes the
+// arguments; the host op `__email_send` checks them against the deployment's
+// restrictions and sends the message through the node's SMTP relay.
+(function () {
+  const MAX_MESSAGE_BYTES = 25 * 1024 * 1024;
+  // How long a raw stream may take to yield its whole message. A stream that
+  // stalls past it is cancelled and send() rejects, so it cannot hold the
+  // isolate's send slot for good.
+  const READ_DEADLINE_MS = 60 * 1000;
+  const raws = new WeakMap();
+
+  const fail = (code, message) => {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+  };
+
+  class EmailMessage {
+    constructor(from, to, raw) {
+      if (typeof from !== "string") {
+        throw new TypeError("Incorrect type for the 'from' argument: the provided value is not of type 'string'.");
+      }
+      if (typeof to !== "string") {
+        throw new TypeError("Incorrect type for the 'to' argument: the provided value is not of type 'string'.");
+      }
+      if (typeof raw !== "string" && !(raw instanceof ReadableStream)) {
+        throw new TypeError("Incorrect type for the 'raw' argument: the provided value is not of type 'ReadableStream or string'.");
+      }
+      Object.defineProperty(this, "from", { value: from, enumerable: true });
+      Object.defineProperty(this, "to", { value: to, enumerable: true });
+      raws.set(this, raw);
+    }
+  }
+
+  // The bytes of a raw message. A stream is read up to the limit and no
+  // further, so a Worker cannot make the node buffer more than that.
+  const readRaw = async (raw) => {
+    if (typeof raw === "string") {
+      if (raw.length > MAX_MESSAGE_BYTES) {
+        throw fail("E_CONTENT_TOO_LARGE", "the message is too large");
+      }
+      // The limit is in bytes, and a character is up to three of them.
+      const bytes = new TextEncoder().encode(raw);
+      if (bytes.byteLength > MAX_MESSAGE_BYTES) {
+        throw fail("E_CONTENT_TOO_LARGE", "the message is too large");
+      }
+      return bytes;
+    }
+    const reader = raw.getReader();
+    const chunks = [];
+    let timer;
+    const expired = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        // Not awaited: a stalled stream may never settle its cancel.
+        reader.cancel().catch(() => {});
+        reject(fail("E_TIMEOUT", "the raw stream did not finish within 60 seconds"));
+      }, READ_DEADLINE_MS);
+    });
+    try {
+      await Promise.race([readChunks(reader, chunks), expired]);
+    } finally {
+      clearTimeout(timer);
+    }
+    const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return bytes;
+  };
+
+  const readChunks = async (reader, chunks) => {
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!(value instanceof Uint8Array)) {
+        await reader.cancel();
+        throw new TypeError("the raw stream of an EmailMessage must yield Uint8Array chunks");
+      }
+      total += value.byteLength;
+      if (total > MAX_MESSAGE_BYTES) {
+        await reader.cancel();
+        throw fail("E_CONTENT_TOO_LARGE", "the message is too large");
+      }
+      chunks.push(value);
+    }
+  };
+
+  const base64 = (bytes) => {
+    let text = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      text += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(text);
+  };
+
+  // The builder as plain data. Attachment content given as bytes becomes
+  // base64, a string is taken as base64 already, and what is not an
+  // attachment is left for the host to refuse.
+  const shapeBuilder = (message) => {
+    const shaped = { ...message };
+    let total = 0;
+    for (const field of ["text", "html"]) {
+      if (typeof message[field] === "string") total += message[field].length;
+    }
+    if (total > MAX_MESSAGE_BYTES) {
+      throw fail("E_CONTENT_TOO_LARGE", "the message is too large");
+    }
+    if (Array.isArray(message.attachments)) {
+      shaped.attachments = message.attachments.map((attachment) => {
+        if (attachment === null || typeof attachment !== "object") return attachment;
+        const { content } = attachment;
+        const copy = { ...attachment };
+        if (typeof content === "string") {
+          total += content.length;
+        } else if (content instanceof ArrayBuffer || ArrayBuffer.isView(content)) {
+          const bytes = content instanceof ArrayBuffer
+            ? new Uint8Array(content)
+            : new Uint8Array(content.buffer, content.byteOffset, content.byteLength);
+          total += bytes.byteLength;
+          if (total > MAX_MESSAGE_BYTES) {
+            throw fail("E_CONTENT_TOO_LARGE", "the message is too large");
+          }
+          copy.content = base64(bytes);
+        }
+        if (total > MAX_MESSAGE_BYTES) {
+          throw fail("E_CONTENT_TOO_LARGE", "the message is too large");
+        }
+        return copy;
+      });
+    }
+    return shaped;
+  };
+
+  class SendEmail {
+    #name;
+
+    constructor(name) {
+      this.#name = name;
+    }
+
+    async send(message) {
+      let answer;
+      if (message instanceof EmailMessage) {
+        const raw = raws.get(message);
+        // A stream is buffered while it is read, so the slot and the
+        // subrequest are taken first: sends past the limit never read theirs.
+        let token;
+        if (typeof raw !== "string") {
+          const reserved = JSON.parse(__email_reserve());
+          if (!reserved.ok) throw fail(reserved.code, reserved.message);
+          token = reserved.token;
+        }
+        let handedOver = false;
+        try {
+          const bytes = await readRaw(raw);
+          handedOver = token !== undefined;
+          answer = await __email_send(
+            JSON.stringify({ binding: this.#name, kind: "raw", from: message.from, to: message.to }),
+            bytes,
+            token,
+          );
+        } finally {
+          if (token !== undefined && !handedOver) __email_release(token);
+        }
+      } else if (message !== null && typeof message === "object") {
+        answer = await __email_send(
+          JSON.stringify({ binding: this.#name, kind: "builder", message: shapeBuilder(message) }),
+          undefined,
+        );
+      } else {
+        throw new TypeError("send() needs an EmailMessage or an object with from, to, subject and text or html");
+      }
+      const result = JSON.parse(answer);
+      if (!result.ok) throw fail(result.code, result.message);
+      return { messageId: result.messageId };
+    }
+  }
+
+  __celld.__cfEmail = { EmailMessage };
+  __celld.__makeSendEmail = (name) => new SendEmail(name);
+})();
