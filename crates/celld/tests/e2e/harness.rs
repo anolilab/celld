@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -490,6 +490,17 @@ pub async fn observe_for(window: Duration) {
     tokio::time::sleep(window).await;
 }
 
+/// How long until the next window of `period_s` seconds starts, for a test of
+/// something that counts in windows aligned to the clock.
+pub fn until_next_window(period_s: u64) -> Duration {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_millis() as u64;
+    let period = period_s * 1000;
+    Duration::from_millis(period - now % period)
+}
+
 /// Polls `probe` until it returns `Some`, and panics after `timeout`. For
 /// outcomes that happen on their own time; never assert after a fixed sleep.
 pub async fn wait_until<T, F, Fut>(what: &str, timeout: Duration, mut probe: F) -> T
@@ -535,7 +546,7 @@ fn child_pids(pid: u32) -> Vec<u32> {
 }
 
 /// Sends `signal` to the process group that `spawn` made for `pgid`.
-fn signal_group(pgid: u32, signal: &str) {
+pub fn signal_group(pgid: u32, signal: &str) {
     let _ = Command::new("kill")
         .args([&format!("-{signal}"), "--", &format!("-{pgid}")])
         .stderr(Stdio::null())

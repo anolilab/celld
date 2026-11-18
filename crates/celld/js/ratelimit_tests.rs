@@ -7,14 +7,19 @@ use super::Engine;
 fn run(script: &str) -> serde_json::Value {
     Engine::init();
     let source = format!(
-        "{}\nconst {{ RateLimitCounters }} = ratelimitService({{\
+        "{}\nconst {{ RateLimitCounters, Ratelimit }} = ratelimitService({{\
              DurableObject: class {{ constructor(ctx) {{ this.ctx = ctx; }} }},\
              now: () => 0,\
+             limits: () => ({{ periods: {:?}, maxLimit: {}, budgetBytes: {}, overheadBytes: {} }}),\
          }});\n\
          const hit = (counters, key, now, limit = 2, period = 10) =>\
              counters.hit({{ key, limit, period }}, now);\n\
          JSON.stringify((() => {{ {script} }})())",
         include_str!("services/ratelimit.js"),
+        celld_logic::ratelimit::PERIODS,
+        celld_logic::ratelimit::MAX_LIMIT,
+        celld_logic::ratelimit::COUNTER_BUDGET_BYTES,
+        celld_logic::ratelimit::COUNTER_OVERHEAD_BYTES,
     );
     let mut isolate = v8::Isolate::new(v8::CreateParams::default());
     v8::scope!(let handle, &mut isolate);
@@ -131,4 +136,68 @@ fn a_key_must_be_a_string_and_the_config_valid() {
         result,
         serde_json::json!(["TypeError", "TypeError", "TypeError", "TypeError", null])
     );
+}
+
+#[test]
+fn the_client_class_is_named_as_the_cloudflare_class() {
+    // worker-rs casts `env.rate_limiter()` by this constructor name.
+    let result = run("const client = new Ratelimit(() => null, 'cell', 1, 10);
+         return client.constructor.name;");
+    assert_eq!(result, serde_json::json!("Ratelimit"));
+}
+
+#[test]
+fn a_flood_of_long_keys_is_refused_at_the_byte_budget() {
+    // Each key is 100,000 code units, 200,000 bytes: far fewer than 250,000
+    // keys fill the 32 MiB budget, and the bytes held never pass it.
+    let result = run("const c = new RateLimitCounters();
+         const long = 'x'.repeat(100_000);
+         let admitted = 0, refusedFrom = null, most = 0;
+         for (let i = 0; i < 400; i++) {
+           if (hit(c, long + i, 0)) admitted += 1;
+           else if (refusedFrom === null) refusedFrom = i;
+           most = Math.max(most, c.bytes());
+         }
+         return [admitted, refusedFrom, most <= 32 * 1024 * 1024, c.size()];");
+    let admitted = result[0].as_u64().unwrap();
+    assert!((100..400).contains(&admitted), "{result}");
+    assert_eq!(result[1].as_u64().unwrap(), admitted, "{result}");
+    assert_eq!(result[2], serde_json::json!(true));
+    assert_eq!(result[3].as_u64().unwrap(), admitted);
+}
+
+#[test]
+fn at_the_budget_a_new_key_is_refused_and_a_known_key_keeps_counting() {
+    // A budget of three counters of one-byte keys.
+    let cost = celld_logic::ratelimit::COUNTER_OVERHEAD_BYTES + 2;
+    let result = run(&format!(
+        "const c = new RateLimitCounters({});
+         const out = [hit(c, 'a', 0, 2), hit(c, 'b', 0, 2), hit(c, 'c', 0, 2)];
+         // Full: a new key resolves to a refusal rather than throwing.
+         out.push(hit(c, 'd', 0, 2));
+         // The keys already held still count, up to their limit.
+         out.push(hit(c, 'a', 0, 2), hit(c, 'a', 0, 2));
+         out.push(c.size(), c.bytes());
+         return out;",
+        3 * cost
+    ));
+    assert_eq!(
+        result,
+        serde_json::json!([true, true, true, false, true, false, 3, 3 * cost])
+    );
+}
+
+#[test]
+fn expired_windows_give_their_bytes_back() {
+    let cost = celld_logic::ratelimit::COUNTER_OVERHEAD_BYTES + 2;
+    let result = run(&format!(
+        "const c = new RateLimitCounters({});
+         hit(c, 'a', 0); hit(c, 'b', 0);
+         const full = hit(c, 'c', 0);
+         // The next window: the old counters are swept to make room.
+         const later = hit(c, 'c', 10_000);
+         return [full, later, c.size(), c.bytes()];",
+        2 * cost
+    ));
+    assert_eq!(result, serde_json::json!([false, true, 1, cost]));
 }

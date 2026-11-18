@@ -18,6 +18,18 @@ pub const RESERVED_CLASS: &str = "__RateLimit";
 /// The window lengths Cloudflare accepts for `simple.period`, in seconds.
 pub const PERIODS: [u32; 2] = [10, 60];
 
+/// The largest `simple.limit` Cloudflare accepts.
+pub const MAX_LIMIT: u32 = u32::MAX;
+
+/// The memory one cell may spend on counters, in bytes, across every period.
+/// A cell shares its isolate with other cells, so a flood of unique keys must
+/// not grow it past this: a new key is refused once its counter would not fit.
+pub const COUNTER_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+
+/// What a counter costs besides its key: the map entry and the `{ window,
+/// count }` record. A key costs two bytes per UTF-16 code unit on top.
+pub const COUNTER_OVERHEAD_BYTES: u64 = 96;
+
 /// The cell that counts for a namespace. The name is hashed into the cell
 /// scope, so every runtime path takes it from here and none formats it.
 pub fn cell_name(namespace_id: &str) -> &str {
@@ -26,7 +38,7 @@ pub fn cell_name(namespace_id: &str) -> &str {
 
 /// Whether `limit` is a value `simple.limit` accepts: a positive integer.
 pub fn valid_limit(limit: u64) -> bool {
-    limit >= 1 && limit <= u64::from(u32::MAX)
+    limit >= 1 && limit <= u64::from(MAX_LIMIT)
 }
 
 /// Whether `period` is a value `simple.period` accepts: 10 or 60 seconds.

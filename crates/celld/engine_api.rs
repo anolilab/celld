@@ -329,12 +329,52 @@ pub struct QueueBinding {
 
 /// One Rate Limiting binding in a Worker environment: its `env` name, the
 /// namespace whose cell counts for it, and the `simple` limit and period.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RateLimitBinding {
     pub environment: String,
     pub namespace: String,
     pub limit: u32,
     pub period: u32,
+}
+
+impl RateLimitBinding {
+    /// The manifest entry for this binding: the one place its shape is written.
+    pub fn to_manifest(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "ratelimit",
+            "name": self.environment,
+            "namespace_id": self.namespace,
+            "simple": { "limit": self.limit, "period": self.period },
+        })
+    }
+
+    /// Reads a manifest entry back, refusing one `to_manifest` could not have
+    /// written: a deploy writes only complete bindings, and a missing
+    /// `env.LIMITER` would otherwise surface when the Worker first calls it.
+    pub fn from_manifest(entry: &serde_json::Value) -> anyhow::Result<Self> {
+        let text = |field: &str| entry.get(field).and_then(serde_json::Value::as_str);
+        let simple = entry.get("simple");
+        let number = |field: &str| {
+            simple
+                .and_then(|simple| simple.get(field))
+                .and_then(serde_json::Value::as_u64)
+        };
+        match (
+            text("name"),
+            text("namespace_id"),
+            number("limit").filter(|limit| celld_logic::ratelimit::valid_limit(*limit)),
+            number("period").filter(|period| celld_logic::ratelimit::valid_period(*period)),
+        ) {
+            (Some(name), Some(namespace), Some(limit), Some(period)) => Ok(Self {
+                environment: name.to_string(),
+                namespace: namespace.to_string(),
+                // Both were validated against bounds that fit a `u32`.
+                limit: u32::try_from(limit)?,
+                period: u32::try_from(period)?,
+            }),
+            _ => anyhow::bail!("the manifest has an invalid ratelimit binding: {entry}"),
+        }
+    }
 }
 
 /// The `version_metadata` binding of a deployment: the `env` name and the
@@ -606,49 +646,49 @@ pub(crate) fn namespace_key(script_name: &str, class_name: &str) -> String {
     }
 }
 
-/// The cell scope a D1 database lives at, for a caller outside any isolate.
-/// `celld d1` addresses a database over the operator route, which takes a
-/// scope, so this derives what `getByName` derives in the harness, from the
-/// same key and the same HMAC.
-pub fn d1_cell_scope(database_identity: &str) -> String {
-    let id = durable_object_id_for_name(D1_NAMESPACE_KEY, database_identity);
-    format!("{}:{}", crate::deploy::D1_CLASS, durable_object_id_hex(&id))
+/// The cell scope `name` has in a shared reserved `class`, for a caller outside
+/// any isolate: what `getByName` derives in the harness, from the same key, the
+/// same name, and the same HMAC. A name that is formatted differently here does
+/// not fail; it silently addresses a second, empty cell.
+fn shared_cell_scope(class: &str, name: &str) -> String {
+    let key = shared_namespace_key(class).expect("a shared reserved class has a namespace key");
+    format!(
+        "{class}:{}",
+        durable_object_id_hex(&durable_object_id_for_name(key, name))
+    )
 }
 
-/// The cell scope one shard of a KV namespace lives at, for a caller outside
-/// any isolate. `celld kv` addresses a namespace over the operator route, and
-/// this derives what `getByName` derives in the harness -- from the same key,
-/// the same name, and the same HMAC.
+/// The cell scope a D1 database lives at. `celld d1` addresses a database over
+/// the operator route, which takes a scope.
+pub fn d1_cell_scope(database_identity: &str) -> String {
+    shared_cell_scope(crate::deploy::D1_CLASS, database_identity)
+}
+
+/// The cell scope one shard of a KV namespace lives at. `celld kv` addresses a
+/// namespace over the operator route.
 ///
 /// The name comes from `celld_logic::kv::cell_name`, which is also what the
-/// binding is handed at `build_env`. Neither side formats it, because a
-/// formatting disagreement here does not fail: it silently addresses a second,
-/// empty namespace.
+/// binding is handed at `build_env`. Neither side formats it.
 pub fn kv_cell_scope(namespace_id: &str, shard: u32) -> String {
-    let name = celld_logic::kv::cell_name(namespace_id, shard);
-    let id = durable_object_id_for_name(KV_NAMESPACE_KEY, &name);
-    format!("{}:{}", crate::deploy::KV_CLASS, durable_object_id_hex(&id))
+    shared_cell_scope(
+        crate::deploy::KV_CLASS,
+        &celld_logic::kv::cell_name(namespace_id, shard),
+    )
 }
 
 /// The cell scope that counts for a rate limit namespace.
 pub fn ratelimit_cell_scope(namespace_id: &str) -> String {
-    let name = celld_logic::ratelimit::cell_name(namespace_id);
-    let id = durable_object_id_for_name(RATELIMIT_NAMESPACE_KEY, name);
-    format!(
-        "{}:{}",
+    shared_cell_scope(
         crate::deploy::RATELIMIT_CLASS,
-        durable_object_id_hex(&id)
+        celld_logic::ratelimit::cell_name(namespace_id),
     )
 }
 
 /// The Queue broker scope for callers outside a Worker isolate.
 pub fn queue_cell_scope(queue: &str) -> String {
-    let name = celld_logic::queue::cell_name(queue);
-    let id = durable_object_id_for_name(QUEUE_NAMESPACE_KEY, name);
-    format!(
-        "{}:{}",
+    shared_cell_scope(
         crate::deploy::QUEUE_CLASS,
-        durable_object_id_hex(&id)
+        celld_logic::queue::cell_name(queue),
     )
 }
 

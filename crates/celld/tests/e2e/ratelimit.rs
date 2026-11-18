@@ -5,25 +5,15 @@
 // disallowed-methods policy protects.
 #![allow(clippy::disallowed_methods)]
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::harness::Server;
+use super::harness::{until_next_window, Server};
 
 async fn limit(server: &Server, binding: &str, key: &str) -> bool {
     let out: Value = server.get_json(&format!("/limit/{binding}/{key}")).await;
     out["success"].as_bool().expect("a success flag")
-}
-
-/// Milliseconds until the next window of `period_s` seconds starts.
-fn until_next_window(period_s: u64) -> Duration {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    let period = period_s * 1000;
-    Duration::from_millis(period - now % period)
 }
 
 #[tokio::test]

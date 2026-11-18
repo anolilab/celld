@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::harness::fixture_dir;
+use super::harness::{client, fixture_dir, signal_group, wait_until};
 
 const CELLD: &str = env!("CARGO_BIN_EXE_celld");
 const TOKEN: &str = "ratelimit-fleet-token";
@@ -57,29 +57,26 @@ impl Node {
     }
 
     async fn wait_ready(&self, client: &reqwest::Client) {
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while Instant::now() < deadline {
-            let mut ready = true;
-            for path in ["/.well-known/celld/health", "/__ready"] {
-                ready &= client
-                    .get(format!("{}{path}", self.public))
-                    .send()
-                    .await
-                    .is_ok_and(|response| response.status().is_success());
-            }
-            if ready {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        panic!("the node at {} did not become ready", self.public);
+        wait_until(
+            &format!("the node at {} to be ready", self.public),
+            Duration::from_secs(120),
+            || async {
+                for path in ["/.well-known/celld/health", "/__ready"] {
+                    let response = client.get(format!("{}{path}", self.public)).send().await;
+                    if !response.is_ok_and(|response| response.status().is_success()) {
+                        return None;
+                    }
+                }
+                Some(())
+            },
+        )
+        .await;
     }
 }
 
 impl Drop for Node {
     fn drop(&mut self) {
-        let group = format!("-{}", self.child.id());
-        let _ = Command::new("kill").args(["-TERM", "--", &group]).status();
+        signal_group(self.child.id(), "TERM");
         let deadline = Instant::now() + Duration::from_secs(45);
         while Instant::now() < deadline {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
@@ -87,7 +84,7 @@ impl Drop for Node {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+        signal_group(self.child.id(), "KILL");
         let _ = self.child.wait();
     }
 }
@@ -150,10 +147,7 @@ async fn two_nodes_share_one_counter() {
         Node::spawn(home.path(), 0, &bucket, &endpoint),
         Node::spawn(home.path(), 1, &bucket, &endpoint),
     ];
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .expect("build the client");
+    let client = client();
     for node in &nodes {
         node.wait_ready(&client).await;
     }

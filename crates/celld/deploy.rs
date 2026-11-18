@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 
 mod node_imports;
 mod python;
+mod ratelimit;
 mod sourcemap;
 
 /// Config keys we understand. Anything else is an error: refusing is
@@ -2140,7 +2141,7 @@ fn read_project(
         do_classes.push(QUEUE_CLASS.to_string());
         sqlite_classes.push(QUEUE_CLASS.to_string());
     }
-    let ratelimits = read_ratelimits(object.get("ratelimits"))?;
+    let ratelimits = ratelimit::read_ratelimits(object.get("ratelimits"))?;
     bindings.extend(ratelimits.iter().cloned());
     if !ratelimits.is_empty() {
         // A namespace is a cell of a runtime-supplied class, like KV's, and
@@ -3189,82 +3190,6 @@ pub(crate) fn check_env_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The `ratelimits` of a config as manifest bindings.
-///
-/// Wrangler's own checks, applied here so a malformed entry stops the deploy
-/// and never reaches a node: `simple.limit` a positive integer, `simple.period`
-/// 10 or 60, and every key celld does not model refused.
-fn read_ratelimits(value: Option<&Value>) -> anyhow::Result<Vec<Value>> {
-    let ratelimits = match value {
-        None => &[][..],
-        Some(Value::Array(ratelimits)) => ratelimits.as_slice(),
-        Some(_) => bail!("config `ratelimits` must be an array"),
-    };
-    let mut bindings = Vec::new();
-    for ratelimit in ratelimits {
-        let object = ratelimit
-            .as_object()
-            .ok_or_else(|| anyhow!("a `ratelimits` entry must be an object"))?;
-        if let Some(key) = object
-            .keys()
-            .find(|key| !matches!(key.as_str(), "name" | "namespace_id" | "simple"))
-        {
-            bail!(
-                "ratelimit declares `{key}`, which celld does not model; \
-                 celld models `name`, `namespace_id`, and `simple`"
-            );
-        }
-        let name = object
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("ratelimit has no `name`"))?;
-        if !valid_binding(name) {
-            bail!("invalid ratelimit binding name: {name:?}");
-        }
-        // Wrangler writes the id as a string of digits; celld takes any stable
-        // string that can name a cell, as it does for a KV namespace.
-        let namespace_id = object
-            .get("namespace_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("ratelimit {name} needs a string `namespace_id`"))?;
-        if !celld_logic::cell::valid_cell_scope(namespace_id) {
-            bail!(
-                "ratelimit {name} has a `namespace_id` that cannot name a cell: \
-                 {namespace_id:?}; use ASCII letters, digits, and `_ - . : $`"
-            );
-        }
-        let simple = object
-            .get("simple")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                anyhow!("ratelimit {name} needs a `simple` object with `limit` and `period`")
-            })?;
-        if let Some(key) = simple
-            .keys()
-            .find(|key| !matches!(key.as_str(), "limit" | "period"))
-        {
-            bail!("ratelimit {name} `simple` declares `{key}`; it takes `limit` and `period`");
-        }
-        let limit = simple
-            .get("limit")
-            .and_then(Value::as_u64)
-            .filter(|limit| celld_logic::ratelimit::valid_limit(*limit))
-            .ok_or_else(|| anyhow!("ratelimit {name} `simple.limit` must be a positive integer"))?;
-        let period = simple
-            .get("period")
-            .and_then(Value::as_u64)
-            .filter(|period| celld_logic::ratelimit::valid_period(*period))
-            .ok_or_else(|| anyhow!("ratelimit {name} `simple.period` must be 10 or 60"))?;
-        bindings.push(json!({
-            "type": "ratelimit",
-            "name": name,
-            "namespace_id": namespace_id,
-            "simple": { "limit": limit, "period": period },
-        }));
-    }
-    Ok(bindings)
-}
-
 pub(crate) fn valid_binding(binding: &str) -> bool {
     binding.len() <= 128
         && binding
@@ -4234,90 +4159,5 @@ mod secrets_store_config_tests {
     fn the_deployment_requires_the_secrets_store_feature() {
         let project = read(ENTRY, &VarOverrides::None).unwrap();
         assert!(has_binding_type(&project.metadata, "secrets_store_secret"));
-    }
-}
-
-#[cfg(test)]
-mod ratelimit_config_tests {
-    use super::*;
-
-    fn read(entry: Value) -> anyhow::Result<Vec<Value>> {
-        read_ratelimits(Some(&json!([entry])))
-    }
-
-    fn refused(entry: Value) -> String {
-        format!("{:#}", read(entry).unwrap_err())
-    }
-
-    #[test]
-    fn a_valid_entry_becomes_a_manifest_binding() {
-        let bindings = read(json!({
-            "name": "LIMITER", "namespace_id": "1001", "simple": { "limit": 5, "period": 60 }
-        }))
-        .unwrap();
-        assert_eq!(
-            bindings,
-            [json!({
-                "type": "ratelimit", "name": "LIMITER", "namespace_id": "1001",
-                "simple": { "limit": 5, "period": 60 }
-            })]
-        );
-        assert!(read_ratelimits(None).unwrap().is_empty());
-    }
-
-    #[test]
-    fn limit_must_be_a_positive_integer() {
-        for limit in [json!(0), json!(-1), json!(1.5), json!("5"), json!(null)] {
-            let entry = json!({
-                "name": "L", "namespace_id": "1", "simple": { "limit": limit, "period": 10 }
-            });
-            assert!(refused(entry).contains("`simple.limit`"), "{limit}");
-        }
-    }
-
-    #[test]
-    fn period_must_be_ten_or_sixty() {
-        for period in [json!(0), json!(30), json!(61), json!("10"), json!(null)] {
-            let entry = json!({
-                "name": "L", "namespace_id": "1", "simple": { "limit": 1, "period": period }
-            });
-            assert!(refused(entry).contains("`simple.period`"), "{period}");
-        }
-        assert!(read(json!({
-            "name": "L", "namespace_id": "1", "simple": { "limit": 1, "period": 10 }
-        }))
-        .is_ok());
-    }
-
-    #[test]
-    fn a_malformed_entry_is_refused_with_its_reason() {
-        let simple = json!({ "limit": 1, "period": 10 });
-        assert!(refused(json!({ "namespace_id": "1", "simple": simple })).contains("no `name`"));
-        assert!(
-            refused(json!({ "name": "bad name", "namespace_id": "1", "simple": simple }))
-                .contains("invalid ratelimit binding name")
-        );
-        assert!(refused(json!({ "name": "L", "simple": simple })).contains("`namespace_id`"));
-        assert!(
-            refused(json!({ "name": "L", "namespace_id": 1001, "simple": simple }))
-                .contains("`namespace_id`")
-        );
-        assert!(
-            refused(json!({ "name": "L", "namespace_id": "a/b", "simple": simple }))
-                .contains("cannot name a cell")
-        );
-        assert!(refused(json!({ "name": "L", "namespace_id": "1" })).contains("`simple`"));
-        assert!(
-            refused(json!({ "name": "L", "namespace_id": "1", "simple": simple, "burst": 3 }))
-                .contains("`burst`")
-        );
-        assert!(refused(json!({
-            "name": "L", "namespace_id": "1", "simple": { "limit": 1, "period": 10, "burst": 3 }
-        }))
-        .contains("`burst`"));
-        assert!(read_ratelimits(Some(&json!({})))
-            .unwrap_err()
-            .to_string()
-            .contains("must be an array"));
     }
 }

@@ -56,10 +56,17 @@ on the node that owns the namespace, and one request to the owner over the
 internal listener otherwise. The owner counts and answers, so a count is exact
 however many nodes take calls.
 
-The cell drops the counters of past windows as calls arrive, so storage follows
-the keys of the current window and not the history. A namespace holds at most
-250,000 keys in one window. A call with a new key past that bound fails until
-the window ends.
+The cell drops the counters of past windows as calls arrive, so memory follows
+the keys of the current windows and not the history.
+
+A cell holds at most 32 MiB of counters, in one budget across both periods. A
+counter costs its key (two bytes per character) plus 96 bytes, so the number of
+keys that fit depends on their length: about 250,000 keys of 60 characters, far
+fewer long ones. A call with a key the cell does not hold, when the budget is
+full, does not throw: `limit()` resolves to `{ success: false }`, so a Worker
+that answers 429 on `success: false` refuses it. Keys the cell already holds
+keep counting. Expired counters are dropped first to make room, so the cell
+takes new keys again once old windows end.
 
 ## Differences from Cloudflare
 

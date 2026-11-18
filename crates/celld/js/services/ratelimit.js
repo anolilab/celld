@@ -25,23 +25,16 @@
 // - `DurableObject`: the cell's base class; the harness grants RPC to the
 //   runtime classes itself.
 // - `now()`: the owner's clock, in milliseconds.
+// - `limits()`: the bounds `celld_logic::ratelimit` declares, as data:
+//   `periods`, `maxLimit`, `budgetBytes` and `overheadBytes`.
 function ratelimitService(host) {
-  // The values `simple.limit` and `simple.period` accept; they must match
-  // `celld_logic::ratelimit`.
-  const __PERIODS = [10, 60];
-  const __MAX_LIMIT = 4294967295;
-  // At most this many live counters per period. A flood of unique keys inside
-  // one window would otherwise grow the cell without bound.
-  const __MAX_KEYS = 250000;
   // At most this many expired counters are dropped by one call. Each call adds
   // at most one counter, so one would hold the size to the live windows; the
   // larger number clears a backlog quickly.
   const __SWEEP_PER_CALL = 32;
 
-  const __rlError = (message) => new Error("RATELIMIT_ERROR: " + String(message));
-
   const __rlLimit = (limit) => {
-    if (!Number.isInteger(limit) || limit < 1 || limit > __MAX_LIMIT) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > host.limits().maxLimit) {
       throw new TypeError(
         `the rate limit \`limit\` must be a positive integer, got ${String(limit)}`,
       );
@@ -49,24 +42,53 @@ function ratelimitService(host) {
   };
 
   const __rlPeriod = (period) => {
-    if (!__PERIODS.includes(period)) {
+    if (!host.limits().periods.includes(period)) {
       throw new TypeError(
-        `the rate limit \`period\` must be 10 or 60 seconds, got ${String(period)}`,
+        `the rate limit \`period\` must be ${host.limits().periods.join(" or ")} seconds, got ${String(period)}`,
       );
     }
   };
 
   // The one place a count changes. `request` is `{ key, limit, period }` and
   // `now` is the owner's clock; the cell supplies it and a test supplies its own.
+  //
+  // The counters are bounded in bytes, not in keys: a key is any string the
+  // Worker passes, so a count of keys says nothing about memory. Every live
+  // counter costs its key (two bytes per code unit) plus a fixed overhead, and
+  // the total over all periods stays within one budget. A call with a new key
+  // that would not fit resolves to a refusal instead of growing the cell, and
+  // a key already counted keeps counting.
   class RateLimitCounters {
-    constructor() {
+    constructor(budgetBytes = host.limits().budgetBytes) {
+      this._budget = budgetBytes;
+      this._bytes = 0;
       // One Map per period. A Map iterates in insertion order and a counter
       // that enters a new window is deleted and inserted again, so the first
       // entries of a period are always its oldest windows and a sweep only
       // has to look at the front.
-      this._periods = new Map(__PERIODS.map((period) => [period, new Map()]));
+      this._periods = new Map(host.limits().periods.map((period) => [period, new Map()]));
     }
 
+    _cost(key) {
+      return key.length * 2 + host.limits().overheadBytes;
+    }
+
+    // Drops up to `max` expired counters from the front of one period's map.
+    _sweep(period, now, max) {
+      const window = Math.floor(now / (period * 1000));
+      const counters = this._periods.get(period);
+      let swept = 0;
+      for (const [expired, counter] of counters) {
+        if (counter.window >= window || swept >= max) break;
+        counters.delete(expired);
+        this._bytes -= this._cost(expired);
+        swept += 1;
+      }
+    }
+
+    // Whether the call is within its limit. A new key the budget cannot hold
+    // is refused too (fail closed), after expired counters of every period
+    // have been dropped to make room.
     hit(request, now) {
       const { key, limit, period } = request;
       if (typeof key !== "string") {
@@ -76,21 +98,17 @@ function ratelimitService(host) {
       __rlPeriod(period);
       const window = Math.floor(now / (period * 1000));
       const counters = this._periods.get(period);
-      let swept = 0;
-      for (const [expired, counter] of counters) {
-        if (counter.window >= window || swept >= __SWEEP_PER_CALL) break;
-        counters.delete(expired);
-        swept += 1;
-      }
+      this._sweep(period, now, __SWEEP_PER_CALL);
       let counter = counters.get(key);
       if (counter === undefined) {
-        if (counters.size >= __MAX_KEYS) {
-          throw __rlError(
-            `the namespace holds ${__MAX_KEYS} keys in the current window and takes no new one`,
-          );
+        const cost = this._cost(key);
+        if (this._bytes + cost > this._budget) {
+          for (const swept of this._periods.keys()) this._sweep(swept, now, Infinity);
+          if (this._bytes + cost > this._budget) return false;
         }
         counter = { window, count: 0 };
         counters.set(key, counter);
+        this._bytes += cost;
       } else if (counter.window !== window) {
         counters.delete(key);
         counter.window = window;
@@ -102,11 +120,15 @@ function ratelimitService(host) {
       return true;
     }
 
-    // Counters held, for tests and diagnostics.
+    // Counters held and the bytes they cost, for tests and diagnostics.
     size() {
       let total = 0;
       for (const counters of this._periods.values()) total += counters.size;
       return total;
+    }
+
+    bytes() {
+      return this._bytes;
     }
   }
 
@@ -123,7 +145,9 @@ function ratelimitService(host) {
     }
   }
 
-  class RateLimit {
+  // Named `Ratelimit`, as Cloudflare's class is: a worker-rs `env.rate_limiter()`
+  // checks the constructor name before it hands the binding out.
+  class Ratelimit {
     // `namespace()` answers the namespace of rate limit cells, and `cellName`
     // names this binding's one cell (`celld_logic::ratelimit::cell_name`).
     constructor(namespace, cellName, limit, period) {
@@ -156,5 +180,5 @@ function ratelimitService(host) {
     }
   }
 
-  return { RateLimitCell, RateLimit, RateLimitCounters };
+  return { RateLimitCell, Ratelimit, RateLimitCounters };
 }
