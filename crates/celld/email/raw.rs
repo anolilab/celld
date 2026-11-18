@@ -85,7 +85,10 @@ pub fn prepare_raw(
     let mut data = Vec::with_capacity(message.len() + 64);
     data.extend_from_slice(format!("Message-ID: <{message_id}>\r\n").as_bytes());
     for header in &headers {
-        if !(header.name_is("message-id") || header.name_is("bcc")) {
+        if !["message-id", "bcc", "resent-bcc"]
+            .iter()
+            .any(|name| header.name_is(name))
+        {
             data.extend_from_slice(&head[header.start..header.end]);
         }
     }
@@ -257,12 +260,15 @@ mod tests {
 
     #[test]
     fn a_raw_message_is_normalised_and_gets_a_message_id_of_ours() {
-        let message = format!("Message-ID: <theirs@x>\nBcc: hidden@example.com\n{MESSAGE}");
+        let message = format!(
+            "Message-ID: <theirs@x>\nBcc: hidden@example.com\nResent-Bcc: resent@example.com\n{MESSAGE}"
+        );
         let prepared = raw(&binding(), "ann@example.com", "bob@example.com", &message).unwrap();
         let text = String::from_utf8(prepared.data.clone()).unwrap();
         assert!(!text.replace("\r\n", "").contains(['\r', '\n']), "{text:?}");
         assert!(!text.contains("theirs@x"), "{text}");
         assert!(!text.contains("hidden@example.com"), "{text}");
+        assert!(!text.contains("resent@example.com"), "{text}");
         assert!(
             text.starts_with(&format!("Message-ID: <{}>\r\n", prepared.message_id)),
             "{text}"

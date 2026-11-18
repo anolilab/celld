@@ -21,8 +21,8 @@
 //!   server reads differently.
 //! - A raw message's `From:` header must carry the envelope sender, so an
 //!   `allowed_sender_addresses` list also holds for the header a recipient
-//!   sees. Its `Message-ID` is replaced by one celld makes, its `Bcc:` header
-//!   is dropped, and a `Received:` header is refused.
+//!   sees. Its `Message-ID` is replaced by one celld makes, its `Bcc:` and
+//!   `Resent-Bcc:` headers are dropped, and a `Received:` header is refused.
 
 use anyhow::{anyhow, bail};
 use base64::engine::general_purpose::STANDARD;

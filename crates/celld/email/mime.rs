@@ -265,15 +265,15 @@ pub fn prepare_builder(binding: &SendEmailBinding, builder: Value) -> Result<Pre
     head.push_str("MIME-Version: 1.0\r\n");
     head.push_str(&fold_header(
         "From",
-        &format_mailbox(from_name.as_deref(), &from),
+        &format_mailbox(from_name.as_deref(), &from)?,
     ));
     for (field, group) in &groups {
         // A bcc recipient is in the envelope and nowhere in the message.
         if *field != "bcc" && !group.is_empty() {
-            let items: Vec<String> = group
+            let items = group
                 .iter()
                 .map(|(name, email)| format_mailbox(name.as_deref(), email))
-                .collect();
+                .collect::<Result<Vec<String>, _>>()?;
             let mut name = field.to_string();
             name[..1].make_ascii_uppercase();
             head.push_str(&fold_list(&name, &items));
@@ -282,7 +282,7 @@ pub fn prepare_builder(binding: &SendEmailBinding, builder: Value) -> Result<Pre
     if let Some((name, address)) = &reply_to {
         head.push_str(&fold_header(
             "Reply-To",
-            &format_mailbox(name.as_deref(), address),
+            &format_mailbox(name.as_deref(), address)?,
         ));
     }
     head.push_str(&fold_header("Subject", &encode_text(&builder.subject)?));
@@ -391,25 +391,29 @@ fn custom_headers(
     Ok(accepted)
 }
 
-/// `name <address>` with the name quoted or encoded, or the bare address.
-fn format_mailbox(name: Option<&str>, address: &str) -> String {
-    match name {
-        None => address.to_string(),
-        Some(name) if name.is_ascii() => {
-            let mut quoted = String::from("\"");
-            for c in name.chars().filter(|c| !c.is_control()) {
-                if c == '"' || c == '\\' {
-                    quoted.push('\\');
-                }
-                quoted.push(c);
-            }
-            format!("{quoted}\" <{address}>")
-        }
-        Some(name) => {
-            let name: String = name.chars().filter(|c| !c.is_control()).collect();
-            format!("{} <{address}>", encoded_words(&name))
-        }
+/// `name <address>` with the name quoted or encoded, or the bare address. A
+/// name with a control character is refused, as a subject is.
+fn format_mailbox(name: Option<&str>, address: &str) -> Result<String, EmailError> {
+    let Some(name) = name else {
+        return Ok(address.to_string());
+    };
+    if name.chars().any(char::is_control) {
+        return Err(EmailError::invalid(
+            "a display name holds a control character",
+        ));
     }
+    Ok(if name.is_ascii() {
+        let mut quoted = String::from("\"");
+        for c in name.chars() {
+            if c == '"' || c == '\\' {
+                quoted.push('\\');
+            }
+            quoted.push(c);
+        }
+        format!("{quoted}\" <{address}>")
+    } else {
+        format!("{} <{address}>", encoded_words(name))
+    })
 }
 
 /// `text` as is when it is printable ASCII, else as RFC 2047 encoded words.
@@ -797,6 +801,19 @@ mod tests {
             "E_VALIDATION_ERROR"
         );
         assert_eq!(code(json!({ "unknown": 1 })), "E_VALIDATION_ERROR");
+        // A display name is refused for a control character, not stripped.
+        for name in ["Bob\r\nBcc: x@y.z", "Bob\n", "B\tob", "Bób\r"] {
+            assert_eq!(
+                code(json!({ "to": [{ "name": name, "email": "bob@example.com" }] })),
+                "E_VALIDATION_ERROR",
+                "{name:?}"
+            );
+            assert_eq!(
+                code(json!({ "from": { "name": name, "email": "ann@example.com" } })),
+                "E_VALIDATION_ERROR",
+                "{name:?}"
+            );
+        }
         // A line a server would not read is refused, as it is in a raw message:
         // a word without a space cannot be folded.
         assert_eq!(

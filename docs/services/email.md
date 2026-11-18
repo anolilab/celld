@@ -140,8 +140,8 @@ message as a string or a `ReadableStream` of bytes. celld requires that
 - it has no `Received:` header;
 - every line end is CRLF: a bare LF or CR is changed to CRLF.
 
-celld replaces the `Message-ID` header with one it makes and drops a `Bcc:`
-header. `send()` resolves to `{ messageId }` in both forms.
+celld replaces the `Message-ID` header with one it makes and drops the `Bcc:` and
+`Resent-Bcc:` headers. `send()` resolves to `{ messageId }` in both forms.
 
 ## Limits
 
