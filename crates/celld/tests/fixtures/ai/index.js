@@ -40,6 +40,7 @@ export default {
         const stream = await env.AI.run(CHAT, { prompt: "stream-usage-key", stream: true });
         return new Response(stream, { headers: { "content-type": "text/event-stream" } });
       }
+      case "/stream-open":
       case "/stream-empty-data":
       case "/stream-bad-utf8":
       case "/stream-escaped-key":
@@ -65,6 +66,7 @@ export default {
         return Response.json({ ...result, text });
       }
       case "/usage-key":
+      case "/fail-escaped":
       case "/escaped-key":
       case "/bad-utf8":
         return Response.json(

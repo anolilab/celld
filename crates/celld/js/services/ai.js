@@ -135,8 +135,9 @@ function __aiEventStream(streamId) {
     async pull(controller) {
       for (;;) {
         const end = /\r\n|\n|\r/.exec(buffer);
-        // A CR at the end of the buffer may be half of a CRLF.
-        if (end !== null && (ended || end.index + end[0].length < buffer.length)) {
+        // Only a CR at the end of the buffer may be half of a CRLF; an LF or a
+        // CRLF there is a complete line end, and the stream may stay open.
+        if (end !== null && (ended || end[0] !== "\r" || end.index + 1 < buffer.length)) {
           if (end.index > __AI_MAX_LINE) return tooLarge(controller);
           const line = buffer.slice(0, end.index);
           buffer = buffer.slice(end.index + end[0].length);

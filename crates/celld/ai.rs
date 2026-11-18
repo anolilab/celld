@@ -132,6 +132,21 @@ impl Config {
 }
 
 impl Config {
+    fn redact_json(&self, value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => *text = self.redact(text),
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| self.redact_json(v)),
+            serde_json::Value::Object(map) => {
+                let entries = std::mem::take(map);
+                for (name, mut item) in entries {
+                    self.redact_json(&mut item);
+                    map.insert(self.redact(&name), item);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// How many bytes of an upstream error to read so that `cut_detail` can
     /// still see a whole key that starts inside the first `max`.
     fn error_read_limit(&self, max: usize) -> usize {
@@ -167,7 +182,16 @@ impl Config {
                 .unwrap_or(0);
             raw = &raw[..raw.len() - cut];
         }
-        let mut text = self.redact(String::from_utf8_lossy(raw).trim());
+        let text = String::from_utf8_lossy(raw);
+        let mut text = match serde_json::from_str::<serde_json::Value>(text.trim()) {
+            // A JSON body may write the key with escapes, which only its
+            // decoded strings show.
+            Ok(mut value) => {
+                self.redact_json(&mut value);
+                value.to_string()
+            }
+            Err(_) => self.redact(text.trim()),
+        };
         let mut end = max.min(text.len());
         while !text.is_char_boundary(end) {
             end -= 1;
@@ -347,6 +371,15 @@ mod tests {
         let raw = format!("boom, your key {}", &key[..10]);
         let detail = config.cut_detail(raw.as_bytes(), 2048);
         assert_eq!(detail, "boom, your key");
+    }
+
+    #[test]
+    fn a_json_error_that_writes_the_key_with_escapes_is_redacted() {
+        let config = config(Some("sk-a/b-key-0123"));
+        let raw = br#"{"error":{"message":"bad key sk-a\/b-key-0123 and \u0073k-a/b-key-0123"}}"#;
+        let detail = config.cut_detail(raw, 2048);
+        assert!(!detail.contains("key-0123"), "{detail}");
+        assert!(detail.contains("[redacted]"), "{detail}");
     }
 
     #[test]

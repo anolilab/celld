@@ -96,6 +96,9 @@ async fn serve(mut stream: tokio::net::TcpStream, log: Arc<Mutex<Vec<Seen>>>) {
         .to_string();
     if let Some(raw) = raw_reply(&last) {
         let _ = stream.write_all(&raw).await;
+        if last == "stream-open" {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
         let _ = stream.shutdown().await;
         return;
     }
@@ -261,6 +264,24 @@ fn raw_reply(prompt: &str) -> Option<Vec<u8>> {
             reply.extend(
                 br#"data: {"choices":[{"delta":{"content":"ok"}}],"usage":{"total_tokens":5,"note":"sk-test-key-123"}}"#,
             );
+            reply.extend(b"\n\ndata: [DONE]\n\n");
+        }
+        // An error body that writes the key with an escape.
+        "fail-escaped" => {
+            let body = br#"{"error":{"message":"bad key \u0073k-test-key-123"}}"#;
+            reply.extend(
+                format!(
+                    "HTTP/1.1 400 X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                )
+                .bytes(),
+            );
+            reply.extend(body);
+        }
+        // The stream's last event and `[DONE]`, and the connection stays open.
+        "stream-open" => {
+            reply.extend(head("text/event-stream", "").bytes());
+            reply.extend(br#"data: {"choices":[{"delta":{"content":"Hel"}}]}"#);
             reply.extend(b"\n\ndata: [DONE]\n\n");
         }
         "stream-escaped-key" => {
@@ -639,4 +660,37 @@ async fn only_token_counts_of_usage_reach_the_worker() {
     let stream = server.get_text("/stream-usage-key").await;
     assert!(!stream.contains(KEY), "{stream}");
     assert!(stream.contains(r#""usage":{"total_tokens":5}"#), "{stream}");
+}
+
+#[tokio::test]
+async fn a_json_error_body_that_escapes_the_key_does_not_hand_it_over() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    let result: Value = server.get_json("/fail-escaped").await;
+    assert_eq!(result["ok"], false, "{result}");
+    let message = result["message"].as_str().unwrap();
+    assert!(
+        message.contains("400") && message.contains("[redacted]"),
+        "{message}"
+    );
+    assert!(!message.contains("key-123"), "{message}");
+}
+
+#[tokio::test]
+async fn a_stream_completes_at_done_while_the_connection_stays_open() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    let result: Value = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        server.get_json("/stream-open"),
+    )
+    .await
+    .expect("the stream did not complete at [DONE]");
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(
+        result["text"],
+        "data: {\"response\":\"Hel\"}\n\ndata: [DONE]\n\n"
+    );
 }

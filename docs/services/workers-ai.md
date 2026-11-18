@@ -45,7 +45,8 @@ another endpoint or model. `celld dev` reads the same settings.
 The node makes the HTTP call, so the key never enters a Worker. celld does not
 log it, and it removes the key from what the endpoint sends back, an error, an
 answer or a stream event, before the Worker sees it, and again from the text it
-decodes, so a key the endpoint writes with JSON escapes is removed too. A `401`
+decodes, so a key the endpoint writes with JSON escapes is removed too, also
+from a JSON error body. A `401`
 or `403` from the endpoint reaches the Worker without the body. An error from
 the connection to the endpoint does not name its URL, because the path of the
 base URL may carry a credential.
