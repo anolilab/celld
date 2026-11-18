@@ -336,6 +336,7 @@ pub fn validate() -> anyhow::Result<()> {
     }
 
     crate::sql_limits::validate()?;
+    crate::sql_stats::validate()?;
 
     if let Some(megabytes) = positive::<usize>("CELLD_V8_HEAP_LIMIT_MB")? {
         if megabytes.checked_mul(1024 * 1024).is_none() {

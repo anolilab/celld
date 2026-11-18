@@ -119,6 +119,8 @@ OTLP yet.
 | `celld_retained_bundles` | gauge | |
 | `celld_http_requests_total` | counter | `listener`: `public`, `internal`, `peer`; `class`: `1xx` to `5xx`, `dropped` |
 | `celld_http_request_duration_seconds` | histogram | `listener`; buckets from 1 ms to 10 s |
+| `celld_sql_statement_duration_seconds` | histogram | `outcome`: `ok`, `error`, `timeout`; buckets from 10 us to 30 s |
+| `celld_sql_statement_rows_read`, `celld_sql_statement_rows_written`, `celld_sql_statement_bytes` | histogram | `outcome` |
 
 A scrape does not build the `/state` document and does not walk the cells.
 The node answers with a handful of counts it already keeps, and the storage
@@ -140,6 +142,47 @@ before it has a response, or that a forced drain cuts off, counts under
 internal listener, and `internal` is the rest of it. On `peer`, a tunnel
 upgrade counts once, with a `1xx` class, and the calls carried over the
 tunnel are not counted. A WebSocket upgrade on `public` counts once.
+
+## SQL statements
+
+Every application SQL statement of a Durable Object (`ctx.storage.sql.exec`)
+and of D1 feeds four histograms: its time, the rows it read, the rows it wrote
+and the bytes of the values it returned (see Metrics). They are split by
+outcome only. `error` is a failed statement and `timeout` is one that the
+per-statement time bound interrupted. A query reads as many rows as it
+returns, so a cursor that is closed early counts only the rows it produced.
+The statement's time is its prepare and step time, summed over the cursor's
+steps, and excludes the time the Worker spends between steps.
+
+A failed statement, and one that ran at least `CELLD_SQL_SLOW_LOG_MS`
+milliseconds, also writes one `WARN` line (target `celld::sql`):
+
+```
+failed SQL statement outcome=error fingerprint=3f9a0c1d2b4e5a67 duration_us=412 rows_read=0 rows_written=0 bytes=0 class=Counter sqlite_code=1
+```
+
+With the variable unset nothing is logged. `0` logs every statement. At most
+10 lines a second are written per node; the next line after that carries
+`suppressed=N`, the number of statements it dropped.
+
+The fingerprint is a 64-bit hash of the statement text with whitespace and
+comments collapsed, keywords and names folded to lower case, and string, blob
+and number literals replaced by one placeholder. Statements of the same shape
+have the same fingerprint, on every node. celld reads the text from the
+prepared statement, so a bound value is never part of it. A fingerprint is
+computed only for a line that passes the rate limit; with the variable unset it
+is never computed, and a statement adds a few relaxed atomic increments and one
+clock read.
+
+What is recorded: the fingerprint, outcome, time, rows read, rows written,
+bytes, SQLite's result code of a failure, and the cell class (the Durable
+Object class name, or `d1`).
+
+What is never recorded: the SQL text, a bound value, a result value, an error
+message (which can name a table, a column or a value), a table or column name,
+and the cell id. Not in the log, the metrics or the telemetry. A statement with
+a rare shape can still be guessed from its fingerprint by someone who can try
+candidate statements, so treat fingerprints as internal.
 
 ## Query the bucket with DuckDB
 

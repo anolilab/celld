@@ -444,6 +444,7 @@ pub fn family_names() -> impl Iterator<Item = &'static str> {
         .iter()
         .map(|family| family.name)
         .chain(REQUEST_FAMILIES)
+        .chain(crate::sql_stats::FAMILIES)
 }
 
 /// Render the exposition from the actor's counts, the storage counters and
@@ -479,6 +480,7 @@ fn render_reading(reading: &Reading) -> String {
         }
     }
     requests(&mut out);
+    crate::sql_stats::render(&mut out);
     out
 }
 

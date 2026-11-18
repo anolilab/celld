@@ -85,6 +85,7 @@ pub mod runtime;
 pub mod secret_cli;
 pub mod secrets;
 pub(crate) mod sql_limits;
+pub(crate) mod sql_stats;
 pub mod staged;
 pub mod startup;
 pub mod storage;
