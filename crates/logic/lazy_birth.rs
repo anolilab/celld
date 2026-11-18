@@ -194,8 +194,6 @@ pub(crate) struct Design {
     /// that was never granted, is taken over by K5: a first-form record over
     /// it, with the taken mark.
     pub session_record_takeover_marks: bool,
-    /// A sealer keeps the taken entries of the chunk it read.
-    pub sealer_keeps_taken: bool,
     /// The plain record of the minting session at epoch 1 is refused once the
     /// cell has a taken entry.
     pub session_record_refused_when_taken: bool,
@@ -204,9 +202,6 @@ pub(crate) struct Design {
     /// A waived id that the session placed on a peer is claimed by K5 on the
     /// open chunk.
     pub placed_claim_marks: bool,
-    /// The session writes its open chunk only over a body it read, and keeps
-    /// what another writer put there.
-    pub session_merges_chunk: bool,
     /// The session writes one first record for an id, or places it; never both
     /// and never twice.
     pub session_claims_once: bool,
@@ -221,6 +216,12 @@ pub(crate) struct Design {
     /// The same trace before the reload marker of a preserved restart, for a
     /// captured cell of the process's own tag that was never granted.
     pub trace_before_marker: bool,
+    // Rules revision 3 already follows, made knobs for M43 and M37.
+    /// A sealer keeps the taken entries of the chunk it read.
+    pub sealer_keeps_taken: bool,
+    /// The session writes its open chunk only over a body it read, and keeps
+    /// what another writer put there.
+    pub session_merges_chunk: bool,
     /// The bound of the carried set.
     pub carried_bound: usize,
 }
