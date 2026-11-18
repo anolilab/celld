@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 /// per-statement bound, so the same value applies to both.
 const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A SQLite-backed Durable Object and a D1 database each hold at most 10 GB.
+/// A SQLite-backed Durable Object and a D1 database each hold at most 10 GiB.
 const DEFAULT_MAX_DATABASE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Virtual-machine instructions between two deadline checks. A check costs a
