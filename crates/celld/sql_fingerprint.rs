@@ -28,20 +28,17 @@ pub(crate) fn fingerprint(sql: &str) -> u64 {
     while at < bytes.len() {
         let byte = bytes[at];
         if byte.is_ascii_whitespace() {
-            shape.gap = true;
             at += 1;
         } else if byte == b'-' && bytes.get(at + 1) == Some(&b'-') {
             while at < bytes.len() && bytes[at] != b'\n' {
                 at += 1;
             }
-            shape.gap = true;
         } else if byte == b'/' && bytes.get(at + 1) == Some(&b'*') {
             at += 2;
             while at < bytes.len() && !(bytes[at] == b'*' && bytes.get(at + 1) == Some(&b'/')) {
                 at += 1;
             }
             at = (at + 2).min(bytes.len());
-            shape.gap = true;
         } else if byte == b'\'' || byte == b'"' || byte == b'`' {
             // A quote is doubled to put one inside.
             at += 1;
@@ -137,10 +134,8 @@ pub(crate) fn fingerprint(sql: &str) -> u64 {
 #[derive(Default)]
 struct Shape {
     hash: Hash,
-    /// Whitespace or a comment came before the next token.
-    gap: bool,
     /// The last token was a word or a placeholder: two of them in a row stay
-    /// apart by a space.
+    /// apart by a space, whether or not the source had one.
     atom: bool,
     /// The last token was the word `in`.
     after_in: bool,
@@ -168,6 +163,7 @@ const OPERATOR_KEYWORDS: &[&str] = &[
     "between",
     "by",
     "case",
+    "default",
     "distinct",
     "else",
     "escape",
@@ -183,7 +179,6 @@ const OPERATOR_KEYWORDS: &[&str] = &[
     "on",
     "or",
     "regexp",
-    "return",
     "returning",
     "select",
     "set",
@@ -219,10 +214,9 @@ impl Shape {
     /// Start a token. `atom` says it is a word or a placeholder.
     fn begin(&mut self, atom: bool) {
         self.release();
-        if self.gap && self.atom && atom {
+        if self.atom && atom {
             self.hash.feed(b' ');
         }
-        self.gap = false;
         self.atom = atom;
         self.after_in = false;
         self.after_is = 0;
@@ -232,7 +226,6 @@ impl Shape {
         if self.held_comma {
             // `?, ?` in a list: the run is one placeholder.
             self.held_comma = false;
-            self.gap = false;
             return;
         }
         self.begin(true);
@@ -267,7 +260,6 @@ impl Shape {
         let after_in = self.after_in;
         let in_list_run = byte == b',' && self.list_depth == 1 && self.list_placeholder;
         if in_list_run {
-            self.gap = false;
             self.operand = false;
             self.after_is = 0;
             self.held_comma = true;
@@ -345,6 +337,14 @@ mod tests {
             &["SELECT x'00", "SELECT x'ff"],
             &["SELECT 1 /* open", "SELECT 1 /* other"],
             &["SELECT 1 -- note", "SELECT 1"],
+            // A literal right after a word has the same shape as one after a space.
+            &["SELECT'x'", "SELECT 'y'", "SELECT ?", "SELECT/**/1"],
+            &["SELECT (1", "SELECT ( 1"],
+            // A sign after `DEFAULT` belongs to the number.
+            &[
+                "CREATE TABLE t (a DEFAULT -1)",
+                "CREATE TABLE t (a DEFAULT 5)",
+            ],
         ];
         assert_one_shape(groups);
     }

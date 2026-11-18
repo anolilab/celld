@@ -167,7 +167,9 @@ statements of `ctx.storage.sql.ingest`, which run application SQL too.
 - Rows written are the changes the statement's own steps made, so a cursor
   closed early reports what the statement had written, and a cursor that stayed
   open while other statements wrote counts none of their rows. A failed
-  statement reports none, because SQLite rolled it back. A statement that
+  statement reports none. Under `OR FAIL` or `RAISE(FAIL)` SQLite keeps the
+  rows the statement changed before the failing one, and those are not
+  counted. A statement that
   cannot write reads no change count; one that can reads it around each step.
 - Bytes are the length of every text and BLOB value returned and eight for each
   number, the same in a Durable Object and in D1.
