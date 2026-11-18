@@ -5,8 +5,9 @@ request 2197 in a celld Durable Object. The harness needs a model, and the
 example gets one from any OpenAI-compatible chat completions endpoint. It
 uses OpenRouter and Llama 3.2 1B by default.
 
-The pi provider expects the `ai.run()` shape of a Workers AI binding, and celld
-serves no such binding, so the example builds a small adapter that posts each
+The pi provider expects the `ai.run()` shape of a Workers AI binding. The
+example builds a small adapter instead of using celld's
+[Workers AI binding](../../docs/services/workers-ai.md). The adapter posts each
 request to `PI_ENDPOINT` with `OPENROUTER_API_KEY` as the bearer token. The
 example stops at startup when a variable is absent, because a stand-in model
 answers every prompt and therefore hides a broken configuration. Set

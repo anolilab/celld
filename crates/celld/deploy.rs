@@ -17,10 +17,10 @@ use crate::note;
 use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, ComponentPointer,
     DeployPointer, Manifest, ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig,
-    QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1,
-    FEATURE_CONTAINER_IMAGES_V1, FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_HYPERDRIVE_V1,
-    FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1,
-    FEATURE_RATELIMIT_V1, FEATURE_SECRETS_STORE_V1, FEATURE_SQLITE_VEC_V1,
+    QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_AI_V1, FEATURE_ASSETS_V1,
+    FEATURE_CONTAINERS_V1, FEATURE_CONTAINER_IMAGES_V1, FEATURE_CRON_V1, FEATURE_D1_V1,
+    FEATURE_HYPERDRIVE_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1,
+    FEATURE_R2_V1, FEATURE_RATELIMIT_V1, FEATURE_SECRETS_STORE_V1, FEATURE_SQLITE_VEC_V1,
     FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
     QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
@@ -66,6 +66,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "version_metadata",
     "secrets_store_secrets",
     "hyperdrive",
+    "ai",
     "containers",
     "no_bundle",
     "define",
@@ -603,6 +604,7 @@ impl Built {
                         let id = binding.get("id").and_then(Value::as_str)?;
                         Some((format!("env.{name} (Hyperdrive)"), id.to_string()))
                     }
+                    Some("ai") => Some((format!("env.{name} (AI)"), "Workers AI".to_string())),
                     Some("plain_text") => Some((
                         format!("env.{name} (Text)"),
                         "Environment Variable".to_string(),
@@ -788,6 +790,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     let uses_secrets_store =
         has_binding_type(&project.metadata, crate::secrets::STORE_BINDING_TYPE);
     let uses_hyperdrive = has_binding_type(&project.metadata, crate::hyperdrive::BINDING_TYPE);
+    let uses_ai = has_binding_type(&project.metadata, "ai");
     let manifest = Manifest {
         schema_version: if asset_reference.is_some() { 2 } else { 1 },
         version: version.clone(),
@@ -866,6 +869,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if uses_hyperdrive {
                 features.push(FEATURE_HYPERDRIVE_V1.to_string());
+            }
+            if uses_ai {
+                features.push(FEATURE_AI_V1.to_string());
             }
             features
         },
@@ -2477,6 +2483,31 @@ fn read_project(
             "id": id,
         }));
     }
+    // `ai` names one env binding for Workers AI. The endpoint, key and model
+    // map belong to the node, so the config carries only the name.
+    let mut declared_ai = false;
+    match object.get("ai") {
+        None => {}
+        Some(Value::Object(ai)) => {
+            if let Some(key) = ai.keys().find(|key| key.as_str() != "binding") {
+                bail!("`ai` sets `{key}`, which is not a supported option");
+            }
+            let binding = match ai.get("binding") {
+                None => bail!("`ai` has no `binding` name"),
+                Some(Value::String(binding)) => binding.as_str(),
+                Some(_) => bail!("`ai` `binding` must be a string"),
+            };
+            if !valid_binding(binding) {
+                bail!("invalid ai binding name: {binding:?}");
+            }
+            declared_ai = true;
+            bindings.push(json!({
+                "type": "ai",
+                "name": binding,
+            }));
+        }
+        Some(_) => bail!("config `ai` must be an object with a `binding` name"),
+    }
     let mut vars = BTreeMap::new();
     match object.get("vars") {
         None => {}
@@ -2591,6 +2622,7 @@ fn read_project(
             || declared_version_metadata
             || !secret_store_bindings.is_empty()
             || !hyperdrive_bindings.is_empty()
+            || declared_ai
             || !r2_binding_names.is_empty()
             || !worker_loaders.is_empty())
     {
@@ -4441,5 +4473,45 @@ mod hyperdrive_config_tests {
         )
         .unwrap();
         assert!(read_project(&path, dir.path(), &VarOverrides::None, false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod ai_config_tests {
+    use super::*;
+
+    fn read(extra: &str) -> anyhow::Result<Project> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
+        let path = dir.path().join("wrangler.jsonc");
+        std::fs::write(
+            &path,
+            format!(r#"{{ "name": "app", "main": "index.js", "no_bundle": true, {extra} }}"#),
+        )
+        .unwrap();
+        read_project(&path, dir.path(), &VarOverrides::None, false)
+    }
+
+    #[test]
+    fn the_binding_becomes_an_ai_entry_and_requires_the_feature() {
+        let project = read(r#""ai": { "binding": "AI" }"#).unwrap();
+        assert!(project.metadata["bindings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({ "type": "ai", "name": "AI" })));
+    }
+
+    #[test]
+    fn a_malformed_declaration_is_refused() {
+        for extra in [
+            r#""ai": "AI""#,
+            r#""ai": {}"#,
+            r#""ai": { "binding": 1 }"#,
+            r#""ai": { "binding": "not valid" }"#,
+            r#""ai": { "binding": "AI", "staging": true }"#,
+            r#""ai": { "binding": "X" }, "vars": { "X": "y" }"#,
+        ] {
+            assert!(read(extra).is_err(), "{extra}");
+        }
     }
 }

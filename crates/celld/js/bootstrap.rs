@@ -735,6 +735,9 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 binding.binding
             ));
         }
+        if let Some(name) = &config.ai_binding {
+            lines.push_str(&format!("e[{name:?}] = __celld.__makeAi();\n"));
+        }
         if let Some(name) = asset_binding {
             lines.push_str(&format!(
                 "e[{:?}] = __celld.__makeAssetsBinding({:?});\n",

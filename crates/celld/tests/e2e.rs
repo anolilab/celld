@@ -1,6 +1,7 @@
 //! End-to-end tests: fixture Workers served by the real `celld dev` binary.
 
 mod e2e {
+    pub mod ai;
     pub mod alarms;
     pub mod body_clone;
     pub mod claim_provenance;

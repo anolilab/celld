@@ -212,9 +212,8 @@ named `HYPERDRIVE_` and the binding name. It is not a variable of `env`. See
 
 - celld does not manage a custom domain or terminate TLS.
 - `ctx.passThroughOnException()` has no effect, because celld has no CDN.
-- celld does not supply a Workers AI binding. The process rejects
-  `CELLD_AI_BINDING` and `CELLD_AI_URL`, and a deployment rejects an `ai`
-  declaration.
+- The [Workers AI](workers-ai.md) binding runs against an endpoint the
+  operator configures, not against Cloudflare's models.
 
 The [Cloudflare compatibility](../cloudflare-compat.md#services) page lists the
 runtime APIs and the unsupported services.

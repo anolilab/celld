@@ -4183,6 +4183,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     version_metadata: None,
                     secret_stores: Vec::new(),
                     hyperdrive: Vec::new(),
+                    ai_binding: None,
                     assets: None,
                     services: Vec::new(),
                     crons,

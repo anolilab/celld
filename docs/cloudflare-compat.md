@@ -31,7 +31,7 @@ An unsupported feature that does not cause an error is a defect.
 | [R2](services/r2.md) | **Yes** |
 | [Worker secrets](services/workers.md#secrets) | **Partial** — `celld secret` stores them encrypted under a secrets key; no key rotation yet, and a change reaches a node at its next deployment load |
 | [Secrets Store](services/workers.md#secrets-store) | **Yes** — a `secrets_store_secrets` binding reads a store that `celld secret --store` fills; the store is the fleet bucket's, not an account's |
-| Workers AI | **No** |
+| [Workers AI](services/workers-ai.md) | **Partial** — `env.AI.run()` for text generation and embeddings, served by an OpenAI-compatible endpoint the operator configures |
 | Vectorize | **No** |
 | [Hyperdrive](services/hyperdrive.md) | **Partial** — a `hyperdrive` binding hands the Worker a direct connection to its own Postgres or MySQL; no pooling and no query cache, and `host` and `port` name the database itself |
 | Browser Rendering | **No** |
@@ -475,7 +475,7 @@ The accepted top-level keys:
 - `assets`, `services`, `triggers`, and `vars`
 - `d1_databases`, `kv_namespaces`, `queues`, `ratelimits`, `workflows`, and
   `r2_buckets`
-- `worker_loaders`, `version_metadata`, `secrets_store_secrets`, `hyperdrive`, and
+- `worker_loaders`, `version_metadata`, `secrets_store_secrets`, `hyperdrive`, `ai`, and
   `containers`
 - `define` and `rules`
 

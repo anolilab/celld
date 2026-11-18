@@ -1685,6 +1685,8 @@ pub struct WorkerConfig {
     /// The deployment's Hyperdrive bindings, with their connection strings.
     /// Not in `vars`, so `process.env` never holds them.
     hyperdrive: Vec<crate::hyperdrive::HyperdriveBinding>,
+    /// The `env` name of the deployment's `ai` binding, if its config declares one.
+    ai_binding: Option<String>,
     /// Ambient outbound authority. Loaded workers may be denied.
     egress: EgressPolicy,
     /// Structured-clone values and host-minted service routes that a loaded
@@ -1831,6 +1833,7 @@ impl WorkerConfig {
             version_metadata: None,
             secret_stores: Vec::new(),
             hyperdrive: Vec::new(),
+            ai_binding: None,
             egress: EgressPolicy::Allow,
             loader_env: None,
             resource_limits: None,
@@ -1955,6 +1958,12 @@ impl WorkerConfig {
     /// Give this Worker its Hyperdrive bindings.
     pub fn with_hyperdrive(mut self, bindings: Vec<crate::hyperdrive::HyperdriveBinding>) -> Self {
         self.hyperdrive = bindings;
+        self
+    }
+
+    /// Give this Worker its `ai` binding at `env.<name>`.
+    pub fn with_ai_binding(mut self, name: Option<String>) -> Self {
+        self.ai_binding = name;
         self
     }
 
@@ -6799,6 +6808,7 @@ ops! { OP_NAMES, install_op_functions,
         "__sc_decode" => storage_ops::op_sc_decode,
         "__structured_clone" => storage_ops::op_structured_clone,
         "__op_fetch" => op_fetch,
+        "__ai_run" => ai_ops::op_ai_run,
         "__r2_head" => r2_ops::op_r2_head,
         "__r2_get" => r2_ops::op_r2_get,
         "__r2_put" => r2_ops::op_r2_put,
@@ -10338,6 +10348,7 @@ fn op_heap_over_admission_share(
 // `celld r2` writes an object a binding then reads, so the operator command
 // calls the very functions the ops call rather than a second implementation
 // of the object record.
+mod ai_ops;
 pub(crate) mod r2_ops;
 mod storage_ops;
 mod vfs;
