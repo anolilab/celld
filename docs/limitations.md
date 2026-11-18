@@ -35,8 +35,9 @@ APIs, and Wrangler configuration.
   rejects, not waits for ever. A write the ended event had not committed is
   not acknowledged. The handlers that rejection runs cannot write: a storage
   or SQL call there throws the same reason, and an operation they start is
-  rejected. Work a client hang-up leaves in `waitUntil` is not ended, so it
-  keeps its access.
+  rejected. Rolling back an open transaction, dropping queued puts and closing
+  a cursor stay allowed, so the unwinding leaves nothing open. Work a client
+  hang-up leaves in `waitUntil` is not ended, so it keeps its access.
 - `/state` reports `deployment.retiring`: how many superseded deployments still
   hold isolates, and the age in milliseconds of the oldest. A cell that has not
   yet moved to the new deployment keeps its isolate until it does.

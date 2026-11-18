@@ -542,6 +542,13 @@ async fn background_storage_work_after_the_handler_returns_completes_or_leaves_n
     )
     .await;
     assert_eq!(server.get_text("/do-late").await, "started");
+    // Only a transaction that began can be cut off half way.
+    wait_until(
+        "the leftover timer to enter its transaction",
+        Duration::from_secs(10),
+        || async { (server.get_text("/do-late-entered").await == "entered").then_some(()) },
+    )
+    .await;
     redeploy(&server).await;
     wait_until(
         "the superseded generation to be freed",
@@ -558,8 +565,50 @@ async fn background_storage_work_after_the_handler_returns_completes_or_leaves_n
     let (status, keys) =
         get_within_budget(&reqwest::Client::new(), &server.url("/do-late-keys")).await;
     assert!(status.is_success(), "{status} {keys}");
+    // Entering the transaction is what the wait above proves; what remains
+    // is that the move never leaves half of it.
     assert!(
         keys.is_empty() || keys == "late,late2",
         "half a transaction: {keys}"
     );
+}
+
+/// An event ended inside an open transaction is unwound by a rejection, and
+/// the rollback that follows must not be refused as new storage work: the
+/// object would be taken for broken and aborted.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_event_ended_inside_a_transaction_rolls_it_back_without_aborting_the_object() {
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_RETIRE_DEADLINE_S", "30"),
+            ("CELLD_DEPLOY_MAX_AGE_S", MAX_AGE_S),
+            ("CELLD_HANDLER_BUDGET_S", "20"),
+        ],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let running = {
+        let (client, url) = (client.clone(), server.url("/do-tx-hold"));
+        tokio::spawn(async move { client.get(url).send().await.expect("get") })
+    };
+    wait_until(
+        "the request to open its transaction",
+        Duration::from_secs(10),
+        || async { (server.get_text("/do-tx-entered").await == "entered").then_some(()) },
+    )
+    .await;
+    redeploy(&server).await;
+
+    let ended = running.await.expect("request task");
+    let body = ended.text().await.expect("body");
+    assert!(body.contains("Durable Object was moved"), "{body}");
+    assert!(
+        !server.log_text().contains("transaction rollback failed"),
+        "the rollback was refused and the object aborted"
+    );
+    let (status, value) = get_within_budget(&client, &server.url("/do-tx-value")).await;
+    assert!(status.is_success(), "{status} {value}");
+    assert_eq!(value, "none", "the open transaction was committed");
 }

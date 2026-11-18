@@ -1182,9 +1182,6 @@ fn wake_gate_waiters(cell: &str, outcome: Result<(), String>) {
 }
 
 const ABANDONED_INPUT_GATE: &str = "the cell's critical section ended without releasing";
-/// How many ended events isolates remember. Every host op reads this, so a
-/// process with none pays one load and never looks up the caller's event.
-static ENDED_CONTEXTS: AtomicUsize = AtomicUsize::new(0);
 const ENDED_EVENT_OP: &str = "the event that started this operation has ended";
 const RETIRED_INPUT_GATE: &str = "the cell event ended before it could acquire an input gate";
 
@@ -2332,8 +2329,29 @@ impl ActorRuntimeState {
         context
     }
 
+    /// Why the event with this id may not touch storage any more, if it may not.
+    ///
+    /// A live context speaks for itself. Otherwise the record answers, and an id
+    /// the record has forgotten is refused too: ids only grow, so one at or
+    /// below the highest forgotten id has ended, whatever the record says.
     fn ended_reason(&self, id: u64) -> Option<String> {
-        self.ended_contexts.0.lock().unwrap().get(&id).cloned()
+        match self.ended_contexts.lookup(id) {
+            EndedLookup::Ended(reason) => Some(reason),
+            EndedLookup::Unknown => None,
+            EndedLookup::Forgotten => match self.io_context(id) {
+                Some(context) => context.ended().map(str::to_string),
+                None => Some(ENDED_EVENT_FORGOTTEN.to_string()),
+            },
+        }
+    }
+
+    /// Why a continuation token may not touch storage: either of its two ends
+    /// having ended is enough. A plain token names one event as both.
+    fn token_ended_reason(&self, origin: Option<u64>, driver: Option<u64>) -> Option<String> {
+        [driver, origin]
+            .into_iter()
+            .flatten()
+            .find_map(|id| self.ended_reason(id))
     }
 
     fn io_context(&self, id: u64) -> Option<Arc<IoContext>> {
@@ -2347,31 +2365,60 @@ impl ActorRuntimeState {
 }
 
 /// How many ended events one isolate remembers. Ids are never reused, so a
-/// record cannot be mistaken for a later event; the oldest are forgotten
-/// first, because a continuation that old has long since run or been dropped.
+/// record cannot be mistaken for a later event. The oldest are forgotten
+/// first, and the highest id forgotten becomes a floor that keeps refusing
+/// them (see [`ActorRuntimeState::ended_reason`]).
 const ENDED_CONTEXT_RECORDS: usize = 4096;
 
-/// The reasons events ended, oldest id first, counted in `ENDED_CONTEXTS`
-/// while they are held.
+/// The refusal for an event whose record was forgotten.
+const ENDED_EVENT_FORGOTTEN: &str = "this event has ended";
+
+/// What the record knows about one event id.
+enum EndedLookup {
+    Ended(String),
+    /// Older than a forgotten record, with no record of its own.
+    Forgotten,
+    Unknown,
+}
+
 #[derive(Default)]
-struct EndedContexts(std::sync::Mutex<std::collections::BTreeMap<u64, String>>);
+struct EndedRecords {
+    /// The reasons events ended, oldest id first.
+    reasons: std::collections::BTreeMap<u64, String>,
+    /// The highest id whose record was forgotten.
+    floor: Option<u64>,
+}
+
+/// The events that ended in one isolate. `any` stays false until the first
+/// one, so an isolate none has ended in pays one load per storage op and never
+/// looks up the caller's event.
+#[derive(Default)]
+struct EndedContexts {
+    any: AtomicBool,
+    records: std::sync::Mutex<EndedRecords>,
+}
 
 impl EndedContexts {
     fn record(&self, id: u64, reason: &str) {
-        let mut records = self.0.lock().unwrap();
-        if records.insert(id, reason.to_string()).is_none() {
-            ENDED_CONTEXTS.fetch_add(1, Ordering::Relaxed);
+        let mut records = self.records.lock().unwrap();
+        records.reasons.insert(id, reason.to_string());
+        while records.reasons.len() > ENDED_CONTEXT_RECORDS {
+            if let Some((forgotten, _)) = records.reasons.pop_first() {
+                records.floor = records.floor.max(Some(forgotten));
+            }
         }
-        while records.len() > ENDED_CONTEXT_RECORDS {
-            records.pop_first();
-            ENDED_CONTEXTS.fetch_sub(1, Ordering::Relaxed);
-        }
+        self.any.store(true, Ordering::Release);
     }
-}
 
-impl Drop for EndedContexts {
-    fn drop(&mut self) {
-        ENDED_CONTEXTS.fetch_sub(self.0.get_mut().unwrap().len(), Ordering::Relaxed);
+    fn lookup(&self, id: u64) -> EndedLookup {
+        let records = self.records.lock().unwrap();
+        if let Some(reason) = records.reasons.get(&id) {
+            EndedLookup::Ended(reason.clone())
+        } else if records.floor.is_some_and(|floor| id <= floor) {
+            EndedLookup::Forgotten
+        } else {
+            EndedLookup::Unknown
+        }
     }
 }
 
@@ -3942,16 +3989,50 @@ fn touches_storage(op: &str) -> bool {
     .any(|prefix| op.starts_with(prefix))
 }
 
+/// Whether an op only undoes or frees what an event already did: ending a
+/// transaction by rollback, dropping queued puts, closing a cursor.
+fn is_cleanup_op(op: &str, action: impl FnOnce() -> String) -> bool {
+    match op {
+        "__storage_cancel_pending_puts" | "__sql_cursor_close" => true,
+        "__storage_transaction_control" => {
+            matches!(action().as_str(), "rollback" | "rollback_explicit")
+        }
+        _ => false,
+    }
+}
+
 /// Refuse a storage op called by an event that has ended, by throwing the
 /// reason it ended. Rejecting the event's pending operations runs the handlers
 /// that wait on them, and a synchronous storage call there would write for an
 /// event that is over. An operation that only starts work is rejected when the
 /// turn adopts it, in `adopt`.
-fn ended_event_refuses(scope: &mut v8::PinScope) -> bool {
-    let Some(id) = operation_continuation_id(scope) else {
+///
+/// Cleanup is never refused: a transaction an ended event left open must be
+/// able to roll back, and a cursor or queued puts it left behind to be freed,
+/// or the harness takes the failed rollback for a broken object and aborts it.
+fn ended_event_refuses(
+    op: &str,
+    args: &v8::FunctionCallbackArguments,
+    scope: &mut v8::PinScope,
+) -> bool {
+    if !scope
+        .get_slot::<Arc<ActorRuntimeState>>()
+        .expect("actor runtime state slot")
+        .ended_contexts
+        .any
+        .load(Ordering::Acquire)
+    {
         return false;
-    };
-    let Some(reason) = actor_runtime_state(scope).ended_reason(id) else {
+    }
+    if is_cleanup_op(op, || args.get(1).to_rust_string_lossy(scope)) {
+        return false;
+    }
+    // Inside a critical section the token names an origin and a driver. The
+    // origin owns the resources and the driver the operations; either ending
+    // ends the call. A plain token names one event twice.
+    let origin = reaction_continuation_id(scope);
+    let driver = operation_continuation_id(scope);
+    let Some(reason) = actor_runtime_state(scope).token_ended_reason(origin, driver) else {
         return false;
     };
     loader_throw(scope, &reason);
@@ -6363,9 +6444,8 @@ macro_rules! ops {
                             return;
                         }
                     }
-                    if ENDED_CONTEXTS.load(Ordering::Relaxed) != 0
-                        && touches_storage($name)
-                        && ended_event_refuses(scope)
+                    if touches_storage($name)
+                        && ended_event_refuses($name, &args, scope)
                     {
                         return;
                     }
@@ -12720,15 +12800,90 @@ mod storage_guard_tests {
     #[test]
     fn an_ended_event_is_remembered_by_id_and_the_record_is_bounded() {
         let ended = EndedContexts::default();
+        assert!(!ended.any.load(Ordering::Acquire));
         for id in 1..=(ENDED_CONTEXT_RECORDS as u64 + 10) {
             ended.record(id, "over");
         }
-        let records = ended.0.lock().unwrap();
-        assert_eq!(records.len(), ENDED_CONTEXT_RECORDS);
+        assert!(ended.any.load(Ordering::Acquire));
+        let records = ended.records.lock().unwrap();
+        assert_eq!(records.reasons.len(), ENDED_CONTEXT_RECORDS);
         assert!(
-            !records.contains_key(&1) && records.contains_key(&(ENDED_CONTEXT_RECORDS as u64 + 10))
+            !records.reasons.contains_key(&1)
+                && records
+                    .reasons
+                    .contains_key(&(ENDED_CONTEXT_RECORDS as u64 + 10))
         );
-        drop(records);
-        drop(ended);
+        assert_eq!(records.floor, Some(10));
+    }
+
+    /// Forgetting a record must not let the event it described write again.
+    #[test]
+    fn an_event_whose_record_was_forgotten_is_still_refused_unless_it_is_live() {
+        let state = Arc::new(ActorRuntimeState::default());
+        let live = IoContext::tracked(&state);
+        let live_id = live.continuation_id().expect("tracked id");
+        let gone = IoContext::tracked(&state);
+        let gone_id = gone.continuation_id().expect("tracked id");
+        drop(gone);
+        // Everything ended after these two ids, enough to evict the oldest.
+        let newer = gone_id.max(live_id) + 1;
+        for id in newer..newer + ENDED_CONTEXT_RECORDS as u64 + 2 {
+            state.ended_contexts.record(id, "over");
+        }
+        // A forgotten id with no live context: refused.
+        assert_eq!(
+            state.ended_reason(gone_id).as_deref(),
+            Some(ENDED_EVENT_FORGOTTEN)
+        );
+        // Raise the floor above the live context's id as well.
+        state.ended_contexts.record(live_id + 100_000, "later");
+        for id in 0..ENDED_CONTEXT_RECORDS as u64 {
+            state.ended_contexts.record(live_id + 200_000 + id, "later");
+        }
+        assert!(state.ended_contexts.records.lock().unwrap().floor > Some(live_id));
+        // A live context below the floor answers for itself.
+        assert_eq!(state.ended_reason(live_id), None);
+        live.end("the reason");
+        assert_eq!(state.ended_reason(live_id).as_deref(), Some("the reason"));
+        // An id above everything forgotten is a later event: allowed.
+        assert_eq!(state.ended_reason(live_id + 1_000_000), None);
+    }
+
+    /// A critical section's token names an origin and a driver; the guard
+    /// used to look at the driver only.
+    #[test]
+    fn a_token_is_refused_when_either_its_origin_or_its_driver_has_ended() {
+        let state = ActorRuntimeState::default();
+        state.ended_contexts.record(7, "origin over");
+        state.ended_contexts.record(9, "driver over");
+        // Ended origin, live foreign driver.
+        assert_eq!(
+            state.token_ended_reason(Some(7), Some(8)).as_deref(),
+            Some("origin over")
+        );
+        // Live origin, ended driver.
+        assert_eq!(
+            state.token_ended_reason(Some(8), Some(9)).as_deref(),
+            Some("driver over")
+        );
+        // Neither, and a plain token.
+        assert_eq!(state.token_ended_reason(Some(8), Some(8)), None);
+        assert_eq!(
+            state.token_ended_reason(Some(9), Some(9)).as_deref(),
+            Some("driver over")
+        );
+    }
+
+    #[test]
+    fn cleanup_ops_are_exempt_from_the_ended_event_guard() {
+        let action = |name: &'static str| move || name.to_string();
+        assert!(is_cleanup_op("__sql_cursor_close", action("")));
+        assert!(is_cleanup_op("__storage_cancel_pending_puts", action("")));
+        let control = "__storage_transaction_control";
+        assert!(is_cleanup_op(control, action("rollback")));
+        assert!(is_cleanup_op(control, action("rollback_explicit")));
+        assert!(!is_cleanup_op(control, action("start")));
+        assert!(!is_cleanup_op(control, action("commit")));
+        assert!(!is_cleanup_op("__storage_put", action("rollback")));
     }
 }

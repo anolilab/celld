@@ -6,6 +6,11 @@ const HOUR = 60 * 60 * 1000;
 // event that never awaits its own timer does. Each tick is stored, so a
 // count that moves later shows JavaScript still running.
 export class Pinned extends DurableObject {
+  signal(name) {
+    return this.env.PIN.get(this.env.PIN.idFromName(`signal-${name}`)).fetch(
+      "http://do/mark",
+    );
+  }
   async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname === "/ticks") {
@@ -23,6 +28,7 @@ export class Pinned extends DurableObject {
       setTimeout(async () => {
         try {
           await this.ctx.storage.transaction(async (txn) => {
+            await this.signal("late");
             await txn.put("late", 1);
             await new Promise((resolve) => setTimeout(resolve, 300));
             await txn.put("late2", 1);
@@ -72,6 +78,32 @@ export class Pinned extends DurableObject {
         .exec("SELECT count(*) AS n FROM guarded")
         .one().n;
       return new Response(JSON.stringify({ ...this.outcome, rows }));
+    }
+    // Holds a transaction open, waiting for ever. The object's move to a new
+    // deployment ends the event inside it, and the rejection that unwinds it
+    // must be able to roll the transaction back.
+    if (url.pathname === "/tx-hold") {
+      await this.ctx.storage.transaction(async (txn) => {
+        await txn.put("tx", 1);
+        await this.signal("tx");
+        await new Promise((resolve) => setTimeout(resolve, HOUR));
+      });
+      return new Response("committed");
+    }
+    if (url.pathname === "/tx-value") {
+      return new Response(String((await this.ctx.storage.get("tx")) ?? "none"));
+    }
+    // A transaction shuts the object's input gate, so an event that entered
+    // one is reported through an object of its own.
+    if (url.pathname === "/mark") {
+      this.marked = true;
+      return new Response("marked");
+    }
+    if (url.pathname === "/marked") {
+      return new Response(this.marked ? "entered" : "waiting");
+    }
+    if (url.pathname === "/tx-value") {
+      return new Response(String((await this.ctx.storage.get("tx")) ?? "none"));
     }
     // Waits for `/late-release`, which runs in another event. When the client
     // has hung up by then, this handler's event is over and its context gone.
@@ -154,6 +186,16 @@ export default {
       case "/do-late-release":
         return env.PIN.get(env.PIN.idFromName("late-write")).fetch(
           new Request("http://do/late-release"),
+        );
+      case "/do-tx-entered":
+      case "/do-late-entered":
+        return env.PIN.get(
+          env.PIN.idFromName(`signal-${url.pathname.split("-")[1]}`),
+        ).fetch(new Request("http://do/marked"));
+      case "/do-tx-hold":
+      case "/do-tx-value":
+        return env.PIN.get(env.PIN.idFromName("tx")).fetch(
+          new Request(`http://do/${url.pathname.slice("/do-".length)}`),
         );
       case "/do-late":
       case "/do-late-outcome":
