@@ -91,7 +91,10 @@ impl Server {
     ) -> Server {
         let mut server = Server::prepare(fixture, env);
         setup(&server.project);
-        server.launch().await;
+        server
+            .launch()
+            .await
+            .unwrap_or_else(|reason| panic!("{reason}"));
         server
     }
 
