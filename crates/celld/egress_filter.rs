@@ -974,18 +974,28 @@ fn with_canonical(addrs: Vec<IpAddr>) -> Vec<IpAddr> {
 /// the node runs. A failed read changes nothing, and an address is never forgotten.
 fn keep_interfaces_current(node: &'static NodeAddrs) {
     crate::asyncrt::spawn(async move {
+        // A host that cannot list its interfaces usually cannot do so on any
+        // read, so the warning is logged when reading starts to fail, not on
+        // every read after.
+        let mut failing = false;
         loop {
             crate::asyncrt::sleep(INTERFACE_REFRESH).await;
             // The listing is a system call; it runs on the blocking pool so a
             // slow one never holds a runtime worker.
             match crate::asyncrt::blocking(crate::node_addrs::try_interfaces).await {
-                Ok(Ok(listed)) => node.learn_interfaces(listed),
-                Ok(Err(error)) => {
+                Ok(Ok(listed)) => {
+                    failing = false;
+                    node.learn_interfaces(listed);
+                }
+                Ok(Err(error)) if !failing => {
+                    failing = true;
                     tracing::warn!(%error, "could not re-read this node's interface addresses, keeping the last list");
                 }
-                Err(_) => {
+                Err(_) if !failing => {
+                    failing = true;
                     tracing::warn!("re-reading this node's interface addresses panicked, keeping the last list");
                 }
+                Ok(Err(_)) | Err(_) => {}
             }
         }
     })
