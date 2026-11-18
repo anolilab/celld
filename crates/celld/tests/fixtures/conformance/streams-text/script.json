@@ -1,0 +1,8 @@
+{
+  "description": "TextEncoder, TextDecoder, ReadableStream, TransformStream and tee give the same bytes and counts.",
+  "requests": [
+    { "name": "ascii", "method": "POST", "path": "/", "body": "hello world" },
+    { "name": "multibyte", "method": "POST", "path": "/", "body": "héllo wörld € 😀" },
+    { "name": "pipeline", "method": "GET", "path": "/stream" }
+  ]
+}

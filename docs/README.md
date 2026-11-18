@@ -120,6 +120,7 @@ the waker role, and it wakes only the cells whose owner node has stopped.
 - [Telemetry](telemetry.md)
 - [Testing](testing.md)
   - [Test baseline](test-baseline.md)
+  - [Conformance harness](conformance.md)
 - [WebAssembly](wasm.md)
 - [Roadmap](roadmap.md)
 - [Python Workers](services/workers.md#python-workers)

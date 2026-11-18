@@ -1,0 +1,10 @@
+{
+  "description": "URL, URLSearchParams and URLPattern parse, resolve and serialise the same way.",
+  "requests": [
+    { "name": "absolute", "method": "GET", "path": "/?u=https%3A%2F%2Fuser%3Apw%40Example.COM%3A8080%2Fa%2F..%2Fb%2Fc%3Fz%3D1%26y%3D2%23frag" },
+    { "name": "relative", "method": "GET", "path": "/?u=..%2Fother%3Fq%3Dx" },
+    { "name": "default-port", "method": "GET", "path": "/?u=http%3A%2F%2Fexample.com%3A80%2Fp" },
+    { "name": "invalid", "method": "GET", "path": "/?u=http%3A%2F%2F%5B" },
+    { "name": "unicode-host", "method": "GET", "path": "/?u=https%3A%2F%2Fb%C3%BCcher.example%2F%C3%A4" }
+  ]
+}

@@ -53,7 +53,8 @@ ticket that owns each one.
 
 ## Conformance: two runtimes, one output
 
-*Status: the differential harness against workerd is tracked in [#5](https://github.com/anolilab/celld/issues/5), and the
+*Status: a first slice of the differential harness runs nightly; see [Conformance harness](conformance.md). The rest is
+tracked in [#5](https://github.com/anolilab/celld/issues/5), and the
 Web Platform Tests and workerd API tests in [#6](https://github.com/anolilab/celld/issues/6). The end-to-end contract tests
 check documented behavior, not workerd's output.*
 

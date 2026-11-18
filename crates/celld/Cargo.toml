@@ -20,6 +20,13 @@ name = "e2e"
 path = "benches/e2e.rs"
 harness = false
 
+# Compares celld with a pinned workerd on the fixtures of
+# tests/fixtures/conformance. Needs network for the workerd download.
+[[bench]]
+name = "conformance"
+path = "benches/conformance.rs"
+harness = false
+
 [[bench]]
 name = "storage_requests"
 path = "benches/storage_requests.rs"
