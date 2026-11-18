@@ -1112,18 +1112,33 @@ struct PumpClose {
     initiator: CloseInitiator,
 }
 
-async fn write_ws_out<S>(ws: &SocketWriter<S>, out: celld::js::WsOut) -> bool
+/// What writing one frame did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Written {
+    /// The socket took no more of the frame.
+    Failed,
+    /// A close frame was written.
+    Close,
+    /// A text or binary frame was written, and more may follow.
+    Data,
+}
+
+async fn write_ws_out<S>(ws: &SocketWriter<S>, out: celld::js::WsOut) -> Written
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
     use fastwebsockets::Frame;
-    let keep_open = matches!(out, celld::js::WsOut::Text(_) | celld::js::WsOut::Binary(_));
+    let data = matches!(out, celld::js::WsOut::Text(_) | celld::js::WsOut::Binary(_));
     let frame = match out {
         celld::js::WsOut::Text(text) => Frame::text(text.into_bytes().into()),
         celld::js::WsOut::Binary(data) => Frame::binary(data.into()),
         celld::js::WsOut::Close(code, reason) => Frame::close(code, reason.as_bytes()),
     };
-    ws.lock().await.write_frame(frame).await.is_ok() && keep_open
+    match (ws.lock().await.write_frame(frame).await.is_ok(), data) {
+        (false, _) => Written::Failed,
+        (true, true) => Written::Data,
+        (true, false) => Written::Close,
+    }
 }
 
 async fn echo_websocket_close<S>(
@@ -1325,6 +1340,8 @@ where
             }
         };
 
+        // Whether the close frame of the application reached the socket.
+        let close_written = std::sync::atomic::AtomicBool::new(false);
         // `recv` and the stop signal are both cancel-safe, and the write runs in
         // the branch body, so no write is ever cancelled either.
         let write = async {
@@ -1348,10 +1365,13 @@ where
                         let written = match outputs.write_timeout() {
                             Some(limit) => tokio::time::timeout(limit, write_ws_out(&writer, output))
                                 .await
-                                .unwrap_or(false),
+                                .unwrap_or(Written::Failed),
                             None => write_ws_out(&writer, output).await,
                         };
-                        if !written { return closed; }
+                        if written != Written::Data {
+                            close_written.store(written == Written::Close, std::sync::atomic::Ordering::Relaxed);
+                            return closed;
+                        }
                     }
                 }
             }
@@ -1371,7 +1391,7 @@ where
                 if let Some(details) = result {
                     let by_application = details.initiator == CloseInitiator::Application;
                     close = details;
-                    if let (true, Some(linger)) = (by_application, linger) {
+                    if let (true, true, Some(linger)) = (by_application, close_written.load(std::sync::atomic::Ordering::Relaxed), linger) {
                         // Keep reading, so nothing the peer sent is left
                         // unread when the socket closes.
                         let _ = tokio::time::timeout(linger, &mut read).await;
@@ -1552,7 +1572,7 @@ pub(super) async fn websocket_task<S>(
     let mut handler_sent_close = false;
     while let Ok(output) = outputs.try_recv() {
         handler_sent_close |= matches!(output, celld::js::WsOut::Close(_, _));
-        if !write_ws_out(&writer, output).await {
+        if write_ws_out(&writer, output).await != Written::Data {
             break;
         }
     }
@@ -2246,6 +2266,59 @@ mod pipe_tests {
         fn close_linger(&self) -> Option<Duration> {
             Some(Duration::from_secs(30))
         }
+    }
+
+    /// A socket that reads nothing and takes no write.
+    struct Broken;
+
+    impl tokio::io::AsyncWrite for Broken {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A close that could not be written leaves nothing to read on for: the
+    /// pump ends at once instead of holding the socket for the linger.
+    #[tokio::test]
+    async fn a_pump_does_not_linger_after_a_close_it_could_not_write() {
+        // The read side stays open and silent, so only the write ends the pump.
+        let (near, _far) = tokio::io::duplex(1024);
+        let (read, _unused) = tokio::io::split(near);
+        let socket = fastwebsockets::WebSocket::after_handshake(
+            tokio::io::join(read, Broken),
+            fastwebsockets::Role::Server,
+        );
+        let (frames, receiver) = mpsc::unbounded_channel();
+        frames
+            .send(celld::js::WsOut::Close(4002, "done".into()))
+            .unwrap();
+        let mut outputs = Lingering(receiver);
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            pump_cell_socket(socket, &mut outputs, true, |_| async { Ok(()) }),
+        )
+        .await;
+        let (close, _writer) = ended.expect("the pump lingered after a close it could not write");
+        assert_eq!(close.initiator, CloseInitiator::Application);
+        drop(frames);
     }
 
     /// A pump that wrote the close the application sent does not end while the
