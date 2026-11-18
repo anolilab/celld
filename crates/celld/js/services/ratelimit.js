@@ -109,7 +109,8 @@ function ratelimitService(host) {
         counter = { window, count: 0 };
         counters.set(key, counter);
         this._bytes += cost;
-      } else if (counter.window !== window) {
+      } else if (counter.window < window) {
+        // A clock that moved back keeps counting against the later window.
         counters.delete(key);
         counter.window = window;
         counter.count = 0;

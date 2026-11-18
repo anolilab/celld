@@ -81,6 +81,13 @@ fn a_limit_of_one_admits_one_per_window() {
 }
 
 #[test]
+fn a_clock_that_moves_back_does_not_readmit_calls() {
+    let result = run("const c = new RateLimitCounters();
+         return [hit(c, 'k', 10_000, 1), hit(c, 'k', 0, 1), hit(c, 'k', 10_000, 1)];");
+    assert_eq!(result, serde_json::json!([true, false, false]));
+}
+
+#[test]
 fn counters_of_past_windows_are_dropped() {
     // A thousand keys in one window, then one call a window later: the sweep
     // drops at most 32 per call, so the count falls by that much per call and

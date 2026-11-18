@@ -1752,6 +1752,7 @@ pub async fn apply_deployment(
     validate_managed_class_migrations(&deployment.manifest)?;
     crate::protocol::validate_required_features(&deployment.manifest.required_features)?;
     crate::protocol::validate_queue_manifest(&deployment.manifest)?;
+    crate::protocol::validate_ratelimit_manifest(&deployment.manifest)?;
     // Read the current owner before writing this deployment's immutable
     // objects. A competing Queue consumer must refuse the deployment without
     // leaving a prefix that looks publishable.
@@ -2940,6 +2941,25 @@ mod store_secret_tests {
             format!("{error:#}").contains("not a valid store id"),
             "{error:#}"
         );
+        assert!(bucket.get("deploy/current.json").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_managed_deployment_with_an_invalid_ratelimit_binding_is_refused() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = Bucket::open_dev(&directory.path().join("objects.sqlite3")).unwrap();
+        // The binding needs `ratelimit-v1` and the reserved class, which this
+        // manifest declares neither of.
+        let deployment = deployment_binding(serde_json::json!({
+            "type": "ratelimit", "name": "LIMITER", "namespace_id": "1001",
+            "simple": { "limit": 5, "period": 10 }
+        }));
+        let error = apply_deployment(&reqwest::Client::new(), "token", &bucket, &deployment)
+            .await
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("Rate Limiting"), "{error}");
         assert!(bucket.get("deploy/current.json").await.unwrap().is_none());
     }
 }
