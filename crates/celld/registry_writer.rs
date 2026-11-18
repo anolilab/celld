@@ -25,7 +25,7 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::ops::Range;
 use std::sync::atomic::Ordering;
@@ -131,8 +131,18 @@ impl Registry {
         let records: Vec<Record> = batch.values().copied().collect();
         let key = objects::segment_key(&self.prefix, &self.node, &self.session, seq);
         self.counters.put_requests.fetch_add(1, Ordering::Relaxed);
+        // A write that is dropped while the PUT is in flight (the wait's bound,
+        // a cancelled caller) must not lose the batch.
+        let mut unwritten = Requeue {
+            registry: self,
+            batch: Some(batch),
+        };
         let written =
             objects::put_create(self.store.as_ref(), &key, reg::encode_segment(&records)).await;
+        let batch = unwritten
+            .batch
+            .take()
+            .expect("the batch is held until the PUT returns");
         let mut queue = self.queue.lock().unwrap();
         match written {
             Ok(()) => {
@@ -309,44 +319,56 @@ impl Registry {
         self.counters.backstop_waits.fetch_add(1, Ordering::Relaxed);
         self.waiters.fetch_add(1, Ordering::Relaxed);
         let waiting = Waiting(self);
-        let _ = self.flush_now().await;
-        let requested = crate::asyncrt::mono_ms();
-        self.request_pass().await;
-        let outcome = loop {
-            if self.covered_now(&key) {
-                break Ok(());
+        let mut requested = crate::asyncrt::mono_ms();
+        // The segment write, the request to the holder and every root read have
+        // no deadline of their own, so the bound is enforced around all of them:
+        // a store that stalls inside one must not hold the write past it.
+        let remaining = self
+            .cfg
+            .bound
+            .saturating_sub(Duration::from_millis(requested.saturating_sub(started)));
+        let waited = async {
+            let _ = self.flush_now().await;
+            requested = crate::asyncrt::mono_ms();
+            self.request_pass().await;
+            loop {
+                if self.covered_now(&key) {
+                    break;
+                }
+                let io = Io::default();
+                let _ = self.refresh(&io).await;
+                if self.covered_now(&key) {
+                    break;
+                }
+                let flushed = self
+                    .queue
+                    .lock()
+                    .unwrap()
+                    .created
+                    .get(&key)
+                    .is_some_and(|created| created.seg.is_none());
+                if flushed {
+                    let _ = self.flush_now().await;
+                }
+                crate::asyncrt::select_biased! {
+                    "a root observation ends the poll pause";
+                    _ = self.observed.notified() => {}
+                    _ = crate::asyncrt::sleep(POLL) => {}
+                }
+                if !self.covered_now(&key) {
+                    self.request_pass().await;
+                }
             }
-            if crate::asyncrt::mono_ms().saturating_sub(started)
-                >= self.cfg.bound.as_millis() as u64
-            {
+        };
+        let outcome = match crate::asyncrt::timeout(remaining, waited).await {
+            Ok(()) => Ok(()),
+            Err(_) if self.covered_now(&key) => Ok(()),
+            Err(_) => {
                 self.counters.bound_hits.fetch_add(1, Ordering::Relaxed);
-                break Err(object_store::Error::Generic {
+                Err(object_store::Error::Generic {
                     store: "registry",
                     source: format!("cell {cell} is not covered by the registry yet").into(),
-                });
-            }
-            let io = Io::default();
-            let _ = self.refresh(&io).await;
-            if self.covered_now(&key) {
-                break Ok(());
-            }
-            let flushed = self
-                .queue
-                .lock()
-                .unwrap()
-                .created
-                .get(&key)
-                .is_some_and(|created| created.seg.is_none());
-            if flushed {
-                let _ = self.flush_now().await;
-            }
-            crate::asyncrt::select_biased! {
-                "a root observation ends the poll pause";
-                _ = self.observed.notified() => {}
-                _ = crate::asyncrt::sleep(POLL) => {}
-            }
-            if !self.covered_now(&key) {
-                self.request_pass().await;
+                })
             }
         };
         drop(waiting);
@@ -377,6 +399,31 @@ impl Registry {
             Some(cell) => self.ensure_covered(cell).await,
             None => Ok(()),
         }
+    }
+}
+
+/// The entries of a segment whose PUT has not returned: put back in the queue
+/// if the write is dropped before it does.
+struct Requeue<'a> {
+    registry: &'a Registry,
+    batch: Option<BTreeMap<Key, Record>>,
+}
+
+impl Drop for Requeue<'_> {
+    fn drop(&mut self) {
+        let Some(batch) = self.batch.take() else {
+            return;
+        };
+        let mut queue = self.registry.queue.lock().unwrap();
+        for (cell, record) in batch {
+            queue
+                .waiting
+                .entry(cell)
+                .and_modify(|held| *held = reg::merge(*held, record))
+                .or_insert(record);
+        }
+        drop(queue);
+        self.registry.queued.notify_one();
     }
 }
 
