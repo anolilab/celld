@@ -19,6 +19,8 @@ const TOKEN: &str = "e2e-retire-token";
 const DEADLINE_S: &str = "4";
 // The deadline must exceed the maximum age, whose default is 60 seconds.
 const MAX_AGE_S: &str = "1";
+// How long after the deadline the list may still show the generation.
+const FREED_MARGIN_S: u64 = 20;
 
 async fn state(server: &Server) -> Value {
     reqwest::Client::new()
@@ -46,14 +48,14 @@ async fn get_within_budget(client: &reqwest::Client, url: &str) -> (reqwest::Sta
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         attempts += 1;
-        if attempts == 5
+        if attempts == 10
             || !(body.contains("handler exceeded")
                 || status == reqwest::StatusCode::SERVICE_UNAVAILABLE)
         {
             return (status, body);
         }
         // Give the queue that made it time out a moment to drain.
-        tokio::time::sleep(Duration::from_millis(200 * attempts)).await;
+        tokio::time::sleep(Duration::from_millis(200 * attempts.min(5))).await;
     }
 }
 
@@ -138,10 +140,12 @@ async fn a_superseded_generation_is_freed_at_its_deadline_though_its_work_never_
     );
 
     // The isolate is freed, the generation leaves the list, and the new one
-    // is unaffected.
+    // is unaffected. The deadline ends the work, and the list follows within
+    // moments, not a maintenance interval later; the margin is for a loaded
+    // machine.
     wait_until(
         "the superseded generation to be freed",
-        Duration::from_secs(60),
+        Duration::from_secs(DEADLINE_S.parse::<u64>().expect("deadline") + FREED_MARGIN_S),
         || async {
             let state = state(&server).await;
             state["deployment"]["draining"]

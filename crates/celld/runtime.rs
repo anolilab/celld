@@ -42,6 +42,47 @@ const MAX_ALARM_COMPLETIONS: usize = 65_536;
 /// How often the isolate pool gives back what it no longer needs.
 const REAP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// The first wait before a superseded generation is checked for having freed
+/// its last isolate, so a generation that frees quickly leaves the draining
+/// list soon after, not up to a `REAP_INTERVAL` later.
+const DRAIN_POLL: Duration = Duration::from_millis(250);
+
+/// The longest wait between two checks of a generation that is still
+/// draining. The wait doubles from `DRAIN_POLL`, so a long retirement costs a
+/// few checks, not one every 250 ms.
+const DRAIN_POLL_MAX: Duration = Duration::from_secs(5);
+
+/// From this wait on, a check also reaps the generation's cell pools. Earlier
+/// checks only ask `is_drained`, which takes read locks and no maintenance
+/// lock, so overlapping deploys do not multiply pool maintenance.
+const DRAIN_REAP_FROM: Duration = Duration::from_secs(1);
+
+/// The wait after `wait` for a generation that is still draining.
+fn next_drain_wait(wait: Duration) -> Duration {
+    (wait * 2).min(DRAIN_POLL_MAX)
+}
+
+/// Drop a drained generation from the draining list.
+fn remove_drained(
+    generations: &std::sync::RwLock<crate::cell_runtime::Generations>,
+    generation: &Arc<Generation>,
+) {
+    let mut generations = generations.write().expect("generation lock poisoned");
+    if let Some(index) = generations
+        .draining
+        .iter()
+        .position(|candidate| Arc::ptr_eq(candidate, generation))
+    {
+        generations.draining.remove(index);
+        tracing::info!(
+            event = "deployment_generation_freed",
+            generation = generation.id,
+            version = %generation.version,
+            "application generation freed"
+        );
+    }
+}
+
 /// How long a reclaim waits before it retries when admission holds the pool.
 const RECLAIM_RETRY: Duration = Duration::from_millis(10);
 
@@ -834,6 +875,7 @@ impl RuntimeManager {
         // previous generation and this must not hold the generation lock,
         // which every request reads.
         previous.retire();
+        self.watch_drain(&previous);
         next
     }
 
@@ -866,20 +908,37 @@ impl RuntimeManager {
                 if !generation.is_drained() {
                     continue;
                 }
-                let mut generations = generations.write().expect("generation lock poisoned");
-                if let Some(index) = generations
-                    .draining
-                    .iter()
-                    .position(|candidate| Arc::ptr_eq(candidate, &generation))
-                {
-                    generations.draining.remove(index);
-                    tracing::info!(
-                        event = "deployment_generation_freed",
-                        generation = generation.id,
-                        version = %generation.version,
-                        "application generation freed"
-                    );
+                remove_drained(&generations, &generation);
+            }
+        });
+    }
+
+    /// Spawn the loop that removes a superseded generation from the draining
+    /// list as soon as its last isolate is freed. The maintenance loop of
+    /// `watch_generation` ticks every `REAP_INTERVAL` and would leave a
+    /// generation that freed just after a tick listed, and counted by
+    /// `/state`, for another full interval.
+    fn watch_drain(&self, generation: &Arc<Generation>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let draining = Arc::downgrade(generation);
+        let generations = self.generations.clone();
+        handle.spawn(async move {
+            let mut wait = DRAIN_POLL;
+            loop {
+                tokio::time::sleep(wait).await;
+                let Some(generation) = draining.upgrade() else {
+                    return;
+                };
+                if wait >= DRAIN_REAP_FROM && !generation.is_drained() {
+                    generation.reap_cell_pools();
                 }
+                if generation.is_drained() {
+                    remove_drained(&generations, &generation);
+                    return;
+                }
+                wait = next_drain_wait(wait);
             }
         });
     }
@@ -3597,6 +3656,23 @@ fn install_container_specs(generation: &Generation) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn drain_wait_doubles_to_its_cap() {
+        assert_eq!(next_drain_wait(DRAIN_POLL), Duration::from_millis(500));
+        assert_eq!(next_drain_wait(Duration::from_secs(4)), DRAIN_POLL_MAX);
+        assert_eq!(next_drain_wait(DRAIN_POLL_MAX), DRAIN_POLL_MAX);
+        // Thirty seconds of retirement is a handful of checks, not 120.
+        let mut elapsed = Duration::ZERO;
+        let mut checks = 0;
+        let mut wait = DRAIN_POLL;
+        while elapsed < Duration::from_secs(30) {
+            elapsed += wait;
+            checks += 1;
+            wait = next_drain_wait(wait);
+        }
+        assert!(checks <= 12, "{checks} checks");
+    }
+
     use super::*;
 
     /// A wait that parked while its generation served has no bell to be woken
