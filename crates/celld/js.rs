@@ -6809,6 +6809,7 @@ ops! { OP_NAMES, install_op_functions,
         "__structured_clone" => storage_ops::op_structured_clone,
         "__op_fetch" => op_fetch,
         "__ai_run" => ai_ops::op_ai_run,
+        "__ai_redact" => ai_ops::op_ai_redact,
         "__r2_head" => r2_ops::op_r2_head,
         "__r2_get" => r2_ops::op_r2_get,
         "__r2_put" => r2_ops::op_r2_put,
@@ -9080,6 +9081,14 @@ fn op_rpc_call(
     rv.set(p);
 }
 
+/// How long an outbound request may take, for `fetch` and the AI binding.
+fn fetch_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        crate::env_vars::positive_or("CELLD_FETCH_TIMEOUT_S", 120)
+            .expect("validated CELLD_FETCH_TIMEOUT_S"),
+    )
+}
+
 /// Outbound `fetch` — the op behind the harness's `fetch()`. Resolves to a JSON
 /// `{status, body, headers}` string.
 fn op_fetch(
@@ -9310,11 +9319,7 @@ fn op_fetch(
         let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
         // a timeout bounds a black-hole host: the future settles (Err) instead
         // of parking run_loop forever — the hang the Drop guard can't catch.
-        let fetch_timeout = crate::env_vars::positive_or("CELLD_FETCH_TIMEOUT_S", 120)
-            .expect("validated CELLD_FETCH_TIMEOUT_S");
-        let mut rb = client
-            .request(m.clone(), &url)
-            .timeout(std::time::Duration::from_secs(fetch_timeout));
+        let mut rb = client.request(m.clone(), &url).timeout(fetch_timeout());
         // reqwest omits Content-Length for an empty Vec, which collapses the
         // wire representation of `Some([])` into the representation of
         // `None`. Install the zero length here unless the Worker supplied a

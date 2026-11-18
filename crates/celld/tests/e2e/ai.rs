@@ -117,7 +117,22 @@ async fn serve(mut stream: tokio::net::TcpStream, log: Arc<Mutex<Vec<Seen>>>) {
             .and_then(|message| message["content"].as_str())
             .unwrap_or_default()
             .to_string();
-        if last == "fail" {
+        if last == "big" {
+            // An answer past the host's limit.
+            http(200, "application/json", &"x".repeat(33 << 20))
+        } else if last == "stream-error" || last == "stream-cut" {
+            let mut text = format!(
+                "data: {}\n\n",
+                json!({ "choices": [{ "delta": { "content": "Hel" } }] })
+            );
+            if last == "stream-error" {
+                text.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({ "error": { "message": format!("overloaded, key {KEY}") } })
+                ));
+            }
+            http(200, "text/event-stream", &text)
+        } else if last == "fail" {
             http(
                 500,
                 "text/plain",
@@ -270,4 +285,54 @@ async fn a_node_without_the_endpoint_says_what_to_set() {
     assert_eq!(result["ok"], false);
     let message = result["message"].as_str().unwrap();
     assert!(message.contains("CELLD_AI_BASE_URL"), "{message}");
+}
+
+#[tokio::test]
+async fn an_error_event_in_a_stream_errors_the_stream_and_the_key_stays_out() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    let result: Value = server.get_json("/stream-error").await;
+    assert_eq!(result["ok"], false, "{result}");
+    assert_eq!(result["text"], "data: {\"response\":\"Hel\"}\n\n");
+    let message = result["message"].as_str().unwrap();
+    assert!(
+        message.contains("overloaded") && message.contains("[redacted]"),
+        "{message}"
+    );
+    assert!(!message.contains(KEY), "{message}");
+}
+
+#[tokio::test]
+async fn a_stream_that_ends_without_done_errors_instead_of_completing() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    let result: Value = server.get_json("/stream-cut").await;
+    assert_eq!(result["ok"], false, "{result}");
+    assert_eq!(result["text"], "data: {\"response\":\"Hel\"}\n\n");
+    assert!(
+        result["message"].as_str().unwrap().contains("[DONE]"),
+        "{result}"
+    );
+}
+
+#[tokio::test]
+async fn bodies_past_the_limit_fail_the_call() {
+    let stub = Stub::start().await;
+    let (server, _key) = start(&stub).await;
+
+    let answer: Value = server.get_json("/big-answer").await;
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert!(
+        answer["message"].as_str().unwrap().contains("larger than"),
+        "{answer}"
+    );
+    let request: Value = server.get_json("/big-request").await;
+    assert_eq!(request["ok"], false, "{request}");
+    assert!(
+        request["message"].as_str().unwrap().contains("larger than"),
+        "{request}"
+    );
+    assert_eq!(stub.requests().len(), 1, "the oversized request was sent");
 }

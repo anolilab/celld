@@ -1761,6 +1761,34 @@ fn entry_text<'a>(
     }
 }
 
+/// The binding name of a config key that declares one env binding and nothing
+/// else, as `{ "binding": "NAME" }`. `None` when the key is absent.
+fn single_binding<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> anyhow::Result<Option<&'a str>> {
+    let declaration = match object.get(key) {
+        None => return Ok(None),
+        Some(Value::Object(declaration)) => declaration,
+        Some(_) => bail!("config `{key}` must be an object with a `binding` name"),
+    };
+    if let Some(option) = declaration
+        .keys()
+        .find(|option| option.as_str() != "binding")
+    {
+        bail!("`{key}` sets `{option}`, which is not a supported option");
+    }
+    let binding = match declaration.get("binding") {
+        None => bail!("`{key}` has no `binding` name"),
+        Some(Value::String(binding)) => binding.as_str(),
+        Some(_) => bail!("`{key}` `binding` must be a string"),
+    };
+    if !valid_binding(binding) {
+        bail!("invalid {key} binding name: {binding:?}");
+    }
+    Ok(Some(binding))
+}
+
 fn read_project(
     path: &Path,
     root: &Path,
@@ -2387,28 +2415,13 @@ fn read_project(
     // `version_metadata` names one env binding that reports the deployment's
     // id, tag and creation time. The values come from the manifest at load
     // time; the config carries only the name.
-    let mut declared_version_metadata = false;
-    match object.get("version_metadata") {
-        None => {}
-        Some(Value::Object(metadata)) => {
-            if let Some(key) = metadata.keys().find(|key| key.as_str() != "binding") {
-                bail!("`version_metadata` sets `{key}`, which is not a supported option");
-            }
-            let binding = match metadata.get("binding") {
-                None => bail!("`version_metadata` has no `binding` name"),
-                Some(Value::String(binding)) => binding.as_str(),
-                Some(_) => bail!("`version_metadata` `binding` must be a string"),
-            };
-            if !valid_binding(binding) {
-                bail!("invalid version_metadata binding name: {binding:?}");
-            }
-            declared_version_metadata = true;
-            bindings.push(json!({
-                "type": "version_metadata",
-                "name": binding,
-            }));
-        }
-        Some(_) => bail!("config `version_metadata` must be an object with a `binding` name"),
+    let version_metadata = single_binding(object, "version_metadata")?;
+    let declared_version_metadata = version_metadata.is_some();
+    if let Some(binding) = version_metadata {
+        bindings.push(json!({
+            "type": "version_metadata",
+            "name": binding,
+        }));
     }
     // `secrets_store_secrets` binds one secret of a Secrets Store. The config
     // keeps Cloudflare's `store_id` and `secret_name`; the value comes from
@@ -2485,28 +2498,13 @@ fn read_project(
     }
     // `ai` names one env binding for Workers AI. The endpoint, key and model
     // map belong to the node, so the config carries only the name.
-    let mut declared_ai = false;
-    match object.get("ai") {
-        None => {}
-        Some(Value::Object(ai)) => {
-            if let Some(key) = ai.keys().find(|key| key.as_str() != "binding") {
-                bail!("`ai` sets `{key}`, which is not a supported option");
-            }
-            let binding = match ai.get("binding") {
-                None => bail!("`ai` has no `binding` name"),
-                Some(Value::String(binding)) => binding.as_str(),
-                Some(_) => bail!("`ai` `binding` must be a string"),
-            };
-            if !valid_binding(binding) {
-                bail!("invalid ai binding name: {binding:?}");
-            }
-            declared_ai = true;
-            bindings.push(json!({
-                "type": "ai",
-                "name": binding,
-            }));
-        }
-        Some(_) => bail!("config `ai` must be an object with a `binding` name"),
+    let ai = single_binding(object, "ai")?;
+    let declared_ai = ai.is_some();
+    if let Some(binding) = ai {
+        bindings.push(json!({
+            "type": "ai",
+            "name": binding,
+        }));
     }
     let mut vars = BTreeMap::new();
     match object.get("vars") {
@@ -3960,7 +3958,7 @@ mod container_image_tests {
 mod version_metadata_config_tests {
     use super::*;
 
-    fn read(config: &str) -> anyhow::Result<Project> {
+    pub(super) fn read(config: &str) -> anyhow::Result<Project> {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
         let path = dir.path().join("wrangler.jsonc");
@@ -3968,7 +3966,7 @@ mod version_metadata_config_tests {
         read_project(&path, dir.path(), &VarOverrides::None, false)
     }
 
-    fn base(extra: &str) -> String {
+    pub(super) fn base(extra: &str) -> String {
         format!(r#"{{ "name": "app", "main": "index.js", "no_bundle": true, {extra} }}"#)
     }
 
@@ -4478,23 +4476,12 @@ mod hyperdrive_config_tests {
 
 #[cfg(test)]
 mod ai_config_tests {
+    use super::version_metadata_config_tests::{base, read};
     use super::*;
-
-    fn read(extra: &str) -> anyhow::Result<Project> {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
-        let path = dir.path().join("wrangler.jsonc");
-        std::fs::write(
-            &path,
-            format!(r#"{{ "name": "app", "main": "index.js", "no_bundle": true, {extra} }}"#),
-        )
-        .unwrap();
-        read_project(&path, dir.path(), &VarOverrides::None, false)
-    }
 
     #[test]
     fn the_binding_becomes_an_ai_entry_and_requires_the_feature() {
-        let project = read(r#""ai": { "binding": "AI" }"#).unwrap();
+        let project = read(&base(r#""ai": { "binding": "AI" }"#)).unwrap();
         assert!(project.metadata["bindings"]
             .as_array()
             .unwrap()
@@ -4511,7 +4498,7 @@ mod ai_config_tests {
             r#""ai": { "binding": "AI", "staging": true }"#,
             r#""ai": { "binding": "X" }, "vars": { "X": "y" }"#,
         ] {
-            assert!(read(extra).is_err(), "{extra}");
+            assert!(read(&base(extra)).is_err(), "{extra}");
         }
     }
 }

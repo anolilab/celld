@@ -61,23 +61,19 @@ pub(super) fn op_ai_run(
     let client = CLIENT.with(|client| client.clone());
     let gate = egress_gate_request(&context, celld_logic::Channel::Fetch);
     let stream_service = http_stream_service();
-    let timeout = crate::env_vars::positive_or("CELLD_FETCH_TIMEOUT_S", 120)
-        .expect("validated CELLD_FETCH_TIMEOUT_S");
+    let timeout = fetch_timeout();
     let id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
         let mut builder = client
             .post(&request.url)
-            .timeout(std::time::Duration::from_secs(timeout))
+            .timeout(timeout)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(request.body);
         if stream {
             builder = builder.header(reqwest::header::ACCEPT, "text/event-stream");
         }
         if let Some(bearer) = request.bearer {
-            let mut value = reqwest::header::HeaderValue::from_str(&bearer)
-                .map_err(|_| "AI: the API key is not a valid header value".to_string())?;
-            value.set_sensitive(true);
-            builder = builder.header(reqwest::header::AUTHORIZATION, value);
+            builder = builder.header(reqwest::header::AUTHORIZATION, bearer);
         }
         let mut response = builder.send().await.map_err(|error| {
             // The error names the URL, which carries no credential.
@@ -90,16 +86,10 @@ pub(super) fn op_ai_run(
             let detail = if matches!(status.as_u16(), 401 | 403) {
                 String::new()
             } else {
-                let limit = config.error_read_limit(ERROR_BODY_BYTES);
-                let mut text = Vec::new();
-                while text.len() < limit {
-                    match response.chunk().await {
-                        Ok(Some(chunk)) => text.extend_from_slice(&chunk),
-                        _ => break,
-                    }
-                }
-                text.truncate(limit);
-                format!(": {}", config.error_detail(&text, ERROR_BODY_BYTES))
+                format!(
+                    ": {}",
+                    config.error_detail(response, ERROR_BODY_BYTES).await
+                )
             };
             return Err(format!(
                 "AiError: the upstream answered {}{detail}",
@@ -112,9 +102,44 @@ pub(super) fn op_ai_run(
                 .map(|stream_id| stream_id.to_string())
                 .ok_or_else(|| format!("AI: {HTTP_STREAM_REGISTRATION_CLOSED}"));
         }
-        response.text().await.map_err(|error| {
+        let too_large = || {
+            format!(
+                "AiError: the upstream answer is larger than {} MiB",
+                crate::ai::MAX_BODY_BYTES >> 20
+            )
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > crate::ai::MAX_BODY_BYTES as u64)
+        {
+            return Err(too_large());
+        }
+        let mut answer = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
             config.redact(&format!("AiError: reading the upstream answer: {error}"))
-        })
+        })? {
+            if answer.len() + chunk.len() > crate::ai::MAX_BODY_BYTES {
+                return Err(too_large());
+            }
+            answer.extend_from_slice(&chunk);
+        }
+        Ok(String::from_utf8_lossy(&answer).into_owned())
     });
     rv.set(promise_for(scope, id));
+}
+
+/// `__ai_redact(text)`: `text` without the node's API key, for an error the
+/// upstream put in a stream after its head. Without a configured endpoint
+/// there is no key to remove.
+pub(super) fn op_ai_redact(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let text = args.get(0).to_rust_string_lossy(scope);
+    let text = match crate::ai::load() {
+        Ok(Some(config)) => config.redact(&text),
+        _ => text,
+    };
+    rv.set(v8::String::new(scope, &text).unwrap().into());
 }

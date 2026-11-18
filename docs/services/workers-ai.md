@@ -37,13 +37,18 @@ export CELLD_AI_MODELS='{
 }'
 ```
 
-The key is optional, for a server that takes none. A malformed setting stops
+The key is optional, for a server that takes none. A blank variable counts as
+unset. celld logs a warning when the key file can be read by other users. A malformed setting stops
 the node at startup. The settings belong to the node, so a Worker cannot choose
 another endpoint or model. `celld dev` reads the same settings.
 
 The node makes the HTTP call, so the key never enters a Worker. celld does not
 log it, and it removes the key from an upstream error before the Worker sees
 it. A `401` or `403` from the endpoint reaches the Worker without the body.
+
+A request body from the Worker and an answer from the endpoint may each be up
+to 32 MiB. A larger request is refused without a call, and a larger answer
+fails the call with an error that names the limit.
 
 The endpoint is the operator's own, so the egress policy (`CELLD_EGRESS`) does
 not apply to it and a private or loopback address works. celld does not follow
@@ -72,6 +77,11 @@ text, then `data: [DONE]`.
 const stream = await env.AI.run(model, { prompt, stream: true });
 return new Response(stream, { headers: { "content-type": "text/event-stream" } });
 ```
+
+A stream that the endpoint cuts short, or that carries an error event, does not
+end with `[DONE]`. The stream errors instead, and reading it throws an
+`AiError` with the endpoint's message (without the key), so a Worker cannot
+take a partial answer for a complete one.
 
 ## Embeddings
 

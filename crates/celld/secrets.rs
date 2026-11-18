@@ -126,34 +126,21 @@ impl SecretsKey {
     ///
     /// The key is read and parsed once per process; a change to the variable or
     /// the file takes effect at the next start.
-    #[allow(clippy::disallowed_methods)] // Operator input, not node storage.
     pub fn from_environment() -> anyhow::Result<Option<&'static Self>> {
         static KEY: OnceLock<Option<SecretsKey>> = OnceLock::new();
         if let Some(key) = KEY.get() {
             return Ok(key.as_ref());
         }
-        let file =
-            crate::env_vars::value(KEY_FILE_VARIABLE)?.filter(|path| !path.trim().is_empty());
-        let variable_set =
-            crate::env_vars::value(KEY_VARIABLE)?.is_some_and(|value| !value.trim().is_empty());
-        let key = match (variable_set, file) {
-            (false, None) => None,
-            (true, None) => Self::from_variable()?,
-            (false, Some(path)) => {
-                let path = std::path::Path::new(&path);
-                let text = Zeroizing::new(
-                    crate::credential_file::read(path, KEY_FILE_MAX_BYTES)
-                        .with_context(|| format!("read {KEY_FILE_VARIABLE}"))?,
-                );
-                warn_if_shared(path);
-                Some(Self::parse(&text).with_context(|| {
-                    format!("{KEY_FILE_VARIABLE} ({}) is invalid", path.display())
-                })?)
-            }
-            (true, Some(_)) => {
-                bail!("set only one of {KEY_VARIABLE} and {KEY_FILE_VARIABLE}")
-            }
-        };
+        let key = crate::credential_file::variable_or_file(
+            KEY_VARIABLE,
+            KEY_FILE_VARIABLE,
+            KEY_FILE_MAX_BYTES,
+        )?
+        .map(|credential| {
+            Self::parse(&credential.text)
+                .with_context(|| format!("{} is invalid", credential.origin))
+        })
+        .transpose()?;
         Ok(KEY.get_or_init(|| key).as_ref())
     }
 
@@ -213,28 +200,6 @@ impl SecretsKey {
             .map_err(|_| wrong())
     }
 }
-
-/// Log once that the key file can be read by other users. A container secret
-/// mount is often mode 0644, so this is a warning and never a refusal.
-#[cfg(unix)]
-#[allow(clippy::disallowed_methods)] // Operator input, not node storage.
-fn warn_if_shared(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    if let Ok(metadata) = std::fs::metadata(path) {
-        let mode = metadata.permissions().mode() & 0o777;
-        if mode & 0o077 != 0 {
-            tracing::warn!(
-                event = "secrets_key_file_shared",
-                path = %path.display(),
-                mode = format!("{mode:o}"),
-                "the secrets key file can be read by other users; restrict it to its owner"
-            );
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn warn_if_shared(_path: &std::path::Path) {}
 
 /// What a value is bound to: its script and its name. The separators cannot
 /// occur in either, so two pairs never give the same bytes.

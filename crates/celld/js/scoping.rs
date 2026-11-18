@@ -302,6 +302,7 @@ const NOT_CELL_SCOPED: &[&str] = &[
     "__structured_clone",
     "__op_fetch",
     "__ai_run",
+    "__ai_redact",
     "__r2_head",
     "__r2_get",
     "__r2_put",

@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context as _};
+use reqwest::header::HeaderValue;
 use zeroize::Zeroizing;
 
 pub const BASE_URL: &str = "CELLD_AI_BASE_URL";
@@ -26,6 +27,10 @@ pub const MODELS: &str = "CELLD_AI_MODELS";
 
 /// A key is a short line; a larger file is not one.
 const KEY_FILE_MAX_BYTES: u64 = 4096;
+
+/// The most of a request body a Worker may send, and of an upstream answer the
+/// host reads. Both are held in host memory, outside the isolate's heap limit.
+pub const MAX_BODY_BYTES: usize = 32 << 20;
 
 /// Which OpenAI-compatible route a `run()` call goes to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +59,8 @@ impl Route {
 pub struct Config {
     base: String,
     key: Option<Zeroizing<String>>,
+    /// `Bearer <key>`, marked sensitive so it never prints.
+    bearer: Option<HeaderValue>,
     models: BTreeMap<String, String>,
 }
 
@@ -71,7 +78,7 @@ impl std::fmt::Debug for Config {
 pub struct Request {
     pub url: String,
     pub body: Vec<u8>,
-    pub bearer: Option<String>,
+    pub bearer: Option<HeaderValue>,
 }
 
 impl Config {
@@ -79,6 +86,12 @@ impl Config {
     /// `body` the harness built. The upstream model name replaces the
     /// `model` field, whatever the Worker put there.
     pub fn request(&self, route: Route, model: &str, body: &str) -> Result<Request, String> {
+        if body.len() > MAX_BODY_BYTES {
+            return Err(format!(
+                "AI request body is larger than {} MiB",
+                MAX_BODY_BYTES >> 20
+            ));
+        }
         let upstream = self.models.get(model).ok_or_else(|| {
             format!("Workers AI model {model:?} is not mapped; add it to {MODELS} on this node")
         })?;
@@ -91,10 +104,7 @@ impl Config {
         Ok(Request {
             url: format!("{}{}", self.base, route.path()),
             body: serde_json::to_vec(&body).map_err(|error| error.to_string())?,
-            bearer: self
-                .key
-                .as_ref()
-                .map(|key| format!("Bearer {}", key.as_str())),
+            bearer: self.bearer.clone(),
         })
     }
 
@@ -109,16 +119,30 @@ impl Config {
 }
 
 impl Config {
-    /// How many bytes of an upstream error to read so that `error_detail` can
+    /// How many bytes of an upstream error to read so that `cut_detail` can
     /// still see a whole key that starts inside the first `max`.
-    pub fn error_read_limit(&self, max: usize) -> usize {
+    fn error_read_limit(&self, max: usize) -> usize {
         max + self.key.as_ref().map_or(0, |key| key.len())
     }
 
-    /// The first `max` bytes of an upstream error `raw`, read to
-    /// `error_read_limit`, with the key removed before the cut so that no part
-    /// of it survives at the edge.
-    pub fn error_detail(&self, raw: &[u8], max: usize) -> String {
+    /// The first `max` bytes of the body of an upstream error `response`, with
+    /// the key removed: the body is read far enough to hold a whole key, and
+    /// redacted before it is cut, so that no part of the key survives at the
+    /// edge.
+    pub async fn error_detail(&self, mut response: reqwest::Response, max: usize) -> String {
+        let limit = self.error_read_limit(max);
+        let mut raw = Vec::new();
+        while raw.len() < limit {
+            match response.chunk().await {
+                Ok(Some(chunk)) => raw.extend_from_slice(&chunk),
+                _ => break,
+            }
+        }
+        raw.truncate(limit);
+        self.cut_detail(&raw, max)
+    }
+
+    fn cut_detail(&self, raw: &[u8], max: usize) -> String {
         let mut raw = raw;
         if let Some(key) = &self.key {
             if raw.len() >= self.error_read_limit(max) {
@@ -148,20 +172,11 @@ pub fn load() -> anyhow::Result<Option<&'static Config>> {
     if let Some(config) = CONFIG.get() {
         return Ok(config.as_ref());
     }
-    let key_file = crate::env_vars::value(API_KEY_FILE)?;
-    let key_file_text = key_file
-        .as_deref()
-        .map(|path| {
-            crate::credential_file::read(std::path::Path::new(path), KEY_FILE_MAX_BYTES)
-                .map(Zeroizing::new)
-                .with_context(|| format!("read {API_KEY_FILE}"))
-        })
-        .transpose()?;
-    let key = crate::env_vars::value(API_KEY)?.map(Zeroizing::new);
+    let key = crate::credential_file::variable_or_file(API_KEY, API_KEY_FILE, KEY_FILE_MAX_BYTES)?;
     let config = parse(
         crate::env_vars::value(BASE_URL)?.as_deref(),
-        key.as_deref().map(String::as_str),
-        key_file_text.as_deref().map(String::as_str),
+        key.as_ref()
+            .map(|key| key.text.trim_end_matches(['\r', '\n'])),
         crate::env_vars::value(MODELS)?.as_deref(),
     )?;
     Ok(CONFIG.get_or_init(|| config).as_ref())
@@ -170,11 +185,10 @@ pub fn load() -> anyhow::Result<Option<&'static Config>> {
 fn parse(
     base: Option<&str>,
     key: Option<&str>,
-    key_file: Option<&str>,
     models: Option<&str>,
 ) -> anyhow::Result<Option<Config>> {
     let Some(base) = base else {
-        if key.is_some() || key_file.is_some() || models.is_some() {
+        if key.is_some() || models.is_some() {
             bail!("{BASE_URL} is required when {API_KEY}, {API_KEY_FILE} or {MODELS} is set");
         }
         return Ok(None);
@@ -191,19 +205,22 @@ fn parse(
             && parsed.fragment().is_none(),
         "{BASE_URL} must not carry credentials, a query or a fragment; set the key in {API_KEY_FILE}"
     );
-    let key = match (key, key_file) {
-        (Some(_), Some(_)) => bail!("set only one of {API_KEY} and {API_KEY_FILE}"),
-        (Some(key), None) => Some(("variable", key)),
-        (None, Some(text)) => Some(("file", text.trim_end_matches(['\r', '\n']))),
-        (None, None) => None,
-    };
     let key = key
-        .map(|(source, key)| {
+        .map(|key| {
             anyhow::ensure!(
                 !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_graphic()),
-                "the AI API key from the {source} is empty or has characters a header cannot carry"
+                "the AI API key ({API_KEY} or {API_KEY_FILE}) is empty or has characters a header cannot carry"
             );
             Ok(Zeroizing::new(key.to_string()))
+        })
+        .transpose()?;
+    let bearer = key
+        .as_ref()
+        .map(|key| {
+            let line = Zeroizing::new(format!("Bearer {}", key.as_str()));
+            let mut value = HeaderValue::from_str(&line)?;
+            value.set_sensitive(true);
+            anyhow::Ok(value)
         })
         .transpose()?;
     let models: BTreeMap<String, String> = serde_json::from_str(
@@ -218,8 +235,10 @@ fn parse(
         "{MODELS} has an empty model name"
     );
     Ok(Some(Config {
-        base: base.trim_end_matches('/').to_string(),
+        // The parsed URL, so that a stray space around the value is not sent.
+        base: parsed.as_str().trim_end_matches('/').to_string(),
         key,
+        bearer,
         models,
     }))
 }
@@ -231,25 +250,20 @@ mod tests {
     const MODELS_JSON: &str = r#"{"@cf/meta/llama-3.1-8b-instruct":"gpt-4o-mini"}"#;
 
     fn config(key: Option<&str>) -> Config {
-        parse(
-            Some("https://api.example.com/v1/"),
-            key,
-            None,
-            Some(MODELS_JSON),
-        )
-        .unwrap()
-        .unwrap()
+        parse(Some("https://api.example.com/v1/"), key, Some(MODELS_JSON))
+            .unwrap()
+            .unwrap()
     }
 
     #[test]
     fn nothing_set_is_off() {
-        assert!(parse(None, None, None, None).unwrap().is_none());
+        assert!(parse(None, None, None).unwrap().is_none());
     }
 
     #[test]
     fn other_settings_without_a_base_url_are_refused() {
         for (key, models) in [(Some("k"), None), (None, Some(MODELS_JSON))] {
-            let error = parse(None, key, None, models).unwrap_err().to_string();
+            let error = parse(None, key, models).unwrap_err().to_string();
             assert!(error.contains(BASE_URL), "{error}");
         }
     }
@@ -265,7 +279,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(request.url, "https://api.example.com/v1/chat/completions");
-        assert_eq!(request.bearer.as_deref(), Some("Bearer sk-secret"));
+        let bearer = request.bearer.as_ref().unwrap();
+        assert_eq!(bearer, "Bearer sk-secret");
+        assert!(bearer.is_sensitive());
+        assert!(!format!("{bearer:?}").contains("sk-secret"));
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["model"], "gpt-4o-mini");
         let request = config
@@ -301,7 +318,7 @@ mod tests {
             raw.extend_from_slice(key.as_bytes());
             raw.extend_from_slice("y".repeat(max * 2).as_bytes());
             raw.truncate(config.error_read_limit(max));
-            let detail = config.error_detail(&raw, max);
+            let detail = config.cut_detail(&raw, max);
             assert!(detail.len() <= max, "{start}");
             for n in 4..=key.len() {
                 assert!(!detail.contains(&key[..n]), "{start}: {detail}");
@@ -310,20 +327,28 @@ mod tests {
     }
 
     #[test]
-    fn a_key_file_loses_its_newline_and_excludes_the_variable() {
+    fn a_stray_space_around_the_base_url_is_not_sent() {
         let config = parse(
-            Some("http://localhost:11434/v1"),
+            Some(" https://api.example.com/v1/ "),
             None,
-            Some("sk-file\n"),
             Some(MODELS_JSON),
         )
         .unwrap()
         .unwrap();
-        assert_eq!(config.key.as_ref().unwrap().as_str(), "sk-file");
-        let error = parse(Some("http://h/v1"), Some("a"), Some("b"), Some(MODELS_JSON))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("only one"), "{error}");
+        let request = config
+            .request(Route::Chat, "@cf/meta/llama-3.1-8b-instruct", "{}")
+            .unwrap();
+        assert_eq!(request.url, "https://api.example.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn an_oversized_request_body_is_refused() {
+        let body = format!(r#"{{"prompt":"{}"}}"#, "x".repeat(MAX_BODY_BYTES));
+        let error = config(None)
+            .request(Route::Chat, "@cf/meta/llama-3.1-8b-instruct", &body)
+            .err()
+            .unwrap();
+        assert!(error.contains("larger than"), "{error}");
     }
 
     #[test]
@@ -339,10 +364,10 @@ mod tests {
             ("https://h/v1", None, "not json"),
         ] {
             assert!(
-                parse(Some(base), key, None, Some(models)).is_err(),
+                parse(Some(base), key, Some(models)).is_err(),
                 "{base} {key:?} {models}"
             );
         }
-        assert!(parse(Some("https://h/v1"), None, None, None).is_err());
+        assert!(parse(Some("https://h/v1"), None, None).is_err());
     }
 }

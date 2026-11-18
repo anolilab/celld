@@ -36,6 +36,25 @@ export default {
           headers: { "content-type": "text/event-stream" },
         });
       }
+      case "/stream-error":
+      case "/stream-cut": {
+        // Read the stream to its end, keeping what arrived before it failed.
+        let text = "";
+        const result = await attempt(async () => {
+          const stream = await env.AI.run(CHAT, {
+            prompt: url.pathname.slice(1),
+            stream: true,
+          });
+          const decoder = new TextDecoder();
+          for await (const chunk of stream) text += decoder.decode(chunk);
+        });
+        return Response.json({ ...result, text });
+      }
+      case "/big-answer":
+        return Response.json(await attempt(() => env.AI.run(CHAT, { prompt: "big" })));
+      case "/big-request":
+        return Response.json(
+          await attempt(() => env.AI.run(CHAT, { prompt: "x".repeat(33 << 20) })));
       case "/unmapped":
         return Response.json(await attempt(() => env.AI.run("@cf/nope/none", { prompt: "x" })));
       case "/badinput":
