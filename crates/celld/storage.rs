@@ -2618,6 +2618,23 @@ fn d1_sqlite_failure(
     detail
 }
 
+/// A failed bookkeeping write of a migration, reported like the migration's own
+/// statements: the size cap and the time bound are named, and the failure goes
+/// through the same latch classification.
+fn d1_bookkeeping_failure(
+    scope: &str,
+    connection: &Connection,
+    error: &rusqlite::Error,
+) -> D1Failure {
+    let code = match error {
+        rusqlite::Error::SqliteFailure(failure, _) => failure.extended_code,
+        _ => rusqlite::ffi::SQLITE_ERROR,
+    };
+    // SAFETY: the handle belongs to the scope's live connection.
+    let database = unsafe { connection.handle() };
+    d1_error(d1_sqlite_failure(scope, database, true, code))
+}
+
 /// Whether `tail` holds another statement. Trivia -- whitespace and comments,
 /// terminated or not -- prepares to a null statement, so SQLite's tokenizer
 /// answers this rather than a re-implementation of it in JS.
@@ -3114,13 +3131,13 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
                             ),
                             [],
                         )
-                        .map_err(|error| d1_error(error.to_string()))?;
+                        .map_err(|error| d1_bookkeeping_failure(scope, connection, &error))?;
                     connection
                         .execute(
                             &format!("INSERT INTO \"{table}\" (name) VALUES (?)"),
                             [name],
                         )
-                        .map_err(|error| d1_error(error.to_string()))?;
+                        .map_err(|error| d1_bookkeeping_failure(scope, connection, &error))?;
                     Ok(count)
                 });
                 match applied {
@@ -4482,6 +4499,37 @@ mod recycle_tests {
             "mode": "prepared", "sql": "INSERT INTO t VALUES (zeroblob(10))", "params": [],
         }));
         assert!(small.get("ok").is_some(), "{small}");
+        close(scope);
+    }
+
+    /// The bookkeeping writes of a migration run in its transaction, so one
+    /// that needs a new page past the cap names the cap, not SQLite's bare
+    /// "database or disk is full", and rolls back without a restart.
+    #[test]
+    fn a_migration_whose_bookkeeping_write_hits_the_cap_names_the_cap() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let _ = reports();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "capped-migration";
+        let path = open_in(&dir, "cell.sqlite", scope);
+        let run = |request: serde_json::Value| -> serde_json::Value {
+            serde_json::from_str(&d1_run_json(scope, &request.to_string())).unwrap()
+        };
+        let made = run(serde_json::json!({"mode": "exec", "sql": "CREATE TABLE t (b BLOB)"}));
+        assert!(made.get("ok").is_some(), "{made}");
+        // No room for the bookkeeping table the migration creates after it.
+        // The cap is installed when the database opens.
+        let pages = page_count(scope) as u64;
+        close(scope);
+        limit(None, Some(pages * 4096));
+        open(scope, &path).unwrap();
+        let failed = run(serde_json::json!({
+            "mode": "migrate", "name": "0001.sql", "sql": "SELECT 1;", "table": "d1_migrations",
+        }));
+        let message = failed["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("storage limit exceeded"), "{failed}");
+        assert!(sql_critical_error(scope).is_none(), "the database latched");
         close(scope);
     }
 

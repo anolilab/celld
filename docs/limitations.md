@@ -63,10 +63,11 @@ and its value.
 - The size limit counts database pages, so it includes indexes and free pages
   inside the file. The write-ahead log is not counted: it is transient and
   reclaimed at checkpoints. A write that would grow the file past the limit
-  fails with the message above, SQLite rolls back the statement, and nothing
-  restarts: the database stays consistent and keeps serving reads and writes
-  that fit. This holds for SQL, key-value, D1 `batch`, `exec` and migrations,
-  and a Workflow's own storage.
+  fails with the message above and SQLite rolls back the statement. Outside an
+  application transaction that restarts nothing: the database stays consistent
+  and keeps serving reads and writes that fit. Only the engine's own D1 `batch`,
+  `exec` and migration brackets roll back without a restart; see the next item
+  for a transaction the application opens.
 - A cap hit inside an application `transaction()` or `transactionSync()`
   makes SQLite discard the whole transaction, so the object restarts as
   described in [Guarantees](guarantees.md): the application could otherwise
