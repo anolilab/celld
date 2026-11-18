@@ -124,7 +124,10 @@ fn failed(stage: &str, detail: impl std::fmt::Display) -> EmailError {
 }
 
 fn refused(stage: &str, reply: &Reply) -> EmailError {
-    let code = if reply.code == 552 {
+    // A 552 names the message size at the end of the body or at `MAIL FROM`
+    // (where `SIZE` is declared); at `RCPT TO` it is a refusal of that
+    // recipient's mailbox, not of the message.
+    let code = if reply.code == 552 && matches!(stage, "mail" | "body") {
         "E_CONTENT_TOO_LARGE"
     } else {
         "E_DELIVERY_FAILED"
@@ -660,6 +663,17 @@ pub fn relay() -> Result<&'static Settings, EmailError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_552_is_too_large_only_where_the_size_is_judged() {
+        let reply = Reply {
+            code: 552,
+            lines: Vec::new(),
+        };
+        assert_eq!(refused("body", &reply).code, "E_CONTENT_TOO_LARGE");
+        assert_eq!(refused("mail", &reply).code, "E_CONTENT_TOO_LARGE");
+        assert_eq!(refused("rcpt", &reply).code, "E_DELIVERY_FAILED");
+    }
 
     #[tokio::test]
     async fn a_reply_with_a_multibyte_character_in_its_code_is_malformed_not_a_panic() {

@@ -87,8 +87,9 @@ fn subrequest_limit(message: String) -> EmailError {
 }
 
 /// Take the isolate's slot and charge the subrequest for a send whose raw
-/// stream the binding is about to read, before it reads any of it. Answers ""
-/// or the refusal as `send()` shall reject with it.
+/// stream the binding is about to read, before it reads any of it. Answers
+/// `{ ok: true, token }`, to name the slot in [`op_email_send`] and
+/// [`op_email_release`], or the refusal as `send()` shall reject with it.
 pub(super) fn op_email_reserve(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
@@ -101,8 +102,7 @@ pub(super) fn op_email_reserve(
             Some(slot) => {
                 // Kept with the event: if it ends while the stream stalls, the
                 // slot goes with it.
-                context.reserve_send(slot);
-                String::new()
+                format!(r#"{{"ok":true,"token":{}}}"#, context.reserve_send(slot))
             }
             None => answer(Err(rate_limited())),
         },
@@ -111,13 +111,30 @@ pub(super) fn op_email_reserve(
     rv.set(text.into());
 }
 
+/// The token of a reservation, as the binding passes it back.
+fn reserved_token(
+    scope: &mut v8::PinScope,
+    args: &v8::FunctionCallbackArguments,
+    index: i32,
+) -> Option<u64> {
+    let value = args.get(index);
+    if !value.is_number() {
+        return None;
+    }
+    value
+        .integer_value(scope)
+        .and_then(|token| u64::try_from(token).ok())
+}
+
 /// Give back a slot [`op_email_reserve`] took, when the send did not start.
 pub(super) fn op_email_release(
     scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
+    args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    drop(event_context(scope).take_reserved_send());
+    if let Some(token) = reserved_token(scope, &args, 0) {
+        drop(event_context(scope).take_reserved_send(token));
+    }
 }
 
 pub(super) fn op_email_send(
@@ -127,9 +144,10 @@ pub(super) fn op_email_send(
 ) {
     // A send whose stream was read took its slot and paid its subrequest
     // first; it holds that slot from here, and any early refusal gives it back.
-    let reserved = args.get(2).is_true();
+    let token = reserved_token(scope, &args, 2);
+    let reserved = token.is_some();
     let context = event_context(scope);
-    let held = reserved.then(|| context.take_reserved_send()).flatten();
+    let held = token.and_then(|token| context.take_reserved_send(token));
     if reserved && held.is_none() {
         return refuse(
             scope,
@@ -212,5 +230,27 @@ mod tests {
         assert_eq!(answer["ok"], false);
         assert_eq!(answer["code"], "E_RATE_LIMIT_EXCEEDED");
         assert_eq!(answer["message"], "Worker exceeded subrequest limit of 3");
+    }
+
+    #[test]
+    fn a_reserved_slot_is_taken_only_by_its_own_token() {
+        use crate::smtp::InFlight;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (first, second) = (IoContext::new(), IoContext::new());
+        let first_token = first.reserve_send(InFlight::take(&counter).unwrap());
+        let second_token = second.reserve_send(InFlight::take(&counter).unwrap());
+        // The first event ends: its slot goes with it.
+        drop(first);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        // Its late release or send, resolved to the second event, finds nothing.
+        assert!(second.take_reserved_send(first_token).is_none());
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        // The second send still holds its slot, and once only.
+        let held = second.take_reserved_send(second_token);
+        assert!(held.is_some());
+        assert!(second.take_reserved_send(second_token).is_none());
+        drop(held);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 }

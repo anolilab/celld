@@ -59,7 +59,7 @@ Worker reads, or in a log.
 The node checks these at start and refuses to start on a malformed value, or
 on a variable that is set while `CELLD_SMTP_HOST` is not. The error names the
 variable and never the password. That includes a password file that cannot be
-read. The warning about a shared file is logged at the first `send()`.
+read. The warning about a shared file is logged once, when the node reads the file at start.
 
 - **TLS is required unless `CELLD_SMTP_TLS=off` says otherwise.** With
   `starttls`, a relay that does not offer `STARTTLS` is an error: celld never

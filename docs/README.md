@@ -801,7 +801,7 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_SMTP_TLS` | `starttls` (default), `tls` or `off`. TLS is required unless this is `off`, and the relay's certificate must chain to the bundled public roots |
 | `CELLD_SMTP_USERNAME` | The relay account. Set it with `CELLD_SMTP_PASSWORD` or `CELLD_SMTP_PASSWORD_FILE` |
 | `CELLD_SMTP_PASSWORD` | The relay password. A Worker never sees it, and it is kept out of logs and errors |
-| `CELLD_SMTP_PASSWORD_FILE` | The path of a file that holds the relay password, in place of `CELLD_SMTP_PASSWORD`. Setting both is an error. celld reads it at the first `send()` and warns when other users can read it |
+| `CELLD_SMTP_PASSWORD_FILE` | The path of a file that holds the relay password, in place of `CELLD_SMTP_PASSWORD`. Setting both is an error. celld reads it at startup, with the other settings, and warns when other users can read it |
 | `CELLD_SMTP_HELO_NAME` | The name celld gives in `EHLO` (default: `localhost`) |
 | `CELLD_NODE` | An explicit node-session ID: 1 to 128 ASCII letters, numbers, dots, dashes, or underscores, but not `.` or `..` |
 | `CELLD_WATCH` | The local work directory for SQLite and replication |

@@ -10924,7 +10924,7 @@ pub struct IoContext {
     /// Send slots of this event that a `send_email` call took before reading
     /// its stream. They are given back with the event, so a stream that never
     /// yields cannot keep them when the event ends.
-    reserved_sends: Mutex<Vec<crate::smtp::InFlight>>,
+    reserved_sends: Mutex<Vec<(u64, crate::smtp::InFlight)>>,
 }
 
 /// An op enqueued by one event's continuation during another event's turn: the
@@ -11037,16 +11037,24 @@ impl IoContext {
         Ok(())
     }
 
-    /// Keep `slot` for a send of this event that has not started yet. It is
-    /// given back by [`Self::take_reserved_send`] or when the event ends.
-    fn reserve_send(&self, slot: crate::smtp::InFlight) {
-        self.reserved_sends.lock().unwrap().push(slot);
+    /// Keep `slot` for a send of this event that has not started yet, under a
+    /// token no other reservation has. The slot is given back by
+    /// [`Self::take_reserved_send`] with that token, or when the event ends.
+    fn reserve_send(&self, slot: crate::smtp::InFlight) -> u64 {
+        static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        self.reserved_sends.lock().unwrap().push((token, slot));
+        token
     }
 
-    /// A slot kept by [`Self::reserve_send`], to be held by the send or
-    /// dropped. Slots are interchangeable, so none is named.
-    fn take_reserved_send(&self) -> Option<crate::smtp::InFlight> {
-        self.reserved_sends.lock().unwrap().pop()
+    /// The slot kept under `token`, to be held by the send or dropped. A token
+    /// this event does not hold (its own event ended and the slot went with it,
+    /// or it was taken already) gives nothing, so a late call never takes the
+    /// slot of another request.
+    fn take_reserved_send(&self, token: u64) -> Option<crate::smtp::InFlight> {
+        let mut reserved = self.reserved_sends.lock().unwrap();
+        let at = reserved.iter().position(|(held, _)| *held == token)?;
+        Some(reserved.swap_remove(at).1)
     }
 
     fn begin_cpu_turn(&self) {

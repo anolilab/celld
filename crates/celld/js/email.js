@@ -148,25 +148,23 @@
         const raw = raws.get(message);
         // A stream is buffered while it is read, so the slot and the
         // subrequest are taken first: sends past the limit never read theirs.
-        const streamed = typeof raw !== "string";
-        if (streamed) {
-          const refusal = __email_reserve();
-          if (refusal) {
-            const result = JSON.parse(refusal);
-            throw fail(result.code, result.message);
-          }
+        let token;
+        if (typeof raw !== "string") {
+          const reserved = JSON.parse(__email_reserve());
+          if (!reserved.ok) throw fail(reserved.code, reserved.message);
+          token = reserved.token;
         }
         let handedOver = false;
         try {
           const bytes = await readRaw(raw);
-          handedOver = streamed;
+          handedOver = token !== undefined;
           answer = await __email_send(
             JSON.stringify({ binding: this.#name, kind: "raw", from: message.from, to: message.to }),
             bytes,
-            streamed,
+            token,
           );
         } finally {
-          if (streamed && !handedOver) __email_release();
+          if (token !== undefined && !handedOver) __email_release(token);
         }
       } else if (message !== null && typeof message === "object") {
         answer = await __email_send(
