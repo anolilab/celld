@@ -584,6 +584,22 @@ async fn a_continuation_that_outlives_its_ended_events_context_cannot_write() {
     assert_eq!(outcome["rows"], 0, "{body}");
 }
 
+/// A continuation of an event that completed normally keeps its context id
+/// after the context is dropped. It is not an ended event, so it still writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continuation_of_a_completed_event_can_still_write_after_its_context_is_dropped() {
+    let server = Server::start("retire", &[("CELLD_OPERATOR_TOKEN", TOKEN)]).await;
+    assert_eq!(server.get_text("/do-orphan").await, "started");
+    // Long enough for the completed event's context to be dropped.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (status, body) =
+        get_within_budget(&reqwest::Client::new(), &server.url("/do-orphan-release")).await;
+    assert!(status.is_success(), "{status} {body}");
+    let outcome: Value = serde_json::from_str(&body).expect("outcome json");
+    assert_eq!(outcome["write"], "written", "{body}");
+    assert_eq!(outcome["rows"], 1, "{body}");
+}
+
 /// Storage work a leftover timer starts after the handler returned either
 /// completes or leaves nothing behind when its object is moved to the new
 /// deployment mid-way: a transaction is never half written.

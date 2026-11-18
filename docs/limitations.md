@@ -38,6 +38,10 @@ APIs, and Wrangler configuration.
   rejected. Rolling back an open transaction, dropping queued puts and closing
   a cursor stay allowed, so the unwinding leaves nothing open. Work a client
   hang-up leaves in `waitUntil` is not ended, so it keeps its access.
+  An isolate remembers the ids of the last 262144 events it ended; a
+  continuation of an event that completed normally is never refused. Past that
+  many in one isolate, the continuations of older events are refused as well,
+  so a stale write fails closed.
 - `/state` reports `deployment.retiring`: how many superseded deployments still
   hold isolates, and the age in milliseconds of the oldest. A cell that has not
   yet moved to the new deployment keeps its isolate until it does.

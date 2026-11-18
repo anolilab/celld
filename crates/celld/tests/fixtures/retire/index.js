@@ -137,6 +137,33 @@ export class Pinned extends DurableObject {
         .one().n;
       return new Response(JSON.stringify({ ...this.lateWrite, rows }));
     }
+    // Answers at once and leaves a continuation behind that writes once
+    // `/orphan-release` runs in another event. The event that started it has
+    // completed normally, and its context is gone by then.
+    if (url.pathname === "/orphan") {
+      this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS orphan (k TEXT)");
+      this.orphan = {};
+      (async () => {
+        await new Promise((resolve) => {
+          this.orphanRelease = resolve;
+        });
+        try {
+          this.ctx.storage.sql.exec("INSERT INTO orphan VALUES ('after')");
+          this.orphan.write = "written";
+        } catch (refused) {
+          this.orphan.write = refused.message;
+        }
+      })();
+      return new Response("started");
+    }
+    if (url.pathname === "/orphan-release") {
+      this.orphanRelease?.();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const rows = this.ctx.storage.sql
+        .exec("SELECT count(*) AS n FROM orphan")
+        .one().n;
+      return new Response(JSON.stringify({ ...this.orphan, rows }));
+    }
     if (url.pathname === "/nap") {
       await new Promise((resolve) => setTimeout(resolve, 200));
       return new Response("napped");
@@ -240,6 +267,14 @@ export default {
         );
       case "/do-late-write":
         return env.PIN.get(env.PIN.idFromName("late-write")).fetch(request);
+      case "/do-orphan":
+        return env.PIN.get(env.PIN.idFromName("orphan")).fetch(
+          new Request("http://do/orphan"),
+        );
+      case "/do-orphan-release":
+        return env.PIN.get(env.PIN.idFromName("orphan")).fetch(
+          new Request("http://do/orphan-release"),
+        );
       case "/do-late-release":
         return env.PIN.get(env.PIN.idFromName("late-write")).fetch(
           new Request("http://do/late-release"),

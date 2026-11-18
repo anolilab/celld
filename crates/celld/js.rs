@@ -2331,9 +2331,11 @@ impl ActorRuntimeState {
 
     /// Why the event with this id may not touch storage any more, if it may not.
     ///
-    /// A live context speaks for itself. Otherwise the record answers, and an id
-    /// the record has forgotten is refused too: ids only grow, so one at or
-    /// below the highest forgotten id has ended, whatever the record says.
+    /// The record is exact: an id it holds ended, and one it never held did not,
+    /// whether or not its context is still alive. Only an id the record has
+    /// forgotten past its bound is refused too, because ids only grow and one
+    /// at or below the highest forgotten id may have been forgotten; a live
+    /// context speaks for itself.
     fn ended_reason(&self, id: u64) -> Option<String> {
         match self.ended_contexts.lookup(id) {
             EndedLookup::Ended(reason) => Some(reason),
@@ -2374,11 +2376,13 @@ impl ActorRuntimeState {
     }
 }
 
-/// How many ended events one isolate remembers. Ids are never reused, so a
-/// record cannot be mistaken for a later event. The oldest are forgotten
-/// first, and the highest id forgotten becomes a floor that keeps refusing
-/// them (see [`ActorRuntimeState::ended_reason`]).
-const ENDED_CONTEXT_RECORDS: usize = 4096;
+/// How many ended events one isolate remembers: about 10 MB at the bound. Ids
+/// are never reused, so a record cannot be mistaken for a later event, and an
+/// id with no record is an event that did not end. Past the bound the oldest
+/// are forgotten, and the highest id forgotten becomes a floor that keeps
+/// refusing them (see [`ActorRuntimeState::ended_reason`]) at the price of
+/// refusing the continuations of events that completed normally below it.
+const ENDED_CONTEXT_RECORDS: usize = 262_144;
 
 /// The refusal for an event whose record was forgotten.
 const ENDED_EVENT_FORGOTTEN: &str = "this event has ended";
@@ -2394,7 +2398,10 @@ enum EndedLookup {
 #[derive(Default)]
 struct EndedRecords {
     /// The reasons events ended, oldest id first.
-    reasons: std::collections::BTreeMap<u64, String>,
+    reasons: std::collections::BTreeMap<u64, Arc<str>>,
+    /// The reason recorded last. Events end for a handful of reasons, so the
+    /// record shares one allocation between neighbours.
+    last: Option<Arc<str>>,
     /// The highest id whose record was forgotten.
     floor: Option<u64>,
 }
@@ -2411,7 +2418,12 @@ struct EndedContexts {
 impl EndedContexts {
     fn record(&self, id: u64, reason: &str) {
         let mut records = self.records.lock().unwrap();
-        records.reasons.insert(id, reason.to_string());
+        let reason = match &records.last {
+            Some(last) if **last == *reason => last.clone(),
+            _ => Arc::from(reason),
+        };
+        records.last = Some(reason.clone());
+        records.reasons.insert(id, reason);
         while records.reasons.len() > ENDED_CONTEXT_RECORDS {
             if let Some((forgotten, _)) = records.reasons.pop_first() {
                 records.floor = records.floor.max(Some(forgotten));
@@ -2428,7 +2440,7 @@ impl EndedContexts {
     fn lookup(&self, id: u64) -> EndedLookup {
         let records = self.records.lock().unwrap();
         if let Some(reason) = records.reasons.get(&id) {
-            EndedLookup::Ended(reason.clone())
+            EndedLookup::Ended(reason.to_string())
         } else if records.floor.is_some_and(|floor| id <= floor) {
             EndedLookup::Forgotten
         } else {
@@ -12868,6 +12880,29 @@ mod storage_guard_tests {
         assert_eq!(state.ended_reason(live_id).as_deref(), Some("the reason"));
         // An id above everything forgotten is a later event: allowed.
         assert_eq!(state.ended_reason(live_id + 1_000_000), None);
+    }
+
+    /// An event that completed normally is never recorded, so cancellations
+    /// elsewhere in the isolate, however many, must not refuse its leftover
+    /// continuation once its context has dropped. A cancelled event stays
+    /// refused through the same churn.
+    #[test]
+    fn many_cancellations_refuse_the_cancelled_but_not_the_completed() {
+        let state = Arc::new(ActorRuntimeState::default());
+        let completed = IoContext::tracked(&state);
+        let completed_id = completed.continuation_id().expect("tracked id");
+        let cancelled = IoContext::tracked(&state);
+        let cancelled_id = cancelled.continuation_id().expect("tracked id");
+        cancelled.end("the client hung up");
+        drop((completed, cancelled));
+        for _ in 0..5000 {
+            IoContext::tracked(&state).end("the client hung up");
+        }
+        assert_eq!(state.ended_reason(completed_id), None);
+        assert_eq!(
+            state.ended_reason(cancelled_id).as_deref(),
+            Some("the client hung up")
+        );
     }
 
     /// A critical section's token names an origin and a driver; the guard
