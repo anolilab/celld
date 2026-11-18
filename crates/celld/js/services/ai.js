@@ -104,7 +104,10 @@ function __aiEventStream(streamId) {
   // Reads one complete event; true when the pull is over (an event went out,
   // the stream ended or it failed).
   const dispatch = (controller) => {
-    const data = __ai_redact(dataLines.join("\n")).trim();
+    // Only the text and the numeric usage of an event leave it, and the text
+    // is redacted after parsing: redacting the raw event would let a key such as
+    // `DONE` or one holding a quote break a valid stream.
+    const data = dataLines.join("\n").trim();
     dataLines = [];
     dataSize = 0;
     // An event with no data, such as a bare `data:` line, carries nothing.

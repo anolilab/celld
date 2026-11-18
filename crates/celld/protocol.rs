@@ -312,7 +312,9 @@ pub fn validate_ratelimit_manifest(
 
 /// The name of the Workers AI binding of a manifest, `None` without one. A
 /// binding without a string name is an error: dropping it would leave the
-/// Worker without `env.AI` and a failure far from the cause.
+/// Worker without `env.AI` and a failure far from the cause. So is a second
+/// binding (a Worker has one `ai` binding, and only one would be installed) and
+/// a manifest that does not require [`FEATURE_AI_V1`].
 #[doc(hidden)]
 pub fn ai_binding(manifest: &Manifest) -> anyhow::Result<Option<String>> {
     let mut name = None;
@@ -332,8 +334,20 @@ pub fn ai_binding(manifest: &Manifest) -> anyhow::Result<Option<String>> {
             .ok_or_else(|| {
                 anyhow::anyhow!("the Workers AI binding #{position} has no string name")
             })?;
-        name.get_or_insert_with(|| this.to_string());
+        anyhow::ensure!(
+            name.is_none(),
+            "a Worker has one Workers AI binding, and the manifest has more"
+        );
+        name = Some(this.to_string());
     }
+    anyhow::ensure!(
+        name.is_none()
+            || manifest
+                .required_features
+                .iter()
+                .any(|f| f == FEATURE_AI_V1),
+        "Workers AI deployment does not require {FEATURE_AI_V1}"
+    );
     Ok(name)
 }
 
@@ -793,6 +807,7 @@ mod ai_manifest_tests {
         serde_json::from_value(json!({
             "version": "v", "script_name": "s", "main_module": "index.js",
             "do_classes": [], "sqlite_classes": [], "modules": [],
+            "required_features": [FEATURE_AI_V1],
             "raw_metadata": { "bindings": bindings }
         }))
         .unwrap()
@@ -807,5 +822,26 @@ mod ai_manifest_tests {
             let error = ai_binding(&manifest(json!([bad]))).unwrap_err().to_string();
             assert!(error.contains("Workers AI binding #0"), "{error}");
         }
+    }
+
+    #[test]
+    fn an_ai_binding_needs_the_feature() {
+        let mut without = manifest(json!([{ "type": "ai", "name": "AI" }]));
+        without.required_features.clear();
+        let error = ai_binding(&without).unwrap_err().to_string();
+        assert!(error.contains(FEATURE_AI_V1), "{error}");
+        // No AI binding, no feature needed.
+        without.raw_metadata = json!({ "bindings": [] });
+        assert_eq!(ai_binding(&without).unwrap(), None);
+    }
+
+    #[test]
+    fn a_second_ai_binding_is_refused() {
+        let two = manifest(json!([
+            { "type": "ai", "name": "AI" },
+            { "type": "ai", "name": "OTHER" }
+        ]));
+        let error = ai_binding(&two).unwrap_err().to_string();
+        assert!(error.contains("one Workers AI binding"), "{error}");
     }
 }

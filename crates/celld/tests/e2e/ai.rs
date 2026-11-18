@@ -319,9 +319,13 @@ async fn start(stub: &Stub) -> (Server, tempfile::TempDir) {
 }
 
 async fn start_at(base: &str) -> (Server, tempfile::TempDir) {
+    start_with_key(base, KEY).await
+}
+
+async fn start_with_key(base: &str, key: &str) -> (Server, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let key_file = dir.path().join("ai-key");
-    std::fs::write(&key_file, format!("{KEY}\n")).unwrap();
+    std::fs::write(&key_file, format!("{key}\n")).unwrap();
     let server = Server::start(
         "ai",
         &[
@@ -589,6 +593,19 @@ async fn a_key_written_with_json_escapes_does_not_reach_the_worker() {
     let stream = server.get_text("/stream-escaped-key").await;
     assert!(!stream.contains(KEY), "{stream}");
     assert!(stream.contains("key [redacted]"), "{stream}");
+}
+
+#[tokio::test]
+async fn a_key_that_appears_in_the_event_syntax_does_not_break_a_valid_stream() {
+    let stub = Stub::start().await;
+    // The key is a piece of every event's JSON, quotes included.
+    let (server, _key) = start_with_key(&stub.base(), "\"delta\"").await;
+
+    let body = server.get_text("/stream").await;
+    assert_eq!(
+        body,
+        "data: {\"response\":\"Hel\"}\n\ndata: {\"response\":\"lo\"}\n\ndata: [DONE]\n\n"
+    );
 }
 
 #[tokio::test]
