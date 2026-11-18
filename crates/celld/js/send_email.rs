@@ -13,11 +13,11 @@
 use super::*;
 use crate::email::{too_large, EmailError, Prepared, SendEmailBinding};
 
-/// The longest call, in UTF-16 units of its JSON: a message is at most 25 MiB,
+/// The longest call, in UTF-8 bytes of its JSON: a message is at most 25 MiB,
 /// and the rest of the call (addresses, headers, quoting) is small. A message
 /// that needs more once JSON has escaped it is refused, so a call costs the
 /// host no more than about this before it is parsed.
-const MAX_CALL_UNITS: usize = crate::email::MAX_MESSAGE_BYTES + 256 * 1024;
+const MAX_CALL_BYTES: usize = crate::email::MAX_MESSAGE_BYTES + 256 * 1024;
 
 #[derive(serde::Deserialize)]
 struct Call {
@@ -137,6 +137,13 @@ pub(super) fn op_email_release(
     }
 }
 
+/// Whether the call's JSON weighs more than a call may once copied into the
+/// host. The size is that of the copy (UTF-8, up to three times the UTF-16
+/// length), measured before the copy is made.
+fn call_too_long(scope: &mut v8::PinScope, text: v8::Local<v8::String>) -> bool {
+    text.utf8_length(scope) > MAX_CALL_BYTES
+}
+
 pub(super) fn op_email_send(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -163,8 +170,8 @@ pub(super) fn op_email_send(
     }
     // Bound what the host copies before it copies it: the JavaScript side
     // limits a message, but this op is the boundary.
-    let too_long = |length: usize| length > MAX_CALL_UNITS;
-    if v8::Local::<v8::String>::try_from(args.get(0)).map_or(true, |text| too_long(text.length()))
+    if v8::Local::<v8::String>::try_from(args.get(0))
+        .map_or(true, |text| call_too_long(scope, text))
         || v8::Local::<v8::ArrayBufferView>::try_from(args.get(1))
             .is_ok_and(|view| view.byte_length() > crate::email::MAX_MESSAGE_BYTES)
     {
@@ -220,6 +227,22 @@ pub(super) fn op_email_send(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_is_bounded_by_the_bytes_the_host_would_copy() {
+        crate::js::Engine::init();
+        let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+        v8::scope!(let handle, &mut isolate);
+        let context = v8::Context::new(handle, Default::default());
+        let scope = &mut v8::ContextScope::new(handle, context);
+        // Three bytes each: 9M units are under the cap as a count and 27M
+        // bytes are over it as the copy the host would make.
+        let wide = v8::String::new(scope, &"\u{20ac}".repeat(9_000_000)).unwrap();
+        assert!(wide.length() <= MAX_CALL_BYTES);
+        assert!(call_too_long(scope, wide));
+        let narrow = v8::String::new(scope, &"a".repeat(1000)).unwrap();
+        assert!(!call_too_long(scope, narrow));
+    }
 
     #[test]
     fn a_spent_subrequest_budget_reaches_send_as_a_coded_rejection() {
