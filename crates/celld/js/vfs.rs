@@ -554,7 +554,10 @@ mod tests {
             }
         }
         assert_eq!(files, 100_000);
-        assert!(started.elapsed().as_secs() < 5, "{:?}", started.elapsed());
+        // The indexed walk takes well under a second; the scan took about two
+        // minutes on a developer machine. The bound only has to tell them apart,
+        // so it leaves a slow or busy runner plenty of room.
+        assert!(started.elapsed().as_secs() < 60, "{:?}", started.elapsed());
         assert_eq!(tree.list("/bundle/d1/f1"), Err("ENOTDIR"));
         assert_eq!(tree.list("/bundle/none"), Err("ENOENT"));
         assert_eq!(tree.list("/bundle/d1").unwrap().len(), 10);
