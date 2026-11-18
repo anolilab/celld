@@ -40,7 +40,7 @@ and both match Cloudflare where Cloudflare documents a value.
 | Limit | Default | Setting | At the limit |
 | --- | --- | --- | --- |
 | Time of one SQL statement | 30 seconds | `CELLD_SQL_STATEMENT_TIMEOUT_MS` | SQLite interrupts the statement. The call fails with `SQL statement exceeded the time limit of N ms and was interrupted`. |
-| Size of one database | 10 GB | `CELLD_MAX_DATABASE_BYTES` | The write that would grow the file past the limit fails with `storage limit exceeded`. Deleting rows makes room again. |
+| Size of one database | 10 GiB | `CELLD_MAX_DATABASE_BYTES` | The write that would grow the file past the limit fails with `storage limit exceeded`. Deleting rows makes room again. |
 
 A value of `0` removes the limit. A setting that is not a whole number, or a
 size below one 4096-byte page, stops celld at startup and names the variable
