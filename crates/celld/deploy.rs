@@ -2472,18 +2472,12 @@ fn read_project(
     // build_env installs every binding into one JavaScript object. Validate
     // that structural invariant once here, after every binding source has
     // contributed, so a new binding kind cannot silently shadow an old one.
-    let mut binding_names = BTreeMap::new();
     for binding in &bindings {
         let name = binding.get("name").and_then(Value::as_str).unwrap_or("");
         let kind = binding.get("type").and_then(Value::as_str).unwrap_or("");
         check_env_name(name).map_err(|error| anyhow!("a {kind} binding: {error}"))?;
-        if let Some(previous) = binding_names.insert(name, kind) {
-            bail!(
-                "binding name {name:?} is declared by both a {previous} and a {kind} \
-                 binding; every name in `env` must be unique"
-            );
-        }
     }
+    crate::secrets::ensure_unique_binding_names(&bindings)?;
     let mut metadata = Map::new();
     if main.is_some() {
         metadata.insert("main_module".into(), json!("index.js"));

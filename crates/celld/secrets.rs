@@ -385,9 +385,41 @@ async fn names_in(bucket: &Bucket, scope: Scope<'_>) -> anyhow::Result<Vec<Strin
         .unwrap_or_default())
 }
 
+/// Refuse bindings that share a name. `build_env` installs every binding into
+/// one JavaScript object, so the one added last would silently replace the
+/// others; a Secrets Store binding and a var of the same name is the case a
+/// hand-written manifest can reach.
+pub fn ensure_unique_binding_names(bindings: &[serde_json::Value]) -> anyhow::Result<()> {
+    let mut seen = std::collections::BTreeMap::new();
+    for binding in bindings {
+        let name = binding
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let kind = binding
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if let Some(previous) = seen.insert(name, kind) {
+            anyhow::bail!(
+                "binding name {name:?} is declared by both a {previous} and a {kind} \
+                 binding; every name in `env` must be unique"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a deployment whose bindings use the name of a stored secret. Reads
 /// names only, so a deploy needs no key.
 pub async fn ensure_no_clash(bucket: &Bucket, manifest: &Manifest) -> anyhow::Result<()> {
+    if let Some(bindings) = manifest
+        .raw_metadata
+        .get("bindings")
+        .and_then(serde_json::Value::as_array)
+    {
+        ensure_unique_binding_names(bindings)?;
+    }
     let bindings = binding_names(&manifest.raw_metadata);
     for name in names(bucket, &manifest.script_name).await? {
         if bindings.contains(&name) {
@@ -929,6 +961,21 @@ mod tests {
         delete(&bucket, "app", "A").await.unwrap();
         assert_eq!(names(&bucket, "app").await.unwrap(), ["B"]);
         assert!(delete(&bucket, "app", "A").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_managed_manifest_with_two_bindings_of_one_name_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let mut manifest = manifest(&["A"]);
+        manifest.raw_metadata["bindings"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": STORE_BINDING_TYPE, "name": "A", "store_id": "s", "secret_name": "n",
+            }));
+        let error = ensure_no_clash(&bucket, &manifest).await.unwrap_err();
+        assert!(format!("{error:#}").contains("must be unique"), "{error:#}");
     }
 
     #[tokio::test]
