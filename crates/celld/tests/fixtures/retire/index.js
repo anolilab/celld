@@ -41,6 +41,38 @@ export class Pinned extends DurableObject {
       const keys = [...(await this.ctx.storage.list()).keys()];
       return new Response(keys.filter((key) => key.startsWith("late")).join(","));
     }
+    // A client that hangs up ends this event while it waits. The handlers its
+    // rejected wait runs must not write or start anything.
+    if (url.pathname === "/do-guarded") {
+      this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS guarded (k TEXT)");
+      this.outcome = {};
+      try {
+        await this.env.PIN.get(this.env.PIN.idFromName("stay")).fetch(
+          "http://do/stay",
+        );
+      } catch (error) {
+        this.outcome.ended = error.message;
+        try {
+          this.ctx.storage.sql.exec("INSERT INTO guarded VALUES ('caught')");
+          this.outcome.write = "written";
+        } catch (refused) {
+          this.outcome.write = refused.message;
+        }
+        try {
+          await fetch("http://127.0.0.1:1/");
+          this.outcome.fetch = "answered";
+        } catch (refused) {
+          this.outcome.fetch = refused.message;
+        }
+      }
+      return new Response("guarded");
+    }
+    if (url.pathname === "/guarded-outcome") {
+      const rows = this.ctx.storage.sql
+        .exec("SELECT count(*) AS n FROM guarded")
+        .one().n;
+      return new Response(JSON.stringify({ ...this.outcome, rows }));
+    }
     if (url.pathname === "/nap") {
       await new Promise((resolve) => setTimeout(resolve, 200));
       return new Response("napped");
@@ -80,11 +112,19 @@ export default {
         );
         return await globalThis.stashed;
       case "/await-stash":
+        if (!globalThis.stashed) return new Response("nothing stashed");
         try {
           return new Response(await (await globalThis.stashed).text());
         } catch (error) {
           return new Response(`rejected: ${error.message}`);
         }
+      // The object's event ends when the client of this request hangs up.
+      case "/do-guarded":
+        return env.PIN.get(env.PIN.idFromName("guarded")).fetch(request);
+      case "/do-guarded-outcome":
+        return env.PIN.get(env.PIN.idFromName("guarded")).fetch(
+          new Request("http://do/guarded-outcome"),
+        );
       case "/do-late":
       case "/do-late-outcome":
       case "/do-late-keys":

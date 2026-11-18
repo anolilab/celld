@@ -1182,6 +1182,9 @@ fn wake_gate_waiters(cell: &str, outcome: Result<(), String>) {
 }
 
 const ABANDONED_INPUT_GATE: &str = "the cell's critical section ended without releasing";
+/// How many live events are ended. Every host op reads this, so a process
+/// with none pays one load and never looks up the caller's event.
+static ENDED_CONTEXTS: AtomicUsize = AtomicUsize::new(0);
 const ENDED_EVENT_OP: &str = "the event that started this operation has ended";
 const RETIRED_INPUT_GATE: &str = "the cell event ended before it could acquire an input gate";
 
@@ -3591,6 +3594,7 @@ impl InFlight {
     /// for that work would otherwise stay pending for ever. Rejections nobody
     /// handles are silent, so the ones nobody awaits cost nothing.
     fn reject_ops(&mut self, tc: &mut v8::PinScope, message: &str) {
+        self.context.end(message);
         let handed = self.context.close_handed_ops();
         let ids: Vec<u64> = self
             .ops
@@ -3887,6 +3891,32 @@ fn continuation_context_id(scope: &mut v8::PinScope, index: u32) -> Option<u64> 
 
 fn operation_continuation_id(scope: &mut v8::PinScope) -> Option<u64> {
     continuation_context_id(scope, 1)
+}
+
+/// Whether a host op reads or writes the cell's storage, or sets its alarm.
+fn touches_storage(op: &str) -> bool {
+    ["__storage_", "__sql_", "__d1_", "__alarm_"]
+        .iter()
+        .any(|prefix| op.starts_with(prefix))
+}
+
+/// Refuse a storage op called by an event that has ended, by throwing the
+/// reason it ended. Rejecting the event's pending operations runs the handlers
+/// that wait on them, and a synchronous storage call there would write for an
+/// event that is over. An operation that only starts work is rejected when the
+/// turn adopts it, in `adopt`.
+fn ended_event_refuses(scope: &mut v8::PinScope) -> bool {
+    let Some(id) = operation_continuation_id(scope) else {
+        return false;
+    };
+    let Some(context) = actor_runtime_state(scope).io_context(id) else {
+        return false;
+    };
+    let Some(reason) = context.ended() else {
+        return false;
+    };
+    loader_throw(scope, reason);
+    true
 }
 
 /// Enter a critical section with its gate owner and operation driver bound
@@ -4298,6 +4328,12 @@ fn adopt(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
     for (id, future, lifetime, owner) in spawns {
         if let Some(owner) = owner.filter(|owner| Some(*owner) != mine) {
             entry.hand_op(tc, owner, id, future, lifetime);
+            continue;
+        }
+        // An op of an event that has ended cannot run: reject it, like the
+        // ones the event had pending when it ended.
+        if let Some(reason) = entry.context.ended().map(str::to_string) {
+            resolve_res(tc, id, Err(reason));
             continue;
         }
         entry.ops.insert(id);
@@ -6287,6 +6323,12 @@ macro_rules! ops {
                         if !scoping::own_cell_arg(scope, &args, index) {
                             return;
                         }
+                    }
+                    if ENDED_CONTEXTS.load(Ordering::Relaxed) != 0
+                        && touches_storage($name)
+                        && ended_event_refuses(scope)
+                    {
+                        return;
                     }
                     let before = asyncrt::spawn_count();
                     $op(scope, args, rv);
@@ -10628,6 +10670,10 @@ pub struct IoContext {
     /// Wakes this event's driver when `handed` grows or a pending entrypoint
     /// starts. Both changes can make the driver's current wait obsolete.
     handed_wake: tokio::sync::Notify,
+    /// Why this event ended with its operations rejected, once it has. See
+    /// [`IoContext::end`]: from then on the event starts no operation and
+    /// makes no synchronous storage call.
+    ended: OnceLock<String>,
     /// IDs of nested `WorkerEntrypoint` calls that have not settled. The
     /// driver consumes these IDs only when the request has no native work, so
     /// it can reject the calls instead of timing out the enclosing event.
@@ -10832,6 +10878,7 @@ impl IoContext {
             handed: Mutex::new(Some(Vec::new())),
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
+            ended: OnceLock::new(),
             pending_events: Mutex::new(HashSet::new()),
             subrequest_limit: limits.and_then(|limits| limits.sub_requests),
             subrequests: AtomicUsize::new(0),
@@ -10869,6 +10916,7 @@ impl IoContext {
             handed: Mutex::new(Some(Vec::new())),
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
+            ended: OnceLock::new(),
             pending_events: Mutex::new(HashSet::new()),
             subrequest_limit: runtime_state
                 .resource_limits
@@ -10985,6 +11033,22 @@ impl IoContext {
         let mut handed = self.handed.lock().unwrap();
         self.handed_len.store(0, Ordering::Release);
         handed.take().unwrap_or_default()
+    }
+
+    /// Mark this event as ended with its operations rejected.
+    ///
+    /// The rejections run the handlers waiting on them in the same turn, and
+    /// those handlers must not write storage or start work for an event that
+    /// is over. A synchronous storage call and a new operation both refuse
+    /// afterwards, with `reason`.
+    fn end(&self, reason: &str) {
+        if self.ended.set(reason.to_string()).is_ok() {
+            ENDED_CONTEXTS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn ended(&self) -> Option<&str> {
+        self.ended.get().map(String::as_str)
     }
 
     fn begin_event(&self) {
@@ -11185,6 +11249,9 @@ impl IoContext {
 impl Drop for IoContext {
     fn drop(&mut self) {
         let already_panicking = std::thread::panicking();
+        if self.ended.get().is_some() {
+            ENDED_CONTEXTS.fetch_sub(1, Ordering::Relaxed);
+        }
         // The drive loop also abandons these while it still owns the isolate,
         // because that path resets the JavaScript actor state. Drop is the
         // final host-side invariant for an earlier exit: no request context

@@ -13,7 +13,7 @@ use std::time::Duration;
 use celld::deploy::{Options, VarOverrides};
 use serde_json::Value;
 
-use super::harness::{host_runtime, wait_until, Server};
+use super::harness::{host_runtime, wait_until, Server, ONE_ISOLATE};
 
 const TOKEN: &str = "e2e-retire-token";
 const DEADLINE_S: &str = "4";
@@ -444,14 +444,13 @@ async fn durable_object_events_running_at_the_deadline_are_ended_and_the_node_ke
 /// ever on an operation nothing drives any more.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_promise_for_work_of_an_ended_event_rejects_instead_of_staying_pending() {
-    let server = Server::start(
-        "retire",
-        &[
-            ("CELLD_OPERATOR_TOKEN", TOKEN),
-            ("CELLD_HANDLER_BUDGET_S", "3"),
-        ],
-    )
-    .await;
+    // One isolate, so the second request sees the promise the first left.
+    let mut vars = vec![
+        ("CELLD_OPERATOR_TOKEN", TOKEN),
+        ("CELLD_HANDLER_BUDGET_S", "3"),
+    ];
+    vars.extend_from_slice(ONE_ISOLATE);
+    let server = Server::start("retire", &vars).await;
     // The client gives up while the event waits, which ends the event.
     let _ = reqwest::Client::new()
         .get(server.url("/stash"))
@@ -463,7 +462,37 @@ async fn a_promise_for_work_of_an_ended_event_rejects_instead_of_staying_pending
     let (status, body) =
         get_within_budget(&reqwest::Client::new(), &server.url("/await-stash")).await;
     assert!(status.is_success(), "{status} {body}");
-    assert!(body.starts_with("rejected: "), "{body}");
+    assert_eq!(body, "rejected: The client has disconnected");
+}
+
+/// The handlers a rejected wait runs, when the client hangs up, run inside
+/// the turn that ends the event. They must not write storage or start work.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_event_ended_by_a_hang_up_writes_and_starts_nothing_while_it_unwinds() {
+    let server = Server::start(
+        "retire",
+        &[
+            ("CELLD_OPERATOR_TOKEN", TOKEN),
+            ("CELLD_HANDLER_BUDGET_S", "3"),
+        ],
+    )
+    .await;
+    let _ = reqwest::Client::new()
+        .get(server.url("/do-guarded"))
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let (status, body) =
+        get_within_budget(&reqwest::Client::new(), &server.url("/do-guarded-outcome")).await;
+    assert!(status.is_success(), "{status} {body}");
+    let outcome: Value = serde_json::from_str(&body).expect("outcome json");
+    let reason = "The client has disconnected";
+    assert_eq!(outcome["ended"], reason, "{body}");
+    assert_eq!(outcome["write"], reason, "{body}");
+    assert_eq!(outcome["fetch"], reason, "{body}");
+    assert_eq!(outcome["rows"], 0, "{body}");
 }
 
 /// Storage work a leftover timer starts after the handler returned either

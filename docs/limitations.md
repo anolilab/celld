@@ -33,7 +33,10 @@ APIs, and Wrangler configuration.
   the reason it was ended, and an operation a stale continuation of it starts
   is rejected too. A promise that another event holds for that work therefore
   rejects, not waits for ever. A write the ended event had not committed is
-  not acknowledged.
+  not acknowledged. The handlers that rejection runs cannot write: a storage
+  or SQL call there throws the same reason, and an operation they start is
+  rejected. Work a client hang-up leaves in `waitUntil` is not ended, so it
+  keeps its access.
 - `/state` reports `deployment.retiring`: how many superseded deployments still
   hold isolates, and the age in milliseconds of the oldest. A cell that has not
   yet moved to the new deployment keeps its isolate until it does.
