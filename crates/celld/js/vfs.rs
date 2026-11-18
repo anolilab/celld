@@ -564,6 +564,17 @@ mod tests {
     }
 
     #[test]
+    fn bundle_module_paths_are_normalised_like_lookups() {
+        let tree = BundleTree::from_files(
+            ["./foo.js", "./lib/a.js", "x/../y.js"]
+                .into_iter()
+                .map(|name| (name, bytes::Bytes::new())),
+        );
+        assert_eq!(tree.list("/bundle").unwrap(), ["foo.js", "lib", "y.js"]);
+        assert_eq!(tree.list("/bundle/lib").unwrap(), ["a.js"]);
+    }
+
+    #[test]
     fn appended_files_are_charged_their_capacity() {
         let mut vfs = RequestVfs::default();
         let mut expected = 0;

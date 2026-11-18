@@ -10687,9 +10687,19 @@ impl BundleTree {
         let mut nodes = HashMap::new();
         nodes.insert("/bundle".to_string(), BundleNode::Directory);
         for (name, bytes) in files {
-            // A leading or doubled separator would otherwise create an empty
-            // segment, which no path can address.
-            let segments: Vec<&str> = name.split('/').filter(|part| !part.is_empty()).collect();
+            // Normalise as a lookup does: an empty or `.` segment would
+            // create an entry no path can address, and `..` removes the
+            // segment before it.
+            let mut segments: Vec<&str> = Vec::new();
+            for part in name.split('/') {
+                match part {
+                    "" | "." => {}
+                    ".." => {
+                        segments.pop();
+                    }
+                    part => segments.push(part),
+                }
+            }
             let Some((file, directories)) = segments.split_last() else {
                 continue;
             };
