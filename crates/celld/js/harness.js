@@ -3827,6 +3827,28 @@ __celld.__makeLoader = () => {
   };
 };
 
+// `hyperdrive` binding: the operator's own database. The fields are getters
+// on the prototype, as they are on Cloudflare, so enumerating the binding or
+// `JSON.stringify(env.DB)` does not show the connection string. `connect()`
+// dials the database itself, with no pool in between.
+class Hyperdrive {
+  #info;
+  constructor(info) { this.#info = info; }
+  get connectionString() { return this.#info.connectionString; }
+  get host() { return this.#info.host; }
+  get port() { return this.#info.port; }
+  get user() { return this.#info.user; }
+  get password() { return this.#info.password; }
+  get database() { return this.#info.database; }
+  connect(options) {
+    const { host, port } = this.#info;
+    return __celld.__cfSockets.connect(
+      { hostname: host, port },
+      options);
+  }
+}
+__celld.__makeHyperdrive = (info) => Object.freeze(new Hyperdrive(info));
+
 const __makeServiceBinding = __celld.__makeServiceBinding =
   (script, entrypoint = null, propsSc = undefined) => {
   const target = {

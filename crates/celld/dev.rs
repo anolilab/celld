@@ -739,21 +739,50 @@ fn read_dev_vars(config: &Path) -> anyhow::Result<deploy::VarOverrides> {
 const CONFIG_ENV: &str = "CELLD_INTERNAL_DEV_CONFIG";
 
 /// The entries of `.dev.vars` or the dotenv files, read now, that fill the
-/// Secrets Store bindings of a deployment. The node calls it each time it
-/// loads a deployment, and keeps the values in memory only, so a secret never
-/// reaches the deployment on disk and a changed file reaches the next load.
-/// Empty outside a `celld dev` node.
+/// Secrets Store bindings of a deployment, and the config's
+/// `localConnectionString` of each Hyperdrive binding, under the binding's
+/// local variable where that has no non-empty entry. The node calls it each
+/// time it loads a deployment, and keeps the values in memory only, so a
+/// secret never reaches the deployment on disk and a changed file reaches the
+/// next load. Empty outside a `celld dev` node.
 pub fn store_values() -> anyhow::Result<BTreeMap<String, String>> {
-    let (Some(_), Some(config)) = (
-        std::env::var_os("CELLD_INTERNAL_DEV_STORE"),
-        std::env::var_os(CONFIG_ENV),
-    ) else {
+    let Some(config) = std::env::var_os(CONFIG_ENV).filter(|_| is_dev_node()) else {
         return Ok(BTreeMap::new());
     };
-    Ok(match read_dev_vars(Path::new(&config))? {
+    let mut values = match read_dev_vars(Path::new(&config))? {
         deploy::VarOverrides::DevVars(entries) | deploy::VarOverrides::DotEnv(entries) => entries,
         deploy::VarOverrides::None => BTreeMap::new(),
-    })
+    };
+    let (_, project) = deploy::read_config(Some(config.into()))?;
+    add_local_connection_strings(&mut values, &project);
+    Ok(values)
+}
+
+/// Put `localConnectionString` of each `hyperdrive` entry of `config` under the
+/// binding's local variable, unless `values` holds a non-empty value for it.
+fn add_local_connection_strings(values: &mut BTreeMap<String, String>, config: &serde_json::Value) {
+    let entries = config
+        .get("hyperdrive")
+        .and_then(serde_json::Value::as_array);
+    for entry in entries.into_iter().flatten() {
+        let text = |key| entry.get(key).and_then(serde_json::Value::as_str);
+        if let (Some(binding), Some(local)) = (
+            text("binding"),
+            text("localConnectionString").filter(|local| !local.is_empty()),
+        ) {
+            let slot = values
+                .entry(crate::hyperdrive::local_variable(binding))
+                .or_default();
+            if slot.is_empty() {
+                *slot = local.to_string();
+            }
+        }
+    }
+}
+
+/// Whether this process is the node of a `celld dev` run.
+pub fn is_dev_node() -> bool {
+    std::env::var_os("CELLD_INTERNAL_DEV_STORE").is_some() && std::env::var_os(CONFIG_ENV).is_some()
 }
 
 /// The contents of `path`, or `None` when it does not exist. One read, not an
@@ -1280,6 +1309,25 @@ mod tests {
     fn port_zero_asks_for_a_free_port() {
         let options = parse(&["--port", "0"]).unwrap().unwrap();
         assert_eq!(options.stack.listener.port(), 0);
+    }
+
+    #[test]
+    fn a_config_string_fills_a_local_variable_that_has_no_value() {
+        let config = serde_json::json!({ "hyperdrive": [
+            { "binding": "A", "id": "a", "localConnectionString": "from-config-a" },
+            { "binding": "B", "id": "b", "localConnectionString": "from-config-b" },
+            { "binding": "C", "id": "c", "localConnectionString": "" },
+            { "binding": "D", "id": "d" }
+        ] });
+        let name = crate::hyperdrive::local_variable;
+        let mut values = BTreeMap::from([
+            (name("A"), String::new()),
+            (name("B"), "from-dev-vars".to_string()),
+        ]);
+        add_local_connection_strings(&mut values, &config);
+        assert_eq!(values[&name("A")], "from-config-a");
+        assert_eq!(values[&name("B")], "from-dev-vars");
+        assert!(!values.contains_key(&name("C")) && !values.contains_key(&name("D")));
     }
 
     #[test]

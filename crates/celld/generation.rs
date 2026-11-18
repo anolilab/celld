@@ -685,6 +685,7 @@ impl Generation {
                 loader_bindings,
                 version_metadata,
                 secret_stores,
+                hyperdrive,
                 assets: resolver,
                 services,
                 crons,
@@ -705,6 +706,7 @@ impl Generation {
                     .with_loaders(loader_bindings)
                     .with_version_metadata(version_metadata)
                     .with_secret_stores(secret_stores)
+                    .with_hyperdrive(hyperdrive)
                     .with_queue_consumers(queue_catalog.clone())
                     .with_crons(if is_primary { crons } else { Vec::new() })
                     .with_containers(containers)

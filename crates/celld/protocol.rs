@@ -131,6 +131,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_PYTHON_WORKERS_V1,
     FEATURE_VERSION_METADATA_V1,
     FEATURE_SECRETS_STORE_V1,
+    FEATURE_HYPERDRIVE_V1,
 ];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
@@ -171,6 +172,10 @@ pub const FEATURE_VERSION_METADATA_V1: &str = "version-metadata-v1";
 /// without them would build an `env` missing the binding, and the application
 /// would fail only when it first calls `env.<name>.get()`.
 pub const FEATURE_SECRETS_STORE_V1: &str = "secrets-store-v1";
+/// A deployment with `hyperdrive` bindings. Required because a node without
+/// them would build an `env` missing the binding, and the application would
+/// fail only when it first reads `env.<name>.connectionString`.
+pub const FEATURE_HYPERDRIVE_V1: &str = "hyperdrive-v1";
 /// A deployment with `workflows` bindings. Required because a build without
 /// the reserved workflow cell would load the manifest, build an `env` missing
 /// the binding, and fail only when the application first calls `create()` —

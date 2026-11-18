@@ -1682,6 +1682,9 @@ pub struct WorkerConfig {
     /// The deployment's Secrets Store bindings, already resolved. Not in
     /// `vars`, so `process.env` never holds them.
     secret_stores: Vec<crate::secrets::StoreSecret>,
+    /// The deployment's Hyperdrive bindings, with their connection strings.
+    /// Not in `vars`, so `process.env` never holds them.
+    hyperdrive: Vec<crate::hyperdrive::HyperdriveBinding>,
     /// Ambient outbound authority. Loaded workers may be denied.
     egress: EgressPolicy,
     /// Structured-clone values and host-minted service routes that a loaded
@@ -1827,6 +1830,7 @@ impl WorkerConfig {
             loader_bindings: Vec::new(),
             version_metadata: None,
             secret_stores: Vec::new(),
+            hyperdrive: Vec::new(),
             egress: EgressPolicy::Allow,
             loader_env: None,
             resource_limits: None,
@@ -1945,6 +1949,12 @@ impl WorkerConfig {
     /// Give this Worker its Secrets Store bindings.
     pub fn with_secret_stores(mut self, secrets: Vec<crate::secrets::StoreSecret>) -> Self {
         self.secret_stores = secrets;
+        self
+    }
+
+    /// Give this Worker its Hyperdrive bindings.
+    pub fn with_hyperdrive(mut self, bindings: Vec<crate::hyperdrive::HyperdriveBinding>) -> Self {
+        self.hyperdrive = bindings;
         self
     }
 
@@ -2257,6 +2267,8 @@ struct ActorRuntimeState {
     /// an event's lifetime merely to flush its output.
     ws_capture_touched: Mutex<Vec<Weak<IoContext>>>,
     egress: EgressPolicy,
+    /// The host and port of each Hyperdrive binding (`Filter::resolve_database`).
+    hyperdrive_destinations: Vec<(String, u16)>,
     resource_limits: Option<ResourceLimits>,
     tail_reporting: bool,
     script_name: String,
@@ -5862,6 +5874,11 @@ impl Worker {
         let runtime_state = Arc::new(ActorRuntimeState {
             promises: std::sync::Mutex::new(PromiseMap::new()),
             egress: config.egress.clone(),
+            hyperdrive_destinations: config
+                .hyperdrive
+                .iter()
+                .map(|binding| binding.connection.destination())
+                .collect(),
             resource_limits: config.resource_limits,
             tail_reporting: config.tail_reporting,
             script_name: script_name.to_string(),

@@ -940,14 +940,13 @@ async fn load_worker_at_pointer(
     let mut vars = worker_vars(&manifest);
     // Secrets are decrypted here, once per deployment load, and join the vars
     // as string bindings: one bucket read, nothing per request.
-    vars.extend(
-        crate::secrets::load(
-            bucket,
-            &manifest,
-            crate::secrets::SecretsKey::from_environment,
-        )
-        .await?,
-    );
+    let script_secrets = crate::secrets::load(
+        bucket,
+        &manifest,
+        crate::secrets::SecretsKey::from_environment,
+    )
+    .await?;
+    vars.extend(script_secrets.env);
     // Store secrets are bindings of their own, not vars, so `process.env`
     // never holds them. One more bucket read per distinct store.
     // `.dev.vars` is read only for a binding that `celld dev` marked, so an
@@ -960,6 +959,12 @@ async fn load_worker_at_pointer(
         crate::secrets::SecretsKey::from_environment,
     )
     .await?;
+    // Hyperdrive connection strings are script secrets, or `celld dev` values.
+    let hyperdrive = crate::hyperdrive::load(
+        &manifest,
+        script_secrets.consumed,
+        crate::dev::is_dev_node().then_some(&dev_values),
+    )?;
     let compat = crate::worker_compat(&manifest.raw_metadata);
     let assets = match &manifest.assets {
         Some(reference) => Some(
@@ -1018,6 +1023,7 @@ async fn load_worker_at_pointer(
         loader_bindings,
         version_metadata,
         secret_stores,
+        hyperdrive,
         assets,
         services,
         crons,
@@ -1040,6 +1046,8 @@ pub struct LoadedDeployment {
     pub version_metadata: Option<crate::engine_api::VersionMetadata>,
     /// The deployment's Secrets Store bindings, decrypted at load.
     pub secret_stores: Vec<crate::secrets::StoreSecret>,
+    /// The deployment's Hyperdrive bindings, with their connection strings.
+    pub hyperdrive: Vec<crate::hyperdrive::HyperdriveBinding>,
     pub assets: Option<crate::assets::AssetResolver>,
     pub services: Vec<(String, String, Option<String>)>,
     /// `triggers.crons` from the manifest, driving the reserved cron cell.

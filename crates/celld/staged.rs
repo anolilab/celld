@@ -224,6 +224,7 @@ pub async fn activate(
         // version binds, and activation would shadow it.
         crate::secrets::ensure_no_clash(bucket, manifest).await?;
         crate::secrets::ensure_store_secrets(bucket, manifest, false).await?;
+        crate::hyperdrive::ensure_connection_strings(bucket, manifest, false).await?;
     }
 
     let read = crate::deploy::read_fleet_pointer(bucket).await?;

@@ -548,13 +548,59 @@ impl Filter {
     pub async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, Refused> {
         self.check_host(host, port)?;
         let bare = host.trim_start_matches('[').trim_end_matches(']');
-        if let Ok(ip) = bare.parse::<IpAddr>() {
-            return Ok(vec![SocketAddr::new(ip, port)]);
+        let resolved = lookup(bare, port).await?;
+        // `check_host` checked an IP literal in full.
+        if bare.parse::<IpAddr>().is_ok() {
+            return Ok(resolved);
         }
-        let resolved = tokio::net::lookup_host((bare, port))
-            .await
-            .map_err(|error| Refused(format!("egress: could not resolve {bare}: {error}")))?;
-        self.filter_resolved(bare, port, resolved.collect())
+        self.filter_resolved(bare, port, resolved)
+    }
+
+    /// Resolve the host of a Hyperdrive binding once and keep the addresses
+    /// its Worker may dial; connect to these and nothing else.
+    ///
+    /// The operator chose the database, so a private, carrier-grade or
+    /// unique-local address is allowed where the public policy refuses it.
+    /// Loopback is allowed only with `allow_loopback`, which `celld dev` sets.
+    /// Unspecified, link-local, metadata, multicast and reserved addresses
+    /// are refused, and so is a listener of this node (or the name it
+    /// advertises), whatever `CELLD_EGRESS_ALLOW` says. Another port of the
+    /// node's own address is refused unless `CELLD_EGRESS_ALLOW` names it, and
+    /// `celld dev` allows it.
+    pub async fn resolve_database(
+        &self,
+        host: &str,
+        port: u16,
+        allow_loopback: bool,
+    ) -> Result<Vec<SocketAddr>, Refused> {
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        if (self.node_name)(&bare.trim_end_matches('.').to_ascii_lowercase(), port) {
+            return Err(Refused::own_name(bare));
+        }
+        let resolved = lookup(bare, port).await?;
+        keep(bare, resolved, |addr| {
+            self.database_address(addr, allow_loopback).map(|()| addr)
+        })
+    }
+
+    fn database_address(&self, addr: SocketAddr, allow_loopback: bool) -> Result<(), Refused> {
+        let ip = canonical(addr.ip());
+        match (self.node_endpoint)(SocketAddr::new(ip, addr.port())) {
+            NodeEndpoint::Listener => return Err(Refused::address(addr.ip(), Class::Own)),
+            // Another port of this node reaches other daemons and published
+            // container ports on the host: a fleet node needs the exception
+            // that the general policy asks for. `celld dev` allows it, as it
+            // allows loopback. Loopback stays refused here, as before.
+            NodeEndpoint::Address if !allow_loopback && classify(ip) != Class::Loopback => {
+                return self.permits_on(addr, addr.port());
+            }
+            NodeEndpoint::Address | NodeEndpoint::Elsewhere => {}
+        }
+        match classify(ip) {
+            Class::Public | Class::Private | Class::Cgnat | Class::UniqueLocal => Ok(()),
+            Class::Loopback if allow_loopback => Ok(()),
+            class => Err(Refused::address(addr.ip(), class)),
+        }
     }
 
     /// Keep the resolved addresses a Worker may dial. A hostname with an
@@ -565,64 +611,74 @@ impl Filter {
         port: u16,
         resolved: Vec<SocketAddr>,
     ) -> Result<Vec<SocketAddr>, Refused> {
-        let mut first_refusal = None;
         if let Some(ports) = self.name_ports(name) {
             // A hostname with an exception keeps every address, except one
             // that is a listener of the node on a port it may be dialed on.
             // With the port unknown, that is any allowed port: fail closed.
             let dialed: Vec<u16> = if port == 0 { ports.clone() } else { vec![port] };
-            let kept: Vec<SocketAddr> = resolved
-                .into_iter()
-                .filter(|addr| {
-                    let listener = dialed.iter().any(|port| {
-                        let at = SocketAddr::new(canonical(addr.ip()), *port);
-                        (self.node_endpoint)(at) == NodeEndpoint::Listener
-                    });
-                    if listener {
-                        first_refusal.get_or_insert(Refused::address(addr.ip(), Class::Own));
-                    }
-                    !listener
-                })
-                .collect();
-            return self.kept_or_refused(name, kept, first_refusal);
-        }
-        let kept: Vec<SocketAddr> = resolved
-            .into_iter()
-            .filter_map(|addr| {
-                let dialed =
-                    SocketAddr::new(addr.ip(), if addr.port() == 0 { port } else { addr.port() });
-                // A `host:port` exception for an IP applies to a request that
-                // names the IP, never to a name that resolves to it, so a name
-                // needs a range. The port decides a listener and a published
-                // container port: `connect()` knows it, while `fetch()`
-                // resolves without one and treats every address of the node as
-                // a listener.
-                match self.permits_on(SocketAddr::new(addr.ip(), 0), port) {
-                    Ok(()) => Some(dialed),
-                    Err(refusal) => {
-                        first_refusal.get_or_insert(refusal);
-                        None
-                    }
+            return keep(name, resolved, |addr| {
+                let listener = dialed.iter().any(|port| {
+                    let at = SocketAddr::new(canonical(addr.ip()), *port);
+                    (self.node_endpoint)(at) == NodeEndpoint::Listener
+                });
+                if listener {
+                    Err(Refused::address(addr.ip(), Class::Own))
+                } else {
+                    Ok(addr)
                 }
-            })
-            .collect();
-        self.kept_or_refused(name, kept, first_refusal)
-    }
-
-    fn kept_or_refused(
-        &self,
-        name: &str,
-        kept: Vec<SocketAddr>,
-        first_refusal: Option<Refused>,
-    ) -> Result<Vec<SocketAddr>, Refused> {
-        if kept.is_empty() {
-            return Err(first_refusal.map_or_else(
-                || Refused(format!("egress: {name} did not resolve to any address")),
-                |refusal| Refused(format!("{refusal}; {name} resolves only to such addresses")),
-            ));
+            });
         }
-        Ok(kept)
+        keep(name, resolved, |addr| {
+            let dialed =
+                SocketAddr::new(addr.ip(), if addr.port() == 0 { port } else { addr.port() });
+            // A `host:port` exception for an IP applies to a request that
+            // names the IP, never to a name that resolves to it, so a name
+            // needs a range. The port decides a listener and a published
+            // container port: `connect()` knows it, while `fetch()`
+            // resolves without one and treats every address of the node as
+            // a listener.
+            self.permits_on(SocketAddr::new(addr.ip(), 0), port)
+                .map(|()| dialed)
+        })
     }
+}
+
+/// The addresses of `bare`, an IP literal or a name, resolved once.
+async fn lookup(bare: &str, port: u16) -> Result<Vec<SocketAddr>, Refused> {
+    match bare.parse::<IpAddr>() {
+        Ok(ip) => Ok(vec![SocketAddr::new(ip, port)]),
+        Err(_) => tokio::net::lookup_host((bare, port))
+            .await
+            .map(Iterator::collect)
+            .map_err(|error| Refused(format!("egress: could not resolve {bare}: {error}"))),
+    }
+}
+
+/// The addresses that `check` accepts, as it returns them. The first refusal
+/// explains an answer that is empty.
+fn keep(
+    name: &str,
+    resolved: Vec<SocketAddr>,
+    mut check: impl FnMut(SocketAddr) -> Result<SocketAddr, Refused>,
+) -> Result<Vec<SocketAddr>, Refused> {
+    let mut first_refusal = None;
+    let kept: Vec<SocketAddr> = resolved
+        .into_iter()
+        .filter_map(|addr| match check(addr) {
+            Ok(kept) => Some(kept),
+            Err(refusal) => {
+                first_refusal.get_or_insert(refusal);
+                None
+            }
+        })
+        .collect();
+    if kept.is_empty() {
+        return Err(first_refusal.map_or_else(
+            || Refused(format!("egress: {name} did not resolve to any address")),
+            |refusal| Refused(format!("{refusal}; {name} resolves only to such addresses")),
+        ));
+    }
+    Ok(kept)
 }
 
 fn name_key(name: &str) -> String {
@@ -1288,6 +1344,104 @@ mod tests {
             NodeEndpoint::Elsewhere
         );
         assert!(filter.permits(sock("[64:ff9b::808:808]:8080")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_database_address_may_be_private_but_not_loopback_or_a_listener() {
+        fn node(addr: SocketAddr) -> NodeEndpoint {
+            if addr.port() == 8081 {
+                NodeEndpoint::Listener
+            } else {
+                NodeEndpoint::Elsewhere
+            }
+        }
+        let filter = Filter::public().with_node_endpoints(node);
+        for private in [
+            "10.1.2.3",
+            "172.16.0.9",
+            "192.168.1.5",
+            "100.64.0.1",
+            "fd00::5",
+        ] {
+            let addrs = filter.resolve_database(private, 5432, false).await.unwrap();
+            assert_eq!(addrs.len(), 1, "{private}");
+        }
+        for refused in [
+            "127.0.0.1",
+            "[::1]",
+            "169.254.169.254",
+            "169.254.1.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                filter.resolve_database(refused, 5432, false).await.is_err(),
+                "{refused}"
+            );
+        }
+        // Loopback only where the caller allows it, and never a listener.
+        assert!(filter
+            .resolve_database("127.0.0.1", 5432, true)
+            .await
+            .is_ok());
+        assert!(filter
+            .resolve_database("169.254.169.254", 5432, true)
+            .await
+            .is_err());
+        assert!(filter
+            .resolve_database("127.0.0.1", 8081, true)
+            .await
+            .is_err());
+        assert!(filter
+            .resolve_database("10.0.0.5", 8081, false)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_database_on_the_nodes_own_address_needs_an_exception_outside_dev() {
+        fn node(addr: SocketAddr) -> NodeEndpoint {
+            match addr.port() {
+                8081 => NodeEndpoint::Listener,
+                _ if addr.ip().to_string() == "10.0.0.5" => NodeEndpoint::Address,
+                _ => NodeEndpoint::Elsewhere,
+            }
+        }
+        let filter = Filter::public().with_node_endpoints(node);
+        assert!(filter
+            .resolve_database("10.0.0.5", 5432, false)
+            .await
+            .is_err());
+        // An exception for the address, or a range that holds it, allows it.
+        for allow in ["10.0.0.5:5432", "10.0.0.0/24"] {
+            let allowed = Filter::public()
+                .with_node_endpoints(node)
+                .with_exceptions(allow)
+                .unwrap();
+            assert!(
+                allowed
+                    .resolve_database("10.0.0.5", 5432, false)
+                    .await
+                    .is_ok(),
+                "{allow}"
+            );
+            // The listener stays refused whatever the exception says.
+            assert!(allowed
+                .resolve_database("10.0.0.5", 8081, false)
+                .await
+                .is_err());
+        }
+        // `celld dev` allows it, as it allows loopback.
+        assert!(filter
+            .resolve_database("10.0.0.5", 5432, true)
+            .await
+            .is_ok());
+        // Another private address of the network is unchanged.
+        assert!(filter
+            .resolve_database("10.0.0.6", 5432, false)
+            .await
+            .is_ok());
     }
 
     #[test]

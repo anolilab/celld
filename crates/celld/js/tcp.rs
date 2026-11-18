@@ -80,9 +80,19 @@ fn insert(id: u64, owner: u64, stream: Duplex) {
     );
 }
 
+/// The host without the brackets of an IPv6 literal, as a socket address and a
+/// TLS server name take it.
+fn unbracketed(host: &str) -> &str {
+    host.trim_start_matches('[').trim_end_matches(']')
+}
+
+fn server_name(host: &str) -> Result<rustls::pki_types::ServerName<'static>, String> {
+    rustls::pki_types::ServerName::try_from(unbracketed(host).to_string())
+        .map_err(|error| format!("invalid TLS server name: {error}"))
+}
+
 async fn handshake(stream: Duplex, host: String) -> Result<Duplex, String> {
-    let name = rustls::pki_types::ServerName::try_from(host)
-        .map_err(|error| format!("invalid TLS server name: {error}"))?;
+    let name = server_name(&host)?;
     let tls = crate::tls_roots::connector()
         .connect(name, stream)
         .await
@@ -123,15 +133,25 @@ pub(super) fn op_tcp_connect(
         }
     }
     let raw = args.get(0).to_rust_string_lossy(scope);
-    let request: ConnectArgs = match serde_json::from_str(&raw) {
+    let mut request: ConnectArgs = match serde_json::from_str(&raw) {
         Ok(request) => request,
         Err(error) => return loader_throw(scope, &format!("connect(): {error}")),
     };
+    // `connect("[::1]:5432")` arrives with the brackets of the literal.
+    request.hostname = unbracketed(&request.hostname).to_string();
     // The id exists before the connection does, so the request context
     // can own the socket even if the event ends mid-connect.
     let id = next_id();
     current_context().tcp_sockets.lock().unwrap().push(id);
     let owner = event_context(scope).owner_id();
+    // A Worker's own Hyperdrive address is held to `Filter::resolve_database`.
+    let own_database = {
+        let host = crate::hyperdrive::normalize_host(&request.hostname);
+        actor_runtime_state(scope)
+            .hyperdrive_destinations
+            .iter()
+            .any(|(bound, port)| *bound == host && *port == request.port)
+    };
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
@@ -140,10 +160,18 @@ pub(super) fn op_tcp_connect(
         // same resolved addresses.
         let connected = match crate::egress_filter::active() {
             Some(filter) => {
-                let addrs = filter
-                    .resolve(&request.hostname, request.port)
-                    .await
-                    .map_err(|refused| refused.to_string())?;
+                let resolved = if own_database {
+                    filter
+                        .resolve_database(
+                            &request.hostname,
+                            request.port,
+                            crate::dev::is_dev_node(),
+                        )
+                        .await
+                } else {
+                    filter.resolve(&request.hostname, request.port).await
+                };
+                let addrs = resolved.map_err(|refused| refused.to_string())?;
                 tokio::net::TcpStream::connect(&addrs[..]).await
             }
             None => tokio::net::TcpStream::connect((request.hostname.as_str(), request.port)).await,
@@ -302,4 +330,18 @@ pub(super) fn op_tcp_starttls(
         Ok::<String, String>(serde_json::json!({ "id": new_id }).to_string())
     });
     rv.set(promise_for(scope, async_id));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_ipv6_literal_is_a_tls_server_name_with_or_without_its_brackets() {
+        for host in ["[::1]", "::1", "[fd00::5]"] {
+            assert!(server_name(host).is_ok(), "{host}");
+        }
+        assert!(server_name("db.internal").is_ok());
+        assert!(server_name("not a name").is_err());
+    }
 }
