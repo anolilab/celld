@@ -162,6 +162,8 @@ statements of `ctx.storage.sql.ingest`, which run application SQL too.
 - Time runs from the start of preparing the statement to the end of its last
   step, summed over a cursor's steps. It excludes the time the Worker spends
   between steps. D1 counts the same span.
+  The per-statement time bound covers execution, not preparing, so a slow
+  prepare is reported in the time but is not interrupted.
 - A query reads as many rows as it returns, so a cursor that is closed early
   counts only the rows it produced. D1 counts the rows its statement stepped.
 - Rows written are the changes the statement's own steps made, so a cursor
@@ -211,7 +213,9 @@ relaxed atomic increments and one clock read.
 
 What is recorded: the fingerprint, outcome, time, rows read, rows written,
 bytes, SQLite's result code of a failure, and the cell class (the Durable
-Object class name, or `__D1Database` for D1).
+Object class name, or `__D1Database` for D1). A class name is cut at 64
+characters, and a control character or space in it is written as a `\u{..}`
+escape, so it cannot end the line.
 
 What is never recorded: the SQL text, a bound value, a result value, an error
 message (which can name a table, a column or a value), a table or column name,

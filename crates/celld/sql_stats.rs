@@ -248,6 +248,24 @@ fn take_slot(window: &Mutex<Option<Window>>, now: Instant) -> Option<u64> {
     Some(std::mem::take(&mut window.suppressed))
 }
 
+/// The longest class name a line carries.
+const CLASS_CHARS: usize = 64;
+
+/// A class name safe to put in a log line. The name comes from Worker metadata,
+/// so a control character or a space could end the line or forge a field.
+fn printable(class: &str) -> String {
+    class
+        .chars()
+        .take(CLASS_CHARS)
+        .flat_map(|c| {
+            let keep = !c.is_control() && !c.is_whitespace();
+            keep.then_some(c)
+                .into_iter()
+                .chain(c.escape_unicode().filter(move |_| !keep))
+        })
+        .collect()
+}
+
 struct Line<'a> {
     fingerprint: Option<u64>,
     outcome: Outcome,
@@ -278,7 +296,7 @@ impl Line<'_> {
             self.rows_read,
             self.rows_written,
             self.bytes,
-            self.class,
+            printable(self.class),
         );
         if self.outcome != Outcome::Ok {
             let _ = write!(out, " sqlite_code={}", self.code);
@@ -379,6 +397,28 @@ mod tests {
             .count();
         assert_eq!(taken, LOG_LINES_PER_SECOND as usize);
         assert_eq!(take_slot(&window, now + Duration::from_secs(2)), Some(5));
+    }
+
+    #[test]
+    fn a_class_name_cannot_end_the_line_or_forge_a_field() {
+        let line = Line {
+            fingerprint: None,
+            outcome: Outcome::Ok,
+            elapsed: Duration::ZERO,
+            rows_read: 0,
+            rows_written: 0,
+            bytes: 0,
+            code: 0,
+            class: "Evil\nslow statement",
+            suppressed: 0,
+        }
+        .render();
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(
+            line.ends_with("class=Evil\\u{a}slow\\u{20}statement"),
+            "{line}"
+        );
+        assert_eq!(printable(&"a".repeat(500)).len(), CLASS_CHARS);
     }
 
     #[test]
