@@ -210,6 +210,9 @@ pub struct Options {
     /// Upload the version and validate it, but move no pointer and publish no
     /// queue consumer attachment. `celld activate` selects it later.
     pub no_activate: bool,
+    /// Make this script the fleet's primary, the one that serves requests.
+    /// Without it a deploy leaves the primary alone, unless the fleet has none.
+    pub primary: bool,
     /// Worker variables that override the `vars` of the config. `celld dev`
     /// reads them from `.dev.vars` or the dotenv files; `celld deploy`
     /// supplies none, so a local credential cannot reach a fleet.
@@ -250,7 +253,7 @@ pub fn print_help() {
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --sourcemap PATH       Write the entry's source map to PATH, with its sources\n                         relative to the project. The deployed module does not\n                         change. With `no_bundle`, the map is the file the\n                         entry's own build wrote beside it, <entry>.map\n  --tag TAG              Label the deployment; a `version_metadata` binding\n                         reports it as `tag`. It does not change the version\n  --dry-run              Bundle and print the version without writing\n  --strict               Fail when the bundle imports a node: module celld does\n                         not implement; without it they are listed as a warning\n  --strict-compat-flags\n                         Fail on a compatibility flag celld does not know or\n                         does not handle yet, instead of warning\n  --no-activate          Upload and validate the version but select nothing; the\n                         fleet keeps serving what it serves. `celld activate`\n                         selects the version later and `celld discard` removes it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
+OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --sourcemap PATH       Write the entry's source map to PATH, with its sources\n                         relative to the project. The deployed module does not\n                         change. With `no_bundle`, the map is the file the\n                         entry's own build wrote beside it, <entry>.map\n  --tag TAG              Label the deployment; a `version_metadata` binding\n                         reports it as `tag`. It does not change the version\n  --dry-run              Bundle and print the version without writing\n  --strict               Fail when the bundle imports a node: module celld does\n                         not implement; without it they are listed as a warning\n  --strict-compat-flags\n                         Fail on a compatibility flag celld does not know or\n                         does not handle yet, instead of warning\n  --no-activate          Upload and validate the version but select nothing; the\n                         fleet keeps serving what it serves. `celld activate`\n                         selects the version later and `celld discard` removes it\n  --primary              Make this script the primary one, the script that\n                         serves requests. Without it a deploy keeps the serving\n                         primary and only updates this script's own version, so\n                         several scripts can share a fleet; an empty fleet takes\n                         the first script as its primary. Not with --no-activate\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain, from Google\n\
 Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
 account key, managed identity, or workload identity for an az:// bucket.\n\n\
@@ -279,6 +282,7 @@ pub fn options_from_arguments(
         strict: false,
         strict_compat_flags: false,
         no_activate: false,
+        primary: false,
         local_images: false,
         json: false,
         vars: VarOverrides::None,
@@ -293,6 +297,7 @@ pub fn options_from_arguments(
             "--strict" => options.strict = true,
             "--strict-compat-flags" => options.strict_compat_flags = true,
             "--no-activate" => options.no_activate = true,
+            "--primary" => options.primary = true,
             "--json" => options.json = true,
             "--config" => {
                 options.config = Some(PathBuf::from(
@@ -323,6 +328,12 @@ pub fn options_from_arguments(
             other if options.config.is_none() => options.config = Some(PathBuf::from(other)),
             other => bail!("`celld deploy` takes one project path, and already has one: {other}"),
         }
+    }
+    if options.primary && options.no_activate {
+        bail!(
+            "--primary and --no-activate contradict each other: a staged version selects \
+             nothing. Stage it, then run `celld activate SCRIPT=VERSION --primary SCRIPT`"
+        );
     }
     Ok(Some(options))
 }
@@ -1069,14 +1080,37 @@ async fn ensure_image_tar(bucket: &Bucket, image: &str) -> anyhow::Result<()> {
     bucket.put(&key, output.stdout).await
 }
 
-/// Upload a deployment. With `activate` it also becomes the serving one:
-/// queue consumers attach to it and the pointers move. Without it the version
-/// is complete and validated but inert, and only `celld activate` can select it.
+/// What a deploy selects once the version is uploaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    /// Nothing. The version is complete and validated but inert, and only
+    /// `celld activate` can select it.
+    Stage,
+    /// The version becomes the one its script serves: queue consumers attach
+    /// to it and the pointers move. The fleet's primary script stays what it
+    /// is, except that an empty fleet has none yet, so this script becomes it.
+    Activate,
+    /// As [`Selection::Activate`], and the script also becomes the primary.
+    Primary,
+}
+
+impl Selection {
+    /// The selection `celld deploy` makes for its flags.
+    pub fn from_flags(no_activate: bool, primary: bool) -> Self {
+        match (no_activate, primary) {
+            (true, _) => Self::Stage,
+            (false, true) => Self::Primary,
+            (false, false) => Self::Activate,
+        }
+    }
+}
+
+/// Upload a deployment and select it as `selection` says.
 /// Returns what happened to the manifest, see [`write_manifest`].
 pub async fn write(
     bucket: &Bucket,
     built: &Built,
-    activate: bool,
+    selection: Selection,
 ) -> anyhow::Result<ManifestWrite> {
     // Read every attachment before uploading immutable deployment objects.
     // A competing consumer is a deploy refusal, so it must not leave a new
@@ -1126,7 +1160,7 @@ pub async fn write(
     }
     let manifest = write_manifest(bucket, &built.prefix, &built.manifest).await?;
 
-    if !activate {
+    if selection == Selection::Stage {
         return Ok(manifest);
     }
 
@@ -1136,44 +1170,58 @@ pub async fn write(
     // without tearing this queue-to-consumer relationship.
     publish_queue_attachments(bucket, &built.manifest, &built.prefix, queue_attachments).await?;
 
-    let selection = ComponentPointer {
+    let target = crate::staged::Target {
+        script: built.script_name.clone(),
         version: built.version.clone(),
-        prefix: built.prefix.clone(),
     };
     // The named pointer resolves service-binding components; the fleet-wide
     // one is the sole application selector, so it moves last. A concurrent
     // deploy must produce a loser, not a lost write.
-    put_named_pointer(bucket, &built.script_name, &selection).await?;
+    put_named_pointer(
+        bucket,
+        &built.script_name,
+        &ComponentPointer {
+            version: target.version.clone(),
+            prefix: target.prefix(),
+        },
+    )
+    .await?;
     let current = read_fleet_pointer(bucket).await?;
-    let mut components = current
+    // A fleet pointer that names no script cannot be read by any node, so a
+    // deploy repairs it and its script becomes the primary.
+    let repairs = current
         .as_ref()
-        .map(|(pointer, _)| pointer.components.clone())
-        .unwrap_or_default();
-    // A fleet that selects its scripts through the map keeps doing so: the
-    // script that stops being primary stays selected at the version it served.
-    if let Some((previous, _)) = current.as_ref().filter(|_| !components.is_empty()) {
-        if let Some(script) = previous
-            .script_name
-            .as_ref()
-            .filter(|script| **script != built.script_name)
-        {
-            components.insert(
-                script.clone(),
-                ComponentPointer {
-                    version: previous.version.clone(),
-                    prefix: previous.prefix.clone(),
-                },
-            );
-        }
+        .is_some_and(|(pointer, _)| pointer.script_name.is_none());
+    let primary =
+        (selection == Selection::Primary || repairs).then_some(built.script_name.as_str());
+    // A script that does not serve resolves through its own pointer, written
+    // above, unless the fleet pointer's component map already lists it: the
+    // map wins there, so it has to follow.
+    let listed = current
+        .as_ref()
+        .is_some_and(|(pointer, _)| pointer.components.contains_key(&built.script_name));
+    let serves = current.as_ref().is_some_and(|(pointer, _)| {
+        pointer.script_name.as_deref() == Some(built.script_name.as_str())
+    });
+    if current.is_some() && primary.is_none() && !serves && !listed {
+        return Ok(manifest);
     }
-    components.remove(&built.script_name);
-    let pointer = DeployPointer {
-        script_name: Some(built.script_name.clone()),
-        version: selection.version,
-        prefix: selection.prefix,
-        rollout: Rollout { percent: 100 },
-        components,
-    };
+    let mut pointer = crate::staged::next_pointer(
+        current
+            .as_ref()
+            .map(|(pointer, _)| pointer)
+            .filter(|_| !repairs),
+        &[target],
+        primary,
+    )?;
+    // A fleet that never stages keeps no component map; the script that stops
+    // being primary resolves through its own pointer.
+    if current
+        .as_ref()
+        .is_none_or(|(old, _)| old.components.is_empty())
+    {
+        pointer.components.clear();
+    }
     write_fleet_pointer(bucket, current.map(|(_, token)| token), &pointer).await?;
     Ok(manifest)
 }

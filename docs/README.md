@@ -296,6 +296,30 @@ deployment can call a Durable Object on the other, so two adjacent
 versions must accept each other's calls. `/state` reports the deployment
 of each resident object.
 
+### Deploy several Workers into one fleet
+
+One script serves requests: the primary script. `celld deploy` does not
+change it unless you ask:
+
+- The first deploy into an empty fleet makes its script the primary, so a
+  single-Worker fleet needs no flag.
+- Later, `celld deploy` of the primary script moves the primary to the new
+  version.
+- `celld deploy` of any other script uploads it and moves that script's own
+  pointer, so service bindings resolve the new version. The primary and the
+  fleet pointer stay as they were, and the command says which script serves.
+- `celld deploy --primary` also makes the script the primary. The previous
+  primary stays selected at the version it served.
+
+`--primary` does not combine with `--no-activate`, which selects nothing; the
+command refuses the pair. To stage a version and make it primary later, use
+`celld activate SCRIPT=VERSION --primary SCRIPT`.
+
+Requests reach the primary script only. A fleet pointer that names no script,
+which no node can read, is repaired by the next `celld deploy`, and that
+script becomes the primary. `celld dev` runs one project and deploys it as
+the primary.
+
 ### Stage a deployment and activate it later
 
 `celld deploy --no-activate` uploads and validates a version and selects
@@ -365,7 +389,7 @@ version](security.md#run-a-request-on-a-staged-version).
 
 Both `celld activate` and `celld discard` take the fleet flags of `celld deploy` and `--json`. A
 `celld deploy` without `--no-activate` keeps the `components` map of a fleet
-that uses it. A managed deployment writes the pointer without the map, so a
+that uses it, and follows a listed script when you deploy that script. A managed deployment writes the pointer without the map, so a
 fleet that uses managed deployments does not stage.
 
 ## Develop an application locally

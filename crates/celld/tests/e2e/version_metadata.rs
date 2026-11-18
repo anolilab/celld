@@ -63,6 +63,7 @@ fn build(tag: Option<&str>) -> celld::deploy::Built {
         dry_run: true,
         json: false,
         no_activate: false,
+        primary: false,
         strict: false,
         strict_compat_flags: false,
         vars: celld::deploy::VarOverrides::None,

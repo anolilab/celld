@@ -878,6 +878,7 @@ async fn deploy_project(
         strict: false,
         strict_compat_flags,
         no_activate: false,
+        primary: true,
         json: false,
         vars: read_dev_vars(config)?,
         local_images: true,
@@ -888,7 +889,9 @@ async fn deploy_project(
         built.report();
     }
     crate::wake_format::ensure_ready(&bucket).await?;
-    deploy::write(&bucket, &built, true).await.map(drop)
+    deploy::write(&bucket, &built, deploy::Selection::Primary)
+        .await
+        .map(drop)
 }
 
 async fn run_stack(
