@@ -1514,6 +1514,44 @@ async fn a_spill_and_a_base_merge_through_the_paced_store_lose_no_key() {
     }
 }
 
+#[tokio::test]
+async fn a_takeover_spill_scheduled_through_the_paced_store_commits_beside_lookups() {
+    let store = memory();
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            job_pacing: true,
+            ..config()
+        },
+    );
+    let mut holding = holder_of(&node).await;
+    let batches: Vec<Vec<String>> = (0..12)
+        .map(|batch| (batch * 40..batch * 40 + 40).map(cell).collect())
+        .collect();
+    aged(&node, &mut holding, &batches).await;
+    // As a new holder: the spill is due at once and `schedule` starts it.
+    holding.last_spill_ms = None;
+    let lookups = {
+        let node = node.clone();
+        crate::asyncrt::spawn(async move {
+            for index in 0..200 {
+                let _ = answer(&node, &cell(index)).await;
+            }
+        })
+    };
+    crate::asyncrt::timeout(Duration::from_secs(10), async {
+        while node.counters.spills.load(Ordering::Relaxed) == 0 {
+            assert!(node.pass(&mut holding).await.unwrap());
+            crate::asyncrt::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the paced takeover spill commits");
+    lookups.await.unwrap();
+    assert_eq!(holding.running.load(Ordering::SeqCst), 0);
+}
+
 // ---------------------------------------------------------------------------
 // One DeleteObjects per pass
 // ---------------------------------------------------------------------------
