@@ -126,16 +126,22 @@ load and nothing per request. A node whose script has secrets and that has no
 key does not load the deployment and says why; a node that already serves keeps
 serving.
 
-A `put` or `delete` makes every node rebuild the same version of the Worker
-and read its secrets again, within one poll interval (`CELLD_DEPLOY_POLL_S`,
-default 30). The command writes the secrets object, then replaces
-`secrets_revision` in `deploy/current.json`; a node rebuilds when that value
-differs from the one it built from. The cost is one GET and one conditional
-PUT of the pointer for each `put` or `delete`, and nothing for each poll or
-request. A fleet with no pointer has no node to tell, so the command writes
-nothing there. A node on an older version ignores `secrets_revision` and reads
-the change at its next deploy, `POST /reload`, or restart. A build that fails
-is not retried every interval; a later `put` or `delete` retries it.
+A `put` or `delete` makes the nodes whose deployment uses that script or
+store rebuild the same version of the Worker and read its secrets again, within
+one poll interval (`CELLD_DEPLOY_POLL_S`, default 30). A put for a script
+that is staged or not served, or a store that no served Worker binds, rebuilds
+nothing. The command writes the secrets object, then sets a fresh
+`secrets_revisions["script:<name>"]` (or `"store:<id>"`) in
+`deploy/current.json`; a node rebuilds when that value differs from the one it
+built from, for a script or store it loaded. The cost is one GET and one
+conditional PUT of the pointer for each `put` or `delete`, and nothing for each
+poll or request. A fleet with no pointer has no node to tell, so the command
+writes nothing there, and an unreadable pointer is left as it is: the change is
+stored and the next deploy picks it up. A node on an older version ignores
+`secrets_revisions` and reads the change at its next deploy, `POST /reload`, or
+restart. A build that fails is not retried every interval; a later `put` or
+`delete` retries it. A `celld deploy` that reads the pointer before a secret
+write and writes it after loses its conditional write; run it again.
 
 A secret cannot have the name of a variable or binding of the Worker, or be
 named `__proto__`. `celld secret put` refuses a name that the deployment the
@@ -215,8 +221,8 @@ is in addition to the one request for the Worker's own secrets, and it adds
 nothing per request. A node that has no key does not load a deployment whose
 store holds a secret it binds, and says why. A change reaches a node at its
 next load of the deployment, and `celld secret put --store` or `delete --store`
-makes every node load it within one poll interval, as it does for a script's
-secrets.
+makes the nodes whose Workers bind that store load it within one poll interval,
+as it does for a script's secrets.
 
 A `hyperdrive` binding keeps its connection string as a secret of the script,
 named `HYPERDRIVE_` and the binding name. It is not a variable of `env`. See

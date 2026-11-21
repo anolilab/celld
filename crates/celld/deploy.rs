@@ -1377,7 +1377,7 @@ fn unreadable_pointer() -> DeployPointer {
         prefix: String::new(),
         rollout: Rollout { percent: 100 },
         components: BTreeMap::new(),
-        secrets_revision: None,
+        secrets_revisions: Default::default(),
     }
 }
 
@@ -1415,6 +1415,61 @@ pub(crate) async fn write_fleet_pointer(
     .await
 }
 
+/// What [`bump_secrets_revision`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RevisionBump {
+    /// The fleet pointer holds a fresh revision for the scope.
+    Updated,
+    /// There is no fleet pointer, so no node is running a deployment.
+    NoPointer,
+    /// The fleet pointer exists but is not a JSON object, so it was left as it is.
+    Unreadable,
+}
+
+/// Tell running nodes that the secrets of `scope_key` (`secrets::script_revision_key`
+/// or `store_revision_key`) changed: set a fresh random value for that key of the
+/// fleet pointer's `secrets_revisions`, so only the generations that loaded the
+/// scope rebuild. Call it after the secrets object is written.
+///
+/// The pointer is read and written back with a conditional write and a bounded
+/// retry, as raw JSON, so every other field is kept, including ones this
+/// version does not know. A deploy that reads the pointer before this write and
+/// writes it after loses its conditional write, and must be run again.
+pub async fn bump_secrets_revision(
+    bucket: &Bucket,
+    scope_key: &str,
+) -> anyhow::Result<RevisionBump> {
+    const ATTEMPTS: usize = 16;
+    let key = crate::fleet::CURRENT_POINTER_KEY;
+    for _ in 0..ATTEMPTS {
+        let Some((body, token)) = bucket.get(key).await? else {
+            return Ok(RevisionBump::NoPointer);
+        };
+        let Ok(Value::Object(mut pointer)) = serde_json::from_slice(&body) else {
+            return Ok(RevisionBump::Unreadable);
+        };
+        let revisions = pointer
+            .entry("secrets_revisions")
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Value::Object(revisions) = revisions else {
+            return Ok(RevisionBump::Unreadable);
+        };
+        revisions.insert(scope_key.to_string(), Value::String(new_revision()?));
+        let body = serde_json::to_vec_pretty(&Value::Object(pointer))?;
+        if bucket.put_cas(key, body, Some(&token)).await?.is_some() {
+            return Ok(RevisionBump::Updated);
+        }
+    }
+    bail!("{key} kept changing under this write; try again")
+}
+
+/// 16 random bytes as hex. Never derived from a secret value.
+fn new_revision() -> anyhow::Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|_| anyhow!("the OS random source is unavailable"))?;
+    Ok(crate::control_plane::hex(&bytes))
+}
+
 /// The per-script pointer that resolves a service binding of a node that
 /// reads no component map, and any script the map does not list.
 pub(crate) async fn put_named_pointer(
@@ -1428,7 +1483,7 @@ pub(crate) async fn put_named_pointer(
         prefix: selection.prefix.clone(),
         rollout: Rollout { percent: 100 },
         components: BTreeMap::new(),
-        secrets_revision: None,
+        secrets_revisions: Default::default(),
     };
     put_pointer(
         bucket,
@@ -4808,5 +4863,90 @@ mod durable_object_binding_tests {
                 .any(|binding| binding["type"] == "durable_object_namespace"
                     && binding["class_name"] == "Cell"));
         }
+    }
+}
+
+#[cfg(test)]
+mod secrets_revision_tests {
+    use super::*;
+    use crate::fleet::CURRENT_POINTER_KEY;
+
+    fn bucket(directory: &tempfile::TempDir) -> Bucket {
+        crate::asyncrt::install_test_host_runtime();
+        Bucket::open_dev(&directory.path().join("objects.sqlite3")).unwrap()
+    }
+
+    async fn read(bucket: &Bucket) -> Value {
+        let (body, _) = bucket.get(CURRENT_POINTER_KEY).await.unwrap().unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_bump_sets_its_own_scope_and_keeps_every_other_field() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        assert_eq!(
+            bump_secrets_revision(&bucket, "script:app").await.unwrap(),
+            RevisionBump::NoPointer
+        );
+        assert!(bucket.get(CURRENT_POINTER_KEY).await.unwrap().is_none());
+
+        let original = json!({
+            "script_name": "app",
+            "version": "v1",
+            "prefix": "deploy/app/v1",
+            "rollout": { "percent": 100 },
+            "components": { "b": { "version": "b1", "prefix": "deploy/b/b1" } },
+            "from_a_newer_node": [1, 2],
+        });
+        let put = |value: &Value| {
+            bucket.put_cas(
+                CURRENT_POINTER_KEY,
+                serde_json::to_vec(value).unwrap(),
+                None,
+            )
+        };
+        put(&original).await.unwrap().unwrap();
+
+        let bump = |scope: &'static str| bump_secrets_revision(&bucket, scope);
+        assert_eq!(bump("script:app").await.unwrap(), RevisionBump::Updated);
+        let first = read(&bucket).await;
+        let revision = first["secrets_revisions"]["script:app"].as_str().unwrap();
+        assert_eq!(revision.len(), 32);
+        assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let mut without = first.clone();
+        without.as_object_mut().unwrap().remove("secrets_revisions");
+        assert_eq!(without, original, "every other field is kept");
+
+        assert_eq!(bump("store:billing").await.unwrap(), RevisionBump::Updated);
+        let second = read(&bucket).await;
+        assert_eq!(
+            second["secrets_revisions"]["script:app"], first["secrets_revisions"]["script:app"],
+            "a bump of one scope leaves the others"
+        );
+        assert!(second["secrets_revisions"]["store:billing"].is_string());
+
+        assert_eq!(bump("script:app").await.unwrap(), RevisionBump::Updated);
+        assert_ne!(
+            read(&bucket).await["secrets_revisions"]["script:app"],
+            first["secrets_revisions"]["script:app"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_pointer_is_left_as_it_is() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        bucket
+            .put_cas(CURRENT_POINTER_KEY, b"[1]".to_vec(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bump_secrets_revision(&bucket, "script:app").await.unwrap(),
+            RevisionBump::Unreadable
+        );
+        let (body, _) = bucket.get(CURRENT_POINTER_KEY).await.unwrap().unwrap();
+        assert_eq!(&body[..], b"[1]");
     }
 }

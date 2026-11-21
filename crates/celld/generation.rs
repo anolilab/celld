@@ -138,9 +138,9 @@ pub struct DeploymentGraph {
     /// compares it with the pointer it reads next, so a pointer that moves
     /// only a co-hosted script still reads as a new deployment.
     pub components: BTreeMap<String, ComponentPointer>,
-    /// The `secrets_revision` of that pointer, so a changed revision reads
-    /// as a new deployment of the same version.
-    pub secrets_revision: Option<String>,
+    /// The secrets revision of every script and store this graph loaded,
+    /// by scope key, as that pointer held it.
+    pub secrets_revisions: BTreeMap<String, Option<String>>,
 }
 
 impl DeploymentGraph {
@@ -152,7 +152,7 @@ impl DeploymentGraph {
             primary,
             cohosted: Vec::new(),
             components: BTreeMap::new(),
-            secrets_revision: None,
+            secrets_revisions: BTreeMap::new(),
         }
     }
 
@@ -201,7 +201,7 @@ impl DeploymentGraph {
         with_queues: bool,
     ) -> anyhow::Result<Self> {
         let components = pointer.components.clone();
-        let secrets_revision = pointer.secrets_revision.clone();
+        let revisions = pointer.secrets_revisions.clone();
         let primary = fleet::load_primary_worker(bucket, pointer.clone(), node.clone()).await?;
         let primary_script = primary.script_name.clone();
         let mut loaded_scripts = BTreeMap::from([(primary_script.clone(), primary.prefix.clone())]);
@@ -299,11 +299,16 @@ impl DeploymentGraph {
             }
             cohosted.push(loaded);
         }
+        let secrets_revisions = std::iter::once(&primary)
+            .chain(&cohosted)
+            .flat_map(|loaded| &loaded.secret_scopes)
+            .map(|scope| (scope.clone(), revisions.get(scope).cloned()))
+            .collect();
         Ok(Self {
             primary,
             cohosted,
             components,
-            secrets_revision,
+            secrets_revisions,
         })
     }
 }
@@ -355,68 +360,6 @@ pub struct GenerationOptions {
     pub region: String,
 }
 
-/// Whether `pointer` names the version, prefix, components and secrets
-/// revision a generation was built from.
-fn selected_by(
-    pointer: &DeployPointer,
-    version: &str,
-    prefix: &str,
-    components: &BTreeMap<String, ComponentPointer>,
-    secrets_revision: Option<&str>,
-) -> bool {
-    pointer.version == version
-        && pointer.prefix == prefix
-        && &pointer.components == components
-        && pointer.secrets_revision.as_deref() == secrets_revision
-}
-
-#[cfg(test)]
-mod selection_tests {
-    use super::*;
-    use crate::protocol::Rollout;
-
-    fn pointer(revision: Option<&str>) -> DeployPointer {
-        DeployPointer {
-            script_name: Some("app".into()),
-            version: "v1".into(),
-            prefix: "deploy/app/v1".into(),
-            rollout: Rollout { percent: 100 },
-            components: BTreeMap::new(),
-            secrets_revision: revision.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn a_changed_secrets_revision_selects_a_new_generation() {
-        let built = |revision| {
-            selected_by(
-                &pointer(revision),
-                "v1",
-                "deploy/app/v1",
-                &BTreeMap::new(),
-                Some("r1"),
-            )
-        };
-        assert!(built(Some("r1")), "the revision it was built from");
-        assert!(!built(Some("r2")), "a put changed the revision");
-        assert!(!built(None), "a deploy dropped the revision");
-        assert!(selected_by(
-            &pointer(None),
-            "v1",
-            "deploy/app/v1",
-            &BTreeMap::new(),
-            None
-        ));
-        assert!(!selected_by(
-            &pointer(Some("r1")),
-            "v1",
-            "deploy/app/v1",
-            &BTreeMap::new(),
-            None
-        ));
-    }
-}
-
 /// A deployment, built and ready to serve.
 ///
 /// The fields are the four maps `RuntimeManager` once held for the life of
@@ -430,8 +373,8 @@ pub struct Generation {
     pub(crate) script_name: String,
     /// The component map of the pointer this generation was built from.
     pub(crate) components: BTreeMap<String, ComponentPointer>,
-    /// The `secrets_revision` of that pointer.
-    pub(crate) secrets_revision: Option<String>,
+    /// The revision of each secrets scope this generation loaded, at build.
+    pub(crate) secrets_revisions: BTreeMap<String, Option<String>>,
     pub(crate) stateless: crate::runtime::StatelessRuntime,
     pub(crate) services: HashMap<String, crate::runtime::StatelessRuntime>,
     pub(crate) cell_configs: HashMap<String, Arc<WorkerConfig>>,
@@ -466,16 +409,13 @@ impl Generation {
     }
 
     /// Whether `pointer` selects the deployments this generation was built
-    /// from, the primary script and every component, with the same secrets
-    /// revision.
+    /// from, the primary script and every component, with unchanged secrets
+    /// revisions for every script and store it loaded.
     pub fn is_selected_by(&self, pointer: &DeployPointer) -> bool {
-        selected_by(
-            pointer,
-            &self.version,
-            &self.prefix,
-            &self.components,
-            self.secrets_revision.as_deref(),
-        )
+        pointer.version == self.version
+            && pointer.prefix == self.prefix
+            && pointer.components == self.components
+            && pointer.secrets_unchanged(&self.secrets_revisions)
     }
 
     /// The primary script: the one ingress serves and whose assets ingress
@@ -700,7 +640,7 @@ impl Generation {
             primary,
             cohosted,
             components,
-            secrets_revision,
+            secrets_revisions,
         } = graph;
         crate::runtime::init_engine();
 
@@ -867,7 +807,7 @@ impl Generation {
             prefix,
             script_name: primary_script,
             components,
-            secrets_revision,
+            secrets_revisions,
             stateless,
             services: service_pools,
             cell_configs,

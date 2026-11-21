@@ -144,7 +144,7 @@ pub fn shadow_pointer(
         prefix: selection.prefix,
         rollout: Rollout { percent: 100 },
         components,
-        secrets_revision: None,
+        secrets_revisions: Default::default(),
     }
 }
 
@@ -400,7 +400,7 @@ mod tests {
                 },
             )]
             .into(),
-            secrets_revision: None,
+            secrets_revisions: Default::default(),
         };
         let shadow = shadow_pointer(Some(&serving), "back", "b2");
         assert_eq!(shadow.script_name.as_deref(), Some("back"));

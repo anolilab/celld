@@ -678,11 +678,13 @@ pub struct DeployPointer {
     /// every script it names together.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub components: BTreeMap<String, ComponentPointer>,
-    /// A random token `celld secret` replaces after every secret write. A
-    /// node that sees it change rebuilds the same version, which re-reads the
-    /// secrets. It is opaque and never derived from a value.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub secrets_revision: Option<String>,
+    /// One random token for each script or store whose secrets `celld secret`
+    /// changed, keyed `script:<name>` or `store:<id>`, replaced by every write
+    /// to that scope. A node rebuilds the same version when the token of a
+    /// scope its generation loaded differs. Opaque, never derived from a
+    /// value.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets_revisions: BTreeMap<String, String>,
 }
 
 /// One script's deployment as a [`DeployPointer`] names it.
@@ -705,8 +707,9 @@ impl DeployPointer {
         self.components.get(script).cloned()
     }
 
-    /// Whether `other` selects exactly the same deployments, so a node that
-    /// serves one has nothing to adopt from the other.
+    /// Whether `other` selects exactly the same deployments, ignoring secrets
+    /// revisions. The adoption check is [`Self::same_build`] on a failed
+    /// build and `Generation::is_selected_by` on a built generation.
     pub fn selects_same(&self, other: &Self) -> bool {
         self.version == other.version
             && self.prefix == other.prefix
@@ -714,10 +717,20 @@ impl DeployPointer {
     }
 
     /// Whether a node builds the same generation from `other`: the same
-    /// deployments and the same secrets revision. A put changes only the
+    /// deployments and the same secrets revisions. A put changes only a
     /// revision, and must not be answered from the memory of a failed build.
+    /// A failed build has no recorded scopes, so this compares the whole map.
     pub fn same_build(&self, other: &Self) -> bool {
-        self.selects_same(other) && self.secrets_revision == other.secrets_revision
+        self.selects_same(other) && self.secrets_revisions == other.secrets_revisions
+    }
+
+    /// Whether every scope in `recorded`, the revision a generation read at
+    /// build (`None` for none), is unchanged in this pointer. A scope the
+    /// generation never loaded cannot make it stale.
+    pub fn secrets_unchanged(&self, recorded: &BTreeMap<String, Option<String>>) -> bool {
+        recorded
+            .iter()
+            .all(|(scope, revision)| self.secrets_revisions.get(scope) == revision.as_ref())
     }
 }
 
@@ -972,28 +985,56 @@ mod send_email_manifest_tests {
 mod pointer_build_tests {
     use super::*;
 
-    fn pointer(revision: Option<&str>) -> DeployPointer {
+    fn pointer(revisions: &[(&str, &str)]) -> DeployPointer {
         serde_json::from_value(serde_json::json!({
             "version": "v1",
             "prefix": "deploy/app/v1",
             "rollout": { "percent": 100 },
-            "secrets_revision": revision,
+            "secrets_revisions": revisions.iter().copied().collect::<BTreeMap<_, _>>(),
         }))
         .unwrap()
     }
 
     #[test]
     fn a_changed_revision_is_a_different_build_of_the_same_deployment() {
-        let failed = pointer(Some("r1"));
-        assert!(failed.same_build(&pointer(Some("r1"))));
-        assert!(failed.selects_same(&pointer(Some("r2"))));
-        assert!(!failed.same_build(&pointer(Some("r2"))));
-        assert!(!failed.same_build(&pointer(None)));
+        let failed = pointer(&[("script:app", "r1")]);
+        assert!(failed.same_build(&pointer(&[("script:app", "r1")])));
+        assert!(failed.selects_same(&pointer(&[("script:app", "r2")])));
+        assert!(!failed.same_build(&pointer(&[("script:app", "r2")])));
+        assert!(!failed.same_build(&pointer(&[])));
     }
 
     #[test]
-    fn a_pointer_without_a_revision_round_trips_without_the_field() {
-        let text = serde_json::to_string(&pointer(None)).unwrap();
-        assert!(!text.contains("secrets_revision"), "{text}");
+    fn only_a_scope_the_generation_loaded_makes_it_stale() {
+        let recorded = BTreeMap::from([
+            ("script:app".to_string(), Some("r1".to_string())),
+            ("store:billing".to_string(), None),
+        ]);
+        let pointer_with =
+            |revisions: &[(&str, &str)]| pointer(revisions).secrets_unchanged(&recorded);
+        assert!(pointer_with(&[("script:app", "r1")]));
+        assert!(
+            pointer_with(&[
+                ("script:app", "r1"),
+                ("script:other", "x"),
+                ("store:unbound", "y")
+            ]),
+            "a scope outside the recorded set"
+        );
+        assert!(
+            !pointer_with(&[("script:app", "r2")]),
+            "a loaded script changed"
+        );
+        assert!(!pointer_with(&[]), "a loaded script's revision was dropped");
+        assert!(
+            !pointer_with(&[("script:app", "r1"), ("store:billing", "z")]),
+            "a bound store was written"
+        );
+    }
+
+    #[test]
+    fn a_pointer_without_revisions_round_trips_without_the_field() {
+        let text = serde_json::to_string(&pointer(&[])).unwrap();
+        assert!(!text.contains("secrets_revisions"), "{text}");
     }
 }

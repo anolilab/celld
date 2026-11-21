@@ -4284,6 +4284,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         .collect(),
                     version_metadata: None,
                     secret_stores: Vec::new(),
+                    secret_scopes: Vec::new(),
                     hyperdrive: Vec::new(),
                     ai_binding: None,
                     assets: None,

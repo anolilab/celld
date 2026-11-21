@@ -21,17 +21,23 @@ fn key_text() -> String {
 /// Put `NAME=value` into the dev store of `server`, as `celld secret put` does
 /// against a fleet bucket. The CLI cannot reach `celld dev`'s local store.
 async fn put(server: &Server, name: &str, value: &str) {
-    write(server, name, Some(value), false).await;
+    write(server, name, Some(value), None).await;
 }
 
 /// As `put`, then tell running nodes the way `celld secret put` does.
 async fn put_and_announce(server: &Server, name: &str, value: &str) {
-    write(server, name, Some(value), true).await;
+    write(
+        server,
+        name,
+        Some(value),
+        Some(secrets::script_revision_key("secrets")),
+    )
+    .await;
 }
 
-/// `put` of `value`, or `delete` when it is `None`, then optionally the
-/// revision bump.
-async fn write(server: &Server, name: &str, value: Option<&str>, announce: bool) {
+/// `put` of `value`, or `delete` when it is `None`, then the revision bump of
+/// the scope key `announce` names, if any.
+async fn write(server: &Server, name: &str, value: Option<&str>, announce: Option<String>) {
     let database = std::fs::canonicalize(server.project().join(".celld/dev"))
         .expect("resolve the dev state directory")
         .join("objects.sqlite3");
@@ -50,8 +56,8 @@ async fn write(server: &Server, name: &str, value: Option<&str>, announce: bool)
                     .await
                     .expect("delete the secret"),
             }
-            if announce {
-                secrets::bump_revision(&bucket)
+            if let Some(scope) = announce {
+                celld::deploy::bump_secrets_revision(&bucket, &scope)
                     .await
                     .expect("bump the secrets revision");
             }
@@ -206,7 +212,7 @@ async fn a_failed_build_is_retried_after_a_put_changes_the_revision() {
 
     // Remove the clash and add a secret the Worker can read. The watcher must
     // build again, though the deployment is the one that failed.
-    write(&server, "PLAIN", None, false).await;
+    write(&server, "PLAIN", None, None).await;
     put_and_announce(&server, "API_TOKEN", "fixed").await;
     wait_until(
         "the node serves the fixed build",
@@ -216,5 +222,56 @@ async fn a_failed_build_is_retried_after_a_put_changes_the_revision() {
             (served["token"] == "fixed").then_some(())
         },
     )
+    .await;
+}
+
+async fn generation(server: &Server) -> u64 {
+    let state: Value = server
+        .internal_get("/state")
+        .await
+        .send()
+        .await
+        .expect("GET /state")
+        .json()
+        .await
+        .expect("the state body");
+    state["deployment"]["generation"]
+        .as_u64()
+        .expect("a generation id")
+}
+
+#[tokio::test]
+async fn a_put_for_a_scope_the_node_does_not_serve_rebuilds_nothing() {
+    let key = key_text();
+    let server = Server::start("secrets", &[("CELLD_SECRETS_KEY", key.as_str()), POLL]).await;
+    let before = generation(&server).await;
+
+    // Another script and a store no served Worker binds.
+    write(
+        &server,
+        "OTHER",
+        Some("x"),
+        Some(secrets::script_revision_key("unrelated")),
+    )
+    .await;
+    write(
+        &server,
+        "OTHER",
+        Some("x"),
+        Some(secrets::store_revision_key("nobody")),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        generation(&server).await,
+        before,
+        "a rebuild moved the generation"
+    );
+
+    // The watcher is alive: a put for the served script does rebuild.
+    put_and_announce(&server, "API_TOKEN", "served").await;
+    wait_until("the generation moves", Duration::from_secs(20), || async {
+        (generation(&server).await != before).then_some(())
+    })
     .await;
 }

@@ -522,47 +522,27 @@ async fn update(
     bail!("{key} kept changing under this write; try again")
 }
 
-/// Tell running nodes that a secrets object changed: replace the fleet
-/// pointer's `secrets_revision` with a fresh random value, so every node
-/// rebuilds its generation and reads the new values. Call it after the
-/// secrets object is written.
-///
-/// A fleet with no pointer has no node to tell, so nothing is written. The
-/// pointer is read, changed and written back with a conditional write, which
-/// keeps every other field, including ones this version does not know.
-/// Returns whether a pointer was updated.
-pub async fn bump_revision(bucket: &Bucket) -> anyhow::Result<bool> {
-    let key = crate::fleet::CURRENT_POINTER_KEY;
-    for _ in 0..WRITE_ATTEMPTS {
-        let Some((body, token)) = bucket.get(key).await? else {
-            return Ok(false);
-        };
-        let mut pointer: serde_json::Value =
-            serde_json::from_slice(&body).with_context(|| format!("decode {key}"))?;
-        let fields = pointer
-            .as_object_mut()
-            .ok_or_else(|| anyhow!("{key} is not a JSON object"))?;
-        fields.insert(
-            "secrets_revision".to_string(),
-            serde_json::Value::String(new_revision()?),
-        );
-        let body = serde_json::to_vec_pretty(&pointer)?;
-        if bucket.put_cas(key, body, Some(&token)).await?.is_some() {
-            return Ok(true);
-        }
-    }
-    bail!("{key} kept changing under this write; try again")
+/// The key of a script's secrets in the fleet pointer's `secrets_revisions`.
+pub fn script_revision_key(script: &str) -> String {
+    format!("script:{script}")
 }
 
-/// 16 random bytes as hex. Never derived from a secret value.
-fn new_revision() -> anyhow::Result<String> {
-    use std::fmt::Write as _;
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).map_err(|_| anyhow!("the OS random source is unavailable"))?;
-    Ok(bytes.iter().fold(String::new(), |mut hex, byte| {
-        let _ = write!(hex, "{byte:02x}");
-        hex
-    }))
+/// The key of a Secrets Store's secrets in `secrets_revisions`.
+pub fn store_revision_key(store: &str) -> String {
+    format!("store:{store}")
+}
+
+/// The scopes a load of `manifest` reads secrets from: its own script and
+/// every Secrets Store it binds. A generation records their revisions, so a
+/// put to any other scope does not rebuild it.
+pub fn revision_scopes(manifest: &Manifest) -> anyhow::Result<Vec<String>> {
+    let stores: BTreeSet<&str> = store_bindings(manifest)?
+        .iter()
+        .map(|binding| binding.store_id)
+        .collect();
+    Ok(std::iter::once(script_revision_key(&manifest.script_name))
+        .chain(stores.into_iter().map(store_revision_key))
+        .collect())
 }
 
 /// The decrypted secrets of a script.
@@ -1085,55 +1065,6 @@ mod tests {
     fn bucket(directory: &tempfile::TempDir) -> Bucket {
         crate::asyncrt::install_test_host_runtime();
         Bucket::open_dev(&directory.path().join("objects.sqlite3")).unwrap()
-    }
-
-    #[tokio::test]
-    async fn a_revision_bump_keeps_every_field_and_needs_a_pointer() {
-        let directory = tempfile::tempdir().unwrap();
-        let bucket = bucket(&directory);
-        assert!(!bump_revision(&bucket).await.unwrap());
-        assert!(bucket
-            .get(crate::fleet::CURRENT_POINTER_KEY)
-            .await
-            .unwrap()
-            .is_none());
-
-        let original = serde_json::json!({
-            "script_name": "app",
-            "version": "v1",
-            "prefix": "deploy/app/v1",
-            "rollout": { "percent": 100 },
-            "components": { "b": { "version": "b1", "prefix": "deploy/b/b1" } },
-            "from_a_newer_node": [1, 2],
-        });
-        let put = |value: &serde_json::Value| {
-            bucket.put_cas(
-                crate::fleet::CURRENT_POINTER_KEY,
-                serde_json::to_vec(value).unwrap(),
-                None,
-            )
-        };
-        put(&original).await.unwrap().unwrap();
-        let read = || async {
-            let (body, _) = bucket
-                .get(crate::fleet::CURRENT_POINTER_KEY)
-                .await
-                .unwrap()
-                .unwrap();
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
-        };
-
-        assert!(bump_revision(&bucket).await.unwrap());
-        let first = read().await;
-        let revision = first["secrets_revision"].as_str().unwrap().to_string();
-        assert_eq!(revision.len(), 32);
-        assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        let mut without = first.clone();
-        without.as_object_mut().unwrap().remove("secrets_revision");
-        assert_eq!(without, original, "every other field is kept");
-
-        assert!(bump_revision(&bucket).await.unwrap());
-        assert_ne!(read().await["secrets_revision"], revision.as_str());
     }
 
     #[tokio::test]

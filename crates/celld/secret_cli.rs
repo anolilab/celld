@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use crate::bucket::Bucket;
 use crate::cli_options::{FleetFlags, FLEET_HELP};
 use crate::cli_output::{Format, Output, Record};
+use crate::deploy::RevisionBump;
 use crate::note;
 use crate::secrets::{self, SecretsKey};
 
@@ -74,16 +75,36 @@ impl Record for Name {
     }
 }
 
-/// Tell running nodes the secrets changed. The secrets object is already
-/// written, so a failure here leaves the change stored and says how to
-/// make nodes read it.
-async fn announce(bucket: &Bucket) -> anyhow::Result<()> {
-    secrets::bump_revision(bucket).await.context(
-        "the secret is stored, but running nodes were not told: they read it at their next \
-         load of the deployment (a deploy, `POST /reload`, or a restart), or run this command \
-         again",
-    )?;
-    Ok(())
+/// Tell running nodes the secrets of `owner` changed. The secrets object is
+/// already written, so this never fails the command over an unreadable
+/// pointer: the change is stored and the next deploy picks it up. Returns
+/// what the nodes will do, as a sentence ending the command's note.
+async fn announce(bucket: &Bucket, owner: &Owner) -> anyhow::Result<&'static str> {
+    let scope = match owner {
+        Owner::Script(script) => secrets::script_revision_key(script),
+        Owner::Store(store) => secrets::store_revision_key(store),
+    };
+    let told = crate::deploy::bump_secrets_revision(bucket, &scope)
+        .await
+        .context(
+            "the secret is stored, but running nodes were not told: they read it at their next \
+             load of the deployment (a deploy, `POST /reload`, or a restart), or run this \
+             command again",
+        )?;
+    Ok(match told {
+        RevisionBump::Updated => {
+            "Running nodes that use it rebuild the deployment within one poll interval \
+             (CELLD_DEPLOY_POLL_S)."
+        }
+        RevisionBump::NoPointer => {
+            "No node was told: the fleet has no deployment pointer, and nodes read the secret \
+             when they first load a deployment."
+        }
+        RevisionBump::Unreadable => {
+            "No node was told: the fleet pointer (deploy/current.json) is unreadable, and the \
+             next deploy picks the change up."
+        }
+    })
 }
 
 pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
@@ -130,11 +151,8 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                     secrets::put_store(&bucket, key, store, &name, &value).await?;
                 }
             }
-            announce(&bucket).await?;
-            note!(
-                "Stored secret {name} for {owner}. Running nodes rebuild the deployment and \
-                 serve it within one poll interval (CELLD_DEPLOY_POLL_S)."
-            );
+            let told = announce(&bucket, &owner).await?;
+            note!("Stored secret {name} for {owner}. {told}");
             Ok(())
         }
         Step::Delete(name) => {
@@ -142,11 +160,8 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                 Owner::Script(script) => secrets::delete(&bucket, script, &name).await?,
                 Owner::Store(store) => secrets::delete_store(&bucket, store, &name).await?,
             }
-            announce(&bucket).await?;
-            note!(
-                "Deleted secret {name} of {owner}. Running nodes stop serving it within one \
-                 poll interval (CELLD_DEPLOY_POLL_S)."
-            );
+            let told = announce(&bucket, &owner).await?;
+            note!("Deleted secret {name} of {owner}. {told}");
             Ok(())
         }
         Step::List => {
@@ -305,10 +320,11 @@ stores it in the bucket. A node refuses to load a deployment whose script has
 secrets when no key is set.
 
 A node reads a script's secrets when it loads a deployment. `put` and `delete`
-then replace `secrets_revision` in `deploy/current.json`, so every node reloads
-within one poll interval (CELLD_DEPLOY_POLL_S). A fleet with no pointer is not
-touched, and a node on an older version needs a deploy, `POST /reload`, or
-restart.
+then set `secrets_revisions` for that script or store in `deploy/current.json`,
+so only the nodes whose deployment uses it rebuild, within one poll interval
+(CELLD_DEPLOY_POLL_S). A fleet with no pointer is not touched, and a node on an
+older version needs a deploy, `POST /reload`, or restart. A `celld deploy` that
+races a secret write can lose its pointer write; run it again.
 
 SCRIPT defaults to the `name` of the Wrangler config in the working directory;
 `--config PATH` names another.
