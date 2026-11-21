@@ -342,9 +342,18 @@ pub(crate) fn redact_url(url: &str) -> String {
     if let Some((scheme, rest)) = url.split_once("://") {
         let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         if let Some(at) = rest[..authority_end].rfind('@') {
-            return format!("{scheme}://{REDACTED}@{}", redact_url(&rest[at + 1..]));
+            return format!(
+                "{}://{REDACTED}@{}",
+                redact_runs(scheme),
+                redact_runs(&rest[at + 1..])
+            );
         }
     }
+    redact_runs(url)
+}
+
+/// Replace each identifier-like run in `url`; see [`redact_url`].
+fn redact_runs(url: &str) -> String {
     let mut out = Vec::with_capacity(url.len());
     let mut start = 0;
     let mut run = Run::default();
@@ -658,6 +667,14 @@ mod tests {
         // An `@` after the authority is not userinfo.
         let kept = "https://example.com/a@b?x=y@z";
         assert_eq!(redact_url(kept), kept);
+        // Only the URL's own authority is looked at, once, however many
+        // `scheme://user@` shapes follow it.
+        assert_eq!(
+            redact_url("https://u@h/x://y@z"),
+            "https://REDACTED@h/x://y@z"
+        );
+        let deep = "a://b@".repeat(100_000);
+        assert!(redact_url(&deep).starts_with("a://REDACTED@a://b@"));
     }
 
     #[test]
