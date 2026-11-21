@@ -169,6 +169,11 @@ The errors remain visible without this flag. Set `NO_COLOR` to disable color,
 or set `FORCE_COLOR` to enable color when the output is not a terminal.
 `NO_COLOR` always takes priority.
 
+To develop Workers that call each other through service bindings, list the
+projects: `celld dev ./api ./billing`. The first serves requests and the others
+are reached through its service bindings; see
+[Service bindings in development](docs/services/workers.md#service-bindings-in-development).
+
 The command watches the project and rebuilds the application after a
 source or configuration change. It keeps the current application running
 if a build fails, and a successful restart retains the durable state. See

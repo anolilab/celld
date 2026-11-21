@@ -208,6 +208,38 @@ A `hyperdrive` binding keeps its connection string as a secret of the script,
 named `HYPERDRIVE_` and the binding name. It is not a variable of `env`. See
 [Hyperdrive](hyperdrive.md#the-connection-string).
 
+## Service bindings in development
+
+`celld dev` runs several Workers together, so a Worker can call another through
+a `services` binding without a deploy. List the projects as arguments or with
+`-c`/`--config`, the primary first:
+
+```sh
+celld dev ./api ./billing -c ./audit/wrangler.jsonc
+```
+
+One node runs them all. The first project is the primary: it serves requests at
+the listener. The others are reached only through the `services` bindings of
+the projects that name them, directly or through another project, and through
+the queues that a loaded project produces to or consumes. A listed project that
+nothing reaches is not loaded, and the console names it. The binding's `service`
+field names the other project's Worker `name`. Each project keeps its own
+`.dev.vars`, dotenv files and Hyperdrive `localConnectionString`; a value of one
+project never reaches another's script.
+
+- Each project needs its own Worker `name`, and one config cannot be listed
+  twice. Both are refused before any build, naming the paths.
+- A Durable Object class that two loaded projects export is refused at start,
+  naming both projects. The runtime's own classes (queues, KV, D1, rate limits,
+  workflows) do not count.
+- Cron triggers run for the first project only, as for any fleet.
+- The local state, and the `--state-dir` hash, are the first project's.
+  `celld d1 --local` reads them, so run it from the first project. Scripts that
+  an earlier run left in the state stay there and are not removed.
+- A change in a project rebuilds and writes only that project, then restarts the
+  node. A project that fails to build, or whose new `name` clashes with another's,
+  keeps the node serving, and is rebuilt again at the next change.
+
 ## Differences from Cloudflare
 
 - celld does not manage a custom domain or terminate TLS.

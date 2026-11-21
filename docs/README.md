@@ -405,12 +405,19 @@ fleet that uses managed deployments does not stage.
 ## Develop an application locally
 
 ```sh
-celld dev [PROJECT_DIR_OR_CONFIG]
+celld dev [PROJECT_DIR_OR_CONFIG...] [-c CONFIG]...
 ```
 
 The command starts a local object store, deploys the application, and runs
 one node. It does not need Docker or a cloud bucket. The Worker listener
 is `http://127.0.0.1:9876` by default.
+
+### Several projects
+
+List several projects, as arguments or with `-c`/`--config`, to run Workers that
+call each other through service bindings. One node runs them; the first serves
+requests and the others are reached through bindings. See
+[Service bindings in development](services/workers.md#service-bindings-in-development).
 
 | flag | effect |
 | --- | --- |
@@ -443,11 +450,12 @@ value from an earlier configuration can make the application fail with an
 error that looks unrelated. Use `--clean` to start from an empty state.
 `--clean` deletes nothing else under `.celld`.
 
-The command watches the project directory and rebuilds on a source,
+The command watches each project directory and rebuilds on a source,
 configuration, or dotenv change. The current application serves during the
 build, and a failed build does not replace it. The watcher ignores
 `.celld`, `.git`, `.wrangler`, `node_modules`, and `target` at each depth,
-and it does not watch files outside the project.
+and it does not watch files outside the projects. `--watch-ignore` globs are
+relative to the project directory that holds the changed file.
 
 The local object store is not available to a fleet node; it needs a supported
 cloud bucket. `celld d1 ... --local` is the one operator subcommand that
