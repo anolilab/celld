@@ -26,6 +26,7 @@ const MAX_FORWARD_CALL_BYTES: usize = 64 * 1024;
 pub(super) fn begin_email(
     tc: &mut v8::PinScope,
     mut message: Inbound,
+    request_id: Option<RequestId>,
     reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
 ) -> Begun {
     let context = IoContext::with_resource_limits(actor_runtime_state(tc).resource_limits);
@@ -33,30 +34,41 @@ pub(super) fn begin_email(
     let _ = context
         .inbound_email
         .set(Box::new(Event::new(&mut message)));
-    bootstrap::begin_job_event(tc, context, Answer::Rpc(reply), None, false, |tc| {
-        let dispatch = internal_function(tc, "__dispatchEntrypointEmail")?;
-        let Inbound {
-            from,
-            to,
-            raw,
-            headers,
-            ..
-        } = message;
-        let meta = serde_json::json!({
-            "from": from,
-            "to": to,
-            "rawSize": raw.len(),
-            "headers": headers,
-        })
-        .to_string();
-        let meta = v8::String::new(tc, &meta).ok_or_else(|| anyhow!("email metadata too large"))?;
-        let raw = bytes_value(tc, raw);
-        let entrypoint = v8::String::new(tc, "default").unwrap();
-        let recv = v8::undefined(tc).into();
-        dispatch
-            .call(tc, recv, &[entrypoint.into(), meta.into(), raw])
-            .ok_or_else(|| anyhow!("email dispatch threw"))
-    })
+    bootstrap::begin_job_event(
+        tc,
+        context,
+        request_id,
+        Answer::Rpc(reply),
+        None,
+        false,
+        |tc| {
+            let dispatch = internal_function(tc, "__dispatchEntrypointEmail")?;
+            let Inbound {
+                from,
+                to,
+                raw,
+                headers,
+                ..
+            } = message;
+            let meta = serde_json::json!({
+                "from": from,
+                "to": to,
+                "rawSize": raw.len(),
+                "headers": headers,
+            })
+            .to_string();
+            let meta =
+                v8::String::new(tc, &meta).ok_or_else(|| anyhow!("email metadata too large"))?;
+            // V8 owns what it is given and a Worker may write to it, so it gets a
+            // copy of its own; the event keeps the shared original.
+            let raw = bytes_value(tc, raw.to_vec());
+            let entrypoint = v8::String::new(tc, "default").unwrap();
+            let recv = v8::undefined(tc).into();
+            dispatch
+                .call(tc, recv, &[entrypoint.into(), meta.into(), raw])
+                .ok_or_else(|| anyhow!("email dispatch threw"))
+        },
+    )
 }
 
 #[derive(serde::Deserialize)]
@@ -92,8 +104,12 @@ pub(super) fn op_email_forward(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    if event_context(scope).inbound_email.get().is_none() {
+    let context = event_context(scope);
+    let Some(event) = context.inbound_email.get() else {
         return not_an_email_event(scope, "forward");
+    };
+    if let Err(error) = event.check_open() {
+        return refuse(scope, rv, error);
     }
     let too_long = v8::Local::<v8::String>::try_from(args.get(0)).map_or(true, |text| {
         text.utf8_length(scope) > MAX_FORWARD_CALL_BYTES
@@ -119,7 +135,11 @@ pub(super) fn op_email_forward(
         .inbound_email
         .get()
         .expect("checked above")
-        .prepare_forward(&call.to, &call.headers);
+        .prepare_forward(
+            crate::email::inbound::forward_allow(),
+            &call.to,
+            &call.headers,
+        );
     let gate = egress_gate_request(&context, celld_logic::Channel::Fetch);
     let async_id = asyncrt::enqueue(send_prepared(slot, prepared, gate, script));
     rv.set(promise_for(scope, async_id));
@@ -136,15 +156,19 @@ pub(super) fn op_email_reply(
     let Some(event) = context.inbound_email.get() else {
         return not_an_email_event(scope, "reply");
     };
-    // A refused reply is the event's one reply, as a failed one is.
-    if let Err(error) = event.take_reply() {
-        // A raw stream's reservation is given back with the event.
+    if let Err(error) = event.check_open().and_then(|()| event.check_reply_open()) {
         return refuse(scope, rv, error);
     }
+    // The reply is taken once the send is admitted: one turned away for lack
+    // of a slot or a subrequest can be made again, a refused or failed one
+    // cannot.
     let (context, slot) = match begin_send(scope, &args, 2) {
         Ok(begun) => begun,
         Err(error) => return refuse(scope, rv, error),
     };
+    if let Err(error) = event.take_reply() {
+        return refuse(scope, rv, error);
+    }
     let text = args.get(0).to_rust_string_lossy(scope);
     let call: ReplyCall = match serde_json::from_str(&text) {
         Ok(call) => call,

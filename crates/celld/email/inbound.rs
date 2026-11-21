@@ -4,8 +4,9 @@
 //! `message` of an `email()` event, and what the handler does with it
 //! (`forward()`, `reply()`, `setReject()`) is checked here.
 //!
-//! The route answers on the internal listener, behind the operator token, so
-//! the poster is the operator's own relay or webhook. A message is accepted
+//! The route answers on the internal listener, behind the operator token or
+//! the route's own token (`CELLD_EMAIL_INBOUND_TOKEN`), so the poster is the
+//! operator's own relay or webhook. A message is accepted
 //! as it came: the headers are parsed for `message.headers`, but a `Received:`
 //! header, a foreign `From:` and a `Message-ID` are all normal in mail that
 //! arrives, and the bytes handed to the Worker are never rewritten. Only what
@@ -18,13 +19,16 @@
 //! JavaScript side names an action and never supplies the original.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
+use bytes::Bytes;
 use serde_json::Value;
 
 use super::raw::{normalise_line_ends, parse_headers, split_head, Header};
 use super::{
     new_message_id, prepare_builder, prepare_raw, too_large, valid_address, EmailError, Prepared,
     SendEmailBinding, MAX_HEADER_SECTION_BYTES, MAX_LINE_BYTES, MAX_MESSAGE_BYTES,
+    MAX_RESTRICTION_ADDRESSES,
 };
 
 /// The most headers an inbound message may carry.
@@ -39,8 +43,85 @@ pub const MAX_REJECT_REASON_CHARS: usize = 200;
 /// Messages the node holds at once, each on the host and again in the
 /// isolate. A relay past this is told to retry.
 pub const MAX_CONCURRENT: usize = 4;
-/// How long the route waits for a handler before it answers 504.
-pub const HANDLER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+/// The variable that sets how many seconds the route waits to read a message
+/// and, separately, for its handler.
+pub const DEADLINE_ENV: &str = "CELLD_EMAIL_INBOUND_DEADLINE_S";
+/// The variable that lists the destinations `forward()` may send to.
+pub const FORWARD_ALLOW_ENV: &str = "CELLD_EMAIL_FORWARD_ALLOW";
+
+/// How long the route waits to read a message, and then for its handler,
+/// before it answers 408 or 504: 60 seconds unless [`DEADLINE_ENV`] says so.
+pub fn deadline() -> std::time::Duration {
+    static DEADLINE: OnceLock<std::time::Duration> = OnceLock::new();
+    *DEADLINE.get_or_init(|| {
+        std::time::Duration::from_secs(
+            crate::env_vars::positive_or(DEADLINE_ENV, 60).expect("validated at start"),
+        )
+    })
+}
+
+/// The destinations `forward()` may send to: whole addresses, compared exactly
+/// as written like the lists of a binding, and `@domain` entries, which match
+/// that domain alone, not its subdomains, and ignore case.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ForwardAllow {
+    addresses: Vec<String>,
+    domains: Vec<String>,
+}
+
+impl ForwardAllow {
+    /// A comma-separated list. A blank list allows nothing; an empty entry or
+    /// an entry that is neither an address nor `@domain` is an error.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut allow = Self::default();
+        if text.trim().is_empty() {
+            return Ok(allow);
+        }
+        for entry in text.split(',').map(str::trim) {
+            if allow.addresses.len() + allow.domains.len() >= MAX_RESTRICTION_ADDRESSES {
+                return Err(format!("has more than {MAX_RESTRICTION_ADDRESSES} entries"));
+            }
+            match entry.strip_prefix('@') {
+                Some(domain) if valid_address(&format!("a@{domain}")) => {
+                    allow.domains.push(domain.to_ascii_lowercase());
+                }
+                None if valid_address(entry) => allow.addresses.push(entry.to_string()),
+                _ => return Err(format!("has {entry:?}, which is not an address or @domain")),
+            }
+        }
+        Ok(allow)
+    }
+
+    pub fn allows(&self, address: &str) -> bool {
+        self.addresses.iter().any(|allowed| allowed == address)
+            || address.rsplit_once('@').is_some_and(|(_, domain)| {
+                self.domains
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(domain))
+            })
+    }
+}
+
+fn load_forward_allow() -> anyhow::Result<ForwardAllow> {
+    match crate::env_vars::value(FORWARD_ALLOW_ENV)? {
+        None => Ok(ForwardAllow::default()),
+        Some(text) => ForwardAllow::parse(&text)
+            .map_err(|error| anyhow::anyhow!("{FORWARD_ALLOW_ENV} {error}")),
+    }
+}
+
+/// The node's forward list. It is checked at start, so one that cannot be
+/// read here allows nothing.
+pub fn forward_allow() -> &'static ForwardAllow {
+    static ALLOW: OnceLock<ForwardAllow> = OnceLock::new();
+    ALLOW.get_or_init(|| load_forward_allow().unwrap_or_default())
+}
+
+/// Check the node's inbound mail settings, for startup.
+pub fn validate() -> anyhow::Result<()> {
+    crate::env_vars::positive::<u64>(DEADLINE_ENV)?;
+    load_forward_allow().map(drop)
+}
 
 /// A refusal of a posted message, with the HTTP status the relay is told.
 #[derive(Debug, PartialEq, Eq)]
@@ -64,7 +145,7 @@ pub struct Inbound {
     /// The envelope sender; empty for a bounce (`MAIL FROM:<>`).
     pub from: String,
     pub to: String,
-    pub raw: Vec<u8>,
+    pub raw: Bytes,
     /// Every header, in order, with its folds removed.
     pub headers: Vec<(String, String)>,
     /// The `Message-ID` header, with its angle brackets.
@@ -74,12 +155,20 @@ pub struct Inbound {
     /// The place among [`MAX_CONCURRENT`] this message holds. It moves to the
     /// [`Event`], so it is kept until the handler's event has ended.
     pub permit: Option<Permit>,
+    /// Set when the route gives up on the handler, so what it does from then
+    /// on is refused.
+    pub cancelled: Arc<AtomicBool>,
 }
 
 /// Parse a posted message. `from` and `to` are the envelope as the relay gave
 /// it, and both are required: the recipient decides which domain a reply may be
 /// sent from, so it is never read from a header the sender wrote.
-pub fn parse(raw: Vec<u8>, from: Option<&str>, to: Option<&str>) -> Result<Inbound, InboundError> {
+pub fn parse(
+    raw: impl Into<Bytes>,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<Inbound, InboundError> {
+    let raw = raw.into();
     if raw.is_empty() {
         return Err(InboundError::new(400, "the message is empty"));
     }
@@ -161,6 +250,7 @@ pub fn parse(raw: Vec<u8>, from: Option<&str>, to: Option<&str>) -> Result<Inbou
         message_id,
         references,
         permit: None,
+        cancelled: Arc::default(),
     })
 }
 
@@ -180,11 +270,49 @@ fn valid_message_id(id: &str) -> bool {
 pub struct Event {
     pub from: String,
     pub to: String,
-    raw: Vec<u8>,
+    /// The one copy the host keeps, shared with the request that carried it.
+    raw: Bytes,
     message_id: Option<String>,
     references: Vec<String>,
+    /// Why a reply would be unwelcome, when the message is automatic mail.
+    automatic: Option<&'static str>,
     replied: AtomicBool,
+    cancelled: Arc<AtomicBool>,
     _permit: Option<Permit>,
+}
+
+/// Whether the headers or the envelope sender mark the message as one a
+/// machine sent, which a reply could only bounce back and forth.
+fn automatic(from: &str, headers: &[(String, String)]) -> Option<&'static str> {
+    fn values<'a>(headers: &'a [(String, String)], name: &'a str) -> impl Iterator<Item = &'a str> {
+        headers
+            .iter()
+            .filter(move |(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim())
+    }
+    let first_word = |value: &str| {
+        value
+            .split(|c: char| c == ';' || c.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    if values(headers, "auto-submitted").any(|value| first_word(value) != "no") {
+        return Some("it is automatic mail (Auto-Submitted)");
+    }
+    if values(headers, "precedence")
+        .any(|value| matches!(first_word(value).as_str(), "bulk" | "list" | "junk"))
+    {
+        return Some("it is bulk mail (Precedence)");
+    }
+    let local = from.rsplit_once('@').map_or(from, |(local, _)| local);
+    if ["mailer-daemon", "postmaster"]
+        .iter()
+        .any(|name| local.eq_ignore_ascii_case(name))
+    {
+        return Some("it comes from a mail system");
+    }
+    None
 }
 
 impl Event {
@@ -195,17 +323,36 @@ impl Event {
             raw: inbound.raw.clone(),
             message_id: inbound.message_id.clone(),
             references: inbound.references.clone(),
+            automatic: automatic(&inbound.from, &inbound.headers),
             replied: AtomicBool::new(false),
+            cancelled: inbound.cancelled.clone(),
             _permit: inbound.permit.take(),
         }
     }
 
+    /// Refuse what a handler tries once the route has given up on it.
+    pub fn check_open(&self) -> Result<(), EmailError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(EmailError::new(
+                "E_TIMEOUT",
+                "the email event was cancelled because the handler did not finish in time",
+            ));
+        }
+        Ok(())
+    }
+
     /// The original message plus the `X-` headers the handler adds, for
-    /// `rcpt_to`. The bytes are the received ones apart from CRLF line ends and
-    /// the loss of `Bcc:`; `Received:`, `Message-ID` and any signature headers
-    /// stay as they were, so a signature over them still holds.
+    /// `rcpt_to`, which must be a destination `allow` lists. It goes out with
+    /// the receiving address as its envelope sender, since the sender is
+    /// someone else's and the relay would be sending as them; the `From:`
+    /// header stays. The bytes are the received ones apart from CRLF line ends
+    /// and the loss of `Bcc:`; `Received:`, `Message-ID` and any signature
+    /// headers stay as they were, so a signature over them still holds. A
+    /// message with no usable `Message-ID` gets one, so the id this returns is
+    /// the one in the bytes.
     pub fn prepare_forward(
         &self,
+        allow: &ForwardAllow,
         rcpt_to: &str,
         headers: &[(String, String)],
     ) -> Result<Prepared, EmailError> {
@@ -213,6 +360,12 @@ impl Event {
             return Err(EmailError::new(
                 "E_VALIDATION_ERROR",
                 "the recipient is not a valid email address",
+            ));
+        }
+        if !allow.allows(rcpt_to) {
+            return Err(EmailError::new(
+                "E_RECIPIENT_NOT_ALLOWED",
+                "the recipient is not a destination the operator allows forwarding to",
             ));
         }
         let extra = forward_headers(headers)?;
@@ -234,10 +387,20 @@ impl Event {
             ));
         }
         let parsed = parse_headers(head)?;
-        let mut data = Vec::with_capacity(message.len() + extra.len() + 8);
+        let message_id = self.message_id.as_deref().map_or_else(
+            || new_message_id(&self.to),
+            |id| id[1..id.len() - 1].to_string(),
+        );
+        let mut data = Vec::with_capacity(message.len() + extra.len() + 80);
         data.extend_from_slice(extra.as_bytes());
+        if self.message_id.is_none() {
+            data.extend_from_slice(format!("Message-ID: <{message_id}>\r\n").as_bytes());
+        }
         for header in &parsed {
-            if !header.name_is("bcc") && !header.name_is("resent-bcc") {
+            let dropped = header.name_is("bcc")
+                || header.name_is("resent-bcc")
+                || (self.message_id.is_none() && header.name_is("message-id"));
+            if !dropped {
                 data.extend_from_slice(&head[header.start..header.end]);
             }
         }
@@ -249,26 +412,32 @@ impl Event {
         if data.len() > MAX_MESSAGE_BYTES {
             return Err(too_large());
         }
-        let message_id = self.message_id.as_deref().map_or_else(
-            || new_message_id(&self.to),
-            |id| id[1..id.len() - 1].to_string(),
-        );
         Ok(Prepared::new(
-            self.from.clone(),
+            self.to.clone(),
             vec![rcpt_to.to_string()],
             data,
             message_id,
         ))
     }
 
-    /// Take the one reply this event may make. A failed reply counts, so a
-    /// handler cannot try one sender after another.
-    pub fn take_reply(&self) -> Result<(), EmailError> {
-        if self.replied.swap(true, Ordering::AcqRel) {
+    /// Whether the one reply this event may make is still to be made.
+    pub fn check_reply_open(&self) -> Result<(), EmailError> {
+        if self.replied.load(Ordering::Acquire) {
             return Err(EmailError::new(
                 "E_VALIDATION_ERROR",
                 "this message has been replied to already",
             ));
+        }
+        Ok(())
+    }
+
+    /// Take the one reply this event may make, once the send is admitted. A
+    /// reply that is then refused or fails counts, so a handler cannot try one
+    /// sender after another; one that was turned away for lack of a slot or a
+    /// subrequest does not, as it can be made again.
+    pub fn take_reply(&self) -> Result<(), EmailError> {
+        if self.replied.swap(true, Ordering::AcqRel) {
+            return self.check_reply_open();
         }
         Ok(())
     }
@@ -286,6 +455,12 @@ impl Event {
             return Err(EmailError::new(
                 "E_VALIDATION_ERROR",
                 "the incoming message has no sender to reply to",
+            ));
+        }
+        if let Some(why) = self.automatic {
+            return Err(EmailError::new(
+                "E_RECIPIENT_NOT_ALLOWED",
+                format!("a reply is not sent because {why}"),
             ));
         }
         if self.references.len() > MAX_REFERENCES {
@@ -595,12 +770,37 @@ pub fn admit() -> Option<Permit> {
     Some(Permit(()))
 }
 
+/// Ends an event the route stops waiting for, at the deadline or because the
+/// relay hung up: the event is aborted, and what a handler that outlives the
+/// abort through `waitUntil` still does is refused.
+struct GiveUp {
+    cancelled: Option<Arc<AtomicBool>>,
+    _abort: crate::runtime::AbortOnDrop,
+}
+
+impl GiveUp {
+    fn disarm(&mut self) {
+        self.cancelled = None;
+        self._abort.disarm();
+    }
+}
+
+impl Drop for GiveUp {
+    fn drop(&mut self) {
+        if let Some(cancelled) = &self.cancelled {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
 /// The route: parse a posted message, run it through the primary Worker's
-/// `email()` handler and map what it did to a status and body.
+/// `email()` handler and map what it did to a status and body. A handler that
+/// has not finished at the [`deadline`] is cancelled, as one whose client hung
+/// up is, so it gives its place back and what it still tries is refused.
 pub async fn handle(
     runtime: &crate::runtime::RuntimeManager,
     query: Option<&str>,
-    body: Vec<u8>,
+    body: Bytes,
     permit: Permit,
 ) -> (u16, String) {
     let (mut from, mut to) = (None, None);
@@ -623,19 +823,29 @@ pub async fn handle(
             )
         }
     };
-    let ran = crate::asyncrt::timeout(HANDLER_DEADLINE, runtime.email_worker(inbound)).await;
+    let cancellation = crate::runtime::RequestCancellationLifetime::stateless();
+    let mut giveup = GiveUp {
+        cancelled: Some(inbound.cancelled.clone()),
+        _abort: crate::runtime::AbortOnDrop::armed(cancellation.clone()),
+    };
+    let ran =
+        crate::asyncrt::timeout(deadline(), runtime.email_worker(inbound, cancellation)).await;
     let outcome = match ran {
         Ok(Ok(bytes)) => read_outcome(&bytes),
         Ok(Err(error)) => {
             tracing::warn!(event = "inbound_email_failed", %error);
             Outcome::Failed("the message could not be handled".into())
         }
-        Err(_) => return (
-            504,
-            r#"{"ok":false,"outcome":"error","error":"the email handler did not finish in time"}"#
-                .to_string(),
-        ),
+        Err(_) => {
+            return (
+                504,
+                r#"{"ok":false,"outcome":"error","error":"the email handler did not finish in time"}"#
+                    .to_string(),
+            );
+        }
     };
+    // The handler is done: what it left in `waitUntil` is not cancelled.
+    giveup.disarm();
     answer(outcome)
 }
 
@@ -647,6 +857,10 @@ mod tests {
     static PLACES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     const MESSAGE: &str = "Received: from mx by node\r\nFrom: Ann <ann@example.org>\r\nTo: bob@example.com\r\nSubject: hi\r\nMessage-ID: <m1@example.org>\r\nReferences: <a@x> <b@x>\r\nBcc: spy@example.net\r\n\r\nHello\r\n.dot\r\n";
+
+    fn allow() -> ForwardAllow {
+        ForwardAllow::parse("team@example.net, a@b.co, @partner.example").unwrap()
+    }
 
     fn parsed(text: &str) -> Inbound {
         parse(
@@ -757,6 +971,7 @@ mod tests {
         let event = Event::new(&mut parsed(MESSAGE.replace("\r\n", "\n").as_str()));
         let sent = event
             .prepare_forward(
+                &allow(),
                 "team@example.net",
                 &[
                     ("X-Processed-By".into(), "worker".into()),
@@ -772,13 +987,17 @@ mod tests {
         assert!(text.contains("Message-ID: <m1@example.org>\r\n"));
         assert!(!text.contains("Bcc") && !text.contains("dropped"));
         assert!(text.ends_with("\r\n\r\nHello\r\n.dot\r\n"), "{text:?}");
-        assert_eq!(sent.from, "ann@example.org");
+        // The receiving address is the envelope sender; From: stays the sender's.
+        assert_eq!(sent.from, "bob@example.com");
+        assert!(text.contains("From: Ann <ann@example.org>\r\n"));
         assert_eq!(sent.recipients, ["team@example.net"]);
         assert_eq!(sent.message_id, "m1@example.org");
-        assert!(event.prepare_forward("not an address", &[]).is_err());
+        assert!(event
+            .prepare_forward(&allow(), "not an address", &[])
+            .is_err());
         let code = |name: &str, value: &str| {
             event
-                .prepare_forward("a@b.co", &[(name.into(), value.into())])
+                .prepare_forward(&allow(), "a@b.co", &[(name.into(), value.into())])
                 .unwrap_err()
                 .code
         };
@@ -791,7 +1010,10 @@ mod tests {
             .map(|i| (format!("X-{i}"), "v".to_string()))
             .collect();
         assert_eq!(
-            event.prepare_forward("a@b.co", &many).unwrap_err().code,
+            event
+                .prepare_forward(&allow(), "a@b.co", &many)
+                .unwrap_err()
+                .code,
             "E_HEADERS_TOO_MANY"
         );
         // A line past the limit in the body is refused, not folded.
@@ -799,9 +1021,127 @@ mod tests {
         let event =
             Event::new(&mut parse(long.into_bytes(), Some("a@b.co"), Some("b@c.co")).unwrap());
         assert_eq!(
-            event.prepare_forward("a@b.co", &[]).unwrap_err().code,
+            event
+                .prepare_forward(&allow(), "a@b.co", &[])
+                .unwrap_err()
+                .code,
             "E_LINE_TOO_LONG"
         );
+    }
+
+    #[test]
+    fn a_forward_goes_only_to_a_listed_destination() {
+        let event = Event::new(&mut parsed(MESSAGE));
+        let code = |allow: &ForwardAllow, to: &str| {
+            event
+                .prepare_forward(allow, to, &[])
+                .map(|_| "sent")
+                .unwrap_or_else(|error| error.code)
+        };
+        let allow = allow();
+        for listed in [
+            "team@example.net",
+            "a@b.co",
+            "x@partner.example",
+            "x@PARTNER.example",
+        ] {
+            assert_eq!(code(&allow, listed), "sent", "{listed}");
+        }
+        for other in [
+            "eve@example.org",
+            "Team@example.net",
+            "x@sub.partner.example",
+            "x@partner.example.evil.test",
+        ] {
+            assert_eq!(code(&allow, other), "E_RECIPIENT_NOT_ALLOWED", "{other}");
+        }
+        // With nothing set, nothing is allowed.
+        let none = ForwardAllow::default();
+        assert_eq!(code(&none, "team@example.net"), "E_RECIPIENT_NOT_ALLOWED");
+        assert_eq!(ForwardAllow::parse("  ").unwrap(), none);
+        for bad in [
+            "a@b.co,",
+            ",a@b.co",
+            "a@b.co,,c@d.ee",
+            "@",
+            "@bad domain",
+            "not an address",
+            "Name <a@b.co>",
+        ] {
+            assert!(ForwardAllow::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_forward_without_a_message_id_carries_the_id_it_reports() {
+        let event = Event::new(&mut parsed(
+            "From: ann@example.org\r\nMessage-ID: <bad id@x>\r\nSubject: s\r\n\r\nbody\r\n",
+        ));
+        let sent = event.prepare_forward(&allow(), "a@b.co", &[]).unwrap();
+        let text = String::from_utf8(sent.data).unwrap();
+        assert!(
+            text.contains(&format!("Message-ID: <{}>\r\n", sent.message_id)),
+            "{text}"
+        );
+        assert!(sent.message_id.ends_with("@example.com"));
+        assert_eq!(text.matches("Message-ID").count(), 1, "{text}");
+        assert!(text.contains("Subject: s\r\n"));
+    }
+
+    #[test]
+    fn a_reply_is_not_sent_to_automatic_mail_or_a_mail_system() {
+        let reply = |headers: &str, from: &str| {
+            let raw = format!(
+                "From: {from}\r\nTo: bob@example.com\r\nMessage-ID: <m@x>\r\n{headers}\r\nx"
+            );
+            let event = Event::new(&mut parse(raw, Some(from), Some("bob@example.com")).unwrap());
+            event
+                .prepare_reply_builder(
+                    serde_json::json!({ "from": "bob@example.com", "subject": "s", "text": "t" }),
+                )
+                .map(|_| "sent")
+                .unwrap_or_else(|error| error.code)
+        };
+        crate::asyncrt::install_test_host_runtime();
+        for refused in [
+            "Auto-Submitted: auto-replied\r\n",
+            "auto-submitted: auto-generated; x=y\r\n",
+            "Precedence: bulk\r\n",
+            "precedence: List\r\n",
+            "Precedence: junk\r\n",
+            "Auto-Submitted: no\r\nAuto-Submitted: auto-notified\r\n",
+        ] {
+            assert_eq!(
+                reply(refused, "ann@example.org"),
+                "E_RECIPIENT_NOT_ALLOWED",
+                "{refused:?}"
+            );
+        }
+        for from in ["MAILER-DAEMON@example.org", "postmaster@example.org"] {
+            assert_eq!(reply("", from), "E_RECIPIENT_NOT_ALLOWED", "{from}");
+        }
+        for fine in ["Auto-Submitted: no\r\n", "Precedence: first-class\r\n", ""] {
+            assert_eq!(reply(fine, "ann@example.org"), "sent", "{fine:?}");
+        }
+    }
+
+    #[test]
+    fn what_a_handler_does_after_the_route_gave_up_is_refused() {
+        let mut inbound = parsed(MESSAGE);
+        let cancelled = inbound.cancelled.clone();
+        let event = Event::new(&mut inbound);
+        event.check_open().unwrap();
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(event.check_open().unwrap_err().code, "E_TIMEOUT");
+    }
+
+    #[test]
+    fn the_event_shares_the_posted_bytes_instead_of_copying_them() {
+        let body = Bytes::from(MESSAGE.as_bytes().to_vec());
+        let mut inbound = parse(body.clone(), Some("a@b.co"), Some("b@c.co")).unwrap();
+        assert_eq!(inbound.raw.as_ptr(), body.as_ptr());
+        let event = Event::new(&mut inbound);
+        assert_eq!(event.raw.as_ptr(), body.as_ptr());
     }
 
     fn reply_message(extra: &str) -> Vec<u8> {
@@ -936,7 +1276,9 @@ mod tests {
     #[test]
     fn one_reply_per_event_and_a_failed_one_counts() {
         let event = Event::new(&mut parsed(MESSAGE));
+        event.check_reply_open().unwrap();
         event.take_reply().unwrap();
+        assert!(event.check_reply_open().is_err());
         assert!(event.take_reply().is_err());
     }
 

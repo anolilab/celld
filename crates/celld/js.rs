@@ -4682,8 +4682,13 @@ fn begin<'s>(
         crate::WorkerJob::Tail { items, reply } => {
             return begin_tail(tc, &items, reply);
         }
-        crate::WorkerJob::Email { message, reply, .. } => {
-            return inbound_email::begin_email(tc, message, reply);
+        crate::WorkerJob::Email {
+            message,
+            request_id,
+            reply,
+            ..
+        } => {
+            return inbound_email::begin_email(tc, message, request_id, reply);
         }
         job => job,
     };
@@ -5166,6 +5171,7 @@ fn begin_queue(
     bootstrap::begin_job_event(
         tc,
         context,
+        None,
         Answer::Queue(reply),
         tail_report,
         false,

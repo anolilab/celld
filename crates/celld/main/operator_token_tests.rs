@@ -133,3 +133,53 @@ async fn metrics_answer_503_without_the_actors_gauges() {
     assert_eq!(up.status(), StatusCode::OK);
     assert_eq!(up.headers()["content-type"], celld::metrics::CONTENT_TYPE);
 }
+
+#[test]
+fn the_inbound_email_token_opens_the_inbound_route_and_no_other() {
+    let email = token("relay-only");
+    let mut presented = headers(Some("Bearer relay-only"));
+    assert!(email_inbound_gate(
+        HttpSurface::Internal,
+        true,
+        Some(&email),
+        &mut presented
+    ));
+    assert!(
+        !presented.contains_key(hyper::header::AUTHORIZATION),
+        "the token must not reach the handler"
+    );
+    // Any other route is not the inbound route, so the token is left for the
+    // operator gate to refuse.
+    let mut presented = headers(Some("Bearer relay-only"));
+    assert!(!email_inbound_gate(
+        HttpSurface::Internal,
+        false,
+        Some(&email),
+        &mut presented
+    ));
+    assert!(presented.contains_key(hyper::header::AUTHORIZATION));
+    for surface in [HttpSurface::Recovery, HttpSurface::Public] {
+        let mut presented = headers(Some("Bearer relay-only"));
+        assert!(!email_inbound_gate(
+            surface,
+            true,
+            Some(&email),
+            &mut presented
+        ));
+    }
+    for presented in [None, Some("Bearer other"), Some("relay-only")] {
+        assert!(!email_inbound_gate(
+            HttpSurface::Internal,
+            true,
+            Some(&email),
+            &mut headers(presented)
+        ));
+    }
+    // Without the setting the route needs the operator token.
+    assert!(!email_inbound_gate(
+        HttpSurface::Internal,
+        true,
+        None,
+        &mut headers(Some("Bearer relay-only"))
+    ));
+}

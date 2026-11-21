@@ -193,7 +193,6 @@
   const makeInbound = (meta, bytes) => {
     let active = true;
     let rejection = null;
-    let replied = false;
     const checkActive = () => {
       if (!active) throw new Error("Email message methods cannot be called after the handler returns.");
     };
@@ -242,11 +241,7 @@
       },
       reply(reply) {
         checkActive();
-        // The first reply is the only one, whether or not it succeeds.
-        if (replied) {
-          return Promise.reject(fail("E_VALIDATION_ERROR", "this message has been replied to already"));
-        }
-        replied = true;
+        // The host allows one reply per message, once a send is admitted.
         return submit(
           reply,
           __email_reply,

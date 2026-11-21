@@ -306,6 +306,7 @@ pub fn validate() -> anyhow::Result<()> {
     crate::ai::validate()?;
     crate::tls_roots::extra()?;
     crate::smtp::validate()?;
+    crate::email::inbound::validate()?;
     crate::container::FenceNodeNetns::from_env()?;
 
     positive::<usize>("CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES")?;

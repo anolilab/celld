@@ -6,6 +6,14 @@
 //   reply-raw   replies with a raw EmailMessage
 //   reply-twice replies twice and reports the second error
 //   reply-wrong replies to someone else and reports the error
+//   reply-code  replies with a builder message and reports "sent" or "code:<code>"
+//   forward-to  forwards to the address in X-To and reports "sent" or "code:<code>"
+//   forward-id  forwards to team@example.net and reports the messageId it got
+//   reply-limit fills the isolate's send slots with forwards, replies (refused for
+//               lack of a slot), waits for the forwards, replies again, and
+//               reports both outcomes
+//   hang        waits for an hour
+//   hang-forward  waits for an hour, and tries to forward from waitUntil after 1.5 s
 //   late        tries to reject the message after the handler returned
 //   throw       throws
 //   (any other) accepts
@@ -75,6 +83,48 @@ export default {
         } catch (error) {
           message.setReject("code:" + error.code);
         }
+        return;
+      case "reply-code":
+        try {
+          await message.reply({ from: message.to, subject: "Re", text: "x" });
+          message.setReject("sent");
+        } catch (error) {
+          message.setReject("code:" + error.code);
+        }
+        return;
+      case "forward-to":
+        try {
+          await message.forward(message.headers.get("x-to"));
+          message.setReject("sent");
+        } catch (error) {
+          message.setReject("code:" + error.code);
+        }
+        return;
+      case "forward-id": {
+        const { messageId } = await message.forward("team@example.net");
+        message.setReject("id:" + messageId);
+        return;
+      }
+      case "reply-limit": {
+        const reply = { from: message.to, subject: "Re", text: "x" };
+        const forwards = [1, 2, 3, 4].map(() => message.forward("team@example.net"));
+        const first = await message.reply(reply).then(() => "ok", (error) => error.code);
+        await Promise.all(forwards);
+        const second = await message.reply(reply).then(() => "ok", (error) => error.code);
+        message.setReject(first + "|" + second);
+        return;
+      }
+      case "hang-forward":
+        ctx.waitUntil(
+          new Promise((resolve) => setTimeout(resolve, 1500)).then(
+            () => message.forward("team@example.net"),
+            () => {},
+          ).catch(() => {}),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 3_600_000));
+        return;
+      case "hang":
+        await new Promise((resolve) => setTimeout(resolve, 3_600_000));
         return;
       case "late":
         ctx.waitUntil(

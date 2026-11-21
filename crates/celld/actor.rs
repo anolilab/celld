@@ -1315,6 +1315,8 @@ pub struct AppHandle {
     pub peer_auth: Arc<PeerAuth>,
     /// The token every request to this node's internal listener must carry.
     pub operator_token: crate::operator_token::OperatorToken,
+    /// A token that opens `POST /email/inbound` and no other route.
+    pub email_inbound_token: Option<crate::operator_token::OperatorToken>,
     pub advertise: String,
     pub websockets: mpsc::UnboundedSender<WebSocketFuture>,
     /// Concurrent outbound WebSockets one cell may hold, for the refusal

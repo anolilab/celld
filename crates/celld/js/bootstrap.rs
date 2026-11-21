@@ -1153,9 +1153,11 @@ pub(super) fn begin_event_context<'s>(
 /// back, a promise or a value. An error answers `answer` and starts nothing.
 /// `tail_report` is the trace the event reports, if a tail sink is set;
 /// `ends_at_budget` is whether the handler's budget ends the event.
+/// A job with a `request_id` can be cancelled by it.
 pub(super) fn begin_job_event(
     tc: &mut v8::PinScope,
     context: Arc<IoContext>,
+    request_id: Option<RequestId>,
     answer: Answer,
     tail_report: Option<TailReportState>,
     ends_at_budget: bool,
@@ -1181,7 +1183,7 @@ pub(super) fn begin_job_event(
                 context,
                 scope: None,
                 writes_before: None,
-                request_id: None,
+                request_id,
                 active_request_id: None,
                 reply: Some(answer),
                 gated_reply: None,

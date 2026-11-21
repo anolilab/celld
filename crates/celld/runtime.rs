@@ -980,9 +980,10 @@ impl RuntimeManager {
     pub async fn email_worker(
         &self,
         message: crate::email::inbound::Inbound,
+        cancellation: Arc<RequestCancellationLifetime>,
     ) -> anyhow::Result<Vec<u8>> {
         let generation = self.generation();
-        generation.stateless.email(message).await
+        generation.stateless.email(message, cancellation).await
     }
 
     /// Dispatch a cancellable top-level Worker request to the stateless pool.
@@ -3221,13 +3222,26 @@ impl StatelessRuntime {
         .await
     }
 
-    /// Dispatch one inbound message to the Worker's `email()` handler.
-    pub async fn email(&self, message: crate::email::inbound::Inbound) -> anyhow::Result<Vec<u8>> {
+    /// Dispatch one inbound message to the Worker's `email()` handler. An
+    /// abort published on `cancellation` ends the event.
+    pub async fn email(
+        &self,
+        message: crate::email::inbound::Inbound,
+        cancellation: Arc<RequestCancellationLifetime>,
+    ) -> anyhow::Result<Vec<u8>> {
         let queued_at = Instant::now();
-        self.dispatch(StatelessVerb::Email, move |reply| crate::WorkerJob::Email {
-            queued_at,
-            message,
-            reply,
+        let request_id = Some(cancellation.request_id());
+        let shedding = crate::ownership_store::node_is_shedding();
+        self.dispatch_stateless(StatelessVerb::Email, shedding, move |reply| {
+            StatelessWorkerJob {
+                job: crate::WorkerJob::Email {
+                    queued_at,
+                    request_id,
+                    message,
+                    reply,
+                },
+                cancellation: RequestCancellationGuard::shared(cancellation),
+            }
         })
         .await
     }

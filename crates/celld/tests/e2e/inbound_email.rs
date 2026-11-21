@@ -21,9 +21,21 @@ fn message(mode: &str) -> String {
 
 const ENVELOPE: &str = "from=ann%40example.org&to=bob%40example.com";
 
+/// The destinations a handler may forward to in these tests.
+const FORWARD_ALLOW: &str = "team@example.net,@partner.example";
+
 async fn start(sink: &Sink, fixture: &str) -> Server {
+    start_with(
+        sink,
+        fixture,
+        &[("CELLD_EMAIL_FORWARD_ALLOW", FORWARD_ALLOW)],
+    )
+    .await
+}
+
+async fn start_with(sink: &Sink, fixture: &str, extra: &[(&str, &str)]) -> Server {
     let port = sink.port.to_string();
-    Server::start(fixture, &env(&port, &[])).await
+    Server::start(fixture, &env(&port, extra)).await
 }
 
 /// Post `body` to the route with the node's operator token.
@@ -47,6 +59,13 @@ async fn post(server: &Server, query: &str, body: Vec<u8>) -> (u16, Value) {
 
 async fn post_mode(server: &Server, mode: &str) -> (u16, Value) {
     post(server, ENVELOPE, message(mode).into_bytes()).await
+}
+
+/// The reason a handler reported through `setReject()`.
+async fn reported(server: &Server, query: &str, raw: String) -> String {
+    let (status, body) = post(server, query, raw.into_bytes()).await;
+    assert_eq!(status, 550, "{body}");
+    body["reason"].as_str().unwrap().to_string()
 }
 
 #[tokio::test]
@@ -118,8 +137,12 @@ async fn a_forward_goes_to_the_relay_as_received_with_only_the_x_headers_added()
     let delivered = sink.delivered();
     assert_eq!(delivered.len(), 1, "{:?}", sink.transactions());
     let sent = &delivered[0];
-    assert_eq!(sent.mail_from.as_deref(), Some("ann@example.org"));
+    // The receiving address is the envelope sender, so the relay's own policy
+    // for the sender's domain does not reject the forwarded mail.
+    assert_eq!(sent.mail_from.as_deref(), Some("bob@example.com"));
     assert_eq!(sent.recipients, ["team@example.net"]);
+    assert!(String::from_utf8_lossy(sent.body.as_ref().unwrap())
+        .contains("From: Ann <ann@example.org>\r\n"));
     let text = String::from_utf8(sent.body.clone().unwrap()).unwrap();
     assert!(
         text.starts_with("x-processed-by: worker\r\nReceived: from mx.example.org by node\r\n"),
@@ -279,4 +302,301 @@ async fn a_class_entrypoint_with_an_email_method_gets_the_message() {
         (status, body["reason"].as_str()),
         (550, Some("from a class"))
     );
+}
+
+#[tokio::test]
+async fn the_inbound_token_opens_the_inbound_route_and_nothing_else() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start_with(
+        &sink,
+        "inbound-email",
+        &[("CELLD_EMAIL_INBOUND_TOKEN", "relay-only-token")],
+    )
+    .await;
+    let relay = |method: reqwest::Method, path: String, token: String| {
+        let server = &server;
+        async move {
+            client()
+                .request(method, server.internal_url(&path).await)
+                .bearer_auth(token)
+                .body(message("accept"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    let inbound = format!("/email/inbound?{ENVELOPE}");
+    assert_eq!(
+        relay(
+            reqwest::Method::POST,
+            inbound.clone(),
+            "relay-only-token".into()
+        )
+        .await,
+        200
+    );
+    for path in [
+        "/state",
+        "/shutdown",
+        "/reload",
+        "/metrics",
+        "/rebalance/pause",
+    ] {
+        for method in [reqwest::Method::GET, reqwest::Method::POST] {
+            assert_eq!(
+                relay(method.clone(), path.to_string(), "relay-only-token".into()).await,
+                401,
+                "{method} {path}"
+            );
+        }
+    }
+    assert_eq!(
+        relay(reqwest::Method::POST, inbound.clone(), "wrong".into()).await,
+        401
+    );
+    // The operator token keeps working for the route.
+    let operator = server.operator_token().await;
+    let token = operator
+        .bearer()
+        .to_str()
+        .unwrap()
+        .trim_start_matches("Bearer ")
+        .to_string();
+    assert_eq!(relay(reqwest::Method::POST, inbound, token).await, 200);
+}
+
+#[tokio::test]
+async fn a_forward_goes_only_to_a_destination_the_operator_allows() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, "inbound-email").await;
+    let raw = |address: &str| {
+        message("forward-to").replacen("\n\n", &format!("\nX-To: {address}\n\n"), 1)
+    };
+    assert_eq!(
+        reported(&server, ENVELOPE, raw("team@example.net")).await,
+        "sent"
+    );
+    assert_eq!(
+        reported(&server, ENVELOPE, raw("anyone@partner.example")).await,
+        "sent"
+    );
+    assert_eq!(sink.delivered().len(), 2);
+    for refused in [
+        "eve@example.org",
+        "Team@example.net",
+        "x@sub.partner.example",
+        "x@partner.example.evil.test",
+    ] {
+        assert_eq!(
+            reported(&server, ENVELOPE, raw(refused)).await,
+            "code:E_RECIPIENT_NOT_ALLOWED",
+            "{refused}"
+        );
+    }
+    assert_eq!(
+        sink.delivered().len(),
+        2,
+        "a refused forward reaches no relay"
+    );
+    // With nothing set, no forward is allowed.
+    let closed = start_with(&sink, "inbound-email", &[]).await;
+    assert_eq!(
+        reported(&closed, ENVELOPE, raw("team@example.net")).await,
+        "code:E_RECIPIENT_NOT_ALLOWED"
+    );
+    assert_eq!(sink.delivered().len(), 2);
+}
+
+#[test]
+fn a_malformed_forward_allow_list_stops_the_node_at_start() {
+    for list in [
+        "team@example.net, not an address",
+        "team@example.net,,",
+        "@",
+        "@bad domain",
+    ] {
+        let exited = super::harness::run_expecting_exit(
+            "inbound-email",
+            &[
+                ("CELLD_SMTP_HOST", "127.0.0.1"),
+                ("CELLD_EMAIL_FORWARD_ALLOW", list),
+            ],
+        );
+        assert!(!exited.success, "{list:?}: the node started");
+        assert!(
+            exited.output.contains("CELLD_EMAIL_FORWARD_ALLOW"),
+            "{}",
+            exited.output
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_reply_is_refused_to_mail_that_a_machine_sent() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, "inbound-email").await;
+    let with = |header: &str| message("reply-code").replacen("\n\n", &format!("\n{header}\n\n"), 1);
+    for header in [
+        "Auto-Submitted: auto-replied",
+        "auto-submitted: auto-generated; x=y",
+        "Precedence: bulk",
+        "Precedence: LIST",
+        "Precedence: junk",
+    ] {
+        assert_eq!(
+            reported(&server, ENVELOPE, with(header)).await,
+            "code:E_RECIPIENT_NOT_ALLOWED",
+            "{header}"
+        );
+    }
+    for query in [
+        "from=mailer-daemon%40example.org&to=bob%40example.com",
+        "from=MAILER-DAEMON%40example.org&to=bob%40example.com",
+        "from=&to=bob%40example.com",
+    ] {
+        let reason = reported(&server, query, with("X-A: b")).await;
+        assert!(reason.starts_with("code:"), "{query}: {reason}");
+    }
+    assert!(sink.delivered().is_empty());
+    for header in ["Auto-Submitted: no", "Precedence: first-class", "X-A: b"] {
+        assert_eq!(
+            reported(&server, ENVELOPE, with(header)).await,
+            "sent",
+            "{header}"
+        );
+    }
+    assert_eq!(sink.delivered().len(), 3);
+}
+
+#[tokio::test]
+async fn a_forward_of_a_message_with_no_message_id_carries_the_id_it_reports() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, "inbound-email").await;
+    let bare = message("forward-id").replace(&format!("Message-ID: {MESSAGE_ID}\n"), "");
+    let reason = reported(&server, ENVELOPE, bare).await;
+    let id = reason.strip_prefix("id:").unwrap();
+    let delivered = sink.delivered();
+    assert_eq!(delivered.len(), 1);
+    let text = String::from_utf8(delivered[0].body.clone().unwrap()).unwrap();
+    assert!(
+        text.contains(&format!("Message-ID: <{id}>\r\n")),
+        "{id}: {text:?}"
+    );
+    // A message that has one keeps it and reports it.
+    let kept = reported(&server, ENVELOPE, message("forward-id")).await;
+    assert_eq!(kept, "id:m1@example.org");
+    let text = String::from_utf8(sink.delivered()[1].body.clone().unwrap()).unwrap();
+    assert_eq!(text.matches("Message-ID:").count(), 1, "{text:?}");
+}
+
+#[tokio::test]
+async fn a_reply_refused_for_lack_of_a_slot_is_not_the_events_one_reply() {
+    let sink = Sink::start(Behaviour::slow(std::time::Duration::from_millis(400))).await;
+    let server = start(&sink, "inbound-email").await;
+    assert_eq!(
+        reported(&server, ENVELOPE, message("reply-limit")).await,
+        "E_RATE_LIMIT_EXCEEDED|ok"
+    );
+    let delivered = sink.delivered();
+    assert_eq!(delivered.len(), 5, "{:?}", sink.transactions());
+    assert_eq!(delivered.last().unwrap().recipients, ["ann@example.org"]);
+}
+
+/// The deadline of the route, in seconds, for the tests that wait on it.
+const SHORT: (&str, &str) = ("CELLD_EMAIL_INBOUND_DEADLINE_S", "1");
+
+#[tokio::test]
+async fn a_handler_past_the_deadline_is_cancelled_and_gives_its_place_back() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start_with(
+        &sink,
+        "inbound-email",
+        &[SHORT, ("CELLD_EMAIL_FORWARD_ALLOW", FORWARD_ALLOW)],
+    )
+    .await;
+    // More hung messages than there are places: each one answers 504 and must
+    // free its place, or the fifth would be told the node is busy.
+    for round in 0..6 {
+        let url = server
+            .internal_url(&format!("/email/inbound?{ENVELOPE}"))
+            .await;
+        let token = server.operator_token().await;
+        let response = client()
+            .post(url)
+            .header(reqwest::header::AUTHORIZATION, token.bearer())
+            .timeout(std::time::Duration::from_secs(20))
+            .body(message("hang"))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        assert_eq!(response.status().as_u16(), 504, "round {round}");
+    }
+    let (status, body) = post_mode(&server, "accept").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(sink.delivered().is_empty());
+}
+
+#[tokio::test]
+async fn a_handler_cancelled_at_the_deadline_cannot_forward_afterwards() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start_with(
+        &sink,
+        "inbound-email",
+        &[SHORT, ("CELLD_EMAIL_FORWARD_ALLOW", FORWARD_ALLOW)],
+    )
+    .await;
+    // The deadline passes at 1 s; the handler's waitUntil work, which outlives
+    // the cancellation, forwards at 1.5 s.
+    let (status, body) = post_mode(&server, "hang-forward").await;
+    assert_eq!(status, 504, "{body}");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(sink.delivered().is_empty(), "{:?}", sink.transactions());
+    // Its place is back once that work has ended.
+    let (status, body) = post_mode(&server, "accept").await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn an_upload_that_stalls_is_cut_off_and_does_not_hold_a_place() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start_with(&sink, "inbound-email", &[SHORT]).await;
+    let token = server.operator_token().await;
+    let token = token
+        .bearer()
+        .to_str()
+        .unwrap()
+        .trim_start_matches("Bearer ")
+        .to_string();
+    let url = server.internal_url("/email/inbound").await;
+    let address = url
+        .strip_prefix("http://")
+        .and_then(|rest| rest.split('/').next())
+        .unwrap();
+    let mut stalled = Vec::new();
+    for _ in 0..5 {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let head = format!(
+            "POST /email/inbound?{ENVELOPE} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\nContent-Length: 1000\r\n\r\nSubject: x\r\n"
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stalled.push(stream);
+    }
+    for stream in &mut stalled {
+        let mut answer = vec![0u8; 64];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut answer))
+                .await
+                .expect("the node cut the upload off")
+                .unwrap();
+        let text = String::from_utf8_lossy(&answer[..read]);
+        assert!(
+            text.starts_with("HTTP/1.1 408") || text.starts_with("HTTP/1.1 503"),
+            "{text:?}"
+        );
+    }
+    let (status, body) = post_mode(&server, "accept").await;
+    assert_eq!(status, 200, "{body}");
 }

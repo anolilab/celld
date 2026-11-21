@@ -845,6 +845,10 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_SMTP_PASSWORD` | The relay password. A Worker never sees it, and it is kept out of logs and errors |
 | `CELLD_SMTP_PASSWORD_FILE` | The path of a file that holds the relay password, in place of `CELLD_SMTP_PASSWORD`. Setting both is an error. celld reads it at startup, with the other settings, and warns when other users can read it |
 | `CELLD_SMTP_HELO_NAME` | The name celld gives in `EHLO` (default: `localhost`) |
+| `CELLD_EMAIL_INBOUND_TOKEN` | A token that opens `POST /email/inbound` on the internal listener and no other route, for the relay that posts mail. The operator token also opens that route. Without either, the route needs the operator token. See [Email](services/email.md#the-route) |
+| `CELLD_EMAIL_INBOUND_TOKEN_FILE` | The path of a file that holds that token, in place of `CELLD_EMAIL_INBOUND_TOKEN`. Setting both is an error. The node reads it at start, accepts a symbolic link, drops one trailing line end and warns (`email_inbound_token_file_shared`) when other users can read it |
+| `CELLD_EMAIL_FORWARD_ALLOW` | The destinations an `email()` handler's `forward()` may send to: comma-separated addresses and `@domain` entries. Unset: `forward()` is refused. celld refuses to start on a malformed list. See [Email](services/email.md#forward-and-reply) |
+| `CELLD_EMAIL_INBOUND_DEADLINE_S` | How many seconds `POST /email/inbound` waits to read a message (408 after) and then for the `email()` handler (504 after, and the handler is cancelled). Default: 60 |
 | `CELLD_NODE` | An explicit node-session ID: 1 to 128 ASCII letters, numbers, dots, dashes, or underscores, but not `.` or `..` |
 | `CELLD_WATCH` | The local work directory for SQLite and replication |
 | `CELLD_ESBUILD` | The path of the esbuild executable |

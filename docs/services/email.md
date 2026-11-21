@@ -229,7 +229,7 @@ export default {
 
 ```
 POST /email/inbound?from=<envelope sender>&to=<envelope recipient>
-Authorization: Bearer <operator token>
+Authorization: Bearer <inbound token or operator token>
 
 <the raw RFC 5322 message>
 ```
@@ -239,6 +239,11 @@ Authorization: Bearer <operator token>
   before any route is looked up. It is not on the public listener, which hands
   the same path to the Worker's `fetch()`. A Worker cannot reach it: egress to a
   node's own listeners is refused, and it has no token.
+- The operator token opens every route of the internal listener, so give the
+  relay a token of its own. `CELLD_EMAIL_INBOUND_TOKEN` (or a file named by
+  `CELLD_EMAIL_INBOUND_TOKEN_FILE`) sets one that this route accepts and every
+  other route refuses with 401. The operator token keeps working for the
+  route; without either setting, the route needs the operator token.
 - The body is the message, bytes as received, with any line ends. It is not
   rewritten: `message.raw` is what was posted. A `Received:` header, a `From:`
   that is not the envelope sender and a `Message-ID` are all normal.
@@ -251,14 +256,22 @@ Authorization: Bearer <operator token>
   list of domains it receives for; the relay decides which mail it posts.
 - One request is one message and one `email()` call; a message for several
   recipients is posted once for each. At most four messages are
-  in flight; a message keeps its place until its handler's event has ended,
-  even when the route has answered 504.
+  in flight; a message keeps its place until its handler's event has ended. A
+  handler that is cancelled at the deadline or whose relay hung up ends, and
+  gives its place back, as soon as it unwinds.
 - `forward()` and `reply()` need `CELLD_SMTP_HOST`; without a relay they
   reject, and a handler that does not catch it answers 500 and is retried.
-- The poster must be the operator's own relay or webhook. The operator token
-  also opens `/shutdown` and `/reload`, so do not hand it to a provider you do
-  not control. Put a small proxy that adds the header in front of a provider
-  that cannot send one, and keep the node's internal listener off the internet.
+- Each message is held in memory twice while it is handled: the host's copy,
+  which `forward()` reads, and the Worker's copy of `message.raw`. The host's
+  copy is the one the request carried and is not copied again. A `forward()`
+  builds one more, briefly, while it sends.
+- A header line over 998 bytes or a NUL byte anywhere in the message is refused
+  with 400, so the relay bounces it, even when the server in front accepted it.
+- The poster must be the operator's own relay or webhook. Give it
+  `CELLD_EMAIL_INBOUND_TOKEN`, not the operator token, which also opens
+  `/shutdown` and `/reload`. Put a small proxy that adds the header in front of
+  a provider that cannot send one, and keep the node's internal listener off the
+  internet.
 - celld does not check SPF, DKIM or DMARC. Check them at the relay, and have it
   put its result in an `Authentication-Results` header for the Worker to read.
   Mail that fails can be refused there, or by `setReject()`.
@@ -292,7 +305,8 @@ retry:
 | 550 | `{"ok":false,"outcome":"rejected","reason":"..."}` | The handler called `setReject()`. Bounce with a permanent failure and `reason` (printable ASCII, at most 200 characters, so it is safe in an SMTP reply line) |
 | 500 | `{"ok":false,"outcome":"error","error":"..."}` | The handler threw. Treat it as temporary and retry |
 | 501 | `{"ok":false,"outcome":"no_handler",...}` | The primary Worker has no `email()` handler. Treat it as temporary: the operator can deploy one |
-| 504 | | The handler did not finish within 60 seconds. Temporary |
+| 504 | | The handler did not finish within 60 seconds (`CELLD_EMAIL_INBOUND_DEADLINE_S`). The event is cancelled, as one whose client hung up is: it gives its place back, and a `forward()` or `reply()` it makes later is refused with `E_TIMEOUT`. Temporary, and the retry runs the handler again |
+| 408 | | The message was not received within the same time. Temporary |
 | 503 | | The node is busy (at most four messages at once, with `Retry-After`), or has no Worker runtime. Temporary |
 | 400, 413, 431 | `{"ok":false,"error":"..."}` | The message was refused: empty, malformed, with a NUL byte, over 25 MiB (413), with a header line over 998 bytes, or with more than 64 KiB or 1,000 headers (431). The error names the fault |
 | 401 | | No or a wrong operator token |
@@ -309,9 +323,12 @@ Any program that can make an HTTP request per message will do. With Postfix, a
 ```sh
 #!/bin/sh
 # usage: deliver-to-celld <sender> <recipient>   (needs curl 7.87 or later)
-# CELLD_INTERNAL_URL is the node's internal listener, e.g. http://127.0.0.1:8081
+# CELLD_INTERNAL_URL is the node's internal listener, e.g. http://127.0.0.1:8081.
+# CELLD_INBOUND_HEADER is a file that only the relay's user can read, with the
+# line `Authorization: Bearer <token>`. curl reads the header from it, so the
+# token is not in the process list as it is after -H "Authorization: ...".
 status=$(curl -s -o /dev/null -w '%{http_code}' \
-  -H "Authorization: Bearer $CELLD_OPERATOR_TOKEN" \
+  -H "@$CELLD_INBOUND_HEADER" \
   --data-binary @- \
   --url-query "from=$1" --url-query "to=$2" \
   "$CELLD_INTERNAL_URL/email/inbound")
@@ -330,19 +347,26 @@ Both deliver through the [operator's relay](#configuration-of-the-node), with
 the checks and limits of `send()`: plain ASCII addresses, CRLF line ends, no
 `Bcc:`, a message of at most 25 MiB with lines of at most 998 bytes, a
 subrequest each, and at most four messages in flight for an isolate. They are
-not restricted by any `send_email` binding: the Worker may forward to any valid
-address, so the relay and the Worker's own code decide where mail may go.
+not restricted by any `send_email` binding. `forward()` has a list of its own.
 
-- `forward(rcptTo, headers?)` sends the message as received to `rcptTo`, from
-  the envelope sender. Its bytes are kept (`Received:`, `Message-ID` and
-  signature headers included) apart from CRLF line ends and the loss of `Bcc:`
-  and `Resent-Bcc:`. Only headers whose name starts with `X-` are added; others
-  in `headers` are dropped, and a value that is not ASCII, is empty, holds a
-  control character or is longer than 2,048 bytes is refused with
-  `E_HEADER_VALUE_INVALID`. At most 20 are added. The relay must accept the
-  envelope sender, or rewrite it. A message with a body line over 998 bytes is
-  refused with `E_LINE_TOO_LONG`. It resolves to `{ messageId }`, the
-  message's own id.
+- `forward(rcptTo, headers?)` sends the message as received to `rcptTo`, which
+  must be on the node's `CELLD_EMAIL_FORWARD_ALLOW` list: whole addresses,
+  compared exactly as written, and `@domain` entries, which match that domain
+  and not its subdomains. Any other address is refused with
+  `E_RECIPIENT_NOT_ALLOWED`, as Cloudflare forwards only to verified
+  destinations, and with the list unset `forward()` is refused. The envelope
+  sender is the address that received the message (`to`), not the sender of the
+  message, whose domain would not accept the relay's mail; the `From:` header
+  stays. celld does not rewrite the sender as SRS does, so a destination that
+  checks SPF sees the receiving domain's policy. The message's bytes are kept
+  (`Received:`, `Message-ID` and signature headers included) apart from CRLF
+  line ends and the loss of `Bcc:` and `Resent-Bcc:`. A message with no usable
+  `Message-ID` gets one, and the id `forward()` resolves with is that one.
+  Only headers whose name starts with `X-` are added; others in `headers` are
+  dropped, and a value that is not ASCII, is empty, holds a control character
+  other than a tab or is longer than 2,048 bytes is refused with
+  `E_HEADER_VALUE_INVALID`, as it is in `send()`. At most 20 are added. A
+  message with a body line over 998 bytes is refused with `E_LINE_TOO_LONG`.
 - `reply(message)` takes a builder object (`from`, `subject`, `text`, `html`,
   `replyTo`, `attachments`, `headers`) or an `EmailMessage`. The reply goes to
   the sender of the incoming message: a builder has no `to`, `cc` or `bcc`, and
@@ -351,8 +375,15 @@ address, so the relay and the Worker's own code decide where mail may go.
   `References` from the incoming `Message-ID`; a value the Worker sets must be
   the same. It is refused when the incoming message has no `Message-ID`
   (`E_FIELD_MISSING`), more than 100 `References`, or no sender (a bounce). A
-  message may be replied to once, and a failed reply counts. A reply resolves to
-  `{ messageId }` and rejects with the codes of `send()`.
+  message may be replied to once, and a failed reply counts, but one turned away
+  for lack of a slot or a subrequest (`E_RATE_LIMIT_EXCEEDED`) does not. A reply
+  resolves to `{ messageId }` and rejects with the codes of `send()`. It is
+  refused with `E_RECIPIENT_NOT_ALLOWED` when the incoming message is automatic
+  mail (`Auto-Submitted` with a value other than `no`, or `Precedence: bulk`,
+  `list` or `junk`) or comes from `MAILER-DAEMON` or `postmaster`, so two
+  machines cannot answer each other for ever. celld does not check DMARC of the
+  incoming message, which Cloudflare requires before it allows a reply; check
+  it at the relay.
 
 ## Differences from Cloudflare
 
@@ -361,8 +392,8 @@ address, so the relay and the Worker's own code decide where mail may go.
   exist here; the relay and the binding's lists decide.
 - Mail does not arrive by itself. The operator posts it to
   [`/email/inbound`](#receiving-mail); there is no Email Routing, no address
-  rules and no verified destination list. `forward()` may send to any valid
-  address through the relay.
+  rules and no verified destination list. `forward()` goes to the addresses of
+  `CELLD_EMAIL_FORWARD_ALLOW`, which stands in for the verified destinations.
 - `reply()` does not check DMARC: the operator's relay decides which mail may
   reach the Worker. The `E_TEMPORARY_AUTHENTICATION_ERROR` code is never raised.
 - The event runs on the primary script only, and is not routed by recipient.

@@ -35,6 +35,16 @@ pub(super) struct Behaviour {
     hang_on_quit: bool,
 }
 
+impl Behaviour {
+    /// A relay that takes `delay` to answer the end of each body.
+    pub(super) fn slow(delay: std::time::Duration) -> Self {
+        Self {
+            slow_body_reply: Some(delay),
+            ..Self::default()
+        }
+    }
+}
+
 /// One connection to the sink.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Transaction {

@@ -41,6 +41,21 @@ pub const FILE_ENV: &str = "CELLD_OPERATOR_TOKEN_FILE";
 /// The name of the token file inside a configuration or state directory.
 pub const FILE_NAME: &str = "operator-token";
 
+/// The variable that holds a token accepted for `POST /email/inbound` alone.
+/// The relay that posts mail holds it in place of the operator token, which
+/// opens every route of the internal listener.
+pub const EMAIL_INBOUND_ENV: &str = "CELLD_EMAIL_INBOUND_TOKEN";
+
+/// The variable that names a file that holds the inbound email token, in place
+/// of [`EMAIL_INBOUND_ENV`].
+pub const EMAIL_INBOUND_FILE_ENV: &str = "CELLD_EMAIL_INBOUND_TOKEN_FILE";
+
+const EMAIL_INBOUND_SHARED: crate::credential_file::SharedWarning =
+    crate::credential_file::SharedWarning {
+        event: "email_inbound_token_file_shared",
+        subject: "inbound email token file",
+    };
+
 const SCHEME: &str = "Bearer";
 
 /// The most a token file may hold. A token is a short line; a larger file is
@@ -94,6 +109,31 @@ impl OperatorToken {
                 .with_context(|| format!("{ENV} is not usable"))
                 .map(Some),
         }
+    }
+
+    /// The token a node accepts for `POST /email/inbound` alone, from
+    /// `CELLD_EMAIL_INBOUND_TOKEN` or the file `CELLD_EMAIL_INBOUND_TOKEN_FILE`
+    /// names, or `None` when neither is set. It has the same form as the
+    /// operator token. A file ends in the line end its editor wrote, which is
+    /// dropped.
+    pub fn email_inbound() -> anyhow::Result<Option<Self>> {
+        let Some(credential) = crate::credential_file::variable_or_file(
+            EMAIL_INBOUND_ENV,
+            EMAIL_INBOUND_FILE_ENV,
+            MAX_FILE_BYTES,
+            &EMAIL_INBOUND_SHARED,
+        )?
+        else {
+            return Ok(None);
+        };
+        let text = if credential.origin == EMAIL_INBOUND_ENV {
+            credential.text.as_str()
+        } else {
+            credential.text.trim_end_matches(['\r', '\n'])
+        };
+        Self::parse(OsStr::new(text))
+            .with_context(|| format!("{} is not usable", credential.origin))
+            .map(Some)
     }
 
     /// The token a node enforces. `CELLD_OPERATOR_TOKEN` wins. Without it, a
