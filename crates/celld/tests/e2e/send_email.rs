@@ -20,7 +20,7 @@ const RAW: &str = "From: Ann <ann@example.com>\nTo: bob@example.com\nSubject: hi
 
 /// What the sink does.
 #[derive(Clone, Default)]
-struct Behaviour {
+pub(super) struct Behaviour {
     /// Require `AUTH PLAIN` with this user and password.
     auth: Option<(String, String)>,
     /// Answer a failed `AUTH` with a text that echoes what was sent.
@@ -35,28 +35,38 @@ struct Behaviour {
     hang_on_quit: bool,
 }
 
+impl Behaviour {
+    /// A relay that takes `delay` to answer the end of each body.
+    pub(super) fn slow(delay: std::time::Duration) -> Self {
+        Self {
+            slow_body_reply: Some(delay),
+            ..Self::default()
+        }
+    }
+}
+
 /// One connection to the sink.
 #[derive(Clone, Debug, Default)]
-struct Transaction {
+pub(super) struct Transaction {
     commands: Vec<String>,
     auth_args: Vec<String>,
-    mail_from: Option<String>,
+    pub(super) mail_from: Option<String>,
     /// The whole `MAIL` line, parameters included.
     mail_line: Option<String>,
-    recipients: Vec<String>,
+    pub(super) recipients: Vec<String>,
     /// The body as it came over the wire, dots stuffed.
     wire: Option<Vec<u8>>,
     /// The body with the stuffing removed.
-    body: Option<Vec<u8>>,
+    pub(super) body: Option<Vec<u8>>,
 }
 
-struct Sink {
-    port: u16,
+pub(super) struct Sink {
+    pub(super) port: u16,
     transactions: Arc<Mutex<Vec<Transaction>>>,
 }
 
 impl Sink {
-    async fn start(behaviour: Behaviour) -> Sink {
+    pub(super) async fn start(behaviour: Behaviour) -> Sink {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the sink");
@@ -79,12 +89,12 @@ impl Sink {
         Sink { port, transactions }
     }
 
-    fn transactions(&self) -> Vec<Transaction> {
+    pub(super) fn transactions(&self) -> Vec<Transaction> {
         self.transactions.lock().unwrap().clone()
     }
 
     /// The transactions that carried a message.
-    fn delivered(&self) -> Vec<Transaction> {
+    pub(super) fn delivered(&self) -> Vec<Transaction> {
         self.transactions()
             .into_iter()
             .filter(|transaction| transaction.body.is_some())
@@ -213,7 +223,7 @@ async fn serve(
     }
 }
 
-fn env<'a>(port: &'a str, extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+pub(super) fn env<'a>(port: &'a str, extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
     let mut env = vec![
         ("CELLD_SMTP_HOST", "127.0.0.1"),
         ("CELLD_SMTP_PORT", port),

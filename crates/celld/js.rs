@@ -4338,7 +4338,9 @@ impl Worker {
             | crate::WorkerJob::Rpc {
                 invocation_limits, ..
             } => *invocation_limits,
-            crate::WorkerJob::Queue { .. } | crate::WorkerJob::Tail { .. } => None,
+            crate::WorkerJob::Queue { .. }
+            | crate::WorkerJob::Tail { .. }
+            | crate::WorkerJob::Email { .. } => None,
         };
         let initial_limits =
             effective_resource_limits(inner.runtime_state.resource_limits, invocation_limits);
@@ -4679,6 +4681,14 @@ fn begin<'s>(
         }
         crate::WorkerJob::Tail { items, reply } => {
             return begin_tail(tc, &items, reply);
+        }
+        crate::WorkerJob::Email {
+            message,
+            request_id,
+            reply,
+            ..
+        } => {
+            return inbound_email::begin_email(tc, message, request_id, reply);
         }
         job => job,
     };
@@ -5158,67 +5168,23 @@ fn begin_queue(
         },
         failure: None,
     });
-    let guard = CurrentGuard::enter(context.clone());
-    install_io_context(tc, &context);
-    context.begin_cpu_turn();
-    let started = (|| {
-        let dispatch = internal_function(tc, "__dispatchEntrypointQueue")?;
-        let batch = queue_batch_value(tc, batch)?;
-        let entrypoint = v8::String::new(tc, "default").unwrap();
-        let recv = v8::undefined(tc).into();
-        begin_event_context(tc)?;
-        let ret = dispatch
-            .call(tc, recv, &[entrypoint.into(), batch])
-            .ok_or_else(|| anyhow!("queue dispatch threw"))?;
-        match ret.try_cast::<v8::Promise>() {
-            Ok(promise) => Ok(promise),
-            Err(_) => resolved_promise(tc, ret),
-        }
-    })();
-    match started {
-        Ok(promise) => {
-            tc.perform_microtask_checkpoint();
-            let entry = InFlight {
-                runtime_state: actor_runtime_state(tc),
-                promise: v8::Global::new(tc, promise),
-                context,
-                scope: None,
-                writes_before: None,
-                request_id: None,
-                active_request_id: None,
-                reply: Some(Answer::Queue(reply)),
-                gated_reply: None,
-                background: None,
-                completed_cell_event: false,
-                ops: std::collections::HashSet::new(),
-                io_context_ops: std::collections::HashSet::new(),
-                unrefed_ops: std::collections::HashSet::new(),
-                alarm: None,
-                started: Instant::now(),
-                trace: None,
-                failure: None,
-                response_status: None,
-                tail_report,
-                ends_at_budget: false,
-            };
-            drop(guard);
-            Begun::Running(Box::new(entry))
-        }
-        Err(error) => {
-            let _ = end_event_context(tc);
-            let cpu_error = context.finish_cpu_turn().err().map(anyhow::Error::msg);
-            let error = take_execution_termination(tc)
-                .or(cpu_error)
-                .unwrap_or(error);
-            if let Some(mut report) = tail_report {
-                report.record_failure(format!("{error:#}"));
-                report.finish(&context, None);
-            }
-            drop(guard);
-            let _ = reply.send(Err(error));
-            Begun::Nothing
-        }
-    }
+    bootstrap::begin_job_event(
+        tc,
+        context,
+        None,
+        Answer::Queue(reply),
+        tail_report,
+        false,
+        |tc| {
+            let dispatch = internal_function(tc, "__dispatchEntrypointQueue")?;
+            let batch = queue_batch_value(tc, batch)?;
+            let entrypoint = v8::String::new(tc, "default").unwrap();
+            let recv = v8::undefined(tc).into();
+            dispatch
+                .call(tc, recv, &[entrypoint.into(), batch])
+                .ok_or_else(|| anyhow!("queue dispatch threw"))
+        },
+    )
 }
 
 /// for the JSON flavor, a `Uint8Array` for structured clone.
@@ -6918,6 +6884,8 @@ ops! { OP_NAMES, install_op_functions,
         "__email_send" => send_email::op_email_send,
         "__email_reserve" => send_email::op_email_reserve,
         "__email_release" => send_email::op_email_release,
+        "__email_forward" => inbound_email::op_email_forward,
+        "__email_reply" => inbound_email::op_email_reply,
         "__tcp_connect" => tcp::op_tcp_connect,
         "__tcp_read" => tcp::op_tcp_read,
         "__tcp_write" => tcp::op_tcp_write,
@@ -10354,6 +10322,7 @@ fn webcrypto_return_bytes(
 mod container;
 mod crypto;
 mod html_rewriter;
+mod inbound_email;
 mod send_email;
 mod tcp;
 mod zlib;
@@ -11134,6 +11103,8 @@ pub struct IoContext {
     /// its stream. They are given back with the event, so a stream that never
     /// yields cannot keep them when the event ends.
     reserved_sends: Mutex<Vec<(u64, crate::smtp::InFlight)>>,
+    /// The inbound message this event handles, when it is an `email()` event.
+    inbound_email: OnceLock<Box<crate::email::inbound::Event>>,
 }
 
 /// An op enqueued by one event's continuation during another event's turn: the
@@ -11352,6 +11323,7 @@ impl IoContext {
             tail_logs: Mutex::new(TailLogCapture::default()),
             listener_error: OnceLock::new(),
             reserved_sends: Mutex::new(Vec::new()),
+            inbound_email: OnceLock::new(),
         })
     }
 
@@ -11397,6 +11369,7 @@ impl IoContext {
             tail_logs: Mutex::new(TailLogCapture::default()),
             listener_error: OnceLock::new(),
             reserved_sends: Mutex::new(Vec::new()),
+            inbound_email: OnceLock::new(),
         });
         runtime_state
             .io_contexts

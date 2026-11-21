@@ -190,6 +190,16 @@ pub enum WorkerJob {
         items: String,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
     },
+    /// One inbound message for the Worker's `email()` handler. It answers
+    /// with the JSON outcome the handler reached, as bytes.
+    Email {
+        queued_at: std::time::Instant,
+        /// The id a cancellation names this event by, so one that outlives
+        /// its deadline can be ended.
+        request_id: Option<js::RequestId>,
+        message: email::inbound::Inbound,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
+    },
 }
 
 /// Temporary host seam required by the verbatim JS adapter. The runtime

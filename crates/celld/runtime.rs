@@ -239,7 +239,8 @@ impl StatelessWorkerJob {
             }
             crate::WorkerJob::Rpc { .. }
             | crate::WorkerJob::Queue { .. }
-            | crate::WorkerJob::Tail { .. } => None,
+            | crate::WorkerJob::Tail { .. }
+            | crate::WorkerJob::Email { .. } => None,
         };
         let cancellation = RequestCancellationGuard::new(lifetime);
         Self { job, cancellation }
@@ -533,6 +534,7 @@ pub enum StatelessVerb {
     Rpc,
     Queue,
     Tail,
+    Email,
 }
 
 impl StatelessVerb {
@@ -550,6 +552,7 @@ impl StatelessVerb {
             Self::Rpc => anyhow!("stateless RPC task died: {error}"),
             Self::Queue => anyhow!("stateless queue task died: {error}"),
             Self::Tail => anyhow!("stateless tail task died: {error}"),
+            Self::Email => anyhow!("stateless email task died: {error}"),
         }
     }
 
@@ -559,6 +562,7 @@ impl StatelessVerb {
             Self::Rpc => anyhow!("stateless Worker dropped RPC result"),
             Self::Queue => anyhow!("stateless Worker dropped queue result"),
             Self::Tail => anyhow!("stateless Worker dropped tail result"),
+            Self::Email => anyhow!("stateless Worker dropped email result"),
         }
     }
 }
@@ -970,6 +974,16 @@ impl RuntimeManager {
             .stateless
             .fetch(url, method, body.into(), headers, None)
             .await
+    }
+
+    /// Hand one inbound message to the primary Worker's `email()` handler.
+    pub async fn email_worker(
+        &self,
+        message: crate::email::inbound::Inbound,
+        cancellation: Arc<RequestCancellationLifetime>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let generation = self.generation();
+        generation.stateless.email(message, cancellation).await
     }
 
     /// Dispatch a cancellable top-level Worker request to the stateless pool.
@@ -2893,6 +2907,12 @@ impl StatelessTiming {
                 "celld.fetch",
                 crate::telemetry::KIND_SERVER,
             ),
+            crate::WorkerJob::Email { queued_at, .. } => (
+                *queued_at,
+                None,
+                "celld.email",
+                crate::telemetry::KIND_CONSUMER,
+            ),
         };
         StatelessTiming {
             queued_at,
@@ -3198,6 +3218,30 @@ impl StatelessRuntime {
             queued_at,
             batch,
             reply,
+        })
+        .await
+    }
+
+    /// Dispatch one inbound message to the Worker's `email()` handler. An
+    /// abort published on `cancellation` ends the event.
+    pub async fn email(
+        &self,
+        message: crate::email::inbound::Inbound,
+        cancellation: Arc<RequestCancellationLifetime>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let queued_at = Instant::now();
+        let request_id = Some(cancellation.request_id());
+        let shedding = crate::ownership_store::node_is_shedding();
+        self.dispatch_stateless(StatelessVerb::Email, shedding, move |reply| {
+            StatelessWorkerJob {
+                job: crate::WorkerJob::Email {
+                    queued_at,
+                    request_id,
+                    message,
+                    reply,
+                },
+                cancellation: RequestCancellationGuard::shared(cancellation),
+            }
         })
         .await
     }

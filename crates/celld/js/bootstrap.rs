@@ -1147,6 +1147,79 @@ pub(super) fn begin_event_context<'s>(
         .ok_or_else(|| anyhow!("__beginEvent threw"))
 }
 
+/// Start a stateless job's first turn on a fresh event context: the half of a
+/// queue batch or an inbound message that runs before the handler can suspend.
+/// `dispatch` calls the harness with the job's data and returns what it gave
+/// back, a promise or a value. An error answers `answer` and starts nothing.
+/// `tail_report` is the trace the event reports, if a tail sink is set;
+/// `ends_at_budget` is whether the handler's budget ends the event.
+/// A job with a `request_id` can be cancelled by it.
+pub(super) fn begin_job_event(
+    tc: &mut v8::PinScope,
+    context: Arc<IoContext>,
+    request_id: Option<RequestId>,
+    answer: Answer,
+    tail_report: Option<TailReportState>,
+    ends_at_budget: bool,
+    dispatch: impl for<'s> FnOnce(&mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>>,
+) -> Begun {
+    let guard = CurrentGuard::enter(context.clone());
+    install_io_context(tc, &context);
+    context.begin_cpu_turn();
+    let started = (|| {
+        begin_event_context(tc)?;
+        let ret = dispatch(tc)?;
+        match ret.try_cast::<v8::Promise>() {
+            Ok(promise) => Ok(promise),
+            Err(_) => resolved_promise(tc, ret),
+        }
+    })();
+    match started {
+        Ok(promise) => {
+            tc.perform_microtask_checkpoint();
+            let entry = InFlight {
+                runtime_state: actor_runtime_state(tc),
+                promise: v8::Global::new(tc, promise),
+                context,
+                scope: None,
+                writes_before: None,
+                request_id,
+                active_request_id: None,
+                reply: Some(answer),
+                gated_reply: None,
+                background: None,
+                completed_cell_event: false,
+                ops: std::collections::HashSet::new(),
+                io_context_ops: std::collections::HashSet::new(),
+                unrefed_ops: std::collections::HashSet::new(),
+                alarm: None,
+                started: Instant::now(),
+                trace: None,
+                failure: None,
+                response_status: None,
+                tail_report,
+                ends_at_budget,
+            };
+            drop(guard);
+            Begun::Running(Box::new(entry))
+        }
+        Err(error) => {
+            let _ = end_event_context(tc);
+            let cpu_error = context.finish_cpu_turn().err().map(anyhow::Error::msg);
+            let error = take_execution_termination(tc)
+                .or(cpu_error)
+                .unwrap_or(error);
+            if let Some(mut report) = tail_report {
+                report.record_failure(format!("{error:#}"));
+                report.finish(&context, None);
+            }
+            drop(guard);
+            answer.fail(error);
+            Begun::Nothing
+        }
+    }
+}
+
 pub(super) fn end_event_context<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<Option<v8::Local<'s, v8::Promise>>> {

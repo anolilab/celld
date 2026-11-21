@@ -36,7 +36,7 @@ An unsupported feature that does not cause an error is a defect.
 | Vectorize | **No** |
 | [Hyperdrive](services/hyperdrive.md) | **Partial** — a `hyperdrive` binding hands the Worker a direct connection to its own Postgres or MySQL; no pooling and no query cache, and `host` and `port` name the database itself |
 | Browser Rendering | **No** |
-| [Email](services/email.md) | **Partial** — `send_email` delivers through an SMTP server the operator configures; the `email()` handler is unavailable |
+| [Email](services/email.md) | **Partial** — `send_email` delivers through an SMTP server the operator configures; the `email()` handler runs for a message the operator's relay posts to an authenticated route, with `forward()`, `reply()` and `setReject()`; no Email Routing |
 | [Python Workers](services/workers.md#python-workers) | **Partial** — `fetch` handlers on the Pyodide 0.28 runtime line |
 
 ## Runtime APIs
@@ -111,8 +111,10 @@ A secret is a string binding like a `vars` entry; `celld dev` reads it from
 
 ### [Handlers](https://developers.cloudflare.com/workers/runtime-apis/handlers/)
 
-The `email` handler is unavailable. A Worker can send mail with the
-[`send_email` binding](services/email.md), but cannot receive it.
+The `email` handler is available on the primary script for mail that the operator
+posts to the node's [inbound route](services/email.md#receiving-mail); there is
+no Email Routing. A Worker can also send mail with the
+[`send_email` binding](services/email.md).
 
 The `tail` handler receives the trace items of the Workers that name it in
 `tail_consumers`, for `fetch` and `queue` invocations. Cron triggers, alarms and

@@ -109,7 +109,7 @@ pub fn prepare_raw(
 }
 
 /// `raw` with every line end, `\r\n`, `\n` or a lone `\r`, as `\r\n`.
-fn normalise_line_ends(raw: &[u8]) -> Vec<u8> {
+pub(super) fn normalise_line_ends(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len() + raw.len() / 32);
     let mut bytes = raw.iter().copied().peekable();
     while let Some(byte) = bytes.next() {
@@ -127,7 +127,7 @@ fn normalise_line_ends(raw: &[u8]) -> Vec<u8> {
 
 /// The header section of a normalised message, with its closing CRLF, and the
 /// body after the blank line.
-fn split_head(message: &[u8]) -> (&[u8], &[u8]) {
+pub(super) fn split_head(message: &[u8]) -> (&[u8], &[u8]) {
     if message.starts_with(b"\r\n") {
         return (&[], &message[2..]);
     }
@@ -137,22 +137,22 @@ fn split_head(message: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
-struct Header {
-    name: String,
+pub(super) struct Header {
+    pub(super) name: String,
     /// The value with its folds removed.
-    value: String,
+    pub(super) value: String,
     /// The bytes of this header, folds included, within the header section.
-    start: usize,
-    end: usize,
+    pub(super) start: usize,
+    pub(super) end: usize,
 }
 
 impl Header {
-    fn name_is(&self, name: &str) -> bool {
+    pub(super) fn name_is(&self, name: &str) -> bool {
         self.name.eq_ignore_ascii_case(name)
     }
 }
 
-fn parse_headers(head: &[u8]) -> Result<Vec<Header>, EmailError> {
+pub(super) fn parse_headers(head: &[u8]) -> Result<Vec<Header>, EmailError> {
     let mut headers: Vec<Header> = Vec::new();
     let mut offset = 0;
     while offset < head.len() {
@@ -211,7 +211,7 @@ fn parse_headers(head: &[u8]) -> Result<Vec<Header>, EmailError> {
 /// comment ends when it holds a quoted pair such as `\)`, so a header that
 /// uses one could name a different sender to them than to this check. A list,
 /// a group and what is not an address are refused too.
-fn single_address(value: &str) -> Option<String> {
+pub(super) fn single_address(value: &str) -> Option<String> {
     let value = value.trim();
     if value.contains('\\') {
         return None;

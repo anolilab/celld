@@ -314,6 +314,50 @@ pub fn prepare_builder(binding: &SendEmailBinding, builder: Value) -> Result<Pre
     Ok(Prepared::new(from, recipients, data, message_id))
 }
 
+/// The name and value rules of a header a Worker adds, shared by the builder and
+/// by `forward()`. A name is at most 100 characters of letters, digits and
+/// `-`, and an `X-` name may hold `_` after a non-empty rest. A value is not
+/// empty, is at most 2,048 bytes and holds no control character but a tab. It
+/// must be ASCII unless the header is free text, which the builder encodes.
+pub(super) fn check_header(name: &str, value: &str, free_text: bool) -> Result<(), EmailError> {
+    let named_ok = !name.is_empty()
+        && name.len() <= 100
+        && match name
+            .get(..2)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("x-"))
+        {
+            Some(_) => {
+                name.len() > 2
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            }
+            None => name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+        };
+    if !named_ok {
+        return Err(EmailError::new(
+            "E_HEADER_NAME_INVALID",
+            format!("header name {name:?} is not valid"),
+        ));
+    }
+    if value.is_empty()
+        || value.len() > MAX_CUSTOM_HEADER_VALUE_BYTES
+        || value.contains(|c: char| c.is_ascii_control() && c != '\t')
+    {
+        return Err(EmailError::new(
+            "E_HEADER_VALUE_INVALID",
+            format!("the value of header {name} is empty, too long, or holds a control character"),
+        ));
+    }
+    if !free_text && !value.is_ascii() {
+        return Err(EmailError::new(
+            "E_HEADER_VALUE_INVALID",
+            format!("the value of header {name} must be ASCII"),
+        ));
+    }
+    Ok(())
+}
+
 fn custom_headers(
     headers: std::collections::BTreeMap<String, String>,
 ) -> Result<Vec<(String, String)>, EmailError> {
@@ -322,23 +366,8 @@ fn custom_headers(
     for (name, value) in headers {
         let lower = name.to_ascii_lowercase();
         let own = OWN_HEADERS.contains(&lower.as_str()) || lower.starts_with("arc-");
-        let named_ok = if let Some(rest) = lower.strip_prefix("x-") {
-            !rest.is_empty()
-                && name.len() <= 100
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        } else {
-            !name.is_empty()
-                && name.len() <= 100
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        };
-        if !named_ok {
-            return Err(EmailError::new(
-                "E_HEADER_NAME_INVALID",
-                format!("header name {name:?} is not valid"),
-            ));
-        }
+        let free_text = lower.starts_with("x-") || TEXT_HEADERS.contains(&lower.as_str());
+        check_header(&name, &value, free_text)?;
         if matches!(
             lower.as_str(),
             "from" | "to" | "cc" | "bcc" | "subject" | "reply-to"
@@ -352,22 +381,6 @@ fn custom_headers(
             return Err(EmailError::new(
                 "E_HEADER_NOT_ALLOWED",
                 format!("header {name} is not allowed"),
-            ));
-        }
-        if value.is_empty()
-            || value.len() > MAX_CUSTOM_HEADER_VALUE_BYTES
-            || value.contains(['\r', '\n', '\0'])
-        {
-            return Err(EmailError::new(
-                "E_HEADER_VALUE_INVALID",
-                format!("the value of header {name} is empty, too long, or holds a line break"),
-            ));
-        }
-        if !value.is_ascii() && !(lower.starts_with("x-") || TEXT_HEADERS.contains(&lower.as_str()))
-        {
-            return Err(EmailError::new(
-                "E_HEADER_VALUE_INVALID",
-                format!("the value of header {name} must be ASCII"),
             ));
         }
         if !lower.starts_with("x-") {
@@ -455,7 +468,7 @@ fn encoded_words(text: &str) -> String {
 
 /// One header line, folded at white space so no line passes 76 bytes where a
 /// space allows it. Unfolding gives the value back unchanged.
-fn fold_header(name: &str, value: &str) -> String {
+pub(super) fn fold_header(name: &str, value: &str) -> String {
     let mut out = format!("{name}: ");
     let mut line = out.len();
     let mut placed = false;
@@ -893,6 +906,10 @@ mod tests {
             "E_HEADER_VALUE_INVALID"
         );
         assert_eq!(code(json!({ "X-A": "" })), "E_HEADER_VALUE_INVALID");
+        // The rules are those of `forward()`: a control character other than a
+        // tab is refused here as there.
+        assert_eq!(code(json!({ "X-A": "a\u{1}b" })), "E_HEADER_VALUE_INVALID");
+        assert!(custom_headers([("X-A".to_string(), "a\tb".to_string())].into()).is_ok());
         assert_eq!(
             code(json!({ "X-A": "a".repeat(2049) })),
             "E_HEADER_VALUE_INVALID"

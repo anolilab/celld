@@ -125,6 +125,11 @@ on an empty value, on surrounding whitespace, and on any other unusable
 value, so a mistake does not leave the listener open. celld compares the
 token in constant time.
 
+The operator token opens every route. A relay that posts inbound mail needs
+one route only, so give it `CELLD_EMAIL_INBOUND_TOKEN` (or
+`CELLD_EMAIL_INBOUND_TOKEN_FILE`): that token opens `POST /email/inbound` and
+every other route refuses it with 401. See [Email](services/email.md#the-route).
+
 Every in-tree client reads `CELLD_OPERATOR_TOKEN`, or else the file named by
 `CELLD_OPERATOR_TOKEN_FILE` or the one in the configuration directory, and
 sends the token: peer forwarding, handoff, abort, the log tier, the signed

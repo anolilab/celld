@@ -1015,6 +1015,63 @@ async fn internal_invoke(request: Request<Incoming>, app: AppHandle) -> HttpRepl
     ))
 }
 
+/// `POST /email/inbound`: one raw message for the Worker's `email()` handler.
+/// The operator token, or the route's own token, has been checked in front of routing.
+async fn internal_email_inbound(request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    let Some(runtime) = app.runtime.clone() else {
+        return peer_response(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no Worker runtime",
+        ));
+    };
+    // A draining node runs no more user code, and shutdown waits for the
+    // messages it already took, as for public requests.
+    let Some(_admission) = app.admit_public() else {
+        let mut draining = response(StatusCode::SERVICE_UNAVAILABLE, "the node is draining");
+        draining.headers_mut().insert(
+            hyper::header::RETRY_AFTER,
+            hyper::header::HeaderValue::from_static("1"),
+        );
+        return peer_response(draining);
+    };
+    // Each message is held twice while it is handled, so a relay that sends
+    // faster than the Worker answers is asked to wait.
+    let Some(permit) = celld::email::inbound::admit() else {
+        let mut busy = response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many messages in flight",
+        );
+        busy.headers_mut().insert(
+            hyper::header::RETRY_AFTER,
+            hyper::header::HeaderValue::from_static("5"),
+        );
+        return peer_response(busy);
+    };
+    let query = request.uri().query().map(str::to_owned);
+    // A stalled upload would hold one of the places until the relay gave up.
+    let body = match celld::asyncrt::timeout(
+        celld::email::inbound::deadline(),
+        collect_limited_body(request.into_body(), celld::email::MAX_MESSAGE_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(error)) => return peer_response(body_read_error("email", error)),
+        Err(_) => {
+            return peer_response(response(
+                StatusCode::REQUEST_TIMEOUT,
+                "the message was not received in time",
+            ))
+        }
+    };
+    let (status, text) =
+        celld::email::inbound::handle(&runtime, query.as_deref(), body, permit).await;
+    peer_response(response(
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        text,
+    ))
+}
+
 async fn internal_reload(app: AppHandle) -> HttpReply {
     let (reply, receive) = tokio::sync::oneshot::channel();
     let sent = app
@@ -3063,6 +3120,10 @@ async fn handle_internal(
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
         "/invoke" => internal_invoke(request, app).await,
+        "/email/inbound" if request.method() != hyper::Method::POST => {
+            response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+        }
+        "/email/inbound" => internal_email_inbound(request, app).await,
         "/rebalance/pause" | "/rebalance/resume" if request.method() != hyper::Method::POST => {
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
@@ -3386,6 +3447,26 @@ fn operator_gate(
     Some(peer_response(refusal))
 }
 
+/// Whether the route-scoped inbound email token opens this request: only the
+/// inbound route (`/email/inbound`) on the internal listener, and only with
+/// that token. Any
+/// other path falls through to the operator gate, so the token opens nothing
+/// else. As with the operator token, the credential does not travel on.
+fn email_inbound_gate(
+    surface: HttpSurface,
+    inbound_route: bool,
+    token: Option<&celld::operator_token::OperatorToken>,
+    headers: &mut hyper::HeaderMap,
+) -> bool {
+    let opens = matches!(surface, HttpSurface::Internal)
+        && inbound_route
+        && token.is_some_and(|token| token.authorizes(headers));
+    if opens {
+        headers.remove(hyper::header::AUTHORIZATION);
+    }
+    opens
+}
+
 fn serve_http_connection(
     stream: tokio::net::TcpStream,
     surface: HttpSurface,
@@ -3415,10 +3496,22 @@ fn serve_http_connection(
                 celld::metrics::observe(listener, async move {
                     let mut request = request;
                     let probe = request.uri().path() == "/peer/probe";
-                    if let Some(refusal) =
-                        operator_gate(surface, probe, &app.operator_token, request.headers_mut())
-                    {
-                        return Ok(refusal);
+                    let inbound_route = request.uri().path() == "/email/inbound";
+                    let scoped = email_inbound_gate(
+                        surface,
+                        inbound_route,
+                        app.email_inbound_token.as_ref(),
+                        request.headers_mut(),
+                    );
+                    if !scoped {
+                        if let Some(refusal) = operator_gate(
+                            surface,
+                            probe,
+                            &app.operator_token,
+                            request.headers_mut(),
+                        ) {
+                            return Ok(refusal);
+                        }
                     }
                     match surface {
                         HttpSurface::Public => handle_public(request, app, service_requests).await,
@@ -3794,6 +3887,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         internal_listener.local_addr()?.ip(),
         &internal.advertise,
     )?;
+    let email_inbound_token = celld::operator_token::OperatorToken::email_inbound()?;
     celld::egress_filter::register_node_addresses(
         &[listener.local_addr()?, internal_listener.local_addr()?],
         &internal.advertise,
@@ -4350,6 +4444,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         peer_http,
         peer_auth,
         operator_token,
+        email_inbound_token,
         advertise: advertise.clone(),
         websockets: websocket_tx,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
