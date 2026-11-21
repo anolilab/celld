@@ -654,8 +654,12 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
         );
     } else {
         note!("Nodes adopt this version at their next pointer poll, without a restart.");
+        // Only a hint: the deploy has committed, so a failed read must not fail it.
         let serving = deploy::read_fleet_pointer(&store)
-            .await?
+            .await
+            .inspect_err(|error| tracing::warn!(%error, "could not read the fleet pointer"))
+            .ok()
+            .flatten()
             .and_then(|(pointer, _)| pointer.script_name)
             .filter(|serving| *serving != built.script_name);
         if let Some(serving) = serving {

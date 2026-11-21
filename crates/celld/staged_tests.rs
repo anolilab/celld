@@ -162,10 +162,12 @@ async fn a_plain_deploy_keeps_the_primary_and_selects_its_own_version() {
     let (_, token_before) = fleet_pointer(&fleet).await;
     select(&fleet, "b", "v1", Selection::Activate).await;
 
+    // Nodes watch only the fleet pointer, so it carries the new script.
     let (pointer, token_after) = fleet_pointer(&fleet).await;
-    assert_eq!(token_before, token_after, "the fleet pointer was rewritten");
+    assert_ne!(token_before, token_after, "the fleet pointer did not move");
     assert_eq!(pointer.script_name.as_deref(), Some("a"));
     assert_eq!(pointer.prefix, "deploy/a/v1");
+    assert_eq!(pointer.components["b"].version, "v1");
     assert_eq!(named_pointer(&fleet, "b").await.version, "v1");
 
     // Redeploying the primary itself moves it.
@@ -173,7 +175,60 @@ async fn a_plain_deploy_keeps_the_primary_and_selects_its_own_version() {
     let (pointer, _) = fleet_pointer(&fleet).await;
     assert_eq!(pointer.script_name.as_deref(), Some("a"));
     assert_eq!(pointer.version, "v2");
+    assert_eq!(pointer.components["b"].version, "v1");
     assert_eq!(named_pointer(&fleet, "b").await.version, "v1");
+}
+
+#[tokio::test]
+async fn a_running_graph_adopts_a_plain_deploy_of_another_script() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    select(&fleet, "b", "v1", Selection::Activate).await;
+    let (before, _) = fleet_pointer(&fleet).await;
+    let graph = DeploymentGraph::load_pointer(&fleet.bucket, before.clone(), "node".to_string())
+        .await
+        .expect("load the graph");
+    // A node adopts a pointer when it differs from the one its graph holds
+    // in version, prefix or component map (`Generation::is_selected_by`).
+    assert_eq!(graph.components, before.components);
+
+    select(&fleet, "b", "v2", Selection::Activate).await;
+
+    let (after, _) = fleet_pointer(&fleet).await;
+    assert_eq!(after.script_name.as_deref(), Some("a"));
+    assert_ne!(
+        graph.components, after.components,
+        "a node would keep the old version of b"
+    );
+}
+
+#[tokio::test]
+async fn a_plain_deploy_of_the_primary_keeps_the_other_entries() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    select(&fleet, "b", "v1", Selection::Activate).await;
+
+    select(&fleet, "a", "v2", Selection::Activate).await;
+
+    let (pointer, _) = fleet_pointer(&fleet).await;
+    assert_eq!(pointer.script_name.as_deref(), Some("a"));
+    assert_eq!(pointer.version, "v2");
+    assert_eq!(pointer.components["b"].version, "v1");
+    assert!(!pointer.components.contains_key("a"));
+}
+
+#[tokio::test]
+async fn deploy_with_primary_moves_the_old_primary_into_the_component_map() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    select(&fleet, "c", "v1", Selection::Activate).await;
+    select(&fleet, "b", "v1", Selection::Primary).await;
+
+    let (pointer, _) = fleet_pointer(&fleet).await;
+    assert_eq!(pointer.script_name.as_deref(), Some("b"));
+    assert_eq!(pointer.components["a"].version, "v1");
+    assert_eq!(pointer.components["c"].version, "v1");
+    assert!(!pointer.components.contains_key("b"));
 }
 
 #[tokio::test]
@@ -385,7 +440,7 @@ async fn a_pointer_that_moves_only_a_component_selects_something_new() {
 }
 
 #[tokio::test]
-async fn a_plain_deploy_keeps_the_components_of_a_staged_fleet() {
+async fn a_primary_deploy_keeps_the_components_of_a_staged_fleet() {
     let fleet = fleet();
     serving_pair(&fleet).await;
     deploy(&fleet, "back", "v2", &[], false).await;

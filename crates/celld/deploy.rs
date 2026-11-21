@@ -1194,18 +1194,9 @@ pub async fn write(
         .is_some_and(|(pointer, _)| pointer.script_name.is_none());
     let primary =
         (selection == Selection::Primary || repairs).then_some(built.script_name.as_str());
-    // A script that does not serve resolves through its own pointer, written
-    // above, unless the fleet pointer's component map already lists it: the
-    // map wins there, so it has to follow.
-    let listed = current
-        .as_ref()
-        .is_some_and(|(pointer, _)| pointer.components.contains_key(&built.script_name));
-    let serves = current.as_ref().is_some_and(|(pointer, _)| {
-        pointer.script_name.as_deref() == Some(built.script_name.as_str())
-    });
-    if current.is_some() && primary.is_none() && !serves && !listed {
-        return Ok(manifest);
-    }
+    // The fleet pointer is the one thing running nodes watch, so every
+    // selection moves it, whichever script it names: a script that does not
+    // serve is selected through the component map.
     let mut pointer = crate::staged::next_pointer(
         current
             .as_ref()
@@ -1214,11 +1205,12 @@ pub async fn write(
         &[target],
         primary,
     )?;
-    // A fleet that never stages keeps no component map; the script that stops
-    // being primary resolves through its own pointer.
-    if current
-        .as_ref()
-        .is_none_or(|(old, _)| old.components.is_empty())
+    // A fleet that never stages keeps no component map when its script takes
+    // the primary: the one it replaces resolves through its own pointer.
+    if pointer.script_name.as_deref() == Some(built.script_name.as_str())
+        && current
+            .as_ref()
+            .is_none_or(|(old, _)| old.components.is_empty())
     {
         pointer.components.clear();
     }

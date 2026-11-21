@@ -305,9 +305,10 @@ change it unless you ask:
   single-Worker fleet needs no flag.
 - Later, `celld deploy` of the primary script moves the primary to the new
   version.
-- `celld deploy` of any other script uploads it and moves that script's own
-  pointer, so service bindings resolve the new version. The primary and the
-  fleet pointer stay as they were, and the command says which script serves.
+- `celld deploy` of any other script uploads it and lists it in the component
+  map of the fleet pointer (which it creates when the fleet has none) at the
+  new version, so running nodes rebuild and service bindings resolve it. The
+  primary stays as it was, and the command says which script serves.
 - `celld deploy --primary` also makes the script the primary. The previous
   primary stays selected at the version it served.
 
@@ -319,6 +320,9 @@ Requests reach the primary script only. A fleet pointer that names no script,
 which no node can read, is repaired by the next `celld deploy`, and that
 script becomes the primary. `celld dev` runs one project and deploys it as
 the primary.
+
+The managed deploy of the control plane differs: it makes the deployed script
+the primary on every deploy.
 
 ### Stage a deployment and activate it later
 
