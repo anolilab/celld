@@ -309,7 +309,7 @@ retry:
 | 408 | | The message was not received within the same time. Temporary |
 | 503 | | The node is busy (at most four messages at once, with `Retry-After`), or has no Worker runtime. Temporary |
 | 400, 413, 431 | `{"ok":false,"error":"..."}` | The message was refused: empty, malformed, with a NUL byte, over 25 MiB (413), with a header line over 998 bytes, or with more than 64 KiB or 1,000 headers (431). The error names the fault |
-| 401 | | No or a wrong operator token |
+| 401 | | The bearer token is missing or wrong. The route accepts the token in `CELLD_EMAIL_INBOUND_TOKEN` (or its file) or the operator token; any other token is refused |
 
 200 accepts and 550 bounces. 400, 413 and 431 mean the message itself is bad and
 will not improve on a retry, so bounce it too. Every other status is temporary:
@@ -384,6 +384,9 @@ not restricted by any `send_email` binding. `forward()` has a list of its own.
   (`E_FIELD_MISSING`), more than 100 `References`, or no sender (a bounce). A
   message may be replied to once, and a failed reply counts, but one turned away
   for lack of a slot or a subrequest (`E_RATE_LIMIT_EXCEEDED`) does not. A reply
+  that has no `Auto-Submitted` header of its own gets `Auto-Submitted:
+  auto-replied`, so two handlers that answer each other stop (a value the Worker
+  sets is kept). A reply
   resolves to `{ messageId }` and rejects with the codes of `send()`. It is
   refused with `E_RECIPIENT_NOT_ALLOWED` when the incoming message is automatic
   mail (`Auto-Submitted` with a value other than `no`, or `Precedence: bulk`,

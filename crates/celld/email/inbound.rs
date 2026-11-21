@@ -597,6 +597,9 @@ impl Event {
                 data.extend_from_slice(fold_header(name, wanted).as_bytes());
             }
         }
+        if !parsed.iter().any(|header| header.name_is("auto-submitted")) {
+            data.extend_from_slice(AUTO_REPLIED.as_bytes());
+        }
         data.extend_from_slice(head);
         data.extend_from_slice(b"\r\n");
         data.extend_from_slice(body);
@@ -655,11 +658,24 @@ impl Event {
             };
             headers.insert(name.to_string(), Value::String(value));
         }
+        if !headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("auto-submitted"))
+        {
+            headers.insert(
+                "Auto-Submitted".into(),
+                Value::String("auto-replied".into()),
+            );
+        }
         fields.insert("headers".into(), Value::Object(headers));
         fields.insert("to".into(), Value::String(self.from.clone()));
         prepare_builder(&SendEmailBinding::default(), Value::Object(fields))
     }
 }
+
+/// Marks a reply as one a machine made (RFC 3834), so a handler that answers
+/// another handler's reply is refused by [`automatic`] instead of looping.
+const AUTO_REPLIED: &str = "Auto-Submitted: auto-replied\r\n";
 
 /// A `References` value that fits the one a builder header may hold: the
 /// first id and the newest ones after it, as RFC 5322 section 3.6.4 advises.
@@ -1405,6 +1421,36 @@ mod tests {
         let long = Event::new(&mut parsed(&format!("From: ann@example.org\r\nTo: bob@example.com\r\nMessage-ID: <m@x>\r\nReferences: {refs}\r\n\r\nx")));
         long.prepare_reply_raw("bob@example.com", "ann@example.org", &reply_message(""))
             .unwrap();
+    }
+
+    #[test]
+    fn a_generated_reply_is_marked_auto_replied_unless_the_worker_set_the_header() {
+        crate::asyncrt::install_test_host_runtime();
+        let event = Event::new(&mut parsed(MESSAGE));
+        let text = |sent: Prepared| String::from_utf8(sent.data).unwrap();
+        let raw = |extra: &str| {
+            text(
+                event
+                    .prepare_reply_raw("bob@example.com", "ann@example.org", &reply_message(extra))
+                    .unwrap(),
+            )
+        };
+        assert!(raw("").contains("Auto-Submitted: auto-replied\r\n"));
+        let kept = raw("Auto-Submitted: no\r\n");
+        assert!(kept.contains("Auto-Submitted: no\r\n") && !kept.contains("auto-replied"));
+        let builder = |headers: Value| {
+            text(
+                event
+                    .prepare_reply_builder(serde_json::json!({
+                        "from": "bob@example.com", "subject": "s", "text": "t", "headers": headers,
+                    }))
+                    .unwrap(),
+            )
+        };
+        assert!(builder(serde_json::json!({})).contains("Auto-Submitted: auto-replied\r\n"));
+        let kept = builder(serde_json::json!({ "auto-submitted": "no" }));
+        assert!(kept.to_ascii_lowercase().contains("auto-submitted: no\r\n"));
+        assert!(!kept.contains("auto-replied"));
     }
 
     #[test]
