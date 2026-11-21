@@ -240,6 +240,69 @@ const fsChecks = {
     is(text(await fsp.readdir("/tmp/bn", { encoding: "buffer" })), [[true, "sub"]]);
     is(fs.readdirSync("/tmp/bn"), ["sub"]);
   },
+  readdirRecursiveIsBreadthFirst: () => {
+    fs.mkdirSync("/tmp/bf/a/x", { recursive: true });
+    fs.mkdirSync("/tmp/bf/b");
+    fs.mkdirSync("/tmp/bf/c");
+    fs.writeFileSync("/tmp/bf/a/x/z", "1");
+    fs.writeFileSync("/tmp/bf/b/y", "1");
+    fs.writeFileSync("/tmp/bf/c/w", "1");
+    is(fs.readdirSync("/tmp/bf", { recursive: true }), ["a", "b", "c", "a/x", "b/y", "c/w", "a/x/z"]);
+    const entries = fs.readdirSync("/tmp/bf", { recursive: true, withFileTypes: true });
+    is(entries.map((entry) => entry.name), ["a", "b", "c", "x", "y", "w", "z"]);
+    is(entries.map((entry) => entry.parentPath), [
+      "/tmp/bf", "/tmp/bf", "/tmp/bf", "/tmp/bf/a", "/tmp/bf/b", "/tmp/bf/c", "/tmp/bf/a/x",
+    ]);
+  },
+  readdirEncodings: () => {
+    fs.mkdirSync("/tmp/enc/a/x", { recursive: true });
+    fs.writeFileSync("/tmp/enc/\u00e9", "1");
+    const names = (encoding) => fs.readdirSync("/tmp/enc", { encoding });
+    is(names("utf8"), ["a", "é"]);
+    is(names("utf-8"), ["a", "é"]);
+    is(names("UTF8"), ["a", "é"]);
+    is(names(null), ["a", "é"]);
+    is(names(""), ["a", "é"]);
+    is(names(false), ["a", "é"]);
+    is(names(0), ["a", "é"]);
+    is(names("hex"), ["61", "c3a9"]);
+    is(names("base64"), ["YQ==", "w6k="]);
+    is(names("base64url"), ["YQ", "w6k"]);
+    is(names("latin1"), ["a", "Ã©"]);
+    is(names("binary"), ["a", "Ã©"]);
+    is(names("ascii"), ["a", "C)"]);
+    for (const encoding of ["ucs2", "ucs-2", "utf16le", "utf-16le"]) {
+      is(names(encoding), ["", "\ua9c3"]);
+    }
+    is(fs.readdirSync("/tmp/enc", "hex"), ["61", "c3a9"]);
+    is(fs.readdirSync("/tmp/enc", { encoding: "hex", recursive: true }), ["61", "c3a9", "612f78"]);
+    const nested = fs.readdirSync("/tmp/enc", { encoding: "hex", recursive: true, withFileTypes: true });
+    is(nested.map((entry) => [entry.name, entry.parentPath]), [
+      ["61", "/tmp/enc"], ["c3a9", "/tmp/enc"], ["78", "/tmp/enc/61"],
+    ]);
+    for (const bad of ["bogus", "BUFFER", 1]) {
+      throwsCodeSync("ERR_INVALID_ARG_VALUE", () => names(bad));
+      throwsCodeSync("ERR_INVALID_ARG_VALUE", () => fs.readdirSync("/tmp/enc", { encoding: bad, recursive: true }));
+    }
+  },
+  readdirBadEncodingThrowsBeforeTheCallback: async () => {
+    fs.mkdirSync("/tmp/be");
+    let called = false;
+    throwsCodeSync("ERR_INVALID_ARG_VALUE", () => fs.readdir("/tmp/be", { encoding: "nope" }, () => { called = true; }));
+    throwsCodeSync("ERR_INVALID_ARG_VALUE", () => fs.readdir("/tmp/be", "nope", () => { called = true; }));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    is(called, false);
+    await throwsCode("ERR_INVALID_ARG_VALUE", () => fsp.readdir("/tmp/be", { encoding: "nope" }));
+  },
+  writeAfterAppendSlackIsReclaimed: () => {
+    const mib = 1024 * 1024;
+    fs.writeFileSync("/tmp/slack-a", Buffer.alloc(40 * mib));
+    fs.appendFileSync("/tmp/slack-a", "x");
+    fs.writeFileSync("/tmp/slack-b", Buffer.alloc(14 * mib));
+    is(fs.statSync("/tmp/slack-b").size, 14 * mib);
+    fs.rmSync("/tmp/slack-a");
+    fs.rmSync("/tmp/slack-b");
+  },
   readdirManyEntries: () => {
     fs.mkdirSync("/tmp/many");
     for (let index = 0; index < 150000; index++) fs.mkdirSync(`/tmp/many/${index}`);

@@ -111,7 +111,7 @@ async fn node_url_matches_node() {
 #[tokio::test]
 async fn tmp_accepts_writes_and_mutations() {
     let server = Server::start("node-compat", &[]).await;
-    assert_all_ok(&server, "/fs", 26).await;
+    assert_all_ok(&server, "/fs", 30).await;
 }
 
 #[derive(serde::Deserialize, PartialEq, Debug)]

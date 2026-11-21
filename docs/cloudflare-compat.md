@@ -273,10 +273,12 @@ execution.
   a read-only `/bundle` that contains the Worker modules. `/tmp` starts empty,
   lives in memory, and is freed when the request ends. One request can hold at
   most 64 MiB in it, counting the memory each file holds (a file that grows by appends may
-  hold up to 1 MiB more than its length, and an append first uses that spare
-  room before it is charged more) and a small charge for each entry; a
+  hold up to a quarter more than its length, at least 1 MiB, and an append
+  first uses that spare room before it is charged more) and a small charge for each entry; a
   write that would pass that fails with `ENOSPC` and changes nothing. `readdir` takes
-  `encoding: "buffer"` for `Buffer` names, and lists `/` and `/bundle` with the
+  every `encoding` that Node accepts (`"buffer"` for `Buffer` names, and an
+  unknown one throws `ERR_INVALID_ARG_VALUE`), lists a recursive read breadth
+  first as Node does, and lists `/` and `/bundle` with the
   entries `stat` reports. Writes
   outside `/tmp` fail with `EPERM`. `/tmp` belongs to a request: code that runs
   with no request, such as module scope while the Worker loads, cannot change
