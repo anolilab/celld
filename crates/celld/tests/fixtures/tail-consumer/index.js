@@ -18,6 +18,21 @@ export default {
       console.log("LINGER started");
       ctx.waitUntil(new Promise((resolve) => setTimeout(resolve, 3_600_000)));
     }
+    if (events.some((event) => event.logs.some((log) => log.message.includes("make-the-consumer-open-a-socket")))) {
+      // Returns with a socket still open to the producer.
+      console.log("SOCKET started");
+      const url = new URL(events[0].event.request.url);
+      const socket = new WebSocket(`ws://${url.host}/__ws`);
+      socket.addEventListener("message", () => {});
+      await new Promise((resolve, reject) => {
+        socket.addEventListener("open", resolve);
+        socket.addEventListener("error", () => reject(new Error("socket failed")));
+      });
+      // The handler returns, and `waitUntil` work keeps the event running up
+      // to the budget while the socket is open.
+      ctx.waitUntil(new Promise((resolve) => setTimeout(resolve, 3_600_000)));
+      console.log("SOCKET open");
+    }
     if (events.some((event) => event.logs.some((log) => log.message.includes("make-the-consumer-throw")))) {
       throw new Error("consumer exploded");
     }

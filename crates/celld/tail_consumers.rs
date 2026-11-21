@@ -273,6 +273,8 @@ pub(crate) fn redact_headers(
 /// The counts of one run of URL characters, to tell an identifier from a word.
 #[derive(Default)]
 struct Run {
+    /// The decoded characters of the run.
+    bytes: Vec<u8>,
     hex: usize,
     digits: usize,
     upper: usize,
@@ -282,6 +284,7 @@ struct Run {
 
 impl Run {
     fn add(&mut self, byte: u8) {
+        self.bytes.push(byte);
         let separator = matches!(byte, b'+' | b'-' | b'_');
         if byte.is_ascii_hexdigit() {
             self.hex += 1;
@@ -297,10 +300,10 @@ impl Run {
     /// characters or more with two each of digits, upper and lower case
     /// letters, or a payment card number (13 to 19 digits that pass the Luhn
     /// check).
-    fn is_secret(&self, run: &[u8]) -> bool {
+    fn is_secret(&self) -> bool {
         (self.hex >= 32 && !self.non_hex)
-            || (run.len() >= 21 && self.digits >= 2 && self.upper >= 2 && self.lower >= 2)
-            || is_card_number(run)
+            || (self.bytes.len() >= 21 && self.digits >= 2 && self.upper >= 2 && self.lower >= 2)
+            || is_card_number(&self.bytes)
     }
 }
 
@@ -329,14 +332,17 @@ fn is_card_number(run: &[u8]) -> bool {
 
 /// The URL of a trace item with each run of letters, digits and `+ - _` that
 /// looks like an identifier or a card number replaced. A run ends at any other
-/// character, so a path segment or a query value is one run. This is the rule
-/// `TraceItem.event.request.url` applies on Cloudflare.
+/// character, so a path segment or a query value is one run. A percent-encoded
+/// character counts as the character it stands for, so encoding an identifier
+/// does not hide it, and a replaced run is replaced whole, encoded span
+/// included. This is the rule `TraceItem.event.request.url` applies on
+/// Cloudflare.
 pub(crate) fn redact_url(url: &str) -> String {
     let mut out = Vec::with_capacity(url.len());
     let mut start = 0;
     let mut run = Run::default();
     let end_run = |out: &mut Vec<u8>, run: &mut Run, span: &[u8]| {
-        if run.is_secret(span) {
+        if run.is_secret() {
             out.extend_from_slice(REDACTED.as_bytes());
         } else {
             out.extend_from_slice(span);
@@ -344,14 +350,27 @@ pub(crate) fn redact_url(url: &str) -> String {
         *run = Run::default();
     };
     let bytes = url.as_bytes();
-    for (index, &byte) in bytes.iter().enumerate() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'_') {
-            run.add(byte);
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let escaped = (byte == b'%')
+            .then(|| bytes.get(index + 1..index + 3))
+            .flatten()
+            .filter(|pair| pair.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|pair| std::str::from_utf8(pair).ok())
+            .and_then(|pair| u8::from_str_radix(pair, 16).ok());
+        let (decoded, width) = match escaped {
+            Some(decoded) => (decoded, 3),
+            None => (byte, 1),
+        };
+        if decoded.is_ascii_alphanumeric() || matches!(decoded, b'+' | b'-' | b'_') {
+            run.add(decoded);
         } else {
             end_run(&mut out, &mut run, &bytes[start..index]);
-            out.push(byte);
-            start = index + 1;
+            out.extend_from_slice(&bytes[index..index + width]);
+            start = index + width;
         }
+        index += width;
     }
     end_run(&mut out, &mut run, &bytes[start..]);
     // Only whole ASCII runs were replaced, so the bytes are still UTF-8.
@@ -432,6 +451,7 @@ async fn deliver_lane(
             continue;
         };
         let body = encode_batch(&batch);
+        let items = batch.len();
         batch.clear();
         // The call ends when the handler returns or throws, or when the
         // runtime ends its event at `delivery_budget`, `waitUntil` work
@@ -441,11 +461,11 @@ async fn deliver_lane(
         match crate::asyncrt::timeout(delivery_budget() + DELIVERY_GRACE, call).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => tracing::warn!(
-                %script, %consumer, items = batch.len(), %error,
+                %script, %consumer, items, %error,
                 "tail consumer failed; its trace items are lost"
             ),
             Err(_) => tracing::warn!(
-                %script, %consumer, items = batch.len(),
+                %script, %consumer, items,
                 "tail consumer did not report; its trace items are lost"
             ),
         }
@@ -587,6 +607,35 @@ mod tests {
             redact_url("https://domain/caf\u{e9}?token=0123456789abcdef0123456789abcdef&x=1"),
             "https://domain/caf\u{e9}?token=REDACTED&x=1"
         );
+    }
+
+    #[test]
+    fn a_percent_encoded_identifier_is_hidden_too() {
+        // `0123456789abcdef` twice, every character encoded.
+        let hex: String = "0123456789abcdef0123456789abcdef"
+            .bytes()
+            .map(|byte| format!("%{byte:02X}"))
+            .collect();
+        assert_eq!(
+            redact_url(&format!("https://domain/{hex}/x?t={hex}")),
+            "https://domain/REDACTED/x?t=REDACTED"
+        );
+        // Half encoded, with an encoded character that is not part of a run.
+        assert_eq!(
+            redact_url("https://domain/01234567%38%39abcdef0123456789abcdef"),
+            "https://domain/REDACTED"
+        );
+        let base64: String = "aB3dE6gH9jK2mN5pQ8sT1"
+            .bytes()
+            .map(|byte| format!("%{byte:02x}"))
+            .collect();
+        assert_eq!(
+            redact_url(&format!("https://domain/p?k={base64}&y=2")),
+            "https://domain/p?k=REDACTED&y=2"
+        );
+        // Short encoded values and an encoded separator are kept as written.
+        let kept = "https://domain/a%2Fb%20c?q=%41%42&r=%zz%+1";
+        assert_eq!(redact_url(kept), kept);
     }
 
     #[test]

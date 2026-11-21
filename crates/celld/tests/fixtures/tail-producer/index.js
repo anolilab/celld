@@ -5,6 +5,12 @@ export default {
     if (url.pathname === "/__ready") {
       return new Response("ready");
     }
+    if (url.pathname === "/__ws") {
+      // The far end of the socket the consumer opens; it never closes it.
+      const [client, server] = Object.values(new WebSocketPair());
+      server.accept();
+      return new Response(null, { status: 101, webSocket: client });
+    }
     console.log("served", url.pathname);
     if (url.pathname === "/fail") {
       throw new Error("producer failed");
@@ -23,6 +29,10 @@ export default {
     if (url.pathname === "/linger") {
       // The consumer returns from this one and leaves `waitUntil` work behind.
       console.log("make-the-consumer-linger");
+    }
+    if (url.pathname === "/socket") {
+      // The consumer opens an outbound WebSocket and never closes it.
+      console.log("make-the-consumer-open-a-socket");
     }
     if (url.pathname === "/poison") {
       // The consumer throws on this one; the response must not change.

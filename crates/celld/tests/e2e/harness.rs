@@ -185,6 +185,11 @@ impl Server {
         server
     }
 
+    /// The process id of `celld dev`.
+    pub fn pid(&self) -> u32 {
+        self.child.as_ref().expect("running").id()
+    }
+
     /// Time from spawning the process to its first successful response, on the
     /// attempt that came up. Benchmarks read it as the cold-start time.
     #[allow(dead_code)]

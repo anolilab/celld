@@ -260,6 +260,14 @@ async fn a_consumer_that_throws_changes_nothing_for_the_producer() {
         },
     )
     .await;
+    // The warning counts the batch it lost.
+    let warning = server
+        .log_text()
+        .lines()
+        .find(|line| line.contains("tail consumer failed"))
+        .map(str::to_string)
+        .expect("a warning");
+    assert!(warning.contains("items=1"), "{warning}");
     // The producer answers, and later items still reach the consumer.
     assert_eq!(server.get_text("/after").await, "produced");
     wait_for_item(&server, "/after").await;
@@ -306,6 +314,53 @@ async fn a_consumer_with_work_that_never_settles_has_one_event_at_a_time() {
         (started(&server) == 2).then_some(())
     })
     .await;
+}
+
+/// The CPU time a process has used, in seconds, from `ps`.
+fn cpu_seconds(pid: u32) -> f64 {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "time=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps");
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    text.split(':')
+        .try_fold(0.0, |total, part| {
+            part.parse::<f64>().map(|n| total * 60.0 + n)
+        })
+        .expect("cpu time")
+}
+
+#[tokio::test]
+async fn a_consumer_that_leaves_a_socket_open_is_ended_at_the_budget() {
+    let server = Server::start_projects(
+        &[TAIL_PRODUCER, TAIL_CONSUMER],
+        &[("CELLD_HANDLER_BUDGET_S", "2")],
+        |_| {},
+    )
+    .await;
+    let started = |server: &Server| server.log_text().matches("SOCKET started").count();
+    assert_eq!(server.get_text("/socket").await, "produced");
+    wait_until("the socket", Duration::from_secs(30), || async {
+        server.log_text().contains("SOCKET open").then_some(())
+    })
+    .await;
+    assert_eq!(server.get_text("/socket").await, "produced");
+    // The first event has returned but its socket is open, so the next batch
+    // waits for the runtime to end that event at the budget.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(started(&server), 1, "a second event started early");
+    // Once the event has expired, nothing may keep the driver running.
+    let before = cpu_seconds(server.pid());
+    wait_until("the second event", Duration::from_secs(15), || async {
+        (started(&server) == 2).then_some(())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let used = cpu_seconds(server.pid()) - before;
+    assert!(
+        used < 1.0,
+        "the node used {used}s of CPU while the event ended"
+    );
 }
 
 #[tokio::test]

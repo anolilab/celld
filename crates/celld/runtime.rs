@@ -2412,7 +2412,15 @@ async fn drive_worker(
                 started
             }
             Wake::Expired => {
+                let bounded = entry.lingering_left(budget).is_some();
                 entry.time_out(budget);
+                // An event the budget bounds ends with it: its sockets are
+                // closed, as when an event retires, and the work that lives
+                // as long as the event is dropped.
+                if bounded {
+                    entry.finish_cross_entry_gates();
+                    abort_ops(&mut ops, &mut entry);
+                }
                 Vec::new()
             }
             Wake::Idle => {

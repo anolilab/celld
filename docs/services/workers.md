@@ -321,7 +321,9 @@ letters, digits, `+`, `-` and `_` (a path segment or a query value) that is a
 hex identifier of 32 digits or more, a base64-like identifier of 21 characters
 or more with at least two digits, two upper-case and two lower-case letters, or
 a payment card number (13 to 19 digits that pass the Luhn check) becomes
-`REDACTED`. `event.request.getUnredacted()` returns the request with its
+`REDACTED`. A percent-encoded character counts as the character it stands for,
+and a run that is redacted is replaced whole, encoded or not.
+`event.request.getUnredacted()` returns the request with its
 original headers and URL.
 
 Delivery is best effort and never part of the producer's work:

@@ -3703,6 +3703,8 @@ impl InFlight {
     /// of one the budget bounds.
     pub fn time_out(&mut self, budget: Duration) {
         self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
+        // The budget has ended it; nothing is left to linger for.
+        self.ends_at_budget = false;
         if self.reply.is_none() {
             self.background = None;
             self.context.seal_wait_until();
