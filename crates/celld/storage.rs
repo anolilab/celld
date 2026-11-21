@@ -682,24 +682,40 @@ fn allowed_sql_pragma(name: &str, value: Option<&str>) -> bool {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    /// How long preparing a statement that calls `typeof` takes on this
-    /// thread, for tests of where the statement time bound starts.
-    static PREPARE_DELAY: std::cell::Cell<Option<std::time::Duration>> =
-        const { std::cell::Cell::new(None) };
-}
+/// The authorizer every cell connection installs.
+#[cfg(not(test))]
+use authorize_sql as authorize_sql_installed;
 
 #[cfg(test)]
-fn slow_prepare_for_test(action: &rusqlite::hooks::AuthAction<'_>) {
-    let slow = matches!(
-        action,
-        rusqlite::hooks::AuthAction::Function {
-            function_name: "typeof"
+use prepare_delay::authorize_sql_for_test as authorize_sql_installed;
+
+/// Lets a test make preparing a chosen statement slow, to show where the
+/// statement time bound starts.
+#[cfg(test)]
+mod prepare_delay {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    thread_local! {
+        /// The function whose call makes a statement slow to prepare on this
+        /// thread, and for how long.
+        static DELAY: RefCell<Option<(&'static str, Duration)>> = const { RefCell::new(None) };
+    }
+
+    /// Make preparing a statement that calls `function` take `delay`.
+    pub(super) fn slow_prepare(function: &'static str, delay: Duration) {
+        DELAY.with(|slot| *slot.borrow_mut() = Some((function, delay)));
+    }
+
+    pub(super) fn authorize_sql_for_test(context: AuthContext<'_>) -> Authorization {
+        if let AuthAction::Function { function_name } = context.action {
+            let slow = DELAY.with(|slot| *slot.borrow());
+            if let Some((_, delay)) = slow.filter(|(function, _)| *function == function_name) {
+                std::thread::sleep(delay);
+            }
         }
-    );
-    if let Some(delay) = PREPARE_DELAY.with(std::cell::Cell::get).filter(|_| slow) {
-        std::thread::sleep(delay);
+        super::authorize_sql(context)
     }
 }
 
@@ -710,8 +726,6 @@ fn authorize_sql(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::
     // place that sees everything able to move a schema cookie. See
     // `SchemaCookie`.
     SQL_PREPARES.fetch_add(1, Ordering::Relaxed);
-    #[cfg(test)]
-    slow_prepare_for_test(&context.action);
 
     let prohibited = match context.action {
         // The Attach deny is also the only thing blocking VACUUM and VACUUM
@@ -851,7 +865,7 @@ fn without_sql_authorizer<T>(
     let result = callback(connection);
     // SQLite only fails this on allocation failure; continuing would run user
     // SQL without the authorizer.
-    if let Err(error) = connection.authorizer(Some(authorize_sql)) {
+    if let Err(error) = connection.authorizer(Some(authorize_sql_installed)) {
         eprintln!("celld: could not reinstall the SQL authorizer: {error}");
         std::process::abort();
     }
@@ -1008,7 +1022,7 @@ fn finish_open(
     }
     // Before the authorizer: the size cap is set with a pragma it denies.
     crate::sql_limits::install(&mut c)?;
-    c.authorizer(Some(authorize_sql))?;
+    c.authorizer(Some(authorize_sql_installed))?;
     // rusqlite's default holds 16 statements; the KV texts plus a cell's
     // few hot user statements fit in 64 without evicting each other.
     c.set_prepared_statement_cache_capacity(64);
@@ -1570,8 +1584,8 @@ pub fn sql_exec(scope: &str, query: &str, binds: &[serde_json::Value]) -> Result
                     let Some(mut statement) = batch.next().map_err(|e| e.to_string())? else {
                         break;
                     };
-                    let mut rows = statement.query([]).map_err(|e| e.to_string())?;
-                    while rows.next().map_err(|e| e.to_string())?.is_some() {}
+                    // One step, no parameter check, as `execute_batch` does.
+                    statement.raw_query().next().map_err(|e| e.to_string())?;
                 }
                 return Ok((
                     Vec::new(),
@@ -2714,20 +2728,14 @@ fn d1_result_limit_error() -> String {
     )
 }
 
-/// Where a D1 statement began: the connection's change count, taken as the
-/// statement's clock starts. That clock, before the statement is prepared, is
-/// the one the time bound and the statistics both read.
-#[derive(Clone, Copy)]
-struct D1Start {
-    changes: u64,
-}
+/// Clears the statement deadline when a D1 run ends, on every path: what runs
+/// next is engine SQL (a migration's bookkeeping), which the bound does not
+/// reach.
+struct Disarm;
 
-impl D1Start {
-    unsafe fn now(database: *mut rusqlite::ffi::sqlite3) -> Self {
-        crate::sql_limits::arm();
-        Self {
-            changes: total_changes_for_handle(database),
-        }
+impl Drop for Disarm {
+    fn drop(&mut self) {
+        crate::sql_limits::disarm();
     }
 }
 
@@ -2783,7 +2791,7 @@ struct D1Stepped {
 /// on every path. `keep` below the row cap means the caller asked for fewer
 /// rows (`first()` keeps one), so rows past it are dropped without an error;
 /// at the cap, overflow is a refusal. The statement is recorded when this
-/// returns, timed from `start`, where its clock began: before it was prepared.
+/// returns.
 unsafe fn d1_step_to_done(
     scope: &str,
     database: *mut rusqlite::ffi::sqlite3,
@@ -2791,13 +2799,13 @@ unsafe fn d1_step_to_done(
     started_in_transaction: bool,
     keep: usize,
     budget: &mut usize,
-    start: D1Start,
+    changes_before: u64,
 ) -> Result<D1Stepped, String> {
     let mut recording = D1Recording {
         scope,
         database,
         statement,
-        changes_before: start.changes,
+        changes_before,
         stats: crate::sql_stats::Running::default(),
     };
     let mut returned_bytes = 0;
@@ -2994,8 +3002,10 @@ unsafe fn d1_run_statements(
     let mut source_ptr = source.as_ptr();
     let mut count = 0_u64;
     let mut results = Vec::new();
+    let _disarm = Disarm;
     loop {
-        let start = D1Start::now(database);
+        crate::sql_limits::arm();
+        let changes_before = total_changes_for_handle(database);
         let mut statement = std::ptr::null_mut();
         let mut tail = std::ptr::null();
         let prepare =
@@ -3052,7 +3062,7 @@ unsafe fn d1_run_statements(
             started_in_transaction,
             keep,
             &mut budget,
-            start,
+            changes_before,
         );
         rusqlite::ffi::sqlite3_finalize(statement);
         let stepped = stepped.map_err(failure)?;
@@ -3088,7 +3098,9 @@ unsafe fn d1_run_prepared(
     let database = connection.handle();
     let started_in_transaction = rusqlite::ffi::sqlite3_get_autocommit(database) == 0;
     let schema_before = d1_schema_version(connection);
-    let start = D1Start::now(database);
+    let _disarm = Disarm;
+    crate::sql_limits::arm();
+    let changes_before = total_changes_for_handle(database);
     let mut statement = std::ptr::null_mut();
     let mut tail = std::ptr::null();
     let prepare =
@@ -3150,7 +3162,7 @@ unsafe fn d1_run_prepared(
         started_in_transaction,
         keep,
         budget,
-        start,
+        changes_before,
     );
     let rows_read = stepped
         .as_ref()
@@ -3161,7 +3173,7 @@ unsafe fn d1_run_prepared(
     if let Some(over) = stepped.over {
         return Err(d1_error(over));
     }
-    let rows_written = total_changes_for_handle(database).saturating_sub(start.changes);
+    let rows_written = total_changes_for_handle(database).saturating_sub(changes_before);
     let (last_row_id, changes) = if readonly {
         (0, 0)
     } else {
@@ -4767,15 +4779,13 @@ mod recycle_tests {
 
     /// A bounded statement of a few thousand rows: well past the handler's
     /// first check, and far shorter than any bound below. The `typeof` call
-    /// is what [`slow_prepare`] keys on.
+    /// is what the tests make slow to prepare.
     const SLOW_TO_PREPARE: &str = "WITH RECURSIVE c(x) AS \
         (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 5000) \
         SELECT count(typeof(x)) FROM c";
 
-    /// Make preparing a statement that calls `typeof` take `delay` on this
-    /// thread, by sleeping in the authorizer SQLite consults while it prepares.
-    fn slow_prepare(delay: std::time::Duration) {
-        PREPARE_DELAY.with(|slot| slot.set(Some(delay)));
+    fn slow_prepare(function: &'static str, delay: std::time::Duration) {
+        super::prepare_delay::slow_prepare(function, delay);
     }
 
     /// One rule on every path: the bound starts before the statement is
@@ -4789,7 +4799,7 @@ mod recycle_tests {
     fn slow_cell(dir: &tempfile::TempDir, scope: &str) {
         limit(Some(300), None);
         open_in(dir, "cell.sqlite", scope);
-        slow_prepare(std::time::Duration::from_millis(400));
+        slow_prepare("typeof", std::time::Duration::from_millis(400));
     }
 
     #[test]
@@ -4887,10 +4897,69 @@ mod recycle_tests {
         let dir = tempfile::tempdir().unwrap();
         limit(Some(300), None);
         open_in(&dir, "cell.sqlite", "batch-bound");
-        slow_prepare(std::time::Duration::from_millis(200));
+        slow_prepare("typeof", std::time::Duration::from_millis(200));
         let batch = format!("{SLOW_TO_PREPARE}; {SLOW_TO_PREPARE}; {SLOW_TO_PREPARE};");
         sql_exec("batch-bound", &batch, &[]).expect("a statement within its bound was interrupted");
         close("batch-bound");
+    }
+
+    /// A batch steps each statement once, binds nothing, and checks no
+    /// parameter count: an unbound `?` is NULL, and a `SELECT` is not scanned
+    /// past its first row.
+    #[test]
+    fn a_sql_exec_batch_steps_each_statement_once() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        limit(Some(300), None);
+        open_in(&dir, "cell.sqlite", "batch-step");
+        sql_exec(
+            "batch-step",
+            "CREATE TABLE t (x); INSERT INTO t VALUES (?);",
+            &[],
+        )
+        .unwrap();
+        let (_, rows, _) =
+            sql_exec("batch-step", "SELECT count(*) FROM t WHERE x IS NULL", &[]).unwrap();
+        assert_eq!(rows, vec![vec![serde_json::json!(1)]]);
+
+        // Rows past the first are never stepped: a statement that would
+        // fail on its second row does not fail in a batch.
+        let (_, _, _) = sql_exec(
+            "batch-step",
+            "SELECT CASE x WHEN 1 THEN 1 ELSE abs(-9223372036854775807 - 1) END FROM \
+             (SELECT 1 AS x UNION ALL SELECT 2); CREATE TABLE u (y);",
+            &[],
+        )
+        .expect("a batch SELECT was stepped past its first row");
+        close("batch-step");
+    }
+
+    /// A D1 run leaves no deadline armed, so the bookkeeping after it is not
+    /// bounded: here a run that ends on a trailing comment, which prepares to
+    /// no statement.
+    #[test]
+    fn a_d1_run_leaves_no_deadline_armed() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        limit(Some(300), None);
+        open_in(&dir, "cell.sqlite", "d1-disarm");
+        let sql = "SELECT 1; -- done";
+        let source = CString::new(sql).unwrap();
+        with_mut("d1-disarm", |connection| {
+            // SAFETY: the connection outlives the call, which finalizes its
+            // statements.
+            unsafe { d1_run_statements("d1-disarm", connection, &source, sql, false, d1_error) }
+                .map(drop)
+                .unwrap_or_else(|_| panic!("the D1 run failed"));
+        })
+        .unwrap();
+        assert!(
+            !crate::sql_limits::armed(),
+            "the deadline outlived the D1 run"
+        );
+        close("d1-disarm");
     }
 
     thread_local! {

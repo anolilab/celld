@@ -135,6 +135,12 @@ pub(crate) fn elapsed() -> Duration {
         .map_or(Duration::ZERO, |started| started.elapsed())
 }
 
+/// Whether a deadline is armed, for tests.
+#[cfg(test)]
+pub(crate) fn armed() -> bool {
+    TIMEOUT.with(Cell::get).is_some()
+}
+
 pub(crate) fn disarm() {
     TIMEOUT.with(|slot| slot.set(None));
 }
