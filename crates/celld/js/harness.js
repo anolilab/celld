@@ -5879,13 +5879,11 @@ const __newEntrypointInstance = (name, props) =>
 // handler functions as fn(arg, env, ctx).
 // A missing fetch reports workerd's own text, the same one the loader
 // installs for a Worker with no default export, so the two paths agree.
-const __missingHandlers = new WeakSet();
 const __noHandler = (name, method) => {
   const error = method === "fetch" && name === "default"
     ? new Error("Handler does not export a fetch() function.")
     : new TypeError(
       `Entrypoint ${JSON.stringify(name)} has no ${method} handler`);
-  __missingHandlers.add(error);
   return error;
 };
 
@@ -5912,17 +5910,24 @@ const __dispatchEntrypointMethod = async (name, method, arg, props) => {
 // Invoke a handler inside the event frame that the host already opened. A
 // Queue dispatch uses this form because its host driver must receive and keep
 // driving the handler's waitUntil aggregate after the settlement is returned.
-const __dispatchEntrypointMethodInCurrentEvent = async (name, method, arg) => {
+const __dispatchEntrypointMethodInCurrentEvent = async (name, method, arg, own) => {
+  // `own.error` is the missing-handler error of this lookup, so a caller can
+  // tell it from one a nested call threw.
+  const missing = () => {
+    const error = __noHandler(name, method);
+    if (own !== undefined) own.error = error;
+    return error;
+  };
   const handler = __cell.objectEntrypoints[name];
   if (handler !== undefined) {
     if (typeof handler[method] !== "function")
-      throw __noHandler(name, method);
+      throw missing();
     return await __ctxRun(undefined,
       () => handler[method](arg, __cell.env, __entrypointContext()));
   }
   const inst = __newEntrypointInstance(name, undefined);
   if (typeof inst[method] !== "function")
-    throw __noHandler(name, method);
+    throw missing();
   return await __ctxRun(undefined, () => inst[method](arg));
 };
 const __dispatchEntrypointFetch = __celld.__dispatchEntrypointFetch =
@@ -6071,12 +6076,16 @@ __celld.__dispatchEntrypointEmail = async (name, metaJson, raw) => {
     return answer({ outcome: "no_handler" });
   }
   const inbound = __celld.__makeInboundEmail(JSON.parse(metaJson), raw);
+  const own = {};
   try {
-    await __dispatchEntrypointMethodInCurrentEvent(name, "email", inbound.message);
+    await __dispatchEntrypointMethodInCurrentEvent(name, "email", inbound.message, own);
   } catch (error) {
     // The handler is looked up on the constructed instance, like any other
-    // entrypoint method, so one a constructor or a field assigns counts.
-    if (__missingHandlers.has(error)) return answer({ outcome: "no_handler" });
+    // entrypoint method, so one a constructor or a field assigns counts. Only
+    // this lookup may answer 501: a missing handler that a call the handler
+    // made reports is the handler's own failure.
+    if (own.error !== undefined && error === own.error)
+      return answer({ outcome: "no_handler" });
     let text;
     try {
       text = String(error);

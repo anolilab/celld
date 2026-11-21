@@ -19,18 +19,38 @@
 //   forward-wait-throw  starts a forward in waitUntil, then throws
 //   hang        waits for an hour
 //   hang-forward  waits for an hour, and tries to forward from waitUntil after 1.5 s
+//   forward-then-reject  forwards to team@example.net, then calls setReject
+//   wait-reply-then-reject  starts a streamed raw reply in waitUntil (its bytes arrive after
+//               0.6 s, when the route has answered), then calls setReject at once
+//   wait-reply-then-throw  the same, then throws
+//   nested-missing  calls an entrypoint of this script that has no fetch()
 //   late        tries to reject the message after the handler returned
 //   throw       throws
 //   (any other) accepts
 import { EmailMessage } from "cloudflare:email";
+import { WorkerEntrypoint } from "cloudflare:workers";
+
+// An entrypoint with no fetch(), for a call the email handler makes.
+export class NoFetch extends WorkerEntrypoint {}
+
+// A handler that reports what it saw does so through setReject, and also keeps the
+// report in KV, which every isolate sees, for GET /__report: a message the handler sent
+// mail for answers 200 whatever it called, so its status carries no report.
+async function report(env, message, text) {
+  await env.KV.put("report", text);
+  message.setReject(text);
+}
 
 export default {
-  async fetch(request) {
-    if (new URL(request.url).pathname === "/__ready") return new Response("ready");
+  async fetch(request, env) {
+    const path = new URL(request.url).pathname;
+    if (path === "/__report") return new Response((await env.KV.get("report")) ?? "");
+    if (path === "/__ready") return new Response("ready");
     return new Response("fetch");
   },
 
   async email(message, env, ctx) {
+    await env.KV.delete("report");
     const subject = message.headers.get("subject") ?? "";
     switch (message.headers.get("x-mode")) {
       case "echo": {
@@ -76,7 +96,7 @@ export default {
         try {
           await message.reply(reply);
         } catch (error) {
-          message.setReject("second:" + error.code);
+          await report(env, message, "second:" + error.code);
         }
         return;
       }
@@ -86,28 +106,28 @@ export default {
             new EmailMessage(message.to, "eve@example.net", "From: " + message.to + "\r\n\r\nx\r\n"),
           );
         } catch (error) {
-          message.setReject("code:" + error.code);
+          await report(env, message, "code:" + error.code);
         }
         return;
       case "reply-code":
         try {
           await message.reply({ from: message.to, subject: "Re", text: "x" });
-          message.setReject("sent");
+          await report(env, message, "sent");
         } catch (error) {
-          message.setReject("code:" + error.code);
+          await report(env, message, "code:" + error.code);
         }
         return;
       case "forward-to":
         try {
           await message.forward(message.headers.get("x-to"));
-          message.setReject("sent");
+          await report(env, message, "sent");
         } catch (error) {
-          message.setReject("code:" + error.code);
+          await report(env, message, "code:" + error.code);
         }
         return;
       case "forward-id": {
         const { messageId } = await message.forward("team@example.net");
-        message.setReject("id:" + messageId);
+        await report(env, message, "id:" + messageId);
         return;
       }
       case "forward-throw":
@@ -135,7 +155,7 @@ export default {
         const forwards = await Promise.all(
           [1, 2, 3, 4].map(() => message.forward("team@example.net").then(() => "ok", (error) => error.code)),
         );
-        message.setReject([second, ...forwards].join("|"));
+        await report(env, message, [second, ...forwards].join("|"));
         return;
       }
       case "reply-limit": {
@@ -144,7 +164,7 @@ export default {
         const first = await message.reply(reply).then(() => "ok", (error) => error.code);
         await Promise.all(forwards);
         const second = await message.reply(reply).then(() => "ok", (error) => error.code);
-        message.setReject(first + "|" + second);
+        await report(env, message, first + "|" + second);
         return;
       }
       case "forward-wait-throw":
@@ -165,6 +185,56 @@ export default {
         return;
       case "hang":
         await new Promise((resolve) => setTimeout(resolve, 3_600_000));
+        return;
+      case "forward-then-reject":
+        await message.forward("team@example.net");
+        message.setReject("after the forward");
+        return;
+      case "wait-reply-then-reject":
+        ctx.waitUntil(
+          message.reply(
+            new EmailMessage(
+              message.to,
+              message.from,
+              new ReadableStream({
+                async start(controller) {
+                  await new Promise((resolve) => setTimeout(resolve, 600));
+                  controller.enqueue(
+                    new TextEncoder().encode(
+                      `From: ${message.to}\r\nTo: ${message.from}\r\nSubject: Re\r\n\r\nraw reply\r\n`,
+                    ),
+                  );
+                  controller.close();
+                },
+              }),
+            ),
+          ),
+        );
+        message.setReject("after starting the reply");
+        return;
+      case "wait-reply-then-throw":
+        ctx.waitUntil(
+          message.reply(
+            new EmailMessage(
+              message.to,
+              message.from,
+              new ReadableStream({
+                async start(controller) {
+                  await new Promise((resolve) => setTimeout(resolve, 600));
+                  controller.enqueue(
+                    new TextEncoder().encode(
+                      `From: ${message.to}\r\nTo: ${message.from}\r\nSubject: Re\r\n\r\nraw reply\r\n`,
+                    ),
+                  );
+                  controller.close();
+                },
+              }),
+            ),
+          ),
+        );
+        throw new Error("after starting the reply");
+      case "nested-missing":
+        await ctx.exports.NoFetch.fetch("http://nested/");
         return;
       case "late":
         ctx.waitUntil(

@@ -61,11 +61,27 @@ async fn post_mode(server: &Server, mode: &str) -> (u16, Value) {
     post(server, ENVELOPE, message(mode).into_bytes()).await
 }
 
-/// The reason a handler reported through `setReject()`.
+/// What a handler reported about the message. It is the reason of its
+/// `setReject()`, but a message whose copy was sent answers 200 instead, so the
+/// fixture also keeps the report for the Worker's own `/__report`.
 async fn reported(server: &Server, query: &str, raw: String) -> String {
     let (status, body) = post(server, query, raw.into_bytes()).await;
-    assert_eq!(status, 550, "{body}");
-    body["reason"].as_str().unwrap().to_string()
+    match status {
+        550 => body["reason"].as_str().unwrap().to_string(),
+        200 => {
+            let report = client()
+                .get(server.url("/__report"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(!report.is_empty(), "the handler reported nothing: {body}");
+            report
+        }
+        _ => panic!("{status}: {body}"),
+    }
 }
 
 #[tokio::test]
@@ -191,10 +207,9 @@ async fn a_reply_goes_to_the_sender_threaded_to_the_message() {
 async fn a_message_may_be_replied_to_once_and_only_as_its_recipient_to_its_sender() {
     let sink = Sink::start(Behaviour::default()).await;
     let server = start(&sink, "inbound-email").await;
-    let (status, body) = post_mode(&server, "reply-twice").await;
     assert_eq!(
-        (status, body["reason"].as_str()),
-        (550, Some("second:E_VALIDATION_ERROR"))
+        reported(&server, ENVELOPE, message("reply-twice")).await,
+        "second:E_VALIDATION_ERROR"
     );
     assert_eq!(sink.delivered().len(), 1);
     let (status, body) = post_mode(&server, "reply-wrong").await;
@@ -676,4 +691,114 @@ async fn an_upload_that_stalls_is_cut_off_and_does_not_hold_a_place() {
     }
     let (status, body) = post_mode(&server, "accept").await;
     assert_eq!(status, 200, "{body}");
+}
+
+/// The log lines of one event, with the message id the node logged for it.
+fn log_lines(server: &Server, event: &str) -> Vec<String> {
+    server
+        .log_text()
+        .lines()
+        .filter(|line| line.contains(event))
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_reject_after_a_forward_is_accepted_so_the_relay_does_not_bounce_a_delivered_message() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, "inbound-email").await;
+    let (status, body) = post_mode(&server, "forward-then-reject").await;
+    assert_eq!(
+        (status, &body["outcome"]),
+        (200, &Value::from("accepted")),
+        "{body}"
+    );
+    assert_eq!(sink.delivered().len(), 1, "{:?}", sink.transactions());
+    let lines = log_lines(&server, "inbound_email_rejected_after_delivery");
+    assert!(
+        lines.len() == 1 && lines[0].contains(MESSAGE_ID),
+        "{lines:?}"
+    );
+    // A reject with nothing delivered stays 550.
+    let (status, body) = post_mode(&server, "reject").await;
+    assert_eq!(status, 550, "{body}");
+}
+
+#[tokio::test]
+async fn a_streamed_reply_that_would_send_after_the_550_is_refused() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, "inbound-email").await;
+    // The reply's bytes arrive 0.6 s after the handler rejected, when the route
+    // has answered 550: the relay bounces the message, so nothing may go out.
+    let (status, body) = post_mode(&server, "wait-reply-then-reject").await;
+    assert_eq!(status, 550, "{body}");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(sink.delivered().is_empty(), "{:?}", sink.transactions());
+}
+
+#[tokio::test]
+async fn a_streamed_reply_that_would_send_after_the_500_is_refused() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, "inbound-email").await;
+    // The relay retries a 500, so a reply that went out after it would be sent twice.
+    let (status, body) = post_mode(&server, "wait-reply-then-throw").await;
+    assert_eq!(status, 500, "{body}");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(sink.delivered().is_empty(), "{:?}", sink.transactions());
+}
+
+#[tokio::test]
+async fn a_message_id_or_reference_with_8_bit_bytes_is_not_a_thread_id() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, "inbound-email").await;
+    let raw = |extra: &str| message("reply-code").replacen("\n\n", &format!("\n{extra}\n\n"), 1);
+    // A bad Reference is dropped and the reply is threaded on the rest.
+    let bad = "References: <a@x> <caf\u{e9}@x>";
+    assert_eq!(reported(&server, ENVELOPE, raw(bad)).await, "sent");
+    let text = String::from_utf8(sink.delivered()[0].body.clone().unwrap()).unwrap();
+    assert!(
+        text.contains(&format!("References: <a@x> {MESSAGE_ID}\r\n")),
+        "{text:?}"
+    );
+    // A Message-ID that is not ASCII is no id: the reply is refused cleanly.
+    let odd = message("reply-code").replace(MESSAGE_ID, "<caf\u{e9}@x>");
+    assert_eq!(
+        reported(&server, ENVELOPE, odd).await,
+        "code:E_FIELD_MISSING"
+    );
+    assert_eq!(sink.delivered().len(), 1);
+}
+
+#[tokio::test]
+async fn a_deadline_and_a_failure_are_logged_with_the_message_id() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start_with(
+        &sink,
+        "inbound-email",
+        &[SHORT, ("CELLD_EMAIL_FORWARD_ALLOW", FORWARD_ALLOW)],
+    )
+    .await;
+    let (status, body) = post_mode(&server, "hang").await;
+    assert_eq!(status, 504, "{body}");
+    let lines = log_lines(&server, "inbound_email_timeout");
+    assert!(
+        lines.len() == 1 && lines[0].contains(MESSAGE_ID),
+        "{lines:?}"
+    );
+    let (status, body) = post_mode(&server, "throw").await;
+    assert_eq!(status, 500, "{body}");
+    let lines = log_lines(&server, "inbound_email_failed");
+    assert!(
+        lines.len() == 1 && lines[0].contains(MESSAGE_ID),
+        "{lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_handler_in_a_call_the_handler_made_is_a_failure_not_501() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, "inbound-email").await;
+    let (status, body) = post_mode(&server, "nested-missing").await;
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(body["outcome"], "error");
 }

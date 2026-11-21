@@ -315,6 +315,14 @@ fn valid_message_id(id: &str) -> bool {
             .contains(|c: char| c.is_control() || c.is_whitespace() || "<>".contains(c))
 }
 
+/// Whether an id can go into the `In-Reply-To` and `References` headers of a
+/// reply, which hold printable ASCII only. An id with other bytes (8-bit, or
+/// U+FFFD from a lossy decode) is kept as it arrived for a forward, but it is
+/// absent for threading.
+fn threadable(id: &str) -> bool {
+    id.chars().all(|c| c.is_ascii_graphic())
+}
+
 /// What the node keeps of one inbound message for the event that handles it.
 /// Everything a handler may do with the message is decided from this.
 pub struct Event {
@@ -387,7 +395,7 @@ impl Event {
         if self.cancelled.load(Ordering::SeqCst) {
             return Err(EmailError::new(
                 "E_TIMEOUT",
-                "the email event was cancelled because the handler did not finish in time",
+                "the email event has answered or was cancelled, so nothing new is sent",
             ));
         }
         Ok(())
@@ -507,11 +515,11 @@ impl Event {
 
     /// The `In-Reply-To` and `References` values a reply to this message
     /// carries, or why there is no reply to make.
-    fn threading(&self) -> Result<(String, String), EmailError> {
-        let Some(id) = &self.message_id else {
+    pub fn threading(&self) -> Result<(String, String), EmailError> {
+        let Some(id) = self.message_id.as_ref().filter(|id| threadable(id)) else {
             return Err(EmailError::new(
                 "E_FIELD_MISSING",
-                "the incoming message has no Message-ID, so a reply cannot be threaded",
+                "the incoming message has no Message-ID of printable ASCII, so a reply cannot be threaded",
             ));
         };
         if self.from.is_empty() {
@@ -526,14 +534,15 @@ impl Event {
                 format!("a reply is not sent because {why}"),
             ));
         }
-        if self.references.len() > MAX_REFERENCES {
+        let kept: Vec<&String> = self.references.iter().filter(|id| threadable(id)).collect();
+        if kept.len() > MAX_REFERENCES {
             return Err(EmailError::new(
                 "E_VALIDATION_ERROR",
                 format!("the incoming message has more than {MAX_REFERENCES} References"),
             ));
         }
-        let mut references = self.references.clone();
-        references.push(id.clone());
+        let mut references: Vec<&str> = kept.into_iter().map(String::as_str).collect();
+        references.push(id);
         Ok((id.clone(), references.join(" ")))
     }
 
@@ -642,21 +651,22 @@ impl Event {
                 .filter(|(key, _)| key.eq_ignore_ascii_case(name))
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
+            let trimmed = if name == "References" {
+                trim_references(wanted)
+            } else {
+                wanted.clone()
+            };
             for (key, value) in found {
-                let same = value
-                    .as_str()
-                    .is_some_and(|value| value.split_whitespace().eq(wanted.split_whitespace()));
+                let same = value.as_str().is_some_and(|value| {
+                    value.split_whitespace().eq(wanted.split_whitespace())
+                        || value.split_whitespace().eq(trimmed.split_whitespace())
+                });
                 if !same {
                     return Err(invalid(&format!("{name}: is not the value for this reply")));
                 }
                 headers.remove(&key);
             }
-            let value = if name == "References" {
-                trim_references(wanted)
-            } else {
-                wanted.clone()
-            };
-            headers.insert(name.to_string(), Value::String(value));
+            headers.insert(name.to_string(), Value::String(trimmed));
         }
         if !headers
             .keys()
@@ -944,7 +954,11 @@ pub async fn handle(
             outcome
         }
         Ok(Err(error)) => {
-            tracing::warn!(event = "inbound_email_failed", %error);
+            tracing::warn!(
+                event = "inbound_email_failed",
+                message_id = message_id.as_deref().unwrap_or(""),
+                %error,
+            );
             Outcome::Failed("the message could not be handled".into())
         }
         Err(_) => {
@@ -953,6 +967,10 @@ pub async fn handle(
             // chosen; the rest of the event is cancelled when `giveup` drops.
             cancelled.store(true, Ordering::SeqCst);
             sends.settle().await;
+            tracing::warn!(
+                event = "inbound_email_timeout",
+                message_id = message_id.as_deref().unwrap_or(""),
+            );
             return after_delivery(
                 (
                     504,
@@ -970,13 +988,18 @@ pub async fn handle(
     // A handler that failed may have left a send in `waitUntil` talking to the
     // relay; it is waited for, since a 500 makes the relay post the message
     // again. A success is not held back for it: that 200 stands.
-    if answered.0 == 500 {
+    //
+    // A 500 or a 550 is final for new sends: none starts from here, and one
+    // already talking to the relay is waited for, since a delivery before the
+    // answer must not be bounced or retried.
+    if matches!(answered.0, 500 | 550) {
+        cancelled.store(true, Ordering::SeqCst);
         sends.settle().await;
     }
     after_delivery(answered, &sends.delivered, message_id.as_deref())
 }
 
-/// A handler that failed or timed out after the relay accepted a message it
+/// A handler that failed, timed out or called `setReject()` after the relay accepted a message it
 /// forwarded or replied to (a send still in flight when the handler failed or
 /// the deadline passed counts once the relay has answered it) has still delivered it, and a retry would send it
 /// again: the route answers 200 and logs the failure.
@@ -985,11 +1008,15 @@ fn after_delivery(
     delivered: &AtomicBool,
     message_id: Option<&str>,
 ) -> (u16, String) {
-    if !matches!(answered.0, 500 | 504) || !delivered.load(Ordering::Acquire) {
+    if !matches!(answered.0, 500 | 504 | 550) || !delivered.load(Ordering::Acquire) {
         return answered;
     }
     tracing::warn!(
-        event = "inbound_email_failed_after_delivery",
+        event = if answered.0 == 550 {
+            "inbound_email_rejected_after_delivery"
+        } else {
+            "inbound_email_failed_after_delivery"
+        },
         message_id = message_id.unwrap_or(""),
         status = answered.0,
         body = %answered.1,
@@ -1340,6 +1367,86 @@ mod tests {
     }
 
     #[test]
+    fn a_message_id_or_reference_that_is_not_printable_ascii_is_not_threaded_on() {
+        crate::asyncrt::install_test_host_runtime();
+        let head = "From: ann@example.org\r\nTo: bob@example.com\r\n";
+        let odd = parsed(&format!(
+            "{head}Message-ID: <caf\u{e9}@x>\r\nReferences: <a@x> <\u{fffd}@x> <b@x>\r\n\r\nx"
+        ));
+        assert_eq!(odd.message_id.as_deref(), Some("<caf\u{e9}@x>"));
+        assert_eq!(odd.references.len(), 3);
+        let event = Event::new(&mut parsed(&format!(
+            "{head}Message-ID: <m@x>\r\nReferences: <a@x> <\u{fffd}@x>\r\n\r\nx"
+        )));
+        let sent = event
+            .prepare_reply_builder(
+                serde_json::json!({ "from": "bob@example.com", "subject": "s", "text": "t" }),
+            )
+            .unwrap();
+        let text = String::from_utf8(sent.data).unwrap();
+        assert!(text.contains("In-Reply-To: <m@x>\r\n"), "{text}");
+        assert!(text.contains("References: <a@x> <m@x>\r\n"), "{text}");
+        // Without a usable Message-ID there is nothing to thread on.
+        let event = Event::new(&mut parsed(&format!(
+            "{head}Message-ID: <caf\u{e9}@x>\r\n\r\nx"
+        )));
+        let error = event
+            .prepare_reply_builder(
+                serde_json::json!({ "from": "bob@example.com", "subject": "s", "text": "t" }),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "E_FIELD_MISSING");
+    }
+
+    #[test]
+    fn a_builder_reply_to_a_long_thread_accepts_the_full_or_the_trimmed_chain() {
+        crate::asyncrt::install_test_host_runtime();
+        let ids: Vec<String> = (0..90).map(|i| format!("<{i:0>30}@example.org>")).collect();
+        let event = Event::new(&mut parsed(&format!(
+            "From: ann@example.org\r\nTo: bob@example.com\r\nMessage-ID: <m@x>\r\nReferences: {}\r\n\r\nx",
+            ids.join("\r\n ")
+        )));
+        let (_, full) = event.threading().unwrap();
+        let trimmed = trim_references(&full);
+        assert!(full.len() > 2000 && trimmed.len() <= 2000 && trimmed != full);
+        let reply = |references: &str| {
+            event.prepare_reply_builder(serde_json::json!({
+                "from": "bob@example.com", "subject": "s", "text": "t",
+                "headers": { "References": references },
+            }))
+        };
+        for accepted in [&full, &trimmed] {
+            let text = String::from_utf8(reply(accepted).unwrap().data).unwrap();
+            assert!(text.contains(&format!("References: {}", ids[0])), "{text}");
+        }
+        assert_eq!(reply("<other@x>").unwrap_err().code, "E_VALIDATION_ERROR");
+    }
+
+    #[test]
+    fn a_rejected_message_that_was_delivered_is_accepted() {
+        let delivered = AtomicBool::new(false);
+        let rejected = || (550, "{}".to_string());
+        assert_eq!(after_delivery(rejected(), &delivered, Some("<m@x>")).0, 550);
+        delivered.store(true, Ordering::Release);
+        assert_eq!(after_delivery(rejected(), &delivered, Some("<m@x>")).0, 200);
+    }
+
+    #[test]
+    fn a_forward_keeps_a_message_id_that_is_not_ascii() {
+        for id in ["<caf\u{e9}@x>", "<a\u{fffd}@x>"] {
+            let event = Event::new(&mut parsed(&format!(
+                "From: ann@example.org\r\nTo: bob@example.com\r\nMessage-ID: {id}\r\n\r\nx"
+            )));
+            let sent = event
+                .prepare_forward(&allow(), "team@example.net", &[])
+                .unwrap();
+            let text = String::from_utf8(sent.data).unwrap();
+            assert!(text.contains(&format!("Message-ID: {id}\r\n")), "{text}");
+            assert_eq!(text.matches("Message-ID:").count(), 1, "{text}");
+        }
+    }
+
+    #[test]
     fn a_raw_reply_to_a_long_thread_trims_the_chain() {
         crate::asyncrt::install_test_host_runtime();
         let refs = (0..90)
@@ -1375,8 +1482,6 @@ mod tests {
         delivered.store(true, Ordering::Release);
         assert_eq!(after_delivery(failed(), &delivered, Some("<m@x>")).0, 200);
         assert_eq!(after_delivery((504, "{}".into()), &delivered, None).0, 200);
-        // A refusal the handler asked for stays one.
-        assert_eq!(after_delivery((550, "{}".into()), &delivered, None).0, 550);
     }
 
     fn reply_message(extra: &str) -> Vec<u8> {
