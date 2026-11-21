@@ -634,6 +634,23 @@ async fn a_handler_that_fails_with_a_forward_in_flight_waits_for_it_and_answers_
 }
 
 #[tokio::test]
+async fn waituntil_work_that_never_settles_gives_its_place_back_after_the_deadline() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start_with(&sink, "inbound-email", &[SHORT]).await;
+    // Every place is taken by a message whose waitUntil work never ends.
+    for round in 0..4 {
+        let (status, body) = post_mode(&server, "wait-forever").await;
+        assert_eq!(status, 200, "round {round}: {body}");
+    }
+    let (status, _) = post_mode(&server, "accept").await;
+    assert_eq!(status, 503, "the places are held until the deadline");
+    // The work is cancelled one deadline after the answers.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let (status, body) = post_mode(&server, "accept").await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
 async fn an_upload_that_stalls_is_cut_off_and_does_not_hold_a_place() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let sink = Sink::start(Behaviour::default()).await;

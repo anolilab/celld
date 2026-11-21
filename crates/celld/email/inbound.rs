@@ -153,8 +153,9 @@ pub struct Inbound {
     /// The entries of every `References` header.
     pub references: Vec<String>,
     /// The place among [`MAX_CONCURRENT`] this message holds. It moves to the
-    /// [`Event`], so it is kept until the handler's event has ended.
-    pub permit: Option<Permit>,
+    /// [`Event`], so it is kept until the handler's event has ended, or until
+    /// the route gives up on it, whichever comes first.
+    pub place: Option<Place>,
     /// Set when the route gives up on the handler, so what it does from then
     /// on is refused.
     pub cancelled: Arc<AtomicBool>,
@@ -298,7 +299,7 @@ pub fn parse(
         headers,
         message_id,
         references,
-        permit: None,
+        place: None,
         cancelled: Arc::default(),
         sends: Arc::default(),
     })
@@ -315,6 +316,11 @@ fn valid_message_id(id: &str) -> bool {
             .contains(|c: char| c.is_control() || c.is_whitespace() || "<>".contains(c))
 }
 
+/// A place that the event holds and the route may take back: an event that
+/// never settles (a `waitUntil` promise that nothing resolves) cannot be
+/// unwound by cancelling it, and must not hold its place for good.
+pub type Place = Arc<std::sync::Mutex<Option<Permit>>>;
+
 /// What the node keeps of one inbound message for the event that handles it.
 /// Everything a handler may do with the message is decided from this.
 pub struct Event {
@@ -329,7 +335,7 @@ pub struct Event {
     replied: AtomicBool,
     cancelled: Arc<AtomicBool>,
     sends: Arc<Sends>,
-    _permit: Option<Permit>,
+    _place: Option<Place>,
 }
 
 /// Whether the headers or the envelope sender mark the message as one a
@@ -378,7 +384,7 @@ impl Event {
             replied: AtomicBool::new(false),
             cancelled: inbound.cancelled.clone(),
             sends: inbound.sends.clone(),
-            _permit: inbound.permit.take(),
+            _place: inbound.place.take(),
         }
     }
 
@@ -864,21 +870,17 @@ pub fn admit() -> Option<Permit> {
 /// relay hung up: the event is aborted, and what a handler that outlives the
 /// abort through `waitUntil` still does is refused.
 struct GiveUp {
-    cancelled: Option<Arc<AtomicBool>>,
+    cancelled: Arc<AtomicBool>,
+    /// The event's place, if the event still holds it.
+    place: Option<std::sync::Weak<std::sync::Mutex<Option<Permit>>>>,
     _abort: crate::runtime::AbortOnDrop,
-}
-
-impl GiveUp {
-    fn disarm(&mut self) {
-        self.cancelled = None;
-        self._abort.disarm();
-    }
 }
 
 impl Drop for GiveUp {
     fn drop(&mut self) {
-        if let Some(cancelled) = &self.cancelled {
-            cancelled.store(true, Ordering::SeqCst);
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Some(place) = self.place.as_ref().and_then(std::sync::Weak::upgrade) {
+            place.lock().unwrap_or_else(|e| e.into_inner()).take();
         }
     }
 }
@@ -903,7 +905,7 @@ pub async fn handle(
     }
     let inbound = match parse(body, from.as_deref(), to.as_deref()) {
         Ok(mut inbound) => {
-            inbound.permit = Some(permit);
+            inbound.place = Some(Arc::new(std::sync::Mutex::new(Some(permit))));
             inbound
         }
         Err(error) => {
@@ -916,9 +918,11 @@ pub async fn handle(
     let sends = inbound.sends.clone();
     let cancelled = inbound.cancelled.clone();
     let message_id = inbound.message_id.clone();
+    let place = inbound.place.as_ref().map(Arc::downgrade);
     let cancellation = crate::runtime::RequestCancellationLifetime::stateless();
-    let mut giveup = GiveUp {
-        cancelled: Some(inbound.cancelled.clone()),
+    let giveup = GiveUp {
+        cancelled: inbound.cancelled.clone(),
+        place,
         _abort: crate::runtime::AbortOnDrop::armed(cancellation.clone()),
     };
     let ran =
@@ -946,8 +950,16 @@ pub async fn handle(
             );
         }
     };
-    // The handler is done: what it left in `waitUntil` is not cancelled.
-    giveup.disarm();
+    // The handler is done, and what it left in `waitUntil` may go on, for as
+    // long as the deadline allows from now. Then the rest of the event is
+    // cancelled, as at the deadline, and the event's place is taken back even
+    // if the work never settles, so a handler that leaves such work cannot hold
+    // the places for good. For an event that has ended this does nothing.
+    crate::asyncrt::spawn(async move {
+        crate::asyncrt::sleep(deadline()).await;
+        drop(giveup);
+    })
+    .detach();
     let answered = answer(outcome);
     // A handler that failed may have left a send in `waitUntil` talking to the
     // relay; it is waited for, since a 500 makes the relay post the message
@@ -1047,7 +1059,7 @@ mod tests {
         let _places = PLACES.lock().unwrap_or_else(|e| e.into_inner());
         let permit = admit().unwrap();
         let mut inbound = parsed(MESSAGE);
-        inbound.permit = Some(permit);
+        inbound.place = Some(Arc::new(std::sync::Mutex::new(Some(permit))));
         let event = Event::new(&mut inbound);
         drop(inbound);
         // The handler is still running: the event, and so the place, is held.

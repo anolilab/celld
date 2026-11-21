@@ -17,6 +17,7 @@
 //               forwards four times at once and reports the second error and the four outcomes
 //   forward-hang  forwards to team@example.net and then waits for an hour
 //   forward-wait-throw  starts a forward in waitUntil, then throws
+//   wait-forever  accepts, leaving waitUntil work that never settles
 //   hang        waits for an hour
 //   hang-forward  waits for an hour, and tries to forward from waitUntil after 1.5 s
 //   late        tries to reject the message after the handler returned
@@ -150,6 +151,9 @@ export default {
       case "forward-wait-throw":
         ctx.waitUntil(message.forward("team@example.net"));
         throw new Error("after starting the forward");
+      case "wait-forever":
+        ctx.waitUntil(new Promise(() => {}));
+        return;
       case "forward-hang":
         await message.forward("team@example.net");
         await new Promise((resolve) => setTimeout(resolve, 3_600_000));

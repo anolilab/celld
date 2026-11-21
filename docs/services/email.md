@@ -258,7 +258,9 @@ Authorization: Bearer <inbound token or operator token>
   recipients is posted once for each. At most four messages are
   in flight; a message keeps its place until its handler's event has ended. A
   handler that is cancelled at the deadline or whose relay hung up ends, and
-  gives its place back, as soon as it unwinds.
+  gives its place back, as soon as it unwinds. `waitUntil` work that is still
+  running after the answer gets up to the same deadline from the answer; then
+  it is cancelled, and the place comes back even if the work never settles.
 - `forward()` and `reply()` need `CELLD_SMTP_HOST`; without a relay they
   reject, and a handler that does not catch it answers 500 and is retried.
 - Each message is held in memory twice while it is handled: the host's copy,
