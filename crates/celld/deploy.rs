@@ -1171,28 +1171,8 @@ pub async fn write(
         return Ok(manifest);
     }
 
-    // An attachment names this exact immutable prefix. Publish it only after
-    // the prefix is complete, so a node can never resolve a consumer to a
-    // half-uploaded deployment. The named and fleet pointers can move later
-    // without tearing this queue-to-consumer relationship.
-    publish_queue_attachments(bucket, &built.manifest, &built.prefix, queue_attachments).await?;
-
-    let target = crate::staged::Target {
-        script: built.script_name.clone(),
-        version: built.version.clone(),
-    };
-    // The named pointer resolves service-binding components; the fleet-wide
-    // one is the sole application selector, so it moves last. A concurrent
-    // deploy must produce a loser, not a lost write.
-    put_named_pointer(
-        bucket,
-        &built.script_name,
-        &ComponentPointer {
-            version: target.version.clone(),
-            prefix: target.prefix(),
-        },
-    )
-    .await?;
+    // Decide the primary before any write, so a refusal below leaves the
+    // queue attachments and the named pointer as they were.
     let mut current = read_fleet_pointer_checked(bucket).await?;
     // A pointer that does not decode cannot be read by any node, so a deploy
     // repairs it and its script becomes the primary. A pointer that decodes
@@ -1214,6 +1194,10 @@ pub async fn write(
     }
     let current =
         current.map(|(pointer, token)| (pointer.unwrap_or_else(unreadable_pointer), token));
+    let target = crate::staged::Target {
+        script: built.script_name.clone(),
+        version: built.version.clone(),
+    };
     let primary =
         (selection == Selection::Primary || repairs).then_some(built.script_name.as_str());
     // The fleet pointer is the one thing running nodes watch, so every
@@ -1224,7 +1208,7 @@ pub async fn write(
             .as_ref()
             .map(|(pointer, _)| pointer)
             .filter(|_| !repairs),
-        &[target],
+        std::slice::from_ref(&target),
         primary,
     )?;
     // A fleet that never stages keeps no component map when its script takes
@@ -1236,6 +1220,24 @@ pub async fn write(
     {
         pointer.components.clear();
     }
+    // An attachment names this exact immutable prefix. Publish it only after
+    // the prefix is complete, so a node can never resolve a consumer to a
+    // half-uploaded deployment. The named and fleet pointers can move later
+    // without tearing this queue-to-consumer relationship.
+    publish_queue_attachments(bucket, &built.manifest, &built.prefix, queue_attachments).await?;
+
+    // The named pointer resolves service-binding components; the fleet-wide
+    // one is the sole application selector, so it moves last. A concurrent
+    // deploy must produce a loser, not a lost write.
+    put_named_pointer(
+        bucket,
+        &built.script_name,
+        &ComponentPointer {
+            version: target.version.clone(),
+            prefix: target.prefix(),
+        },
+    )
+    .await?;
     write_fleet_pointer(bucket, current.map(|(_, token)| token), &pointer).await?;
     Ok(manifest)
 }

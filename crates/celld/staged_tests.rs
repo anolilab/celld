@@ -334,6 +334,42 @@ async fn a_pointer_that_names_no_script_and_no_manifest_needs_primary() {
     );
 }
 
+#[tokio::test]
+async fn a_refused_deploy_leaves_the_named_pointer_and_queue_attachments() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    crate::deploy::write(&fleet.bucket, &consumer("v1"), Selection::Activate)
+        .await
+        .expect("deploy the consumer");
+    drop_script_name(&fleet, "deploy/gone/v1").await;
+    let attachment = "deploy/queues/jobs/consumer.json";
+    let named_before = named_pointer(&fleet, "worker").await;
+    let attached_before = fleet
+        .bucket
+        .get(attachment)
+        .await
+        .unwrap()
+        .expect("attached")
+        .0;
+
+    let error = crate::deploy::write(&fleet.bucket, &consumer("v2"), Selection::Activate)
+        .await
+        .expect_err("refused");
+    assert!(error.to_string().contains("--primary"), "{error}");
+
+    let named_after = named_pointer(&fleet, "worker").await;
+    assert_eq!(named_after.version, named_before.version);
+    assert_eq!(named_after.prefix, named_before.prefix);
+    let attached_after = fleet
+        .bucket
+        .get(attachment)
+        .await
+        .unwrap()
+        .expect("attached")
+        .0;
+    assert_eq!(attached_after, attached_before);
+}
+
 #[test]
 fn primary_contradicts_no_activate() {
     let arguments = |flags: &[&str]| {
