@@ -302,6 +302,7 @@ pub fn validate() -> anyhow::Result<()> {
     // A malformed secrets key stops the node now, not at its first deployment
     // load. The file is read at load, like the operator token file above.
     crate::secrets::SecretsKey::from_variable()?;
+    crate::secrets::SecretsKey::previous_from_variable()?;
     crate::egress_filter::from_env()?;
     crate::ai::validate()?;
     crate::tls_roots::extra()?;

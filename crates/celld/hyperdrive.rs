@@ -440,9 +440,10 @@ mod tests {
         let manifest = one_binding(serde_json::json!({}));
         // One read of the script's secrets gives both the `env` pairs and the
         // values the binding consumes.
-        let secrets = crate::secrets::load(&bucket, &manifest, || Ok(Some(&key)))
-            .await
-            .unwrap();
+        let secrets =
+            crate::secrets::load(&bucket, &manifest, || Ok(crate::secrets::Keys::only(&key)))
+                .await
+                .unwrap();
         assert_eq!(secrets.env, [("TOKEN".to_string(), "t".to_string())]);
         let loaded = load(&manifest, secrets.consumed, None).unwrap();
         assert_eq!(loaded.len(), 1);
@@ -466,7 +467,7 @@ mod tests {
         crate::secrets::put(&bucket, &key, "app", "HYPERDRIVE_HD", URL, &BTreeSet::new())
             .await
             .unwrap();
-        let error = crate::secrets::load(&bucket, &manifest, || Ok(None))
+        let error = crate::secrets::load(&bucket, &manifest, || Ok(Default::default()))
             .await
             .expect_err("no key");
         assert!(format!("{error:#}").contains("secrets key"), "{error:#}");

@@ -275,3 +275,81 @@ async fn a_put_for_a_scope_the_node_does_not_serve_rebuilds_nothing() {
     })
     .await;
 }
+
+/// Run `work` against the dev store of `server`, as the CLI would against a bucket.
+async fn with_store<F, Fut>(server: &Server, work: F)
+where
+    F: FnOnce(celld::bucket::Bucket) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let database = std::fs::canonicalize(server.project().join(".celld/dev"))
+        .expect("resolve the dev state directory")
+        .join("objects.sqlite3");
+    host_runtime()
+        .spawn(async move {
+            work(celld::dev::open_local_bucket(&database).expect("open the dev store")).await;
+        })
+        .await
+        .expect("the store task finished");
+}
+
+#[tokio::test]
+async fn a_node_serves_an_old_secret_during_a_rotation_and_after_it_with_the_new_key() {
+    let encode = |byte: u8| base64::engine::general_purpose::STANDARD.encode([byte; 32]);
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let current = directory.path().join("current");
+    let previous = directory.path().join("previous");
+    std::fs::write(&current, encode(43)).expect("write the new key");
+    std::fs::write(&previous, encode(42)).expect("write the old key");
+    let (current_path, previous_path) = (
+        current.to_str().expect("a UTF-8 path").to_string(),
+        previous.to_str().expect("a UTF-8 path").to_string(),
+    );
+    let mut server = Server::start(
+        "secrets",
+        &[
+            ("CELLD_SECRETS_KEY_FILE", current_path.as_str()),
+            ("CELLD_SECRETS_KEY_PREVIOUS_FILE", previous_path.as_str()),
+        ],
+    )
+    .await;
+
+    // The secret was put under the old key, before the nodes had the new one.
+    with_store(&server, |bucket| async move {
+        let old = SecretsKey::parse(&key_text()).expect("a valid key");
+        secrets::put(
+            &bucket,
+            &old,
+            "secrets",
+            "API_TOKEN",
+            PLANTED,
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("put the secret");
+    })
+    .await;
+    let (status, reply) = reload(&server).await;
+    assert_eq!(status, 200, "{reply}");
+    let served: Value = server.get_json("/").await;
+    assert_eq!(served["token"], PLANTED, "the previous key opens it");
+
+    with_store(&server, |bucket| async move {
+        let old = SecretsKey::parse(&key_text()).expect("a valid key");
+        let new = SecretsKey::parse(&base64::engine::general_purpose::STANDARD.encode([43u8; 32]))
+            .expect("a valid key");
+        let rotated = secrets::rotate(&bucket, &old, &new).await.expect("rotate");
+        assert_eq!(rotated.entries, 1);
+    })
+    .await;
+
+    // Drop the previous key: the file now holds an unrelated key, which opens
+    // nothing, so only the new key can open the secret.
+    let unrelated = encode(7);
+    server
+        .restart_after(|_| std::fs::write(&previous, unrelated).expect("replace the old key"))
+        .await;
+    let served: Value = server.get_json("/").await;
+    assert_eq!(served["token"], PLANTED, "the new key alone opens it");
+    assert!(!server.log_text().contains(PLANTED));
+}
