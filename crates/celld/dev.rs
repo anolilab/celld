@@ -7,6 +7,7 @@
 //! one persisted local object store and one supervised celld node.
 
 use crate::bucket::Bucket;
+use crate::protocol::Manifest;
 use crate::{deploy, fleet};
 use anyhow::{bail, Context as _};
 use glob::{MatchOptions, Pattern};
@@ -734,26 +735,46 @@ fn read_dev_vars(config: &Path) -> anyhow::Result<deploy::VarOverrides> {
     Ok(deploy::VarOverrides::DotEnv(vars))
 }
 
-/// The config of the project that this `celld dev` node serves, so the node
-/// can read `.dev.vars` itself. Only the supervisor sets it.
+/// The configs of the projects that this `celld dev` node serves, as a JSON
+/// object from script name to config path, so the node can read each project's
+/// `.dev.vars` itself. Only the supervisor sets it.
 const CONFIG_ENV: &str = "CELLD_INTERNAL_DEV_CONFIG";
+
+/// The value of [`CONFIG_ENV`] for `projects`, each a script name and its config.
+fn config_map(projects: &[(String, PathBuf)]) -> anyhow::Result<String> {
+    serde_json::to_string(&projects.iter().cloned().collect::<BTreeMap<_, _>>())
+        .context("a project config path is not valid UTF-8")
+}
+
+/// The config that `script` was built from, in a [`CONFIG_ENV`] value. A script
+/// the map does not name has none, so it never reads another project's files.
+fn config_for(map: &str, script: &str) -> Option<PathBuf> {
+    serde_json::from_str::<BTreeMap<String, PathBuf>>(map)
+        .ok()?
+        .remove(script)
+}
 
 /// The entries of `.dev.vars` or the dotenv files, read now, that fill the
 /// Secrets Store bindings of a deployment, and the config's
 /// `localConnectionString` of each Hyperdrive binding, under the binding's
-/// local variable where that has no non-empty entry. The node calls it each
+/// local variable where that has no non-empty entry. The files are those of the
+/// project that `manifest`'s script was built from. The node calls it each
 /// time it loads a deployment, and keeps the values in memory only, so a
 /// secret never reaches the deployment on disk and a changed file reaches the
-/// next load. Empty outside a `celld dev` node.
-pub fn store_values() -> anyhow::Result<BTreeMap<String, String>> {
-    let Some(config) = std::env::var_os(CONFIG_ENV).filter(|_| is_dev_node()) else {
+/// next load. Empty outside a `celld dev` node, and for a script that this
+/// run did not build.
+pub fn store_values(manifest: &Manifest) -> anyhow::Result<BTreeMap<String, String>> {
+    let Some(map) = std::env::var(CONFIG_ENV).ok().filter(|_| is_dev_node()) else {
         return Ok(BTreeMap::new());
     };
-    let mut values = match read_dev_vars(Path::new(&config))? {
+    let Some(config) = config_for(&map, &manifest.script_name) else {
+        return Ok(BTreeMap::new());
+    };
+    let mut values = match read_dev_vars(&config)? {
         deploy::VarOverrides::DevVars(entries) | deploy::VarOverrides::DotEnv(entries) => entries,
         deploy::VarOverrides::None => BTreeMap::new(),
     };
-    let (_, project) = deploy::read_config(Some(config.into()))?;
+    let (_, project) = deploy::read_config(Some(config))?;
     add_local_connection_strings(&mut values, &project);
     Ok(values)
 }
@@ -867,7 +888,7 @@ async fn deploy_project(
     store: &Store,
     logs: bool,
     strict_compat_flags: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let bucket = open_local_bucket(&store.database)?;
     let options = deploy::Options {
         config: Some(config.to_path_buf()),
@@ -890,9 +911,8 @@ async fn deploy_project(
         built.report();
     }
     crate::wake_format::ensure_ready(&bucket).await?;
-    deploy::write(&bucket, &built, options.selection())
-        .await
-        .map(drop)
+    deploy::write(&bucket, &built, options.selection()).await?;
+    Ok(built.script_name)
 }
 
 async fn run_stack(
@@ -917,9 +937,12 @@ async fn run_stack(
         .transpose()?;
 
     console.progress("building the application");
-    deploy_project(config, store, options.logs, options.strict_compat_flags).await?;
+    let mut projects = vec![(
+        deploy_project(config, store, options.logs, options.strict_compat_flags).await?,
+        config.to_path_buf(),
+    )];
     let mut running = start_node(
-        config,
+        &projects,
         state,
         options.listener,
         options.logs,
@@ -947,16 +970,18 @@ async fn run_stack(
             }
             NodeEvent::Reload => {
                 console.progress("change detected; rebuilding the application");
-                if let Err(error) =
-                    deploy_project(config, store, options.logs, options.strict_compat_flags).await
+                match deploy_project(config, store, options.logs, options.strict_compat_flags).await
                 {
-                    console.failure(&format!("reload failed: {error:#}"));
-                    continue;
+                    Ok(script) => projects = vec![(script, config.to_path_buf())],
+                    Err(error) => {
+                        console.failure(&format!("reload failed: {error:#}"));
+                        continue;
+                    }
                 }
                 console.progress("restarting the application");
                 stop_running_node(running).await;
                 running = start_node(
-                    config,
+                    &projects,
                     state,
                     listener,
                     options.logs,
@@ -989,7 +1014,7 @@ enum NodeEvent {
 
 #[allow(clippy::disallowed_methods)] // Child supervision uses real host process and time APIs.
 async fn start_node(
-    config: &Path,
+    projects: &[(String, PathBuf)],
     state: &Path,
     listener: SocketAddr,
     logs: bool,
@@ -1037,7 +1062,7 @@ async fn start_node(
             "127.0.0.1:0",
         ])
         .env("CELLD_INTERNAL_DEV_STORE", &store.database)
-        .env(CONFIG_ENV, config)
+        .env(CONFIG_ENV, config_map(projects)?)
         .env("CELLD_WATCH", state.join("runtime"))
         .env(crate::operator_token::FILE_ENV, &token_file)
         .env("CELLD_NODE", format!("dev-{}", &project_hash[..12]))
@@ -1332,6 +1357,30 @@ mod tests {
         assert_eq!(values[&name("A")], "from-config-a");
         assert_eq!(values[&name("B")], "from-dev-vars");
         assert!(!values.contains_key(&name("C")) && !values.contains_key(&name("D")));
+    }
+
+    #[test]
+    fn each_script_reads_the_config_it_was_built_from() {
+        let map = config_map(&[
+            ("dev-a".to_string(), PathBuf::from("/work/a/wrangler.jsonc")),
+            ("dev-b".to_string(), PathBuf::from("/work/b/wrangler.jsonc")),
+        ])
+        .unwrap();
+        assert_eq!(
+            config_for(&map, "dev-a"),
+            Some(PathBuf::from("/work/a/wrangler.jsonc"))
+        );
+        assert_eq!(
+            config_for(&map, "dev-b"),
+            Some(PathBuf::from("/work/b/wrangler.jsonc"))
+        );
+    }
+
+    #[test]
+    fn a_script_this_run_did_not_build_has_no_config() {
+        let map = config_map(&[("dev-a".to_string(), PathBuf::from("/work/a/w.json"))]).unwrap();
+        assert_eq!(config_for(&map, "left-over"), None);
+        assert_eq!(config_for("not json", "dev-a"), None);
     }
 
     #[test]

@@ -699,19 +699,19 @@ fn store_bindings(manifest: &Manifest) -> anyhow::Result<Vec<StoreBinding<'_>>> 
     .collect()
 }
 
-/// The dev values for `manifest`: `read` runs only when a Secrets Store or
-/// Hyperdrive binding is marked, so an unreadable `.dev.vars` cannot stop a
-/// Worker that has none, and the files are read once for both.
+/// The dev values for `manifest`: `read` runs, given the manifest, only when a
+/// Secrets Store or Hyperdrive binding is marked, so an unreadable `.dev.vars`
+/// cannot stop a Worker that has none, and the files are read once for both.
 pub fn dev_values_for(
     manifest: &Manifest,
-    read: impl FnOnce() -> anyhow::Result<BTreeMap<String, String>>,
+    read: impl FnOnce(&Manifest) -> anyhow::Result<BTreeMap<String, String>>,
 ) -> anyhow::Result<BTreeMap<String, String>> {
     let marked = |binding_type| {
         raw_bindings(&manifest.raw_metadata, binding_type)
             .any(|binding| binding.get("dev_value") == Some(&serde_json::Value::Bool(true)))
     };
     if marked(STORE_BINDING_TYPE) || marked(crate::hyperdrive::BINDING_TYPE) {
-        read()
+        read(manifest)
     } else {
         Ok(BTreeMap::new())
     }
@@ -1380,15 +1380,15 @@ mod tests {
         let unmarked = store_manifest(serde_json::json!([store_binding("A", "st1", "k")]));
         let none = store_manifest(serde_json::json!([]));
         for manifest in [&unmarked, &none] {
-            let values = dev_values_for(manifest, || anyhow::bail!("unreadable .dev.vars"));
+            let values = dev_values_for(manifest, |_| anyhow::bail!("unreadable .dev.vars"));
             assert!(values.unwrap().is_empty());
         }
         let marked = store_manifest(serde_json::json!([{
             "type": STORE_BINDING_TYPE, "name": "A", "store_id": "st1",
             "secret_name": "k", "dev_value": true,
         }]));
-        assert!(dev_values_for(&marked, || anyhow::bail!("unreadable .dev.vars")).is_err());
-        let read = || Ok(BTreeMap::from([("A".to_string(), "v".to_string())]));
+        assert!(dev_values_for(&marked, |_| anyhow::bail!("unreadable .dev.vars")).is_err());
+        let read = |_: &Manifest| Ok(BTreeMap::from([("A".to_string(), "v".to_string())]));
         assert_eq!(dev_values_for(&marked, read).unwrap()["A"], "v");
     }
 
