@@ -28,7 +28,7 @@
 //! unspecified, multicast or reserved address, and a listener of this node,
 //! are refused; see [`crate::egress_filter::smtp_addresses`].
 //!
-//! A relay that answers `EHLO` with a 5xx gets `HELO` instead. It has no
+//! A relay that answers `EHLO` with 500, 501, 502 or 504 gets `HELO` instead. It has no
 //! extensions then, so it cannot be used with `STARTTLS` or `AUTH`.
 //!
 //! One message is one transaction on one connection: `EHLO`, optional
@@ -539,10 +539,11 @@ async fn transaction(
     }
     let ehlo = format!("EHLO {}", settings.helo);
     let first = connection.command("ehlo", &ehlo).await?;
-    // A relay that does not know `EHLO` answers it with a 5xx (RFC 5321
-    // section 4.1.1.1) and gets `HELO`. It then offers no extension, so there
+    // A relay that does not know `EHLO` answers it with 500, 501, 502 or 504
+    // (RFC 5321 section 4.2.4) and gets `HELO`. Any other refusal, such as a
+    // 554 for policy, is the relay's answer and is reported as it is. It then offers no extension, so there
     // is no `STARTTLS`, `AUTH`, `8BITMIME` or `SIZE`.
-    let helo_only = (500..600).contains(&first.code);
+    let helo_only = matches!(first.code, 500 | 501 | 502 | 504);
     let mut capabilities = if helo_only {
         expect(
             &mut connection,

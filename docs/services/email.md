@@ -68,8 +68,9 @@ read. The warning about a shared file is logged once, when the node reads the fi
   continues in the clear and never logs in before TLS. The relay's certificate
   must chain to the bundled public roots. `CELLD_EXTRA_CA_CERTS` is for what
   Workers dial and does not apply here.
-- A relay that answers `EHLO` with a 5xx (usually 500 or 502) is sent `HELO`
-  instead, as RFC 5321 says. It then has no extensions: `STARTTLS` is not
+- A relay that answers `EHLO` with 500, 501, 502 or 504 ("not recognised or
+  not implemented") is sent `HELO` instead, as RFC 5321 says. Any other
+  refusal, such as a 554, fails the send with its code at stage `ehlo`. It then has no extensions: `STARTTLS` is not
   possible, so `send()` fails as it does for a relay that does not offer it,
   unless `CELLD_SMTP_TLS` is `tls` or `off`; configured credentials fail the
   send with `E_DELIVERY_FAILED` before anything is sent, as there is no `AUTH`;
@@ -148,7 +149,8 @@ message as a string or a `ReadableStream` of bytes. celld requires that
   that same single address too; any other address is refused;
 - it has no `Received:` header;
 - its headers are valid UTF-8, or the message is refused with
-  `E_HEADER_VALUE_INVALID` (a message built from fields cannot hold such a
+  `E_HEADER_NAME_INVALID` for a bad byte in a name and `E_HEADER_VALUE_INVALID`
+  for one in a value (a message built from fields cannot hold such a
   header either). The body may hold any bytes. This is for a message a Worker
   supplies, also as the raw form of `reply()`; `forward()` sends the headers of
   the received message as they came;

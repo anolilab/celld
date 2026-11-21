@@ -35,6 +35,8 @@ pub(super) struct Behaviour {
     hang_on_quit: bool,
     /// Answer `EHLO` with a 502, as a relay that only knows `HELO` does.
     no_ehlo: bool,
+    /// Refuse `EHLO` with a 554, a policy refusal and not "unknown command".
+    blocked_ehlo: bool,
 }
 
 impl Behaviour {
@@ -134,6 +136,7 @@ async fn serve(
         }
         let reply = match verb.as_str() {
             "EHLO" if behaviour.no_ehlo => "502 5.5.1 command not implemented\r\n".to_string(),
+            "EHLO" if behaviour.blocked_ehlo => "554 5.7.1 blocked\r\n".to_string(),
             "HELO" => "250 sink\r\n".to_string(),
             "EHLO" => {
                 let mut reply = String::from("250-sink\r\n");
@@ -1110,5 +1113,29 @@ async fn a_relay_that_does_not_know_ehlo_cannot_be_used_with_tls_or_credentials(
         sink.transactions().iter().all(|t| t.auth_args.is_empty()),
         "{:?}",
         sink.transactions()
+    );
+}
+
+#[tokio::test]
+async fn an_ehlo_refused_for_policy_is_reported_and_not_retried_as_helo() {
+    let sink = Sink::start(Behaviour {
+        blocked_ehlo: true,
+        ..Default::default()
+    })
+    .await;
+    let server = start(&sink, &[]).await;
+    let out = send(
+        &server,
+        sent_as("EMAIL", "ann@example.com", "bob@example.com"),
+    )
+    .await;
+    assert_eq!(out["code"], "E_DELIVERY_FAILED", "{out}");
+    let message = out["message"].as_str().unwrap();
+    assert!(message.contains("554") && message.contains("ehlo"), "{out}");
+    let seen = sink.transactions();
+    assert!(
+        seen.iter()
+            .all(|t| t.commands.iter().all(|c| !c.starts_with("HELO"))),
+        "{seen:?}"
     );
 }

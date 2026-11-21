@@ -46,12 +46,7 @@ pub fn prepare_raw(
     // Headers are read as text below, and a byte that is not UTF-8 would be
     // read as a replacement character: what was checked would not be what is
     // sent. The builder form cannot make such a header either.
-    if std::str::from_utf8(head).is_err() {
-        return Err(EmailError::new(
-            "E_HEADER_VALUE_INVALID",
-            "the message headers are not valid UTF-8",
-        ));
-    }
+    check_header_utf8(head)?;
     // A line longer than RFC 5321 allows is refused, not folded: folding a
     // body would change it.
     if body
@@ -115,6 +110,36 @@ pub fn prepare_raw(
         data,
         message_id,
     ))
+}
+
+/// Refuse a header line with a byte that is not UTF-8: in a name with
+/// `E_HEADER_NAME_INVALID`, in a value or a fold with `E_HEADER_VALUE_INVALID`,
+/// as the builder form does.
+fn check_header_utf8(head: &[u8]) -> Result<(), EmailError> {
+    let valid = |bytes: &[u8]| std::str::from_utf8(bytes).is_ok();
+    for line in head.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let continuation = line
+            .first()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'));
+        let (name, value) = match line.iter().position(|byte| *byte == b':') {
+            Some(colon) if !continuation => (&line[..colon], &line[colon + 1..]),
+            _ => (&line[..0], line),
+        };
+        if !valid(name) {
+            return Err(EmailError::new(
+                "E_HEADER_NAME_INVALID",
+                "a header name is not valid UTF-8",
+            ));
+        }
+        if !valid(value) {
+            return Err(EmailError::new(
+                "E_HEADER_VALUE_INVALID",
+                "a header value is not valid UTF-8",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `raw` with every line end, `\r\n`, `\n` or a lone `\r`, as `\r\n`.
@@ -293,9 +318,11 @@ mod tests {
             |bytes: &[u8]| prepare_raw(&binding(), "ann@example.com", "bob@example.com", bytes);
         let error = send(b"From: ann@example.com\nSubject: caf\xe9\n\nbody\n").unwrap_err();
         assert_eq!(error.code, "E_HEADER_VALUE_INVALID");
-        // A fold and a header name are headers too.
         let error = send(b"From: ann@example.com\nSubject: a\n b\xff\n\nbody\n").unwrap_err();
         assert_eq!(error.code, "E_HEADER_VALUE_INVALID");
+        // A bad byte in a name is a bad name, as in the builder form.
+        let error = send(b"From: ann@example.com\nX-\xe9: a\n\nbody\n").unwrap_err();
+        assert_eq!(error.code, "E_HEADER_NAME_INVALID");
         // Valid UTF-8 in a header, and any bytes in the body, are the sender's.
         assert!(send("From: ann@example.com\nSubject: caf\u{e9}\n\nbody\n".as_bytes()).is_ok());
         assert!(send(b"From: ann@example.com\n\nbody \xff\n").is_ok());
