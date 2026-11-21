@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::Endpoints;
+use super::{positive, Endpoints};
 
 pub async fn jget(client: &reqwest::Client, url: &str) -> Option<Value> {
     let response = client
@@ -326,15 +326,62 @@ impl Check {
     }
 }
 
-/// Look up every key, `parallel` at a time across the live nodes. A miss is
-/// retried once after 2 s, then counted.
+/// What one lookup of a node's debug route answered.
+pub type Looked = Option<(String, Value, u64, u64, u64)>;
+
+/// Lookups a check sends per second, all workers together. The store a node
+/// reads may close every connection (a gateway that answers `Connection:
+/// close`), and each lookup is three reads: unlimited, 32 workers use up the
+/// host's ephemeral ports within seconds, every later connect fails, the nodes
+/// miss their lease renewals and halt, and the check then waits on dead nodes.
+const CHECK_PER_S: f64 = 100.0;
+
+/// Look up every key, `parallel` at a time across the live nodes, at most
+/// `CELLD_REG_CHECK_PER_S` lookups a second (default 100). A miss is retried
+/// once after 2 s, then counted.
 pub async fn check_keys(
     ep: &Endpoints,
     keys: Vec<(String, Expect)>,
     parallel: usize,
     nodes: &[usize],
 ) -> Check {
+    let per_s = positive("CELLD_REG_CHECK_PER_S", CHECK_PER_S);
+    let ep = ep.clone();
+    check_with(
+        keys,
+        parallel,
+        nodes,
+        per_s,
+        Duration::from_secs(60),
+        move |node, key| {
+            let ep = ep.clone();
+            async move { lookup(&ep, node, &key).await }
+        },
+    )
+    .await
+}
+
+/// `check_keys` over any lookup. The whole check has a deadline, three times
+/// the time its rate needs plus `slack`; keys not answered by then are counted
+/// as misses, so a store or a node that is gone ends the check instead of
+/// holding it.
+pub async fn check_with<F, Fut>(
+    keys: Vec<(String, Expect)>,
+    parallel: usize,
+    nodes: &[usize],
+    per_s: f64,
+    slack: Duration,
+    lookup: F,
+) -> Check
+where
+    F: Fn(usize, String) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Looked> + Send,
+{
     let total = keys.len() as u64;
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs_f64(total as f64 / per_s * 3.0) + slack;
+    let gap = Duration::from_secs_f64(1.0 / per_s);
+    let next_slot = Arc::new(Mutex::new(tokio::time::Instant::now()));
     let queue = Arc::new(Mutex::new(keys));
     let check = Arc::new(Mutex::new(Check {
         total,
@@ -347,18 +394,35 @@ pub async fn check_keys(
     }));
     let mut tasks = Vec::new();
     for worker in 0..parallel {
-        let (ep, queue, check) = (ep.clone(), queue.clone(), check.clone());
+        let (queue, check, next_slot, lookup) = (
+            queue.clone(),
+            check.clone(),
+            next_slot.clone(),
+            lookup.clone(),
+        );
         let nodes = nodes.to_vec();
         tasks.push(tokio::spawn(async move {
             let mut at = worker;
-            loop {
+            while tokio::time::Instant::now() < deadline {
                 let Some((key, expect)) = queue.lock().unwrap().pop() else {
                     return;
                 };
                 at += 1;
                 let mut got = None;
                 for attempt in 0..2 {
-                    got = lookup(&ep, nodes[(at + attempt) % nodes.len()], &key).await;
+                    let slot = {
+                        let mut next = next_slot.lock().unwrap();
+                        let slot = (*next).max(tokio::time::Instant::now());
+                        *next = slot + gap;
+                        slot
+                    };
+                    tokio::time::sleep_until(slot).await;
+                    got = tokio::time::timeout_at(
+                        deadline,
+                        lookup(nodes[(at + attempt) % nodes.len()], key.clone()),
+                    )
+                    .await
+                    .unwrap_or(None);
                     let ok = got.as_ref().is_some_and(|(answer, ..)| match expect {
                         Expect::Exists => answer == "exists",
                         Expect::New => answer == "new",
@@ -398,7 +462,16 @@ pub async fn check_keys(
     for task in tasks {
         let _ = task.await;
     }
-    Arc::try_unwrap(check).ok().unwrap().into_inner().unwrap()
+    let mut check = Arc::try_unwrap(check).ok().unwrap().into_inner().unwrap();
+    let left = queue.lock().unwrap().len() as u64;
+    if left > 0 {
+        say!(
+            "check: deadline reached with {left} of {total} keys not looked up; counted as unknown"
+        );
+        check.unknown += left;
+        check.misses += left;
+    }
+    check
 }
 
 /// A record of what a gate measured, its threshold and the verdict.
