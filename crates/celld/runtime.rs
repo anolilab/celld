@@ -2667,6 +2667,7 @@ async fn wake(
             // disconnect no longer matters, but a lifecycle cancellation
             // must still retire the background work before the runtime stops.
             let Some(request_id) = request_id else {
+                let lingering = entry.lingering_left(budget);
                 let context = entry.io_context();
                 let retired = match arm_retire(retire, true) {
                     Ok(bell) => bell,
@@ -2677,6 +2678,13 @@ async fn wake(
                     result = ops.next() => Some(result),
                     _ = context.handed_ready() => None,
                     _ = retire_bell(retired) => None,
+                    // An event the budget bounds ends with it.
+                    _ = async {
+                        match lingering {
+                            Some(left) => tokio::time::sleep(left).await,
+                            None => std::future::pending().await,
+                        }
+                    } => return Wake::Expired,
                 };
                 match next {
                     Some(Some((op, result))) => return Wake::Op(op, result),
@@ -3084,7 +3092,15 @@ impl StatelessRuntime {
             verb.budget(),
         ));
         match receive.await {
-            Ok(result) => result,
+            Ok(result) => {
+                // A tail delivery ends with its event, `waitUntil` work
+                // included, which the budget bounds: the next batch for the
+                // consumer must not start while this one still runs.
+                if matches!(verb, StatelessVerb::Tail) {
+                    let _ = driving.await;
+                }
+                result
+            }
             // The driver dropped the reply without sending. Joining it here —
             // and only here — turns a bare "channel closed" into the panic
             // that actually caused it, at no cost on the path that works.

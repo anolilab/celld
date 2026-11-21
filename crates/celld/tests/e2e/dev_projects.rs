@@ -283,6 +283,32 @@ async fn a_consumer_that_never_returns_is_ended_and_later_items_still_arrive() {
 }
 
 #[tokio::test]
+async fn a_consumer_with_work_that_never_settles_has_one_event_at_a_time() {
+    let server = Server::start_projects(
+        &[TAIL_PRODUCER, TAIL_CONSUMER],
+        &[("CELLD_HANDLER_BUDGET_S", "4")],
+        |_| {},
+    )
+    .await;
+    let started = |server: &Server| server.log_text().matches("LINGER started").count();
+    assert_eq!(server.get_text("/linger").await, "produced");
+    wait_until("the first event", Duration::from_secs(30), || async {
+        (started(&server) == 1).then_some(())
+    })
+    .await;
+    assert_eq!(server.get_text("/linger").await, "produced");
+    // The first event has returned but its `waitUntil` work has not ended, so
+    // the next batch waits.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(started(&server), 1, "a second event started early");
+    // The runtime ends the first at the budget, and the batch goes out.
+    wait_until("the second event", Duration::from_secs(30), || async {
+        (started(&server) == 2).then_some(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_busy_request_reports_its_cpu_and_wall_time() {
     let server = Server::start_projects(&[TAIL_PRODUCER, TAIL_CONSUMER], &[], |_| {}).await;
     assert_eq!(server.get_text("/burn").await, "produced");

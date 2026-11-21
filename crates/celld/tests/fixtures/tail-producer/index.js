@@ -20,6 +20,10 @@ export default {
       // The consumer never returns from this one.
       console.log("make-the-consumer-hang");
     }
+    if (url.pathname === "/linger") {
+      // The consumer returns from this one and leaves `waitUntil` work behind.
+      console.log("make-the-consumer-linger");
+    }
     if (url.pathname === "/poison") {
       // The consumer throws on this one; the response must not change.
       console.log("make-the-consumer-throw");

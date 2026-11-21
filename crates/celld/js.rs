@@ -3298,6 +3298,9 @@ pub struct InFlight {
     response_status: Option<u16>,
     /// The report owed to the loader isolate after this invocation retires.
     tail_report: Option<TailReportState>,
+    /// Whether the budget also bounds the work that outlives the answer, as it
+    /// does for a `tail()` delivery, which the next one waits for.
+    ends_at_budget: bool,
     /// The isolate this entry's ops belong to, so `abandon` can drop their
     /// resolvers without a scope to reach the isolate through.
     runtime_state: Arc<ActorRuntimeState>,
@@ -3689,9 +3692,21 @@ impl InFlight {
             .then(|| budget.saturating_sub(self.started.elapsed()))
     }
 
-    /// Give up on a handler that will not settle.
+    /// How long the work that outlives the answer may still run, for an event
+    /// the budget bounds to its end. `None` for any other.
+    pub fn lingering_left(&self, budget: Duration) -> Option<Duration> {
+        self.ends_at_budget
+            .then(|| budget.saturating_sub(self.started.elapsed()))
+    }
+
+    /// Give up on a handler that will not settle, or end the `waitUntil` work
+    /// of one the budget bounds.
     pub fn time_out(&mut self, budget: Duration) {
         self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
+        if self.reply.is_none() {
+            self.background = None;
+            self.context.seal_wait_until();
+        }
     }
 
     /// Nothing this request awaits can move it, so it will never settle on
@@ -4759,6 +4774,7 @@ fn begin<'s>(
                 failure: None,
                 response_status: None,
                 tail_report,
+                ends_at_budget: false,
             };
             drop(guard);
             Begun::Running(Box::new(entry))
@@ -4855,6 +4871,7 @@ fn begin_entrypoint_rpc(
                 failure: None,
                 response_status: None,
                 tail_report: None,
+                ends_at_budget: false,
             };
             drop(guard);
             Begun::Running(Box::new(entry))
@@ -4923,6 +4940,7 @@ fn begin_tail(
                 failure: None,
                 response_status: None,
                 tail_report: None,
+                ends_at_budget: true,
             };
             drop(guard);
             Begun::Running(Box::new(entry))
@@ -5177,6 +5195,7 @@ fn begin_queue(
                 failure: None,
                 response_status: None,
                 tail_report,
+                ends_at_budget: false,
             };
             drop(guard);
             Begun::Running(Box::new(entry))
@@ -5376,6 +5395,7 @@ fn start_cell_event<'s>(
                 failure: None,
                 response_status: None,
                 tail_report: None,
+                ends_at_budget: false,
             };
             restore_io_context(tc, previous_io_context);
             drop(guard);
@@ -5432,6 +5452,7 @@ fn start_cell_event<'s>(
                     failure: Some(failure),
                     response_status: None,
                     tail_report: None,
+                    ends_at_budget: false,
                 }))
             };
             restore_io_context(tc, previous_io_context);

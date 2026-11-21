@@ -4,8 +4,9 @@
 //! A traced invocation hands its finished trace item to [`TailSink::submit`],
 //! which is one non-blocking `try_send` per consumer. Everything else happens
 //! on a task of its own: it takes the items that have gathered, sends them as
-//! one `tail(events)` call, and waits for that call to end before the next
-//! batch, so a consumer never has two calls running for one producer. The
+//! one `tail(events)` call, and waits for that call's event to end, its
+//! `waitUntil` work included, before the next batch, so a consumer never has
+//! two events running for one producer. The
 //! producer never waits for, and never sees the result of, that call.
 //!
 //! Each consumer has a bounded buffer, and the node has one byte budget for
@@ -22,11 +23,12 @@ use std::time::Duration;
 pub(crate) const BUFFER_ITEMS: usize = 256;
 /// The most trace items one `tail()` call carries.
 pub(crate) const BATCH_ITEMS: usize = 100;
-/// The bytes of trace items the whole node holds for delivery, in buffers and
-/// in the batch of a running call. An item past it is dropped.
+/// The bytes of trace items the whole node holds for delivery: the items in
+/// buffers, and the encoded batch of each running call. An item past it is
+/// dropped, and so is a batch the node has no room to encode.
 pub(crate) const NODE_BUFFER_BYTES: usize = 64 << 20;
-/// The share of that budget one producer can hold, so one Worker with a stuck
-/// consumer cannot leave the others nothing.
+/// The share of that budget one producer can hold in buffers, so one Worker
+/// with a stuck consumer cannot leave the others nothing.
 pub(crate) const PRODUCER_BUFFER_BYTES: usize = NODE_BUFFER_BYTES / 4;
 /// How long one `tail()` call may run before the runtime ends it.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -106,12 +108,16 @@ impl Drop for Reservation {
     }
 }
 
-/// One buffered trace item and its claim on the budget.
-struct Queued {
-    item: Arc<str>,
+/// One trace item and its claim on the budgets. Every consumer's buffer holds
+/// the same `Arc<Item>`, so the claim is made once and released when the last
+/// of them is done with the item.
+struct Item {
+    json: String,
     _producer: Reservation,
     _node: Reservation,
 }
+
+type Queued = Arc<Item>;
 
 struct Lane {
     tx: tokio::sync::mpsc::Sender<Queued>,
@@ -176,6 +182,7 @@ impl TailSink {
                     rx,
                     dropped.clone(),
                     retired.clone(),
+                    node.clone(),
                     deliver.clone(),
                 ))
                 .detach();
@@ -197,19 +204,22 @@ impl TailSink {
 
     /// Queue one trace item, a JSON object, for every consumer. Never blocks.
     pub(crate) fn submit(&self, item: String) {
-        let item: Arc<str> = item.into();
-        for lane in &self.lanes {
-            let queued = self
-                .producer
-                .reserve(item.len())
-                .zip(self.node.reserve(item.len()))
-                .map(|(producer, node)| Queued {
-                    item: item.clone(),
+        let queued: Option<Queued> = self
+            .producer
+            .reserve(item.len())
+            .zip(self.node.reserve(item.len()))
+            .map(|(producer, node)| {
+                Arc::new(Item {
+                    json: item,
                     _producer: producer,
                     _node: node,
                 })
-                .and_then(|queued| lane.tx.try_send(queued).ok());
-            if queued.is_none() && lane.dropped.fetch_add(1, Ordering::Relaxed) == 0 {
+            });
+        for lane in &self.lanes {
+            let sent = queued
+                .as_ref()
+                .and_then(|queued| lane.tx.try_send(queued.clone()).ok());
+            if sent.is_none() && lane.dropped.fetch_add(1, Ordering::Relaxed) == 0 {
                 // The first drop since the last report; the task reports the
                 // total when it next gets to run.
                 tracing::warn!(
@@ -348,24 +358,37 @@ pub(crate) fn redact_url(url: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| REDACTED.to_string())
 }
 
+/// The bytes of the batch the consumer receives, the array of items.
+fn encoded_len(items: &[Queued]) -> usize {
+    items.iter().map(|queued| queued.json.len()).sum::<usize>() + items.len().max(1) + 1
+}
+
 /// The batch the consumer receives: the array of items.
 fn encode_batch(items: &[Queued]) -> String {
-    let mut body = String::with_capacity(
-        items
-            .iter()
-            .map(|queued| queued.item.len() + 1)
-            .sum::<usize>()
-            + 2,
-    );
+    let mut body = String::with_capacity(encoded_len(items));
     body.push('[');
     for (index, queued) in items.iter().enumerate() {
         if index != 0 {
             body.push(',');
         }
-        body.push_str(&queued.item);
+        body.push_str(&queued.json);
     }
     body.push(']');
     body
+}
+
+/// What a producer that retired lost in all: the batch the lane had taken, the
+/// items still in its buffer, and those the buffer turned away earlier.
+fn retired_loss(
+    batch: usize,
+    rx: &mut tokio::sync::mpsc::Receiver<Queued>,
+    dropped: &AtomicU64,
+) -> u64 {
+    let mut lost = batch as u64 + dropped.swap(0, Ordering::Relaxed);
+    while rx.try_recv().is_ok() {
+        lost += 1;
+    }
+    lost
 }
 
 async fn deliver_lane(
@@ -374,6 +397,7 @@ async fn deliver_lane(
     mut rx: tokio::sync::mpsc::Receiver<Queued>,
     dropped: Arc<AtomicU64>,
     retired: Arc<AtomicBool>,
+    node: Arc<Budget>,
     deliver: Deliver,
 ) {
     let mut batch = Vec::with_capacity(BATCH_ITEMS);
@@ -383,10 +407,7 @@ async fn deliver_lane(
             return;
         }
         if retired.load(Ordering::SeqCst) {
-            let mut lost = batch.len();
-            while rx.try_recv().is_ok() {
-                lost += 1;
-            }
+            let lost = retired_loss(batch.len(), &mut rx, &dropped);
             tracing::warn!(
                 %script, %consumer, dropped = lost,
                 "tail producer retired; its buffered trace items were dropped"
@@ -400,11 +421,23 @@ async fn deliver_lane(
                 "tail consumer buffer was full; trace items were dropped"
             );
         }
+        // The encoded batch is a second copy of the items, so it is paid for
+        // from the node budget before it exists. Once it does, the items
+        // release theirs.
+        let Some(_encoded) = node.reserve(encoded_len(&batch)) else {
+            tracing::warn!(
+                %script, %consumer, dropped = batch.len(),
+                "tail buffer budget is spent; a batch of trace items was dropped"
+            );
+            continue;
+        };
+        let body = encode_batch(&batch);
+        batch.clear();
         // The call ends when the handler returns or throws, or when the
-        // runtime ends its event at `delivery_budget`. The next batch waits
-        // for that, so calls never overlap; the grace only covers a runtime
-        // that never reports.
-        let call = deliver(consumer.clone(), encode_batch(&batch));
+        // runtime ends its event at `delivery_budget`, `waitUntil` work
+        // included. The next batch waits for that, so events never overlap;
+        // the grace only covers a runtime that never reports.
+        let call = deliver(consumer.clone(), body);
         match crate::asyncrt::timeout(delivery_budget() + DELIVERY_GRACE, call).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => tracing::warn!(
@@ -766,19 +799,24 @@ mod tests {
             .unwrap()
         };
         let (first, second) = (sink("first"), sink("second"));
-        // Each producer has a call running on 40 bytes.
-        first.submit("a".repeat(40));
-        second.submit("b".repeat(40));
-        seen.until("both calls to start", |seen| {
+        // Each producer has a call running on 30 bytes, held as the batch
+        // `[...]` of 32.
+        first.submit("a".repeat(30));
+        seen.until("the first call to start", |seen| {
+            seen.entered.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        second.submit("b".repeat(30));
+        seen.until("the second call to start", |seen| {
             seen.entered.load(Ordering::SeqCst) == 2
         })
         .await;
-        assert_eq!(budget.used.load(Ordering::Relaxed), 80);
+        assert_eq!(budget.used.load(Ordering::Relaxed), 64);
         // 40 more bytes pass the node's 100, whichever producer sends them.
         first.submit("c".repeat(40));
         assert_eq!(first.lanes[0].dropped.load(Ordering::Relaxed), 1);
-        // 20 fit.
-        second.submit("d".repeat(20));
+        // 36 fit.
+        second.submit("d".repeat(36));
         assert_eq!(second.lanes[0].dropped.load(Ordering::Relaxed), 0);
         assert_eq!(budget.used.load(Ordering::Relaxed), 100);
         // What is delivered is released.
@@ -812,18 +850,134 @@ mod tests {
         })
         .await;
         greedy.submit("a".repeat(40));
-        // Its cap is 100, whatever the node has left.
-        greedy.submit("a".to_string());
+        // What it buffers is capped at 100, whatever the node has left.
+        greedy.submit("a".repeat(61));
         assert_eq!(greedy.lanes[0].dropped.load(Ordering::Relaxed), 1);
         // Another producer still buffers.
         other.submit("b".repeat(60));
         assert_eq!(other.lanes[0].dropped.load(Ordering::Relaxed), 0);
-        assert_eq!(node.used.load(Ordering::Relaxed), 160);
+        // The running call's batch of 62, and the 40 and 60 waiting.
+        assert_eq!(node.used.load(Ordering::Relaxed), 162);
         gate.add_permits(10);
         seen.until("the budget to be released", |_| {
             node.used.load(Ordering::Relaxed) == 0
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn a_producer_with_several_consumers_buffers_its_whole_cap_of_items() {
+        crate::asyncrt::install_test_host_runtime();
+        let node = Arc::new(Budget::new(10_000));
+        let seen = Seen::default();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let consumers = ["a", "b", "c"].map(String::from);
+        let sink = TailSink::with_budget(
+            "producer",
+            &consumers,
+            recording(&seen, Some(gate.clone()), false),
+            node.clone(),
+            100,
+        )
+        .unwrap();
+        sink.submit("x".to_string());
+        seen.until("every consumer's call to start", |seen| {
+            seen.entered.load(Ordering::SeqCst) == 3
+        })
+        .await;
+        // Ten distinct items of ten bytes fill the cap of 100 once, however
+        // many consumers share them.
+        for _ in 0..10 {
+            sink.submit("y".repeat(10));
+        }
+        for lane in &sink.lanes {
+            assert_eq!(lane.dropped.load(Ordering::Relaxed), 0);
+        }
+        assert_eq!(sink.producer.used.load(Ordering::Relaxed), 100);
+        sink.submit("z".to_string());
+        for lane in &sink.lanes {
+            assert_eq!(lane.dropped.load(Ordering::Relaxed), 1);
+        }
+        // The claim goes when the last consumer has taken the item.
+        gate.add_permits(100);
+        seen.until("the budget to be released", |_| {
+            node.used.load(Ordering::Relaxed) == 0
+        })
+        .await;
+        assert_eq!(sink.producer.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_running_batch_counts_against_the_node_with_the_items_waiting() {
+        crate::asyncrt::install_test_host_runtime();
+        let node = Arc::new(Budget::new(100));
+        let seen = Seen::default();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sink = TailSink::with_budget(
+            "producer",
+            &["slow".to_string()],
+            recording(&seen, Some(gate.clone()), false),
+            node.clone(),
+            usize::MAX,
+        )
+        .unwrap();
+        sink.submit("a".repeat(40));
+        seen.until("the call to start", |seen| {
+            seen.entered.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        // The batch the call runs on is held once, as its encoded 42 bytes.
+        assert_eq!(node.used.load(Ordering::Relaxed), 42);
+        sink.submit("b".repeat(60));
+        assert_eq!(sink.lanes[0].dropped.load(Ordering::Relaxed), 1);
+        sink.submit("b".repeat(58));
+        assert_eq!(node.used.load(Ordering::Relaxed), 100);
+        gate.add_permits(10);
+        seen.until("the budget to be released", |_| {
+            node.used.load(Ordering::Relaxed) == 0
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_batch_the_node_cannot_encode_is_dropped_and_released() {
+        crate::asyncrt::install_test_host_runtime();
+        let node = Arc::new(Budget::new(100));
+        let seen = Seen::default();
+        let sink = TailSink::with_budget(
+            "producer",
+            &["a".to_string()],
+            recording(&seen, None, false),
+            node.clone(),
+            usize::MAX,
+        )
+        .unwrap();
+        // The item fits, but it and its encoded copy do not.
+        sink.submit("a".repeat(60));
+        seen.until("the budget to be released", |_| {
+            node.used.load(Ordering::Relaxed) == 0
+        })
+        .await;
+        assert!(seen.calls().is_empty());
+    }
+
+    #[test]
+    fn a_retired_producer_reports_everything_it_lost_once() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let budget = Arc::new(Budget::new(100));
+        for _ in 0..3 {
+            tx.try_send(Arc::new(Item {
+                json: "{}".to_string(),
+                _producer: budget.reserve(1).unwrap(),
+                _node: budget.reserve(1).unwrap(),
+            }))
+            .unwrap();
+        }
+        let dropped = AtomicU64::new(5);
+        // Two taken as a batch, three still buffered, five turned away.
+        assert_eq!(retired_loss(2, &mut rx, &dropped), 10);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.used.load(Ordering::Relaxed), 0);
     }
 
     #[test]
