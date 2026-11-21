@@ -1024,6 +1024,16 @@ async fn internal_email_inbound(request: Request<Incoming>, app: AppHandle) -> H
             "no Worker runtime",
         ));
     };
+    // A draining node runs no more user code, and shutdown waits for the
+    // messages it already took, as for public requests.
+    let Some(_admission) = app.admit_public() else {
+        let mut draining = response(StatusCode::SERVICE_UNAVAILABLE, "the node is draining");
+        draining.headers_mut().insert(
+            hyper::header::RETRY_AFTER,
+            hyper::header::HeaderValue::from_static("1"),
+        );
+        return peer_response(draining);
+    };
     // Each message is held twice while it is handled, so a relay that sends
     // faster than the Worker answers is asked to wait.
     let Some(permit) = celld::email::inbound::admit() else {

@@ -310,7 +310,7 @@ retry:
 | 501 | `{"ok":false,"outcome":"no_handler",...}` | The primary Worker has no `email()` handler. Treat it as temporary: the operator can deploy one |
 | 504 | | The handler did not finish within 60 seconds (`CELLD_EMAIL_INBOUND_DEADLINE_S`). At the deadline no new `forward()` or `reply()` starts (it is refused with `E_TIMEOUT`), and one already talking to the relay is waited for, for as long as its own SMTP transaction allows. The rest of the event is then cancelled, as one whose client hung up is, and gives its place back. The answer is 200 if the relay accepted a send of the event, and 504 otherwise. Temporary, and the retry runs the handler again |
 | 408 | | The message was not received within the same time. Temporary |
-| 503 | | The node is busy (at most four messages at once, with `Retry-After`), or has no Worker runtime. Temporary |
+| 503 | | The node is busy (at most four messages at once, with `Retry-After`), is shutting down (with `Retry-After`; shutdown waits for the messages it already took, as for public requests), or has no Worker runtime. Temporary |
 | 400, 413, 431 | `{"ok":false,"error":"..."}` | The message was refused: empty, malformed, with a NUL byte, over 25 MiB (413), with a header line over 998 bytes, or with more than 64 KiB or 1,000 headers (431). The error names the fault |
 | 401 | | The bearer token is missing or wrong. The route accepts the token in `CELLD_EMAIL_INBOUND_TOKEN` (or its file) or the operator token; any other token is refused |
 
