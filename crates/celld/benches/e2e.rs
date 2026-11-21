@@ -52,6 +52,8 @@ struct Settings {
 struct Workload {
     name: &'static str,
     fixture: &'static str,
+    /// Fixtures of other projects served in the same session.
+    with: &'static [&'static str],
     path: fn(u64) -> String,
     /// How many distinct paths `path` cycles over. Each is requested once,
     /// and must succeed, before the clock starts, so no object's first
@@ -59,28 +61,39 @@ struct Workload {
     distinct: u64,
 }
 
-const WORKLOADS: [Workload; 4] = [
+const WORKLOADS: [Workload; 5] = [
     Workload {
         name: "hello",
         fixture: "bench-hello",
+        with: &[],
+        path: |_| "/".into(),
+        distinct: 1,
+    },
+    Workload {
+        name: "hello_tail",
+        fixture: "bench-hello-tail",
+        with: &["bench-tail-consumer"],
         path: |_| "/".into(),
         distinct: 1,
     },
     Workload {
         name: "do_counter",
         fixture: "bench-do-counter",
+        with: &[],
         path: |_| "/".into(),
         distinct: 1,
     },
     Workload {
         name: "do_sql_insert",
         fixture: "bench-do-sql-insert",
+        with: &[],
         path: |_| "/".into(),
         distinct: 1,
     },
     Workload {
         name: "do_fanout",
         fixture: "bench-do-fanout",
+        with: &[],
         path: |i| format!("/?name=object-{}", i % FANOUT_NAMES),
         distinct: FANOUT_NAMES,
     },
@@ -174,7 +187,15 @@ fn main() {
 /// Starts a fresh server for `workload`, then offers load for the warm-up and
 /// the measured window.
 async fn run_load(workload: &Workload, settings: &Settings) -> LoadResult {
-    let server = Arc::new(Server::start(workload.fixture, &[]).await);
+    let server = if workload.with.is_empty() {
+        Server::start(workload.fixture, &[]).await
+    } else {
+        let projects: Vec<_> = std::iter::once(workload.fixture)
+            .chain(workload.with.iter().copied())
+            .collect();
+        Server::start_projects(&projects, &[], |_| {}).await
+    };
+    let server = Arc::new(server);
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(settings.concurrency)
         .timeout(Duration::from_secs(20))

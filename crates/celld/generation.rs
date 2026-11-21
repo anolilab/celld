@@ -126,7 +126,8 @@ pub fn retire_deadline() -> std::time::Duration {
 }
 
 /// The scripts one deployment reaches: the primary script plus every
-/// service-binding target and queue consumer it declares, transitively.
+/// service-binding target, tail consumer and queue consumer it declares,
+/// transitively.
 ///
 /// [`DeploymentGraph::load`] is the only bucket walk, so the boot path and
 /// the reload path cannot resolve a deployment's dependencies differently.
@@ -329,6 +330,15 @@ fn dependencies_of(loaded: &LoadedDeployment, with_queues: bool) -> VecDeque<Dep
         .services
         .iter()
         .map(|(_, script, _)| Dependency::Service(script.clone()))
+        // A tail consumer is loaded like a service target: it has to run for
+        // the producer's trace items to reach it.
+        .chain(
+            loaded
+                .tail_consumers
+                .iter()
+                .cloned()
+                .map(Dependency::Service),
+        )
         .chain(queues.into_iter().map(Dependency::Queue))
         .collect()
 }
@@ -689,6 +699,7 @@ impl Generation {
                 ai_binding,
                 assets: resolver,
                 services,
+                tail_consumers,
                 crons,
                 containers,
                 fence_image: fence,
@@ -712,7 +723,8 @@ impl Generation {
                     .with_queue_consumers(queue_catalog.clone())
                     .with_crons(if is_primary { crons } else { Vec::new() })
                     .with_containers(containers)
-                    .with_generation(id),
+                    .with_generation(id)
+                    .with_tail_consumers(&tail_consumers),
             );
             if is_primary {
                 primary_config = Some(config.clone());

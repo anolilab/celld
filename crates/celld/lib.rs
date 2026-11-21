@@ -93,6 +93,7 @@ pub mod staged;
 pub mod startup;
 pub mod storage;
 pub(crate) mod storage_counters;
+pub mod tail_consumers;
 pub mod telemetry;
 pub mod tls_roots;
 pub mod wake;
@@ -182,6 +183,12 @@ pub enum WorkerJob {
         queued_at: std::time::Instant,
         batch: js::QueueBatch,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<js::QueueDispatchResult>>,
+    },
+    /// A batch of trace items for the default entrypoint's `tail()`. It
+    /// answers `[1]` when the handler returned and `[0]` when it threw.
+    Tail {
+        items: String,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
     },
 }
 

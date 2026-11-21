@@ -34,6 +34,9 @@ Each workload starts a fresh server on a fresh copy of its fixture
 
 - `hello`: a stateless Worker returning a small body. The floor for request
   handling without storage.
+- `hello_tail`: the `hello` Worker with a tail consumer in a second project,
+  so every request produces a trace item that is delivered. Compare it with
+  `hello` for the cost of tracing.
 - `do_counter`: every request goes to one Durable Object that reads and
   increments a key-value counter. The single-object write path.
 - `do_sql_insert`: every request goes to one Durable Object that inserts a row

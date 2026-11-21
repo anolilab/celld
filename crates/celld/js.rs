@@ -85,6 +85,7 @@ pub use crate::host_channels::set_queue_dispatch_tx;
 pub use crate::host_channels::set_rpc_call_tx;
 pub use crate::host_channels::set_svc_call_tx;
 pub use crate::host_channels::set_svc_rpc_tx;
+pub use crate::host_channels::set_tail_dispatch_tx;
 pub use crate::host_channels::AssetCallReq;
 pub use crate::host_channels::FacetReq;
 pub use crate::host_channels::GateReq;
@@ -92,7 +93,6 @@ pub use crate::host_channels::QueueDispatchReq;
 pub use crate::host_channels::QueueLeaseRef;
 pub use crate::host_channels::RpcCallReq;
 pub use crate::host_channels::SvcCallReq;
-pub use crate::host_channels::SvcRpcReq;
 pub(crate) use crate::host_channels::ASSET_CALL_TX;
 pub(crate) use crate::host_channels::FACET_TX;
 pub(crate) use crate::host_channels::GATE_TX;
@@ -100,6 +100,8 @@ pub(crate) use crate::host_channels::QUEUE_DISPATCH_TX;
 pub(crate) use crate::host_channels::RPC_CALL_TX;
 pub(crate) use crate::host_channels::SVC_CALL_TX;
 pub(crate) use crate::host_channels::SVC_RPC_TX;
+pub(crate) use crate::host_channels::TAIL_DISPATCH_TX;
+pub use crate::host_channels::{SvcRpcReq, TailDispatchReq};
 pub(crate) use crate::http_streams::claim_http_stream;
 pub(crate) use crate::http_streams::encode_http_response;
 pub(crate) use crate::http_streams::http_stream_read;
@@ -1698,6 +1700,9 @@ pub struct WorkerConfig {
     resource_limits: Option<ResourceLimits>,
     /// Whether a Dynamic Worker can receive a tail report sender on a fetch.
     tail_reporting: bool,
+    /// Where this Worker's trace items go when its deployment names
+    /// `tail_consumers`.
+    tail_sink: Option<Arc<crate::tail_consumers::TailSink>>,
     /// `triggers.crons` from the deployment. Empty for a loaded worker and for
     /// any script without cron triggers.
     pub crons: Vec<String>,
@@ -1841,6 +1846,7 @@ impl WorkerConfig {
             loader_env: None,
             resource_limits: None,
             tail_reporting: false,
+            tail_sink: None,
             crons: Vec::new(),
             containers: Vec::new(),
             generation: 0,
@@ -1888,6 +1894,18 @@ impl WorkerConfig {
     /// Stamp this Worker with the application generation it serves.
     pub fn with_generation(mut self, generation: crate::generation::GenerationId) -> Self {
         self.generation = generation;
+        self
+    }
+
+    /// Deliver this Worker's trace items to the `tail()` handler of each named
+    /// script. Call after `with_generation`: the delivery runs in that
+    /// generation.
+    pub fn with_tail_consumers(mut self, consumers: &[String]) -> Self {
+        self.tail_sink = crate::tail_consumers::TailSink::new(
+            &self.script_name,
+            consumers,
+            crate::tail_consumers::rpc_deliver(self.generation),
+        );
         self
     }
 
@@ -2274,6 +2292,7 @@ struct ActorRuntimeState {
     hyperdrive_destinations: Vec<(String, u16)>,
     resource_limits: Option<ResourceLimits>,
     tail_reporting: bool,
+    tail_sink: Option<Arc<crate::tail_consumers::TailSink>>,
     script_name: String,
     /// What the script declared it may address; see [`scoping`].
     declared: scoping::Declared,
@@ -2820,13 +2839,33 @@ pub enum Answer {
 /// work finishes. The response sender stays independent, so tail delivery
 /// cannot delay or replace the Dynamic Worker response.
 struct TailReportState {
-    reply: tokio::sync::oneshot::Sender<String>,
+    reply: TailReply,
     script_name: String,
     event_timestamp: i64,
-    url: String,
-    method: String,
-    headers: serde_json::Map<String, serde_json::Value>,
+    started: Instant,
+    event: TailEvent,
     failure: Option<TailException>,
+}
+
+/// Where a finished trace item goes.
+enum TailReply {
+    /// A Dynamic Worker's loader, which delivers it to the Worker's `tails`.
+    Report(tokio::sync::oneshot::Sender<String>),
+    /// The buffers of a deployed Worker's `tail_consumers`.
+    Sink(Arc<crate::tail_consumers::TailSink>),
+}
+
+/// What started the invocation, as `TraceItem.event` describes it.
+enum TailEvent {
+    Fetch {
+        url: String,
+        method: String,
+        headers: serde_json::Map<String, serde_json::Value>,
+    },
+    Queue {
+        queue: String,
+        batch_size: usize,
+    },
 }
 
 /// A failure and the instant it occurred. Tail delivery can wait for
@@ -2872,7 +2911,7 @@ fn tail_request_headers(
 
 impl TailReportState {
     fn record_failure(&mut self, message: String) {
-        self.failure = Some(TailException::new(message));
+        self.failure = Some(TailException::new(crate::telemetry::cap_error(message)));
     }
 
     /// Record the failure a settled reply gate carries, unless the handler
@@ -2896,6 +2935,8 @@ impl TailReportState {
             if self.failure.is_none() {
                 self.record_failure(failure.clone());
             }
+        } else if completion.is_err() && self.failure.is_none() {
+            self.record_failure("wake-entry reply gate task dropped".to_string());
         }
     }
 
@@ -2906,25 +2947,65 @@ impl TailReportState {
             "ok"
         };
         let exceptions: Vec<_> = self.failure.into_iter().collect();
-        let event = serde_json::json!([{
-            "scriptName": self.script_name,
-            "event": {
-                "request": {
+        let event = match self.event {
+            TailEvent::Fetch {
+                url,
+                method,
+                headers,
+            } => {
+                // The item shows what Cloudflare's does: credentials and
+                // identifiers redacted. The raw values travel beside them,
+                // only when something was redacted, for the consumer's
+                // `getUnredacted()`, and only to a deployed consumer: a
+                // Dynamic Worker's tail gets the redacted request.
+                let (shown_headers, headers_changed) =
+                    crate::tail_consumers::redact_headers(&headers);
+                let shown_url = crate::tail_consumers::redact_url(&url);
+                let mut request = serde_json::json!({
                     "cf": {},
-                    "headers": self.headers,
-                    "method": self.method,
-                    "url": self.url,
-                },
-                "response": response_status.map(|status| serde_json::json!({
-                    "status": status,
-                })),
-            },
+                    "headers": shown_headers,
+                    "method": method,
+                    "url": shown_url,
+                });
+                if matches!(self.reply, TailReply::Sink(_)) && (headers_changed || shown_url != url)
+                {
+                    request["unredacted"] = serde_json::json!({
+                        "headers": headers,
+                        "url": url,
+                    });
+                }
+                serde_json::json!({
+                    "request": request,
+                    "response": response_status.map(|status| serde_json::json!({
+                        "status": status,
+                    })),
+                })
+            }
+            TailEvent::Queue { queue, batch_size } => serde_json::json!({
+                "queue": queue,
+                "batchSize": batch_size,
+            }),
+        };
+        let (logs, truncated) = context.take_tail_logs();
+        let item = serde_json::json!({
+            "scriptName": self.script_name,
+            "executionModel": "stateless",
+            "event": event,
             "eventTimestamp": self.event_timestamp,
-            "logs": context.take_tail_logs(),
+            "logs": logs,
             "exceptions": exceptions,
+            "diagnosticsChannelEvents": [],
             "outcome": outcome,
-        }]);
-        let _ = self.reply.send(event.to_string());
+            "truncated": truncated,
+            "cpuTime": context.cpu_used_nanos.load(Ordering::Relaxed) / 1_000_000,
+            "wallTime": u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        });
+        match self.reply {
+            TailReply::Report(reply) => {
+                let _ = reply.send(serde_json::Value::Array(vec![item]).to_string());
+            }
+            TailReply::Sink(sink) => sink.submit(item.to_string()),
+        }
     }
 }
 
@@ -3219,6 +3300,9 @@ pub struct InFlight {
     response_status: Option<u16>,
     /// The report owed to the loader isolate after this invocation retires.
     tail_report: Option<TailReportState>,
+    /// Whether the budget also bounds the work that outlives the answer, as it
+    /// does for a `tail()` delivery, which the next one waits for.
+    ends_at_budget: bool,
     /// The isolate this entry's ops belong to, so `abandon` can drop their
     /// resolvers without a scope to reach the isolate through.
     runtime_state: Arc<ActorRuntimeState>,
@@ -3286,6 +3370,16 @@ impl InFlight {
             }
             Answer::Queue(reply) => {
                 let read = read_queue_result(tc, value);
+                if let (Some(report), Ok(result)) = (&mut self.tail_report, &read) {
+                    if result.outcome == QueueOutcome::Exception {
+                        report.record_failure(
+                            result
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "queue handler rejected".to_string()),
+                        );
+                    }
+                }
                 if let Ok(result) = &read {
                     if result.outcome == QueueOutcome::Exception
                         && self.trace.is_some_and(|trace| trace.sampled)
@@ -3600,9 +3694,23 @@ impl InFlight {
             .then(|| budget.saturating_sub(self.started.elapsed()))
     }
 
-    /// Give up on a handler that will not settle.
+    /// How long the work that outlives the answer may still run, for an event
+    /// the budget bounds to its end. `None` for any other.
+    pub fn lingering_left(&self, budget: Duration) -> Option<Duration> {
+        self.ends_at_budget
+            .then(|| budget.saturating_sub(self.started.elapsed()))
+    }
+
+    /// Give up on a handler that will not settle, or end the `waitUntil` work
+    /// of one the budget bounds.
     pub fn time_out(&mut self, budget: Duration) {
+        // The budget has ended it; nothing is left to linger for.
+        let bounded = std::mem::take(&mut self.ends_at_budget);
         self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
+        if bounded {
+            self.background = None;
+            self.context.seal_wait_until();
+        }
     }
 
     /// Nothing this request awaits can move it, so it will never settle on
@@ -4230,7 +4338,7 @@ impl Worker {
             | crate::WorkerJob::Rpc {
                 invocation_limits, ..
             } => *invocation_limits,
-            crate::WorkerJob::Queue { .. } => None,
+            crate::WorkerJob::Queue { .. } | crate::WorkerJob::Tail { .. } => None,
         };
         let initial_limits =
             effective_resource_limits(inner.runtime_state.resource_limits, invocation_limits);
@@ -4569,6 +4677,9 @@ fn begin<'s>(
         crate::WorkerJob::Queue { batch, reply, .. } => {
             return begin_queue(tc, batch, reply);
         }
+        crate::WorkerJob::Tail { items, reply } => {
+            return begin_tail(tc, &items, reply);
+        }
         job => job,
     };
     let crate::WorkerJob::Fetch {
@@ -4587,11 +4698,14 @@ fn begin<'s>(
         return Begun::Nothing;
     };
     let runtime_state = actor_runtime_state(tc);
-    let tail_reporting = tail_report.is_some();
     debug_assert!(
-        !tail_reporting || runtime_state.tail_reporting,
+        tail_report.is_none() || runtime_state.tail_reporting,
         "a tail report reached a Worker that was loaded without tails",
     );
+    let tail_reply = tail_report
+        .map(TailReply::Report)
+        .or_else(|| runtime_state.tail_sink.clone().map(TailReply::Sink));
+    let tail_reporting = tail_reply.is_some();
     // The report sender is the invocation-level authority. The isolate-level
     // option also applies to RPC and cell events, but those events have no
     // report to consume retained logs, so enabling capture for them only
@@ -4610,15 +4724,18 @@ fn begin<'s>(
         Some(entrypoint) => FetchTarget::Entrypoint(entrypoint),
         None => FetchTarget::Default(fetch),
     };
+    let tail_started = tail_reply.is_some().then(Instant::now);
     let started = start_fetch(tc, target, &url, &method, body, &headers, request_id);
-    let tail_headers = tail_request_headers(&headers);
-    let mut tail_report = tail_report.map(|reply| TailReportState {
+    let mut tail_report = tail_reply.map(|reply| TailReportState {
         reply,
         script_name: runtime_state.script_name.clone(),
         event_timestamp: unix_now_ms(),
-        url,
-        method,
-        headers: tail_headers,
+        started: tail_started.unwrap_or_else(Instant::now),
+        event: TailEvent::Fetch {
+            url,
+            method,
+            headers: tail_request_headers(&headers),
+        },
         failure: None,
     });
     let promise = match started {
@@ -4661,6 +4778,7 @@ fn begin<'s>(
                 failure: None,
                 response_status: None,
                 tail_report,
+                ends_at_budget: false,
             };
             drop(guard);
             Begun::Running(Box::new(entry))
@@ -4757,6 +4875,76 @@ fn begin_entrypoint_rpc(
                 failure: None,
                 response_status: None,
                 tail_report: None,
+                ends_at_budget: false,
+            };
+            drop(guard);
+            Begun::Running(Box::new(entry))
+        }
+        Err(error) => {
+            let _ = end_event_context(tc);
+            let cpu_error = context.finish_cpu_turn().err().map(anyhow::Error::msg);
+            let error = take_execution_termination(tc)
+                .or(cpu_error)
+                .unwrap_or(error);
+            drop(guard);
+            let _ = reply.send(Err(error));
+            Begun::Nothing
+        }
+    }
+}
+
+/// Start a `tail()` delivery: the batch goes to the Worker's own
+/// `__dispatchEntrypointTail` as a string, inside an event the host keeps
+/// driving, so the handler's `waitUntil` work finishes as a queue handler's does.
+/// A tail delivery is not itself traced.
+fn begin_tail(
+    tc: &mut v8::PinScope,
+    items: &str,
+    reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
+) -> Begun {
+    let context = IoContext::with_resource_limits(actor_runtime_state(tc).resource_limits);
+    let guard = CurrentGuard::enter(context.clone());
+    install_io_context(tc, &context);
+    context.begin_cpu_turn();
+    let started = (|| {
+        let dispatch = internal_function(tc, "__dispatchEntrypointTail")?;
+        let entrypoint = v8::String::new(tc, "default").unwrap();
+        let items = v8::String::new(tc, items).ok_or_else(|| anyhow!("tail batch is too long"))?;
+        let recv = v8::undefined(tc).into();
+        begin_event_context(tc)?;
+        let ret = dispatch
+            .call(tc, recv, &[entrypoint.into(), items.into()])
+            .ok_or_else(|| anyhow!("tail dispatch threw"))?;
+        match ret.try_cast::<v8::Promise>() {
+            Ok(promise) => Ok(promise),
+            Err(_) => resolved_promise(tc, ret),
+        }
+    })();
+    match started {
+        Ok(promise) => {
+            tc.perform_microtask_checkpoint();
+            let entry = InFlight {
+                runtime_state: actor_runtime_state(tc),
+                promise: v8::Global::new(tc, promise),
+                context,
+                scope: None,
+                writes_before: None,
+                request_id: None,
+                active_request_id: None,
+                reply: Some(Answer::Rpc(reply)),
+                gated_reply: None,
+                background: None,
+                completed_cell_event: false,
+                ops: std::collections::HashSet::new(),
+                io_context_ops: std::collections::HashSet::new(),
+                unrefed_ops: std::collections::HashSet::new(),
+                alarm: None,
+                started: Instant::now(),
+                trace: None,
+                failure: None,
+                response_status: None,
+                tail_report: None,
+                ends_at_budget: true,
             };
             drop(guard);
             Begun::Running(Box::new(entry))
@@ -4956,7 +5144,20 @@ fn begin_queue(
     batch: QueueBatch,
     reply: tokio::sync::oneshot::Sender<Result<QueueDispatchResult>>,
 ) -> Begun {
-    let context = IoContext::with_resource_limits(actor_runtime_state(tc).resource_limits);
+    let runtime_state = actor_runtime_state(tc);
+    let tail_sink = runtime_state.tail_sink.clone();
+    let context = IoContext::with_options(runtime_state.resource_limits, tail_sink.is_some());
+    let tail_report = tail_sink.map(|sink| TailReportState {
+        reply: TailReply::Sink(sink),
+        script_name: runtime_state.script_name.clone(),
+        event_timestamp: unix_now_ms(),
+        started: Instant::now(),
+        event: TailEvent::Queue {
+            queue: batch.queue.clone(),
+            batch_size: batch.messages.len(),
+        },
+        failure: None,
+    });
     let guard = CurrentGuard::enter(context.clone());
     install_io_context(tc, &context);
     context.begin_cpu_turn();
@@ -4997,7 +5198,8 @@ fn begin_queue(
                 trace: None,
                 failure: None,
                 response_status: None,
-                tail_report: None,
+                tail_report,
+                ends_at_budget: false,
             };
             drop(guard);
             Begun::Running(Box::new(entry))
@@ -5008,6 +5210,10 @@ fn begin_queue(
             let error = take_execution_termination(tc)
                 .or(cpu_error)
                 .unwrap_or(error);
+            if let Some(mut report) = tail_report {
+                report.record_failure(format!("{error:#}"));
+                report.finish(&context, None);
+            }
             drop(guard);
             let _ = reply.send(Err(error));
             Begun::Nothing
@@ -5193,6 +5399,7 @@ fn start_cell_event<'s>(
                 failure: None,
                 response_status: None,
                 tail_report: None,
+                ends_at_budget: false,
             };
             restore_io_context(tc, previous_io_context);
             drop(guard);
@@ -5249,6 +5456,7 @@ fn start_cell_event<'s>(
                     failure: Some(failure),
                     response_status: None,
                     tail_report: None,
+                    ends_at_budget: false,
                 }))
             };
             restore_io_context(tc, previous_io_context);
@@ -5884,6 +6092,7 @@ impl Worker {
                 .collect(),
             resource_limits: config.resource_limits,
             tail_reporting: config.tail_reporting,
+            tail_sink: config.tail_sink.clone(),
             script_name: script_name.to_string(),
             declared: scoping::Declared::of(&config),
             ..Default::default()
@@ -10971,8 +11180,10 @@ impl IoContext {
         capture.records.push(record);
     }
 
-    fn take_tail_logs(&self) -> Vec<TailLog> {
-        std::mem::take(&mut *self.tail_logs.lock().unwrap()).records
+    /// The captured logs, and whether the cap cut some off.
+    fn take_tail_logs(&self) -> (Vec<TailLog>, bool) {
+        let capture = std::mem::take(&mut *self.tail_logs.lock().unwrap());
+        (capture.records, capture.full)
     }
 
     /// The continuation id this context is registered under, which names
@@ -11058,7 +11269,8 @@ impl IoContext {
     }
 
     fn begin_cpu_turn(&self) {
-        if self.cpu_limit_nanos.is_none() {
+        // A traced invocation reports its CPU time, so it samples without a limit.
+        if self.cpu_limit_nanos.is_none() && !self.tail_reporting {
             return;
         }
         *self.cpu_turn.lock().unwrap() = Some(CpuTurnStart {
@@ -11074,9 +11286,9 @@ impl IoContext {
     }
 
     fn finish_cpu_turn(&self) -> Result<(), String> {
-        let Some(limit) = self.cpu_limit_nanos else {
+        if self.cpu_limit_nanos.is_none() && !self.tail_reporting {
             return Ok(());
-        };
+        }
         let Some(started) = self.cpu_turn.lock().unwrap().take() else {
             return Ok(());
         };
@@ -11086,7 +11298,7 @@ impl IoContext {
             .map(|(started, finished)| finished.saturating_sub(started))
             .unwrap_or_else(|| started.wall.elapsed().as_nanos() as u64);
         let used = self.cpu_used_nanos.fetch_add(elapsed, Ordering::Relaxed) + elapsed;
-        if used > limit {
+        if let Some(limit) = self.cpu_limit_nanos.filter(|limit| used > *limit) {
             return Err(format!(
                 "Worker exceeded CPU limit of {} ms",
                 limit / 1_000_000
@@ -12664,14 +12876,50 @@ mod response_status_tests {
 
     fn tail_report() -> TailReportState {
         TailReportState {
-            reply: tokio::sync::oneshot::channel().0,
+            reply: TailReply::Report(tokio::sync::oneshot::channel().0),
             script_name: "worker".to_string(),
             event_timestamp: 0,
-            url: "http://example.test/".to_string(),
-            method: "GET".to_string(),
-            headers: serde_json::Map::new(),
+            started: Instant::now(),
+            event: TailEvent::Fetch {
+                url: "http://example.test/".to_string(),
+                method: "GET".to_string(),
+                headers: serde_json::Map::new(),
+            },
             failure: None,
         }
+    }
+
+    #[test]
+    fn an_exception_message_in_a_trace_item_is_capped() {
+        let mut report = tail_report();
+        report.record_failure("x".repeat(50 << 20));
+        let message = report.failure.expect("failure").message;
+        assert!(
+            message.len() <= crate::telemetry::LOG_BODY_CAP,
+            "{}",
+            message.len()
+        );
+    }
+
+    #[test]
+    fn a_dynamic_worker_tail_gets_the_redacted_request_and_no_raw_copy() {
+        let (reply, mut received) = tokio::sync::oneshot::channel();
+        let mut report = tail_report();
+        report.reply = TailReply::Report(reply);
+        report.event = TailEvent::Fetch {
+            url: "http://example.test/0123456789abcdef0123456789abcdef".to_string(),
+            method: "GET".to_string(),
+            headers: serde_json::from_str(r#"{"authorization":"Bearer x","accept":"*/*"}"#)
+                .unwrap(),
+        };
+        report.finish(&IoContext::with_options(None, true), Some(200));
+        let items: serde_json::Value =
+            serde_json::from_str(&received.try_recv().expect("report")).unwrap();
+        let request = &items[0]["event"]["request"];
+        assert_eq!(request["headers"]["authorization"], "REDACTED");
+        assert_eq!(request["headers"]["accept"], "*/*");
+        assert_eq!(request["url"], "http://example.test/REDACTED");
+        assert!(request.get("unredacted").is_none());
     }
 
     #[test]
@@ -12691,6 +12939,19 @@ mod response_status_tests {
             failure: Some("gate".to_string()),
         }));
         assert_eq!(report.failure.expect("kept").message, "handler");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_gate_task_makes_the_tail_report_an_exception() {
+        let (send, receive) = tokio::sync::oneshot::channel::<GatedReplyCompletion>();
+        drop(send);
+        let dropped = receive.await;
+        let mut report = tail_report();
+        report.record_gate_failure(&dropped);
+        assert_eq!(
+            report.failure.expect("recorded").message,
+            "wake-entry reply gate task dropped"
+        );
     }
 
     #[test]

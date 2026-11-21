@@ -6027,6 +6027,35 @@ __celld.__dispatchEntrypointQueue = async (name, incoming) => {
     })),
   };
 };
+// A trace item's request is redacted, as Cloudflare's is. When the host
+// redacted something it sent the raw `headers` and `url` as `unredacted`, which
+// becomes the request that `getUnredacted()` returns.
+const __tailItems = (items) => {
+  for (const item of items) {
+    const request = item.event?.request;
+    if (request === undefined) continue;
+    const raw = request.unredacted;
+    delete request.unredacted;
+    const open = raw === undefined ? request : { ...request, ...raw };
+    for (const view of new Set([request, open]))
+      Object.defineProperty(view, "getUnredacted", { value: () => open });
+  }
+  return items;
+};
+// A batch of trace items, as the JSON the host built, goes to `tail()` inside
+// the event the host opened, like a queue batch. Nobody reads the error of a
+// `tail()` that throws, so it is logged in this Worker's own console. The
+// answer is one byte: 1 when `tail()` returned, 0 when it threw.
+__celld.__dispatchEntrypointTail = async (name, json) => {
+  try {
+    await __dispatchEntrypointMethodInCurrentEvent(
+      name, "tail", __tailItems(JSON.parse(json)));
+    return new Uint8Array([1]);
+  } catch (error) {
+    __log("error", `Uncaught exception in tail(): ${error?.stack ?? error}`);
+    return new Uint8Array([0]);
+  }
+};
 // Workerd's simple-handler RPC rules (worker-rpc.c++): a non-class
 // handler method is called as fn(arg, env, ctx), the client must send
 // exactly one argument, and the handler must not declare more than

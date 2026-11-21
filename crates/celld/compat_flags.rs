@@ -452,7 +452,7 @@ pub static FLAGS: &[Flag] = &[
     row(
         "streaming_tail_worker",
         Unsupported,
-        "The `tail` handler is unavailable.",
+        "The `tailStream` handler is unavailable. The `tail` handler works.",
     ),
     row(
         "python_workers_314",

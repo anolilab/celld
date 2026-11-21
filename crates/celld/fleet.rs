@@ -960,6 +960,9 @@ async fn load_worker_at_pointer(
         .map(|binding| manifest.version_metadata(binding));
     let ai_binding = crate::protocol::ai_binding(&manifest)?;
     let services = service_bindings(&manifest);
+    let tail_consumers: Vec<String> = crate::protocol::tail_consumers(&manifest)
+        .map(str::to_string)
+        .collect();
     let mut vars = worker_vars(&manifest);
     // Secrets are decrypted here, once per deployment load, and join the vars
     // as string bindings: one bucket read, nothing per request.
@@ -1051,6 +1054,7 @@ async fn load_worker_at_pointer(
         ai_binding,
         assets,
         services,
+        tail_consumers,
         crons,
         containers,
         fence_image,
@@ -1077,6 +1081,9 @@ pub struct LoadedDeployment {
     pub ai_binding: Option<String>,
     pub assets: Option<crate::assets::AssetResolver>,
     pub services: Vec<(String, String, Option<String>)>,
+    /// The scripts that receive this Worker's trace items: its manifest's
+    /// `tail_consumers`.
+    pub tail_consumers: Vec<String>,
     /// `triggers.crons` from the manifest, driving the reserved cron cell.
     pub crons: Vec<String>,
     /// `containers` from the manifest: the classes whose cells supervise a

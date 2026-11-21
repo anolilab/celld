@@ -1,0 +1,11 @@
+{
+  "name": "tail-queue",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "tail_consumers": [{ "service": "tail-consumer" }],
+  "queues": {
+    "producers": [{ "binding": "JOBS", "queue": "tail-jobs" }],
+    "consumers": [{ "queue": "tail-jobs", "max_batch_size": 10, "max_batch_timeout": 1, "max_retries": 0 }]
+  }
+}
