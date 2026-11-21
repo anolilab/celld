@@ -712,9 +712,7 @@ impl DeployPointer {
             && self.prefix == other.prefix
             && self.components == other.components
     }
-}
 
-impl DeployPointer {
     /// Whether a node builds the same generation from `other`: the same
     /// deployments and the same secrets revision. A put changes only the
     /// revision, and must not be answered from the memory of a failed build.
