@@ -2935,6 +2935,8 @@ impl TailReportState {
             if self.failure.is_none() {
                 self.record_failure(failure.clone());
             }
+        } else if completion.is_err() && self.failure.is_none() {
+            self.record_failure("wake-entry reply gate task dropped".to_string());
         }
     }
 
@@ -12937,6 +12939,19 @@ mod response_status_tests {
             failure: Some("gate".to_string()),
         }));
         assert_eq!(report.failure.expect("kept").message, "handler");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_gate_task_makes_the_tail_report_an_exception() {
+        let (send, receive) = tokio::sync::oneshot::channel::<GatedReplyCompletion>();
+        drop(send);
+        let dropped = receive.await;
+        let mut report = tail_report();
+        report.record_gate_failure(&dropped);
+        assert_eq!(
+            report.failure.expect("recorded").message,
+            "wake-entry reply gate task dropped"
+        );
     }
 
     #[test]

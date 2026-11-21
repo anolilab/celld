@@ -316,8 +316,8 @@ holds `request` (`url`, `method`, `headers`, `cf`) and `response.status`; for
 
 The request in the item is redacted by default, by the rules Cloudflare uses.
 The value of `cookie`, `set-cookie` and every header whose name contains `auth`,
-`jwt`, `key`, `secret` or `token` is `REDACTED`. In the URL, each run of
-letters, digits, `+`, `-` and `_` (a path segment or a query value) that is a
+`jwt`, `key`, `secret` or `token` is `REDACTED`. In the URL, credentials before
+the host (`user:password@`) become `REDACTED`, and each run of letters, digits, `+`, `-` and `_` (a path segment or a query value) that is a
 hex identifier of 32 digits or more, a base64-like identifier of 21 characters
 or more with at least two digits, two upper-case and two lower-case letters, or
 a payment card number (13 to 19 digits that pass the Luhn check) becomes

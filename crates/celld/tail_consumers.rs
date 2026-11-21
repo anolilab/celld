@@ -335,9 +335,16 @@ fn is_card_number(run: &[u8]) -> bool {
 /// character, so a path segment or a query value is one run. A percent-encoded
 /// character counts as the character it stands for, so encoding an identifier
 /// does not hide it, and a replaced run is replaced whole, encoded span
-/// included. This is the rule `TraceItem.event.request.url` applies on
+/// included. Credentials in the authority are replaced. This is the rule `TraceItem.event.request.url` applies on
 /// Cloudflare.
 pub(crate) fn redact_url(url: &str) -> String {
+    // Credentials in the authority (`user:password@host`) go whole.
+    if let Some((scheme, rest)) = url.split_once("://") {
+        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        if let Some(at) = rest[..authority_end].rfind('@') {
+            return format!("{scheme}://{REDACTED}@{}", redact_url(&rest[at + 1..]));
+        }
+    }
     let mut out = Vec::with_capacity(url.len());
     let mut start = 0;
     let mut run = Run::default();
@@ -635,6 +642,21 @@ mod tests {
         );
         // Short encoded values and an encoded separator are kept as written.
         let kept = "https://domain/a%2Fb%20c?q=%41%42&r=%zz%+1";
+        assert_eq!(redact_url(kept), kept);
+    }
+
+    #[test]
+    fn credentials_in_the_authority_are_hidden() {
+        assert_eq!(
+            redact_url("https://user:pass@example.com:8080/p?q=1"),
+            "https://REDACTED@example.com:8080/p?q=1"
+        );
+        assert_eq!(
+            redact_url("https://token@example.com"),
+            "https://REDACTED@example.com"
+        );
+        // An `@` after the authority is not userinfo.
+        let kept = "https://example.com/a@b?x=y@z";
         assert_eq!(redact_url(kept), kept);
     }
 
