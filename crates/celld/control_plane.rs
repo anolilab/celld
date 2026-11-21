@@ -1937,18 +1937,32 @@ pub async fn apply_deployment(
     // The pointer comes from the control plane and knows no secrets
     // revisions; keep the ones the fleet holds, or every node rebuilds a
     // deployment it already serves.
-    let mut fleet_pointer = deployment.pointer.clone();
-    if let Some((body, _)) = bucket.get("deploy/current.json").await? {
-        if let Ok(current) = serde_json::from_slice::<DeployPointer>(&body) {
-            fleet_pointer.secrets_revisions = current.secrets_revisions;
+    // The write is conditional on the pointer it read, so a secret write that
+    // lands in between is merged on the next attempt instead of lost.
+    let key = crate::fleet::CURRENT_POINTER_KEY;
+    let mut written = false;
+    for _ in 0..16 {
+        let mut fleet_pointer = deployment.pointer.clone();
+        let current = bucket.get(key).await?;
+        if let Some((body, _)) = &current {
+            if let Ok(current) = serde_json::from_slice::<DeployPointer>(body) {
+                fleet_pointer.secrets_revisions = current.secrets_revisions;
+            }
+        }
+        let token = current.as_ref().map(|(_, token)| token.as_str());
+        if bucket
+            .put_cas(key, serde_json::to_vec_pretty(&fleet_pointer)?, token)
+            .await?
+            .is_some()
+        {
+            written = true;
+            break;
         }
     }
-    bucket
-        .put(
-            "deploy/current.json",
-            serde_json::to_vec_pretty(&fleet_pointer)?,
-        )
-        .await?;
+    anyhow::ensure!(
+        written,
+        "{key} kept changing under this deployment; try again"
+    );
     info!(
         event = "control_plane_deployment_applied",
         script_name = %deployment.script_name,
