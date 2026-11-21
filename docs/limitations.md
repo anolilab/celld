@@ -11,6 +11,11 @@ APIs, and Wrangler configuration.
 - A fleet stores its durable state in an S3-compatible bucket, a Google Cloud
   Storage bucket, or an Azure Blob Storage container. Only `celld dev` can use
   the local SQLite object store.
+- `celld dev` runs several projects in one node, with one listener for the first.
+  A project that no loaded project binds is not loaded, cron triggers run for
+  the first project only, and `celld d1 --local` reads the first project's
+  state and supports only its databases. Two loaded projects cannot export a
+  Durable Object class of the same name.
 - Ownership balancing counts cells by node weight, not by CPU or memory use.
   It moves only hibernated cells, so a fleet without idle eviction balances
   only the cells that hibernate on their own.

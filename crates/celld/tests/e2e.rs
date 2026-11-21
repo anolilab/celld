@@ -16,6 +16,7 @@ mod e2e {
     pub mod deploy_compat_flags;
     pub mod deploy_node_imports;
     pub mod deploy_sourcemap;
+    pub mod dev_projects;
     pub mod do_alarms;
     pub mod do_gates;
     pub mod do_ids;

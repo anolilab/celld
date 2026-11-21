@@ -60,6 +60,10 @@ pub struct Server {
     ambient_token: Option<String>,
     log: PathBuf,
     project: PathBuf,
+    /// The projects after the first, which `celld dev` is given as well.
+    others: Vec<PathBuf>,
+    /// Whether `celld dev` watches the projects and reloads on a change.
+    watch: bool,
     client: reqwest::Client,
     boot: Duration,
     _dir: TempDir,
@@ -109,10 +113,62 @@ impl Server {
             ambient_token: None,
             log: dir.path().join("celld.log"),
             project,
+            others: Vec::new(),
+            watch: false,
             client: client(),
             boot: Duration::ZERO,
             _dir: dir,
         }
+    }
+
+    /// Starts one `celld dev` on several fixtures, the first as the primary,
+    /// after `setup` has added files to the project directories, given in the
+    /// same order.
+    pub async fn start_projects(
+        fixtures: &[&str],
+        env: &[(&str, &str)],
+        setup: impl FnOnce(&[PathBuf]),
+    ) -> Server {
+        Server::start_projects_watching(fixtures, env, false, setup).await
+    }
+
+    /// [`Self::start_projects`], with the watcher on when `watch` is set.
+    pub async fn start_projects_watching(
+        fixtures: &[&str],
+        env: &[(&str, &str)],
+        watch: bool,
+        setup: impl FnOnce(&[PathBuf]),
+    ) -> Server {
+        let mut server = Server::prepare_projects(fixtures, env);
+        server.watch = watch;
+        setup(&server.projects());
+        server
+            .launch()
+            .await
+            .unwrap_or_else(|reason| panic!("{reason}"));
+        server
+    }
+
+    fn prepare_projects(fixtures: &[&str], env: &[(&str, &str)]) -> Server {
+        let mut server = Server::prepare(fixtures[0], env);
+        let root = server
+            .project
+            .parent()
+            .expect("the project's directory")
+            .to_path_buf();
+        for fixture in &fixtures[1..] {
+            let project = root.join(fixture);
+            copy_dir(&fixture_dir(fixture), &project);
+            server.others.push(project);
+        }
+        server
+    }
+
+    /// Every project directory, the primary first.
+    pub fn projects(&self) -> Vec<PathBuf> {
+        std::iter::once(self.project.clone())
+            .chain(self.others.iter().cloned())
+            .collect()
     }
 
     /// [`Self::start`] with `token` as `CELLD_OPERATOR_TOKEN` in the environment
@@ -322,6 +378,8 @@ impl Server {
             let spawned = Instant::now();
             self.child = Some(try_spawn(
                 &self.project,
+                &self.others,
+                self.watch,
                 &self.env,
                 self.ambient_token.as_deref(),
                 &self.log,
@@ -449,9 +507,24 @@ async fn read_operator_identity(database: PathBuf) -> ([u8; 32], String, String)
 /// Runs `celld dev` on a copy of `fixture` and returns when the process exits.
 /// For configurations that must be refused at start-up.
 pub fn run_expecting_exit(fixture: &str, env: &[(&str, &str)]) -> Exited {
+    run_projects_expecting_exit(&[fixture], env)
+}
+
+/// [`run_expecting_exit`] with several fixtures, the first as the primary. The
+/// first is copied to `project` and each other to a directory of its name, so a
+/// fixture may be listed twice as two projects.
+pub fn run_projects_expecting_exit(fixtures: &[&str], env: &[(&str, &str)]) -> Exited {
     let dir = TempDir::new().expect("create temp dir");
     let project = dir.path().join("project");
-    copy_dir(&fixture_dir(fixture), &project);
+    copy_dir(&fixture_dir(fixtures[0]), &project);
+    let other_dirs: Vec<PathBuf> = fixtures[1..]
+        .iter()
+        .map(|fixture| {
+            let other = dir.path().join(fixture);
+            copy_dir(&fixture_dir(fixture), &other);
+            other
+        })
+        .collect();
     let log_path = dir.path().join("celld.log");
     // The process takes a token from its environment only to validate it, so
     // this is the ambient value, not a seeded file.
@@ -464,7 +537,13 @@ pub fn run_expecting_exit(fixture: &str, env: &[(&str, &str)]) -> Exited {
         .filter(|(k, _)| *k != "CELLD_OPERATOR_TOKEN")
         .copied()
         .collect();
-    let mut child = spawn(&project, &owned_env(&others), ambient, &log_path);
+    let mut child = spawn(
+        &project,
+        &other_dirs,
+        &owned_env(&others),
+        ambient,
+        &log_path,
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll celld") {
@@ -560,12 +639,20 @@ pub fn signal_group(pgid: u32, signal: &str) {
 /// `CELLD_OPERATOR_TOKEN` in `env` is written to the token file of the node's
 /// state directory, the way an operator who keeps one there would, and
 /// `ambient` is set in the environment of the process itself.
-fn spawn(project: &Path, env: &[(String, String)], ambient: Option<&str>, log: &Path) -> Child {
-    try_spawn(project, env, ambient, log).unwrap_or_else(|reason| panic!("{reason}"))
+fn spawn(
+    project: &Path,
+    others: &[PathBuf],
+    env: &[(String, String)],
+    ambient: Option<&str>,
+    log: &Path,
+) -> Child {
+    try_spawn(project, others, false, env, ambient, log).unwrap_or_else(|reason| panic!("{reason}"))
 }
 
 fn try_spawn(
     project: &Path,
+    others: &[PathBuf],
+    watch: bool,
     env: &[(String, String)],
     ambient: Option<&str>,
     log: &Path,
@@ -578,7 +665,9 @@ fn try_spawn(
     Command::new(CELLD)
         .arg("dev")
         .arg(project)
-        .args(["--no-watch", "--logs", "--port", "0"])
+        .args(others)
+        .args(["--logs", "--port", "0"])
+        .args((!watch).then_some("--no-watch"))
         // A token in the runner's environment would gate every test node;
         // a test that wants one passes it in `env`.
         .env_remove("CELLD_OPERATOR_TOKEN")

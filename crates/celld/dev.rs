@@ -7,13 +7,14 @@
 //! one persisted local object store and one supervised celld node.
 
 use crate::bucket::Bucket;
+use crate::protocol::Manifest;
 use crate::{deploy, fleet};
 use anyhow::{bail, Context as _};
 use glob::{MatchOptions, Pattern};
 use notify::{RecursiveMode, Watcher as _};
 use nu_ansi_term::{Color, Style};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::IsTerminal as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -23,6 +24,11 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
+
+mod projects;
+use projects::{
+    changes_nothing_loaded, deploy_projects, ensure_distinct, unreachable_warnings, Project,
+};
 
 pub const DEFAULT_PORT: u16 = 9876;
 const BUCKET: &str = "celld-dev";
@@ -79,7 +85,9 @@ pub(crate) fn local_node_files(
 
 #[derive(Debug)]
 struct Options {
-    project: Option<PathBuf>,
+    /// The projects to run, in order; the first is the primary. Empty means
+    /// the current directory.
+    projects: Vec<PathBuf>,
     state_dir: Option<PathBuf>,
     clean: bool,
     stack: StackOptions,
@@ -379,39 +387,50 @@ impl Console {
         crate::note!("{}", self.paint(style, line));
     }
 
+    fn warning(&self, message: &str) {
+        crate::note!(
+            "  {} {message}",
+            self.paint(Color::Yellow.bold(), "warning")
+        );
+    }
+
     fn failure(&self, message: &str) {
         crate::note!("  {} {message}", self.paint(Color::Red.bold(), "error"));
     }
 }
 
 struct ProjectWatcher {
-    project: PathBuf,
+    /// The project directories, canonical, in the order of the projects.
+    roots: Vec<PathBuf>,
     ignored: Vec<Pattern>,
     _watcher: notify::RecommendedWatcher,
     changes: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
 }
 
 impl ProjectWatcher {
-    fn new(project: &Path, ignored: Vec<Pattern>) -> anyhow::Result<Self> {
+    fn new(roots: Vec<PathBuf>, ignored: Vec<Pattern>) -> anyhow::Result<Self> {
         let (sender, changes) = mpsc::unbounded_channel();
         let mut watcher = notify::recommended_watcher(move |event| {
             let _ = sender.send(event);
         })
         .context("create the project watcher")?;
-        watcher
-            .watch(project, RecursiveMode::Recursive)
-            .with_context(|| format!("watch the project directory {}", project.display()))?;
+        for root in watched_roots(&roots) {
+            watcher
+                .watch(root, RecursiveMode::Recursive)
+                .with_context(|| format!("watch the project directory {}", root.display()))?;
+        }
         Ok(Self {
-            project: project.to_path_buf(),
+            roots,
             ignored,
             _watcher: watcher,
             changes,
         })
     }
 
+    /// The projects that changed, once a quiet interval has passed.
     #[allow(clippy::disallowed_methods)] // Host-side debounce time is outside the Actor domain.
-    async fn changed(&mut self) -> anyhow::Result<()> {
-        self.next_relevant_change().await?;
+    async fn changed(&mut self) -> anyhow::Result<BTreeSet<usize>> {
+        let mut changed = self.next_relevant_change().await?;
         loop {
             // An editor can replace one save through several writes and a
             // rename. Wait for one quiet interval so esbuild never reads the
@@ -419,13 +438,13 @@ impl ProjectWatcher {
             match tokio::time::timeout(Duration::from_millis(150), self.next_relevant_change())
                 .await
             {
-                Ok(result) => result?,
-                Err(_) => return Ok(()),
+                Ok(result) => changed.extend(result?),
+                Err(_) => return Ok(changed),
             }
         }
     }
 
-    async fn next_relevant_change(&mut self) -> anyhow::Result<()> {
+    async fn next_relevant_change(&mut self) -> anyhow::Result<BTreeSet<usize>> {
         loop {
             match self
                 .changes
@@ -433,17 +452,41 @@ impl ProjectWatcher {
                 .await
                 .context("the project watcher stopped")?
             {
-                Ok(event) if relevant_project_event(&self.project, &event, &self.ignored) => {
-                    return Ok(())
+                Ok(event) => {
+                    let changed = changed_projects(&self.roots, &event, &self.ignored);
+                    if !changed.is_empty() {
+                        return Ok(changed);
+                    }
                 }
-                Ok(_) => {}
                 Err(error) => return Err(error).context("watch the project directory"),
             }
         }
     }
 }
 
-fn relevant_project_event(project: &Path, event: &notify::Event, ignored: &[Pattern]) -> bool {
+/// The directories to watch: a root inside another is covered by the outer
+/// watch, and a root listed twice is watched once.
+fn watched_roots(roots: &[PathBuf]) -> Vec<&Path> {
+    let mut watched = Vec::new();
+    for (index, root) in roots.iter().enumerate() {
+        let covered = roots.iter().enumerate().any(|(other_index, other)| {
+            (root.starts_with(other) && other != root) || (other == root && other_index < index)
+        });
+        if !covered {
+            watched.push(root.as_path());
+        }
+    }
+    watched
+}
+
+/// The projects an event changes: a path belongs to the project whose
+/// directory is the deepest one that contains it, and an ignore pattern is read
+/// relative to that directory. Projects in one directory share its changes.
+fn changed_projects(
+    roots: &[PathBuf],
+    event: &notify::Event,
+    ignored: &[Pattern],
+) -> BTreeSet<usize> {
     // A read is not a change. The inotify backend reports `Access(Open(Any))`
     // for every file that the bundler and the deploy step read, so a rebuild
     // produces the events that request the next rebuild and the supervisor
@@ -452,12 +495,25 @@ fn relevant_project_event(project: &Path, event: &notify::Event, ignored: &[Patt
     // write still arrives as a `Modify` event, and a `Create` or a `Remove`
     // event keeps its own kind, so no real change becomes invisible.
     if matches!(event.kind, notify::EventKind::Access(_)) {
-        return false;
+        return BTreeSet::new();
     }
-    event
-        .paths
-        .iter()
-        .any(|path| !ignored_project_path(project, path, ignored))
+    let mut changed = BTreeSet::new();
+    for path in &event.paths {
+        let depth = roots
+            .iter()
+            .filter(|root| path.starts_with(root))
+            .map(|root| root.components().count())
+            .max();
+        for (index, root) in roots.iter().enumerate() {
+            if Some(root.components().count()) == depth
+                && path.starts_with(root)
+                && !ignored_project_path(root, path, ignored)
+            {
+                changed.insert(index);
+            }
+        }
+    }
+    changed
 }
 
 fn ignored_project_path(project: &Path, path: &Path, ignored: &[Pattern]) -> bool {
@@ -547,11 +603,19 @@ impl ShutdownSignals {
 pub fn print_help() -> anyhow::Result<()> {
     crate::cli_output::Output::new(crate::cli_output::Format::Text).help(
         &format!("celld dev — run an application with persistent local storage\n\n\
-USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--state-dir DIR] [--logs] [--strict-compat-flags] [--no-watch] [--clean]\n\n\
+USAGE:\n  celld dev [PROJECT...] [-c CONFIG]... [--host IP] [--port PORT] [--state-dir DIR]\n           [--logs] [--strict-compat-flags] [--no-watch] [--clean]\n\n\
 PROJECT is a directory or a Wrangler config. It defaults to the current\n\
 directory. celld stores all local state in PROJECT/.celld/dev, and it keeps\n\
-that state across a restart. --state-dir DIR, or CELLD_DEV_STATE_DIR, keeps it\n\
-in DIR/<project hash>/.celld/dev instead. A configuration change does not migrate the\n\
+that state across a restart.\n\n\
+Give several projects, as arguments or with -c/--config, to run them together\n\
+in one node. The first one serves requests at the listener; the others are\n\
+reached through the service bindings of the projects that name them, so a\n\
+project that nothing reaches does not run. Each project needs its own Worker\n\
+name, and its Durable Object classes must differ from the others'. Cron\n\
+triggers run for the first project only. The local state is the first\n\
+project's, and celld d1 --local reads it from there.\n\n\
+--state-dir DIR, or CELLD_DEV_STATE_DIR, keeps the local state in\n\
+DIR/<project hash>/.celld/dev instead, the hash being the first project's. A configuration change does not migrate the\n\
 state, so a cell can keep a value that the new configuration rejects. Use\n\
 --clean to start from an empty local state.\n\n\
 A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
@@ -564,7 +628,7 @@ OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  
 }
 
 fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Options>> {
-    let mut project = None;
+    let mut projects = Vec::new();
     let mut state_dir = None;
     let mut host = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut port = DEFAULT_PORT;
@@ -606,16 +670,19 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
                     .parse::<u16>()
                     .with_context(|| format!("invalid --port value {value:?}"))?;
             }
+            "-c" | "--config" => {
+                let value = arguments.next().context("--config requires a value")?;
+                projects.push(PathBuf::from(value));
+            }
             other if other.starts_with('-') => bail!("unknown argument for `celld dev`: {other}"),
-            value if project.is_none() => project = Some(PathBuf::from(value)),
-            value => bail!("celld dev accepts one PROJECT, but also received {value:?}"),
+            value => projects.push(PathBuf::from(value)),
         }
     }
     if !watch && !watch_ignores.is_empty() {
         bail!("--watch-ignore cannot be used with --no-watch");
     }
     Ok(Some(Options {
-        project,
+        projects,
         state_dir,
         clean,
         stack: StackOptions {
@@ -634,9 +701,8 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         print_help()?;
         return Ok(());
     };
-    let config = deploy::resolve_config(options.project)?;
-    let config = std::fs::canonicalize(&config)
-        .with_context(|| format!("resolve Wrangler config {}", config.display()))?;
+    let configs = resolve_projects(options.projects)?;
+    let config = &configs[0];
     let project = config
         .parent()
         .context("the Wrangler config has no project directory")?;
@@ -648,6 +714,9 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let console = Console::new();
     console.header();
     console.detail("Project", &config.display().to_string());
+    for other in &configs[1..] {
+        console.detail("Also", &other.display().to_string());
+    }
     console.detail("State", &state.path().display().to_string());
     state.prepare_shared_root()?;
     // The delete runs before the directory is recreated, and the console names
@@ -681,7 +750,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let project_hash = project_hash(project);
     let store = open_store(state.path(), &console).await?;
     run_stack(
-        &config,
+        &configs,
         state.path(),
         options.stack,
         &project_hash,
@@ -691,7 +760,34 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     .await
 }
 
-#[allow(clippy::disallowed_methods)] // Local development state is an operator-owned host path.
+/// The config of each project to run, resolved and canonical, in the order
+/// given. Two projects may not be the same config or declare the same Worker
+/// name, since a script name selects one deployment in the shared store.
+#[allow(clippy::disallowed_methods)] // Project resolution uses the operator's host filesystem.
+fn resolve_projects(given: Vec<PathBuf>) -> anyhow::Result<Vec<PathBuf>> {
+    let given = if given.is_empty() {
+        vec![deploy::resolve_config(None)?]
+    } else {
+        given
+            .into_iter()
+            .map(|project| deploy::resolve_config(Some(project)))
+            .collect::<anyhow::Result<Vec<_>>>()?
+    };
+    let configs = given
+        .into_iter()
+        .map(|config| {
+            std::fs::canonicalize(&config)
+                .with_context(|| format!("resolve Wrangler config {}", config.display()))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let names = configs
+        .iter()
+        .map(|config| deploy::read_script_name(Some(config.clone())))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    ensure_distinct(&configs, &names)?;
+    Ok(configs)
+}
+
 fn prepare_state(state: &Path) -> anyhow::Result<()> {
     for directory in [state.to_path_buf(), state.join("runtime")] {
         crate::config_dir::create_private(&directory)
@@ -734,26 +830,56 @@ fn read_dev_vars(config: &Path) -> anyhow::Result<deploy::VarOverrides> {
     Ok(deploy::VarOverrides::DotEnv(vars))
 }
 
-/// The config of the project that this `celld dev` node serves, so the node
-/// can read `.dev.vars` itself. Only the supervisor sets it.
+/// The configs of the projects that this `celld dev` node serves, as a JSON
+/// object from script name to config path, so the node can read each project's
+/// `.dev.vars` itself. Only the supervisor sets it.
 const CONFIG_ENV: &str = "CELLD_INTERNAL_DEV_CONFIG";
+
+/// The value of [`CONFIG_ENV`] for `projects`.
+fn config_map(projects: &[Project]) -> anyhow::Result<String> {
+    serde_json::to_string(
+        &projects
+            .iter()
+            .map(|project| (&project.script, &project.config))
+            .collect::<BTreeMap<_, _>>(),
+    )
+    .context("a project config path is not valid UTF-8")
+}
+
+/// The config that `script` was built from, in a [`CONFIG_ENV`] value. A script
+/// the map does not name has none, so it never reads another project's files.
+fn config_for(map: &str, script: &str) -> Option<PathBuf> {
+    serde_json::from_str::<BTreeMap<String, PathBuf>>(map)
+        .ok()?
+        .remove(script)
+}
 
 /// The entries of `.dev.vars` or the dotenv files, read now, that fill the
 /// Secrets Store bindings of a deployment, and the config's
 /// `localConnectionString` of each Hyperdrive binding, under the binding's
-/// local variable where that has no non-empty entry. The node calls it each
+/// local variable where that has no non-empty entry. The files are those of the
+/// project that `manifest`'s script was built from. The node calls it each
 /// time it loads a deployment, and keeps the values in memory only, so a
 /// secret never reaches the deployment on disk and a changed file reaches the
-/// next load. Empty outside a `celld dev` node.
-pub fn store_values() -> anyhow::Result<BTreeMap<String, String>> {
-    let Some(config) = std::env::var_os(CONFIG_ENV).filter(|_| is_dev_node()) else {
+/// next load. Empty outside a `celld dev` node, and for a script that this
+/// run did not build.
+pub fn store_values(manifest: &Manifest) -> anyhow::Result<BTreeMap<String, String>> {
+    match std::env::var(CONFIG_ENV).ok().filter(|_| is_dev_node()) {
+        Some(map) => store_values_from(&map, manifest),
+        None => Ok(BTreeMap::new()),
+    }
+}
+
+/// [`store_values`] for the projects of one [`CONFIG_ENV`] value.
+fn store_values_from(map: &str, manifest: &Manifest) -> anyhow::Result<BTreeMap<String, String>> {
+    let Some(config) = config_for(map, &manifest.script_name) else {
         return Ok(BTreeMap::new());
     };
-    let mut values = match read_dev_vars(Path::new(&config))? {
+    let mut values = match read_dev_vars(&config)? {
         deploy::VarOverrides::DevVars(entries) | deploy::VarOverrides::DotEnv(entries) => entries,
         deploy::VarOverrides::None => BTreeMap::new(),
     };
-    let (_, project) = deploy::read_config(Some(config.into()))?;
+    let (_, project) = deploy::read_config(Some(config))?;
     add_local_connection_strings(&mut values, &project);
     Ok(values)
 }
@@ -862,41 +988,8 @@ fn quoted_lines(value: &str, lines: &mut std::str::Lines<'_>) -> Option<String> 
     None
 }
 
-async fn deploy_project(
-    config: &Path,
-    store: &Store,
-    logs: bool,
-    strict_compat_flags: bool,
-) -> anyhow::Result<()> {
-    let bucket = open_local_bucket(&store.database)?;
-    let options = deploy::Options {
-        config: Some(config.to_path_buf()),
-        bucket: None,
-        endpoint: None,
-        region: None,
-        dry_run: false,
-        strict: false,
-        strict_compat_flags,
-        no_activate: false,
-        primary: true,
-        json: false,
-        vars: read_dev_vars(config)?,
-        local_images: true,
-        sourcemap: None,
-        tag: None,
-    };
-    let built = deploy::build(&options)?;
-    if logs {
-        built.report();
-    }
-    crate::wake_format::ensure_ready(&bucket).await?;
-    deploy::write(&bucket, &built, options.selection())
-        .await
-        .map(drop)
-}
-
 async fn run_stack(
-    config: &Path,
+    configs: &[PathBuf],
     state: &Path,
     options: StackOptions,
     project_hash: &str,
@@ -908,18 +1001,39 @@ async fn run_stack(
     // handler afterwards leaves the new node orphaned under the default Unix
     // signal action.
     let mut signals = ShutdownSignals::install()?;
-    let project = config
-        .parent()
-        .context("the Wrangler config has no project directory")?;
+    let roots = configs
+        .iter()
+        .map(|config| {
+            config
+                .parent()
+                .map(Path::to_path_buf)
+                .context("the Wrangler config has no project directory")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let mut watcher = options
         .watch
-        .then(|| ProjectWatcher::new(project, options.watch_ignores))
+        .then(|| ProjectWatcher::new(roots, options.watch_ignores))
         .transpose()?;
 
     console.progress("building the application");
-    deploy_project(config, store, options.logs, options.strict_compat_flags).await?;
+    let mut manifests = configs.iter().map(|_| None).collect::<Vec<_>>();
+    // Projects whose files changed and that no reload has deployed yet: a
+    // reload that fails leaves them for the next one.
+    let mut pending = BTreeSet::new();
+    let mut projects = deploy_projects(
+        configs,
+        &mut pending,
+        &mut manifests,
+        store,
+        options.logs,
+        options.strict_compat_flags,
+    )
+    .await?;
+    // The projects the node does not load that the console has already named.
+    let mut warned = BTreeSet::new();
+    warn_unreachable(&projects, &mut warned, console);
     let mut running = start_node(
-        config,
+        &projects,
         state,
         options.listener,
         options.logs,
@@ -945,18 +1059,42 @@ async fn run_stack(
                 stop_running_node(running).await;
                 return Ok(());
             }
-            NodeEvent::Reload => {
-                console.progress("change detected; rebuilding the application");
-                if let Err(error) =
-                    deploy_project(config, store, options.logs, options.strict_compat_flags).await
-                {
-                    console.failure(&format!("reload failed: {error:#}"));
+            NodeEvent::Reload(changed) => {
+                pending.extend(changed);
+                // A project that nothing loaded reaches cannot change what the
+                // node serves, so a rebuild and a restart would only drop its
+                // in-flight requests. It stays pending: a later change can make
+                // another project bind it, and it is built then.
+                if changes_nothing_loaded(configs, &pending, &manifests, store).await {
+                    console.progress(
+                        "change detected in a project that no running project reaches; nothing to restart",
+                    );
                     continue;
+                }
+                console.progress("change detected; rebuilding the application");
+                match deploy_projects(
+                    configs,
+                    &mut pending,
+                    &mut manifests,
+                    store,
+                    options.logs,
+                    options.strict_compat_flags,
+                )
+                .await
+                {
+                    Ok(deployed) => {
+                        warn_unreachable(&deployed, &mut warned, console);
+                        projects = deployed;
+                    }
+                    Err(error) => {
+                        console.failure(&format!("reload failed: {error:#}"));
+                        continue;
+                    }
                 }
                 console.progress("restarting the application");
                 stop_running_node(running).await;
                 running = start_node(
-                    config,
+                    &projects,
                     state,
                     listener,
                     options.logs,
@@ -967,6 +1105,12 @@ async fn run_stack(
                 .await?;
             }
         }
+    }
+}
+
+fn warn_unreachable(projects: &[Project], shown: &mut BTreeSet<String>, console: &Console) {
+    for warning in unreachable_warnings(projects, shown) {
+        console.warning(&warning);
     }
 }
 
@@ -983,13 +1127,14 @@ struct RunningNode {
 
 enum NodeEvent {
     Exited(std::process::ExitStatus),
-    Reload,
+    /// The projects whose files changed.
+    Reload(BTreeSet<usize>),
     Shutdown,
 }
 
 #[allow(clippy::disallowed_methods)] // Child supervision uses real host process and time APIs.
 async fn start_node(
-    config: &Path,
+    projects: &[Project],
     state: &Path,
     listener: SocketAddr,
     logs: bool,
@@ -1037,7 +1182,7 @@ async fn start_node(
             "127.0.0.1:0",
         ])
         .env("CELLD_INTERNAL_DEV_STORE", &store.database)
-        .env(CONFIG_ENV, config)
+        .env(CONFIG_ENV, config_map(projects)?)
         .env("CELLD_WATCH", state.join("runtime"))
         .env(crate::operator_token::FILE_ENV, &token_file)
         .env("CELLD_NODE", format!("dev-{}", &project_hash[..12]))
@@ -1220,14 +1365,13 @@ async fn wait_for_node_event(
             Ok(NodeEvent::Exited(status))
         }
         _ = signals.received() => Ok(NodeEvent::Shutdown),
-        changed = wait_for_project_change(watcher) => {
-            changed?;
-            Ok(NodeEvent::Reload)
-        }
+        changed = wait_for_project_change(watcher) => Ok(NodeEvent::Reload(changed?)),
     }
 }
 
-async fn wait_for_project_change(watcher: Option<&mut ProjectWatcher>) -> anyhow::Result<()> {
+async fn wait_for_project_change(
+    watcher: Option<&mut ProjectWatcher>,
+) -> anyhow::Result<BTreeSet<usize>> {
     match watcher {
         Some(watcher) => watcher.changed().await,
         None => std::future::pending().await,
@@ -1296,317 +1440,8 @@ async fn stop_child(
 }
 
 #[cfg(test)]
-mod tests {
-    #![allow(clippy::disallowed_methods)] // Tests use the host filesystem.
-    use super::*;
-
-    fn parse(arguments: &[&str]) -> anyhow::Result<Option<Options>> {
-        options_from_arguments(
-            arguments
-                .iter()
-                .map(|argument| (*argument).to_owned())
-                .collect(),
-        )
-    }
-
-    #[test]
-    fn port_zero_asks_for_a_free_port() {
-        let options = parse(&["--port", "0"]).unwrap().unwrap();
-        assert_eq!(options.stack.listener.port(), 0);
-    }
-
-    #[test]
-    fn a_config_string_fills_a_local_variable_that_has_no_value() {
-        let config = serde_json::json!({ "hyperdrive": [
-            { "binding": "A", "id": "a", "localConnectionString": "from-config-a" },
-            { "binding": "B", "id": "b", "localConnectionString": "from-config-b" },
-            { "binding": "C", "id": "c", "localConnectionString": "" },
-            { "binding": "D", "id": "d" }
-        ] });
-        let name = crate::hyperdrive::local_variable;
-        let mut values = BTreeMap::from([
-            (name("A"), String::new()),
-            (name("B"), "from-dev-vars".to_string()),
-        ]);
-        add_local_connection_strings(&mut values, &config);
-        assert_eq!(values[&name("A")], "from-config-a");
-        assert_eq!(values[&name("B")], "from-dev-vars");
-        assert!(!values.contains_key(&name("C")) && !values.contains_key(&name("D")));
-    }
-
-    #[test]
-    fn the_state_directory_moves_the_parent_of_the_local_state() {
-        let options = parse(&["--state-dir", "/var/celld"]).unwrap().unwrap();
-        assert_eq!(options.state_dir, Some(PathBuf::from("/var/celld")));
-        assert!(parse(&["--state-dir"]).is_err());
-    }
-
-    fn resolved(flag: Option<&str>, env: Option<&str>) -> PathBuf {
-        DevState::resolve(
-            Path::new("/work/app"),
-            flag.map(PathBuf::from),
-            env.map(OsString::from),
-        )
-        .unwrap()
-        .path()
-        .to_path_buf()
-    }
-
-    #[test]
-    fn the_state_defaults_to_the_project() {
-        assert_eq!(resolved(None, None), Path::new("/work/app/.celld/dev"));
-        assert_eq!(
-            resolved(Some(""), Some("")),
-            Path::new("/work/app/.celld/dev")
-        );
-    }
-
-    #[test]
-    fn the_flag_wins_over_the_environment_and_an_empty_flag_falls_back() {
-        let hash = project_hash(Path::new("/work/app"));
-        let expected = |root: &str| Path::new(root).join(&hash).join(".celld/dev");
-        assert_eq!(resolved(Some("/a"), Some("/b")), expected("/a"));
-        assert_eq!(resolved(None, Some("/b")), expected("/b"));
-        assert_eq!(resolved(Some(""), Some("/b")), expected("/b"));
-        assert_eq!(resolved(Some("/a"), Some("")), expected("/a"));
-    }
-
-    #[test]
-    fn projects_that_share_a_state_directory_get_their_own_state() {
-        let state = |project: &str| {
-            DevState::resolve(Path::new(project), Some(PathBuf::from("/shared")), None)
-                .unwrap()
-                .path()
-                .to_path_buf()
-        };
-        let (one, two) = (state("/work/one"), state("/work/two"));
-        assert_ne!(one, two);
-        assert!(one.starts_with("/shared") && one.ends_with(".celld/dev"));
-        assert!(!one.starts_with(&two) && !two.starts_with(&one));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[allow(clippy::disallowed_methods)] // Host paths in a temporary directory.
-    fn clean_refuses_a_state_directory_reached_through_a_link() {
-        let directory = tempfile::tempdir().unwrap();
-        let victim = directory.path().join("victim");
-        std::fs::create_dir_all(victim.join(".celld/dev")).unwrap();
-        std::fs::write(victim.join(".celld/dev/keep"), "data").unwrap();
-        let shared = directory.path().join("shared");
-        std::fs::create_dir(&shared).unwrap();
-        let project = Path::new("/work/app");
-        let state = DevState::resolve(project, Some(shared.clone()), None).unwrap();
-        std::os::unix::fs::symlink(&victim, shared.join(project_hash(project))).unwrap();
-        let error = state.discard().unwrap_err().to_string();
-        assert!(error.contains("symbolic link"), "{error}");
-        assert!(victim.join(".celld/dev/keep").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[allow(clippy::disallowed_methods)] // Host paths in a temporary directory.
-    fn the_per_project_directory_is_private_and_a_real_one_is_cleaned() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let directory = tempfile::tempdir().unwrap();
-        let state = DevState::resolve(
-            Path::new("/work/app"),
-            Some(directory.path().join("shared")),
-            None,
-        )
-        .unwrap();
-        state.prepare_shared_root().unwrap();
-        let root = state.shared_root.clone().unwrap();
-        let mode = std::fs::metadata(&root).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o700);
-        assert!(!state.discard().unwrap());
-        prepare_state(state.path()).unwrap();
-        assert!(state.discard().unwrap());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[allow(clippy::disallowed_methods)] // Host paths in a temporary directory.
-    fn a_planted_per_project_directory_is_refused_before_it_is_used() {
-        let directory = tempfile::tempdir().unwrap();
-        let shared = directory.path().join("shared");
-        std::fs::create_dir(&shared).unwrap();
-        let project = Path::new("/work/app");
-        let state = DevState::resolve(project, Some(shared.clone()), None).unwrap();
-        let victim = directory.path().join("victim");
-        std::fs::create_dir(&victim).unwrap();
-        std::os::unix::fs::symlink(&victim, shared.join(project_hash(project))).unwrap();
-        let error = state.prepare_shared_root().unwrap_err().to_string();
-        assert!(error.contains("symbolic link"), "{error}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[allow(clippy::disallowed_methods)] // Host paths in a temporary directory.
-    fn a_state_directory_others_can_write_to_is_refused() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let directory = tempfile::tempdir().unwrap();
-        let project = std::fs::canonicalize(directory.path()).unwrap();
-        let shared = project.join("shared");
-        for state_dir in [None, Some(shared)] {
-            let state = DevState::resolve(&project, state_dir, None).unwrap();
-            state.prepare_shared_root().unwrap();
-            prepare_state(state.path()).unwrap();
-            state.ensure_not_redirected("use").unwrap();
-            let levels = [state.path().parent().unwrap(), state.path()];
-            for level in levels.into_iter().chain(state.shared_root.as_deref()) {
-                for mode in [0o770, 0o707] {
-                    std::fs::set_permissions(level, std::fs::Permissions::from_mode(mode)).unwrap();
-                    let error = state.ensure_not_redirected("use").unwrap_err().to_string();
-                    assert!(
-                        error.contains("can be written to by other users"),
-                        "{error}"
-                    );
-                }
-                std::fs::set_permissions(level, std::fs::Permissions::from_mode(0o700)).unwrap();
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[allow(clippy::disallowed_methods)] // Host paths in a temporary directory.
-    fn celld_dev_tightens_a_loose_state_but_a_command_that_sends_the_token_refuses_it() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let directory = tempfile::tempdir().unwrap();
-        let project = std::fs::canonicalize(directory.path()).unwrap();
-        let state = DevState::resolve(&project, None, None).unwrap();
-        std::fs::create_dir_all(state.path()).unwrap();
-        for level in [state.path().parent().unwrap(), state.path()] {
-            std::fs::set_permissions(level, std::fs::Permissions::from_mode(0o777)).unwrap();
-        }
-        std::fs::write(state.path().join("objects.sqlite3"), b"").unwrap();
-        let error = local_node_files(&project, None).unwrap_err().to_string();
-        assert!(
-            error.contains("can be written to by other users"),
-            "{error}"
-        );
-        state.prepare_shared_root().unwrap();
-        state.ensure_not_redirected("use").unwrap();
-        let mode = std::fs::metadata(state.path())
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o700);
-        // `--clean` tightens the same way.
-        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(state.discard().unwrap());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[allow(clippy::disallowed_methods)] // Host paths in a temporary directory.
-    fn a_project_local_state_that_another_user_owns_is_refused() {
-        // SAFETY: `geteuid` takes no arguments and cannot fail.
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
-        let directory = tempfile::tempdir().unwrap();
-        let project = std::fs::canonicalize(directory.path()).unwrap();
-        // `/usr` is owned by root and not writable by others, so only the
-        // owner check can refuse it.
-        std::os::unix::fs::symlink("/usr", project.join(".celld")).unwrap();
-        let state = DevState::resolve(&project, None, None).unwrap();
-        let error = state.ensure_not_redirected("use").unwrap_err().to_string();
-        assert!(error.contains("owned by another user"), "{error}");
-
-        // A link to a directory the user owns is still fine.
-        std::fs::remove_file(project.join(".celld")).unwrap();
-        let own = project.join("own");
-        std::fs::create_dir(&own).unwrap();
-        std::fs::set_permissions(&own, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .unwrap();
-        std::os::unix::fs::symlink(&own, project.join(".celld")).unwrap();
-        state.ensure_not_redirected("use").unwrap();
-    }
-
-    #[test]
-    fn clients_find_the_token_where_the_node_with_the_state_directory_keeps_it() {
-        let directory = tempfile::tempdir().unwrap();
-        let project = &std::fs::canonicalize(directory.path()).unwrap();
-        let inside = operator_token_path_with(project, None).unwrap();
-        assert_eq!(inside, project.join(".celld/dev/operator-token"));
-        let shared = operator_token_path_with(project, Some("/shared".into())).unwrap();
-        assert_eq!(
-            shared,
-            DevState::resolve(project, None, Some("/shared".into()))
-                .unwrap()
-                .path()
-                .join(crate::operator_token::FILE_NAME)
-        );
-        assert_ne!(shared, inside);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn clients_find_the_token_through_links_and_relative_paths() {
-        let directory = tempfile::tempdir().unwrap();
-        let project = std::fs::canonicalize(directory.path()).unwrap().join("app");
-        std::fs::create_dir(&project).unwrap();
-        let link = directory.path().join("link");
-        std::os::unix::fs::symlink(&project, &link).unwrap();
-        let state = Some(OsString::from("/shared"));
-        let expected = operator_token_path_with(&project, state.clone()).unwrap();
-        assert_eq!(
-            operator_token_path_with(&link, state.clone()).unwrap(),
-            expected
-        );
-        let dotted = project.join("..").join("app");
-        assert_eq!(
-            operator_token_path_with(&dotted, state.clone()).unwrap(),
-            expected
-        );
-        let relative = pathdiff_from_current(&project);
-        assert_eq!(
-            operator_token_path_with(&relative, state).unwrap(),
-            expected
-        );
-    }
-
-    /// `path` as a relative path from the current directory.
-    fn pathdiff_from_current(path: &Path) -> PathBuf {
-        let current = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
-        let mut relative = PathBuf::new();
-        for _ in current.components().skip(1) {
-            relative.push("..");
-        }
-        relative.join(path.strip_prefix("/").unwrap())
-    }
-
-    #[test]
-    fn a_relative_state_directory_becomes_absolute() {
-        let path = resolved(Some("state"), None);
-        assert!(path.is_absolute(), "{}", path.display());
-        assert!(path.ends_with(".celld/dev"));
-    }
-
-    #[test]
-    fn a_port_out_of_range_is_refused() {
-        assert!(parse(&["--port", "65536"]).is_err());
-        assert!(parse(&["--port", "-1"]).is_err());
-    }
-
-    #[test]
-    fn the_public_address_is_read_from_the_announce_line() {
-        assert_eq!(
-            listener_address("celld listening on 127.0.0.1:55421 (ownership=dev)"),
-            Some("127.0.0.1:55421".parse().unwrap())
-        );
-        assert_eq!(
-            listener_address("celld listening on [::1]:8080 (ownership=dev)"),
-            Some("[::1]:8080".parse().unwrap())
-        );
-        assert_eq!(
-            listener_address("celld internal listening on 127.0.0.1:1 (advertise=x)"),
-            None
-        );
-    }
-}
+#[path = "dev_tests.rs"]
+mod tests;
 
 #[cfg(test)]
 mod operator_token_tests {
