@@ -226,7 +226,7 @@ pub async fn activate(
     }
     let mut attachments = Vec::with_capacity(targets.len());
     for manifest in &manifests {
-        attachments.push(crate::deploy::prepare_queue_attachments(bucket, manifest).await?);
+        attachments.push(crate::deploy::prepare_queue_attachments(bucket, manifest, &[]).await?);
         // A secret put after this version was uploaded may use a name this
         // version binds, and activation would shadow it.
         crate::secrets::ensure_script_secrets(bucket, manifest).await?;

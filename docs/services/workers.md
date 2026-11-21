@@ -342,16 +342,20 @@ them.
   too when a loaded project binds them, and a reload that would load such a
   clash is refused while the node keeps serving.
 - Two projects that consume the same queue are refused before either is written.
+  A reload judges the queues as it leaves them, so it can move a consumer from
+  one project to another: the project that drops the queue releases it, and the
+  one that adds it takes it, written after the first.
+  Two projects that would swap queues in one reload are refused; move one
+  consumer, reload, then move the other.
 - Cron triggers run for the first project only, as for any fleet.
 - The local state, and the `--state-dir` hash, are the first project's.
   `celld d1 --local` reads them and supports only the databases of the first
   project, so run it from there; a database that only another project declares
   is not reachable with it. Scripts that an earlier run left in the state stay
   there and are not removed.
-- A queue consumer attachment that an earlier run, or a project since renamed,
-  left in the state blocks a new consumer of the same queue, and the start or
-  reload is refused naming the queue. Start with `celld dev --clean` to remove
-  it.
+- A queue consumer attachment that a script outside the run holds (a retained
+  script, or a project since renamed) blocks a new consumer of the same queue,
+  and the start or reload is refused naming the queue.
 - A change in a project rebuilds and writes only that project, then restarts the
   node. A change in a project that no running project reaches rebuilds nothing
   and restarts nothing; the console says so, and the project is built when a

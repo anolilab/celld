@@ -70,28 +70,55 @@ pub(super) fn build_project(
 /// Write rebuilt projects, each with its position in the run, into the local
 /// store: the first project is the primary script the node serves, the rest
 /// join the component map and are reached through service bindings. Every
-/// project passes the write-time refusals before any is written.
+/// project passes the write-time refusals before any is written, judged as the
+/// run leaves the store: `batch` holds the manifest each project has after it,
+/// so a queue that one project drops and another adds is a hand-over, not a
+/// clash.
 ///
 /// At the start of a run, `first_start`, the primary goes first so that a store
 /// that another run left with a different primary, or none, ends with this
 /// one, and the others join its component map. In a reload the primary is
 /// already the one the node serves, so it goes last: a refusal that only the
-/// write can find then never moves what the primary serves.
+/// write can find then never moves what the primary serves. A project that
+/// takes a queue another project of the run holds is written after that
+/// project, which releases the queue; a queue has one attachment, so it cannot
+/// be taken first.
 async fn write_projects(
     bucket: &crate::bucket::Bucket,
     rebuilt: &[(usize, deploy::Built)],
+    batch: &[&Manifest],
     first_start: bool,
 ) -> anyhow::Result<()> {
     for (_, built) in rebuilt {
-        deploy::check_write(bucket, built).await?;
+        deploy::check_write(bucket, built, batch).await?;
     }
     let (primary, others): (Vec<_>, Vec<_>) = rebuilt.iter().partition(|(index, _)| *index == 0);
     let order = if first_start {
-        primary.into_iter().chain(others)
+        primary.into_iter().chain(others).collect::<Vec<_>>()
     } else {
-        others.into_iter().chain(primary)
+        others.into_iter().chain(primary).collect()
     };
-    for (index, built) in order {
+    let mut after = Vec::with_capacity(order.len());
+    for (_, built) in &order {
+        after.push(deploy::queues_held_by_others(bucket, &built.manifest).await?);
+    }
+    let mut waiting = order.into_iter().zip(after).collect::<Vec<_>>();
+    while !waiting.is_empty() {
+        let ready = waiting.iter().position(|(_, held)| {
+            held.iter().all(|(_, owner)| {
+                !waiting
+                    .iter()
+                    .any(|((_, other), _)| other.manifest.script_name == *owner)
+            })
+        });
+        let Some(ready) = ready else {
+            bail!(
+                "the projects hand queue consumers to each other in a cycle, and a queue \
+                 cannot change hands in both directions at once; move one consumer, reload, \
+                 then move the other"
+            );
+        };
+        let ((index, built), _) = waiting.remove(ready);
         let selection = if *index == 0 {
             deploy::Selection::Primary
         } else {
@@ -403,7 +430,7 @@ pub(super) async fn deploy_projects(
             reachable,
         })
         .collect();
-    write_projects(&bucket, &rebuilt, manifests[0].is_none()).await?;
+    write_projects(&bucket, &rebuilt, &current, manifests[0].is_none()).await?;
     // Only the manifest is kept: the modules and assets of a build are large
     // and nothing reads them once they are written.
     for (index, built) in rebuilt {

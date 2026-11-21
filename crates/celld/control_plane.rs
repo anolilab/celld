@@ -1759,7 +1759,7 @@ pub async fn apply_deployment(
     // objects. A competing Queue consumer must refuse the deployment without
     // leaving a prefix that looks publishable.
     let queue_attachments =
-        crate::deploy::prepare_queue_attachments(bucket, &deployment.manifest).await?;
+        crate::deploy::prepare_queue_attachments(bucket, &deployment.manifest, &[]).await?;
     // The same refusals as `celld deploy` and `celld activate`: a stored secret
     // must not shadow a binding, and a Secrets Store binding names a secret its
     // store must hold, or the Worker starts with a binding that rejects at
