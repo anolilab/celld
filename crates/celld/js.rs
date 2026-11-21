@@ -3704,10 +3704,10 @@ impl InFlight {
     /// Give up on a handler that will not settle, or end the `waitUntil` work
     /// of one the budget bounds.
     pub fn time_out(&mut self, budget: Duration) {
-        self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
         // The budget has ended it; nothing is left to linger for.
-        self.ends_at_budget = false;
-        if self.reply.is_none() {
+        let bounded = std::mem::take(&mut self.ends_at_budget);
+        self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
+        if bounded {
             self.background = None;
             self.context.seal_wait_until();
         }
