@@ -62,6 +62,8 @@ pub struct Server {
     project: PathBuf,
     /// The projects after the first, which `celld dev` is given as well.
     others: Vec<PathBuf>,
+    /// Whether `celld dev` watches the projects and reloads on a change.
+    watch: bool,
     client: reqwest::Client,
     boot: Duration,
     _dir: TempDir,
@@ -112,6 +114,7 @@ impl Server {
             log: dir.path().join("celld.log"),
             project,
             others: Vec::new(),
+            watch: false,
             client: client(),
             boot: Duration::ZERO,
             _dir: dir,
@@ -126,7 +129,18 @@ impl Server {
         env: &[(&str, &str)],
         setup: impl FnOnce(&[PathBuf]),
     ) -> Server {
+        Server::start_projects_watching(fixtures, env, false, setup).await
+    }
+
+    /// [`Self::start_projects`], with the watcher on when `watch` is set.
+    pub async fn start_projects_watching(
+        fixtures: &[&str],
+        env: &[(&str, &str)],
+        watch: bool,
+        setup: impl FnOnce(&[PathBuf]),
+    ) -> Server {
         let mut server = Server::prepare_projects(fixtures, env);
+        server.watch = watch;
         setup(&server.projects());
         server
             .launch()
@@ -365,6 +379,7 @@ impl Server {
             self.child = Some(try_spawn(
                 &self.project,
                 &self.others,
+                self.watch,
                 &self.env,
                 self.ambient_token.as_deref(),
                 &self.log,
@@ -631,12 +646,13 @@ fn spawn(
     ambient: Option<&str>,
     log: &Path,
 ) -> Child {
-    try_spawn(project, others, env, ambient, log).unwrap_or_else(|reason| panic!("{reason}"))
+    try_spawn(project, others, false, env, ambient, log).unwrap_or_else(|reason| panic!("{reason}"))
 }
 
 fn try_spawn(
     project: &Path,
     others: &[PathBuf],
+    watch: bool,
     env: &[(String, String)],
     ambient: Option<&str>,
     log: &Path,
@@ -650,7 +666,8 @@ fn try_spawn(
         .arg("dev")
         .arg(project)
         .args(others)
-        .args(["--no-watch", "--logs", "--port", "0"])
+        .args(["--logs", "--port", "0"])
+        .args((!watch).then_some("--no-watch"))
         // A token in the runner's environment would gate every test node;
         // a test that wants one passes it in `env`.
         .env_remove("CELLD_OPERATOR_TOKEN")

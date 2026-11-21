@@ -14,7 +14,7 @@ use glob::{MatchOptions, Pattern};
 use notify::{RecursiveMode, Watcher as _};
 use nu_ansi_term::{Color, Style};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::IsTerminal as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -395,33 +395,42 @@ impl Console {
 }
 
 struct ProjectWatcher {
-    project: PathBuf,
+    /// The project directories, canonical, in the order of the projects.
+    roots: Vec<PathBuf>,
     ignored: Vec<Pattern>,
     _watcher: notify::RecommendedWatcher,
     changes: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
 }
 
 impl ProjectWatcher {
-    fn new(project: &Path, ignored: Vec<Pattern>) -> anyhow::Result<Self> {
+    fn new(roots: Vec<PathBuf>, ignored: Vec<Pattern>) -> anyhow::Result<Self> {
         let (sender, changes) = mpsc::unbounded_channel();
         let mut watcher = notify::recommended_watcher(move |event| {
             let _ = sender.send(event);
         })
         .context("create the project watcher")?;
-        watcher
-            .watch(project, RecursiveMode::Recursive)
-            .with_context(|| format!("watch the project directory {}", project.display()))?;
+        // A root inside another is already covered by the outer watch.
+        for root in roots.iter().filter(|root| {
+            !roots
+                .iter()
+                .any(|other| root.starts_with(other) && other != *root)
+        }) {
+            watcher
+                .watch(root, RecursiveMode::Recursive)
+                .with_context(|| format!("watch the project directory {}", root.display()))?;
+        }
         Ok(Self {
-            project: project.to_path_buf(),
+            roots,
             ignored,
             _watcher: watcher,
             changes,
         })
     }
 
+    /// The projects that changed, once a quiet interval has passed.
     #[allow(clippy::disallowed_methods)] // Host-side debounce time is outside the Actor domain.
-    async fn changed(&mut self) -> anyhow::Result<()> {
-        self.next_relevant_change().await?;
+    async fn changed(&mut self) -> anyhow::Result<BTreeSet<usize>> {
+        let mut changed = self.next_relevant_change().await?;
         loop {
             // An editor can replace one save through several writes and a
             // rename. Wait for one quiet interval so esbuild never reads the
@@ -429,13 +438,13 @@ impl ProjectWatcher {
             match tokio::time::timeout(Duration::from_millis(150), self.next_relevant_change())
                 .await
             {
-                Ok(result) => result?,
-                Err(_) => return Ok(()),
+                Ok(result) => changed.extend(result?),
+                Err(_) => return Ok(changed),
             }
         }
     }
 
-    async fn next_relevant_change(&mut self) -> anyhow::Result<()> {
+    async fn next_relevant_change(&mut self) -> anyhow::Result<BTreeSet<usize>> {
         loop {
             match self
                 .changes
@@ -443,17 +452,26 @@ impl ProjectWatcher {
                 .await
                 .context("the project watcher stopped")?
             {
-                Ok(event) if relevant_project_event(&self.project, &event, &self.ignored) => {
-                    return Ok(())
+                Ok(event) => {
+                    let changed = changed_projects(&self.roots, &event, &self.ignored);
+                    if !changed.is_empty() {
+                        return Ok(changed);
+                    }
                 }
-                Ok(_) => {}
                 Err(error) => return Err(error).context("watch the project directory"),
             }
         }
     }
 }
 
-fn relevant_project_event(project: &Path, event: &notify::Event, ignored: &[Pattern]) -> bool {
+/// The projects an event changes: a path belongs to the project whose
+/// directory is the deepest one that contains it, and an ignore pattern is read
+/// relative to that directory. Projects in one directory share its changes.
+fn changed_projects(
+    roots: &[PathBuf],
+    event: &notify::Event,
+    ignored: &[Pattern],
+) -> BTreeSet<usize> {
     // A read is not a change. The inotify backend reports `Access(Open(Any))`
     // for every file that the bundler and the deploy step read, so a rebuild
     // produces the events that request the next rebuild and the supervisor
@@ -462,12 +480,25 @@ fn relevant_project_event(project: &Path, event: &notify::Event, ignored: &[Patt
     // write still arrives as a `Modify` event, and a `Create` or a `Remove`
     // event keeps its own kind, so no real change becomes invisible.
     if matches!(event.kind, notify::EventKind::Access(_)) {
-        return false;
+        return BTreeSet::new();
     }
-    event
-        .paths
-        .iter()
-        .any(|path| !ignored_project_path(project, path, ignored))
+    let mut changed = BTreeSet::new();
+    for path in &event.paths {
+        let depth = roots
+            .iter()
+            .filter(|root| path.starts_with(root))
+            .map(|root| root.components().count())
+            .max();
+        for (index, root) in roots.iter().enumerate() {
+            if Some(root.components().count()) == depth
+                && path.starts_with(root)
+                && !ignored_project_path(root, path, ignored)
+            {
+                changed.insert(index);
+            }
+        }
+    }
+    changed
 }
 
 fn ignored_project_path(project: &Path, path: &Path, ignored: &[Pattern]) -> bool {
@@ -996,15 +1027,16 @@ fn build_project(
     Ok(built)
 }
 
-/// Write the builds into the local store: the first is the primary script the
-/// node serves, the rest join the component map and are reached through service
-/// bindings. The primary goes first so that a store that another run left with
-/// a different primary, or none, ends with this one.
-async fn write_projects(store: &Store, built: &[deploy::Built]) -> anyhow::Result<()> {
+/// Write rebuilt projects, each with its position in the run, into the local
+/// store: the first project is the primary script the node serves, the rest
+/// join the component map and are reached through service bindings. The
+/// primary goes first so that a store that another run left with a different
+/// primary, or none, ends with this one.
+async fn write_projects(store: &Store, rebuilt: &[(usize, deploy::Built)]) -> anyhow::Result<()> {
     let bucket = open_local_bucket(&store.database)?;
     crate::wake_format::ensure_ready(&bucket).await?;
-    for (index, built) in built.iter().enumerate() {
-        let selection = if index == 0 {
+    for (index, built) in rebuilt {
+        let selection = if *index == 0 {
             deploy::Selection::Primary
         } else {
             deploy::Selection::Activate
@@ -1137,36 +1169,59 @@ fn ensure_distinct_classes(
     Ok(())
 }
 
-/// Build the project of each config, then write them, the first as the primary.
-/// Every project is built and checked before anything is written, so one that
-/// fails to build leaves the store, and the node that runs on it, as they were.
+/// Build the projects at the positions in `changed`, and any that `manifests`
+/// holds none for yet, then write them, the first project as the primary. The
+/// other projects keep the version they have. Every rebuilt project is built
+/// and every project checked, names included since a reload can rename one,
+/// before anything is written, so one that fails to build or clashes leaves the
+/// store, the node that runs on it and `manifests` as they were.
 async fn deploy_projects(
     configs: &[PathBuf],
+    changed: &BTreeSet<usize>,
+    manifests: &mut [Option<Manifest>],
     store: &Store,
     logs: bool,
     strict_compat_flags: bool,
 ) -> anyhow::Result<Vec<Project>> {
-    let built = configs
-        .iter()
-        .map(|config| build_project(config, logs, strict_compat_flags))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let manifests = built
-        .iter()
-        .map(|built| &built.manifest)
+    let mut rebuilt = Vec::new();
+    for (index, config) in configs.iter().enumerate() {
+        if changed.contains(&index) || manifests[index].is_none() {
+            rebuilt.push((index, build_project(config, logs, strict_compat_flags)?));
+        }
+    }
+    let current = (0..configs.len())
+        .map(|index| {
+            rebuilt
+                .iter()
+                .find_map(|(at, built)| (*at == index).then_some(&built.manifest))
+                .or(manifests[index].as_ref())
+                .expect("every project has a build")
+        })
         .collect::<Vec<_>>();
-    let loaded = reachable(&manifests);
-    ensure_distinct_classes(configs, &manifests, &loaded)?;
-    write_projects(store, &built).await?;
-    Ok(built
+    let names = current
+        .iter()
+        .map(|manifest| manifest.script_name.clone())
+        .collect::<Vec<_>>();
+    ensure_distinct(configs, &names)?;
+    let loaded = reachable(&current);
+    ensure_distinct_classes(configs, &current, &loaded)?;
+    let projects = names
         .into_iter()
         .zip(configs)
         .zip(loaded)
-        .map(|((built, config), reachable)| Project {
-            script: built.script_name,
+        .map(|((script, config), reachable)| Project {
+            script,
             config: config.clone(),
             reachable,
         })
-        .collect())
+        .collect();
+    write_projects(store, &rebuilt).await?;
+    // Only the manifest is kept: the modules and assets of a build are large
+    // and nothing reads them once they are written.
+    for (index, built) in rebuilt {
+        manifests[index] = Some(built.manifest);
+    }
+    Ok(projects)
 }
 
 async fn run_stack(
@@ -1182,17 +1237,34 @@ async fn run_stack(
     // handler afterwards leaves the new node orphaned under the default Unix
     // signal action.
     let mut signals = ShutdownSignals::install()?;
-    let project = configs[0]
-        .parent()
-        .context("the Wrangler config has no project directory")?;
+    let roots = configs
+        .iter()
+        .map(|config| {
+            config
+                .parent()
+                .map(Path::to_path_buf)
+                .context("the Wrangler config has no project directory")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let mut watcher = options
         .watch
-        .then(|| ProjectWatcher::new(project, options.watch_ignores))
+        .then(|| ProjectWatcher::new(roots, options.watch_ignores))
         .transpose()?;
 
     console.progress("building the application");
-    let mut projects =
-        deploy_projects(configs, store, options.logs, options.strict_compat_flags).await?;
+    let mut manifests = configs.iter().map(|_| None).collect::<Vec<_>>();
+    // Projects whose files changed and that no reload has deployed yet: a
+    // reload that fails leaves them for the next one.
+    let mut pending = BTreeSet::new();
+    let mut projects = deploy_projects(
+        configs,
+        &pending,
+        &mut manifests,
+        store,
+        options.logs,
+        options.strict_compat_flags,
+    )
+    .await?;
     warn_unreachable(&projects, console);
     let mut running = start_node(
         &projects,
@@ -1221,12 +1293,21 @@ async fn run_stack(
                 stop_running_node(running).await;
                 return Ok(());
             }
-            NodeEvent::Reload => {
+            NodeEvent::Reload(changed) => {
+                pending.extend(changed);
                 console.progress("change detected; rebuilding the application");
-                match deploy_projects(configs, store, options.logs, options.strict_compat_flags)
-                    .await
+                match deploy_projects(
+                    configs,
+                    &pending,
+                    &mut manifests,
+                    store,
+                    options.logs,
+                    options.strict_compat_flags,
+                )
+                .await
                 {
                     Ok(deployed) => {
+                        pending.clear();
                         warn_unreachable(&deployed, console);
                         projects = deployed;
                     }
@@ -1275,7 +1356,8 @@ struct RunningNode {
 
 enum NodeEvent {
     Exited(std::process::ExitStatus),
-    Reload,
+    /// The projects whose files changed.
+    Reload(BTreeSet<usize>),
     Shutdown,
 }
 
@@ -1512,14 +1594,13 @@ async fn wait_for_node_event(
             Ok(NodeEvent::Exited(status))
         }
         _ = signals.received() => Ok(NodeEvent::Shutdown),
-        changed = wait_for_project_change(watcher) => {
-            changed?;
-            Ok(NodeEvent::Reload)
-        }
+        changed = wait_for_project_change(watcher) => Ok(NodeEvent::Reload(changed?)),
     }
 }
 
-async fn wait_for_project_change(watcher: Option<&mut ProjectWatcher>) -> anyhow::Result<()> {
+async fn wait_for_project_change(
+    watcher: Option<&mut ProjectWatcher>,
+) -> anyhow::Result<BTreeSet<usize>> {
     match watcher {
         Some(watcher) => watcher.changed().await,
         None => std::future::pending().await,
@@ -1661,6 +1742,20 @@ mod tests {
         directory.join("wrangler.json")
     }
 
+    /// Build and write every project, as the first start of a run does.
+    async fn deploy_all(configs: &[PathBuf], store: &Store) -> anyhow::Result<Vec<Project>> {
+        let mut manifests = configs.iter().map(|_| None).collect::<Vec<_>>();
+        deploy_projects(
+            configs,
+            &BTreeSet::new(),
+            &mut manifests,
+            store,
+            false,
+            false,
+        )
+        .await
+    }
+
     async fn serving(
         store: &Store,
     ) -> (String, BTreeMap<String, crate::protocol::ComponentPointer>) {
@@ -1681,33 +1776,25 @@ mod tests {
 
         // On an empty store, the first project is the primary and the other
         // is a component, though no earlier pointer named it.
-        deploy_projects(&[a.clone(), b.clone()], &store, false, false)
-            .await
-            .unwrap();
+        deploy_all(&[a.clone(), b.clone()], &store).await.unwrap();
         let (script, components) = serving(&store).await;
         assert_eq!(script, "dev-a");
         assert!(components.contains_key("dev-b"));
         std::fs::remove_file(&store.database).unwrap();
 
         // An earlier run left B as the primary.
-        deploy_projects(std::slice::from_ref(&b), &store, false, false)
-            .await
-            .unwrap();
+        deploy_all(std::slice::from_ref(&b), &store).await.unwrap();
         assert_eq!(serving(&store).await.0, "dev-b");
 
         // Listing A first takes the primary and keeps B reachable as a component.
-        let deployed = deploy_projects(&[a.clone(), b.clone()], &store, false, false)
-            .await
-            .unwrap();
+        let deployed = deploy_all(&[a.clone(), b.clone()], &store).await.unwrap();
         assert_eq!(deployed[0].script, "dev-a");
         let (script, components) = serving(&store).await;
         assert_eq!(script, "dev-a");
         assert!(components.contains_key("dev-b") && !components.contains_key("dev-a"));
 
         // Listing B first reverses them.
-        deploy_projects(&[b, a], &store, false, false)
-            .await
-            .unwrap();
+        deploy_all(&[b, a], &store).await.unwrap();
         let (script, components) = serving(&store).await;
         assert_eq!(script, "dev-b");
         assert!(components.contains_key("dev-a") && !components.contains_key("dev-b"));
@@ -1724,7 +1811,7 @@ mod tests {
         let broken = directory.path().join("broken");
         std::fs::create_dir_all(&broken).unwrap();
         std::fs::write(broken.join("wrangler.json"), "{ not json").unwrap();
-        let error = deploy_projects(&[a, broken.join("wrangler.json")], &store, false, false)
+        let error = deploy_all(&[a, broken.join("wrangler.json")], &store)
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("broken"), "{error:#}");
@@ -1797,14 +1884,9 @@ mod tests {
         let b = write_project_with(&directory.path().join("b"), "dev-b", "b", service("dev-c"));
         let c = write_project(&directory.path().join("c"), "dev-c", "c");
         let d = write_project(&directory.path().join("d"), "dev-d", "d");
-        let deployed = deploy_projects(
-            &[a.clone(), d.clone(), c.clone(), b.clone()],
-            &store,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
+        let deployed = deploy_all(&[a.clone(), d.clone(), c.clone(), b.clone()], &store)
+            .await
+            .unwrap();
         let reached = deployed
             .iter()
             .map(|project| (project.script.as_str(), project.reachable))
@@ -1819,9 +1901,7 @@ mod tests {
             ]
         );
         // Listed first, D is the primary and binds nothing: the others never load.
-        let deployed = deploy_projects(&[d, a, b, c], &store, false, false)
-            .await
-            .unwrap();
+        let deployed = deploy_all(&[d, a, b, c], &store).await.unwrap();
         assert_eq!(
             deployed
                 .iter()
@@ -1860,7 +1940,7 @@ mod tests {
                 "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }],
             }),
         );
-        let error = deploy_projects(&[a.clone(), b.clone()], &store, false, false)
+        let error = deploy_all(&[a.clone(), b.clone()], &store)
             .await
             .unwrap_err()
             .to_string();
@@ -1887,9 +1967,154 @@ mod tests {
                 "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }],
             }),
         );
-        deploy_projects(&[a, b], &store, false, false)
+        deploy_all(&[a, b], &store).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reload_rebuilds_and_writes_only_the_changed_project() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store {
+            database: directory.path().join("objects.sqlite3"),
+        };
+        let service = serde_json::json!({ "services": [{ "binding": "B", "service": "dev-b" }] });
+        let a = write_project_with(&directory.path().join("a"), "dev-a", "a", service);
+        let b = write_project(&directory.path().join("b"), "dev-b", "b1");
+        let configs = [a, b.clone()];
+        let mut manifests = vec![None, None];
+        deploy_projects(
+            &configs,
+            &BTreeSet::new(),
+            &mut manifests,
+            &store,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let (_, before) = serving(&store).await;
+        let primary_before = {
+            let bucket = open_local_bucket(&store.database).unwrap();
+            deploy::read_fleet_pointer(&bucket)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .version
+        };
+
+        // B changes: only B is rebuilt and written, so A keeps its version.
+        write_project(&directory.path().join("b"), "dev-b", "b2");
+        let changed = BTreeSet::from([1]);
+        deploy_projects(&configs, &changed, &mut manifests, &store, false, false)
             .await
             .unwrap();
+        let (script, after) = serving(&store).await;
+        assert_eq!(script, "dev-a");
+        assert_ne!(after["dev-b"].version, before["dev-b"].version);
+        let bucket = open_local_bucket(&store.database).unwrap();
+        let (pointer, _) = deploy::read_fleet_pointer(&bucket).await.unwrap().unwrap();
+        assert_eq!(pointer.version, primary_before);
+
+        // A change that does not build stops the reload before anything is
+        // written, and leaves the build the run holds.
+        std::fs::write(b.parent().unwrap().join("wrangler.json"), "{ not json").unwrap();
+        deploy_projects(&configs, &changed, &mut manifests, &store, false, false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            serving(&store).await.1["dev-b"].version,
+            after["dev-b"].version
+        );
+        assert!(manifests.iter().all(Option::is_some));
+    }
+
+    #[tokio::test]
+    async fn a_reload_that_renames_a_project_to_an_existing_name_writes_nothing() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store {
+            database: directory.path().join("objects.sqlite3"),
+        };
+        let a = write_project(&directory.path().join("a"), "dev-a", "a");
+        let b = write_project(&directory.path().join("b"), "dev-b", "b");
+        let configs = [a, b];
+        let mut manifests = vec![None, None];
+        deploy_projects(
+            &configs,
+            &BTreeSet::new(),
+            &mut manifests,
+            &store,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let before = serving(&store).await;
+
+        write_project(&directory.path().join("b"), "dev-a", "b");
+        let error = deploy_projects(
+            &configs,
+            &BTreeSet::from([1]),
+            &mut manifests,
+            &store,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("dev-a") && error.contains("a/wrangler.json"),
+            "{error}"
+        );
+        assert!(error.contains("b/wrangler.json"), "{error}");
+        let after = serving(&store).await;
+        assert_eq!(after.0, before.0);
+        assert_eq!(
+            after.1["dev-b"].version, before.1["dev-b"].version,
+            "the primary's script and the other project are as they were"
+        );
+        assert_eq!(manifests[1].as_ref().unwrap().script_name, "dev-b");
+    }
+
+    #[test]
+    fn a_change_belongs_to_the_deepest_project_directory_that_holds_it() {
+        let roots = [
+            PathBuf::from("/w/app"),
+            PathBuf::from("/w/app/services/b"),
+            PathBuf::from("/w/other"),
+        ];
+        let modify = |path: &str| {
+            notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))
+                .add_path(PathBuf::from(path))
+        };
+        let changed = |event: notify::Event, ignored: &[Pattern]| {
+            changed_projects(&roots, &event, ignored)
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(changed(modify("/w/app/src/index.js"), &[]), [0]);
+        assert_eq!(changed(modify("/w/app/services/b/src/index.js"), &[]), [1]);
+        assert_eq!(changed(modify("/w/other/index.js"), &[]), [2]);
+        assert!(changed(modify("/elsewhere/index.js"), &[]).is_empty());
+        assert!(changed(modify("/w/app/node_modules/x/index.js"), &[]).is_empty());
+        // A pattern is read relative to the directory that owns the path.
+        let ignored = [Pattern::new("generated/**").unwrap()];
+        assert!(changed(modify("/w/app/services/b/generated/x.js"), &ignored).is_empty());
+        assert_eq!(
+            changed(modify("/w/app/services/b/src/generated/x.js"), &ignored),
+            [1]
+        );
+        let read = notify::Event::new(notify::EventKind::Access(notify::event::AccessKind::Any))
+            .add_path(PathBuf::from("/w/app/src/index.js"));
+        assert!(changed(read, &[]).is_empty());
+        // Two projects in one directory share its changes.
+        let shared = [PathBuf::from("/w/app"), PathBuf::from("/w/app")];
+        assert_eq!(
+            changed_projects(&shared, &modify("/w/app/index.js"), &[]).len(),
+            2
+        );
     }
 
     #[test]
