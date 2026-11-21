@@ -2,5 +2,6 @@
   "name": "inbound-email",
   "main": "index.js",
   "no_bundle": true,
-  "compatibility_date": "2026-01-01"
+  "compatibility_date": "2026-01-01",
+  "kv_namespaces": [{ "binding": "KV", "id": "report-kv" }]
 }

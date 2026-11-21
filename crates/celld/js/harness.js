@@ -5879,13 +5879,11 @@ const __newEntrypointInstance = (name, props) =>
 // handler functions as fn(arg, env, ctx).
 // A missing fetch reports workerd's own text, the same one the loader
 // installs for a Worker with no default export, so the two paths agree.
-const __missingHandlers = new WeakSet();
 const __noHandler = (name, method) => {
   const error = method === "fetch" && name === "default"
     ? new Error("Handler does not export a fetch() function.")
     : new TypeError(
       `Entrypoint ${JSON.stringify(name)} has no ${method} handler`);
-  __missingHandlers.add(error);
   return error;
 };
 

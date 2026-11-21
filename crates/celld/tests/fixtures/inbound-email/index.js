@@ -34,24 +34,23 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 export class NoFetch extends WorkerEntrypoint {}
 
 // A handler that reports what it saw does so through setReject, and also keeps the
-// report for GET /__report: a message the handler sent mail for answers 200 whatever
-// it called, so its status carries no report.
-let lastReport = "";
-function report(message, text) {
-  lastReport = text;
+// report in KV, which every isolate sees, for GET /__report: a message the handler sent
+// mail for answers 200 whatever it called, so its status carries no report.
+async function report(env, message, text) {
+  await env.KV.put("report", text);
   message.setReject(text);
 }
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const path = new URL(request.url).pathname;
-    if (path === "/__report") return new Response(lastReport);
+    if (path === "/__report") return new Response((await env.KV.get("report")) ?? "");
     if (path === "/__ready") return new Response("ready");
     return new Response("fetch");
   },
 
   async email(message, env, ctx) {
-    lastReport = "";
+    await env.KV.delete("report");
     const subject = message.headers.get("subject") ?? "";
     switch (message.headers.get("x-mode")) {
       case "echo": {
@@ -97,7 +96,7 @@ export default {
         try {
           await message.reply(reply);
         } catch (error) {
-          report(message, "second:" + error.code);
+          await report(env, message, "second:" + error.code);
         }
         return;
       }
@@ -107,28 +106,28 @@ export default {
             new EmailMessage(message.to, "eve@example.net", "From: " + message.to + "\r\n\r\nx\r\n"),
           );
         } catch (error) {
-          report(message, "code:" + error.code);
+          await report(env, message, "code:" + error.code);
         }
         return;
       case "reply-code":
         try {
           await message.reply({ from: message.to, subject: "Re", text: "x" });
-          report(message, "sent");
+          await report(env, message, "sent");
         } catch (error) {
-          report(message, "code:" + error.code);
+          await report(env, message, "code:" + error.code);
         }
         return;
       case "forward-to":
         try {
           await message.forward(message.headers.get("x-to"));
-          report(message, "sent");
+          await report(env, message, "sent");
         } catch (error) {
-          report(message, "code:" + error.code);
+          await report(env, message, "code:" + error.code);
         }
         return;
       case "forward-id": {
         const { messageId } = await message.forward("team@example.net");
-        report(message, "id:" + messageId);
+        await report(env, message, "id:" + messageId);
         return;
       }
       case "forward-throw":
@@ -156,7 +155,7 @@ export default {
         const forwards = await Promise.all(
           [1, 2, 3, 4].map(() => message.forward("team@example.net").then(() => "ok", (error) => error.code)),
         );
-        report(message, [second, ...forwards].join("|"));
+        await report(env, message, [second, ...forwards].join("|"));
         return;
       }
       case "reply-limit": {
@@ -165,7 +164,7 @@ export default {
         const first = await message.reply(reply).then(() => "ok", (error) => error.code);
         await Promise.all(forwards);
         const second = await message.reply(reply).then(() => "ok", (error) => error.code);
-        report(message, first + "|" + second);
+        await report(env, message, first + "|" + second);
         return;
       }
       case "forward-wait-throw":
