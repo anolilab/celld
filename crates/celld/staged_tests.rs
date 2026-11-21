@@ -335,6 +335,51 @@ async fn a_pointer_that_names_no_script_and_no_manifest_needs_primary() {
 }
 
 #[tokio::test]
+async fn primary_on_a_decodable_pointer_with_no_manifest_keeps_the_components() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    select(&fleet, "c", "v1", Selection::Activate).await;
+    drop_script_name(&fleet, "deploy/gone/v1").await;
+
+    select(&fleet, "b", "v1", Selection::Primary).await;
+
+    let (pointer, _) = fleet_pointer(&fleet).await;
+    assert_eq!(pointer.script_name.as_deref(), Some("b"));
+    assert_eq!(pointer.components["c"].version, "v1");
+}
+
+#[tokio::test]
+async fn a_failed_manifest_read_is_an_error_not_a_missing_manifest() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    let (mut pointer, _) = fleet_pointer(&fleet).await;
+    pointer.script_name = None;
+    assert_eq!(
+        crate::deploy::serving_script(&fleet.bucket, &pointer)
+            .await
+            .unwrap(),
+        Some("a".to_string())
+    );
+    pointer.prefix = "deploy/gone/v1".to_string();
+    assert_eq!(
+        crate::deploy::serving_script(&fleet.bucket, &pointer)
+            .await
+            .unwrap(),
+        None
+    );
+
+    // Replace the store file with a directory so every read fails.
+    let broken = tempfile::tempdir().expect("temp dir");
+    let database = broken.path().join("store.db");
+    let bucket = Bucket::open_dev(&database).expect("open the local store");
+    std::fs::remove_file(&database).expect("remove the store file");
+    std::fs::create_dir(&database).expect("block the store file");
+    crate::deploy::serving_script(&bucket, &pointer)
+        .await
+        .expect_err("a failed read propagates");
+}
+
+#[tokio::test]
 async fn a_refused_deploy_leaves_the_named_pointer_and_queue_attachments() {
     let fleet = fleet();
     select(&fleet, "a", "v1", Selection::Activate).await;

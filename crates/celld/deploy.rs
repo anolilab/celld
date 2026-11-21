@@ -1178,12 +1178,16 @@ pub async fn write(
     // repairs it and its script becomes the primary. A pointer that decodes
     // but names no script (an older fleet) is served by the script of its
     // manifest, which stays primary.
-    let mut repairs = matches!(current, Some((None, _)));
+    let repairs = matches!(current, Some((None, _)));
     if let Some((Some(pointer), _)) = current.as_mut() {
         if pointer.script_name.is_none() {
-            match serving_script(bucket, pointer).await {
+            match serving_script(bucket, pointer).await? {
                 Some(script) => pointer.script_name = Some(script),
-                None if selection == Selection::Primary => repairs = true,
+                // The pointer decodes, so its components stay: the deployed
+                // script takes the primary on top of them.
+                None if selection == Selection::Primary => {
+                    pointer.script_name = Some(built.script_name.clone());
+                }
                 None => bail!(
                     "the fleet pointer names no script and its manifest at {} cannot be read, \
                      so the serving script is unknown; deploy with --primary to take it",
@@ -1356,13 +1360,21 @@ fn unreadable_pointer() -> DeployPointer {
 }
 
 /// The script a fleet pointer without `script_name` serves: the one its
-/// manifest names.
-async fn serving_script(bucket: &Bucket, pointer: &DeployPointer) -> Option<String> {
-    let (body, _) = bucket
+/// manifest names. `None` when the manifest is missing or does not decode; a
+/// failed read is an error, not an absent manifest.
+pub(crate) async fn serving_script(
+    bucket: &Bucket,
+    pointer: &DeployPointer,
+) -> anyhow::Result<Option<String>> {
+    let body = bucket
         .get(&format!("{}/manifest.json", pointer.prefix))
-        .await
-        .ok()??;
-    Some(serde_json::from_slice::<Manifest>(&body).ok()?.script_name)
+        .await?
+        .map(|(body, _)| body);
+    Ok(manifest_script(body.as_deref()))
+}
+
+fn manifest_script(body: Option<&[u8]>) -> Option<String> {
+    Some(serde_json::from_slice::<Manifest>(body?).ok()?.script_name)
 }
 
 /// Replace the fleet pointer, only if it still holds what `token` read. A

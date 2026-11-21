@@ -668,6 +668,13 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
                 built.script_name,
                 built.script_name
             );
+            if !built.manifest.crons.is_empty() {
+                note!(
+                    "Warning: cron triggers run only for the primary script, so the schedule of {} does not fire while {} serves. Deploy with --primary to run it.",
+                    built.script_name,
+                    serving
+                );
+            }
         }
     }
     out.finish()

@@ -323,6 +323,10 @@ script keeps serving the script of its manifest; if that manifest cannot be
 read, a plain deploy refuses and asks for `--primary`. `celld dev` runs one project and deploys it as
 the primary.
 
+Cron triggers run only for the primary script. A plain deploy of another
+script that declares `triggers.crons` succeeds, but its schedule does not fire
+while another script is primary; the command warns, and `--primary` fixes it.
+
 The managed deploy of the control plane differs: it makes the deployed script
 the primary on every deploy.
 
