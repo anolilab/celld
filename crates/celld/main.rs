@@ -1015,6 +1015,42 @@ async fn internal_invoke(request: Request<Incoming>, app: AppHandle) -> HttpRepl
     ))
 }
 
+/// `POST /email/inbound`: one raw message for the Worker's `email()` handler.
+/// The operator token has been checked in front of routing.
+async fn internal_email_inbound(request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    let Some(runtime) = app.runtime.clone() else {
+        return peer_response(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no Worker runtime",
+        ));
+    };
+    // Each message is held twice while it is handled, so a relay that sends
+    // faster than the Worker answers is asked to wait.
+    let Some(permit) = celld::email::inbound::admit() else {
+        let mut busy = response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many messages in flight",
+        );
+        busy.headers_mut().insert(
+            hyper::header::RETRY_AFTER,
+            hyper::header::HeaderValue::from_static("5"),
+        );
+        return peer_response(busy);
+    };
+    let query = request.uri().query().map(str::to_owned);
+    let body =
+        match collect_limited_body(request.into_body(), celld::email::MAX_MESSAGE_BYTES).await {
+            Ok(body) => body,
+            Err(error) => return peer_response(body_read_error("email", error)),
+        };
+    let (status, text) =
+        celld::email::inbound::handle(&runtime, query.as_deref(), body.to_vec(), permit).await;
+    peer_response(response(
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        text,
+    ))
+}
+
 async fn internal_reload(app: AppHandle) -> HttpReply {
     let (reply, receive) = tokio::sync::oneshot::channel();
     let sent = app
@@ -3063,6 +3099,10 @@ async fn handle_internal(
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
         "/invoke" => internal_invoke(request, app).await,
+        "/email/inbound" if request.method() != hyper::Method::POST => {
+            response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+        }
+        "/email/inbound" => internal_email_inbound(request, app).await,
         "/rebalance/pause" | "/rebalance/resume" if request.method() != hyper::Method::POST => {
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }

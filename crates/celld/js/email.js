@@ -135,6 +135,38 @@
     return shaped;
   };
 
+  // Hand a message to a host op, which checks it and sends it: `rawHead` and
+  // `builderHead` make the op's JSON for each form of a message. A raw stream
+  // is read after its slot and subrequest are taken, so sends past the limit
+  // never read theirs.
+  const submit = async (message, op, rawHead, builderHead, usage) => {
+    let answer;
+    if (message instanceof EmailMessage) {
+      const raw = raws.get(message);
+      let token;
+      if (typeof raw !== "string") {
+        const reserved = JSON.parse(__email_reserve());
+        if (!reserved.ok) throw fail(reserved.code, reserved.message);
+        token = reserved.token;
+      }
+      let handedOver = false;
+      try {
+        const bytes = await readRaw(raw);
+        handedOver = token !== undefined;
+        answer = await op(rawHead(message), bytes, token);
+      } finally {
+        if (token !== undefined && !handedOver) __email_release(token);
+      }
+    } else if (message !== null && typeof message === "object") {
+      answer = await op(builderHead(shapeBuilder(message)), undefined);
+    } else {
+      throw new TypeError(usage);
+    }
+    const result = JSON.parse(answer);
+    if (!result.ok) throw fail(result.code, result.message);
+    return { messageId: result.messageId };
+  };
+
   class SendEmail {
     #name;
 
@@ -142,44 +174,96 @@
       this.#name = name;
     }
 
-    async send(message) {
-      let answer;
-      if (message instanceof EmailMessage) {
-        const raw = raws.get(message);
-        // A stream is buffered while it is read, so the slot and the
-        // subrequest are taken first: sends past the limit never read theirs.
-        let token;
-        if (typeof raw !== "string") {
-          const reserved = JSON.parse(__email_reserve());
-          if (!reserved.ok) throw fail(reserved.code, reserved.message);
-          token = reserved.token;
-        }
-        let handedOver = false;
-        try {
-          const bytes = await readRaw(raw);
-          handedOver = token !== undefined;
-          answer = await __email_send(
-            JSON.stringify({ binding: this.#name, kind: "raw", from: message.from, to: message.to }),
-            bytes,
-            token,
-          );
-        } finally {
-          if (token !== undefined && !handedOver) __email_release(token);
-        }
-      } else if (message !== null && typeof message === "object") {
-        answer = await __email_send(
-          JSON.stringify({ binding: this.#name, kind: "builder", message: shapeBuilder(message) }),
-          undefined,
-        );
-      } else {
-        throw new TypeError("send() needs an EmailMessage or an object with from, to, subject and text or html");
-      }
-      const result = JSON.parse(answer);
-      if (!result.ok) throw fail(result.code, result.message);
-      return { messageId: result.messageId };
+    send(message) {
+      return submit(
+        message,
+        __email_send,
+        (raw) => JSON.stringify({ binding: this.#name, kind: "raw", from: raw.from, to: raw.to }),
+        (shaped) => JSON.stringify({ binding: this.#name, kind: "builder", message: shaped }),
+        "send() needs an EmailMessage or an object with from, to, subject and text or html",
+      );
     }
   }
 
+  // The `message` of an `email()` handler. The envelope, the received bytes
+  // and the thread stay with the host: `forward()` and `reply()` name an
+  // action, and the host decides what it may do. `setReject()` and the actions
+  // end with the handler, so a message kept past it cannot bounce a mail that
+  // was accepted or send one later.
+  const makeInbound = (meta, bytes) => {
+    let active = true;
+    let rejection = null;
+    let replied = false;
+    const checkActive = () => {
+      if (!active) throw new Error("Email message methods cannot be called after the handler returns.");
+    };
+    const headers = new Headers();
+    // A header a Headers cannot hold (a name with a separator, a value past
+    // Latin-1) is left out rather than failing the whole message; `raw` has it.
+    for (const [name, value] of meta.headers) {
+      try {
+        headers.append(name, value);
+      } catch {
+        try {
+          headers.append(name, value.replace(/[^\x20-\xff]/g, "?"));
+        } catch {}
+      }
+    }
+    const raw = new ReadableStream({
+      start(controller) {
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+    const message = {
+      get from() { return meta.from; },
+      get to() { return meta.to; },
+      get headers() { return headers; },
+      get raw() { return raw; },
+      get rawSize() { return meta.rawSize; },
+      get canBeForwarded() { return true; },
+      setReject(reason) {
+        checkActive();
+        rejection = String(reason);
+      },
+      async forward(rcptTo, extra) {
+        checkActive();
+        if (typeof rcptTo !== "string") {
+          throw new TypeError("Incorrect type for the 'rcptTo' argument: the provided value is not of type 'string'.");
+        }
+        if (extra !== undefined && !(extra instanceof Headers)) {
+          throw new TypeError("Incorrect type for the 'headers' argument: the provided value is not of type 'Headers'.");
+        }
+        const answer = JSON.parse(await __email_forward(
+          JSON.stringify({ to: rcptTo, headers: extra === undefined ? [] : [...extra] }),
+        ));
+        if (!answer.ok) throw fail(answer.code, answer.message);
+        return { messageId: answer.messageId };
+      },
+      reply(reply) {
+        checkActive();
+        // The first reply is the only one, whether or not it succeeds.
+        if (replied) {
+          return Promise.reject(fail("E_VALIDATION_ERROR", "this message has been replied to already"));
+        }
+        replied = true;
+        return submit(
+          reply,
+          __email_reply,
+          (raw) => JSON.stringify({ kind: "raw", from: raw.from, to: raw.to }),
+          (shaped) => JSON.stringify({ kind: "builder", message: shaped }),
+          "reply() needs an EmailMessage or an object with from, subject and text or html",
+        );
+      },
+    };
+    return {
+      message,
+      rejection: () => rejection,
+      end: () => { active = false; },
+    };
+  };
+
   __celld.__cfEmail = { EmailMessage };
   __celld.__makeSendEmail = (name) => new SendEmail(name);
+  __celld.__makeInboundEmail = makeInbound;
 })();

@@ -6056,6 +6056,34 @@ __celld.__dispatchEntrypointTail = async (name, json) => {
     return new Uint8Array([0]);
   }
 };
+// An inbound message for the `email()` handler. The answer is the outcome as
+// JSON bytes: the handler's own `setReject()` is a permanent refusal, an
+// exception is a temporary one, and a Worker without the handler says so.
+__celld.__dispatchEntrypointEmail = async (name, metaJson, raw) => {
+  const answer = (value) => new TextEncoder().encode(JSON.stringify(value));
+  let handler;
+  try {
+    const object = __cell.objectEntrypoints[name];
+    handler = object !== undefined ? object.email : __entrypointClass(name).prototype.email;
+  } catch {}
+  if (typeof handler !== "function") return answer({ outcome: "no_handler" });
+  const inbound = __celld.__makeInboundEmail(JSON.parse(metaJson), raw);
+  try {
+    await __dispatchEntrypointMethodInCurrentEvent(name, "email", inbound.message);
+  } catch (error) {
+    let text;
+    try {
+      text = String(error);
+    } catch {
+      text = "email handler rejected";
+    }
+    return answer({ outcome: "exception", error: text });
+  } finally {
+    inbound.end();
+  }
+  const reason = inbound.rejection();
+  return reason === null ? answer({ outcome: "accepted" }) : answer({ outcome: "rejected", reason });
+};
 // Workerd's simple-handler RPC rules (worker-rpc.c++): a non-class
 // handler method is called as fn(arg, env, ctx), the client must send
 // exactly one argument, and the handler must not declare more than

@@ -331,6 +331,8 @@ const NOT_CELL_SCOPED: &[&str] = &[
     "__email_send",
     "__email_reserve",
     "__email_release",
+    "__email_forward",
+    "__email_reply",
     "__r2_head",
     "__r2_get",
     "__r2_put",

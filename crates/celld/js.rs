@@ -4338,7 +4338,9 @@ impl Worker {
             | crate::WorkerJob::Rpc {
                 invocation_limits, ..
             } => *invocation_limits,
-            crate::WorkerJob::Queue { .. } | crate::WorkerJob::Tail { .. } => None,
+            crate::WorkerJob::Queue { .. }
+            | crate::WorkerJob::Tail { .. }
+            | crate::WorkerJob::Email { .. } => None,
         };
         let initial_limits =
             effective_resource_limits(inner.runtime_state.resource_limits, invocation_limits);
@@ -4679,6 +4681,9 @@ fn begin<'s>(
         }
         crate::WorkerJob::Tail { items, reply } => {
             return begin_tail(tc, &items, reply);
+        }
+        crate::WorkerJob::Email { message, reply, .. } => {
+            return inbound_email::begin_email(tc, message, reply);
         }
         job => job,
     };
@@ -6918,6 +6923,8 @@ ops! { OP_NAMES, install_op_functions,
         "__email_send" => send_email::op_email_send,
         "__email_reserve" => send_email::op_email_reserve,
         "__email_release" => send_email::op_email_release,
+        "__email_forward" => inbound_email::op_email_forward,
+        "__email_reply" => inbound_email::op_email_reply,
         "__tcp_connect" => tcp::op_tcp_connect,
         "__tcp_read" => tcp::op_tcp_read,
         "__tcp_write" => tcp::op_tcp_write,
@@ -10354,6 +10361,7 @@ fn webcrypto_return_bytes(
 mod container;
 mod crypto;
 mod html_rewriter;
+mod inbound_email;
 mod send_email;
 mod tcp;
 mod zlib;
@@ -11134,6 +11142,8 @@ pub struct IoContext {
     /// its stream. They are given back with the event, so a stream that never
     /// yields cannot keep them when the event ends.
     reserved_sends: Mutex<Vec<(u64, crate::smtp::InFlight)>>,
+    /// The inbound message this event handles, when it is an `email()` event.
+    inbound_email: OnceLock<Box<crate::email::inbound::Event>>,
 }
 
 /// An op enqueued by one event's continuation during another event's turn: the
@@ -11352,6 +11362,7 @@ impl IoContext {
             tail_logs: Mutex::new(TailLogCapture::default()),
             listener_error: OnceLock::new(),
             reserved_sends: Mutex::new(Vec::new()),
+            inbound_email: OnceLock::new(),
         })
     }
 
@@ -11397,6 +11408,7 @@ impl IoContext {
             tail_logs: Mutex::new(TailLogCapture::default()),
             listener_error: OnceLock::new(),
             reserved_sends: Mutex::new(Vec::new()),
+            inbound_email: OnceLock::new(),
         });
         runtime_state
             .io_contexts
