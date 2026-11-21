@@ -343,6 +343,19 @@ case "$status" in
 esac
 ```
 
+The script takes one recipient, so Postfix must run it once for each. With
+the transport named `celld`, set the limit in `main.cf`; without it a message
+for several recipients reaches the Worker for the first one only:
+
+```
+# master.cf
+celld     unix  -       n       n       -       -       pipe
+  user=celld-relay argv=/usr/local/bin/deliver-to-celld ${sender} ${recipient}
+
+# main.cf
+celld_destination_recipient_limit = 1
+```
+
 A provider's inbound webhook that posts the raw message works the same way
 through a proxy that adds the `Authorization` header. A provider that posts a
 parsed form needs a proxy that rebuilds the message.
