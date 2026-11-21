@@ -1240,6 +1240,21 @@ mod tests {
     }
 
     #[test]
+    fn a_forward_keeps_the_8_bit_headers_the_message_arrived_with() {
+        let bytes = b"From: ann@example.org\r\nSubject: caf\xe9 \xff\r\n\r\nbody\r\n".to_vec();
+        let event = Event::new(
+            &mut parse(bytes, Some("ann@example.org"), Some("bob@example.com")).unwrap(),
+        );
+        let sent = event.prepare_forward(&allow(), "a@b.co", &[]).unwrap();
+        assert!(
+            sent.data.windows(7).any(|w| w == b"caf\xe9 \xff\r"),
+            "{:?}",
+            sent.data
+        );
+        assert!(sent.smtputf8 && sent.eight_bit);
+    }
+
+    #[test]
     fn a_forward_without_a_message_id_carries_the_id_it_reports() {
         let event = Event::new(&mut parsed(
             "From: ann@example.org\r\nMessage-ID: <bad id@x>\r\nSubject: s\r\n\r\nbody\r\n",

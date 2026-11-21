@@ -43,6 +43,15 @@ pub fn prepare_raw(
             format!("the message headers exceed {MAX_HEADER_SECTION_BYTES} bytes"),
         ));
     }
+    // Headers are read as text below, and a byte that is not UTF-8 would be
+    // read as a replacement character: what was checked would not be what is
+    // sent. The builder form cannot make such a header either.
+    if std::str::from_utf8(head).is_err() {
+        return Err(EmailError::new(
+            "E_HEADER_VALUE_INVALID",
+            "the message headers are not valid UTF-8",
+        ));
+    }
     // A line longer than RFC 5321 allows is refused, not folded: folding a
     // body would change it.
     if body
@@ -276,6 +285,20 @@ mod tests {
         assert!(prepared.message_id.ends_with("@example.com"));
         assert!(text.contains("\r\n\r\nHello\r\n.dot\r\n"), "{text:?}");
         assert_eq!(prepared.recipients, ["bob@example.com"]);
+    }
+
+    #[test]
+    fn headers_that_are_not_utf8_are_refused_but_a_8_bit_body_is_not() {
+        let send =
+            |bytes: &[u8]| prepare_raw(&binding(), "ann@example.com", "bob@example.com", bytes);
+        let error = send(b"From: ann@example.com\nSubject: caf\xe9\n\nbody\n").unwrap_err();
+        assert_eq!(error.code, "E_HEADER_VALUE_INVALID");
+        // A fold and a header name are headers too.
+        let error = send(b"From: ann@example.com\nSubject: a\n b\xff\n\nbody\n").unwrap_err();
+        assert_eq!(error.code, "E_HEADER_VALUE_INVALID");
+        // Valid UTF-8 in a header, and any bytes in the body, are the sender's.
+        assert!(send("From: ann@example.com\nSubject: caf\u{e9}\n\nbody\n".as_bytes()).is_ok());
+        assert!(send(b"From: ann@example.com\n\nbody \xff\n").is_ok());
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub(super) struct Behaviour {
     slow_body_reply: Option<std::time::Duration>,
     /// Never answer `QUIT`, and keep the connection open.
     hang_on_quit: bool,
+    /// Answer `EHLO` with a 502, as a relay that only knows `HELO` does.
+    no_ehlo: bool,
 }
 
 impl Behaviour {
@@ -131,6 +133,8 @@ async fn serve(
             record(&|t| t.commands.push(text.clone()));
         }
         let reply = match verb.as_str() {
+            "EHLO" if behaviour.no_ehlo => "502 5.5.1 command not implemented\r\n".to_string(),
+            "HELO" => "250 sink\r\n".to_string(),
             "EHLO" => {
                 let mut reply = String::from("250-sink\r\n");
                 if let Some(size) = behaviour.size {
@@ -1009,4 +1013,102 @@ async fn a_body_line_over_998_bytes_is_refused() {
     .await;
     assert_eq!(out["code"], "E_LINE_TOO_LONG", "{out}");
     assert!(sink.transactions().is_empty());
+}
+
+#[tokio::test]
+async fn a_relay_that_does_not_know_ehlo_gets_helo_and_the_message() {
+    let sink = Sink::start(Behaviour {
+        no_ehlo: true,
+        // Never offered: without `EHLO` there is no `SIZE`.
+        size: Some(10),
+        ..Default::default()
+    })
+    .await;
+    let server = start(&sink, &[]).await;
+    let out = send(
+        &server,
+        sent_as("EMAIL", "ann@example.com", "bob@example.com"),
+    )
+    .await;
+    assert!(out["messageId"].is_string(), "{out}");
+    let delivered = sink.delivered();
+    assert_eq!(delivered.len(), 1, "{:?}", sink.transactions());
+    let commands: Vec<&str> = delivered[0]
+        .commands
+        .iter()
+        .map(|c| c.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(&commands[..2], ["EHLO", "HELO"], "{commands:?}");
+    // No `SIZE` was declared, since nothing was offered.
+    assert_eq!(
+        delivered[0].mail_line.as_deref(),
+        Some("MAIL FROM:<ann@example.com>")
+    );
+    // 8-bit content needs `8BITMIME`, which was not offered either.
+    let out = send(
+        &server,
+        raw(
+            "EMAIL",
+            "ann@example.com",
+            "bob@example.com",
+            "From: ann@example.com\nSubject: s\n\ncaf\u{e9}\n",
+        ),
+    )
+    .await;
+    assert_eq!(out["code"], "E_8BIT_NOT_SUPPORTED", "{out}");
+    assert_eq!(sink.delivered().len(), 1);
+}
+
+#[tokio::test]
+async fn a_relay_that_does_not_know_ehlo_cannot_be_used_with_tls_or_credentials() {
+    let sink = Sink::start(Behaviour {
+        no_ehlo: true,
+        ..Default::default()
+    })
+    .await;
+    let port = sink.port.to_string();
+    // STARTTLS is the default, and cannot be had without `EHLO`.
+    let server = Server::start(
+        "send-email",
+        &[("CELLD_SMTP_HOST", "127.0.0.1"), ("CELLD_SMTP_PORT", &port)],
+    )
+    .await;
+    let out = send(
+        &server,
+        sent_as("EMAIL", "ann@example.com", "bob@example.com"),
+    )
+    .await;
+    assert_eq!(out["code"], "E_DELIVERY_FAILED", "{out}");
+    assert!(
+        out["message"].as_str().unwrap().contains("STARTTLS"),
+        "{out}"
+    );
+    drop(server);
+    // Credentials, with TLS off, are not sent to a relay that offers no AUTH.
+    let server = start(
+        &sink,
+        &[
+            ("CELLD_SMTP_USERNAME", "mailer"),
+            ("CELLD_SMTP_PASSWORD", "secret-1"),
+        ],
+    )
+    .await;
+    let out = send(
+        &server,
+        sent_as("EMAIL", "ann@example.com", "bob@example.com"),
+    )
+    .await;
+    assert_eq!(out["code"], "E_DELIVERY_FAILED", "{out}");
+    let message = out["message"].as_str().unwrap();
+    assert!(
+        message.contains("EHLO") && message.contains("AUTH"),
+        "{out}"
+    );
+    assert!(!message.contains("secret-1"), "{out}");
+    assert!(sink.delivered().is_empty());
+    assert!(
+        sink.transactions().iter().all(|t| t.auth_args.is_empty()),
+        "{:?}",
+        sink.transactions()
+    );
 }

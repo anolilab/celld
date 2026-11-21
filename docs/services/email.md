@@ -68,6 +68,13 @@ read. The warning about a shared file is logged once, when the node reads the fi
   continues in the clear and never logs in before TLS. The relay's certificate
   must chain to the bundled public roots. `CELLD_EXTRA_CA_CERTS` is for what
   Workers dial and does not apply here.
+- A relay that answers `EHLO` with a 5xx (usually 500 or 502) is sent `HELO`
+  instead, as RFC 5321 says. It then has no extensions: `STARTTLS` is not
+  possible, so `send()` fails as it does for a relay that does not offer it,
+  unless `CELLD_SMTP_TLS` is `tls` or `off`; configured credentials fail the
+  send with `E_DELIVERY_FAILED` before anything is sent, as there is no `AUTH`;
+  a message with 8-bit content is refused with `E_8BIT_NOT_SUPPORTED`; and no
+  `SIZE` is declared. Every relay that answers `EHLO` is treated as before.
 - Login uses `AUTH PLAIN`, or `AUTH LOGIN` when the relay offers only that.
   A user name and password too long for one command line (512 bytes) are sent
   after the relay's `334`, as RFC 4954 allows.
@@ -140,6 +147,11 @@ message as a string or a `ReadableStream` of bytes. celld requires that
 - a `Sender:`, `Resent-From:` or `Resent-Sender:` header, if there is one, has
   that same single address too; any other address is refused;
 - it has no `Received:` header;
+- its headers are valid UTF-8, or the message is refused with
+  `E_HEADER_VALUE_INVALID` (a message built from fields cannot hold such a
+  header either). The body may hold any bytes. This is for a message a Worker
+  supplies, also as the raw form of `reply()`; `forward()` sends the headers of
+  the received message as they came;
 - every line end is CRLF: a bare LF or CR is changed to CRLF.
 
 celld replaces the `Message-ID` header with one it makes and drops the `Bcc:` and
@@ -164,6 +176,10 @@ celld replaces the `Message-ID` header with one it makes and drops the `Bcc:` an
   at most 1,000 addresses.
 - A relay that announces a `SIZE` smaller than the message is not sent the
   message.
+- The relay's name has 5 seconds to resolve. Connecting has 15 seconds in all,
+  shared by the relay's addresses: each is tried in turn with an equal share of
+  what is left, so an unreachable first address, such as an unrouted `AAAA`
+  record, does not use up the time of the next.
 - A relay has 60 seconds to answer one command and 60 seconds for each 64 KiB
   chunk of the body it is sent, then 10 minutes to answer the end of the body,
   as it may scan the message first. A whole transaction may take five minutes,
@@ -178,7 +194,7 @@ celld replaces the `Message-ID` header with one it makes and drops the `Bcc:` an
   either waits up to 60 seconds, and then rejects with `E_RATE_LIMIT_EXCEEDED`
   (for a script) or `E_DELIVERY_FAILED` (for the node).
 
-Each `send()` is one SMTP transaction on a new connection: `EHLO`, `STARTTLS`,
+Each `send()` is one SMTP transaction on a new connection: `EHLO` (or `HELO`), `STARTTLS`,
 `AUTH`, `MAIL FROM`, one `RCPT TO` for each recipient, `DATA` with dot-stuffing,
 and `QUIT`. `send()` resolves when the relay has accepted the message: `QUIT`
 is written after that and not waited for. A relay that refuses one recipient
