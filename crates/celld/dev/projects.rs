@@ -219,40 +219,54 @@ fn reachable(declared: &[Declared]) -> Vec<bool> {
     }
 }
 
-/// The scripts the node loads that this run does not list: a service a loaded
-/// script binds, or the consumer attached to a queue it uses, that an earlier
-/// run left in the store. The node follows the same edges as [`reachable`],
-/// and through the retained scripts too.
-async fn retained_scripts(
+/// What the node loads, walked once over the listed projects and the scripts an
+/// earlier run left in the store: for each listed project whether the node
+/// loads it, and the loaded scripts this run does not list, that is a service
+/// a loaded script binds, or the consumer attached to a queue it uses. The node
+/// follows the same edges as [`reachable`], through the retained scripts too, so
+/// a listed project that only a retained script reaches is loaded.
+async fn walk_loaded(
     bucket: &crate::bucket::Bucket,
     listed: &[Declared],
-    loaded: &[bool],
-) -> anyhow::Result<Vec<Manifest>> {
-    let mut seen = listed
-        .iter()
-        .map(|(name, _)| name.clone())
-        .collect::<BTreeSet<_>>();
+) -> anyhow::Result<(Vec<Manifest>, Vec<bool>)> {
+    let mut seen = BTreeSet::from([listed[0].0.clone()]);
+    let mut loaded = vec![false; listed.len()];
+    loaded[0] = true;
     let mut queues_seen = BTreeSet::new();
     let mut retained = Vec::new();
-    let mut work = listed
-        .iter()
-        .zip(loaded)
-        .filter(|(_, loaded)| **loaded)
-        .map(|((_, links), _)| (links.services.clone(), links.queues.clone()))
-        .collect::<Vec<_>>();
+    let mut work = vec![(listed[0].1.services.clone(), listed[0].1.queues.clone())];
     while let Some((services, queues)) = work.pop() {
         let mut found = Vec::new();
         for service in services {
-            if seen.insert(service.clone()) {
+            if !seen.insert(service.clone()) {
+                continue;
+            }
+            if let Some(at) = listed.iter().position(|(name, _)| *name == service) {
+                loaded[at] = true;
+                work.push((listed[at].1.services.clone(), listed[at].1.queues.clone()));
+            } else {
                 found.extend(deploy::current_manifest(bucket, &service).await?);
             }
         }
         for queue in queues {
+            if !queues_seen.insert(queue.clone()) {
+                continue;
+            }
             // A listed project that consumes it is a project of this run.
-            let listed_consumer = listed
+            let consumers = listed
                 .iter()
-                .any(|(_, links)| links.consumes.contains(&queue));
-            if listed_consumer || !queues_seen.insert(queue.clone()) {
+                .enumerate()
+                .filter(|(_, (_, links))| links.consumes.contains(&queue))
+                .map(|(at, _)| at)
+                .collect::<Vec<_>>();
+            if !consumers.is_empty() {
+                for at in consumers {
+                    if !loaded[at] {
+                        loaded[at] = true;
+                        seen.insert(listed[at].0.clone());
+                        work.push((listed[at].1.services.clone(), listed[at].1.queues.clone()));
+                    }
+                }
                 continue;
             }
             let Some(consumer) =
@@ -276,7 +290,7 @@ async fn retained_scripts(
             retained.push(manifest);
         }
     }
-    Ok(retained)
+    Ok((retained, loaded))
 }
 
 /// Refuse a Durable Object class that two loaded scripts both export: the
@@ -383,12 +397,11 @@ pub(super) async fn deploy_projects(
         .iter()
         .map(|manifest| manifest_links(manifest))
         .collect::<Vec<_>>();
-    let loaded = reachable(&links);
     let bucket = open_local_bucket(&store.database)?;
     crate::wake_format::ensure_ready(&bucket).await?;
     // The node also loads what a loaded project reaches that an earlier run
     // left in the store, so a clash there is found before the node stops.
-    let retained = retained_scripts(&bucket, &links, &loaded).await?;
+    let (retained, loaded) = walk_loaded(&bucket, &links).await?;
     let scripts = current
         .iter()
         .zip(configs)

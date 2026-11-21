@@ -614,6 +614,42 @@ async fn a_class_clash_with_a_script_left_in_the_store_is_refused_before_any_wri
 }
 
 #[tokio::test]
+async fn a_project_reached_only_through_a_retained_script_is_checked_for_class_clashes() {
+    crate::asyncrt::install_test_host_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let store = store_in(directory.path());
+    let class = |class: &str| {
+        serde_json::json!({
+            "durable_objects": { "bindings": [{ "name": "OBJ", "class_name": class }] },
+            "migrations": [{ "tag": "v1", "new_sqlite_classes": [class] }],
+        })
+    };
+    // An earlier run left `dev-mid` in the store, binding `dev-b`.
+    let mid = write_project_with(
+        &directory.path().join("mid"),
+        "dev-mid",
+        "m",
+        serde_json::json!({ "services": [{ "binding": "B", "service": "dev-b" }] }),
+    );
+    deploy_all(&[mid], &store).await.unwrap();
+    let before = serving(&store).await;
+    let primary_before = primary_version(&store).await;
+
+    // This run lists A and B. A binds only `dev-mid`, so B is loaded through
+    // it, and both export Counter.
+    let mut a_config = class("Counter");
+    a_config["services"] = serde_json::json!([{ "binding": "M", "service": "dev-mid" }]);
+    let a = write_project_with(&directory.path().join("a"), "dev-a", "a", a_config);
+    let b = write_project_with(&directory.path().join("b"), "dev-b", "b", class("Counter"));
+    let error = deploy_all(&[a, b], &store).await.unwrap_err().to_string();
+    for expected in ["Counter", "dev-a", "dev-b"] {
+        assert!(error.contains(expected), "{error}");
+    }
+    assert_eq!(serving(&store).await.0, before.0);
+    assert_eq!(primary_version(&store).await, primary_before);
+}
+
+#[tokio::test]
 async fn two_projects_that_newly_consume_one_queue_are_refused_before_either_is_written() {
     crate::asyncrt::install_test_host_runtime();
     let directory = tempfile::tempdir().unwrap();
