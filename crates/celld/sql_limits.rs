@@ -116,7 +116,9 @@ pub(crate) fn set_limits_for_test(limits: Limits) {
     OVERRIDE.with(|slot| slot.set(Some(limits)));
 }
 
-/// Start the clock for the next statement. Called again before each statement
+/// Start the clock for the next statement. One rule on every path: the clock
+/// starts before the statement is prepared, so a slow prepare counts against
+/// the bound and in the statistics alike. Called again before each statement
 /// of a batch, so the bound is per statement and not per call.
 pub(crate) fn arm() {
     let timeout = limits().statement_timeout;
@@ -131,6 +133,12 @@ pub(crate) fn elapsed() -> Duration {
     STARTED
         .with(Cell::get)
         .map_or(Duration::ZERO, |started| started.elapsed())
+}
+
+/// Whether a deadline is armed, for tests.
+#[cfg(test)]
+pub(crate) fn armed() -> bool {
+    TIMEOUT.with(Cell::get).is_some()
 }
 
 pub(crate) fn disarm() {
@@ -158,7 +166,11 @@ pub(crate) fn statement_expired() -> bool {
 
 /// Put both bounds on a freshly opened cell connection.
 pub(crate) fn install(connection: &mut Connection) -> rusqlite::Result<()> {
-    connection.progress_handler(PROGRESS_INTERVAL, Some(handler))?;
+    // With no bound there is no handler: a check every interval would cost a
+    // statement time for nothing. `None` also removes one an earlier setting
+    // installed.
+    let bounded = limits().statement_timeout.is_some();
+    connection.progress_handler(PROGRESS_INTERVAL, bounded.then_some(handler))?;
     if let Some(bytes) = limits().max_database_bytes {
         let page_size: i64 = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
         let pages = (bytes / page_size.max(1) as u64).max(1);
@@ -284,6 +296,52 @@ mod tests {
         assert!(statement_expired());
         disarm();
         assert!(!handler(), "a disarmed handler interrupted");
+    }
+
+    /// Run enough instructions that a registered handler is called, with the
+    /// deadline long past: it interrupts if and only if one is installed.
+    fn interrupted_by_a_handler(connection: &mut Connection) -> bool {
+        TIMEOUT.with(|slot| slot.set(Some(Duration::ZERO)));
+        STARTED.with(|slot| slot.set(Some(Instant::now())));
+        let outcome: rusqlite::Result<i64> = connection.query_row(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 100000) \
+             SELECT count(*) FROM c",
+            [],
+            |row| row.get(0),
+        );
+        disarm();
+        outcome.is_err()
+    }
+
+    #[test]
+    fn no_bound_installs_no_handler_and_removes_an_earlier_one() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let bounded = Limits {
+            statement_timeout: Some(Duration::from_secs(30)),
+            max_database_bytes: None,
+        };
+        set_limits_for_test(bounded);
+        install(&mut connection).unwrap();
+        assert!(
+            interrupted_by_a_handler(&mut connection),
+            "no handler with a bound"
+        );
+
+        set_limits_for_test(Limits {
+            statement_timeout: None,
+            ..bounded
+        });
+        install(&mut connection).unwrap();
+        assert!(
+            !interrupted_by_a_handler(&mut connection),
+            "the earlier handler stayed"
+        );
+        let mut fresh = Connection::open_in_memory().unwrap();
+        install(&mut fresh).unwrap();
+        assert!(
+            !interrupted_by_a_handler(&mut fresh),
+            "a handler with no bound"
+        );
     }
 
     #[test]
