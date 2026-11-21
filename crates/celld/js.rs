@@ -12796,7 +12796,9 @@ mod refuse_unrequested_websocket_tests {
         assert!(tunneled.websocket.is_none());
         assert!(take_tunnel_upgrade(parked).is_none());
 
-        let id = 9_200_001;
+        // The registry is process-wide and tests run in parallel, so this id
+        // is not shared with another test (js/websocket.rs uses 9_200_001-2).
+        let id = 9_200_003;
         crate::ws_registry::ws_register_outbound(id, "", None);
         let mut cell = tunneled_response().0;
         cell.websocket = Some(HttpResponseWebSocket::Cell(WsTarget {
