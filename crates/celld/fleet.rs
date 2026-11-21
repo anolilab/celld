@@ -960,7 +960,9 @@ async fn load_worker_at_pointer(
         .map(|binding| manifest.version_metadata(binding));
     let ai_binding = crate::protocol::ai_binding(&manifest)?;
     let services = service_bindings(&manifest);
-    let tail_consumers = tail_consumers(&manifest);
+    let tail_consumers: Vec<String> = crate::protocol::tail_consumers(&manifest)
+        .map(str::to_string)
+        .collect();
     let mut vars = worker_vars(&manifest);
     // Secrets are decrypted here, once per deployment load, and join the vars
     // as string bindings: one bucket read, nothing per request.
@@ -1118,18 +1120,6 @@ fn service_bindings(manifest: &Manifest) -> Vec<(String, String, Option<String>)
                     .map(str::to_string),
             ))
         })
-        .collect()
-}
-
-fn tail_consumers(manifest: &Manifest) -> Vec<String> {
-    manifest
-        .raw_metadata
-        .get("tail_consumers")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|consumer| consumer.get("service")?.as_str())
-        .map(str::to_string)
         .collect()
 }
 

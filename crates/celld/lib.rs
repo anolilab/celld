@@ -184,6 +184,12 @@ pub enum WorkerJob {
         batch: js::QueueBatch,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<js::QueueDispatchResult>>,
     },
+    /// A batch of trace items for the default entrypoint's `tail()`. It
+    /// answers `[1]` when the handler returned and `[0]` when it threw.
+    Tail {
+        items: String,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
+    },
 }
 
 /// Temporary host seam required by the verbatim JS adapter. The runtime

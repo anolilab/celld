@@ -319,6 +319,19 @@ pub fn validate_ratelimit_manifest(
     Ok(bindings)
 }
 
+/// The scripts a manifest names in `tail_consumers`: the Workers that receive
+/// the trace items of this one.
+#[doc(hidden)]
+pub fn tail_consumers(manifest: &Manifest) -> impl Iterator<Item = &str> {
+    manifest
+        .raw_metadata
+        .get("tail_consumers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|consumer| consumer.get("service")?.as_str())
+}
+
 /// The name of the Workers AI binding of a manifest, `None` without one. A
 /// binding without a string name is an error: dropping it would leave the
 /// Worker without `env.AI` and a failure far from the cause. So is a second

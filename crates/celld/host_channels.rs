@@ -150,6 +150,19 @@ pub struct SvcRpcReq {
 pub(crate) static SVC_RPC_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<SvcRpcReq>> =
     OnceLock::new();
 
+/// One batch of trace items for the `tail()` handler of a consumer script.
+pub struct TailDispatchReq {
+    /// The generation of the Worker that produced the items; see `SvcCallReq`.
+    pub generation: crate::generation::GenerationId,
+    pub script: String,
+    /// The batch: a JSON array of trace items.
+    pub items: String,
+    /// `[1]` when `tail()` returned, `[0]` when it threw.
+    pub reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
+}
+pub(crate) static TAIL_DISPATCH_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<TailDispatchReq>> =
+    OnceLock::new();
+
 /// The persisted identity a consumer settlement must match for one message.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct QueueLeaseRef {
@@ -195,6 +208,10 @@ pub fn set_svc_rpc_tx(tx: tokio::sync::mpsc::UnboundedSender<SvcRpcReq>) {
 pub fn set_svc_call_tx(tx: tokio::sync::mpsc::UnboundedSender<SvcCallReq>) {
     let _ = SVC_CALL_TX.set(tx);
 }
+pub fn set_tail_dispatch_tx(tx: tokio::sync::mpsc::UnboundedSender<TailDispatchReq>) {
+    let _ = TAIL_DISPATCH_TX.set(tx);
+}
+
 pub fn set_queue_dispatch_tx(tx: tokio::sync::mpsc::UnboundedSender<QueueDispatchReq>) {
     let _ = QUEUE_DISPATCH_TX.set(tx);
 }

@@ -237,7 +237,9 @@ impl StatelessWorkerJob {
             crate::WorkerJob::Fetch { request_id, .. } => {
                 request_id.map(RequestCancellationLifetime::from_request_id)
             }
-            crate::WorkerJob::Rpc { .. } | crate::WorkerJob::Queue { .. } => None,
+            crate::WorkerJob::Rpc { .. }
+            | crate::WorkerJob::Queue { .. }
+            | crate::WorkerJob::Tail { .. } => None,
         };
         let cancellation = RequestCancellationGuard::new(lifetime);
         Self { job, cancellation }
@@ -1101,6 +1103,22 @@ impl RuntimeManager {
             .service(script)
             .ok_or_else(|| anyhow!("no Queue consumer Worker for script {script}"))?
             .queue(batch)
+            .await
+    }
+
+    /// Deliver a batch of trace items to a consumer script. `generation` is
+    /// the producer's, like a service call.
+    pub async fn tail_service(
+        &self,
+        generation: GenerationId,
+        script: &str,
+        items: String,
+    ) -> anyhow::Result<Vec<u8>> {
+        let generation = self.generation_by_id(generation);
+        generation
+            .service(script)
+            .ok_or_else(|| anyhow!("no tail consumer Worker for script {script}"))?
+            .tail(items)
             .await
     }
 
@@ -2838,7 +2856,7 @@ impl StatelessTiming {
                 "celld.queue",
                 crate::telemetry::KIND_CONSUMER,
             ),
-            crate::WorkerJob::Rpc { .. } => (
+            crate::WorkerJob::Rpc { .. } | crate::WorkerJob::Tail { .. } => (
                 Instant::now(),
                 None,
                 "celld.fetch",
@@ -3118,6 +3136,15 @@ impl StatelessRuntime {
             operation,
             props,
             invocation_limits: None,
+            reply,
+        })
+        .await
+    }
+
+    /// Deliver a batch of trace items to the default entrypoint's `tail()`.
+    async fn tail(&self, items: String) -> anyhow::Result<Vec<u8>> {
+        self.dispatch(StatelessVerb::Rpc, move |reply| crate::WorkerJob::Tail {
+            items,
             reply,
         })
         .await

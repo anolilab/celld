@@ -85,6 +85,7 @@ pub use crate::host_channels::set_queue_dispatch_tx;
 pub use crate::host_channels::set_rpc_call_tx;
 pub use crate::host_channels::set_svc_call_tx;
 pub use crate::host_channels::set_svc_rpc_tx;
+pub use crate::host_channels::set_tail_dispatch_tx;
 pub use crate::host_channels::AssetCallReq;
 pub use crate::host_channels::FacetReq;
 pub use crate::host_channels::GateReq;
@@ -92,7 +93,6 @@ pub use crate::host_channels::QueueDispatchReq;
 pub use crate::host_channels::QueueLeaseRef;
 pub use crate::host_channels::RpcCallReq;
 pub use crate::host_channels::SvcCallReq;
-pub use crate::host_channels::SvcRpcReq;
 pub(crate) use crate::host_channels::ASSET_CALL_TX;
 pub(crate) use crate::host_channels::FACET_TX;
 pub(crate) use crate::host_channels::GATE_TX;
@@ -100,6 +100,8 @@ pub(crate) use crate::host_channels::QUEUE_DISPATCH_TX;
 pub(crate) use crate::host_channels::RPC_CALL_TX;
 pub(crate) use crate::host_channels::SVC_CALL_TX;
 pub(crate) use crate::host_channels::SVC_RPC_TX;
+pub(crate) use crate::host_channels::TAIL_DISPATCH_TX;
+pub use crate::host_channels::{SvcRpcReq, TailDispatchReq};
 pub(crate) use crate::http_streams::claim_http_stream;
 pub(crate) use crate::http_streams::encode_http_response;
 pub(crate) use crate::http_streams::http_stream_read;
@@ -4299,7 +4301,7 @@ impl Worker {
             | crate::WorkerJob::Rpc {
                 invocation_limits, ..
             } => *invocation_limits,
-            crate::WorkerJob::Queue { .. } => None,
+            crate::WorkerJob::Queue { .. } | crate::WorkerJob::Tail { .. } => None,
         };
         let initial_limits =
             effective_resource_limits(inner.runtime_state.resource_limits, invocation_limits);
@@ -4638,6 +4640,9 @@ fn begin<'s>(
         crate::WorkerJob::Queue { batch, reply, .. } => {
             return begin_queue(tc, batch, reply);
         }
+        crate::WorkerJob::Tail { items, reply } => {
+            return begin_tail(tc, &items, reply);
+        }
         job => job,
     };
     let crate::WorkerJob::Fetch {
@@ -4682,13 +4687,13 @@ fn begin<'s>(
         Some(entrypoint) => FetchTarget::Entrypoint(entrypoint),
         None => FetchTarget::Default(fetch),
     };
-    let tail_started = Instant::now();
+    let tail_started = tail_reply.is_some().then(Instant::now);
     let started = start_fetch(tc, target, &url, &method, body, &headers, request_id);
     let mut tail_report = tail_reply.map(|reply| TailReportState {
         reply,
         script_name: runtime_state.script_name.clone(),
         event_timestamp: unix_now_ms(),
-        started: tail_started,
+        started: tail_started.unwrap_or_else(Instant::now),
         event: TailEvent::Fetch {
             url,
             method,
@@ -4828,6 +4833,74 @@ fn begin_entrypoint_rpc(
                 unrefed_ops: std::collections::HashSet::new(),
                 alarm: None,
                 started: event_started,
+                trace: None,
+                failure: None,
+                response_status: None,
+                tail_report: None,
+            };
+            drop(guard);
+            Begun::Running(Box::new(entry))
+        }
+        Err(error) => {
+            let _ = end_event_context(tc);
+            let cpu_error = context.finish_cpu_turn().err().map(anyhow::Error::msg);
+            let error = take_execution_termination(tc)
+                .or(cpu_error)
+                .unwrap_or(error);
+            drop(guard);
+            let _ = reply.send(Err(error));
+            Begun::Nothing
+        }
+    }
+}
+
+/// Start a `tail()` delivery: the batch goes to the Worker's own
+/// `__dispatchEntrypointTail` as a string, inside an event the host keeps
+/// driving, so the handler's `waitUntil` work finishes as a queue handler's does.
+/// A tail delivery is not itself traced.
+fn begin_tail(
+    tc: &mut v8::PinScope,
+    items: &str,
+    reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
+) -> Begun {
+    let context = IoContext::with_resource_limits(actor_runtime_state(tc).resource_limits);
+    let guard = CurrentGuard::enter(context.clone());
+    install_io_context(tc, &context);
+    context.begin_cpu_turn();
+    let started = (|| {
+        let dispatch = internal_function(tc, "__dispatchEntrypointTail")?;
+        let entrypoint = v8::String::new(tc, "default").unwrap();
+        let items = v8::String::new(tc, items).ok_or_else(|| anyhow!("tail batch is too long"))?;
+        let recv = v8::undefined(tc).into();
+        begin_event_context(tc)?;
+        let ret = dispatch
+            .call(tc, recv, &[entrypoint.into(), items.into()])
+            .ok_or_else(|| anyhow!("tail dispatch threw"))?;
+        match ret.try_cast::<v8::Promise>() {
+            Ok(promise) => Ok(promise),
+            Err(_) => resolved_promise(tc, ret),
+        }
+    })();
+    match started {
+        Ok(promise) => {
+            tc.perform_microtask_checkpoint();
+            let entry = InFlight {
+                runtime_state: actor_runtime_state(tc),
+                promise: v8::Global::new(tc, promise),
+                context,
+                scope: None,
+                writes_before: None,
+                request_id: None,
+                active_request_id: None,
+                reply: Some(Answer::Rpc(reply)),
+                gated_reply: None,
+                background: None,
+                completed_cell_event: false,
+                ops: std::collections::HashSet::new(),
+                io_context_ops: std::collections::HashSet::new(),
+                unrefed_ops: std::collections::HashSet::new(),
+                alarm: None,
+                started: Instant::now(),
                 trace: None,
                 failure: None,
                 response_status: None,

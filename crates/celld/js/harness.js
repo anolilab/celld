@@ -5390,13 +5390,6 @@ const __rpcRun = async (body, lift) => {
   }
 };
 const __rpcDesArgs = (bytes) => {
-  // The host builds a tail call without an isolate, so its arguments arrive as
-  // JSON after the tag byte; see `tail_consumers::JSON_ARGS_TAG`.
-  if (bytes[0] === 0xfe)
-    return {
-      args: JSON.parse(new TextDecoder().decode(bytes.subarray(1))),
-      received: [],
-    };
   if (bytes[0] === 0xff)
     return { args: __sc_decode(bytes), received: [] };
   const revived = __stubRevive(__sc_decode(bytes.subarray(1)));
@@ -6034,6 +6027,20 @@ __celld.__dispatchEntrypointQueue = async (name, incoming) => {
     })),
   };
 };
+// A batch of trace items, as the JSON the host built, goes to `tail()` inside
+// the event the host opened, like a queue batch. Nobody reads the error of a
+// `tail()` that throws, so it is logged in this Worker's own console. The
+// answer is one byte: 1 when `tail()` returned, 0 when it threw.
+__celld.__dispatchEntrypointTail = async (name, json) => {
+  try {
+    await __dispatchEntrypointMethodInCurrentEvent(
+      name, "tail", JSON.parse(json));
+    return new Uint8Array([1]);
+  } catch (error) {
+    __log("error", `Uncaught exception in tail(): ${error?.stack ?? error}`);
+    return new Uint8Array([0]);
+  }
+};
 // Workerd's simple-handler RPC rules (worker-rpc.c++): a non-class
 // handler method is called as fn(arg, env, ctx), the client must send
 // exactly one argument, and the handler must not declare more than
@@ -6161,27 +6168,12 @@ const __entrypointOp = (name, path, argsSc, local, makeInst, props) => {
 // `propsSc` carries getEntrypoint(name, {props}) as structured-clone bytes,
 // the same encoding as `argsSc`. It is empty when the caller sent no props,
 // which no encoded value can be, so an empty buffer is an unambiguous absent.
-__celld.__dispatchEntrypointRpc = (
-  name, path, argsSc, local = false, propsSc = null,
-) => {
-  const reply = __entrypointOp(
+__celld.__dispatchEntrypointRpc =
+  (name, path, argsSc, local = false, propsSc = null) => __entrypointOp(
     name, typeof path === "string" ? [path] : path, argsSc, local,
     undefined,
     propsSc === null || propsSc.length === 0
       ? undefined : __sc_decode(propsSc));
-  // A tail delivery has no caller that reads the error, so a `tail()` that
-  // throws is reported in this Worker's own log.
-  if (argsSc === null || argsSc[0] !== 0xfe) return reply;
-  return reply.then((bytes) => {
-    if (bytes[0] === 0) {
-      try {
-        const [error] = __sc_decode(bytes.subarray(1));
-        __log("error", `Uncaught exception in tail(): ${error?.stack ?? error}`);
-      } catch {}
-    }
-    return bytes;
-  });
-};
 // A close from Worker code may carry any code RFC 6455 lets an endpoint send:
 // 1000-1003, 1007-1014 and 3000-4999. 1004 is reserved and 1005, 1006 and 1015
 // only report a state locally. The reason is at most 123 bytes of UTF-8 (the

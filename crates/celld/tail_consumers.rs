@@ -23,14 +23,10 @@ pub(crate) const BATCH_ITEMS: usize = 100;
 /// How long one `tail()` call may run before delivery gives up on it.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The first byte of an argument list that carries JSON rather than a
-/// structured clone. The harness decodes it in the consumer's own isolate, so
-/// the host does not need an isolate to build the call.
-pub(crate) const JSON_ARGS_TAG: u8 = 0xfe;
-
-/// Sends one encoded `tail(events)` argument list to a consumer script.
+/// Sends one batch, a JSON array of trace items, to the `tail()` handler of a
+/// consumer script.
 pub(crate) type Deliver = Arc<
-    dyn Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+    dyn Fn(String, String) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync,
 >;
@@ -101,18 +97,18 @@ impl TailSink {
     }
 }
 
-/// The `tail` argument list for a batch: one argument, the array of items.
-fn encode_batch(items: &[Arc<str>]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(items.iter().map(|item| item.len() + 1).sum::<usize>() + 4);
-    body.push(JSON_ARGS_TAG);
-    body.extend_from_slice(b"[[");
+/// The batch the consumer receives: the array of items.
+fn encode_batch(items: &[Arc<str>]) -> String {
+    let mut body =
+        String::with_capacity(items.iter().map(|item| item.len() + 1).sum::<usize>() + 2);
+    body.push('[');
     for (index, item) in items.iter().enumerate() {
         if index != 0 {
-            body.push(b',');
+            body.push(',');
         }
-        body.extend_from_slice(item.as_bytes());
+        body.push_str(item);
     }
-    body.extend_from_slice(b"]]");
+    body.push(']');
     body
 }
 
@@ -151,30 +147,25 @@ async fn deliver_lane(
     }
 }
 
-/// The delivery a node uses: an RPC to the consumer's default entrypoint, in
-/// the generation of the Worker that produced the items.
+/// The delivery a node uses: a `tail()` call on the consumer's default
+/// entrypoint, in the generation of the Worker that produced the items.
 pub(crate) fn rpc_deliver(generation: crate::generation::GenerationId) -> Deliver {
-    Arc::new(move |script, args| {
+    Arc::new(move |script, items| {
         Box::pin(async move {
-            let sender = crate::js::SVC_RPC_TX
+            let sender = crate::js::TAIL_DISPATCH_TX
                 .get()
-                .ok_or_else(|| "no service binding channel".to_string())?;
+                .ok_or_else(|| "no tail dispatch channel".to_string())?;
             let (reply, receive) = tokio::sync::oneshot::channel();
             sender
-                .send(crate::js::SvcRpcReq {
+                .send(crate::js::TailDispatchReq {
                     generation,
                     script,
-                    entrypoint: "default".to_string(),
-                    props: Vec::new(),
-                    operation: crate::WorkerRpcOperation::Call {
-                        path: vec!["tail".to_string()],
-                        args,
-                    },
+                    items,
                     reply,
                 })
-                .map_err(|_| "service binding channel closed".to_string())?;
+                .map_err(|_| "tail dispatch channel closed".to_string())?;
             match receive.await {
-                // An error the handler threw is a reply tagged 0, not a failed call.
+                // A handler that threw answers `[0]`, not a failed call.
                 Ok(Ok(reply)) if reply.first() == Some(&0) => Err("tail() threw".to_string()),
                 Ok(Ok(_)) => Ok(()),
                 Ok(Err(error)) => Err(format!("{error:#}")),
@@ -217,7 +208,7 @@ mod tests {
 
     fn recording(seen: &Seen, gate: Option<Arc<tokio::sync::Semaphore>>, fail: bool) -> Deliver {
         let seen = seen.clone();
-        Arc::new(move |consumer, args| {
+        Arc::new(move |consumer, items| {
             let seen = seen.clone();
             let gate = gate.clone();
             Box::pin(async move {
@@ -225,11 +216,7 @@ mod tests {
                 if let Some(gate) = gate {
                     gate.acquire().await.unwrap().forget();
                 }
-                assert_eq!(args[0], JSON_ARGS_TAG);
-                seen.calls
-                    .lock()
-                    .unwrap()
-                    .push((consumer, String::from_utf8(args[1..].to_vec()).unwrap()));
+                seen.calls.lock().unwrap().push((consumer, items));
                 if fail {
                     Err("consumer threw".to_string())
                 } else {
@@ -264,8 +251,8 @@ mod tests {
         assert_eq!(
             calls,
             vec![
-                ("a".to_string(), r#"[[{"n":1}]]"#.to_string()),
-                ("b".to_string(), r#"[[{"n":1}]]"#.to_string()),
+                ("a".to_string(), r#"[{"n":1}]"#.to_string()),
+                ("b".to_string(), r#"[{"n":1}]"#.to_string()),
             ]
         );
     }
@@ -296,7 +283,7 @@ mod tests {
                 .iter()
                 .map(|(_, body)| body.as_str())
                 .collect::<Vec<_>>(),
-            vec![r#"[[{"n":1}]]"#, r#"[[{"n":2},{"n":3}]]"#]
+            vec![r#"[{"n":1}]"#, r#"[{"n":2},{"n":3}]"#]
         );
     }
 

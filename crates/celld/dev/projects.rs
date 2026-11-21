@@ -127,16 +127,7 @@ fn manifest_links(manifest: &Manifest) -> Declared {
         .collect::<Vec<_>>();
     let links = Links {
         services: named("service", "service")
-            .chain(
-                manifest
-                    .raw_metadata
-                    .get("tail_consumers")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|consumer| consumer.get("service")?.as_str())
-                    .map(str::to_string),
-            )
+            .chain(crate::protocol::tail_consumers(manifest).map(str::to_string))
             .collect(),
         queues: named("queue", "queue")
             .chain(consumes.iter().cloned())
