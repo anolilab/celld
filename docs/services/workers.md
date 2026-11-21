@@ -143,6 +143,11 @@ restart. A build that fails is not retried every interval; a later `put` or
 `delete` retries it. A `celld deploy` that reads the pointer before a secret
 write and writes it after loses its conditional write; run it again.
 
+A deploy or activation of the same version keeps the revisions, so it rebuilds
+nothing. If `delete` removed the secret but could not update the pointer, run
+`celld secret delete NAME --announce-only`: it deletes nothing and only tells the
+nodes.
+
 A secret cannot have the name of a variable or binding of the Worker, or be
 named `__proto__`. `celld secret put` refuses a name that the deployment the
 fleet serves uses; it does not look at staged or retained versions.

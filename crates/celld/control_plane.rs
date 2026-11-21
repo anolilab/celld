@@ -1934,10 +1934,19 @@ pub async fn apply_deployment(
     // This fleet-wide pointer is the sole application selector. The named
     // pointer above remains only for resolving service-binding components and
     // for migrating buckets written by older celld releases.
+    // The pointer comes from the control plane and knows no secrets
+    // revisions; keep the ones the fleet holds, or every node rebuilds a
+    // deployment it already serves.
+    let mut fleet_pointer = deployment.pointer.clone();
+    if let Some((body, _)) = bucket.get("deploy/current.json").await? {
+        if let Ok(current) = serde_json::from_slice::<DeployPointer>(&body) {
+            fleet_pointer.secrets_revisions = current.secrets_revisions;
+        }
+    }
     bucket
         .put(
             "deploy/current.json",
-            serde_json::to_vec_pretty(&deployment.pointer)?,
+            serde_json::to_vec_pretty(&fleet_pointer)?,
         )
         .await?;
     info!(

@@ -46,6 +46,8 @@ struct Command {
     config: Option<PathBuf>,
     fleet: FleetFlags,
     json: bool,
+    /// `delete` only: tell the nodes without deleting, to retry a failed announcement.
+    announce_only: bool,
 }
 
 /// What holds the secrets: a Worker, or a Secrets Store that Workers bind.
@@ -79,18 +81,20 @@ impl Record for Name {
 /// already written, so this never fails the command over an unreadable
 /// pointer: the change is stored and the next deploy picks it up. Returns
 /// what the nodes will do, as a sentence ending the command's note.
-async fn announce(bucket: &Bucket, owner: &Owner) -> anyhow::Result<&'static str> {
+async fn announce(bucket: &Bucket, owner: &Owner, retry: &str) -> anyhow::Result<&'static str> {
     let scope = match owner {
         Owner::Script(script) => secrets::script_revision_key(script),
         Owner::Store(store) => secrets::store_revision_key(store),
     };
     let told = crate::deploy::bump_secrets_revision(bucket, &scope)
         .await
-        .context(
-            "the secret is stored, but running nodes were not told: they read it at their next \
-             load of the deployment (a deploy, `POST /reload`, or a restart), or run this \
-             command again",
-        )?;
+        .with_context(|| {
+            format!(
+                "the change is stored, but running nodes were not told: they read it at their \
+                 next load of the deployment (a deploy that changes the version, `POST /reload`, \
+                 or a restart), or {retry}"
+            )
+        })?;
     Ok(match told {
         RevisionBump::Updated => {
             "Running nodes that use it rebuild the deployment within one poll interval \
@@ -151,16 +155,26 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                     secrets::put_store(&bucket, key, store, &name, &value).await?;
                 }
             }
-            let told = announce(&bucket, &owner).await?;
+            let told = announce(&bucket, &owner, "run this command again").await?;
             note!("Stored secret {name} for {owner}. {told}");
             Ok(())
         }
         Step::Delete(name) => {
-            match &owner {
-                Owner::Script(script) => secrets::delete(&bucket, script, &name).await?,
-                Owner::Store(store) => secrets::delete_store(&bucket, store, &name).await?,
+            // The delete cannot repeat once the name is gone, so a failed
+            // announcement is retried with `--announce-only`, which deletes
+            // nothing.
+            if !command.announce_only {
+                match &owner {
+                    Owner::Script(script) => secrets::delete(&bucket, script, &name).await?,
+                    Owner::Store(store) => secrets::delete_store(&bucket, store, &name).await?,
+                }
             }
-            let told = announce(&bucket, &owner).await?;
+            let told = announce(
+                &bucket,
+                &owner,
+                "run this command again with --announce-only",
+            )
+            .await?;
             note!("Deleted secret {name} of {owner}. {told}");
             Ok(())
         }
@@ -242,6 +256,7 @@ impl Command {
         let mut config = None;
         let mut fleet = FleetFlags::default();
         let mut json = false;
+        let mut announce_only = false;
         while let Some(argument) = arguments.next() {
             let mut value = |flag: &str| {
                 arguments
@@ -251,6 +266,7 @@ impl Command {
             match argument.as_str() {
                 "--help" | "-h" => return Ok(None),
                 "--json" => json = true,
+                "--announce-only" => announce_only = true,
                 "--script" => script = Some(value("--script")?),
                 "--store" => store = Some(value("--store")?),
                 "--config" => config = Some(PathBuf::from(value("--config")?)),
@@ -281,6 +297,9 @@ impl Command {
         if json && !matches!(action, Action::List) {
             bail!("--json applies to `celld secret list`");
         }
+        if announce_only && !matches!(action, Action::Delete(_)) {
+            bail!("--announce-only applies to `celld secret delete`");
+        }
         Ok(Some(Self {
             action,
             script,
@@ -288,6 +307,7 @@ impl Command {
             config,
             fleet: fleet.with_environment(),
             json,
+            announce_only,
         }))
     }
 }
@@ -299,7 +319,7 @@ pub fn print_help() {
 USAGE
   celld secret put    NAME [--script SCRIPT] [fleet options] < value
   celld secret list        [--script SCRIPT] [fleet options] [--json]
-  celld secret delete NAME [--script SCRIPT] [fleet options]
+  celld secret delete NAME [--script SCRIPT] [fleet options] [--announce-only]
   celld secret put|list|delete ... --store STORE_ID    (a Secrets Store's secrets)
 
 The Worker reads a secret as `env.NAME`. With --store, the secrets belong to the
@@ -324,7 +344,9 @@ then set `secrets_revisions` for that script or store in `deploy/current.json`,
 so only the nodes whose deployment uses it rebuild, within one poll interval
 (CELLD_DEPLOY_POLL_S). A fleet with no pointer is not touched, and a node on an
 older version needs a deploy, `POST /reload`, or restart. A `celld deploy` that
-races a secret write can lose its pointer write; run it again.
+races a secret write can lose its pointer write; run it again. If `delete`
+stored the change but could not tell the nodes, run it again with
+--announce-only, which deletes nothing and only tells them.
 
 SCRIPT defaults to the `name` of the Wrangler config in the working directory;
 `--config PATH` names another.
@@ -361,6 +383,17 @@ mod tests {
             .unwrap();
         assert!(matches!(command.action, Action::Put(name) if name == "TOKEN"));
         assert_eq!(command.script.as_deref(), Some("app"));
+    }
+
+    #[test]
+    fn announce_only_applies_to_delete_alone() {
+        let command = parse(&["delete", "TOKEN", "--announce-only"])
+            .unwrap()
+            .unwrap();
+        assert!(command.announce_only);
+        assert!(!parse(&["delete", "TOKEN"]).unwrap().unwrap().announce_only);
+        assert!(parse(&["put", "TOKEN", "--announce-only"]).is_err());
+        assert!(parse(&["list", "--announce-only"]).is_err());
     }
 
     #[test]

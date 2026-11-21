@@ -200,7 +200,11 @@ pub(crate) fn next_pointer(
         prefix: top.prefix,
         rollout: Rollout { percent: 100 },
         components,
-        secrets_revisions: Default::default(),
+        // Selecting deployments is not a secret change: carry the revisions
+        // over, or every node that recorded one rebuilds for nothing.
+        secrets_revisions: current
+            .map(|pointer| pointer.secrets_revisions.clone())
+            .unwrap_or_default(),
     })
 }
 
