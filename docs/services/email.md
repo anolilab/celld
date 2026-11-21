@@ -322,11 +322,11 @@ retry:
 
 | Status | Body | Meaning |
 | --- | --- | --- |
-| 200 | `{"ok":true,"outcome":"accepted"}` | The handler returned, or it threw or ran past the deadline after a `forward()` or `reply()` the relay had already accepted, or accepts while the deadline passes (see 504; the failure is logged with the message's id). Accept the message: a retry would send that mail again |
-| 550 | `{"ok":false,"outcome":"rejected","reason":"..."}` | The handler called `setReject()`. Bounce with a permanent failure and `reason` (printable ASCII, at most 200 characters, so it is safe in an SMTP reply line) |
-| 500 | `{"ok":false,"outcome":"error","error":"the email handler threw"}` | The handler threw before the relay accepted anything. Sends it left running in `waitUntil` are waited for first (each bounded by its own SMTP transaction deadline), and if the relay accepts one the answer is 200 instead. The body does not carry what was thrown, which may hold a secret; it is in the node's log (`inbound_email_failed`). Treat it as temporary and retry |
+| 200 | `{"ok":true,"outcome":"accepted"}` | The handler returned, or it threw or ran past the deadline after a `forward()` or `reply()` the relay had already accepted, or called `setReject()` after one (see 550), or accepts while the deadline passes (see 504; the failure is logged with the message's id). Accept the message: a retry would send that mail again |
+| 550 | `{"ok":false,"outcome":"rejected","reason":"..."}` | The handler called `setReject()` and no `forward()` or `reply()` of the event was accepted by the relay. Bounce with a permanent failure and `reason` (printable ASCII, at most 200 characters, so it is safe in an SMTP reply line). No new `forward()` or `reply()` starts once the route answers 550 (it is refused with `E_TIMEOUT`), including a streamed `reply()` that was started in `waitUntil` and reads its message later. A send already talking to the relay is waited for first. If the relay accepts one, the answer is 200 instead, since a bounce would follow a delivered copy; the node logs `inbound_email_rejected_after_delivery` with the message's id |
+| 500 | `{"ok":false,"outcome":"error","error":"the email handler threw"}` | The handler threw before the relay accepted anything. Sends it left running in `waitUntil` are waited for first (each bounded by its own SMTP transaction deadline), and if the relay accepts one the answer is 200 instead. The body does not carry what was thrown, which may hold a secret; it is in the node's log (`inbound_email_failed`, with the message's id). A missing handler is a 501 only when the `email()` lookup itself finds none; a handler whose own call (for example to a same-script entrypoint with no `fetch()`) hits a missing handler failed, and answers 500. Treat it as temporary and retry |
 | 501 | `{"ok":false,"outcome":"no_handler",...}` | The primary Worker has no `email()` handler. Treat it as temporary: the operator can deploy one |
-| 504 | | The handler did not finish within 60 seconds (`CELLD_EMAIL_INBOUND_DEADLINE_S`). At the deadline no new `forward()` or `reply()` starts (it is refused with `E_TIMEOUT`), and one already talking to the relay is waited for, for as long as its own SMTP transaction allows. The rest of the event is then cancelled, as one whose client hung up is, and gives its place back. The answer is 200 if the relay accepted a send of the event, and 504 otherwise. Temporary, and the retry runs the handler again |
+| 504 | | The handler did not finish within 60 seconds (`CELLD_EMAIL_INBOUND_DEADLINE_S`). At the deadline no new `forward()` or `reply()` starts (it is refused with `E_TIMEOUT`), and one already talking to the relay is waited for, for as long as its own SMTP transaction allows. The rest of the event is then cancelled, as one whose client hung up is, and gives its place back. The answer is 200 if the relay accepted a send of the event, and 504 otherwise. The node logs `inbound_email_timeout` with the message's id. Temporary, and the retry runs the handler again |
 | 408 | | The message was not received within the same time. Temporary |
 | 503 | | The node is busy (at most four messages at once, with `Retry-After`), is shutting down (with `Retry-After`; shutdown waits for the messages it already took, as for public requests), or has no Worker runtime. Temporary |
 | 400, 413, 431 | `{"ok":false,"error":"..."}` | The message was refused: empty, malformed, with a NUL byte, over 25 MiB (413), with a header line over 998 bytes, or with more than 64 KiB or 1,000 headers (431). The error names the fault |
@@ -419,9 +419,12 @@ not restricted by any `send_email` binding. `forward()` has a list of its own.
   an `EmailMessage` must be addressed to the incoming `from`. It must be sent
   from the domain of the incoming `to`. celld sets `In-Reply-To` and
   `References` from the incoming `Message-ID`, keeping only entries that are
-  valid message ids and, in a long thread, the first id and the newest ones; a
-  value the Worker sets must be the same (the full or the trimmed chain). It is refused when the incoming message has no `Message-ID`
-  (`E_FIELD_MISSING`), more than 100 `References`, or no sender (a bounce). A
+  valid message ids (printable ASCII, so an id with 8-bit bytes, or one that was
+  decoded to U+FFFD, is dropped from `References` and is never a thread id) and,
+  in a long thread, the first id and the newest ones; a value the Worker sets,
+  in a builder or a raw message, must be the same (the full or the trimmed
+  chain). It is refused when the incoming message has no usable `Message-ID`
+  (`E_FIELD_MISSING`; one that is not printable ASCII counts as none), more than 100 `References`, or no sender (a bounce). A
   message may be replied to once, and a failed reply counts, but one turned away
   for lack of a slot or a subrequest (`E_RATE_LIMIT_EXCEEDED`) does not. A reply
   that has no `Auto-Submitted` header of its own gets `Auto-Submitted:
