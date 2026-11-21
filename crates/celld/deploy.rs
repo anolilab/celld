@@ -1129,20 +1129,50 @@ impl Selection {
 /// Store secret or Hyperdrive connection string that is missing. A caller that
 /// writes several deployments runs it on all of them first, so one refusal
 /// leaves every pointer as it was.
-pub async fn check_write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
-    prepare_refusals(bucket, built).await.map(drop)
+///
+/// `batch` holds the manifests of every script written in the same run: a queue
+/// that one of them holds now but does not consume in its new version is
+/// released by that run, so it does not clash with a consumer another one adds.
+pub async fn check_write(
+    bucket: &Bucket,
+    built: &Built,
+    batch: &[&Manifest],
+) -> anyhow::Result<()> {
+    prepare_refusals(bucket, built, batch).await.map(drop)
+}
+
+/// Release the queues that `manifest` no longer consumes and that are in
+/// `taken`, those another script of the same run consumes now. Only the queue
+/// consumer attachments change: no pointer moves and nothing is uploaded, so
+/// the version the script serves stays as it is. A run that hands a queue from
+/// one script to another releases first, since a queue has one attachment and
+/// the new consumer cannot take it while another script holds it.
+pub async fn release_queue_consumers(
+    bucket: &Bucket,
+    manifest: &Manifest,
+    batch: &[&Manifest],
+    taken: &BTreeSet<String>,
+) -> anyhow::Result<()> {
+    let states = prepare_queue_attachments(bucket, manifest, batch)
+        .await?
+        .into_iter()
+        .filter(|state| !state.desired && taken.contains(&state.queue))
+        .collect();
+    // Only released queues are published, so the prefix is not read.
+    publish_queue_attachments(bucket, manifest, "", states).await
 }
 
 async fn prepare_refusals(
     bucket: &Bucket,
     built: &Built,
+    batch: &[&Manifest],
 ) -> anyhow::Result<Vec<QueueAttachmentState>> {
     // Read every attachment before uploading immutable deployment objects.
     // A competing consumer is a deploy refusal, so it must not leave a new
     // version in the bucket that an operator can mistake for a published one.
     // A staged version is checked the same way, so activation cannot be the
     // first place that refusal appears.
-    let queue_attachments = prepare_queue_attachments(bucket, &built.manifest).await?;
+    let queue_attachments = prepare_queue_attachments(bucket, &built.manifest, batch).await?;
     // A secret is bound as `env.NAME`, so a binding of the same name would be
     // shadowed. Refuse before anything is uploaded; this reads names only.
     crate::secrets::ensure_script_secrets(bucket, &built.manifest).await?;
@@ -1162,7 +1192,7 @@ pub async fn write(
     built: &Built,
     selection: Selection,
 ) -> anyhow::Result<ManifestWrite> {
-    let queue_attachments = prepare_refusals(bucket, built).await?;
+    let queue_attachments = prepare_refusals(bucket, built, &[]).await?;
 
     // Images are fleet-wide and content-addressed like asset bodies, and
     // they are what a node loads before a container class can start.
@@ -1517,6 +1547,7 @@ pub(crate) struct QueueAttachmentState {
 pub(crate) async fn prepare_queue_attachments(
     bucket: &Bucket,
     manifest: &Manifest,
+    batch: &[&Manifest],
 ) -> anyhow::Result<Vec<QueueAttachmentState>> {
     let desired = manifest
         .queue_consumers
@@ -1545,6 +1576,14 @@ pub(crate) async fn prepare_queue_attachments(
                 .as_ref()
                 .and_then(|attachment| attachment.consumer.as_ref())
                 .filter(|consumer| consumer.script_name != manifest.script_name)
+                // A script of the same run that no longer consumes the queue
+                // releases it before this one takes it.
+                .filter(|consumer| {
+                    !batch.iter().any(|other| {
+                        other.script_name == consumer.script_name
+                            && other.queue_consumers.iter().all(|c| c.queue != queue)
+                    })
+                })
             {
                 bail!(
                     "queue {:?} already has consumer script {:?}; remove that consumer before deploying {}",

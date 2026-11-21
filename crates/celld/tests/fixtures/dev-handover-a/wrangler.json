@@ -1,0 +1,11 @@
+{
+  "name": "handover-a",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "services": [{ "binding": "B", "service": "handover-b" }],
+  "durable_objects": { "bindings": [{ "name": "INBOX", "class_name": "InboxA" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["InboxA"] }],
+  "queues": { "producers": [{ "binding": "JOBS", "queue": "handover-jobs" }],
+    "consumers": [{ "queue": "handover-jobs", "max_batch_size": 10, "max_batch_timeout": 1, "max_retries": 0 }] }
+}

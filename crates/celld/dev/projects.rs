@@ -70,7 +70,16 @@ pub(super) fn build_project(
 /// Write rebuilt projects, each with its position in the run, into the local
 /// store: the first project is the primary script the node serves, the rest
 /// join the component map and are reached through service bindings. Every
-/// project passes the write-time refusals before any is written.
+/// project passes the write-time refusals before any is written, judged as the
+/// run leaves the store: `batch` holds the manifest each project has after it,
+/// so a queue that one project drops and another adds is a hand-over, not a
+/// clash.
+///
+/// A queue has one attachment, and a new consumer cannot take it while another
+/// script holds it. So the queues that a project drops and another takes are
+/// released first, for every project of `batch`, with no pointer moved. In a
+/// hand-over a refused write after that leaves the queue without a consumer
+/// until the next reload; the version each script serves is unchanged.
 ///
 /// At the start of a run, `first_start`, the primary goes first so that a store
 /// that another run left with a different primary, or none, ends with this
@@ -80,10 +89,19 @@ pub(super) fn build_project(
 async fn write_projects(
     bucket: &crate::bucket::Bucket,
     rebuilt: &[(usize, deploy::Built)],
+    batch: &[&Manifest],
     first_start: bool,
 ) -> anyhow::Result<()> {
     for (_, built) in rebuilt {
-        deploy::check_write(bucket, built).await?;
+        deploy::check_write(bucket, built, batch).await?;
+    }
+    let taken = batch
+        .iter()
+        .flat_map(|manifest| &manifest.queue_consumers)
+        .map(|consumer| consumer.queue.clone())
+        .collect::<BTreeSet<_>>();
+    for manifest in batch {
+        deploy::release_queue_consumers(bucket, manifest, batch, &taken).await?;
     }
     let (primary, others): (Vec<_>, Vec<_>) = rebuilt.iter().partition(|(index, _)| *index == 0);
     let order = if first_start {
@@ -345,11 +363,31 @@ pub(super) async fn deploy_projects(
             rebuilt.push((index, build_project(config, logs, strict_compat_flags)?));
         }
     }
+    // A pending project that the node no longer loads is not rebuilt, but it
+    // consumes only the queues its config names now: one that it dropped is
+    // judged, and released, as the run leaves it.
+    let trimmed = (0..configs.len())
+        .map(|index| {
+            let manifest = manifests[index].as_ref()?;
+            if !pending.contains(&index)
+                || wanted[index]
+                || rebuilt.iter().any(|(at, _)| *at == index)
+            {
+                return None;
+            }
+            let mut manifest = manifest.clone();
+            manifest
+                .queue_consumers
+                .retain(|consumer| fresh[index].1.consumes.contains(&consumer.queue));
+            Some(manifest)
+        })
+        .collect::<Vec<_>>();
     let current = (0..configs.len())
         .map(|index| {
             rebuilt
                 .iter()
                 .find_map(|(at, built)| (*at == index).then_some(&built.manifest))
+                .or(trimmed[index].as_ref())
                 .or(manifests[index].as_ref())
                 .expect("every project has a build")
         })
@@ -403,7 +441,7 @@ pub(super) async fn deploy_projects(
             reachable,
         })
         .collect();
-    write_projects(&bucket, &rebuilt, manifests[0].is_none()).await?;
+    write_projects(&bucket, &rebuilt, &current, manifests[0].is_none()).await?;
     // Only the manifest is kept: the modules and assets of a build are large
     // and nothing reads them once they are written.
     for (index, built) in rebuilt {
