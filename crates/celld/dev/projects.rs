@@ -126,7 +126,18 @@ fn manifest_links(manifest: &Manifest) -> Declared {
         .map(|consumer| consumer.queue.clone())
         .collect::<Vec<_>>();
     let links = Links {
-        services: named("service", "service").collect(),
+        services: named("service", "service")
+            .chain(
+                manifest
+                    .raw_metadata
+                    .get("tail_consumers")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|consumer| consumer.get("service")?.as_str())
+                    .map(str::to_string),
+            )
+            .collect(),
         queues: named("queue", "queue")
             .chain(consumes.iter().cloned())
             .chain(
@@ -157,7 +168,10 @@ fn config_links(config: &serde_json::Value) -> Option<Declared> {
     let consumers = queues.and_then(|queues| queues.get("consumers"));
     let consumes = strings(consumers, "queue");
     let links = Links {
-        services: strings(config.get("services"), "service"),
+        services: strings(config.get("services"), "service")
+            .into_iter()
+            .chain(strings(config.get("tail_consumers"), "service"))
+            .collect(),
         queues: strings(queues.and_then(|queues| queues.get("producers")), "queue")
             .into_iter()
             .chain(consumes.iter().cloned())
@@ -448,7 +462,7 @@ pub(super) fn unreachable_warnings(
     now.into_iter()
         .map(|project| {
             format!(
-                "{} ({}) is not reached by a service binding or queue of the projects that run, so it does not run",
+                "{} ({}) is not reached by a service binding, tail consumer or queue of the projects that run, so it does not run",
                 project.script,
                 project.config.display()
             )

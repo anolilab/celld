@@ -15,7 +15,9 @@ The [hello example](../../examples/hello) returns a text response from a
 
 - `fetch(request, env, ctx)` is the default export. It receives the inbound
   `Request` and returns a `Response`.
-- `scheduled` handles a Cron Trigger, and `queue` handles a Queues consumer.
+- `scheduled` handles a Cron Trigger, `queue` handles a Queues consumer, and
+  `tail` receives the trace items of the Workers that name this one in
+  `tail_consumers`; see [Tail Workers](#tail-workers).
 - `env` holds the bindings that the Wrangler configuration declares.
 - `ctx.waitUntil(promise)` keeps the isolate alive for the promise after the
   response goes to the client.
@@ -219,9 +221,9 @@ celld dev ./api ./billing -c ./audit/wrangler.jsonc
 ```
 
 One node runs them all. The first project is the primary: it serves requests at
-the listener. The others are reached only through the `services` bindings of
-the projects that name them, directly or through another project, and through
-the queues that a loaded project produces to or consumes. A listed project that
+the listener. The others are reached only through the `services` bindings and
+`tail_consumers` of the projects that name them, directly or through another
+project, and through the queues that a loaded project produces to or consumes. A listed project that
 nothing reaches is not loaded, and the console names it. The binding's `service`
 field names the other project's Worker `name`. A project's Hyperdrive
 `localConnectionString` reaches only that project's script. Its `.dev.vars` and
@@ -267,6 +269,76 @@ them.
   binding to the new `name`; `--clean` removes the old script.
 - The unreachable warning is printed at the start and again only when the set
   of projects that nothing reaches changes.
+
+## Tail Workers
+
+A Worker can name other Workers in `tail_consumers`. celld delivers the trace
+items of the Worker, the producer, to the `tail()` handler of each consumer:
+
+```jsonc
+{ "name": "api", "tail_consumers": [{ "service": "api-logs" }] }
+```
+
+```js
+export default {
+  async tail(events) {
+    // `events` is an array of TraceItem.
+    for (const item of events) console.log(item.outcome, item.logs.length);
+  },
+};
+```
+
+The consumer is another Worker on the node, loaded like a service binding
+target: `celld deploy` does not check that it exists, and a node that cannot load
+it refuses the deployment. The handler is `tail(events, env, ctx)` on its
+default export. `environment` in an entry
+is accepted and ignored, because a script has one deployment on a node. A Worker
+cannot name itself, and cannot name a consumer twice.
+
+A trace item is built for each `fetch` and each `queue` invocation of the
+producer, after the invocation, `waitUntil` work included. It has the shape of
+Cloudflare's `TraceItem`: `scriptName`, `event`, `eventTimestamp`, `logs`
+(`level`, `message`, `timestamp`), `exceptions` (`name`, `message`, `timestamp`),
+`diagnosticsChannelEvents`, `outcome` (`ok` or `exception`), `executionModel`,
+`truncated`, `cpuTime` and `wallTime` in milliseconds. For `fetch` the event
+holds `request` (`url`, `method`, `headers`, `cf`) and `response.status`; for
+`queue` it holds `queue` and `batchSize`. Differences from Cloudflare:
+
+- `logs[].message` is an array with one string, the arguments of the `console`
+  call joined as `console.log` prints them, and not one element for each
+  argument.
+- `exceptions[].name` is always `Error`, and an exception has no `stack`.
+- `request.headers` carries the values of every header, `authorization` and
+  `cookie` included, and `cf` is empty. The item has no `getUnredacted()`.
+- `outcome` is `ok` or `exception`; the other outcomes Cloudflare reports for
+  a limit or a cancellation are not reported.
+- `entrypoint`, `scriptVersion`, `scriptTags`, `dispatchNamespace` and
+  `durableObjectId` are absent.
+
+Delivery is best effort and never part of the producer's work:
+
+- The producer pays for recording its `console` calls and for one hand-off per
+  invocation. It never waits for a consumer, and a consumer that is slow, throws
+  or does not exist changes nothing about its response.
+- Each consumer has a buffer of 256 trace items. A consumer receives the items
+  that have gathered as one `tail(events)` call of at most 100 items, and the
+  next call starts when the last one returns. When the buffer is full, celld
+  drops the new items, and writes a warning that names the producer and the
+  consumer, and later the number dropped.
+- A `tail()` call that runs longer than 30 seconds counts as failed. A failed
+  call, whether it threw or timed out, loses its items. celld writes a warning
+  and the consumer's own console shows the exception.
+- celld records at most 256 KiB of serialized console log records for each
+  invocation, and sets `truncated` when it stops recording.
+- An invocation of `tail()` is not itself traced, so two Workers can name each
+  other without a loop.
+
+In `celld dev`, a project named in `tail_consumers` runs without a service
+binding. Cron triggers, Durable Object events (alarms, WebSocket messages, RPC
+calls) and RPC calls into the producer's entrypoints are not traced yet, and a
+Dynamic Worker names its tail Workers in `WorkerCode.tails`; see
+[Dynamic Workers](dynamic-workers.md). The `tail()` handler and the OpenTelemetry
+export are independent: see [Telemetry](../telemetry.md#tail-workers).
 
 ## Differences from Cloudflare
 

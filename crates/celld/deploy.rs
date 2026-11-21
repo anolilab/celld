@@ -21,8 +21,8 @@ use crate::protocol::{
     FEATURE_CONTAINERS_V1, FEATURE_CONTAINER_IMAGES_V1, FEATURE_CRON_V1, FEATURE_D1_V1,
     FEATURE_HYPERDRIVE_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1,
     FEATURE_R2_V1, FEATURE_RATELIMIT_V1, FEATURE_SECRETS_STORE_V1, FEATURE_SEND_EMAIL_V1,
-    FEATURE_SQLITE_VEC_V1, FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
-    QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+    FEATURE_SQLITE_VEC_V1, FEATURE_TAIL_CONSUMERS_V1, FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1,
+    FEATURE_WORKFLOWS_V1, QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -55,6 +55,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "migrations",
     "assets",
     "services",
+    "tail_consumers",
     "triggers",
     "vars",
     "d1_databases",
@@ -893,6 +894,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if uses_send_email {
                 features.push(FEATURE_SEND_EMAIL_V1.to_string());
+            }
+            if project.metadata.get("tail_consumers").is_some() {
+                features.push(FEATURE_TAIL_CONSUMERS_V1.to_string());
             }
             features
         },
@@ -2124,6 +2128,7 @@ fn read_project(
         bindings.push(encoded);
         service_count += 1;
     }
+    let tail_consumers = read_tail_consumers(object, &script_name)?;
     let d1_databases = match object.get("d1_databases") {
         None => &[][..],
         Some(Value::Array(databases)) => databases.as_slice(),
@@ -2815,6 +2820,18 @@ fn read_project(
         metadata.insert("compatibility_flags".into(), flags.clone());
     }
     metadata.insert("bindings".into(), Value::Array(bindings));
+    if !tail_consumers.is_empty() {
+        // Part of the deployment identity, and the list `fleet` loads from.
+        metadata.insert(
+            "tail_consumers".into(),
+            Value::Array(
+                tail_consumers
+                    .iter()
+                    .map(|service| json!({ "service": service }))
+                    .collect(),
+            ),
+        );
+    }
     if !queue_consumers.is_empty() {
         // Include consumer policy in deployment identity. The typed manifest
         // field below is the runtime contract; this copy keeps a settings-only
@@ -3153,6 +3170,51 @@ fn read_container_images(
         images.insert(name.clone(), image.to_string());
     }
     Ok(images)
+}
+
+/// The scripts named by `tail_consumers`. `environment` is accepted for a
+/// config shared with Cloudflare and has no meaning here: a script has one
+/// deployment on a node.
+fn read_tail_consumers(
+    object: &Map<String, Value>,
+    script_name: &str,
+) -> anyhow::Result<Vec<String>> {
+    let consumers = match object.get("tail_consumers") {
+        None => return Ok(Vec::new()),
+        Some(Value::Array(consumers)) => consumers,
+        Some(_) => bail!("config `tail_consumers` must be an array"),
+    };
+    let mut services = Vec::new();
+    for consumer in consumers {
+        let Value::Object(consumer) = consumer else {
+            bail!("a tail consumer must be an object with a `service` name");
+        };
+        if let Some(key) = consumer
+            .keys()
+            .find(|key| !matches!(key.as_str(), "service" | "environment"))
+        {
+            bail!("tail consumer declares `{key}`, which celld does not model");
+        }
+        let service = consumer
+            .get("service")
+            .and_then(Value::as_str)
+            .filter(|service| !service.is_empty())
+            .ok_or_else(|| anyhow!("a tail consumer has no `service` name"))?;
+        if consumer
+            .get("environment")
+            .is_some_and(|environment| !environment.is_string())
+        {
+            bail!("tail consumer {service} `environment` must be a string");
+        }
+        if service == script_name {
+            bail!("tail consumer {service} is this Worker; a Worker cannot tail itself");
+        }
+        if services.iter().any(|seen| seen == service) {
+            bail!("tail consumer {service} is listed twice");
+        }
+        services.push(service.to_string());
+    }
+    Ok(services)
 }
 
 fn reject_queue_keys(value: &Value, accepted: &[&str], kind: &str) -> anyhow::Result<()> {
@@ -4181,6 +4243,58 @@ mod version_metadata_config_tests {
             .iter()
             .any(|(binding, _)| binding == "env.META (Version Metadata)"));
         crate::protocol::validate_required_features(&built.manifest.required_features).unwrap();
+    }
+
+    #[test]
+    fn tail_consumers_are_recorded_and_require_the_feature() {
+        let built = build_with(
+            r#""tail_consumers": [{ "service": "logs" }, { "service": "audit", "environment": "production" }]"#,
+        );
+        assert_eq!(
+            built.manifest.raw_metadata["tail_consumers"],
+            serde_json::json!([{ "service": "logs" }, { "service": "audit" }])
+        );
+        assert!(built
+            .manifest
+            .required_features
+            .contains(&FEATURE_TAIL_CONSUMERS_V1.to_string()));
+        crate::protocol::validate_required_features(&built.manifest.required_features).unwrap();
+        let without = build_with(r#""vars": { "A": "b" }"#);
+        assert!(without
+            .manifest
+            .raw_metadata
+            .get("tail_consumers")
+            .is_none());
+    }
+
+    #[test]
+    fn a_malformed_tail_consumer_is_refused() {
+        for (extra, wanted) in [
+            (r#""tail_consumers": "logs""#, "must be an array"),
+            (r#""tail_consumers": ["logs"]"#, "must be an object"),
+            (r#""tail_consumers": [{}]"#, "no `service` name"),
+            (
+                r#""tail_consumers": [{ "service": "logs", "binding": "X" }]"#,
+                "declares `binding`",
+            ),
+            (
+                r#""tail_consumers": [{ "service": "logs", "environment": 1 }]"#,
+                "`environment` must be a string",
+            ),
+            (
+                r#""tail_consumers": [{ "service": "app" }]"#,
+                "cannot tail itself",
+            ),
+            (
+                r#""tail_consumers": [{ "service": "logs" }, { "service": "logs" }]"#,
+                "listed twice",
+            ),
+        ] {
+            let error = read(&base(extra))
+                .err()
+                .unwrap_or_else(|| panic!("{extra} was accepted"));
+            assert!(format!("{error:#}").contains(wanted), "{extra}: {error:#}");
+        }
     }
 
     #[test]

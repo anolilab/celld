@@ -134,6 +134,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_SECRETS_STORE_V1,
     FEATURE_HYPERDRIVE_V1,
     FEATURE_AI_V1,
+    FEATURE_TAIL_CONSUMERS_V1,
 ];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
@@ -182,6 +183,9 @@ pub const FEATURE_HYPERDRIVE_V1: &str = "hyperdrive-v1";
 /// build an `env` missing the binding, and the application would fail only
 /// when it first calls `env.AI.run()`.
 pub const FEATURE_AI_V1: &str = "ai-v1";
+/// A deployment with `tail_consumers`. Required because a node without them
+/// would serve the Worker and silently never deliver its trace items.
+pub const FEATURE_TAIL_CONSUMERS_V1: &str = "tail-consumers-v1";
 /// A deployment with `workflows` bindings. Required because a build without
 /// the reserved workflow cell would load the manifest, build an `env` missing
 /// the binding, and fail only when the application first calls `create()` —

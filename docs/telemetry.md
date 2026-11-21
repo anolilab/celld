@@ -83,6 +83,17 @@ sampled flag clear.
 Under load, telemetry sheds before requests do, and celld counts what it
 sheds.
 
+## Tail Workers
+
+A Worker's `tail_consumers` receive its trace items in a `tail()` handler, and
+the OpenTelemetry export records spans and log records. They are separate:
+neither needs the other, and the sampler does not decide what a consumer gets. A
+consumer receives an item for every `fetch` and `queue` invocation of the
+producer, and an unsampled request still reaches it. The consumer's `tail()`
+invocation is not traced, so it is not in the export. A consumer is a Worker
+that can forward the items itself, to a log service or a table. See
+[Tail Workers](services/workers.md#tail-workers).
+
 ## Metrics
 
 `GET /metrics` on the internal listener returns the node's counters, gauges

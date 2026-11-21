@@ -4182,6 +4182,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     ai_binding: None,
                     assets: None,
                     services: Vec::new(),
+                    tail_consumers: Vec::new(),
                     crons,
                     containers: Vec::new(),
                     fence_image: None,

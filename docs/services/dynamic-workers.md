@@ -141,6 +141,8 @@ compiles the code again.
   limit.
 - Tail delivery starts after the response is available. A Tail Worker failure
   does not change the response, and celld writes the failure to the console.
+- A deployed Worker uses the same delivery through `tail_consumers`; see
+  [Tail Workers](workers.md#tail-workers).
 - celld enforces `cpuMs` and `subRequests` in `WorkerCode.limits` and in a
   `getEntrypoint()` call. It rejects `allowExperimental`.
 - `WorkerCode.env` accepts structured-clone values and Service Binding

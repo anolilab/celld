@@ -93,6 +93,7 @@ pub mod staged;
 pub mod startup;
 pub mod storage;
 pub(crate) mod storage_counters;
+pub mod tail_consumers;
 pub mod telemetry;
 pub mod tls_roots;
 pub mod wake;

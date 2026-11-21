@@ -21,6 +21,7 @@ An unsupported feature that does not cause an error is a defect.
 | [Containers](services/containers.md) | **Experimental** |
 | [Static assets](services/static-assets.md) | **Yes** |
 | [Cron Triggers](services/cron-triggers.md) | **Yes** |
+| [Tail Workers](services/workers.md#tail-workers) | **Partial** — `tail_consumers` and the `tail()` handler for `fetch` and `queue` invocations; no `tailStream`, and no trace items for cron triggers, alarms, RPC calls or Durable Object events |
 | [Dynamic Workers](services/dynamic-workers.md) | **Yes** |
 | [Version metadata](services/workers.md#version-metadata) | **Yes** |
 | [KV](services/kv.md) | **Yes** |
@@ -110,8 +111,14 @@ A secret is a string binding like a `vars` entry; `celld dev` reads it from
 
 ### [Handlers](https://developers.cloudflare.com/workers/runtime-apis/handlers/)
 
-The `tail` and `email` handlers are unavailable. A Worker can send mail with the
+The `email` handler is unavailable. A Worker can send mail with the
 [`send_email` binding](services/email.md), but cannot receive it.
+
+The `tail` handler receives the trace items of the Workers that name it in
+`tail_consumers`, for `fetch` and `queue` invocations. Cron triggers, alarms and
+RPC calls are not traced. See
+[Tail Workers](services/workers.md#tail-workers). The `tailStream` handler is
+unavailable.
 
 ### [RPC](https://developers.cloudflare.com/workers/runtime-apis/rpc/)
 
@@ -453,7 +460,7 @@ that a Worker may test.
 | `cache_option_enabled` | **Honoured** | 2024-11-11 | A request accepts `cache: "no-store"`, a no-op because celld has no outbound HTTP cache. Any other mode throws. |
 | `cache_option_disabled` | **Honoured** |  | Turns off `cache_option_enabled`. |
 | `no_nodejs_compat_v2` | **Unsupported** |  | celld has no polyfill-based `nodejs_compat` to fall back to. |
-| `streaming_tail_worker` | **Unsupported** |  | The `tail` handler is unavailable. |
+| `streaming_tail_worker` | **Unsupported** |  | The `tailStream` handler is unavailable. The `tail` handler works. |
 | `python_workers_314` | **Unsupported** | 2026-09-08, with `python_workers` | celld runs Pyodide 0.28 (Python 3.13). |
 | `no_python_workers_314` | **Honoured** |  | Turns off `python_workers_314`, which celld does not run. |
 | `python_workers_20260610` | **Unsupported** |  | celld runs Pyodide 0.28 (Python 3.13). |
