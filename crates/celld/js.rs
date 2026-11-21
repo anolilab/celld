@@ -5163,67 +5163,22 @@ fn begin_queue(
         },
         failure: None,
     });
-    let guard = CurrentGuard::enter(context.clone());
-    install_io_context(tc, &context);
-    context.begin_cpu_turn();
-    let started = (|| {
-        let dispatch = internal_function(tc, "__dispatchEntrypointQueue")?;
-        let batch = queue_batch_value(tc, batch)?;
-        let entrypoint = v8::String::new(tc, "default").unwrap();
-        let recv = v8::undefined(tc).into();
-        begin_event_context(tc)?;
-        let ret = dispatch
-            .call(tc, recv, &[entrypoint.into(), batch])
-            .ok_or_else(|| anyhow!("queue dispatch threw"))?;
-        match ret.try_cast::<v8::Promise>() {
-            Ok(promise) => Ok(promise),
-            Err(_) => resolved_promise(tc, ret),
-        }
-    })();
-    match started {
-        Ok(promise) => {
-            tc.perform_microtask_checkpoint();
-            let entry = InFlight {
-                runtime_state: actor_runtime_state(tc),
-                promise: v8::Global::new(tc, promise),
-                context,
-                scope: None,
-                writes_before: None,
-                request_id: None,
-                active_request_id: None,
-                reply: Some(Answer::Queue(reply)),
-                gated_reply: None,
-                background: None,
-                completed_cell_event: false,
-                ops: std::collections::HashSet::new(),
-                io_context_ops: std::collections::HashSet::new(),
-                unrefed_ops: std::collections::HashSet::new(),
-                alarm: None,
-                started: Instant::now(),
-                trace: None,
-                failure: None,
-                response_status: None,
-                tail_report,
-                ends_at_budget: false,
-            };
-            drop(guard);
-            Begun::Running(Box::new(entry))
-        }
-        Err(error) => {
-            let _ = end_event_context(tc);
-            let cpu_error = context.finish_cpu_turn().err().map(anyhow::Error::msg);
-            let error = take_execution_termination(tc)
-                .or(cpu_error)
-                .unwrap_or(error);
-            if let Some(mut report) = tail_report {
-                report.record_failure(format!("{error:#}"));
-                report.finish(&context, None);
-            }
-            drop(guard);
-            let _ = reply.send(Err(error));
-            Begun::Nothing
-        }
-    }
+    bootstrap::begin_job_event(
+        tc,
+        context,
+        Answer::Queue(reply),
+        tail_report,
+        false,
+        |tc| {
+            let dispatch = internal_function(tc, "__dispatchEntrypointQueue")?;
+            let batch = queue_batch_value(tc, batch)?;
+            let entrypoint = v8::String::new(tc, "default").unwrap();
+            let recv = v8::undefined(tc).into();
+            dispatch
+                .call(tc, recv, &[entrypoint.into(), batch])
+                .ok_or_else(|| anyhow!("queue dispatch threw"))
+        },
+    )
 }
 
 /// for the JSON flavor, a `Uint8Array` for structured clone.

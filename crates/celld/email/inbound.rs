@@ -31,8 +31,6 @@ use super::{
 pub const MAX_HEADERS: usize = 1000;
 /// The most `X-` headers one `forward()` may add.
 pub const MAX_FORWARD_HEADERS: usize = 20;
-/// The longest value of a header `forward()` adds.
-const MAX_FORWARD_VALUE_BYTES: usize = 2048;
 /// RFC 5322 `References` entries past which a reply is refused, so two
 /// auto-responders cannot keep each other going.
 pub const MAX_REFERENCES: usize = 100;
@@ -469,34 +467,13 @@ fn forward_headers(headers: &[(String, String)]) -> Result<String, EmailError> {
     let mut out = String::new();
     let mut count = 0;
     for (name, value) in headers {
-        let Some(rest) = name
+        if !name
             .get(..2)
-            .filter(|prefix| prefix.eq_ignore_ascii_case("x-"))
-            .map(|_| &name[2..])
-        else {
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-"))
+        {
             continue;
-        };
-        if rest.is_empty()
-            || name.len() > 100
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            return Err(EmailError::new(
-                "E_HEADER_NAME_INVALID",
-                format!("header name {name:?} is not valid"),
-            ));
         }
-        if value.is_empty()
-            || value.len() > MAX_FORWARD_VALUE_BYTES
-            || !value.is_ascii()
-            || value.contains(|c: char| c.is_ascii_control() && c != '\t')
-        {
-            return Err(EmailError::new(
-                "E_HEADER_VALUE_INVALID",
-                format!("the value of header {name} is empty, too long, not ASCII or holds a control character"),
-            ));
-        }
+        super::mime::check_header(name, value, false)?;
         count += 1;
         if count > MAX_FORWARD_HEADERS {
             return Err(EmailError::new(
@@ -807,6 +784,7 @@ mod tests {
         };
         assert_eq!(code("X-A", "line\r\nBcc: x@y.z"), "E_HEADER_VALUE_INVALID");
         assert_eq!(code("X-A", "é"), "E_HEADER_VALUE_INVALID");
+        assert_eq!(code("X-A", "a\u{1}b"), "E_HEADER_VALUE_INVALID");
         assert_eq!(code("X-A b", "x"), "E_HEADER_NAME_INVALID");
         assert_eq!(code("X-", "x"), "E_HEADER_NAME_INVALID");
         let many: Vec<_> = (0..=MAX_FORWARD_HEADERS)
