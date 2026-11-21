@@ -475,7 +475,9 @@ The accepted top-level keys:
 
 - `$schema`, `name`, `main`, and `no_bundle`
 - `compatibility_date` and `compatibility_flags`
-- `durable_objects` and `migrations`
+- `durable_objects` and `migrations`. A binding binds a class that the script
+  itself exports, so a binding with a `script_name` other than the script's own
+  name is refused
 - `assets`, `services`, `triggers`, and `vars`
 - `d1_databases`, `kv_namespaces`, `queues`, `ratelimits`, `send_email`,
   `workflows`, and `r2_buckets`

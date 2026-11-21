@@ -2051,6 +2051,17 @@ fn read_project(
             .get("class_name")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("durable object binding {name} has no `class_name`"))?;
+        // The binding names the class of this script only: the runtime
+        // resolves a class in the script that declares it, so a binding to
+        // another script's class would silently reach this script's namespace.
+        if let Some(script) = binding.get("script_name").and_then(Value::as_str) {
+            if script != script_name {
+                bail!(
+                    "durable object binding {name} sets `script_name` {script:?}; celld binds \
+                     a Durable Object class only in the script that exports it"
+                );
+            }
+        }
         do_classes.push(class_name.to_string());
         bindings.push(json!({
             "type": "durable_object_namespace",
@@ -4613,6 +4624,43 @@ mod ai_config_tests {
             r#""ai": { "binding": "X" }, "vars": { "X": "y" }"#,
         ] {
             assert!(read(&base(extra)).is_err(), "{extra}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod durable_object_binding_tests {
+    use super::version_metadata_config_tests::{base, read};
+
+    fn binding(extra: &str) -> String {
+        base(&format!(
+            r#""durable_objects": {{ "bindings": [{{ "name": "OBJ", "class_name": "Cell"{extra} }}] }},
+               "migrations": [{{ "tag": "v1", "new_sqlite_classes": ["Cell"] }}]"#
+        ))
+    }
+
+    #[test]
+    fn a_binding_to_another_script_is_refused() {
+        let error = read(&binding(r#", "script_name": "other""#))
+            .err()
+            .expect("a binding to another script is refused")
+            .to_string();
+        assert!(
+            error.contains("OBJ") && error.contains("\"other\"") && error.contains("script_name"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_binding_without_a_script_or_to_its_own_is_kept() {
+        for extra in ["", r#", "script_name": "app""#] {
+            let project = read(&binding(extra)).unwrap();
+            assert!(project.metadata["bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|binding| binding["type"] == "durable_object_namespace"
+                    && binding["class_name"] == "Cell"));
         }
     }
 }
