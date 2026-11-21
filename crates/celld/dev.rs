@@ -883,14 +883,12 @@ fn quoted_lines(value: &str, lines: &mut std::str::Lines<'_>) -> Option<String> 
     None
 }
 
-async fn deploy_project(
+fn build_project(
     config: &Path,
-    store: &Store,
     logs: bool,
     strict_compat_flags: bool,
-) -> anyhow::Result<String> {
-    let bucket = open_local_bucket(&store.database)?;
-    let options = deploy::Options {
+) -> anyhow::Result<deploy::Built> {
+    let built = deploy::build(&deploy::Options {
         config: Some(config.to_path_buf()),
         bucket: None,
         endpoint: None,
@@ -899,20 +897,57 @@ async fn deploy_project(
         strict: false,
         strict_compat_flags,
         no_activate: false,
-        primary: true,
+        primary: false,
         json: false,
         vars: read_dev_vars(config)?,
         local_images: true,
         sourcemap: None,
         tag: None,
-    };
-    let built = deploy::build(&options)?;
+    })?;
     if logs {
         built.report();
     }
+    Ok(built)
+}
+
+/// Write the builds into the local store: the first is the primary script the
+/// node serves, the rest join the component map and are reached through service
+/// bindings. The primary goes first so that a store that another run left with
+/// a different primary, or none, ends with this one.
+async fn write_projects(store: &Store, built: &[deploy::Built]) -> anyhow::Result<()> {
+    let bucket = open_local_bucket(&store.database)?;
     crate::wake_format::ensure_ready(&bucket).await?;
-    deploy::write(&bucket, &built, options.selection()).await?;
-    Ok(built.script_name)
+    for (index, built) in built.iter().enumerate() {
+        let selection = if index == 0 {
+            deploy::Selection::Primary
+        } else {
+            deploy::Selection::Activate
+        };
+        deploy::write(&bucket, built, selection).await?;
+    }
+    Ok(())
+}
+
+/// Build the project of each config, then write them, the first as the primary.
+/// Every project is built before anything is written, so one that fails to
+/// build leaves the store, and the node that runs on it, as they were. Returns
+/// each project's script name with its config.
+async fn deploy_projects(
+    configs: &[PathBuf],
+    store: &Store,
+    logs: bool,
+    strict_compat_flags: bool,
+) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let built = configs
+        .iter()
+        .map(|config| build_project(config, logs, strict_compat_flags))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    write_projects(store, &built).await?;
+    Ok(built
+        .into_iter()
+        .zip(configs)
+        .map(|(built, config)| (built.script_name, config.clone()))
+        .collect())
 }
 
 async fn run_stack(
@@ -937,10 +972,9 @@ async fn run_stack(
         .transpose()?;
 
     console.progress("building the application");
-    let mut projects = vec![(
-        deploy_project(config, store, options.logs, options.strict_compat_flags).await?,
-        config.to_path_buf(),
-    )];
+    let configs = [config.to_path_buf()];
+    let mut projects =
+        deploy_projects(&configs, store, options.logs, options.strict_compat_flags).await?;
     let mut running = start_node(
         &projects,
         state,
@@ -970,9 +1004,10 @@ async fn run_stack(
             }
             NodeEvent::Reload => {
                 console.progress("change detected; rebuilding the application");
-                match deploy_project(config, store, options.logs, options.strict_compat_flags).await
+                match deploy_projects(&configs, store, options.logs, options.strict_compat_flags)
+                    .await
                 {
-                    Ok(script) => projects = vec![(script, config.to_path_buf())],
+                    Ok(deployed) => projects = deployed,
                     Err(error) => {
                         console.failure(&format!("reload failed: {error:#}"));
                         continue;
@@ -1357,6 +1392,96 @@ mod tests {
         assert_eq!(values[&name("A")], "from-config-a");
         assert_eq!(values[&name("B")], "from-dev-vars");
         assert!(!values.contains_key(&name("C")) && !values.contains_key(&name("D")));
+    }
+
+    /// A project in `directory` that answers `body`, as script `name`.
+    fn write_project(directory: &Path, name: &str, body: &str) -> PathBuf {
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::write(
+            directory.join("wrangler.json"),
+            format!(
+                r#"{{ "name": "{name}", "main": "index.js", "no_bundle": true,
+                    "compatibility_date": "2026-01-01" }}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("index.js"),
+            format!("export default {{ fetch: () => new Response({body:?}) }};"),
+        )
+        .unwrap();
+        directory.join("wrangler.json")
+    }
+
+    async fn serving(
+        store: &Store,
+    ) -> (String, BTreeMap<String, crate::protocol::ComponentPointer>) {
+        let bucket = open_local_bucket(&store.database).unwrap();
+        let (pointer, _) = deploy::read_fleet_pointer(&bucket).await.unwrap().unwrap();
+        (pointer.script_name.unwrap(), pointer.components)
+    }
+
+    #[tokio::test]
+    async fn the_first_project_becomes_the_primary_over_an_earlier_one() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store {
+            database: directory.path().join("objects.sqlite3"),
+        };
+        let a = write_project(&directory.path().join("a"), "dev-a", "a");
+        let b = write_project(&directory.path().join("b"), "dev-b", "b");
+
+        // On an empty store, the first project is the primary and the other
+        // is a component, though no earlier pointer named it.
+        deploy_projects(&[a.clone(), b.clone()], &store, false, false)
+            .await
+            .unwrap();
+        let (script, components) = serving(&store).await;
+        assert_eq!(script, "dev-a");
+        assert!(components.contains_key("dev-b"));
+        std::fs::remove_file(&store.database).unwrap();
+
+        // An earlier run left B as the primary.
+        deploy_projects(std::slice::from_ref(&b), &store, false, false)
+            .await
+            .unwrap();
+        assert_eq!(serving(&store).await.0, "dev-b");
+
+        // Listing A first takes the primary and keeps B reachable as a component.
+        let deployed = deploy_projects(&[a.clone(), b.clone()], &store, false, false)
+            .await
+            .unwrap();
+        assert_eq!(deployed[0].0, "dev-a");
+        let (script, components) = serving(&store).await;
+        assert_eq!(script, "dev-a");
+        assert!(components.contains_key("dev-b") && !components.contains_key("dev-a"));
+
+        // Listing B first reverses them.
+        deploy_projects(&[b, a], &store, false, false)
+            .await
+            .unwrap();
+        let (script, components) = serving(&store).await;
+        assert_eq!(script, "dev-b");
+        assert!(components.contains_key("dev-a") && !components.contains_key("dev-b"));
+    }
+
+    #[tokio::test]
+    async fn a_project_that_fails_to_build_writes_nothing() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store {
+            database: directory.path().join("objects.sqlite3"),
+        };
+        let a = write_project(&directory.path().join("a"), "dev-a", "a");
+        let broken = directory.path().join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("wrangler.json"), "{ not json").unwrap();
+        let error = deploy_projects(&[a, broken.join("wrangler.json")], &store, false, false)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("broken"), "{error:#}");
+        let bucket = open_local_bucket(&store.database).unwrap();
+        assert!(deploy::read_fleet_pointer(&bucket).await.unwrap().is_none());
     }
 
     #[test]
