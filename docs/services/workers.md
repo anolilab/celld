@@ -169,18 +169,27 @@ in this order:
    id names, and seals only with the current key. It refuses to start on a
    malformed previous key, and setting both the variable and the file is an
    error.
-2. Run `celld secret rotate --new-key-file PATH --bucket ...`, with the old key
+2. Switch every operator and CI job that runs `celld secret put` to the new
+   key, so a secret put from now on creates its object under it. A `put` into
+   an object that is still under the old key is refused until `rotate` reaches
+   it.
+3. Run `celld secret rotate --new-key-file PATH --bucket ...`, with the old key
    in `CELLD_SECRETS_KEY` as for `put`. The new key comes from a file only,
    never from an argument or the environment. The command re-seals every secret
    of every Worker (`deploy/<script>/secrets.json`) and of every Secrets Store
    (`stores/<id>/secrets.json`), one conditional write per object, and prints
-   how many objects and secrets it re-sealed, never a value.
-3. Drop `CELLD_SECRETS_KEY_PREVIOUS` from the nodes.
+   how many objects and secrets it re-sealed, never a value. It lists the
+   owners again afterwards, and ends only when a walk finds nothing left under
+   another key, so an object created under the old key during the run is
+   re-sealed too. If objects keep appearing, it fails and names one.
+4. Drop `CELLD_SECRETS_KEY_PREVIOUS` from the nodes.
 
 A run that stops resumes when you run it again: an object whose entries are all
 under the new key is skipped. An entry sealed under neither key stops the run
-with an error that names the object and the secret; fix it (delete the secret
-or put it again with the old key), then run again. Rotation does not change any
+with an error that names the object and the secret; fix it (delete
+that secret and put it again under the new key, or restore the key it was
+sealed with), then run again. A `put` cannot replace it, because a `put` is
+refused when the object holds entries under two keys. Rotation does not change any
 value, so it does not set `secrets_revisions`, and no node rebuilds. A node that
 finds an entry sealed under a key it does not hold fails that load and keeps
 serving the previous deployment. A `put` with the new key is refused for an

@@ -128,9 +128,11 @@ impl SecretsKey {
         Self::from_named_variable(KEY_VARIABLE)
     }
 
-    /// As [`Self::from_variable`], for `CELLD_SECRETS_KEY_PREVIOUS`.
-    pub(crate) fn previous_from_variable() -> anyhow::Result<Option<Self>> {
-        Self::from_named_variable(PREVIOUS_KEY_VARIABLE)
+    /// Check the previous key at startup, the file included: a node whose
+    /// previous key cannot be read or decoded, or that has both the variable and
+    /// the file, refuses to start and does not fail each load later.
+    pub(crate) fn validate_previous() -> anyhow::Result<()> {
+        Self::previous_from_environment().map(drop)
     }
 
     fn from_named_variable(variable: &str) -> anyhow::Result<Option<Self>> {
@@ -163,29 +165,32 @@ impl SecretsKey {
         .transpose()
     }
 
-    /// The key from `CELLD_SECRETS_KEY` or `CELLD_SECRETS_KEY_FILE`, or `None`
-    /// when neither is set.
-    ///
-    /// The key is read and parsed once per process; a change to the variable or
-    /// the file takes effect at the next start.
-    pub fn from_environment() -> anyhow::Result<Option<&'static Self>> {
-        static KEY: OnceLock<Option<SecretsKey>> = OnceLock::new();
-        if let Some(key) = KEY.get() {
+    /// The key from `variable` or the file `file_variable` names, read once per
+    /// process into `slot`; a change takes effect at the next start.
+    fn cached(
+        slot: &'static OnceLock<Option<SecretsKey>>,
+        variable: &str,
+        file_variable: &str,
+    ) -> anyhow::Result<Option<&'static Self>> {
+        if let Some(key) = slot.get() {
             return Ok(key.as_ref());
         }
-        let key = Self::read_environment(KEY_VARIABLE, KEY_FILE_VARIABLE)?;
-        Ok(KEY.get_or_init(|| key).as_ref())
+        let key = Self::read_environment(variable, file_variable)?;
+        Ok(slot.get_or_init(|| key).as_ref())
+    }
+
+    /// The key from `CELLD_SECRETS_KEY` or `CELLD_SECRETS_KEY_FILE`, or `None`
+    /// when neither is set.
+    pub fn from_environment() -> anyhow::Result<Option<&'static Self>> {
+        static KEY: OnceLock<Option<SecretsKey>> = OnceLock::new();
+        Self::cached(&KEY, KEY_VARIABLE, KEY_FILE_VARIABLE)
     }
 
     /// The key from `CELLD_SECRETS_KEY_PREVIOUS` or its `_FILE`, read as
     /// [`Self::from_environment`] reads the current one. It only opens.
     pub fn previous_from_environment() -> anyhow::Result<Option<&'static Self>> {
         static KEY: OnceLock<Option<SecretsKey>> = OnceLock::new();
-        if let Some(key) = KEY.get() {
-            return Ok(key.as_ref());
-        }
-        let key = Self::read_environment(PREVIOUS_KEY_VARIABLE, PREVIOUS_KEY_FILE_VARIABLE)?;
-        Ok(KEY.get_or_init(|| key).as_ref())
+        Self::cached(&KEY, PREVIOUS_KEY_VARIABLE, PREVIOUS_KEY_FILE_VARIABLE)
     }
 
     pub fn id(&self) -> &str {
@@ -248,20 +253,23 @@ impl SecretsKey {
 /// The keys a node opens entries with: the one that seals, and during a
 /// rotation the one it replaces. An entry names its key by id, and opens only
 /// under that one.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct Keys<'k> {
-    pub current: Option<&'k SecretsKey>,
+    pub current: &'k SecretsKey,
     pub previous: Option<&'k SecretsKey>,
 }
 
 impl Keys<'static> {
-    /// Both keys of the environment. A node reads them when its first
-    /// deployment with secrets loads.
-    pub fn from_environment() -> anyhow::Result<Self> {
-        Ok(Self {
-            current: SecretsKey::from_environment()?,
+    /// Both keys of the environment, or `None` without a current one. A node
+    /// reads them when its first deployment with secrets loads.
+    pub fn from_environment() -> anyhow::Result<Option<Self>> {
+        let Some(current) = SecretsKey::from_environment()? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            current,
             previous: SecretsKey::previous_from_environment()?,
-        })
+        }))
     }
 }
 
@@ -269,7 +277,7 @@ impl<'k> Keys<'k> {
     /// Only the sealing key.
     pub fn only(current: &'k SecretsKey) -> Self {
         Self {
-            current: Some(current),
+            current,
             previous: None,
         }
     }
@@ -277,7 +285,7 @@ impl<'k> Keys<'k> {
     /// The decrypted entry. An entry sealed under neither key is an error and
     /// is not tried against either, so the load fails closed.
     fn open(&self, scope: Scope<'_>, name: &str, sealed: &Sealed) -> anyhow::Result<Vec<u8>> {
-        let key = [self.current, self.previous]
+        let key = [Some(self.current), self.previous]
             .into_iter()
             .flatten()
             .find(|key| key.id == sealed.kid)
@@ -287,7 +295,7 @@ impl<'k> Keys<'k> {
                      key: it was sealed under key {}; set that key as {PREVIOUS_KEY_VARIABLE} \
                      or {PREVIOUS_KEY_FILE_VARIABLE}",
                     scope.label(),
-                    self.current.map_or("(none)", SecretsKey::id),
+                    self.current.id(),
                     sealed.kid
                 )
             })?;
@@ -332,10 +340,14 @@ enum Scope<'a> {
 }
 
 impl Scope<'_> {
+    /// Where the owners of each kind keep their objects: `<prefix><id>/secrets.json`.
+    const SCRIPT_PREFIX: &'static str = "deploy/";
+    const STORE_PREFIX: &'static str = "stores/";
+
     fn object_key(self) -> String {
         match self {
-            Self::Script(script) => format!("deploy/{script}/secrets.json"),
-            Self::Store(store) => format!("stores/{store}/secrets.json"),
+            Self::Script(script) => format!("{}{script}/secrets.json", Self::SCRIPT_PREFIX),
+            Self::Store(store) => format!("{}{store}/secrets.json", Self::STORE_PREFIX),
         }
     }
 
@@ -389,6 +401,9 @@ impl Scope<'_> {
         }
     }
 }
+
+mod rotate;
+pub use rotate::{rotate, Rotated};
 
 pub fn object_key(script: &str) -> String {
     Scope::Script(script).object_key()
@@ -609,126 +624,6 @@ async fn update(
     bail!("{key} kept changing under this write; try again")
 }
 
-/// What a [`rotate`] re-sealed.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Rotated {
-    /// Objects written: script secrets objects and store objects.
-    pub objects: usize,
-    /// Entries re-sealed under the new key.
-    pub entries: usize,
-}
-
-/// Re-seal every entry of every script and every Secrets Store under `new`.
-///
-/// Each object is one conditional write through [`update`], so a `put` that
-/// races it either lands first (and is re-sealed with the rest) or retries
-/// against the re-sealed object. An entry already under `new` is left alone,
-/// and an object that holds only such entries is not written, so a run that
-/// stopped half way resumes where it stopped. The values do not change, so the
-/// fleet pointer's `secrets_revisions` stays as it is and no node rebuilds.
-///
-/// An entry under neither `current` nor `new` stops the run with an error that
-/// names the object and the entry, never a value. Objects before it stay
-/// re-sealed.
-pub async fn rotate(
-    bucket: &Bucket,
-    current: &SecretsKey,
-    new: &SecretsKey,
-) -> anyhow::Result<Rotated> {
-    anyhow::ensure!(
-        current.id != new.id,
-        "the new secrets key is the current one; rotate to a different key"
-    );
-    let mut owners = Vec::new();
-    for script in prefixed_names(bucket, "deploy/").await? {
-        owners.push((Owner::Script, script));
-    }
-    for store in prefixed_names(bucket, "stores/").await? {
-        owners.push((Owner::Store, store));
-    }
-    let mut rotated = Rotated::default();
-    for (owner, id) in &owners {
-        let scope = owner.scope(id);
-        // A directory that is not a valid owner is not ours to touch.
-        if scope.check().is_err() {
-            continue;
-        }
-        let entries = rotate_in(bucket, scope, current, new).await?;
-        if entries > 0 {
-            rotated.objects += 1;
-            rotated.entries += entries;
-        }
-    }
-    Ok(rotated)
-}
-
-#[derive(Clone, Copy)]
-enum Owner {
-    Script,
-    Store,
-}
-
-impl Owner {
-    fn scope(self, id: &str) -> Scope<'_> {
-        match self {
-            Self::Script => Scope::Script(id),
-            Self::Store => Scope::Store(id),
-        }
-    }
-}
-
-/// The names of the directories directly under `prefix`, sorted.
-async fn prefixed_names(bucket: &Bucket, prefix: &str) -> anyhow::Result<Vec<String>> {
-    let mut names: Vec<String> = bucket
-        .common_prefixes(prefix)
-        .await?
-        .into_iter()
-        .filter_map(|child| child.strip_prefix(prefix).map(str::to_string))
-        .collect();
-    names.sort();
-    Ok(names)
-}
-
-/// Re-seal one object. Returns how many entries it re-sealed; zero when the
-/// object is absent, empty, or already entirely under `new`.
-async fn rotate_in(
-    bucket: &Bucket,
-    scope: Scope<'_>,
-    current: &SecretsKey,
-    new: &SecretsKey,
-) -> anyhow::Result<usize> {
-    let behind = |set: &SecretSet| set.secrets.values().any(|entry| entry.kid != new.id);
-    match read(bucket, scope).await? {
-        Some((set, _)) if behind(&set) => {}
-        _ => return Ok(0),
-    }
-    let key = scope.object_key();
-    let mut resealed = 0;
-    update(bucket, scope, |set| {
-        resealed = 0;
-        for (name, sealed) in &mut set.secrets {
-            if sealed.kid == new.id {
-                continue;
-            }
-            anyhow::ensure!(
-                sealed.kid == current.id,
-                "{key}: secret {name} is sealed under key {}, which is neither the current key \
-                 {} nor the new key {}; objects before it are re-sealed, so run again after \
-                 fixing this one",
-                sealed.kid,
-                current.id,
-                new.id
-            );
-            let value = Zeroizing::new(current.open(scope, name, sealed)?);
-            *sealed = new.seal(scope, name, &value)?;
-            resealed += 1;
-        }
-        Ok(())
-    })
-    .await?;
-    Ok(resealed)
-}
-
 /// The key of a script's secrets in the fleet pointer's `secrets_revisions`.
 pub fn script_revision_key(script: &str) -> String {
     format!("script:{script}")
@@ -787,7 +682,7 @@ impl std::fmt::Debug for ScriptSecrets {
 pub async fn load<'k>(
     bucket: &Bucket,
     manifest: &Manifest,
-    keys: impl FnOnce() -> anyhow::Result<Keys<'k>>,
+    keys: impl FnOnce() -> anyhow::Result<Option<Keys<'k>>>,
 ) -> anyhow::Result<ScriptSecrets> {
     if manifest.main_module.is_none() {
         return Ok(ScriptSecrets::default());
@@ -799,8 +694,7 @@ pub async fn load<'k>(
     if set.secrets.is_empty() {
         return Ok(ScriptSecrets::default());
     }
-    let keys = keys()?;
-    keys.current.with_context(|| {
+    let keys = keys()?.with_context(|| {
         format!(
             "script {script} has {} secret(s), and no secrets key is configured; \
              set {KEY_VARIABLE} or {KEY_FILE_VARIABLE} to the key they were put under",
@@ -1033,7 +927,7 @@ pub async fn load_stores<'k>(
     bucket: &Bucket,
     manifest: &Manifest,
     dev_values: &BTreeMap<String, String>,
-    keys: impl FnOnce() -> anyhow::Result<Keys<'k>>,
+    keys: impl FnOnce() -> anyhow::Result<Option<Keys<'k>>>,
 ) -> anyhow::Result<Vec<StoreSecret>> {
     if manifest.main_module.is_none() {
         return Ok(Vec::new());
@@ -1072,16 +966,14 @@ pub async fn load_stores<'k>(
             (None, Some(sealed)) => {
                 if opener.is_none() {
                     let resolve = keys.take().expect("the keys are resolved once");
-                    let resolved = resolve()?;
-                    resolved.current.with_context(|| {
+                    opener = Some(resolve()?.with_context(|| {
                         format!(
                             "a Secrets Store binding of script {} needs the secrets key, and none \
                              is configured; set {KEY_VARIABLE} or {KEY_FILE_VARIABLE} to the key \
                              the secrets were put under",
                             manifest.script_name
                         )
-                    })?;
-                    opener = Some(resolved);
+                    })?);
                 }
                 let opener = opener.expect("set above");
                 let scope = Scope::Store(binding.store_id);
@@ -1163,7 +1055,7 @@ mod tests {
         );
     }
 
-    fn key(byte: u8) -> SecretsKey {
+    pub(super) fn key(byte: u8) -> SecretsKey {
         SecretsKey::from_bytes([byte; KEY_BYTES])
     }
 
@@ -1257,7 +1149,7 @@ mod tests {
         );
     }
 
-    fn manifest(bindings: &[&str]) -> Manifest {
+    pub(super) fn manifest(bindings: &[&str]) -> Manifest {
         let bindings: Vec<_> = bindings
             .iter()
             .map(|name| serde_json::json!({ "type": "plain_text", "name": name, "text": "x" }))
@@ -1274,7 +1166,7 @@ mod tests {
         .unwrap()
     }
 
-    fn bucket(directory: &tempfile::TempDir) -> Bucket {
+    pub(super) fn bucket(directory: &tempfile::TempDir) -> Bucket {
         crate::asyncrt::install_test_host_runtime();
         Bucket::open_dev(&directory.path().join("objects.sqlite3")).unwrap()
     }
@@ -1338,7 +1230,7 @@ mod tests {
         ensure_no_clash(&bucket, &manifest(&["DB"])).await.unwrap();
         let clashing = manifest(&["TOKEN"]);
         assert!(ensure_no_clash(&bucket, &clashing).await.is_err());
-        let error = load(&bucket, &clashing, || Ok(Keys::only(&key)))
+        let error = load(&bucket, &clashing, || Ok(Some(Keys::only(&key))))
             .await
             .unwrap_err();
         let text = format!("{error:#}");
@@ -1347,7 +1239,7 @@ mod tests {
             "{text}"
         );
         assert_eq!(
-            load(&bucket, &manifest(&["DB"]), || Ok(Keys::only(&key)))
+            load(&bucket, &manifest(&["DB"]), || Ok(Some(Keys::only(&key))))
                 .await
                 .unwrap()
                 .env,
@@ -1360,7 +1252,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let bucket = bucket(&directory);
         let manifest = manifest(&[]);
-        assert!(load(&bucket, &manifest, || Ok(Keys::default()))
+        assert!(load(&bucket, &manifest, || Ok(None))
             .await
             .unwrap()
             .env
@@ -1368,15 +1260,13 @@ mod tests {
         put(&bucket, &key(3), "app", "TOKEN", "v", &BTreeSet::new())
             .await
             .unwrap();
-        let error = load(&bucket, &manifest, || Ok(Keys::default()))
-            .await
-            .unwrap_err();
+        let error = load(&bucket, &manifest, || Ok(None)).await.unwrap_err();
         assert!(
             format!("{error:#}").contains("no secrets key is configured"),
             "{error:#}"
         );
         let other = key(4);
-        let error = load(&bucket, &manifest, || Ok(Keys::only(&other)))
+        let error = load(&bucket, &manifest, || Ok(Some(Keys::only(&other))))
             .await
             .unwrap_err();
         assert!(
@@ -1410,7 +1300,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let error = load(&bucket, &manifest(&[]), || Ok(Keys::only(&key)))
+        let error = load(&bucket, &manifest(&[]), || Ok(Some(Keys::only(&key))))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("__proto__"), "{error}");
@@ -1498,7 +1388,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let error = load(&bucket, &manifest(&[]), || Ok(Keys::only(&key)))
+        let error = load(&bucket, &manifest(&[]), || Ok(Some(Keys::only(&key))))
             .await
             .unwrap_err();
         assert!(
@@ -1515,7 +1405,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let error = load(&bucket, &manifest(&[]), || Ok(Keys::only(&key)))
+        let error = load(&bucket, &manifest(&[]), || Ok(Some(Keys::only(&key))))
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("byte limit"), "{error:#}");
@@ -1566,7 +1456,7 @@ mod tests {
             .is_err());
     }
 
-    fn store_manifest(bindings: serde_json::Value) -> Manifest {
+    pub(super) fn store_manifest(bindings: serde_json::Value) -> Manifest {
         let mut manifest = manifest(&[]);
         manifest.raw_metadata = serde_json::json!({ "bindings": bindings });
         manifest.required_features = vec![crate::protocol::FEATURE_SECRETS_STORE_V1.to_string()];
@@ -1586,7 +1476,7 @@ mod tests {
             format!("{error:#}").contains("secrets-store-v1"),
             "{error:#}"
         );
-        let error = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(Keys::default()))
+        let error = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(None))
             .await
             .unwrap_err();
         assert!(
@@ -1604,7 +1494,7 @@ mod tests {
                 "{name}: {error:#}"
             );
             assert!(
-                load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(Keys::default()))
+                load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(None))
                     .await
                     .is_err(),
                 "{name}"
@@ -1629,7 +1519,7 @@ mod tests {
         assert_eq!(dev_values_for(&marked, read).unwrap()["A"], "v");
     }
 
-    fn store_binding(name: &str, store: &str, secret: &str) -> serde_json::Value {
+    pub(super) fn store_binding(name: &str, store: &str, secret: &str) -> serde_json::Value {
         serde_json::json!({
             "type": STORE_BINDING_TYPE, "name": name, "store_id": store, "secret_name": secret
         })
@@ -1655,7 +1545,7 @@ mod tests {
             .await
             .unwrap();
         let loaded = load_stores(&bucket, &manifest, &BTreeMap::new(), || {
-            Ok(Keys::only(&key))
+            Ok(Some(Keys::only(&key)))
         })
         .await
         .unwrap();
@@ -1703,7 +1593,7 @@ mod tests {
         put_store(&bucket, &key, "st1", "gone", "v").await.unwrap();
         delete_store(&bucket, "st1", "gone").await.unwrap();
         let loaded = load_stores(&bucket, &manifest, &BTreeMap::new(), || {
-            Ok(Keys::only(&key))
+            Ok(Some(Keys::only(&key)))
         })
         .await
         .unwrap();
@@ -1724,7 +1614,7 @@ mod tests {
             .value
             .is_err());
         put_store(&bucket, &key(3), "st1", "k", "v").await.unwrap();
-        let error = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(Keys::default()))
+        let error = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(None))
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains(KEY_VARIABLE), "{error:#}");
@@ -1775,7 +1665,7 @@ mod tests {
         assert_eq!(loaded[0].value.as_deref().unwrap(), "second");
         // An entry that has gone since the deploy falls back to the store,
         // which here lacks the secret.
-        let loaded = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(Keys::default()))
+        let loaded = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(None))
             .await
             .unwrap();
         assert!(loaded[0].value.is_err());
@@ -1815,7 +1705,7 @@ mod tests {
             );
         }
         let dev = BTreeMap::from([("A".to_string(), "v".to_string())]);
-        let error = load_stores(&bucket, &manifest, &dev, || Ok(Keys::default()))
+        let error = load_stores(&bucket, &manifest, &dev, || Ok(None))
             .await
             .unwrap_err();
         assert!(
@@ -1836,7 +1726,7 @@ mod tests {
             }),
         ] {
             let manifest = store_manifest(serde_json::json!([entry]));
-            let error = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(Keys::default()))
+            let error = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(None))
                 .await
                 .unwrap_err();
             assert!(format!("{error:#}").contains("binding A"), "{error:#}");
@@ -1859,7 +1749,13 @@ mod tests {
 
     /// Write one entry sealed under `key`, whatever the others are sealed under:
     /// the state a rotation that stopped half way leaves, which `put` refuses.
-    async fn plant(bucket: &Bucket, scope: Scope<'_>, key: &SecretsKey, name: &str, value: &str) {
+    pub(super) async fn plant(
+        bucket: &Bucket,
+        scope: Scope<'_>,
+        key: &SecretsKey,
+        name: &str,
+        value: &str,
+    ) {
         let (mut set, token) = match read(bucket, scope).await.unwrap() {
             Some((set, token)) => (set, Some(token)),
             None => (SecretSet::default(), None),
@@ -1879,7 +1775,7 @@ mod tests {
             .unwrap();
     }
 
-    fn values(loaded: ScriptSecrets) -> Vec<(String, String)> {
+    pub(super) fn values(loaded: ScriptSecrets) -> Vec<(String, String)> {
         loaded.env
     }
 
@@ -1891,10 +1787,12 @@ mod tests {
         plant(&bucket, Scope::Script("app"), &old, "A", "from-old").await;
         plant(&bucket, Scope::Script("app"), &new, "B", "from-new").await;
         let keys = Keys {
-            current: Some(&new),
+            current: &new,
             previous: Some(&old),
         };
-        let loaded = load(&bucket, &manifest(&[]), || Ok(keys)).await.unwrap();
+        let loaded = load(&bucket, &manifest(&[]), || Ok(Some(keys)))
+            .await
+            .unwrap();
         assert_eq!(
             values(loaded),
             [
@@ -1909,7 +1807,7 @@ mod tests {
         // Stores pick the key by entry too.
         plant(&bucket, Scope::Store("st1"), &old, "k", "store-old").await;
         let manifest = store_manifest(serde_json::json!([store_binding("S", "st1", "k")]));
-        let stores = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(keys))
+        let stores = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(Some(keys)))
             .await
             .unwrap();
         assert_eq!(stores[0].value.as_deref().unwrap(), "store-old");
@@ -1930,10 +1828,10 @@ mod tests {
         )
         .await;
         let keys = Keys {
-            current: Some(&current),
+            current: &current,
             previous: Some(&previous),
         };
-        let error = load(&bucket, &manifest(&[]), || Ok(keys))
+        let error = load(&bucket, &manifest(&[]), || Ok(Some(keys)))
             .await
             .unwrap_err();
         let text = format!("{error:#}");
@@ -1955,14 +1853,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let error = load(&bucket, &manifest(&[]), || Ok(keys))
+        let error = load(&bucket, &manifest(&[]), || Ok(Some(keys)))
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("deadbeef"), "{error:#}");
 
         plant(&bucket, Scope::Store("st1"), &stranger, "k", "store-value").await;
         let manifest = store_manifest(serde_json::json!([store_binding("S", "st1", "k")]));
-        let error = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(keys))
+        let error = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(Some(keys)))
             .await
             .unwrap_err();
         let text = format!("{error:#}");
@@ -1970,195 +1868,5 @@ mod tests {
             text.contains(stranger.id()) && !text.contains("store-value"),
             "{text}"
         );
-    }
-
-    /// Secrets of two scripts and a store, all under `old`.
-    async fn fleet_under(bucket: &Bucket, old: &SecretsKey) {
-        let none = BTreeSet::new();
-        put(bucket, old, "app", "A", "one", &none).await.unwrap();
-        put(bucket, old, "app", "B", "two", &none).await.unwrap();
-        put(bucket, old, "other", "C", "three", &none)
-            .await
-            .unwrap();
-        put_store(bucket, old, "st1", "k", "four").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn rotate_re_seals_everything_and_the_new_key_alone_then_loads() {
-        let directory = tempfile::tempdir().unwrap();
-        let bucket = bucket(&directory);
-        let (old, new) = (key(3), key(4));
-        fleet_under(&bucket, &old).await;
-        let rotated = rotate(&bucket, &old, &new).await.unwrap();
-        assert_eq!(
-            rotated,
-            Rotated {
-                objects: 3,
-                entries: 4
-            }
-        );
-
-        let only_new = || Ok(Keys::only(&new));
-        let loaded = load(&bucket, &manifest(&[]), only_new).await.unwrap();
-        assert_eq!(
-            values(loaded),
-            [
-                ("A".to_string(), "one".to_string()),
-                ("B".to_string(), "two".to_string())
-            ]
-        );
-        let manifest = store_manifest(serde_json::json!([store_binding("S", "st1", "k")]));
-        let stores = load_stores(&bucket, &manifest, &BTreeMap::new(), only_new)
-            .await
-            .unwrap();
-        assert_eq!(stores[0].value.as_deref().unwrap(), "four");
-        // The old key alone no longer opens them, and a put with the new key
-        // works now that every entry is under it.
-        assert!(load(&bucket, &self::manifest(&[]), || Ok(Keys::only(&old)))
-            .await
-            .is_err());
-        put(&bucket, &new, "app", "D", "five", &BTreeSet::new())
-            .await
-            .unwrap();
-        let stored = String::from_utf8(
-            bucket
-                .get(&object_key("app"))
-                .await
-                .unwrap()
-                .unwrap()
-                .0
-                .to_vec(),
-        )
-        .unwrap();
-        assert!(!stored.contains(old.id()), "{stored}");
-    }
-
-    #[tokio::test]
-    async fn rotate_is_idempotent_and_resumes_after_a_stop() {
-        let directory = tempfile::tempdir().unwrap();
-        let bucket = bucket(&directory);
-        let (old, new, stranger) = (key(3), key(4), key(5));
-        fleet_under(&bucket, &old).await;
-        // `other` holds an entry that neither key opens, so the run stops there.
-        plant(
-            &bucket,
-            Scope::Script("other"),
-            &stranger,
-            "BAD",
-            "unknown-value",
-        )
-        .await;
-
-        let error = rotate(&bucket, &old, &new).await.unwrap_err();
-        let text = format!("{error:#}");
-        assert!(
-            text.contains("deploy/other/secrets.json") && text.contains("BAD"),
-            "{text}"
-        );
-        assert!(!text.contains("unknown-value") && !text.contains("three"));
-        // `app` sorts before `other` and was re-sealed; the store comes after.
-        let (set, _) = read(&bucket, Scope::Script("app")).await.unwrap().unwrap();
-        assert!(set.secrets.values().all(|entry| entry.kid == new.id()));
-        let (set, _) = read(&bucket, Scope::Store("st1")).await.unwrap().unwrap();
-        assert!(set.secrets.values().all(|entry| entry.kid == old.id()));
-
-        // Fix the stuck object and run again: only what is left is written.
-        delete(&bucket, "other", "BAD").await.unwrap();
-        let rotated = rotate(&bucket, &old, &new).await.unwrap();
-        assert_eq!(
-            rotated,
-            Rotated {
-                objects: 2,
-                entries: 2
-            }
-        );
-        // A third run has nothing to do and writes nothing.
-        let before = bucket.get(&object_key("app")).await.unwrap().unwrap().1;
-        assert_eq!(
-            rotate(&bucket, &old, &new).await.unwrap(),
-            Rotated::default()
-        );
-        assert_eq!(
-            bucket.get(&object_key("app")).await.unwrap().unwrap().1,
-            before
-        );
-        assert!(rotate(&bucket, &new, &new).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn rotate_leaves_the_secrets_revisions_of_the_fleet_pointer_alone() {
-        let directory = tempfile::tempdir().unwrap();
-        let bucket = bucket(&directory);
-        let (old, new) = (key(3), key(4));
-        fleet_under(&bucket, &old).await;
-        let pointer = serde_json::json!({
-            "script_name": "app",
-            "version": "v1",
-            "prefix": "deploy/app/v1",
-            "rollout": { "percent": 100 },
-            "secrets_revisions": { "script:app": "abc", "store:st1": "def" },
-        });
-        bucket
-            .put_cas(
-                crate::fleet::CURRENT_POINTER_KEY,
-                serde_json::to_vec(&pointer).unwrap(),
-                None,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let before = bucket
-            .get(crate::fleet::CURRENT_POINTER_KEY)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(rotate(&bucket, &old, &new).await.unwrap().entries, 4);
-        let after = bucket
-            .get(crate::fleet::CURRENT_POINTER_KEY)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(after.0, before.0, "rotate rewrote the fleet pointer");
-        assert_eq!(after.1, before.1);
-    }
-
-    #[tokio::test]
-    async fn puts_racing_a_rotate_never_leave_mixed_key_ids() {
-        let directory = tempfile::tempdir().unwrap();
-        let bucket = bucket(&directory);
-        let (old, new) = (key(3), key(4));
-        let none = BTreeSet::new();
-        put(&bucket, &old, "app", "A", "one", &none).await.unwrap();
-        let names_put = ["B", "C", "D", "E", "F"];
-        let puts = names_put
-            .iter()
-            .map(|name| put(&bucket, &old, "app", name, "v", &none));
-        let (rotated, results) = tokio::join!(
-            rotate(&bucket, &old, &new),
-            futures_util::future::join_all(puts)
-        );
-        rotated.unwrap();
-        for result in results {
-            if let Err(error) = result {
-                let text = format!("{error:#}");
-                assert!(text.contains("secrets key differs"), "{text}");
-            }
-        }
-        // Whichever side won each write, one key id seals the whole object.
-        let (set, _) = read(&bucket, Scope::Script("app")).await.unwrap().unwrap();
-        let kids: BTreeSet<_> = set
-            .secrets
-            .values()
-            .map(|entry| entry.kid.clone())
-            .collect();
-        assert_eq!(kids.len(), 1, "mixed key ids: {kids:?}");
-        // One more rotate leaves nothing under the old key.
-        rotate(&bucket, &old, &new).await.unwrap();
-        let (set, _) = read(&bucket, Scope::Script("app")).await.unwrap().unwrap();
-        assert!(set.secrets.values().all(|entry| entry.kid == new.id()));
-        let loaded = load(&bucket, &manifest(&[]), || Ok(Keys::only(&new)))
-            .await
-            .unwrap();
-        assert_eq!(loaded.env.len(), set.secrets.len());
     }
 }

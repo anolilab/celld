@@ -177,10 +177,13 @@ To rotate the key, change it in this order:
    `CELLD_SECRETS_KEY_PREVIOUS` (or `CELLD_SECRETS_KEY_PREVIOUS_FILE`), and
    restart or redeploy them. The previous key only opens entries; it never
    seals.
-2. Run `celld secret rotate --new-key-file PATH` with the old key as
+2. Switch every operator and CI job that runs `celld secret put` to the new key,
+   so new secrets create their objects under it.
+3. Run `celld secret rotate --new-key-file PATH` with the old key as
    `CELLD_SECRETS_KEY`. It re-seals every secret of every Worker and store
-   under the new key, and can be run again if it stops.
-3. Drop the previous key.
+   under the new key, checks the fleet again afterwards, and can be run again
+   if it stops.
+4. Drop the previous key.
 
 The new key is read from a file, never from an argument. See
 [Rotate the secrets key](services/workers.md#rotate-the-secrets-key).

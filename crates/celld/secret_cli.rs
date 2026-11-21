@@ -25,21 +25,27 @@ enum Action {
     Put(String),
     List,
     Delete(String),
-    /// Re-seal every secret under the key in `--new-key-file`.
-    Rotate,
+    /// Re-seal every secret of the fleet under the key in this file.
+    Rotate(PathBuf),
 }
 
 /// What `run` does once everything that needs no bucket is settled.
 enum Step {
     Put {
+        owner: Owner,
         key: &'static SecretsKey,
         name: String,
         value: String,
     },
-    Delete(String),
+    Delete(Owner, String),
     /// Tell the nodes about the secrets of the owner, writing nothing else.
-    Announce,
-    List,
+    Announce(Owner),
+    List(Owner),
+    /// Re-seal every secret of the fleet; the keys are read already.
+    Rotate {
+        current: &'static SecretsKey,
+        new: SecretsKey,
+    },
 }
 
 struct Command {
@@ -52,8 +58,6 @@ struct Command {
     json: bool,
     /// `delete` only: tell the nodes without deleting, to retry a failed announcement.
     announce_only: bool,
-    /// `rotate` only: the file that holds the key to re-seal under.
-    new_key_file: Option<PathBuf>,
 }
 
 /// What holds the secrets: a Worker, or a Secrets Store that Workers bind.
@@ -122,22 +126,20 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         print_help();
         return Ok(());
     };
-    if matches!(command.action, Action::Rotate) {
-        return rotate(command).await;
-    }
     // Settle everything that needs no bucket first, so a missing key or an
     // empty stdin fails before any request.
-    let owner = match (&command.store, &command.script) {
-        (Some(store), _) => Owner::Store(store.clone()),
-        (None, Some(script)) => Owner::Script(script.clone()),
-        (None, None) => Owner::Script(
-            crate::deploy::read_script_name(command.config.clone())
-                .context("name the Worker with --script, or run in its project")?,
-        ),
+    let owner = || match (&command.store, &command.script) {
+        (Some(store), _) => Ok(Owner::Store(store.clone())),
+        (None, Some(script)) => Ok(Owner::Script(script.clone())),
+        (None, None) => crate::deploy::read_script_name(command.config.clone())
+            .map(Owner::Script)
+            .context("name the Worker with --script, or run in its project"),
     };
-    let step = match command.action {
-        _ if command.announce_only => Step::Announce,
+    let step = match &command.action {
+        _ if command.announce_only => Step::Announce(owner()?),
         Action::Put(name) => {
+            let name = name.clone();
+            let owner = owner()?;
             let key = SecretsKey::from_environment()?.with_context(|| {
                 format!(
                     "`celld secret put` needs the secrets key: set {} or {} to 32 random bytes \
@@ -147,16 +149,36 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                 )
             })?;
             let value = read_value(&name)?;
-            Step::Put { key, name, value }
+            Step::Put {
+                owner,
+                key,
+                name,
+                value,
+            }
         }
-        Action::Delete(name) => Step::Delete(name),
-        Action::List => Step::List,
-        Action::Rotate => unreachable!("rotate returns before this match"),
+        Action::Delete(name) => Step::Delete(owner()?, name.clone()),
+        Action::List => Step::List(owner()?),
+        Action::Rotate(path) => {
+            let current = SecretsKey::from_environment()?.with_context(|| {
+                format!(
+                    "`celld secret rotate` needs the current secrets key: set {} or {}",
+                    secrets::KEY_VARIABLE,
+                    secrets::KEY_FILE_VARIABLE,
+                )
+            })?;
+            let new = SecretsKey::from_file(path).context("read the new secrets key")?;
+            Step::Rotate { current, new }
+        }
     };
     let storage = command.fleet.resolve("celld secret")?;
     let bucket = storage.open().await?;
     match step {
-        Step::Put { key, name, value } => {
+        Step::Put {
+            owner,
+            key,
+            name,
+            value,
+        } => {
             match &owner {
                 Owner::Script(script) => {
                     let bindings = current_bindings(&bucket, script).await?;
@@ -175,7 +197,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             note!("Stored secret {name} for {owner}. {told}");
             Ok(())
         }
-        Step::Delete(name) => {
+        Step::Delete(owner, name) => {
             match &owner {
                 Owner::Script(script) => secrets::delete(&bucket, script, &name).await?,
                 Owner::Store(store) => secrets::delete_store(&bucket, store, &name).await?,
@@ -192,12 +214,28 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         // Repeating a put or delete would write again (and could replace a
         // newer value), so a failed announcement is retried with this, which
         // writes no secret.
-        Step::Announce => {
+        Step::Announce(owner) => {
             let told = announce(&bucket, &owner, "run this command again").await?;
             note!("Announced the secrets of {owner}; no secret was written. {told}");
             Ok(())
         }
-        Step::List => {
+        Step::Rotate { current, new } => {
+            let rotated = secrets::rotate(&bucket, current, &new).await?;
+            if rotated.objects == 0 {
+                note!("Nothing to re-seal: every secret is already under the new key.");
+            } else {
+                note!(
+                    "Re-sealed {} secret(s) in {} object(s) under the new key. Running nodes \
+                     need no rebuild. Once every node has the new key as {}, drop {}.",
+                    rotated.entries,
+                    rotated.objects,
+                    secrets::KEY_VARIABLE,
+                    secrets::PREVIOUS_KEY_VARIABLE,
+                );
+            }
+            Ok(())
+        }
+        Step::List(owner) => {
             let mut output = Output::new(if command.json {
                 Format::Json
             } else {
@@ -213,40 +251,6 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             output.finish()
         }
     }
-}
-
-/// Re-seal every secret of the fleet under the key in `--new-key-file`. Both
-/// keys are settled before any request, so a missing or malformed key fails
-/// first. No value, and no key, reaches the output.
-async fn rotate(command: Command) -> anyhow::Result<()> {
-    let current = SecretsKey::from_environment()?.with_context(|| {
-        format!(
-            "`celld secret rotate` needs the current secrets key: set {} or {}",
-            secrets::KEY_VARIABLE,
-            secrets::KEY_FILE_VARIABLE,
-        )
-    })?;
-    let path = command
-        .new_key_file
-        .as_deref()
-        .context("`celld secret rotate` needs --new-key-file")?;
-    let new = SecretsKey::from_file(path).context("read the new secrets key")?;
-    let storage = command.fleet.resolve("celld secret")?;
-    let bucket = storage.open().await?;
-    let rotated = secrets::rotate(&bucket, current, &new).await?;
-    if rotated.objects == 0 {
-        note!("Nothing to re-seal: every secret is already under the new key.");
-    } else {
-        note!(
-            "Re-sealed {} secret(s) in {} object(s) under the new key. Running nodes need no \
-             rebuild. Once every node has the new key as {}, drop {}.",
-            rotated.entries,
-            rotated.objects,
-            secrets::KEY_VARIABLE,
-            secrets::PREVIOUS_KEY_VARIABLE,
-        );
-    }
-    Ok(())
 }
 
 /// The value, from standard input without its final line break.
@@ -339,7 +343,9 @@ impl Command {
             }
         }
         let action = match (verb.as_str(), name) {
-            ("rotate", None) => Action::Rotate,
+            ("rotate", None) => Action::Rotate(new_key_file.take().ok_or_else(|| {
+                anyhow!("`celld secret rotate` needs --new-key-file PATH, a file that holds the new key")
+            })?),
             ("rotate", Some(_)) => bail!("`celld secret rotate` takes no secret name"),
             ("list", None) => Action::List,
             ("list", Some(_)) => bail!("`celld secret list` takes no secret name"),
@@ -348,17 +354,16 @@ impl Command {
             (verb, None) => bail!("`celld secret {verb}` needs a secret name"),
             _ => unreachable!("the verb was matched above"),
         };
-        match (&action, &new_key_file) {
-            (Action::Rotate, None) => {
-                bail!("`celld secret rotate` needs --new-key-file PATH, a file that holds the new key")
-            }
-            (Action::Rotate, Some(_)) => anyhow::ensure!(
-                script.is_none() && store.is_none() && config.is_none() && !json && !announce_only,
+        if new_key_file.is_some() {
+            bail!("--new-key-file applies to `celld secret rotate`");
+        }
+        if matches!(action, Action::Rotate(_))
+            && (script.is_some() || store.is_some() || config.is_some() || json || announce_only)
+        {
+            bail!(
                 "`celld secret rotate` re-seals every Worker and store of the fleet; it takes \
                  only --new-key-file and the fleet options"
-            ),
-            (_, Some(_)) => bail!("--new-key-file applies to `celld secret rotate`"),
-            (_, None) => {}
+            );
         }
         if store.is_some() && (script.is_some() || config.is_some()) {
             bail!("--store names a Secrets Store; it takes no --script or --config");
@@ -377,7 +382,6 @@ impl Command {
             fleet: fleet.with_environment(),
             json,
             announce_only,
-            new_key_file,
         }))
     }
 }
@@ -424,10 +428,13 @@ ROTATE THE SECRETS KEY. `rotate` re-seals every secret of every Worker and every
 Secrets Store in the bucket under the key in PATH (32 bytes in base64; never an
 argument or a variable). The current key comes from {} or {}, as for `put`.
 Order: give every node the new key as {} and the old one as {}, and restart
-them; run `rotate`; then drop the previous key. A node opens an entry with
+them; switch every operator and CI job that runs `put` to the new key, so a new
+object is created under it; run `rotate`; then drop the previous key. A node opens an entry with
 whichever of the two keys sealed it, and seals only with the current one. A run
 that stops resumes where it stopped: an object already under the new key is
-skipped. An entry sealed under neither key stops the run and names the object.
+skipped, and `rotate` lists the fleet again at the end so an object created
+meanwhile is not missed. An entry sealed under neither key stops the run and
+names the object.
 The values do not change, so no node rebuilds. A `put` with the new key is
 refused for an object until `rotate` reaches it.
 
@@ -493,8 +500,7 @@ mod tests {
         let command = parse(&["rotate", "--new-key-file", "/k", "--bucket", "b"])
             .unwrap()
             .unwrap();
-        assert!(matches!(command.action, Action::Rotate));
-        assert_eq!(command.new_key_file, Some(PathBuf::from("/k")));
+        assert!(matches!(&command.action, Action::Rotate(path) if path == &PathBuf::from("/k")));
         assert!(parse(&["rotate"]).is_err());
         assert!(parse(&["rotate", "KEY", "--new-key-file", "/k"]).is_err());
         assert!(parse(&["rotate", "--new-key-file", "/k", "--script", "app"]).is_err());
