@@ -1,6 +1,6 @@
 //! Re-sealing every secrets object of the fleet under the current key.
 
-use anyhow::{bail, ensure};
+use anyhow::bail;
 use zeroize::Zeroizing;
 
 use super::{read, update, Scope, SecretSet, SecretsKey};
@@ -57,11 +57,7 @@ async fn rotate_with(
     current: &SecretsKey,
     mut after_walk: impl AsyncFnMut(usize),
 ) -> anyhow::Result<Rotated> {
-    ensure!(
-        previous.id != current.id,
-        "the previous secrets key is the current one; set the old key as \
-         CELLD_SECRETS_KEY_PREVIOUS"
-    );
+    super::ensure_distinct_ids(previous, current)?;
     let mut total = Rotated::default();
     let mut last = String::new();
     for walk_number in 1..=MAX_WALKS {

@@ -337,17 +337,24 @@ async fn a_node_serves_an_old_secret_during_a_rotation_and_after_it_with_the_new
 
 #[tokio::test]
 async fn a_node_refuses_to_start_on_a_broken_previous_key() {
-    let key = key_text();
+    // An old key, other than the node's current one.
+    let key = base64::engine::general_purpose::STANDARD.encode([41u8; 32]);
     let directory = tempfile::tempdir().expect("a temp dir");
     let missing = directory.path().join("missing");
     let file = directory.path().join("previous");
     std::fs::write(&file, &key).expect("write the key");
     let missing = missing.to_str().expect("a UTF-8 path");
     let file = file.to_str().expect("a UTF-8 path");
-    // The same previous key, well formed, starts the node.
+    // A well-formed previous key starts the node.
     Server::start("secrets", &[("CELLD_SECRETS_KEY_PREVIOUS_FILE", file)]).await;
-    let cases: [&[(&str, &str)]; 3] = [
+    let current = key_text();
+    let cases: [&[(&str, &str)]; 4] = [
         &[("CELLD_SECRETS_KEY_PREVIOUS_FILE", missing)],
+        // The current key again: its id is the current key's.
+        &[
+            ("CELLD_SECRETS_KEY", current.as_str()),
+            ("CELLD_SECRETS_KEY_PREVIOUS", current.as_str()),
+        ],
         &[("CELLD_SECRETS_KEY_PREVIOUS", "not a key")],
         &[
             ("CELLD_SECRETS_KEY_PREVIOUS", key.as_str()),

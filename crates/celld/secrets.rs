@@ -80,6 +80,22 @@ impl Drop for SecretsKey {
     }
 }
 
+/// Refuse two keys whose ids match: either they are the same key, or the
+/// short id of two different keys collides and entries could not say which
+/// key sealed them.
+pub(crate) fn ensure_distinct_ids(
+    previous: &SecretsKey,
+    current: &SecretsKey,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        previous.id != current.id,
+        "{PREVIOUS_KEY_VARIABLE} has the key id of {KEY_VARIABLE}: either it is the same key, \
+         or two different keys share an id; set the old key as the previous one, or \
+         generate another new key"
+    );
+    Ok(())
+}
+
 impl SecretsKey {
     fn from_bytes(bytes: [u8; KEY_BYTES]) -> Self {
         // A hash prefix of the key under a fixed label: it names the key in an
@@ -122,9 +138,17 @@ impl SecretsKey {
 
     /// Check the previous key at startup, the file included: a node whose
     /// previous key cannot be read or decoded, or that has both the variable and
-    /// the file, refuses to start and does not fail each load later.
+    /// the file, refuses to start and does not fail each load later. An entry
+    /// names its key by a short id, so a previous key with the current key's
+    /// id is refused too: a load could not tell their entries apart.
     pub(crate) fn validate_previous() -> anyhow::Result<()> {
-        Self::previous_from_environment().map(drop)
+        let Some(previous) = Self::previous_from_environment()? else {
+            return Ok(());
+        };
+        if let Some(current) = Self::from_environment()? {
+            ensure_distinct_ids(previous, current)?;
+        }
+        Ok(())
     }
 
     fn from_named_variable(variable: &str) -> anyhow::Result<Option<Self>> {

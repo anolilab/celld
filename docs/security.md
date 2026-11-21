@@ -171,6 +171,13 @@ Worker secrets are encrypted under one key that the bucket never holds; see
 node and every `celld secret put` the same key, and keep it in your secret
 manager: a lost key cannot be recovered, and the values must be put again.
 
+A node reads and parses the key once per process and clears its copy of the
+decoded bytes and of the file text from memory when it is done with them; the
+key stays in memory while the node runs. A key file may be a symbolic link,
+because a mounted secret is one. celld reads at most 4 KiB from it, and logs a
+warning, without refusing, when other users can read it. The same holds for the
+previous key and its file.
+
 To rotate the key, change it in this order:
 
 1. Set the new key as `CELLD_SECRETS_KEY` and the old one as
@@ -185,7 +192,9 @@ To rotate the key, change it in this order:
 3. Drop the previous key.
 
 From step 1 every `put` seals under the new key, so no new object appears under
-the old one. See [Rotate the secrets key](services/workers.md#rotate-the-secrets-key).
+the old one. Each entry names its key by a short id; in the rare case that the
+new key's id matches the old one's, a node and `rotate` refuse the pair, and
+you generate another new key. See [Rotate the secrets key](services/workers.md#rotate-the-secrets-key).
 
 ## Limit Worker egress
 
