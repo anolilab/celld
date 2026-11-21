@@ -606,12 +606,13 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
         return out.finish();
     }
 
+    let selection = options.selection();
     let bucket = options.bucket.expect("validated deployment bucket");
     let store = bucket_client(&bucket, options.endpoint.as_deref(), &region)?;
     validate_bucket(&store).await?;
     crate::wake_format::ensure_ready(&store).await?;
     let started = std::time::Instant::now();
-    let manifest_write = deploy::write(&store, &built, !options.no_activate).await?;
+    let manifest_write = deploy::write(&store, &built, selection).await?;
     let location = format!(
         "{}://{}/{}{}",
         store.scheme(),
@@ -649,6 +650,32 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
         );
     } else {
         note!("Nodes adopt this version at their next pointer poll, without a restart.");
+        // Only a hint: the deploy has committed, so a failed read must not fail it.
+        let serving = deploy::read_fleet_pointer(&store)
+            .await
+            .inspect_err(|error| tracing::warn!(%error, "could not read the fleet pointer"))
+            .ok()
+            .flatten()
+            .and_then(|(pointer, _)| pointer.script_name)
+            .filter(|serving| *serving != built.script_name);
+        if let Some(serving) = serving {
+            note!(
+                "{} serves requests, not {}. Deploy with --primary, or run `celld activate {}={} --primary {}`, to serve {}.",
+                serving,
+                built.script_name,
+                built.script_name,
+                built.version,
+                built.script_name,
+                built.script_name
+            );
+            if !built.manifest.crons.is_empty() {
+                note!(
+                    "Warning: cron triggers run only for the primary script, so the schedule of {} does not fire while {} serves. Deploy with --primary to run it.",
+                    built.script_name,
+                    serving
+                );
+            }
+        }
     }
     out.finish()
 }

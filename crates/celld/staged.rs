@@ -133,7 +133,7 @@ pub struct Activation {
 /// it by accident: the serving primary stays primary whether or not it is
 /// listed, `primary` names a new one, and only when nothing serves yet may a
 /// single listed script become primary without being named.
-fn next_pointer(
+pub(crate) fn next_pointer(
     current: Option<&DeployPointer>,
     targets: &[Target],
     primary: Option<&str>,

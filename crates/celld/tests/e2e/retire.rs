@@ -80,6 +80,7 @@ async fn redeploy(server: &Server) {
         strict: false,
         json: false,
         no_activate: false,
+        primary: false,
         vars: VarOverrides::None,
         local_images: true,
         sourcemap: None,
@@ -90,7 +91,7 @@ async fn redeploy(server: &Server) {
     let bucket =
         celld::dev::open_local_bucket(&server.project_dir().join(".celld/dev/objects.sqlite3"))
             .expect("open the dev store");
-    celld::deploy::write(&bucket, &built, true)
+    celld::deploy::write(&bucket, &built, celld::deploy::Selection::Primary)
         .await
         .expect("activate the variant");
     let reloaded = reqwest::Client::new()

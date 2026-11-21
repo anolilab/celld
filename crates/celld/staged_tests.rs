@@ -1,5 +1,5 @@
 use super::*;
-use crate::deploy::Built;
+use crate::deploy::{Built, Selection};
 use crate::generation::DeploymentGraph;
 use crate::protocol::{ModuleRef, QueueConsumerAttachment};
 use sha2::{Digest, Sha256};
@@ -79,9 +79,17 @@ async fn deploy(
     services: &[(&str, &str)],
     activate: bool,
 ) {
-    crate::deploy::write(&fleet.bucket, &built(script, version, services), activate)
-        .await
-        .expect("deploy");
+    crate::deploy::write(
+        &fleet.bucket,
+        &built(script, version, services),
+        if activate {
+            Selection::Primary
+        } else {
+            Selection::Stage
+        },
+    )
+    .await
+    .expect("deploy");
 }
 
 async fn fleet_pointer(fleet: &Fleet) -> (DeployPointer, String) {
@@ -141,6 +149,287 @@ async fn no_activate_moves_no_pointer() {
     );
 }
 
+async fn select(fleet: &Fleet, script: &str, version: &str, selection: Selection) {
+    crate::deploy::write(&fleet.bucket, &built(script, version, &[]), selection)
+        .await
+        .expect("deploy");
+}
+
+#[tokio::test]
+async fn a_plain_deploy_keeps_the_primary_and_selects_its_own_version() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    let (_, token_before) = fleet_pointer(&fleet).await;
+    select(&fleet, "b", "v1", Selection::Activate).await;
+
+    // Nodes watch only the fleet pointer, so it carries the new script.
+    let (pointer, token_after) = fleet_pointer(&fleet).await;
+    assert_ne!(token_before, token_after, "the fleet pointer did not move");
+    assert_eq!(pointer.script_name.as_deref(), Some("a"));
+    assert_eq!(pointer.prefix, "deploy/a/v1");
+    assert_eq!(pointer.components["b"].version, "v1");
+    assert_eq!(named_pointer(&fleet, "b").await.version, "v1");
+
+    // Redeploying the primary itself moves it.
+    select(&fleet, "a", "v2", Selection::Activate).await;
+    let (pointer, _) = fleet_pointer(&fleet).await;
+    assert_eq!(pointer.script_name.as_deref(), Some("a"));
+    assert_eq!(pointer.version, "v2");
+    assert_eq!(pointer.components["b"].version, "v1");
+    assert_eq!(named_pointer(&fleet, "b").await.version, "v1");
+}
+
+#[tokio::test]
+async fn a_running_graph_adopts_a_plain_deploy_of_another_script() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    select(&fleet, "b", "v1", Selection::Activate).await;
+    let (before, _) = fleet_pointer(&fleet).await;
+    let graph = DeploymentGraph::load_pointer(&fleet.bucket, before.clone(), "node".to_string())
+        .await
+        .expect("load the graph");
+    // A node adopts a pointer when it differs from the one its graph holds
+    // in version, prefix or component map (`Generation::is_selected_by`).
+    assert_eq!(graph.components, before.components);
+
+    select(&fleet, "b", "v2", Selection::Activate).await;
+
+    let (after, _) = fleet_pointer(&fleet).await;
+    assert_eq!(after.script_name.as_deref(), Some("a"));
+    assert_ne!(
+        graph.components, after.components,
+        "a node would keep the old version of b"
+    );
+}
+
+#[tokio::test]
+async fn a_plain_deploy_of_the_primary_keeps_the_other_entries() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    select(&fleet, "b", "v1", Selection::Activate).await;
+
+    select(&fleet, "a", "v2", Selection::Activate).await;
+
+    let (pointer, _) = fleet_pointer(&fleet).await;
+    assert_eq!(pointer.script_name.as_deref(), Some("a"));
+    assert_eq!(pointer.version, "v2");
+    assert_eq!(pointer.components["b"].version, "v1");
+    assert!(!pointer.components.contains_key("a"));
+}
+
+#[tokio::test]
+async fn deploy_with_primary_moves_the_old_primary_into_the_component_map() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    select(&fleet, "c", "v1", Selection::Activate).await;
+    select(&fleet, "b", "v1", Selection::Primary).await;
+
+    let (pointer, _) = fleet_pointer(&fleet).await;
+    assert_eq!(pointer.script_name.as_deref(), Some("b"));
+    assert_eq!(pointer.components["a"].version, "v1");
+    assert_eq!(pointer.components["c"].version, "v1");
+    assert!(!pointer.components.contains_key("b"));
+}
+
+#[tokio::test]
+async fn a_plain_deploy_follows_a_script_the_component_map_lists() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    select(&fleet, "b", "v1", Selection::Stage).await;
+    activate(&fleet.bucket, &[target("b", "v1")], None)
+        .await
+        .unwrap();
+    select(&fleet, "b", "v2", Selection::Activate).await;
+    // Activating the staged "b" put it in the map, which wins over its own pointer.
+    let (pointer, _) = fleet_pointer(&fleet).await;
+    assert_eq!(pointer.script_name.as_deref(), Some("a"));
+    assert_eq!(pointer.selection_for("b").unwrap().version, "v2");
+}
+
+#[tokio::test]
+async fn deploy_with_primary_takes_the_pointer_and_keeps_the_old_primary_selected() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    select(&fleet, "b", "v1", Selection::Primary).await;
+
+    let (pointer, _) = fleet_pointer(&fleet).await;
+    assert_eq!(pointer.script_name.as_deref(), Some("b"));
+    assert_eq!(pointer.prefix, "deploy/b/v1");
+    assert_eq!(named_pointer(&fleet, "a").await.prefix, "deploy/a/v1");
+}
+
+#[tokio::test]
+async fn the_first_deploy_into_an_empty_fleet_becomes_primary() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    assert_eq!(
+        fleet_pointer(&fleet).await.0.script_name.as_deref(),
+        Some("a")
+    );
+}
+
+#[tokio::test]
+async fn a_deploy_repairs_a_fleet_pointer_that_names_no_script() {
+    let fleet = fleet();
+    fleet
+        .bucket
+        .put(crate::fleet::CURRENT_POINTER_KEY, b"not json".to_vec())
+        .await
+        .unwrap();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    assert_eq!(
+        fleet_pointer(&fleet).await.0.script_name.as_deref(),
+        Some("a")
+    );
+}
+
+/// Overwrite the fleet pointer with one that decodes but has no `script_name`,
+/// as fleets written before the field existed do.
+async fn drop_script_name(fleet: &Fleet, prefix: &str) {
+    let (mut pointer, _) = fleet_pointer(fleet).await;
+    pointer.script_name = None;
+    pointer.prefix = prefix.to_string();
+    let body = serde_json::to_vec(&pointer).unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains("script_name"));
+    fleet
+        .bucket
+        .put(crate::fleet::CURRENT_POINTER_KEY, body)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_plain_deploy_keeps_the_serving_script_of_a_pointer_that_names_none() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    select(&fleet, "c", "v1", Selection::Activate).await;
+    drop_script_name(&fleet, "deploy/a/v1").await;
+
+    select(&fleet, "b", "v1", Selection::Activate).await;
+
+    let (pointer, _) = fleet_pointer(&fleet).await;
+    assert_eq!(pointer.script_name.as_deref(), Some("a"));
+    assert_eq!(pointer.prefix, "deploy/a/v1");
+    assert_eq!(pointer.components["b"].version, "v1");
+    assert_eq!(pointer.components["c"].version, "v1");
+}
+
+#[tokio::test]
+async fn a_pointer_that_names_no_script_and_no_manifest_needs_primary() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    select(&fleet, "c", "v1", Selection::Activate).await;
+    drop_script_name(&fleet, "deploy/gone/v1").await;
+
+    let error = crate::deploy::write(&fleet.bucket, &built("b", "v1", &[]), Selection::Activate)
+        .await
+        .expect_err("refused");
+    assert!(error.to_string().contains("--primary"), "{error}");
+    assert!(fleet_pointer(&fleet).await.0.script_name.is_none());
+
+    select(&fleet, "b", "v1", Selection::Primary).await;
+    assert_eq!(
+        fleet_pointer(&fleet).await.0.script_name.as_deref(),
+        Some("b")
+    );
+}
+
+#[tokio::test]
+async fn primary_on_a_decodable_pointer_with_no_manifest_keeps_the_components() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    select(&fleet, "c", "v1", Selection::Activate).await;
+    drop_script_name(&fleet, "deploy/gone/v1").await;
+
+    select(&fleet, "b", "v1", Selection::Primary).await;
+
+    let (pointer, _) = fleet_pointer(&fleet).await;
+    assert_eq!(pointer.script_name.as_deref(), Some("b"));
+    assert_eq!(pointer.components["c"].version, "v1");
+}
+
+#[tokio::test]
+async fn a_failed_manifest_read_is_an_error_not_a_missing_manifest() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    let (mut pointer, _) = fleet_pointer(&fleet).await;
+    pointer.script_name = None;
+    assert_eq!(
+        crate::deploy::serving_script(&fleet.bucket, &pointer)
+            .await
+            .unwrap(),
+        Some("a".to_string())
+    );
+    pointer.prefix = "deploy/gone/v1".to_string();
+    assert_eq!(
+        crate::deploy::serving_script(&fleet.bucket, &pointer)
+            .await
+            .unwrap(),
+        None
+    );
+
+    // Replace the store file with a directory so every read fails.
+    let broken = tempfile::tempdir().expect("temp dir");
+    let database = broken.path().join("store.db");
+    let bucket = Bucket::open_dev(&database).expect("open the local store");
+    std::fs::remove_file(&database).expect("remove the store file");
+    std::fs::create_dir(&database).expect("block the store file");
+    crate::deploy::serving_script(&bucket, &pointer)
+        .await
+        .expect_err("a failed read propagates");
+}
+
+#[tokio::test]
+async fn a_refused_deploy_leaves_the_named_pointer_and_queue_attachments() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    crate::deploy::write(&fleet.bucket, &consumer("v1"), Selection::Activate)
+        .await
+        .expect("deploy the consumer");
+    drop_script_name(&fleet, "deploy/gone/v1").await;
+    let attachment = "deploy/queues/jobs/consumer.json";
+    let named_before = named_pointer(&fleet, "worker").await;
+    let attached_before = fleet
+        .bucket
+        .get(attachment)
+        .await
+        .unwrap()
+        .expect("attached")
+        .0;
+
+    let error = crate::deploy::write(&fleet.bucket, &consumer("v2"), Selection::Activate)
+        .await
+        .expect_err("refused");
+    assert!(error.to_string().contains("--primary"), "{error}");
+
+    let named_after = named_pointer(&fleet, "worker").await;
+    assert_eq!(named_after.version, named_before.version);
+    assert_eq!(named_after.prefix, named_before.prefix);
+    let attached_after = fleet
+        .bucket
+        .get(attachment)
+        .await
+        .unwrap()
+        .expect("attached")
+        .0;
+    assert_eq!(attached_after, attached_before);
+}
+
+#[test]
+fn primary_contradicts_no_activate() {
+    let arguments = |flags: &[&str]| {
+        crate::deploy::options_from_arguments(flags.iter().map(|flag| flag.to_string()))
+    };
+    let error = arguments(&["--primary", "--no-activate"])
+        .err()
+        .expect("refused");
+    assert!(error.to_string().contains("contradict"), "{error}");
+    assert!(arguments(&["--primary"]).unwrap().unwrap().primary);
+    assert_eq!(Selection::from_flags(true, false), Selection::Stage);
+    assert_eq!(Selection::from_flags(false, true), Selection::Primary);
+    assert_eq!(Selection::from_flags(false, false), Selection::Activate);
+}
+
 /// A deployment of `worker` that consumes the queue `jobs`.
 fn consumer(version: &str) -> Built {
     let mut staged = built("worker", version, &[]);
@@ -163,7 +452,7 @@ fn consumer(version: &str) -> Built {
 async fn staging_publishes_no_queue_consumer_attachment() {
     let fleet = fleet();
     let staged = consumer("v1");
-    crate::deploy::write(&fleet.bucket, &staged, false)
+    crate::deploy::write(&fleet.bucket, &staged, Selection::Stage)
         .await
         .expect("stage");
     let attachment = fleet
@@ -283,7 +572,7 @@ async fn a_pointer_that_moves_only_a_component_selects_something_new() {
 }
 
 #[tokio::test]
-async fn a_plain_deploy_keeps_the_components_of_a_staged_fleet() {
+async fn a_primary_deploy_keeps_the_components_of_a_staged_fleet() {
     let fleet = fleet();
     serving_pair(&fleet).await;
     deploy(&fleet, "back", "v2", &[], false).await;
@@ -441,7 +730,7 @@ async fn activate_refuses_a_version_with_an_invalid_ratelimit_binding() {
         "type": "ratelimit", "name": "LIMITER", "namespace_id": "1",
         "simple": { "limit": 5, "period": 10 }
     }] });
-    crate::deploy::write(&fleet.bucket, &staged, false)
+    crate::deploy::write(&fleet.bucket, &staged, Selection::Stage)
         .await
         .expect("stage");
     let error = activate(&fleet.bucket, &[target("back", "v9")], None)
@@ -461,7 +750,7 @@ async fn activate_refuses_a_version_with_an_invalid_send_email_binding() {
     staged.manifest.raw_metadata = serde_json::json!({ "bindings": [{
         "type": "send_email", "name": "EMAIL"
     }] });
-    crate::deploy::write(&fleet.bucket, &staged, false)
+    crate::deploy::write(&fleet.bucket, &staged, Selection::Stage)
         .await
         .expect("stage");
     let error = activate(&fleet.bucket, &[target("back", "v9")], None)
@@ -539,10 +828,10 @@ fn a_pointer_without_components_reads_and_writes_as_before() {
 #[tokio::test]
 async fn a_staged_queue_consumer_loads_as_a_shadow_but_not_as_a_deployment() {
     let fleet = fleet();
-    crate::deploy::write(&fleet.bucket, &consumer("v1"), true)
+    crate::deploy::write(&fleet.bucket, &consumer("v1"), Selection::Primary)
         .await
         .expect("serve v1");
-    crate::deploy::write(&fleet.bucket, &consumer("v2"), false)
+    crate::deploy::write(&fleet.bucket, &consumer("v2"), Selection::Stage)
         .await
         .expect("stage v2");
     let (serving, _) = fleet_pointer(&fleet).await;
@@ -573,13 +862,13 @@ async fn redeploying_a_version_keeps_the_first_manifest() {
 
     use crate::deploy::ManifestWrite;
     assert_eq!(
-        crate::deploy::write(&fleet.bucket, &first, true)
+        crate::deploy::write(&fleet.bucket, &first, Selection::Primary)
             .await
             .unwrap(),
         ManifestWrite::Created
     );
     assert_eq!(
-        crate::deploy::write(&fleet.bucket, &second, true)
+        crate::deploy::write(&fleet.bucket, &second, Selection::Primary)
             .await
             .unwrap(),
         ManifestWrite::Unchanged
@@ -609,11 +898,11 @@ async fn a_cron_only_redeploy_updates_the_schedule_and_keeps_the_first_tag() {
     second.manifest.created_at = Some("2026-02-02T00:00:00.000Z".to_string());
     second.manifest.crons = vec!["*/5 * * * *".to_string()];
 
-    crate::deploy::write(&fleet.bucket, &first, true)
+    crate::deploy::write(&fleet.bucket, &first, Selection::Primary)
         .await
         .unwrap();
     assert_eq!(
-        crate::deploy::write(&fleet.bucket, &second, true)
+        crate::deploy::write(&fleet.bucket, &second, Selection::Primary)
             .await
             .unwrap(),
         ManifestWrite::Updated
