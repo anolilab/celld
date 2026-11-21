@@ -517,7 +517,7 @@ pub fn run_projects_expecting_exit(fixtures: &[&str], env: &[(&str, &str)]) -> E
     let dir = TempDir::new().expect("create temp dir");
     let project = dir.path().join("project");
     copy_dir(&fixture_dir(fixtures[0]), &project);
-    let others_dirs: Vec<PathBuf> = fixtures[1..]
+    let other_dirs: Vec<PathBuf> = fixtures[1..]
         .iter()
         .map(|fixture| {
             let other = dir.path().join(fixture);
@@ -539,7 +539,7 @@ pub fn run_projects_expecting_exit(fixtures: &[&str], env: &[(&str, &str)]) -> E
         .collect();
     let mut child = spawn(
         &project,
-        &others_dirs,
+        &other_dirs,
         &owned_env(&others),
         ambient,
         &log_path,
