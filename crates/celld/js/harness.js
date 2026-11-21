@@ -5879,11 +5879,15 @@ const __newEntrypointInstance = (name, props) =>
 // handler functions as fn(arg, env, ctx).
 // A missing fetch reports workerd's own text, the same one the loader
 // installs for a Worker with no default export, so the two paths agree.
-const __noHandler = (name, method) =>
-  method === "fetch" && name === "default"
+const __missingHandlers = new WeakSet();
+const __noHandler = (name, method) => {
+  const error = method === "fetch" && name === "default"
     ? new Error("Handler does not export a fetch() function.")
     : new TypeError(
       `Entrypoint ${JSON.stringify(name)} has no ${method} handler`);
+  __missingHandlers.add(error);
+  return error;
+};
 
 const __dispatchEntrypointMethod = async (name, method, arg, props) => {
   const handler = __cell.objectEntrypoints[name];
@@ -6061,16 +6065,18 @@ __celld.__dispatchEntrypointTail = async (name, json) => {
 // exception is a temporary one, and a Worker without the handler says so.
 __celld.__dispatchEntrypointEmail = async (name, metaJson, raw) => {
   const answer = (value) => new TextEncoder().encode(JSON.stringify(value));
-  let handler;
   try {
-    const object = __cell.objectEntrypoints[name];
-    handler = object !== undefined ? object.email : __entrypointClass(name).prototype.email;
-  } catch {}
-  if (typeof handler !== "function") return answer({ outcome: "no_handler" });
+    if (__cell.objectEntrypoints[name] === undefined) __entrypointClass(name);
+  } catch {
+    return answer({ outcome: "no_handler" });
+  }
   const inbound = __celld.__makeInboundEmail(JSON.parse(metaJson), raw);
   try {
     await __dispatchEntrypointMethodInCurrentEvent(name, "email", inbound.message);
   } catch (error) {
+    // The handler is looked up on the constructed instance, like any other
+    // entrypoint method, so one a constructor or a field assigns counts.
+    if (__missingHandlers.has(error)) return answer({ outcome: "no_handler" });
     let text;
     try {
       text = String(error);

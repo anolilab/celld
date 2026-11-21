@@ -301,11 +301,11 @@ retry:
 
 | Status | Body | Meaning |
 | --- | --- | --- |
-| 200 | `{"ok":true,"outcome":"accepted"}` | The handler returned. Accept the message |
+| 200 | `{"ok":true,"outcome":"accepted"}` | The handler returned, or it threw or ran past the deadline after a `forward()` or `reply()` the relay had already accepted (the failure is logged with the message's id). Accept the message: a retry would send that mail again |
 | 550 | `{"ok":false,"outcome":"rejected","reason":"..."}` | The handler called `setReject()`. Bounce with a permanent failure and `reason` (printable ASCII, at most 200 characters, so it is safe in an SMTP reply line) |
-| 500 | `{"ok":false,"outcome":"error","error":"..."}` | The handler threw. Treat it as temporary and retry |
+| 500 | `{"ok":false,"outcome":"error","error":"..."}` | The handler threw before it sent anything. Treat it as temporary and retry |
 | 501 | `{"ok":false,"outcome":"no_handler",...}` | The primary Worker has no `email()` handler. Treat it as temporary: the operator can deploy one |
-| 504 | | The handler did not finish within 60 seconds (`CELLD_EMAIL_INBOUND_DEADLINE_S`). The event is cancelled, as one whose client hung up is: it gives its place back, and a `forward()` or `reply()` it makes later is refused with `E_TIMEOUT`. Temporary, and the retry runs the handler again |
+| 504 | | The handler did not finish within 60 seconds (`CELLD_EMAIL_INBOUND_DEADLINE_S`). The event is cancelled, as one whose client hung up is: it gives its place back, and a `forward()` or `reply()` it makes later is refused with `E_TIMEOUT`. Temporary, and the retry runs the handler again, unless it had already forwarded or replied: then the answer is 200 |
 | 408 | | The message was not received within the same time. Temporary |
 | 503 | | The node is busy (at most four messages at once, with `Retry-After`), or has no Worker runtime. Temporary |
 | 400, 413, 431 | `{"ok":false,"error":"..."}` | The message was refused: empty, malformed, with a NUL byte, over 25 MiB (413), with a header line over 998 bytes, or with more than 64 KiB or 1,000 headers (431). The error names the fault |
@@ -332,9 +332,12 @@ status=$(curl -s -o /dev/null -w '%{http_code}' \
   --data-binary @- \
   --url-query "from=$1" --url-query "to=$2" \
   "$CELLD_INTERNAL_URL/email/inbound")
-[ "$status" = 200 ] && exit 0      # accepted
-[ "$status" = 550 ] && exit 67     # bounce: a permanent failure
-exit 75                            # EX_TEMPFAIL: try again later
+case "$status" in
+  200) exit 0 ;;                   # accepted
+  550) exit 67 ;;                  # the handler rejected it: bounce
+  400|413|431) exit 65 ;;          # EX_DATAERR: the message itself is bad: bounce
+  *) exit 75 ;;                    # EX_TEMPFAIL (500, 501, 503, 504, 408, 401...): try again later
+esac
 ```
 
 A provider's inbound webhook that posts the raw message works the same way
@@ -372,8 +375,9 @@ not restricted by any `send_email` binding. `forward()` has a list of its own.
   the sender of the incoming message: a builder has no `to`, `cc` or `bcc`, and
   an `EmailMessage` must be addressed to the incoming `from`. It must be sent
   from the domain of the incoming `to`. celld sets `In-Reply-To` and
-  `References` from the incoming `Message-ID`; a value the Worker sets must be
-  the same. It is refused when the incoming message has no `Message-ID`
+  `References` from the incoming `Message-ID`, keeping only entries that are
+  valid message ids and, in a long thread, the first id and the newest ones; a
+  value the Worker sets must be the same (the full or the trimmed chain). It is refused when the incoming message has no `Message-ID`
   (`E_FIELD_MISSING`), more than 100 `References`, or no sender (a bounce). A
   message may be replied to once, and a failed reply counts, but one turned away
   for lack of a slot or a subrequest (`E_RATE_LIMIT_EXCEEDED`) does not. A reply

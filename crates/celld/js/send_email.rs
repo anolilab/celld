@@ -136,7 +136,16 @@ pub(super) fn op_email_release(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    if let Some(token) = reserved_token(scope, &args, 0) {
+    release_reserved(scope, &args, 0);
+}
+
+/// Give back the slot of the reservation named by argument `index`, if any.
+pub(super) fn release_reserved(
+    scope: &mut v8::PinScope,
+    args: &v8::FunctionCallbackArguments,
+    index: i32,
+) {
+    if let Some(token) = reserved_token(scope, args, index) {
         drop(event_context(scope).take_reserved_send(token));
     }
 }
@@ -160,6 +169,7 @@ pub(super) async fn send_prepared(
     prepared: Result<Prepared, EmailError>,
     gate: EgressGate,
     script: String,
+    delivered: Option<Arc<AtomicBool>>,
 ) -> Result<String, String> {
     // Held until the send ends, and given back if it is dropped.
     let _slot = slot;
@@ -182,6 +192,9 @@ pub(super) async fn send_prepared(
         // The stage and the reply code are all that is kept: the relay's
         // own text is never logged or passed on.
         tracing::warn!(event = "send_email_failed", code = error.code, detail = %error.message);
+    }
+    if let (Ok(()), Some(delivered)) = (&sent, &delivered) {
+        delivered.store(true, Ordering::Release);
     }
     Ok(answer(sent.map(|()| prepared.message_id)))
 }
@@ -252,7 +265,7 @@ pub(super) fn op_email_send(
     };
     let prepared = prepare(&binding, call, raw);
     let gate = egress_gate_request(&context, celld_logic::Channel::Fetch);
-    let async_id = asyncrt::enqueue(send_prepared(slot, prepared, gate, script));
+    let async_id = asyncrt::enqueue(send_prepared(slot, prepared, gate, script, None));
     rv.set(promise_for(scope, async_id));
 }
 

@@ -305,6 +305,40 @@ async fn a_class_entrypoint_with_an_email_method_gets_the_message() {
 }
 
 #[tokio::test]
+async fn a_class_whose_instance_has_the_email_handler_gets_the_message() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, "inbound-email-field").await;
+    let (status, body) = post_mode(&server, "any").await;
+    assert_eq!(
+        (status, body["reason"].as_str()),
+        (550, Some("from an instance"))
+    );
+}
+
+#[tokio::test]
+async fn a_handler_that_fails_after_a_forward_is_accepted_so_the_relay_does_not_retry() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, "inbound-email").await;
+    let (status, body) = post_mode(&server, "forward-throw").await;
+    assert_eq!(
+        (status, &body["outcome"]),
+        (200, &Value::from("accepted")),
+        "{body}"
+    );
+    assert_eq!(sink.delivered().len(), 1, "{:?}", sink.transactions());
+}
+
+#[tokio::test]
+async fn a_refused_streamed_reply_gives_its_reserved_slot_back() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, "inbound-email").await;
+    assert_eq!(
+        reported(&server, ENVELOPE, message("raw-reply-twice")).await,
+        "E_VALIDATION_ERROR|ok|ok|ok|ok"
+    );
+}
+
+#[tokio::test]
 async fn the_inbound_token_opens_the_inbound_route_and_nothing_else() {
     let sink = Sink::start(Behaviour::default()).await;
     let server = start_with(

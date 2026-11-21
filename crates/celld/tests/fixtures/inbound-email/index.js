@@ -12,6 +12,9 @@
 //   reply-limit fills the isolate's send slots with forwards, replies (refused for
 //               lack of a slot), waits for the forwards, replies again, and
 //               reports both outcomes
+//   forward-throw  forwards to team@example.net, then throws
+//   raw-reply-twice  replies with a streamed raw EmailMessage twice (the second is refused), then
+//               forwards four times at once and reports the second error and the four outcomes
 //   hang        waits for an hour
 //   hang-forward  waits for an hour, and tries to forward from waitUntil after 1.5 s
 //   late        tries to reject the message after the handler returned
@@ -103,6 +106,34 @@ export default {
       case "forward-id": {
         const { messageId } = await message.forward("team@example.net");
         message.setReject("id:" + messageId);
+        return;
+      }
+      case "forward-throw":
+        await message.forward("team@example.net");
+        throw new Error("after the forward");
+      case "raw-reply-twice": {
+        // A stream, so each reply reserves its slot before the host sees it.
+        const raw = () =>
+          new EmailMessage(
+            message.to,
+            message.from,
+            new ReadableStream({
+              start(controller) {
+                controller.enqueue(
+                  new TextEncoder().encode(
+                    `From: ${message.to}\r\nTo: ${message.from}\r\nSubject: Re\r\n\r\nraw reply\r\n`,
+                  ),
+                );
+                controller.close();
+              },
+            }),
+          );
+        await message.reply(raw());
+        const second = await message.reply(raw()).then(() => "ok", (error) => error.code);
+        const forwards = await Promise.all(
+          [1, 2, 3, 4].map(() => message.forward("team@example.net").then(() => "ok", (error) => error.code)),
+        );
+        message.setReject([second, ...forwards].join("|"));
         return;
       }
       case "reply-limit": {

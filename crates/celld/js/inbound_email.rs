@@ -11,10 +11,10 @@
 //! [`send_email::send_prepared`](super::send_email), with the same slot,
 //! subrequest and size limits as a `send_email` binding.
 
-use super::send_email::{begin_send, refuse, send_prepared};
+use super::send_email::{begin_send, refuse, release_reserved, send_prepared};
 use super::*;
 use crate::email::inbound::{Event, Inbound};
-use crate::email::EmailError;
+use crate::email::{EmailError, Prepared};
 
 /// The longest JSON a `forward()` call may carry: a recipient and up to
 /// [`crate::email::inbound::MAX_FORWARD_HEADERS`] short headers, with room for
@@ -141,8 +141,32 @@ pub(super) fn op_email_forward(
             &call.headers,
         );
     let gate = egress_gate_request(&context, celld_logic::Channel::Fetch);
-    let async_id = asyncrt::enqueue(send_prepared(slot, prepared, gate, script));
+    let delivered = context.inbound_email.get().map(|event| event.delivered());
+    let async_id = asyncrt::enqueue(send_prepared(slot, prepared, gate, script, delivered));
     rv.set(promise_for(scope, async_id));
+}
+
+/// Check the call, then take the event's one reply and prepare the message.
+/// A malformed call leaves the reply to be made.
+fn prepare_reply(
+    event: &Event,
+    call: ReplyCall,
+    raw: Option<Vec<u8>>,
+) -> Result<Prepared, EmailError> {
+    match (call.kind.as_str(), call.from, call.to, call.message, raw) {
+        ("raw", Some(from), Some(to), None, Some(raw)) => {
+            event.take_reply()?;
+            event.prepare_reply_raw(&from, &to, &raw)
+        }
+        ("builder", None, None, Some(message), None) => {
+            event.take_reply()?;
+            event.prepare_reply_builder(message)
+        }
+        _ => Err(EmailError::new(
+            "E_VALIDATION_ERROR",
+            "the call is malformed",
+        )),
+    }
 }
 
 /// `message.reply(reply)`: a message to the sender of the received one,
@@ -157,18 +181,18 @@ pub(super) fn op_email_reply(
         return not_an_email_event(scope, "reply");
     };
     if let Err(error) = event.check_open().and_then(|()| event.check_reply_open()) {
+        // A raw message's slot was reserved before this call: give it back.
+        release_reserved(scope, &args, 2);
         return refuse(scope, rv, error);
     }
-    // The reply is taken once the send is admitted: one turned away for lack
-    // of a slot or a subrequest can be made again, a refused or failed one
-    // cannot.
     let (context, slot) = match begin_send(scope, &args, 2) {
         Ok(begun) => begun,
         Err(error) => return refuse(scope, rv, error),
     };
-    if let Err(error) = event.take_reply() {
-        return refuse(scope, rv, error);
-    }
+    // The call is read and checked before the reply is taken, and the reply is
+    // taken once the send is admitted: one turned away for lack of a slot or a
+    // subrequest, or malformed, can be made again; a refused or failed one
+    // cannot. An early return gives the slot back.
     let text = args.get(0).to_rust_string_lossy(scope);
     let call: ReplyCall = match serde_json::from_str(&text) {
         Ok(call) => call,
@@ -176,16 +200,49 @@ pub(super) fn op_email_reply(
     };
     let raw = view_bytes(args.get(1));
     let event = context.inbound_email.get().expect("checked above");
-    let prepared = match (call.kind.as_str(), call.from, call.to, call.message, raw) {
-        ("raw", Some(from), Some(to), None, Some(raw)) => event.prepare_reply_raw(&from, &to, &raw),
-        ("builder", None, None, Some(message), None) => event.prepare_reply_builder(message),
-        _ => Err(EmailError::new(
-            "E_VALIDATION_ERROR",
-            "the call is malformed",
-        )),
-    };
+    let prepared = prepare_reply(event, call, raw);
     let script = actor_runtime_state(scope).declared.script().to_string();
     let gate = egress_gate_request(&context, celld_logic::Channel::Fetch);
-    let async_id = asyncrt::enqueue(send_prepared(slot, prepared, gate, script));
+    let delivered = Some(event.delivered());
+    let async_id = asyncrt::enqueue(send_prepared(slot, prepared, gate, script, delivered));
     rv.set(promise_for(scope, async_id));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::email::inbound::parse;
+
+    fn event() -> Event {
+        let raw =
+            b"From: ann@example.org\r\nTo: bob@example.com\r\nMessage-ID: <m@x>\r\n\r\nhi".to_vec();
+        Event::new(&mut parse(raw, Some("ann@example.org"), Some("bob@example.com")).unwrap())
+    }
+
+    fn call(kind: &str, message: Option<serde_json::Value>) -> ReplyCall {
+        ReplyCall {
+            kind: kind.into(),
+            from: None,
+            to: None,
+            message,
+        }
+    }
+
+    #[test]
+    fn a_malformed_reply_call_does_not_use_up_the_reply() {
+        let event = event();
+        // A raw call with no addresses and a builder call with no message.
+        for malformed in [
+            call("raw", None),
+            call("builder", None),
+            call("other", None),
+        ] {
+            let error = prepare_reply(&event, malformed, None).unwrap_err();
+            assert_eq!(error.code, "E_VALIDATION_ERROR");
+            event.check_reply_open().unwrap();
+        }
+        // A well-formed one takes it, whatever it then makes of the message.
+        let _ = prepare_reply(&event, call("builder", Some(serde_json::json!({}))), None);
+        assert!(event.check_reply_open().is_err());
+    }
 }

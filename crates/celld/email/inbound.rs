@@ -158,6 +158,8 @@ pub struct Inbound {
     /// Set when the route gives up on the handler, so what it does from then
     /// on is refused.
     pub cancelled: Arc<AtomicBool>,
+    /// Set once a `forward()` or `reply()` has been accepted by the relay.
+    pub delivered: Arc<AtomicBool>,
 }
 
 /// Parse a posted message. `from` and `to` are the envelope as the relay gave
@@ -236,7 +238,9 @@ pub fn parse(
     let references = parsed
         .iter()
         .filter(|header| header.name_is("references"))
-        .flat_map(|header| header.value.split_whitespace().map(str::to_string))
+        .flat_map(|header| header.value.split_whitespace())
+        .filter(|id| valid_message_id(id))
+        .map(str::to_string)
         .collect();
     let headers = parsed
         .into_iter()
@@ -251,6 +255,7 @@ pub fn parse(
         references,
         permit: None,
         cancelled: Arc::default(),
+        delivered: Arc::default(),
     })
 }
 
@@ -278,6 +283,7 @@ pub struct Event {
     automatic: Option<&'static str>,
     replied: AtomicBool,
     cancelled: Arc<AtomicBool>,
+    delivered: Arc<AtomicBool>,
     _permit: Option<Permit>,
 }
 
@@ -326,8 +332,14 @@ impl Event {
             automatic: automatic(&inbound.from, &inbound.headers),
             replied: AtomicBool::new(false),
             cancelled: inbound.cancelled.clone(),
+            delivered: inbound.delivered.clone(),
             _permit: inbound.permit.take(),
         }
+    }
+
+    /// Set when the relay has accepted a message this event sent.
+    pub fn delivered(&self) -> Arc<AtomicBool> {
+        self.delivered.clone()
     }
 
     /// Refuse what a handler tries once the route has given up on it.
@@ -499,7 +511,8 @@ impl Event {
         to: &str,
         raw: &[u8],
     ) -> Result<Prepared, EmailError> {
-        let (in_reply_to, references) = self.threading()?;
+        let (in_reply_to, full) = self.threading()?;
+        let references = trim_references(&full);
         if to != self.from {
             return Err(EmailError::new(
                 "E_RECIPIENT_NOT_ALLOWED",
@@ -518,8 +531,10 @@ impl Event {
             let mut present = false;
             for header in parsed.iter().filter(|header| header.name_is(name)) {
                 present = true;
-                if header.value.split_whitespace().collect::<Vec<_>>()
-                    != wanted.split_whitespace().collect::<Vec<_>>()
+                let tokens = header.value.split_whitespace();
+                let full = if name == "References" { &full } else { wanted };
+                if !tokens.clone().eq(wanted.split_whitespace())
+                    && !tokens.eq(full.split_whitespace())
                 {
                     return Err(EmailError::new(
                         "E_VALIDATION_ERROR",
@@ -823,6 +838,8 @@ pub async fn handle(
             )
         }
     };
+    let delivered = inbound.delivered.clone();
+    let message_id = inbound.message_id.clone();
     let cancellation = crate::runtime::RequestCancellationLifetime::stateless();
     let mut giveup = GiveUp {
         cancelled: Some(inbound.cancelled.clone()),
@@ -837,16 +854,40 @@ pub async fn handle(
             Outcome::Failed("the message could not be handled".into())
         }
         Err(_) => {
-            return (
-                504,
-                r#"{"ok":false,"outcome":"error","error":"the email handler did not finish in time"}"#
-                    .to_string(),
+            return after_delivery(
+                (
+                    504,
+                    r#"{"ok":false,"outcome":"error","error":"the email handler did not finish in time"}"#
+                        .to_string(),
+                ),
+                &delivered,
+                message_id.as_deref(),
             );
         }
     };
     // The handler is done: what it left in `waitUntil` is not cancelled.
     giveup.disarm();
-    answer(outcome)
+    after_delivery(answer(outcome), &delivered, message_id.as_deref())
+}
+
+/// A handler that failed or timed out after the relay accepted a message it
+/// forwarded or replied to has still delivered it, and a retry would send it
+/// again: the route answers 200 and logs the failure.
+fn after_delivery(
+    answered: (u16, String),
+    delivered: &AtomicBool,
+    message_id: Option<&str>,
+) -> (u16, String) {
+    if !matches!(answered.0, 500 | 504) || !delivered.load(Ordering::Acquire) {
+        return answered;
+    }
+    tracing::warn!(
+        event = "inbound_email_failed_after_delivery",
+        message_id = message_id.unwrap_or(""),
+        status = answered.0,
+        body = %answered.1,
+    );
+    answer(Outcome::Accepted)
 }
 
 #[cfg(test)]
@@ -1142,6 +1183,59 @@ mod tests {
         assert_eq!(inbound.raw.as_ptr(), body.as_ptr());
         let event = Event::new(&mut inbound);
         assert_eq!(event.raw.as_ptr(), body.as_ptr());
+    }
+
+    #[test]
+    fn references_that_are_not_message_ids_are_dropped() {
+        let inbound = parsed(
+            "From: ann@example.org\r\nTo: bob@example.com\r\nMessage-ID: <m@x>\r\nReferences: <a@x> \x01bad <b@x> junk <c<d@x>\r\n\r\nx",
+        );
+        assert_eq!(inbound.references, ["<a@x>", "<b@x>"]);
+        let event = Event::new(&mut parsed(
+            "From: ann@example.org\r\nTo: bob@example.com\r\nMessage-ID: <m@x>\r\nReferences: <a@x> \x01bad\r\n\r\nx",
+        ));
+        let (_, references) = event.threading().unwrap();
+        assert_eq!(references, "<a@x> <m@x>");
+    }
+
+    #[test]
+    fn a_raw_reply_to_a_long_thread_trims_the_chain() {
+        crate::asyncrt::install_test_host_runtime();
+        let refs = (0..90)
+            .map(|n| format!("<{n}-{}@example.org>", "x".repeat(480)))
+            .collect::<Vec<_>>()
+            .join("\r\n ");
+        let event = Event::new(&mut parsed(&format!(
+            "From: ann@example.org\r\nTo: bob@example.com\r\nMessage-ID: <m@x>\r\nReferences: {refs}\r\n\r\nx"
+        )));
+        let sent = event
+            .prepare_reply_raw("bob@example.com", "ann@example.org", &reply_message(""))
+            .unwrap();
+        let text = String::from_utf8(sent.data).unwrap();
+        let head = text.split("\r\n\r\n").next().unwrap();
+        assert!(head.len() < 4000, "{}", head.len());
+        assert!(head.contains("<0-") && head.contains("<m@x>"), "{head}");
+        // A message that carries the full chain itself is still the same reply.
+        event
+            .prepare_reply_raw(
+                "bob@example.com",
+                "ann@example.org",
+                &reply_message(&format!("References: {refs}\r\n <m@x>\r\n")),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_failed_or_slow_handler_after_a_delivery_is_still_accepted() {
+        let delivered = AtomicBool::new(false);
+        let failed = || (500, "{}".to_string());
+        assert_eq!(after_delivery(failed(), &delivered, Some("<m@x>")).0, 500);
+        assert_eq!(after_delivery((504, "{}".into()), &delivered, None).0, 504);
+        delivered.store(true, Ordering::Release);
+        assert_eq!(after_delivery(failed(), &delivered, Some("<m@x>")).0, 200);
+        assert_eq!(after_delivery((504, "{}".into()), &delivered, None).0, 200);
+        // A refusal the handler asked for stays one.
+        assert_eq!(after_delivery((550, "{}".into()), &delivered, None).0, 550);
     }
 
     fn reply_message(extra: &str) -> Vec<u8> {
