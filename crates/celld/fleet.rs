@@ -763,6 +763,7 @@ pub async fn load_service_worker(
             prefix: selected.prefix.clone(),
             rollout: Rollout { percent: 100 },
             components: Default::default(),
+            secrets_revisions: Default::default(),
         };
         return load_worker_at_pointer(bucket, pointer, CURRENT_POINTER_KEY, node).await;
     }
@@ -799,6 +800,7 @@ pub async fn load_queue_consumer_worker(
         prefix: consumer.prefix.clone(),
         rollout: Rollout { percent: 100 },
         components: Default::default(),
+        secrets_revisions: Default::default(),
     };
     let pointer_key = format!("deploy/{}/current.json", consumer.script_name);
     let loaded = load_worker_at_pointer(bucket, pointer, &pointer_key, node).await?;
@@ -978,6 +980,7 @@ async fn load_worker_at_pointer(
     // `.dev.vars` is read only for a binding that `celld dev` marked, so an
     // unreadable file cannot stop a Worker that has none.
     let dev_values = crate::secrets::dev_values_for(&manifest, crate::dev::store_values)?;
+    let secret_scopes = crate::secrets::revision_scopes(&manifest)?;
     let secret_stores = crate::secrets::load_stores(
         bucket,
         &manifest,
@@ -1050,6 +1053,7 @@ async fn load_worker_at_pointer(
         loader_bindings,
         version_metadata,
         secret_stores,
+        secret_scopes,
         hyperdrive,
         ai_binding,
         assets,
@@ -1075,6 +1079,9 @@ pub struct LoadedDeployment {
     pub version_metadata: Option<crate::engine_api::VersionMetadata>,
     /// The deployment's Secrets Store bindings, decrypted at load.
     pub secret_stores: Vec<crate::secrets::StoreSecret>,
+    /// The secrets scopes this load read (`secrets::revision_scopes`), whose
+    /// revisions a generation records.
+    pub secret_scopes: Vec<String>,
     /// The deployment's Hyperdrive bindings, with their connection strings.
     pub hyperdrive: Vec<crate::hyperdrive::HyperdriveBinding>,
     /// The `env` name of the deployment's `ai` binding, if it declares one.

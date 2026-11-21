@@ -522,6 +522,29 @@ async fn update(
     bail!("{key} kept changing under this write; try again")
 }
 
+/// The key of a script's secrets in the fleet pointer's `secrets_revisions`.
+pub fn script_revision_key(script: &str) -> String {
+    format!("script:{script}")
+}
+
+/// The key of a Secrets Store's secrets in `secrets_revisions`.
+pub fn store_revision_key(store: &str) -> String {
+    format!("store:{store}")
+}
+
+/// The scopes a load of `manifest` reads secrets from: its own script and
+/// every Secrets Store it binds. A generation records their revisions, so a
+/// put to any other scope does not rebuild it.
+pub fn revision_scopes(manifest: &Manifest) -> anyhow::Result<Vec<String>> {
+    let stores: BTreeSet<&str> = store_bindings(manifest)?
+        .iter()
+        .map(|binding| binding.store_id)
+        .collect();
+    Ok(std::iter::once(script_revision_key(&manifest.script_name))
+        .chain(stores.into_iter().map(store_revision_key))
+        .collect())
+}
+
 /// The decrypted secrets of a script.
 #[derive(Default)]
 pub struct ScriptSecrets {

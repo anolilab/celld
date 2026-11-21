@@ -138,6 +138,9 @@ pub struct DeploymentGraph {
     /// compares it with the pointer it reads next, so a pointer that moves
     /// only a co-hosted script still reads as a new deployment.
     pub components: BTreeMap<String, ComponentPointer>,
+    /// The secrets revision of every script and store this graph loaded,
+    /// by scope key, as that pointer held it.
+    pub secrets_revisions: BTreeMap<String, Option<String>>,
 }
 
 impl DeploymentGraph {
@@ -149,6 +152,7 @@ impl DeploymentGraph {
             primary,
             cohosted: Vec::new(),
             components: BTreeMap::new(),
+            secrets_revisions: BTreeMap::new(),
         }
     }
 
@@ -197,6 +201,7 @@ impl DeploymentGraph {
         with_queues: bool,
     ) -> anyhow::Result<Self> {
         let components = pointer.components.clone();
+        let revisions = pointer.secrets_revisions.clone();
         let primary = fleet::load_primary_worker(bucket, pointer.clone(), node.clone()).await?;
         let primary_script = primary.script_name.clone();
         let mut loaded_scripts = BTreeMap::from([(primary_script.clone(), primary.prefix.clone())]);
@@ -294,10 +299,16 @@ impl DeploymentGraph {
             }
             cohosted.push(loaded);
         }
+        let secrets_revisions = std::iter::once(&primary)
+            .chain(&cohosted)
+            .flat_map(|loaded| &loaded.secret_scopes)
+            .map(|scope| (scope.clone(), revisions.get(scope).cloned()))
+            .collect();
         Ok(Self {
             primary,
             cohosted,
             components,
+            secrets_revisions,
         })
     }
 }
@@ -362,6 +373,8 @@ pub struct Generation {
     pub(crate) script_name: String,
     /// The component map of the pointer this generation was built from.
     pub(crate) components: BTreeMap<String, ComponentPointer>,
+    /// The revision of each secrets scope this generation loaded, at build.
+    pub(crate) secrets_revisions: BTreeMap<String, Option<String>>,
     pub(crate) stateless: crate::runtime::StatelessRuntime,
     pub(crate) services: HashMap<String, crate::runtime::StatelessRuntime>,
     pub(crate) cell_configs: HashMap<String, Arc<WorkerConfig>>,
@@ -396,11 +409,13 @@ impl Generation {
     }
 
     /// Whether `pointer` selects the deployments this generation was built
-    /// from, the primary script and every component.
+    /// from, the primary script and every component, with unchanged secrets
+    /// revisions for every script and store it loaded.
     pub fn is_selected_by(&self, pointer: &DeployPointer) -> bool {
         pointer.version == self.version
             && pointer.prefix == self.prefix
             && pointer.components == self.components
+            && pointer.secrets_unchanged(&self.secrets_revisions)
     }
 
     /// The primary script: the one ingress serves and whose assets ingress
@@ -625,6 +640,7 @@ impl Generation {
             primary,
             cohosted,
             components,
+            secrets_revisions,
         } = graph;
         crate::runtime::init_engine();
 
@@ -791,6 +807,7 @@ impl Generation {
             prefix,
             script_name: primary_script,
             components,
+            secrets_revisions,
             stateless,
             services: service_pools,
             cell_configs,

@@ -123,6 +123,30 @@ async fn serving_pair(fleet: &Fleet) {
 }
 
 #[tokio::test]
+async fn a_deploy_or_activation_keeps_the_secrets_revisions() {
+    let fleet = fleet();
+    serving_pair(&fleet).await;
+    crate::deploy::bump_secrets_revision(&fleet.bucket, "script:front")
+        .await
+        .expect("bump");
+    let (before, _) = fleet_pointer(&fleet).await;
+    assert_eq!(before.secrets_revisions.len(), 1);
+    let graph = DeploymentGraph::load_pointer(&fleet.bucket, before.clone(), "node".to_string())
+        .await
+        .expect("load the graph");
+
+    // The same code again, and an activation of the version already serving:
+    // the same deployment, so a running generation has nothing to rebuild.
+    deploy(&fleet, "front", "v1", &[("BACK", "back")], true).await;
+    activate(&fleet.bucket, &[target("back", "v1")], None)
+        .await
+        .expect("activate");
+    let (after, _) = fleet_pointer(&fleet).await;
+    assert_eq!(after.secrets_revisions, before.secrets_revisions);
+    assert!(after.secrets_unchanged(&graph.secrets_revisions));
+}
+
+#[tokio::test]
 async fn no_activate_moves_no_pointer() {
     let fleet = fleet();
     serving_pair(&fleet).await;

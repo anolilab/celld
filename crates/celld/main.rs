@@ -923,7 +923,7 @@ fn start_pointer_watcher(
                             if !request.force
                                 && failed_pointer
                                     .as_ref()
-                                    .is_some_and(|failed| failed.selects_same(&pointer)) =>
+                                    .is_some_and(|failed| failed.same_build(&pointer)) =>
                         {
                             remembered.clone()
                         }
@@ -4284,6 +4284,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         .collect(),
                     version_metadata: None,
                     secret_stores: Vec::new(),
+                    secret_scopes: Vec::new(),
                     hyperdrive: Vec::new(),
                     ai_binding: None,
                     assets: None,

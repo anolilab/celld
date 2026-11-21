@@ -4,12 +4,13 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use base64::Engine as _;
 use celld::secrets::{self, SecretsKey};
 use serde_json::Value;
 
-use super::harness::{client, host_runtime, Server};
+use super::harness::{client, host_runtime, wait_until, Server};
 
 const PLANTED: &str = "planted-secret-value-7f3a9c";
 
@@ -20,17 +21,46 @@ fn key_text() -> String {
 /// Put `NAME=value` into the dev store of `server`, as `celld secret put` does
 /// against a fleet bucket. The CLI cannot reach `celld dev`'s local store.
 async fn put(server: &Server, name: &str, value: &str) {
+    write(server, name, Some(value), None).await;
+}
+
+/// As `put`, then tell running nodes the way `celld secret put` does.
+async fn put_and_announce(server: &Server, name: &str, value: &str) {
+    write(
+        server,
+        name,
+        Some(value),
+        Some(secrets::script_revision_key("secrets")),
+    )
+    .await;
+}
+
+/// `put` of `value`, or `delete` when it is `None`, then the revision bump of
+/// the scope key `announce` names, if any.
+async fn write(server: &Server, name: &str, value: Option<&str>, announce: Option<String>) {
     let database = std::fs::canonicalize(server.project().join(".celld/dev"))
         .expect("resolve the dev state directory")
         .join("objects.sqlite3");
-    let (name, value) = (name.to_string(), value.to_string());
+    let (name, value) = (name.to_string(), value.map(str::to_string));
     host_runtime()
         .spawn(async move {
             let bucket = celld::dev::open_local_bucket(&database).expect("open the dev store");
             let key = SecretsKey::parse(&key_text()).expect("a valid key");
-            secrets::put(&bucket, &key, "secrets", &name, &value, &BTreeSet::new())
-                .await
-                .expect("put the secret");
+            match value {
+                Some(value) => {
+                    secrets::put(&bucket, &key, "secrets", &name, &value, &BTreeSet::new())
+                        .await
+                        .expect("put the secret");
+                }
+                None => secrets::delete(&bucket, "secrets", &name)
+                    .await
+                    .expect("delete the secret"),
+            }
+            if let Some(scope) = announce {
+                celld::deploy::bump_secrets_revision(&bucket, &scope)
+                    .await
+                    .expect("bump the secrets revision");
+            }
         })
         .await
         .expect("the put task finished");
@@ -130,4 +160,118 @@ async fn a_broken_key_file_does_not_stop_a_script_without_secrets() {
     let served: Value = server.get_json("/").await;
     assert_eq!(served["token"], Value::Null);
     assert_eq!(served["plain"], "plain");
+}
+
+/// A short poll interval, and no reload call anywhere below.
+const POLL: (&str, &str) = ("CELLD_DEPLOY_POLL_S", "1");
+
+#[tokio::test]
+async fn a_put_reaches_a_running_node_within_a_poll_without_a_reload() {
+    let key = key_text();
+    let server = Server::start("secrets", &[("CELLD_SECRETS_KEY", key.as_str()), POLL]).await;
+    put(&server, "API_TOKEN", "old-value").await;
+    let (status, reply) = reload(&server).await;
+    assert_eq!(status, 200, "{reply}");
+    let before: Value = server.get_json("/").await;
+    assert_eq!(before["token"], "old-value");
+
+    put_and_announce(&server, "API_TOKEN", "new-value").await;
+
+    wait_until(
+        "the node serves the new secret",
+        Duration::from_secs(20),
+        || async {
+            let served: Value = server.get_json("/").await;
+            (served["token"] == "new-value").then_some(())
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_failed_build_is_retried_after_a_put_changes_the_revision() {
+    let key = key_text();
+    let server = Server::start("secrets", &[("CELLD_SECRETS_KEY", key.as_str()), POLL]).await;
+    // `PLAIN` is a variable of the Worker, so a secret of that name clashes
+    // and the load is refused. The node keeps serving the old generation.
+    put_and_announce(&server, "PLAIN", "clash").await;
+    let (status, reply) = reload(&server).await;
+    assert_eq!(status, 422, "{reply}");
+    // Let the watcher try and remember the failure.
+    wait_until(
+        "the watcher records the failed build",
+        Duration::from_secs(20),
+        || async {
+            server
+                .log_text()
+                .contains("deployment_adoption_failed")
+                .then_some(())
+        },
+    )
+    .await;
+
+    // Remove the clash and add a secret the Worker can read. The watcher must
+    // build again, though the deployment is the one that failed.
+    write(&server, "PLAIN", None, None).await;
+    put_and_announce(&server, "API_TOKEN", "fixed").await;
+    wait_until(
+        "the node serves the fixed build",
+        Duration::from_secs(20),
+        || async {
+            let served: Value = server.get_json("/").await;
+            (served["token"] == "fixed").then_some(())
+        },
+    )
+    .await;
+}
+
+async fn generation(server: &Server) -> u64 {
+    let state: Value = server
+        .internal_get("/state")
+        .await
+        .send()
+        .await
+        .expect("GET /state")
+        .json()
+        .await
+        .expect("the state body");
+    state["deployment"]["generation"]
+        .as_u64()
+        .expect("a generation id")
+}
+
+#[tokio::test]
+async fn a_put_for_a_scope_the_node_does_not_serve_rebuilds_nothing() {
+    let key = key_text();
+    let server = Server::start("secrets", &[("CELLD_SECRETS_KEY", key.as_str()), POLL]).await;
+    let before = generation(&server).await;
+
+    // Another script and a store no served Worker binds.
+    write(
+        &server,
+        "OTHER",
+        Some("x"),
+        Some(secrets::script_revision_key("unrelated")),
+    )
+    .await;
+    write(
+        &server,
+        "OTHER",
+        Some("x"),
+        Some(secrets::store_revision_key("nobody")),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        generation(&server).await,
+        before,
+        "a rebuild moved the generation"
+    );
+
+    // The watcher is alive: a put for the served script does rebuild.
+    put_and_announce(&server, "API_TOKEN", "served").await;
+    wait_until("the generation moves", Duration::from_secs(20), || async {
+        (generation(&server).await != before).then_some(())
+    })
+    .await;
 }
