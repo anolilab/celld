@@ -78,17 +78,15 @@ pub(super) fn build_project(
 /// A queue has one attachment, and a new consumer cannot take it while another
 /// script holds it. So the queues that a project drops and another takes are
 /// released first, for every project of `batch`, with no pointer moved. In a
-/// hand-over a failed write after that gives each released queue back to the
-/// script that held it, at the deployment it held it at, unless a written
-/// project has taken it; if that fails too, the error says the queue is left
-/// without a consumer until the next reload.
+/// hand-over a refused write after that leaves the queue without a consumer
+/// until the next reload; the version each script serves is unchanged.
 ///
 /// At the start of a run, `first_start`, the primary goes first so that a store
 /// that another run left with a different primary, or none, ends with this
 /// one, and the others join its component map. In a reload the primary is
 /// already the one the node serves, so it goes last: a refusal that only the
 /// write can find then never moves what the primary serves.
-pub(super) async fn write_projects(
+async fn write_projects(
     bucket: &crate::bucket::Bucket,
     rebuilt: &[(usize, deploy::Built)],
     batch: &[&Manifest],
@@ -97,47 +95,13 @@ pub(super) async fn write_projects(
     for (_, built) in rebuilt {
         deploy::check_write(bucket, built, batch).await?;
     }
-    let mut released = Vec::new();
-    let Err(error) = release_and_write(bucket, rebuilt, batch, first_start, &mut released).await
-    else {
-        return Ok(());
-    };
-    let failed = deploy::restore_queue_consumers(bucket, &released).await;
-    if failed.is_empty() {
-        return Err(error);
-    }
-    for (queue, reason) in &failed {
-        tracing::warn!(
-            queue,
-            "could not give the queue back to its consumer: {reason:#}"
-        );
-    }
-    let queues = failed
-        .iter()
-        .map(|(queue, _)| format!("{queue:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(error.context(format!(
-        "queue {queues} is left without a consumer until the next reload"
-    )))
-}
-
-/// The releases and writes of [`write_projects`]; `released` holds what was
-/// released, also when a later step fails.
-async fn release_and_write(
-    bucket: &crate::bucket::Bucket,
-    rebuilt: &[(usize, deploy::Built)],
-    batch: &[&Manifest],
-    first_start: bool,
-    released: &mut Vec<deploy::ReleasedQueue>,
-) -> anyhow::Result<()> {
     let taken = batch
         .iter()
         .flat_map(|manifest| &manifest.queue_consumers)
         .map(|consumer| consumer.queue.clone())
         .collect::<BTreeSet<_>>();
     for manifest in batch {
-        deploy::release_queue_consumers(bucket, manifest, batch, &taken, released).await?;
+        deploy::release_queue_consumers(bucket, manifest, batch, &taken).await?;
     }
     let (primary, others): (Vec<_>, Vec<_>) = rebuilt.iter().partition(|(index, _)| *index == 0);
     let order = if first_start {

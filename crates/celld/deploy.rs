@@ -1141,90 +1141,25 @@ pub async fn check_write(
     prepare_refusals(bucket, built, batch).await.map(drop)
 }
 
-/// A queue consumer attachment that [`release_queue_consumers`] cleared, as it
-/// was before, for [`restore_queue_consumers`].
-pub struct ReleasedQueue {
-    key: String,
-    previous: QueueConsumerAttachment,
-}
-
-impl ReleasedQueue {
-    pub fn queue(&self) -> &str {
-        &self.previous.queue
-    }
-}
-
 /// Release the queues that `manifest` no longer consumes and that are in
 /// `taken`, those another script of the same run consumes now. Only the queue
 /// consumer attachments change: no pointer moves and nothing is uploaded, so
 /// the version the script serves stays as it is. A run that hands a queue from
 /// one script to another releases first, since a queue has one attachment and
-/// the new consumer cannot take it while another script holds it. Each queue
-/// that was released is added to `released`, also when a later one fails.
+/// the new consumer cannot take it while another script holds it.
 pub async fn release_queue_consumers(
     bucket: &Bucket,
     manifest: &Manifest,
     batch: &[&Manifest],
     taken: &BTreeSet<String>,
-    released: &mut Vec<ReleasedQueue>,
 ) -> anyhow::Result<()> {
     let states = prepare_queue_attachments(bucket, manifest, batch)
         .await?
         .into_iter()
-        .filter(|state| !state.desired && taken.contains(&state.queue));
-    for state in states {
-        let Some(previous) = state.current.clone().filter(|attachment| {
-            attachment
-                .consumer
-                .as_ref()
-                .is_some_and(|owner| owner.script_name == manifest.script_name)
-        }) else {
-            continue;
-        };
-        let key = state.key.clone();
-        // Only a released queue is published, so the prefix is not read.
-        publish_queue_attachments(bucket, manifest, "", vec![state]).await?;
-        released.push(ReleasedQueue { key, previous });
-    }
-    Ok(())
-}
-
-/// Give the queues in `released` back to the script that held them, at the
-/// deployment it held them at, unless a script has taken one since. Best
-/// effort: the queues that could not be given back are returned with the
-/// error.
-pub async fn restore_queue_consumers(
-    bucket: &Bucket,
-    released: &[ReleasedQueue],
-) -> Vec<(String, anyhow::Error)> {
-    let mut failed = Vec::new();
-    for queue in released {
-        let restored = async {
-            let token = match bucket.get(&queue.key).await? {
-                Some((body, token)) => {
-                    let current: QueueConsumerAttachment = serde_json::from_slice(&body)
-                        .with_context(|| {
-                            format!("decode queue consumer attachment {}", queue.key)
-                        })?;
-                    if current.consumer.is_some() {
-                        return Ok(());
-                    }
-                    Some(token)
-                }
-                None => None,
-            };
-            let body = serde_json::to_vec_pretty(&queue.previous)?;
-            match bucket.put_cas(&queue.key, body, token.as_deref()).await? {
-                Some(_) => Ok(()),
-                None => bail!("another write changed {} first", queue.key),
-            }
-        }
-        .await;
-        if let Err(error) = restored {
-            failed.push((queue.queue().to_string(), error));
-        }
-    }
-    failed
+        .filter(|state| !state.desired && taken.contains(&state.queue))
+        .collect();
+    // Only released queues are published, so the prefix is not read.
+    publish_queue_attachments(bucket, manifest, "", states).await
 }
 
 async fn prepare_refusals(

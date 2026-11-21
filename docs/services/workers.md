@@ -345,9 +345,8 @@ them.
   A reload judges the queues as it leaves them, so it can move a consumer from
   one project to another, also from a project that nothing reaches any more: the
   queue is released first, then the other project takes it. The release moves
-  no pointer. If a later write fails, the released queues go back to the
-  project that held them; only if that fails too does the error say that the
-  queue has no consumer until the next reload.
+  no pointer, so if the later write is refused, the queue has no consumer until
+  the next reload, and each project still serves the version it did.
 - Cron triggers run for the first project only, as for any fleet.
 - The local state, and the `--state-dir` hash, are the first project's.
   `celld d1 --local` reads them and supports only the databases of the first
