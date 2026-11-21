@@ -68,14 +68,18 @@ async fn reported(server: &Server, query: &str, raw: String) -> String {
     let (status, body) = post(server, query, raw.into_bytes()).await;
     match status {
         550 => body["reason"].as_str().unwrap().to_string(),
-        200 => client()
-            .get(server.url("/__report"))
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap(),
+        200 => {
+            let report = client()
+                .get(server.url("/__report"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(!report.is_empty(), "the handler reported nothing: {body}");
+            report
+        }
         _ => panic!("{status}: {body}"),
     }
 }
@@ -728,6 +732,17 @@ async fn a_streamed_reply_that_would_send_after_the_550_is_refused() {
     // has answered 550: the relay bounces the message, so nothing may go out.
     let (status, body) = post_mode(&server, "wait-reply-then-reject").await;
     assert_eq!(status, 550, "{body}");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(sink.delivered().is_empty(), "{:?}", sink.transactions());
+}
+
+#[tokio::test]
+async fn a_streamed_reply_that_would_send_after_the_500_is_refused() {
+    let sink = Sink::start(Behaviour::default()).await;
+    let server = start(&sink, "inbound-email").await;
+    // The relay retries a 500, so a reply that went out after it would be sent twice.
+    let (status, body) = post_mode(&server, "wait-reply-then-throw").await;
+    assert_eq!(status, 500, "{body}");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     assert!(sink.delivered().is_empty(), "{:?}", sink.transactions());
 }

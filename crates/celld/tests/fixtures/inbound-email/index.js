@@ -22,6 +22,7 @@
 //   forward-then-reject  forwards to team@example.net, then calls setReject
 //   wait-reply-then-reject  starts a streamed raw reply in waitUntil (its bytes arrive after
 //               0.6 s, when the route has answered), then calls setReject at once
+//   wait-reply-then-throw  the same, then throws
 //   nested-missing  calls an entrypoint of this script that has no fetch()
 //   late        tries to reject the message after the handler returned
 //   throw       throws
@@ -50,6 +51,7 @@ export default {
   },
 
   async email(message, env, ctx) {
+    lastReport = "";
     const subject = message.headers.get("subject") ?? "";
     switch (message.headers.get("x-mode")) {
       case "echo": {
@@ -211,6 +213,27 @@ export default {
         );
         message.setReject("after starting the reply");
         return;
+      case "wait-reply-then-throw":
+        ctx.waitUntil(
+          message.reply(
+            new EmailMessage(
+              message.to,
+              message.from,
+              new ReadableStream({
+                async start(controller) {
+                  await new Promise((resolve) => setTimeout(resolve, 600));
+                  controller.enqueue(
+                    new TextEncoder().encode(
+                      `From: ${message.to}\r\nTo: ${message.from}\r\nSubject: Re\r\n\r\nraw reply\r\n`,
+                    ),
+                  );
+                  controller.close();
+                },
+              }),
+            ),
+          ),
+        );
+        throw new Error("after starting the reply");
       case "nested-missing":
         await ctx.exports.NoFetch.fetch("http://nested/");
         return;

@@ -155,10 +155,12 @@ fn prepare_reply(
 ) -> Result<Prepared, EmailError> {
     match (call.kind.as_str(), call.from, call.to, call.message, raw) {
         ("raw", Some(from), Some(to), None, Some(raw)) => {
+            event.threading()?;
             event.take_reply()?;
             event.prepare_reply_raw(&from, &to, &raw)
         }
         ("builder", None, None, Some(message), None) => {
+            event.threading()?;
             event.take_reply()?;
             event.prepare_reply_builder(message)
         }
@@ -231,6 +233,24 @@ mod tests {
             to: None,
             message,
         }
+    }
+
+    #[test]
+    fn a_reply_with_nothing_to_thread_on_does_not_use_up_the_reply() {
+        let raw =
+            "From: ann@example.org\r\nTo: bob@example.com\r\nMessage-ID: <caf\u{e9}@x>\r\n\r\nhi";
+        let event = Event::new(
+            &mut parse(
+                raw.as_bytes().to_vec(),
+                Some("ann@example.org"),
+                Some("bob@example.com"),
+            )
+            .unwrap(),
+        );
+        let message = serde_json::json!({ "from": "bob@example.com", "subject": "s", "text": "t" });
+        let error = prepare_reply(&event, call("builder", Some(message)), None).unwrap_err();
+        assert_eq!(error.code, "E_FIELD_MISSING");
+        event.check_reply_open().unwrap();
     }
 
     #[test]
