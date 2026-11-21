@@ -1955,8 +1955,6 @@ fn entry_text<'a>(
     }
 }
 
-/// The binding name of a config key that declares one env binding and nothing
-/// else, as `{ "binding": "NAME" }`. `None` when the key is absent.
 /// The names in the config's `secrets.required`, in the order written, or
 /// `None` without the field. Each follows the rules of `celld secret put`.
 pub(crate) fn required_secrets(
@@ -2003,6 +2001,8 @@ pub(crate) fn limit_to_required(
         .collect()
 }
 
+/// The binding name of a config key that declares one env binding and nothing
+/// else, as `{ "binding": "NAME" }`. `None` when the key is absent.
 fn single_binding<'a>(
     object: &'a serde_json::Map<String, Value>,
     key: &str,
