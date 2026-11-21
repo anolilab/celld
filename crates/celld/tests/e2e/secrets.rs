@@ -347,6 +347,16 @@ async fn a_node_refuses_to_start_on_a_broken_previous_key() {
     let file = file.to_str().expect("a UTF-8 path");
     // A well-formed previous key starts the node.
     Server::start("secrets", &[("CELLD_SECRETS_KEY_PREVIOUS_FILE", file)]).await;
+    // A current key file read only at the first load with secrets (not yet
+    // mounted here) does not stop a node with a previous key from starting.
+    Server::start(
+        "secrets",
+        &[
+            ("CELLD_SECRETS_KEY_FILE", missing),
+            ("CELLD_SECRETS_KEY_PREVIOUS_FILE", file),
+        ],
+    )
+    .await;
     let current = key_text();
     let cases: [&[(&str, &str)]; 4] = [
         &[("CELLD_SECRETS_KEY_PREVIOUS_FILE", missing)],

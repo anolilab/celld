@@ -145,7 +145,10 @@ impl SecretsKey {
         let Some(previous) = Self::previous_from_environment()? else {
             return Ok(());
         };
-        if let Some(current) = Self::from_environment()? {
+        // The current key's file may be read only at the first load with
+        // secrets (a mount can come later), so an unreadable one is left to
+        // that load, which checks the pair again.
+        if let Ok(Some(current)) = Self::from_environment() {
             ensure_distinct_ids(previous, current)?;
         }
         Ok(())
@@ -282,10 +285,11 @@ impl Keys<'static> {
         let Some(current) = SecretsKey::from_environment()? else {
             return Ok(None);
         };
-        Ok(Some(Self {
-            current,
-            previous: SecretsKey::previous_from_environment()?,
-        }))
+        let previous = SecretsKey::previous_from_environment()?;
+        if let Some(previous) = previous {
+            ensure_distinct_ids(previous, current)?;
+        }
+        Ok(Some(Self { current, previous }))
     }
 }
 

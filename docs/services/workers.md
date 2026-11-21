@@ -184,7 +184,11 @@ in this order:
 
 From step 1 every `put` seals under the new key, so a new object can no longer
 appear under the old key. A `put` into an object that is still under the old
-key is refused until `rotate` reaches it, and works after.
+key is refused until `rotate` reaches it, and works after. `rotate` does not
+change what the fleet pointer selects, so a node that was given the new key
+without the previous one, and failed to load a Worker whose secrets were still
+under the old key, keeps serving its old generation after the run: reload it
+(`POST /reload`) or restart it.
 
 A run that stops resumes when you run it again: an object whose entries are all
 under the current key is skipped. An entry sealed under neither key stops the
