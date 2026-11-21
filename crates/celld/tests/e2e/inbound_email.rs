@@ -618,6 +618,22 @@ async fn a_forward_in_flight_at_the_deadline_is_waited_for_and_answers_200() {
 }
 
 #[tokio::test]
+async fn a_handler_that_fails_with_a_forward_in_flight_waits_for_it_and_answers_200() {
+    // The forward runs in waitUntil against a relay that takes 2.5 s, and the
+    // handler throws at once. A 500 would have the relay post the message
+    // again while the first forward is accepted.
+    let sink = Sink::start(Behaviour::slow(std::time::Duration::from_millis(2500))).await;
+    let server = start(&sink, "inbound-email").await;
+    let (status, body) = post_mode(&server, "forward-wait-throw").await;
+    assert_eq!(
+        (status, &body["outcome"]),
+        (200, &Value::from("accepted")),
+        "{body}"
+    );
+    assert_eq!(sink.delivered().len(), 1, "{:?}", sink.transactions());
+}
+
+#[tokio::test]
 async fn an_upload_that_stalls_is_cut_off_and_does_not_hold_a_place() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let sink = Sink::start(Behaviour::default()).await;

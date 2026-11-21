@@ -303,7 +303,7 @@ retry:
 | --- | --- | --- |
 | 200 | `{"ok":true,"outcome":"accepted"}` | The handler returned, or it threw or ran past the deadline after a `forward()` or `reply()` the relay had already accepted, or accepts while the deadline passes (see 504; the failure is logged with the message's id). Accept the message: a retry would send that mail again |
 | 550 | `{"ok":false,"outcome":"rejected","reason":"..."}` | The handler called `setReject()`. Bounce with a permanent failure and `reason` (printable ASCII, at most 200 characters, so it is safe in an SMTP reply line) |
-| 500 | `{"ok":false,"outcome":"error","error":"..."}` | The handler threw before it sent anything. Treat it as temporary and retry |
+| 500 | `{"ok":false,"outcome":"error","error":"..."}` | The handler threw before the relay accepted anything. Sends it left running in `waitUntil` are waited for first (each bounded by its own SMTP transaction deadline), and if the relay accepts one the answer is 200 instead. Treat it as temporary and retry |
 | 501 | `{"ok":false,"outcome":"no_handler",...}` | The primary Worker has no `email()` handler. Treat it as temporary: the operator can deploy one |
 | 504 | | The handler did not finish within 60 seconds (`CELLD_EMAIL_INBOUND_DEADLINE_S`). At the deadline no new `forward()` or `reply()` starts (it is refused with `E_TIMEOUT`), and one already talking to the relay is waited for, for as long as its own SMTP transaction allows. The rest of the event is then cancelled, as one whose client hung up is, and gives its place back. The answer is 200 if the relay accepted a send of the event, and 504 otherwise. Temporary, and the retry runs the handler again |
 | 408 | | The message was not received within the same time. Temporary |

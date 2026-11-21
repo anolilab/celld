@@ -932,12 +932,19 @@ pub async fn handle(
     };
     // The handler is done: what it left in `waitUntil` is not cancelled.
     giveup.disarm();
-    after_delivery(answer(outcome), &sends.delivered, message_id.as_deref())
+    let answered = answer(outcome);
+    // A handler that failed may have left a send in `waitUntil` talking to the
+    // relay; it is waited for, since a 500 makes the relay post the message
+    // again. A success is not held back for it: that 200 stands.
+    if answered.0 == 500 {
+        sends.settle().await;
+    }
+    after_delivery(answered, &sends.delivered, message_id.as_deref())
 }
 
 /// A handler that failed or timed out after the relay accepted a message it
-/// forwarded or replied to (a send still in flight at the deadline counts once
-/// the relay has answered it) has still delivered it, and a retry would send it
+/// forwarded or replied to (a send still in flight when the handler failed or
+/// the deadline passed counts once the relay has answered it) has still delivered it, and a retry would send it
 /// again: the route answers 200 and logs the failure.
 fn after_delivery(
     answered: (u16, String),
