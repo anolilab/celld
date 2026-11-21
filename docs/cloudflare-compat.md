@@ -30,7 +30,7 @@ An unsupported feature that does not cause an error is a defect.
 | [D1](services/d1.md) | **Yes** |
 | [Workflows](services/workflows.md) | **Yes** |
 | [R2](services/r2.md) | **Yes** |
-| [Worker secrets](services/workers.md#secrets) | **Partial** — `celld secret` stores them encrypted under a secrets key; no key rotation yet, and a change reaches a node at its next deployment load |
+| [Worker secrets](services/workers.md#secrets) | **Yes** — `celld secret` stores them encrypted under a secrets key, and a change reaches the nodes within a poll interval; the key can be rotated, and `secrets.required` makes a deploy, an activation and a node load refuse a script that lacks one. Config is JSON or JSONC, not `wrangler.toml` |
 | [Secrets Store](services/workers.md#secrets-store) | **Yes** — a `secrets_store_secrets` binding reads a store that `celld secret --store` fills; the store is the fleet bucket's, not an account's |
 | [Workers AI](services/workers-ai.md) | **Partial** — `env.AI.run()` for text generation and embeddings, served by an OpenAI-compatible endpoint the operator configures |
 | Vectorize | **No** |
@@ -490,8 +490,8 @@ The accepted top-level keys:
 - `assets`, `services`, `triggers`, and `vars`
 - `d1_databases`, `kv_namespaces`, `queues`, `ratelimits`, `send_email`,
   `workflows`, and `r2_buckets`
-- `worker_loaders`, `version_metadata`, `secrets_store_secrets`, `hyperdrive`, `ai`, and
-  `containers`
+- `worker_loaders`, `version_metadata`, `secrets_store_secrets`, `secrets` (only
+  `required`), `hyperdrive`, `ai`, and `containers`
 - `define` and `rules`
 
 Any other top-level key, including `routes`, stops the deployment.

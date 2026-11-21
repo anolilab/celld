@@ -68,6 +68,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "worker_loaders",
     "version_metadata",
     "secrets_store_secrets",
+    "secrets",
     "hyperdrive",
     "ai",
     "containers",
@@ -1141,6 +1142,8 @@ async fn prepare_refusals(
     // A Secrets Store binding names a secret its store must already hold, so
     // a missing one is the deploy's error and not a Worker's first `get()`.
     crate::secrets::ensure_store_secrets(bucket, &built.manifest, true).await?;
+    // A secret the config lists in `secrets.required` must already be put.
+    crate::secrets::ensure_required(bucket, &built.manifest).await?;
     // A Hyperdrive binding needs its connection string as a secret of the
     // script, put before the deploy.
     crate::hyperdrive::ensure_connection_strings(bucket, &built.manifest, true).await?;
@@ -1954,6 +1957,52 @@ fn entry_text<'a>(
 
 /// The binding name of a config key that declares one env binding and nothing
 /// else, as `{ "binding": "NAME" }`. `None` when the key is absent.
+/// The names in the config's `secrets.required`, in the order written, or
+/// `None` without the field. Each follows the rules of `celld secret put`.
+pub(crate) fn required_secrets(
+    object: &serde_json::Map<String, Value>,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let declaration = match object.get("secrets") {
+        None => return Ok(None),
+        Some(Value::Object(declaration)) => declaration,
+        Some(_) => bail!("config `secrets` must be an object with a `required` list"),
+    };
+    if let Some(option) = declaration
+        .keys()
+        .find(|option| option.as_str() != "required")
+    {
+        bail!("`secrets` sets `{option}`, which is not a supported option");
+    }
+    let list = match declaration.get("required") {
+        None => return Ok(None),
+        Some(Value::Array(list)) => list,
+        Some(_) => bail!("`secrets` `required` must be an array of secret names"),
+    };
+    let mut names = Vec::with_capacity(list.len());
+    for name in list {
+        let name = name
+            .as_str()
+            .ok_or_else(|| anyhow!("`secrets` `required` must hold strings"))?;
+        crate::secrets::check_secret_name(name)?;
+        if names.iter().any(|seen| seen == name) {
+            bail!("`secrets` `required` lists {name} twice");
+        }
+        names.push(name.to_string());
+    }
+    Ok(Some(names))
+}
+
+/// The entries of `.dev.vars` or a dotenv file that `required` lists.
+pub(crate) fn limit_to_required(
+    required: &[String],
+    entries: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    required
+        .iter()
+        .filter_map(|name| Some((name.clone(), entries.get(name)?.clone())))
+        .collect()
+}
+
 fn single_binding<'a>(
     object: &'a serde_json::Map<String, Value>,
     key: &str,
@@ -2738,6 +2787,51 @@ fn read_project(
     // `.dev.vars` or `.env` beside it is residue, not a binding the guard below
     // should refuse in the config's name.
     let declared_vars = !vars.is_empty();
+    let required_secrets = required_secrets(object)?;
+    if let Some(required) = &required_secrets {
+        if main.is_none() && !required.is_empty() {
+            bail!("an asset-only project cannot require secrets");
+        }
+        // A secret is bound as `env.NAME`, so a var or binding of the same
+        // name would shadow it. The config's own names only: a `.dev.vars`
+        // entry of that name is the secret itself.
+        let taken = bindings
+            .iter()
+            .filter_map(|binding| binding.get("name").and_then(Value::as_str))
+            .chain(vars.keys().copied())
+            .chain(
+                assets
+                    .as_ref()
+                    .and_then(|assets| assets.config.binding.as_deref()),
+            )
+            .collect::<BTreeSet<_>>();
+        if let Some(name) = required.iter().find(|name| taken.contains(name.as_str())) {
+            bail!(
+                "`secrets` `required` lists {name}, which a var or binding of the config \
+                 already uses; rename one of them"
+            );
+        }
+    }
+    // `celld dev` takes only the listed keys from `.dev.vars` and the dotenv
+    // files, and warns for each one they lack.
+    let for_dev = !matches!(overrides, VarOverrides::None);
+    let limited = match (&required_secrets, overrides) {
+        (Some(required), VarOverrides::DevVars(entries) | VarOverrides::DotEnv(entries)) => {
+            let listed = limit_to_required(required, entries);
+            for name in required.iter().filter(|name| !listed.contains_key(*name)) {
+                note!(
+                    "warning: `secrets.required` lists {name}, which .dev.vars and the dotenv \
+                     files do not set"
+                );
+            }
+            Some(match overrides {
+                VarOverrides::DevVars(_) => VarOverrides::DevVars(listed),
+                _ => VarOverrides::DotEnv(listed),
+            })
+        }
+        _ => None,
+    };
+    let overrides = limited.as_ref().unwrap_or(overrides);
     if main.is_some() {
         match overrides {
             VarOverrides::None => {}
@@ -2880,6 +2974,13 @@ fn read_project(
     }
     if let Some(flags) = object.get("compatibility_flags") {
         metadata.insert("compatibility_flags".into(), flags.clone());
+    }
+    // A deploy refuses, and a node refuses to load, a script that lacks a
+    // listed secret. `celld dev` takes the values from `.dev.vars` instead and
+    // only warns, so its deployment does not carry the requirement. Part of
+    // the version, like the compatibility flags: a changed list is a new one.
+    if let (Some(required), false) = (&required_secrets, for_dev) {
+        metadata.insert("secrets".into(), json!({ "required": required }));
     }
     metadata.insert("bindings".into(), Value::Array(bindings));
     if !tail_consumers.is_empty() {
@@ -4956,5 +5057,115 @@ mod secrets_revision_tests {
             let (body, _) = bucket.get(CURRENT_POINTER_KEY).await.unwrap().unwrap();
             assert_eq!(&body[..], unreadable);
         }
+    }
+}
+
+#[cfg(test)]
+mod secrets_required_config_tests {
+    use super::version_metadata_config_tests::{base, read};
+    use super::*;
+
+    fn required(extra: &str) -> Option<Value> {
+        read(&base(extra)).unwrap().metadata.get("secrets").cloned()
+    }
+
+    #[test]
+    fn the_list_is_recorded_in_the_manifest_metadata() {
+        let metadata = required(
+            r#"/* the credentials */ "secrets": { "required": ["API_KEY", "DB_PASSWORD",], },"#,
+        );
+        assert_eq!(
+            metadata,
+            Some(json!({ "required": ["API_KEY", "DB_PASSWORD"] }))
+        );
+        assert_eq!(required(r#""vars": { "A": "b" }"#), None);
+        assert_eq!(required(r#""secrets": {}"#), None);
+    }
+
+    #[test]
+    fn a_malformed_list_is_refused() {
+        for extra in [
+            r#""secrets": ["API_KEY"]"#,
+            r#""secrets": { "required": "API_KEY" }"#,
+            r#""secrets": { "required": [1] }"#,
+            r#""secrets": { "required": ["not valid"] }"#,
+            r#""secrets": { "required": ["1ST"] }"#,
+            r#""secrets": { "required": ["__proto__"] }"#,
+            r#""secrets": { "required": ["A", "A"] }"#,
+        ] {
+            assert!(read(&base(extra)).is_err(), "{extra}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_inside_secrets_is_refused() {
+        let error = read(&base(r#""secrets": { "required": [], "optional": ["A"] }"#))
+            .err()
+            .expect("refused");
+        assert!(
+            format!("{error:#}").contains("`secrets` sets `optional`"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_name_that_a_var_or_binding_uses_is_refused() {
+        for extra in [
+            r#""vars": { "API_KEY": "x" }, "secrets": { "required": ["API_KEY"] }"#,
+            r#""version_metadata": { "binding": "API_KEY" }, "secrets": { "required": ["API_KEY"] }"#,
+        ] {
+            let error = read(&base(extra)).err().expect("refused");
+            assert!(format!("{error:#}").contains("API_KEY"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn dev_takes_only_the_listed_keys_and_the_requirement_stays_out_of_the_deployment() {
+        let config = base(r#""secrets": { "required": ["LISTED", "ABSENT"] }"#);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
+        let path = dir.path().join("wrangler.jsonc");
+        std::fs::write(&path, config).unwrap();
+        let entries = BTreeMap::from([
+            ("LISTED".to_string(), "1".to_string()),
+            ("UNLISTED".to_string(), "2".to_string()),
+        ]);
+        for overrides in [
+            VarOverrides::DevVars(entries.clone()),
+            VarOverrides::DotEnv(entries.clone()),
+        ] {
+            let project = read_project(&path, dir.path(), &overrides, false).unwrap();
+            let names = crate::secrets::binding_names(&project.metadata);
+            assert!(names.contains("LISTED") && !names.contains("UNLISTED"));
+            assert!(project.metadata.get("secrets").is_none());
+        }
+        // Without the field every entry still becomes a var.
+        std::fs::write(&path, base("")).unwrap();
+        let project =
+            read_project(&path, dir.path(), &VarOverrides::DevVars(entries), false).unwrap();
+        let names = crate::secrets::binding_names(&project.metadata);
+        assert!(names.contains("LISTED") && names.contains("UNLISTED"));
+    }
+
+    #[test]
+    fn the_list_is_part_of_the_version() {
+        let version = |extra: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
+            let path = dir.path().join("wrangler.jsonc");
+            std::fs::write(&path, base(extra)).unwrap();
+            let options = options_from_arguments([
+                "--config".to_string(),
+                path.display().to_string(),
+                "--dry-run".to_string(),
+            ])
+            .unwrap()
+            .unwrap();
+            build(&options).unwrap().version
+        };
+        let plain = version("");
+        let one = version(r#""secrets": { "required": ["A"] }"#);
+        let two = version(r#""secrets": { "required": ["A", "B"] }"#);
+        assert!(plain != one && one != two);
     }
 }

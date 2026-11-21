@@ -378,3 +378,45 @@ async fn a_node_refuses_to_start_on_a_broken_previous_key() {
         );
     }
 }
+
+#[tokio::test]
+async fn dev_loads_only_the_listed_keys_and_warns_for_a_missing_one() {
+    let server = Server::start_with_files("secrets-required", &[], |project| {
+        std::fs::write(
+            project.join(".dev.vars"),
+            "LISTED=listed-value\nUNLISTED=unlisted-value\n",
+        )
+        .expect("write .dev.vars");
+    })
+    .await;
+    let served: Value = server.get_json("/").await;
+    assert_eq!(served["listed"], "listed-value", "{served}");
+    assert_eq!(served["unlisted"], Value::Null, "{served}");
+    assert_eq!(served["absent"], Value::Null, "{served}");
+    let log = server.log_text();
+    assert!(
+        log.contains("secrets.required") && log.contains("ABSENT"),
+        "no warning for the missing key: {log}"
+    );
+    assert!(
+        !log.contains("secrets.required` lists LISTED"),
+        "a present key is warned about: {log}"
+    );
+    assert!(!log.contains("listed-value") && !log.contains("unlisted-value"));
+}
+
+#[tokio::test]
+async fn dev_without_the_field_still_exposes_every_key() {
+    let server = Server::start_with_files("secrets", &[], |project| {
+        std::fs::write(
+            project.join(".dev.vars"),
+            "API_TOKEN=dev-token\nPLAIN=override\n",
+        )
+        .expect("write .dev.vars");
+    })
+    .await;
+    let served: Value = server.get_json("/").await;
+    assert_eq!(served["token"], "dev-token", "{served}");
+    assert_eq!(served["plain"], "override", "{served}");
+    assert!(!server.log_text().contains("secrets.required"));
+}

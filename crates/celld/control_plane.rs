@@ -1766,6 +1766,7 @@ pub async fn apply_deployment(
     // once. A `dev_value` mark in a managed manifest is not honoured.
     crate::secrets::ensure_no_clash(bucket, &deployment.manifest).await?;
     crate::secrets::ensure_store_secrets(bucket, &deployment.manifest, false).await?;
+    crate::secrets::ensure_required(bucket, &deployment.manifest).await?;
     crate::hyperdrive::ensure_connection_strings(bucket, &deployment.manifest, false).await?;
 
     let mut asset_files = 0_u32;

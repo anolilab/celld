@@ -192,7 +192,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         }
         Step::Delete(owner, name) => {
             match &owner {
-                Owner::Script(script) => secrets::delete(&bucket, script, &name).await?,
+                Owner::Script(script) => delete_script_secret(&bucket, script, &name).await?,
                 Owner::Store(store) => secrets::delete_store(&bucket, store, &name).await?,
             }
             let told = announce(
@@ -301,6 +301,18 @@ fn value_from_bytes(mut bytes: Vec<u8>) -> anyhow::Result<String> {
         secrets::MAX_VALUE_BYTES
     );
     String::from_utf8(bytes).map_err(|_| anyhow!("the value is not UTF-8"))
+}
+
+/// Delete `name` of `script`, unless the deployment the fleet serves requires it.
+pub(crate) async fn delete_script_secret(
+    bucket: &Bucket,
+    script: &str,
+    name: &str,
+) -> anyhow::Result<()> {
+    if let Some(manifest) = crate::deploy::current_manifest(bucket, script).await? {
+        secrets::ensure_not_required(script, name, &manifest.raw_metadata)?;
+    }
+    secrets::delete(bucket, script, name).await
 }
 
 /// The binding names of the deployment the fleet serves for `script`, or none
@@ -420,6 +432,10 @@ The secrets key is {} (base64, 32 bytes) or the file in {}.
 Every node and every `celld secret put` must use the same key, and celld never
 stores it in the bucket. A node refuses to load a deployment whose script has
 secrets when no key is set.
+
+A config can list secrets in `secrets.required`: `celld deploy` and `celld activate`
+refuse a version while one is not put, a node refuses to load it, and `delete` refuses
+a name that the selected deployment requires.
 
 A node reads a script's secrets when it loads a deployment. `put` and `delete`
 then set `secrets_revisions` for that script or store in `deploy/current.json`,

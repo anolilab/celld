@@ -479,6 +479,78 @@ async fn names_in(bucket: &Bucket, scope: Scope<'_>) -> anyhow::Result<Vec<Strin
         .unwrap_or_default())
 }
 
+/// Refuse a name that cannot be a script secret, by the rules `put` applies.
+pub(crate) fn check_secret_name(name: &str) -> anyhow::Result<()> {
+    Scope::Script("").check_name(name)
+}
+
+/// The secret names that the deployment's config lists in `secrets.required`.
+/// A manifest the config parser did not write can hold a malformed field; that
+/// is an error, not an empty list, so a requirement is never dropped silently.
+pub fn required_names(metadata: &serde_json::Value) -> anyhow::Result<BTreeSet<String>> {
+    let Some(declared) = metadata.get("secrets") else {
+        return Ok(BTreeSet::new());
+    };
+    let list = declared
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .context("the deployment's `secrets.required` is not a list")?;
+    list.iter()
+        .map(|name| {
+            let name = name
+                .as_str()
+                .context("the deployment's `secrets.required` holds a non-string")?;
+            check_secret_name(name)?;
+            Ok(name.to_string())
+        })
+        .collect()
+}
+
+/// Refuse when a required secret has no entry among `held`, naming every one.
+fn refuse_missing(
+    script: &str,
+    required: &BTreeSet<String>,
+    held: &BTreeSet<String>,
+) -> anyhow::Result<()> {
+    let missing = required.difference(held).cloned().collect::<Vec<_>>();
+    anyhow::ensure!(
+        missing.is_empty(),
+        "script {script} requires secrets that are not set: {}; set each with \
+         `celld secret put NAME --script {script}`",
+        missing.join(", ")
+    );
+    Ok(())
+}
+
+/// Refuse a deployment whose config lists a required secret that its script
+/// does not hold, so the failure is the deploy's and not a Worker's first use.
+/// Reads names only and needs no key.
+pub async fn ensure_required(bucket: &Bucket, manifest: &Manifest) -> anyhow::Result<()> {
+    let required = required_names(&manifest.raw_metadata)?;
+    if required.is_empty() || manifest.main_module.is_none() {
+        return Ok(());
+    }
+    let held = names(bucket, &manifest.script_name)
+        .await?
+        .into_iter()
+        .collect();
+    refuse_missing(&manifest.script_name, &required, &held)
+}
+
+/// Refuse to delete a secret that the script's selected deployment requires.
+pub fn ensure_not_required(
+    script: &str,
+    name: &str,
+    metadata: &serde_json::Value,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !required_names(metadata)?.contains(name),
+        "secret {name} is required by the deployment of script {script} (`secrets.required` \
+         in its config); deploy a version that no longer lists it before you delete it"
+    );
+    Ok(())
+}
+
 /// Refuse bindings that share a name. `build_env` installs every binding into
 /// one JavaScript object, so the one added last would silently replace the
 /// others; a Secrets Store binding and a var of the same name is the case a
@@ -708,7 +780,20 @@ pub async fn load<'k>(
         return Ok(ScriptSecrets::default());
     }
     let script = manifest.script_name.as_str();
-    let Some((set, _)) = read(bucket, Scope::Script(script)).await? else {
+    let required = required_names(&manifest.raw_metadata)?;
+    let set = read(bucket, Scope::Script(script))
+        .await?
+        .map(|(set, _)| set);
+    // Checked before the key is needed: a Worker never starts without a
+    // secret its config requires, and the old generation keeps serving.
+    refuse_missing(
+        script,
+        &required,
+        &set.iter()
+            .flat_map(|set| set.secrets.keys().cloned())
+            .collect(),
+    )?;
+    let Some(set) = set else {
         return Ok(ScriptSecrets::default());
     };
     if set.secrets.is_empty() {
@@ -1235,6 +1320,91 @@ mod tests {
             }));
         let error = ensure_no_clash(&bucket, &manifest).await.unwrap_err();
         assert!(format!("{error:#}").contains("must be unique"), "{error:#}");
+    }
+
+    fn requiring(names: &[&str]) -> Manifest {
+        let mut manifest = manifest(&[]);
+        manifest.raw_metadata["secrets"] = serde_json::json!({ "required": names });
+        manifest
+    }
+
+    #[tokio::test]
+    async fn a_missing_required_secret_is_refused_naming_every_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let key = key(3);
+        let manifest = requiring(&["B", "A", "C"]);
+        put(&bucket, &key, "app", "B", "v", &BTreeSet::new())
+            .await
+            .unwrap();
+        let text = format!(
+            "{:#}",
+            ensure_required(&bucket, &manifest).await.unwrap_err()
+        );
+        assert!(text.contains("not set: A, C"), "{text}");
+        assert!(!text.contains("not set: A, B") && text.contains("celld secret put"));
+        for name in ["A", "C"] {
+            put(&bucket, &key, "app", name, "v", &BTreeSet::new())
+                .await
+                .unwrap();
+        }
+        ensure_required(&bucket, &manifest).await.unwrap();
+        // A deployment without the field, or with no Worker, needs nothing.
+        ensure_required(&bucket, &requiring(&[])).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_node_refuses_to_load_a_deployment_that_lacks_a_required_secret() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let manifest = requiring(&["API_KEY"]);
+        // No object at all, and no key: the missing name is reported first.
+        let error = load(&bucket, &manifest, || Ok(None)).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not set: API_KEY"),
+            "{error:#}"
+        );
+        let key = key(3);
+        put(&bucket, &key, "app", "OTHER", "v", &BTreeSet::new())
+            .await
+            .unwrap();
+        let error = load(&bucket, &manifest, || Ok(Some(Keys::only(&key))))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not set: API_KEY"),
+            "{error:#}"
+        );
+        put(&bucket, &key, "app", "API_KEY", "v", &BTreeSet::new())
+            .await
+            .unwrap();
+        let loaded = load(&bucket, &manifest, || Ok(Some(Keys::only(&key))))
+            .await
+            .unwrap();
+        assert_eq!(loaded.env.len(), 2);
+    }
+
+    #[test]
+    fn a_secret_that_the_deployment_requires_cannot_be_deleted() {
+        let metadata = requiring(&["API_KEY"]).raw_metadata;
+        let error = ensure_not_required("app", "API_KEY", &metadata).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("secret API_KEY is required"),
+            "{error:#}"
+        );
+        ensure_not_required("app", "OTHER", &metadata).unwrap();
+        ensure_not_required("app", "API_KEY", &manifest(&[]).raw_metadata).unwrap();
+    }
+
+    #[test]
+    fn a_malformed_requirement_in_a_manifest_is_an_error() {
+        for bad in [
+            serde_json::json!({ "secrets": { "required": "A" } }),
+            serde_json::json!({ "secrets": { "required": [1] } }),
+            serde_json::json!({ "secrets": { "required": ["not valid"] } }),
+        ] {
+            assert!(required_names(&bad).is_err(), "{bad}");
+        }
     }
 
     #[tokio::test]

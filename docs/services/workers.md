@@ -158,6 +158,36 @@ refuse a version whose bindings use the name of a stored secret, so a rollback t
 secret. A secret's value does not appear in a log, in `/state`, in an error
 message, or in the output of `celld deploy`.
 
+### Require secrets
+
+List the secrets a Worker cannot run without in the config:
+
+```jsonc
+{ "secrets": { "required": ["API_KEY", "DB_PASSWORD"] } }
+```
+
+Each name follows the rules of `celld secret put`. A duplicate, a name that a
+`vars` entry or a binding of the config already uses, a non-string, and any
+other key inside `secrets` stop the build. The list is part of the version:
+changing it is a new version. The config is JSON or JSONC; celld does not read
+`wrangler.toml`.
+
+- `celld deploy` and `celld activate` refuse a version while a listed name has
+  no entry in the script's secrets, and name every missing one. They read names
+  only, so they need no key, and a refused deploy writes nothing.
+- A node that loads the deployment refuses it the same way, so a secret deleted
+  by another route cannot start a Worker without it. The load fails and a node
+  that already serves keeps serving.
+- `celld secret delete NAME` refuses a name that the deployment the fleet serves
+  requires. Deploy a version that no longer lists it first.
+- Only the secrets of the script count. A Secrets Store secret is checked by its
+  binding, not by this list.
+- In `celld dev`, only the listed keys are read from `.dev.vars` (or, without
+  it, the dotenv files), so any other key in the file is not in `env`, nor is a
+  Secrets Store or Hyperdrive dev value under an unlisted name. Each listed key
+  that the files lack prints a warning, and `celld dev` still starts. Without
+  `secrets.required`, every entry of the files is read as before.
+
 ### Rotate the secrets key
 
 To change the key without downtime and without putting the values again, rotate
