@@ -326,10 +326,14 @@ Any program that can make an HTTP request per message will do. With Postfix, a
 ```sh
 #!/bin/sh
 # usage: deliver-to-celld <sender> <recipient>   (needs curl 7.87 or later)
-# CELLD_INTERNAL_URL is the node's internal listener, e.g. http://127.0.0.1:8081.
-# CELLD_INBOUND_HEADER is a file that only the relay's user can read, with the
-# line `Authorization: Bearer <token>`. curl reads the header from it, so the
-# token is not in the process list as it is after -H "Authorization: ...".
+# Postfix runs a pipe command with a cleaned environment, so the settings come
+# from a file: /etc/celld-relay.conf sets
+#   CELLD_INTERNAL_URL    the node's internal listener, e.g. http://127.0.0.1:8081
+#   CELLD_INBOUND_HEADER  a file that only the relay's user can read, with the
+#                         line `Authorization: Bearer <token>`. curl reads the
+#                         header from it, so the token is not in the process
+#                         list as it is after -H "Authorization: ...".
+. /etc/celld-relay.conf
 status=$(curl -s -o /dev/null -w '%{http_code}' \
   -H "@$CELLD_INBOUND_HEADER" \
   --data-binary @- \
@@ -345,12 +349,14 @@ esac
 
 The script takes one recipient, so Postfix must run it once for each. With
 the transport named `celld`, set the limit in `main.cf`; without it a message
-for several recipients reaches the Worker for the first one only:
+for several recipients reaches the Worker for the first one only.
+`null_sender=` passes a bounce's empty sender as empty; Postfix's default,
+`MAILER-DAEMON`, is not an address and the route refuses it with 400:
 
 ```
 # master.cf
 celld     unix  -       n       n       -       -       pipe
-  user=celld-relay argv=/usr/local/bin/deliver-to-celld ${sender} ${recipient}
+  null_sender= user=celld-relay argv=/usr/local/bin/deliver-to-celld ${sender} ${recipient}
 
 # main.cf
 celld_destination_recipient_limit = 1
