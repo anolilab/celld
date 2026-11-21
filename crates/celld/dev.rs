@@ -622,7 +622,7 @@ A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
 as for wrangler dev. Without one, .env and then .env.local supply them, and\n\
 an entry of these files that cannot be a binding is skipped with a warning.\n\
 The entries override the vars of the config. With secrets.required in the\n\
-config, only the listed keys are read, and each one the files lack is a warning.\n\n\
+config, only the listed plain variables are read, and each one the files lack is a warning.\n\n\
 OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port, or 0 for a free one (default: {DEFAULT_PORT})\n  --state-dir DIR        Keep the local state in DIR/<project hash>/.celld/dev\n  --clean                Delete the local state before the server starts\n  --logs                 Show the node warning and information logs\n  --strict-compat-flags\n                         Fail on a compatibility flag celld does not know or\n                         does not handle yet, instead of warning\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
@@ -881,15 +881,6 @@ fn store_values_from(map: &str, manifest: &Manifest) -> anyhow::Result<BTreeMap<
         deploy::VarOverrides::None => BTreeMap::new(),
     };
     let (_, project) = deploy::read_config(Some(config))?;
-    // With `secrets.required` only the listed keys are read, as at build.
-    if let Some(required) = project
-        .as_object()
-        .map(deploy::required_secrets)
-        .transpose()?
-        .flatten()
-    {
-        values = deploy::limit_to_required(&required, &values);
-    }
     add_local_connection_strings(&mut values, &project);
     Ok(values)
 }

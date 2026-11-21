@@ -192,7 +192,10 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         }
         Step::Delete(owner, name) => {
             match &owner {
-                Owner::Script(script) => delete_script_secret(&bucket, script, &name).await?,
+                Owner::Script(script) => {
+                    let required = current_required(&bucket, script).await?;
+                    secrets::delete(&bucket, script, &name, &required).await?
+                }
                 Owner::Store(store) => secrets::delete_store(&bucket, store, &name).await?,
             }
             let told = announce(
@@ -303,16 +306,15 @@ fn value_from_bytes(mut bytes: Vec<u8>) -> anyhow::Result<String> {
     String::from_utf8(bytes).map_err(|_| anyhow!("the value is not UTF-8"))
 }
 
-/// Delete `name` of `script`, unless the deployment the fleet serves requires it.
-pub(crate) async fn delete_script_secret(
+/// The secrets the deployment the fleet serves for `script` requires.
+pub(crate) async fn current_required(
     bucket: &Bucket,
     script: &str,
-    name: &str,
-) -> anyhow::Result<()> {
-    if let Some(manifest) = crate::deploy::current_manifest(bucket, script).await? {
-        secrets::ensure_not_required(script, name, &manifest.raw_metadata)?;
+) -> anyhow::Result<BTreeSet<String>> {
+    match crate::deploy::current_manifest(bucket, script).await? {
+        Some(manifest) => secrets::required_names(&manifest.raw_metadata),
+        None => Ok(BTreeSet::new()),
     }
-    secrets::delete(bucket, script, name).await
 }
 
 /// The binding names of the deployment the fleet serves for `script`, or none

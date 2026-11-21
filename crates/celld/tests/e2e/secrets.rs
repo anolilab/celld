@@ -64,7 +64,7 @@ async fn write(server: &Server, name: &str, value: Option<&str>, announce: Optio
                     .await
                     .expect("put the secret");
             }
-            None => secrets::delete(&bucket, "secrets", &name)
+            None => secrets::delete(&bucket, "secrets", &name, &BTreeSet::new())
                 .await
                 .expect("delete the secret"),
         }
@@ -419,4 +419,20 @@ async fn dev_without_the_field_still_exposes_every_key() {
     assert_eq!(served["token"], "dev-token", "{served}");
     assert_eq!(served["plain"], "override", "{served}");
     assert!(!server.log_text().contains("secrets.required"));
+}
+
+#[tokio::test]
+async fn dev_with_required_secrets_still_fills_a_secrets_store_binding_from_dev_vars() {
+    let server = Server::start_with_files("secrets-required-store", &[], |project| {
+        std::fs::write(
+            project.join(".dev.vars"),
+            "STORE_KEY=store-dev-value\nLISTED=listed-value\nUNLISTED=unlisted-value\n",
+        )
+        .expect("write .dev.vars");
+    })
+    .await;
+    let served: Value = server.get_json("/").await;
+    assert_eq!(served["store"], "store-dev-value", "{served}");
+    assert_eq!(served["listed"], "listed-value", "{served}");
+    assert_eq!(served["unlisted"], Value::Null, "{served}");
 }

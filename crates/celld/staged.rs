@@ -229,9 +229,8 @@ pub async fn activate(
         attachments.push(crate::deploy::prepare_queue_attachments(bucket, manifest).await?);
         // A secret put after this version was uploaded may use a name this
         // version binds, and activation would shadow it.
-        crate::secrets::ensure_no_clash(bucket, manifest).await?;
+        crate::secrets::ensure_script_secrets(bucket, manifest).await?;
         crate::secrets::ensure_store_secrets(bucket, manifest, false).await?;
-        crate::secrets::ensure_required(bucket, manifest).await?;
         crate::hyperdrive::ensure_connection_strings(bucket, manifest, false).await?;
     }
 

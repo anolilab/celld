@@ -1,0 +1,10 @@
+{
+  "name": "secrets-required-store",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "secrets": { "required": ["LISTED"] },
+  "secrets_store_secrets": [
+    { "binding": "STORE_KEY", "store_id": "st-prod", "secret_name": "api-key" }
+  ]
+}

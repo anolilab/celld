@@ -132,6 +132,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_PYTHON_WORKERS_V1,
     FEATURE_VERSION_METADATA_V1,
     FEATURE_SECRETS_STORE_V1,
+    FEATURE_SECRETS_REQUIRED_V1,
     FEATURE_HYPERDRIVE_V1,
     FEATURE_AI_V1,
     FEATURE_TAIL_CONSUMERS_V1,
@@ -175,6 +176,10 @@ pub const FEATURE_VERSION_METADATA_V1: &str = "version-metadata-v1";
 /// without them would build an `env` missing the binding, and the application
 /// would fail only when it first calls `env.<name>.get()`.
 pub const FEATURE_SECRETS_STORE_V1: &str = "secrets-store-v1";
+/// A deployment whose config lists `secrets.required`. Required because a node
+/// without it would load the Worker with a listed secret missing, and the
+/// application would fail only when it first reads `env.<name>`.
+pub const FEATURE_SECRETS_REQUIRED_V1: &str = "secrets-required-v1";
 /// A deployment with `hyperdrive` bindings. Required because a node without
 /// them would build an `env` missing the binding, and the application would
 /// fail only when it first reads `env.<name>.connectionString`.

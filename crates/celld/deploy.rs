@@ -20,9 +20,10 @@ use crate::protocol::{
     QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_AI_V1, FEATURE_ASSETS_V1,
     FEATURE_CONTAINERS_V1, FEATURE_CONTAINER_IMAGES_V1, FEATURE_CRON_V1, FEATURE_D1_V1,
     FEATURE_HYPERDRIVE_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1,
-    FEATURE_R2_V1, FEATURE_RATELIMIT_V1, FEATURE_SECRETS_STORE_V1, FEATURE_SEND_EMAIL_V1,
-    FEATURE_SQLITE_VEC_V1, FEATURE_TAIL_CONSUMERS_V1, FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1,
-    FEATURE_WORKFLOWS_V1, QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+    FEATURE_R2_V1, FEATURE_RATELIMIT_V1, FEATURE_SECRETS_REQUIRED_V1, FEATURE_SECRETS_STORE_V1,
+    FEATURE_SEND_EMAIL_V1, FEATURE_SQLITE_VEC_V1, FEATURE_TAIL_CONSUMERS_V1,
+    FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -899,6 +900,12 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             if project.metadata.get("tail_consumers").is_some() {
                 features.push(FEATURE_TAIL_CONSUMERS_V1.to_string());
             }
+            if project.metadata["secrets"]["required"]
+                .as_array()
+                .is_some_and(|required| !required.is_empty())
+            {
+                features.push(FEATURE_SECRETS_REQUIRED_V1.to_string());
+            }
             features
         },
         raw_metadata: project.metadata,
@@ -1138,12 +1145,10 @@ async fn prepare_refusals(
     let queue_attachments = prepare_queue_attachments(bucket, &built.manifest).await?;
     // A secret is bound as `env.NAME`, so a binding of the same name would be
     // shadowed. Refuse before anything is uploaded; this reads names only.
-    crate::secrets::ensure_no_clash(bucket, &built.manifest).await?;
+    crate::secrets::ensure_script_secrets(bucket, &built.manifest).await?;
     // A Secrets Store binding names a secret its store must already hold, so
     // a missing one is the deploy's error and not a Worker's first `get()`.
     crate::secrets::ensure_store_secrets(bucket, &built.manifest, true).await?;
-    // A secret the config lists in `secrets.required` must already be put.
-    crate::secrets::ensure_required(bucket, &built.manifest).await?;
     // A Hyperdrive binding needs its connection string as a secret of the
     // script, put before the deploy.
     crate::hyperdrive::ensure_connection_strings(bucket, &built.manifest, true).await?;
@@ -1955,50 +1960,16 @@ fn entry_text<'a>(
     }
 }
 
-/// The names in the config's `secrets.required`, in the order written, or
-/// `None` without the field. Each follows the rules of `celld secret put`.
-pub(crate) fn required_secrets(
+/// The names in the config's `secrets.required`, or `None` when the config
+/// lists none.
+fn required_secrets(
     object: &serde_json::Map<String, Value>,
 ) -> anyhow::Result<Option<Vec<String>>> {
-    let declaration = match object.get("secrets") {
-        None => return Ok(None),
-        Some(Value::Object(declaration)) => declaration,
-        Some(_) => bail!("config `secrets` must be an object with a `required` list"),
-    };
-    if let Some(option) = declaration
-        .keys()
-        .find(|option| option.as_str() != "required")
-    {
-        bail!("`secrets` sets `{option}`, which is not a supported option");
-    }
-    let list = match declaration.get("required") {
-        None => return Ok(None),
-        Some(Value::Array(list)) => list,
-        Some(_) => bail!("`secrets` `required` must be an array of secret names"),
-    };
-    let mut names = Vec::with_capacity(list.len());
-    for name in list {
-        let name = name
-            .as_str()
-            .ok_or_else(|| anyhow!("`secrets` `required` must hold strings"))?;
-        crate::secrets::check_secret_name(name)?;
-        if names.iter().any(|seen| seen == name) {
-            bail!("`secrets` `required` lists {name} twice");
-        }
-        names.push(name.to_string());
-    }
-    Ok(Some(names))
-}
-
-/// The entries of `.dev.vars` or a dotenv file that `required` lists.
-pub(crate) fn limit_to_required(
-    required: &[String],
-    entries: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    required
-        .iter()
-        .filter_map(|name| Some((name.clone(), entries.get(name)?.clone())))
-        .collect()
+    Ok(object
+        .get("secrets")
+        .map(crate::secrets::parse_required)
+        .transpose()?
+        .filter(|required| !required.is_empty()))
 }
 
 /// The binding name of a config key that declares one env binding and nothing
@@ -2788,50 +2759,29 @@ fn read_project(
     // should refuse in the config's name.
     let declared_vars = !vars.is_empty();
     let required_secrets = required_secrets(object)?;
-    if let Some(required) = &required_secrets {
-        if main.is_none() && !required.is_empty() {
-            bail!("an asset-only project cannot require secrets");
-        }
-        // A secret is bound as `env.NAME`, so a var or binding of the same
-        // name would shadow it. The config's own names only: a `.dev.vars`
-        // entry of that name is the secret itself.
-        let taken = bindings
-            .iter()
-            .filter_map(|binding| binding.get("name").and_then(Value::as_str))
-            .chain(vars.keys().copied())
-            .chain(
-                assets
-                    .as_ref()
-                    .and_then(|assets| assets.config.binding.as_deref()),
-            )
-            .collect::<BTreeSet<_>>();
-        if let Some(name) = required.iter().find(|name| taken.contains(name.as_str())) {
-            bail!(
-                "`secrets` `required` lists {name}, which a var or binding of the config \
-                 already uses; rename one of them"
+    if main.is_none() && required_secrets.is_some() {
+        bail!("an asset-only project cannot require secrets");
+    }
+    // `celld dev` reads a listed key from `.dev.vars` or the dotenv files, and
+    // warns for each one they lack. Only the entries that become plain `env`
+    // variables are limited to the list: a Secrets Store or Hyperdrive dev
+    // value is not an env secret and passes untouched.
+    let for_dev = !matches!(overrides, VarOverrides::None);
+    if let (Some(required), VarOverrides::DevVars(entries) | VarOverrides::DotEnv(entries)) =
+        (&required_secrets, overrides)
+    {
+        for name in required.iter().filter(|name| !entries.contains_key(*name)) {
+            note!(
+                "warning: `secrets.required` lists {name}, which .dev.vars and the dotenv \
+                 files do not set"
             );
         }
     }
-    // `celld dev` takes only the listed keys from `.dev.vars` and the dotenv
-    // files, and warns for each one they lack.
-    let for_dev = !matches!(overrides, VarOverrides::None);
-    let limited = match (&required_secrets, overrides) {
-        (Some(required), VarOverrides::DevVars(entries) | VarOverrides::DotEnv(entries)) => {
-            let listed = limit_to_required(required, entries);
-            for name in required.iter().filter(|name| !listed.contains_key(*name)) {
-                note!(
-                    "warning: `secrets.required` lists {name}, which .dev.vars and the dotenv \
-                     files do not set"
-                );
-            }
-            Some(match overrides {
-                VarOverrides::DevVars(_) => VarOverrides::DevVars(listed),
-                _ => VarOverrides::DotEnv(listed),
-            })
-        }
-        _ => None,
+    let plain_var = |name: &str| {
+        required_secrets
+            .as_ref()
+            .is_none_or(|required| required.iter().any(|listed| listed == name))
     };
-    let overrides = limited.as_ref().unwrap_or(overrides);
     if main.is_some() {
         match overrides {
             VarOverrides::None => {}
@@ -2839,7 +2789,7 @@ fn read_project(
                 for (name, value) in entries {
                     if secret_store_bindings.contains(name) {
                         mark_dev_value(&mut bindings, name);
-                    } else if !hyperdrive_locals.contains(name) {
+                    } else if !hyperdrive_locals.contains(name) && plain_var(name) {
                         vars.insert(name.as_str(), value.as_str());
                     }
                 }
@@ -2867,7 +2817,7 @@ fn read_project(
                         note!("warning: skipped the dotenv entry {name:?}, which is not a valid binding name");
                     } else if secret_store_bindings.contains(name) {
                         store_values.push(name);
-                    } else if !hyperdrive_locals.contains(name) {
+                    } else if !hyperdrive_locals.contains(name) && plain_var(name) {
                         if taken.contains(name.as_str()) {
                             note!("warning: skipped the dotenv entry {name:?}, whose name another binding uses");
                         } else {
@@ -3009,13 +2959,17 @@ fn read_project(
     }
 
     let containers = read_containers(object, &do_classes, &sqlite_classes)?;
+    let metadata = Value::Object(metadata);
+    // A secret is bound as `env.NAME`, so a var or binding of the same name
+    // would shadow it.
+    crate::secrets::ensure_required_unshadowed(&metadata)?;
     Ok(Project {
         script_name,
         no_bundle,
         entry: main,
         bundle,
         assets,
-        metadata: Value::Object(metadata),
+        metadata,
         compatibility_flags,
         compatibility_date,
         do_classes,
@@ -5080,6 +5034,7 @@ mod secrets_required_config_tests {
         );
         assert_eq!(required(r#""vars": { "A": "b" }"#), None);
         assert_eq!(required(r#""secrets": {}"#), None);
+        assert_eq!(required(r#""secrets": { "required": [] }"#), None);
     }
 
     #[test]
@@ -5145,6 +5100,80 @@ mod secrets_required_config_tests {
             read_project(&path, dir.path(), &VarOverrides::DevVars(entries), false).unwrap();
         let names = crate::secrets::binding_names(&project.metadata);
         assert!(names.contains("LISTED") && names.contains("UNLISTED"));
+    }
+
+    #[test]
+    fn dev_leaves_store_and_hyperdrive_values_untouched() {
+        let config = base(
+            r#""secrets": { "required": ["LISTED"] },
+            "secrets_store_secrets": [
+              { "binding": "STORE_KEY", "store_id": "st", "secret_name": "n" }
+            ],
+            "hyperdrive": [{ "binding": "HD", "id": "db-1" }]"#,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
+        let path = dir.path().join("wrangler.jsonc");
+        std::fs::write(&path, config).unwrap();
+        let local = crate::hyperdrive::local_variable("HD");
+        let entries = BTreeMap::from([
+            ("LISTED".to_string(), "1".to_string()),
+            ("UNLISTED".to_string(), "2".to_string()),
+            ("STORE_KEY".to_string(), "3".to_string()),
+            (local.clone(), "postgres://h/d".to_string()),
+        ]);
+        for overrides in [
+            VarOverrides::DevVars(entries.clone()),
+            VarOverrides::DotEnv(entries.clone()),
+        ] {
+            let project = read_project(&path, dir.path(), &overrides, false).unwrap();
+            let marked = |kind| {
+                crate::secrets::raw_bindings(&project.metadata, kind)
+                    .all(|binding| binding["dev_value"] == true)
+            };
+            let names = crate::secrets::binding_names(&project.metadata);
+            assert!(marked(crate::secrets::STORE_BINDING_TYPE), "{names:?}");
+            assert!(marked(crate::hyperdrive::BINDING_TYPE), "{names:?}");
+            assert!(names.contains("LISTED") && !names.contains("UNLISTED"));
+            assert!(!names.contains(&local));
+        }
+    }
+
+    fn build_with(extra: &str) -> Built {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
+        let path = dir.path().join("wrangler.jsonc");
+        std::fs::write(&path, base(extra)).unwrap();
+        let options = options_from_arguments([
+            "--config".to_string(),
+            path.display().to_string(),
+            "--dry-run".to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+        build(&options).unwrap()
+    }
+
+    #[test]
+    fn a_non_empty_list_requires_the_feature_an_older_node_lacks() {
+        let required = |extra: &str| {
+            build_with(extra)
+                .manifest
+                .required_features
+                .contains(&crate::protocol::FEATURE_SECRETS_REQUIRED_V1.to_string())
+        };
+        assert!(required(r#""secrets": { "required": ["A"] }"#));
+        assert!(!required(r#""secrets": { "required": [] }"#));
+        assert!(!required(""));
+        let built = build_with(r#""secrets": { "required": ["A"] }"#);
+        crate::protocol::validate_required_features(&built.manifest.required_features).unwrap();
+        // A node that predates the feature refuses the manifest at load.
+        let error = crate::protocol::validate_required_features(&[
+            "secrets-required-v1".to_string(),
+            "from-the-future-v1".to_string(),
+        ])
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("from-the-future-v1"));
     }
 
     #[test]

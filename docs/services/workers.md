@@ -182,11 +182,21 @@ changing it is a new version. The config is JSON or JSONC; celld does not read
   requires. Deploy a version that no longer lists it first.
 - Only the secrets of the script count. A Secrets Store secret is checked by its
   binding, not by this list.
-- In `celld dev`, only the listed keys are read from `.dev.vars` (or, without
-  it, the dotenv files), so any other key in the file is not in `env`, nor is a
-  Secrets Store or Hyperdrive dev value under an unlisted name. Each listed key
-  that the files lack prints a warning, and `celld dev` still starts. Without
-  `secrets.required`, every entry of the files is read as before.
+- In `celld dev`, `secrets.required` limits only the plain secrets: of the
+  entries of `.dev.vars` (or, without it, the dotenv files) that would become
+  `env` variables, only the listed ones are read, so any other key is not in
+  `env`. A Secrets Store binding's value and the Hyperdrive local connection
+  string are not env secrets and are read as before. Each listed key that the
+  files lack prints a warning, and `celld dev` still starts. Without
+  `secrets.required`, every entry of the files is read as before. A dev
+  deployment does not carry the requirement.
+- A deployment that lists secrets needs a node that knows the
+  `secrets-required-v1` feature. An older node refuses to load it, keeps serving
+  its current version, and says to upgrade celld, instead of serving the Worker
+  without the secret.
+- A `celld secret delete` that races a deploy can still remove a secret that the
+  new version requires. The node then refuses to load that version and keeps
+  serving the old one; put the secret again.
 
 ### Rotate the secrets key
 
