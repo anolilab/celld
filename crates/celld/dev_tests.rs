@@ -471,26 +471,14 @@ async fn a_change_in_a_project_nothing_loads_restarts_nothing() {
     let mut manifests = no_builds(&configs);
     reload(&configs, &[], &mut manifests, &store).await.unwrap();
     let pending = |indexes: &[usize]| indexes.iter().copied().collect::<BTreeSet<_>>();
-    assert!(changes_nothing_loaded(&configs, &pending(&[1]), &manifests));
-    assert!(!changes_nothing_loaded(
-        &configs,
-        &pending(&[0]),
-        &manifests
-    ));
-    assert!(!changes_nothing_loaded(
-        &configs,
-        &pending(&[0, 1]),
-        &manifests
-    ));
+    assert!(changes_nothing_loaded(&configs, &pending(&[1]), &manifests, &store).await);
+    assert!(!changes_nothing_loaded(&configs, &pending(&[0]), &manifests, &store).await);
+    assert!(!changes_nothing_loaded(&configs, &pending(&[0, 1]), &manifests, &store).await);
 
     // The change renames B to the service A binds: it is reachable now, though
     // the deploy before it did not reach it.
     write_project(&directory.path().join("b"), "dev-later", "b");
-    assert!(!changes_nothing_loaded(
-        &configs,
-        &pending(&[1]),
-        &manifests
-    ));
+    assert!(!changes_nothing_loaded(&configs, &pending(&[1]), &manifests, &store).await);
     let deployed = reload(&configs, &[1], &mut manifests, &store)
         .await
         .unwrap();
@@ -505,18 +493,14 @@ async fn a_change_in_a_project_nothing_loads_restarts_nothing() {
     let configs = [configs[0].clone(), c.clone()];
     let mut manifests = no_builds(&configs);
     reload(&configs, &[], &mut manifests, &store).await.unwrap();
-    assert!(changes_nothing_loaded(&configs, &pending(&[1]), &manifests));
+    assert!(changes_nothing_loaded(&configs, &pending(&[1]), &manifests, &store).await);
     write_project_with(
         &directory.path().join("c"),
         "dev-c",
         "c",
         serde_json::json!({ "queues": { "consumers": [{ "queue": "jobs" }] } }),
     );
-    assert!(!changes_nothing_loaded(
-        &configs,
-        &pending(&[1]),
-        &manifests
-    ));
+    assert!(!changes_nothing_loaded(&configs, &pending(&[1]), &manifests, &store).await);
 }
 
 #[test]
@@ -1028,4 +1012,79 @@ fn the_public_address_is_read_from_the_announce_line() {
         listener_address("celld internal listening on 127.0.0.1:1 (advertise=x)"),
         None
     );
+}
+
+#[tokio::test]
+async fn a_project_reached_only_through_a_retained_script_is_rebuilt_on_change() {
+    crate::asyncrt::install_test_host_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let store = store_in(directory.path());
+    // An earlier run left `dev-mid` in the store, binding `dev-b`.
+    let mid = write_project_with(
+        &directory.path().join("mid"),
+        "dev-mid",
+        "m",
+        serde_json::json!({ "services": [{ "binding": "B", "service": "dev-b" }] }),
+    );
+    deploy_all(&[mid], &store).await.unwrap();
+
+    // This run lists A and B. A binds only `dev-mid`, so B is loaded through it.
+    let a = write_project_with(
+        &directory.path().join("a"),
+        "dev-a",
+        "a",
+        serde_json::json!({ "services": [{ "binding": "M", "service": "dev-mid" }] }),
+    );
+    let b = write_project(&directory.path().join("b"), "dev-b", "b1");
+    let configs = [a, b];
+    let mut manifests = no_builds(&configs);
+    let deployed = reload(&configs, &[], &mut manifests, &store).await.unwrap();
+    assert!(deployed[1].reachable);
+    let before = serving(&store).await.1["dev-b"].version.clone();
+
+    write_project(&directory.path().join("b"), "dev-b", "b2");
+    let pending = BTreeSet::from([1]);
+    assert!(!changes_nothing_loaded(&configs, &pending, &manifests, &store).await);
+    reload(&configs, &[1], &mut manifests, &store)
+        .await
+        .unwrap();
+    assert_ne!(serving(&store).await.1["dev-b"].version, before);
+}
+
+#[tokio::test]
+async fn an_unbuilt_project_renamed_onto_a_retained_script_gets_no_values_for_it() {
+    crate::asyncrt::install_test_host_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let store = store_in(directory.path());
+    // An earlier run left `dev-old` in the store, consuming `jobs`.
+    let old = write_project_with(
+        &directory.path().join("old"),
+        "dev-old",
+        "o",
+        serde_json::json!({ "queues": { "consumers": [{ "queue": "jobs" }] } }),
+    );
+    deploy_all(&[old], &store).await.unwrap();
+
+    // A produces to `jobs`, so the node loads `dev-old`; C is not reached.
+    let a = write_project_with(
+        &directory.path().join("a"),
+        "dev-a",
+        "a",
+        serde_json::json!({ "queues": { "producers": [{ "binding": "Q", "queue": "jobs" }] } }),
+    );
+    let c = write_project(&directory.path().join("c"), "dev-c", "c");
+    let configs = [a, c.clone()];
+    let mut manifests = no_builds(&configs);
+    let deployed = reload(&configs, &[], &mut manifests, &store).await.unwrap();
+    assert!(!deployed[1].reachable);
+
+    // C is renamed to the retained script, with values of its own.
+    write_project(&directory.path().join("c"), "dev-old", "c");
+    std::fs::write(directory.path().join("c/.dev.vars"), "TOKEN=c\n").unwrap();
+    let deployed = reload(&configs, &[1], &mut manifests, &store)
+        .await
+        .unwrap();
+    assert!(!deployed[1].reachable);
+    let map = config_map(&deployed).unwrap();
+    assert_eq!(config_for(&map, "dev-old"), None, "{map}");
 }

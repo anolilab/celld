@@ -1065,7 +1065,7 @@ async fn run_stack(
                 // node serves, so a rebuild and a restart would only drop its
                 // in-flight requests. It stays pending: a later change can make
                 // another project bind it, and it is built then.
-                if changes_nothing_loaded(configs, &pending, &manifests) {
+                if changes_nothing_loaded(configs, &pending, &manifests, store).await {
                     console.progress(
                         "change detected in a project that no running project reaches; nothing to restart",
                     );

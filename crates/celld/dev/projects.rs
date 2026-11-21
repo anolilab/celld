@@ -187,44 +187,14 @@ fn declared(configs: &[PathBuf], manifests: &[Option<Manifest>]) -> Vec<Declared
         .collect()
 }
 
-/// For each project, whether the node loads it: the first one is the
-/// primary, and the node follows service bindings and queues from every script
-/// it has loaded. This mirrors `generation::dependencies_of`, which reads a
-/// loaded deployment and so cannot run before the node has one.
-fn reachable(declared: &[Declared]) -> Vec<bool> {
-    let mut loaded = vec![false; declared.len()];
-    loaded[0] = true;
-    loop {
-        let mut changed = false;
-        for (_, from) in (0..declared.len())
-            .filter(|index| loaded[*index])
-            .map(|index| &declared[index])
-            .collect::<Vec<_>>()
-        {
-            for (to, (name, consumer)) in declared.iter().enumerate() {
-                let named = from.services.contains(name);
-                let queued = consumer
-                    .consumes
-                    .iter()
-                    .any(|queue| from.queues.contains(queue));
-                if !loaded[to] && (named || queued) {
-                    loaded[to] = true;
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            return loaded;
-        }
-    }
-}
-
 /// What the node loads, walked once over the listed projects and the scripts an
 /// earlier run left in the store: for each listed project whether the node
 /// loads it, and the loaded scripts this run does not list, that is a service
 /// a loaded script binds, or the consumer attached to a queue it uses. The node
-/// follows the same edges as [`reachable`], through the retained scripts too, so
-/// a listed project that only a retained script reaches is loaded.
+/// follows service bindings and queues from every script it has loaded, the
+/// retained ones too, so a listed project that only a retained script reaches
+/// is loaded. This mirrors `generation::dependencies_of`, which reads a loaded
+/// deployment and so cannot run before the node has one.
 async fn walk_loaded(
     bucket: &crate::bucket::Bucket,
     listed: &[Declared],
@@ -361,7 +331,9 @@ pub(super) async fn deploy_projects(
     strict_compat_flags: bool,
 ) -> anyhow::Result<Vec<Project>> {
     let fresh = declared(configs, manifests);
-    let wanted = reachable(&fresh);
+    let bucket = open_local_bucket(&store.database)?;
+    crate::wake_format::ensure_ready(&bucket).await?;
+    let wanted = walk_loaded(&bucket, &fresh).await?.1;
     let mut rebuilt = Vec::new();
     for (index, config) in configs.iter().enumerate() {
         if (pending.contains(&index) && wanted[index]) || manifests[index].is_none() {
@@ -397,8 +369,6 @@ pub(super) async fn deploy_projects(
         .iter()
         .map(|manifest| manifest_links(manifest))
         .collect::<Vec<_>>();
-    let bucket = open_local_bucket(&store.database)?;
-    crate::wake_format::ensure_ready(&bucket).await?;
     // The node also loads what a loaded project reaches that an earlier run
     // left in the store, so a clash there is found before the node stops.
     let (retained, loaded) = walk_loaded(&bucket, &links).await?;
@@ -415,12 +385,15 @@ pub(super) async fn deploy_projects(
         )
         .collect::<Vec<_>>();
     ensure_distinct_classes(&scripts)?;
-    let projects = names
-        .into_iter()
+    // A project's script is the name of the version this session last wrote
+    // for it, so an unbuilt project renamed onto a retained script does not
+    // hand that script its dev values.
+    let projects = current
+        .iter()
         .zip(configs)
         .zip(loaded)
-        .map(|((script, config), reachable)| Project {
-            script,
+        .map(|((manifest, config), reachable)| Project {
+            script: manifest.script_name.clone(),
             config: config.clone(),
             reachable,
         })
@@ -438,13 +411,19 @@ pub(super) async fn deploy_projects(
 /// Whether a reload of `pending` changes nothing the node runs: no project in
 /// it is one that the node loads, judged by the configs as they are now, so a
 /// project that a change makes reachable is not skipped.
-pub(super) fn changes_nothing_loaded(
+pub(super) async fn changes_nothing_loaded(
     configs: &[PathBuf],
     pending: &BTreeSet<usize>,
     manifests: &[Option<Manifest>],
+    store: &Store,
 ) -> bool {
-    let wanted = reachable(&declared(configs, manifests));
-    pending.iter().all(|index| !wanted[*index])
+    let Ok(bucket) = open_local_bucket(&store.database) else {
+        return false;
+    };
+    match walk_loaded(&bucket, &declared(configs, manifests)).await {
+        Ok((_, wanted)) => pending.iter().all(|index| !wanted[*index]),
+        Err(_) => false,
+    }
 }
 
 /// The warning for each project the node does not load, unless `shown` already
