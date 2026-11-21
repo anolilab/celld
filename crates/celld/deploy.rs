@@ -1112,13 +1112,19 @@ impl Selection {
     }
 }
 
-/// Upload a deployment and select it as `selection` says.
-/// Returns what happened to the manifest, see [`write_manifest`].
-pub async fn write(
+/// The refusals of [`write`] that read the bucket and write nothing: a
+/// competing queue consumer, a secret that a binding would shadow, a Secrets
+/// Store secret or Hyperdrive connection string that is missing. A caller that
+/// writes several deployments runs it on all of them first, so one refusal
+/// leaves every pointer as it was.
+pub async fn check_write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
+    prepare_refusals(bucket, built).await.map(drop)
+}
+
+async fn prepare_refusals(
     bucket: &Bucket,
     built: &Built,
-    selection: Selection,
-) -> anyhow::Result<ManifestWrite> {
+) -> anyhow::Result<Vec<QueueAttachmentState>> {
     // Read every attachment before uploading immutable deployment objects.
     // A competing consumer is a deploy refusal, so it must not leave a new
     // version in the bucket that an operator can mistake for a published one.
@@ -1134,6 +1140,17 @@ pub async fn write(
     // A Hyperdrive binding needs its connection string as a secret of the
     // script, put before the deploy.
     crate::hyperdrive::ensure_connection_strings(bucket, &built.manifest, true).await?;
+    Ok(queue_attachments)
+}
+
+/// Upload a deployment and select it as `selection` says.
+/// Returns what happened to the manifest, see [`write_manifest`].
+pub async fn write(
+    bucket: &Bucket,
+    built: &Built,
+    selection: Selection,
+) -> anyhow::Result<ManifestWrite> {
+    let queue_attachments = prepare_refusals(bucket, built).await?;
 
     // Images are fleet-wide and content-addressed like asset bodies, and
     // they are what a node loads before a container class can start.

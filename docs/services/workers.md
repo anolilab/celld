@@ -223,9 +223,10 @@ the listener. The others are reached only through the `services` bindings of
 the projects that name them, directly or through another project, and through
 the queues that a loaded project produces to or consumes. A listed project that
 nothing reaches is not loaded, and the console names it. The binding's `service`
-field names the other project's Worker `name`. Each project keeps its own
-`.dev.vars`, dotenv files and Hyperdrive `localConnectionString`; a value of one
-project never reaches another's script.
+field names the other project's Worker `name`. A project's Hyperdrive
+`localConnectionString` reaches only that project's script. Its `.dev.vars` and
+dotenv files are read beside its config, so two configs in one directory share
+them.
 
 - Each project needs its own Worker `name`, and one config cannot be listed
   twice. Both are refused before any build, naming the paths.
@@ -234,11 +235,32 @@ project never reaches another's script.
   workflows) do not count.
 - Cron triggers run for the first project only, as for any fleet.
 - The local state, and the `--state-dir` hash, are the first project's.
-  `celld d1 --local` reads them, so run it from the first project. Scripts that
-  an earlier run left in the state stay there and are not removed.
+  `celld d1 --local` reads them and supports only the databases of the first
+  project, so run it from there; a database that only another project declares
+  is not reachable with it. Scripts that an earlier run left in the state stay
+  there and are not removed.
+- A queue consumer attachment that an earlier run, or a project since renamed,
+  left in the state blocks a new consumer of the same queue, and the start or
+  reload is refused naming the queue. Start with `celld dev --clean` to remove
+  it.
 - A change in a project rebuilds and writes only that project, then restarts the
-  node. A project that fails to build, or whose new `name` clashes with another's,
-  keeps the node serving, and is rebuilt again at the next change.
+  node. A change in a project that no running project reaches rebuilds nothing
+  and restarts nothing; the console says so, and the project is built when a
+  later change reaches it. A project that fails to build, or whose new `name`
+  clashes with another's, or whose write is refused (a queue consumer that
+  another script holds, a secret that a binding would shadow, a missing Secrets
+  Store secret or Hyperdrive connection string), keeps the node serving, and is
+  rebuilt again at the next change. A reload that is refused moves no project:
+  the refusals are checked for every project before any is written.
+- The watcher gives a changed file to the project whose directory is the
+  deepest one that holds it. A project that imports a file below the directory
+  of a nested project is not rebuilt when that file changes; the nested project
+  is. Change a file of the importing project to rebuild it.
+- A project that a reload renames keeps its old script in the component map, so
+  a binding that still names the old `name` reaches the old code. Change the
+  binding to the new `name`; `--clean` removes the old script.
+- The unreachable warning is printed at the start and again only when the set
+  of projects that nothing reaches changes.
 
 ## Differences from Cloudflare
 

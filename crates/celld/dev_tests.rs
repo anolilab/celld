@@ -1,4 +1,5 @@
 #![allow(clippy::disallowed_methods)] // Tests use the host filesystem.
+use super::projects::build_project;
 use super::*;
 
 fn parse(arguments: &[&str]) -> anyhow::Result<Option<Options>> {
@@ -102,6 +103,13 @@ async fn serving(store: &Store) -> (String, BTreeMap<String, crate::protocol::Co
     let bucket = open_local_bucket(&store.database).unwrap();
     let (pointer, _) = deploy::read_fleet_pointer(&bucket).await.unwrap().unwrap();
     (pointer.script_name.unwrap(), pointer.components)
+}
+
+/// The version the fleet pointer, and so the primary, names.
+async fn primary_version(store: &Store) -> String {
+    let bucket = open_local_bucket(&store.database).unwrap();
+    let (pointer, _) = deploy::read_fleet_pointer(&bucket).await.unwrap().unwrap();
+    pointer.version
 }
 
 #[tokio::test]
@@ -310,19 +318,15 @@ async fn a_reload_rebuilds_and_writes_only_the_changed_project() {
     let service = serde_json::json!({ "services": [{ "binding": "B", "service": "dev-b" }] });
     let a = write_project_with(&directory.path().join("a"), "dev-a", "a", service);
     let b = write_project(&directory.path().join("b"), "dev-b", "b1");
-    let configs = [a, b.clone()];
+    let configs = [a.clone(), b.clone()];
     let mut manifests = no_builds(&configs);
     reload(&configs, &[], &mut manifests, &store).await.unwrap();
     let (_, before) = serving(&store).await;
-    let primary_before = {
-        let bucket = open_local_bucket(&store.database).unwrap();
-        deploy::read_fleet_pointer(&bucket)
-            .await
-            .unwrap()
-            .unwrap()
-            .0
-            .version
-    };
+    let primary_before = primary_version(&store).await;
+
+    // Versions are content hashes, so an equal version proves nothing about a
+    // rebuild. A's config no longer builds: a reload that touched A would fail.
+    std::fs::write(&a, "{ not json").unwrap();
 
     // B changes: only B is rebuilt and written, so A keeps its version.
     write_project(&directory.path().join("b"), "dev-b", "b2");
@@ -332,13 +336,11 @@ async fn a_reload_rebuilds_and_writes_only_the_changed_project() {
     let (script, after) = serving(&store).await;
     assert_eq!(script, "dev-a");
     assert_ne!(after["dev-b"].version, before["dev-b"].version);
-    let bucket = open_local_bucket(&store.database).unwrap();
-    let (pointer, _) = deploy::read_fleet_pointer(&bucket).await.unwrap().unwrap();
-    assert_eq!(pointer.version, primary_before);
+    assert_eq!(primary_version(&store).await, primary_before);
 
     // A change that does not build stops the reload before anything is
     // written, and leaves the build the run holds.
-    std::fs::write(b.parent().unwrap().join("wrangler.json"), "{ not json").unwrap();
+    std::fs::write(&b, "{ not json").unwrap();
     reload(&configs, &[1], &mut manifests, &store)
         .await
         .unwrap_err();
@@ -347,6 +349,11 @@ async fn a_reload_rebuilds_and_writes_only_the_changed_project() {
         after["dev-b"].version
     );
     assert!(manifests.iter().all(Option::is_some));
+
+    // A change to A is the one that builds A, and now fails.
+    reload(&configs, &[0], &mut manifests, &store)
+        .await
+        .unwrap_err();
 }
 
 #[tokio::test]
@@ -360,6 +367,7 @@ async fn a_reload_that_renames_a_project_to_an_existing_name_writes_nothing() {
     let mut manifests = no_builds(&configs);
     reload(&configs, &[], &mut manifests, &store).await.unwrap();
     let before = serving(&store).await;
+    let primary_before = primary_version(&store).await;
 
     write_project(&directory.path().join("b"), "dev-a", "b");
     let error = reload(&configs, &[1], &mut manifests, &store)
@@ -377,7 +385,117 @@ async fn a_reload_that_renames_a_project_to_an_existing_name_writes_nothing() {
         after.1["dev-b"].version, before.1["dev-b"].version,
         "the primary's script and the other project are as they were"
     );
+    assert_eq!(primary_version(&store).await, primary_before);
     assert_eq!(manifests[1].as_ref().unwrap().script_name, "dev-b");
+}
+
+#[tokio::test]
+async fn a_refusal_at_write_time_leaves_the_primary_as_it_was() {
+    crate::asyncrt::install_test_host_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let store = store_in(directory.path());
+    let service = serde_json::json!({ "services": [{ "binding": "B", "service": "dev-b" }] });
+    let a = write_project_with(&directory.path().join("a"), "dev-a", "a1", service.clone());
+    let b = write_project(&directory.path().join("b"), "dev-b", "b1");
+    let configs = [a, b];
+    let mut manifests = no_builds(&configs);
+    reload(&configs, &[], &mut manifests, &store).await.unwrap();
+
+    // Another script holds the consumer attachment of queue `jobs`.
+    let other = write_project_with(
+        &directory.path().join("other"),
+        "dev-other",
+        "o",
+        serde_json::json!({ "queues": { "consumers": [{ "queue": "jobs" }] } }),
+    );
+    let bucket = open_local_bucket(&store.database).unwrap();
+    let held = build_project(&other, false, false).unwrap();
+    deploy::write(&bucket, &held, deploy::Selection::Activate)
+        .await
+        .unwrap();
+    let before = serving(&store).await;
+    let primary_before = primary_version(&store).await;
+
+    // Both projects change, and B now consumes `jobs` too. Only the write
+    // refuses that, after A has a new version to write.
+    write_project_with(&directory.path().join("a"), "dev-a", "a2", service);
+    write_project_with(
+        &directory.path().join("b"),
+        "dev-b",
+        "b2",
+        serde_json::json!({ "queues": { "consumers": [{ "queue": "jobs" }] } }),
+    );
+    let error = reload(&configs, &[0, 1], &mut manifests, &store)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("jobs"), "{error:#}");
+    let after = serving(&store).await;
+    assert_eq!(after.0, before.0);
+    assert_eq!(after.1["dev-b"].version, before.1["dev-b"].version);
+    assert_eq!(
+        primary_version(&store).await,
+        primary_before,
+        "a reload that fails leaves the primary on its old version"
+    );
+}
+
+#[test]
+fn a_nested_root_and_a_repeated_root_are_watched_once() {
+    let roots = [
+        PathBuf::from("/w/app"),
+        PathBuf::from("/w/app/services/b"),
+        PathBuf::from("/w/other"),
+        PathBuf::from("/w/app"),
+        PathBuf::from("/w/application"),
+    ];
+    assert_eq!(
+        watched_roots(&roots),
+        [
+            Path::new("/w/app"),
+            Path::new("/w/other"),
+            Path::new("/w/application")
+        ]
+    );
+    assert_eq!(watched_roots(&[]), Vec::<&Path>::new());
+}
+
+#[test]
+fn a_change_in_a_project_nothing_loads_restarts_nothing_and_warns_once() {
+    let mut projects = [project("dev-a", "/w/a"), project("dev-b", "/w/b")];
+    projects[1].reachable = false;
+    let pending = |indexes: &[usize]| indexes.iter().copied().collect::<BTreeSet<_>>();
+    assert!(changes_nothing_loaded(&projects, &pending(&[1])));
+    assert!(!changes_nothing_loaded(&projects, &pending(&[0])));
+    assert!(!changes_nothing_loaded(&projects, &pending(&[0, 1])));
+
+    let mut shown = BTreeSet::new();
+    let first = unreachable_warnings(&projects, &mut shown);
+    assert_eq!(first.len(), 1);
+    assert!(first[0].contains("dev-b"), "{first:?}");
+    // The same set after the next reload is not named again.
+    assert!(unreachable_warnings(&projects, &mut shown).is_empty());
+    // A different set is, and so is the set that follows it.
+    projects[0].reachable = false;
+    assert_eq!(unreachable_warnings(&projects, &mut shown).len(), 2);
+    projects[0].reachable = true;
+    projects[1].reachable = true;
+    assert!(unreachable_warnings(&projects, &mut shown).is_empty());
+    projects[1].reachable = false;
+    assert_eq!(unreachable_warnings(&projects, &mut shown).len(), 1);
+}
+
+#[test]
+fn a_script_this_run_did_not_build_gets_no_store_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = write_project(&directory.path().join("a"), "dev-a", "a");
+    std::fs::write(directory.path().join("a/.dev.vars"), "TOKEN=abc\n").unwrap();
+    let mut manifest = build_project(&config, false, false).unwrap().manifest;
+    let map = config_map(&[project("dev-a", config.to_str().unwrap())]).unwrap();
+    assert_eq!(store_values_from(&map, &manifest).unwrap()["TOKEN"], "abc");
+    // A script that an earlier run, or a renamed project, left in the
+    // component map is not named by the map, so it reads no project's files.
+    manifest.script_name = "dev-stale".to_string();
+    assert!(store_values_from(&map, &manifest).unwrap().is_empty());
 }
 
 #[test]

@@ -126,13 +126,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         let (store, token) =
             crate::dev::local_node_files(&project.root, command.state_dir.clone())?;
         let state = store.parent().unwrap_or(&store).display().to_string();
-        let not_running = |why: &dyn std::fmt::Display| {
-            anyhow!(
-                "no running `celld dev` node for this project (local state in {state}): {why}\n\
-                 start `celld dev` for this project first; when it runs several projects, \
-                 run this from the first one, whose state it uses"
-            )
-        };
+        let not_running = |why: &dyn std::fmt::Display| anyhow!(not_running_message(&state, why));
         let token = crate::operator_token::OperatorToken::from_file(&token)?
             .ok_or_else(|| not_running(&"the node's token file is missing"))?;
         let bucket = crate::dev::open_local_bucket(&store)?;
@@ -850,6 +844,15 @@ OPTIONS:
     let _ = Output::new(Format::Text).help(&text);
 }
 
+/// The error of `--local` when no `celld dev` node answers.
+fn not_running_message(state: &str, why: &dyn std::fmt::Display) -> String {
+    format!(
+        "no running `celld dev` node for this project (local state in {state}): {why}\n\
+         start `celld dev` for this project first; when it runs several projects, \
+         `--local` supports only the databases of the first one, run from its directory"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -868,6 +871,19 @@ mod tests {
             Ok(_) => panic!("{arguments:?} should be refused"),
             Err(error) => format!("{error:#}"),
         }
+    }
+
+    #[test]
+    fn the_local_hint_says_only_the_first_project_databases_are_reached() {
+        let text = not_running_message("/w/app/.celld/dev", &"no lease");
+        assert!(
+            text.contains("start `celld dev` for this project first"),
+            "{text}"
+        );
+        assert!(
+            text.contains("supports only the databases of the first one"),
+            "{text}"
+        );
     }
 
     #[test]

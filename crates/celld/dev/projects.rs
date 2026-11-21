@@ -39,7 +39,7 @@ pub(super) fn ensure_distinct(configs: &[PathBuf], names: &[String]) -> anyhow::
     Ok(())
 }
 
-fn build_project(
+pub(super) fn build_project(
     config: &Path,
     logs: bool,
     strict_compat_flags: bool,
@@ -69,13 +69,31 @@ fn build_project(
 
 /// Write rebuilt projects, each with its position in the run, into the local
 /// store: the first project is the primary script the node serves, the rest
-/// join the component map and are reached through service bindings. The
-/// primary goes first so that a store that another run left with a different
-/// primary, or none, ends with this one.
-async fn write_projects(store: &Store, rebuilt: &[(usize, deploy::Built)]) -> anyhow::Result<()> {
+/// join the component map and are reached through service bindings. Every
+/// project passes the write-time refusals before any is written.
+///
+/// At the start of a run, `first_start`, the primary goes first so that a store
+/// that another run left with a different primary, or none, ends with this
+/// one, and the others join its component map. In a reload the primary is
+/// already the one the node serves, so it goes last: a refusal that only the
+/// write can find then never moves what the primary serves.
+async fn write_projects(
+    store: &Store,
+    rebuilt: &[(usize, deploy::Built)],
+    first_start: bool,
+) -> anyhow::Result<()> {
     let bucket = open_local_bucket(&store.database)?;
     crate::wake_format::ensure_ready(&bucket).await?;
-    for (index, built) in rebuilt {
+    for (_, built) in rebuilt {
+        deploy::check_write(&bucket, built).await?;
+    }
+    let (primary, others): (Vec<_>, Vec<_>) = rebuilt.iter().partition(|(index, _)| *index == 0);
+    let order = if first_start {
+        primary.into_iter().chain(others)
+    } else {
+        others.into_iter().chain(primary)
+    };
+    for (index, built) in order {
         let selection = if *index == 0 {
             deploy::Selection::Primary
         } else {
@@ -239,11 +257,47 @@ pub(super) async fn deploy_projects(
             reachable,
         })
         .collect();
-    write_projects(store, &rebuilt).await?;
+    write_projects(store, &rebuilt, manifests[0].is_none()).await?;
     // Only the manifest is kept: the modules and assets of a build are large
     // and nothing reads them once they are written.
     for (index, built) in rebuilt {
         manifests[index] = Some(built.manifest);
     }
     Ok(projects)
+}
+
+/// Whether a reload of `pending` changes nothing the node runs: every project
+/// in it is one that the node does not load.
+pub(super) fn changes_nothing_loaded(projects: &[Project], pending: &BTreeSet<usize>) -> bool {
+    pending.iter().all(|index| !projects[*index].reachable)
+}
+
+/// The warning for each project the node does not load, unless `shown` already
+/// holds exactly this set. `shown` then holds it, so a run says it once at the
+/// start and again only when the set changes.
+pub(super) fn unreachable_warnings(
+    projects: &[Project],
+    shown: &mut BTreeSet<String>,
+) -> Vec<String> {
+    let now = projects
+        .iter()
+        .filter(|project| !project.reachable)
+        .collect::<Vec<_>>();
+    let scripts = now
+        .iter()
+        .map(|project| project.script.clone())
+        .collect::<BTreeSet<_>>();
+    if scripts == *shown {
+        return Vec::new();
+    }
+    *shown = scripts;
+    now.into_iter()
+        .map(|project| {
+            format!(
+                "{} ({}) is not reached by a service binding or queue of the projects that run, so it does not run",
+                project.script,
+                project.config.display()
+            )
+        })
+        .collect()
 }

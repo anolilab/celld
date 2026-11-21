@@ -26,7 +26,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
 mod projects;
-use projects::{deploy_projects, ensure_distinct, Project};
+use projects::{
+    changes_nothing_loaded, deploy_projects, ensure_distinct, unreachable_warnings, Project,
+};
 
 pub const DEFAULT_PORT: u16 = 9876;
 const BUCKET: &str = "celld-dev";
@@ -412,12 +414,7 @@ impl ProjectWatcher {
             let _ = sender.send(event);
         })
         .context("create the project watcher")?;
-        // A root inside another is already covered by the outer watch.
-        for root in roots.iter().filter(|root| {
-            !roots
-                .iter()
-                .any(|other| root.starts_with(other) && other != *root)
-        }) {
+        for root in watched_roots(&roots) {
             watcher
                 .watch(root, RecursiveMode::Recursive)
                 .with_context(|| format!("watch the project directory {}", root.display()))?;
@@ -465,6 +462,21 @@ impl ProjectWatcher {
             }
         }
     }
+}
+
+/// The directories to watch: a root inside another is covered by the outer
+/// watch, and a root listed twice is watched once.
+fn watched_roots(roots: &[PathBuf]) -> Vec<&Path> {
+    let mut watched = Vec::new();
+    for (index, root) in roots.iter().enumerate() {
+        let covered = roots.iter().enumerate().any(|(other_index, other)| {
+            (root.starts_with(other) && other != root) || (other == root && other_index < index)
+        });
+        if !covered {
+            watched.push(root.as_path());
+        }
+    }
+    watched
 }
 
 /// The projects an event changes: a path belongs to the project whose
@@ -852,10 +864,15 @@ fn config_for(map: &str, script: &str) -> Option<PathBuf> {
 /// next load. Empty outside a `celld dev` node, and for a script that this
 /// run did not build.
 pub fn store_values(manifest: &Manifest) -> anyhow::Result<BTreeMap<String, String>> {
-    let Some(map) = std::env::var(CONFIG_ENV).ok().filter(|_| is_dev_node()) else {
-        return Ok(BTreeMap::new());
-    };
-    let Some(config) = config_for(&map, &manifest.script_name) else {
+    match std::env::var(CONFIG_ENV).ok().filter(|_| is_dev_node()) {
+        Some(map) => store_values_from(&map, manifest),
+        None => Ok(BTreeMap::new()),
+    }
+}
+
+/// [`store_values`] for the projects of one [`CONFIG_ENV`] value.
+fn store_values_from(map: &str, manifest: &Manifest) -> anyhow::Result<BTreeMap<String, String>> {
+    let Some(config) = config_for(map, &manifest.script_name) else {
         return Ok(BTreeMap::new());
     };
     let mut values = match read_dev_vars(&config)? {
@@ -1012,7 +1029,9 @@ async fn run_stack(
         options.strict_compat_flags,
     )
     .await?;
-    warn_unreachable(&projects, console);
+    // The projects the node does not load that the console has already named.
+    let mut warned = BTreeSet::new();
+    warn_unreachable(&projects, &mut warned, console);
     let mut running = start_node(
         &projects,
         state,
@@ -1042,6 +1061,16 @@ async fn run_stack(
             }
             NodeEvent::Reload(changed) => {
                 pending.extend(changed);
+                // A project that nothing loaded reaches cannot change what the
+                // node serves, so a rebuild and a restart would only drop its
+                // in-flight requests. It stays pending: a later change can make
+                // another project bind it, and it is built then.
+                if changes_nothing_loaded(&projects, &pending) {
+                    console.progress(
+                        "change detected in a project that no running project reaches; nothing to restart",
+                    );
+                    continue;
+                }
                 console.progress("change detected; rebuilding the application");
                 match deploy_projects(
                     configs,
@@ -1055,7 +1084,7 @@ async fn run_stack(
                 {
                     Ok(deployed) => {
                         pending.clear();
-                        warn_unreachable(&deployed, console);
+                        warn_unreachable(&deployed, &mut warned, console);
                         projects = deployed;
                     }
                     Err(error) => {
@@ -1080,13 +1109,9 @@ async fn run_stack(
     }
 }
 
-fn warn_unreachable(projects: &[Project], console: &Console) {
-    for project in projects.iter().filter(|project| !project.reachable) {
-        console.warning(&format!(
-            "{} ({}) is not reached by a service binding or queue of the projects that run, so it does not run",
-            project.script,
-            project.config.display()
-        ));
+fn warn_unreachable(projects: &[Project], shown: &mut BTreeSet<String>, console: &Console) {
+    for warning in unreachable_warnings(projects, shown) {
+        console.warning(&warning);
     }
 }
 
