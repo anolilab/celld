@@ -440,9 +440,11 @@ mod tests {
         let manifest = one_binding(serde_json::json!({}));
         // One read of the script's secrets gives both the `env` pairs and the
         // values the binding consumes.
-        let secrets = crate::secrets::load(&bucket, &manifest, || Ok(Some(&key)))
-            .await
-            .unwrap();
+        let secrets = crate::secrets::load(&bucket, &manifest, || {
+            Ok(Some(crate::secrets::Keys::only(&key)))
+        })
+        .await
+        .unwrap();
         assert_eq!(secrets.env, [("TOKEN".to_string(), "t".to_string())]);
         let loaded = load(&manifest, secrets.consumed, None).unwrap();
         assert_eq!(loaded.len(), 1);

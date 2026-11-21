@@ -35,35 +35,46 @@ async fn put_and_announce(server: &Server, name: &str, value: &str) {
     .await;
 }
 
-/// `put` of `value`, or `delete` when it is `None`, then the revision bump of
-/// the scope key `announce` names, if any.
-async fn write(server: &Server, name: &str, value: Option<&str>, announce: Option<String>) {
+/// Run `work` against the dev store of `server`, as the CLI would against a bucket.
+async fn with_store<F, Fut>(server: &Server, work: F)
+where
+    F: FnOnce(celld::bucket::Bucket) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     let database = std::fs::canonicalize(server.project().join(".celld/dev"))
         .expect("resolve the dev state directory")
         .join("objects.sqlite3");
-    let (name, value) = (name.to_string(), value.map(str::to_string));
     host_runtime()
         .spawn(async move {
-            let bucket = celld::dev::open_local_bucket(&database).expect("open the dev store");
-            let key = SecretsKey::parse(&key_text()).expect("a valid key");
-            match value {
-                Some(value) => {
-                    secrets::put(&bucket, &key, "secrets", &name, &value, &BTreeSet::new())
-                        .await
-                        .expect("put the secret");
-                }
-                None => secrets::delete(&bucket, "secrets", &name)
-                    .await
-                    .expect("delete the secret"),
-            }
-            if let Some(scope) = announce {
-                celld::deploy::bump_secrets_revision(&bucket, &scope)
-                    .await
-                    .expect("bump the secrets revision");
-            }
+            work(celld::dev::open_local_bucket(&database).expect("open the dev store")).await;
         })
         .await
-        .expect("the put task finished");
+        .expect("the store task finished");
+}
+
+/// `put` of `value`, or `delete` when it is `None`, then the revision bump of
+/// the scope key `announce` names, if any.
+async fn write(server: &Server, name: &str, value: Option<&str>, announce: Option<String>) {
+    let (name, value) = (name.to_string(), value.map(str::to_string));
+    with_store(server, |bucket| async move {
+        let key = SecretsKey::parse(&key_text()).expect("a valid key");
+        match value {
+            Some(value) => {
+                secrets::put(&bucket, &key, "secrets", &name, &value, &BTreeSet::new())
+                    .await
+                    .expect("put the secret");
+            }
+            None => secrets::delete(&bucket, "secrets", &name)
+                .await
+                .expect("delete the secret"),
+        }
+        if let Some(scope) = announce {
+            celld::deploy::bump_secrets_revision(&bucket, &scope)
+                .await
+                .expect("bump the secrets revision");
+        }
+    })
+    .await;
 }
 
 async fn reload(server: &Server) -> (u16, Value) {
@@ -274,4 +285,96 @@ async fn a_put_for_a_scope_the_node_does_not_serve_rebuilds_nothing() {
         (generation(&server).await != before).then_some(())
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_node_serves_an_old_secret_during_a_rotation_and_after_it_with_the_new_key() {
+    let encode = |byte: u8| base64::engine::general_purpose::STANDARD.encode([byte; 32]);
+    let (old_key, new_key) = (key_text(), encode(43));
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let current = directory.path().join("current");
+    let previous = directory.path().join("previous");
+    std::fs::write(&current, &new_key).expect("write the new key");
+    std::fs::write(&previous, &old_key).expect("write the old key");
+    let (current_path, previous_path) = (
+        current.to_str().expect("a UTF-8 path").to_string(),
+        previous.to_str().expect("a UTF-8 path").to_string(),
+    );
+    let mut server = Server::start(
+        "secrets",
+        &[
+            ("CELLD_SECRETS_KEY_FILE", current_path.as_str()),
+            ("CELLD_SECRETS_KEY_PREVIOUS_FILE", previous_path.as_str()),
+        ],
+    )
+    .await;
+
+    // The secret was put under the old key, before the nodes had the new one.
+    put(&server, "API_TOKEN", PLANTED).await;
+    let (status, reply) = reload(&server).await;
+    assert_eq!(status, 200, "{reply}");
+    let served: Value = server.get_json("/").await;
+    assert_eq!(served["token"], PLANTED, "the previous key opens it");
+
+    with_store(&server, move |bucket| async move {
+        let old = SecretsKey::parse(&key_text()).expect("a valid key");
+        let new = SecretsKey::parse(&new_key).expect("a valid key");
+        let rotated = secrets::rotate(&bucket, &old, &new).await.expect("rotate");
+        assert_eq!(rotated.entries, 1);
+    })
+    .await;
+
+    // Drop the previous key: the file now holds an unrelated key, which opens
+    // nothing, so only the new key can open the secret.
+    let unrelated = encode(7);
+    server
+        .restart_after(|_| std::fs::write(&previous, unrelated).expect("replace the old key"))
+        .await;
+    let served: Value = server.get_json("/").await;
+    assert_eq!(served["token"], PLANTED, "the new key alone opens it");
+    assert!(!server.log_text().contains(PLANTED));
+}
+
+#[tokio::test]
+async fn a_node_refuses_to_start_on_a_broken_previous_key() {
+    // An old key, other than the node's current one.
+    let key = base64::engine::general_purpose::STANDARD.encode([41u8; 32]);
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let missing = directory.path().join("missing");
+    let file = directory.path().join("previous");
+    std::fs::write(&file, &key).expect("write the key");
+    let missing = missing.to_str().expect("a UTF-8 path");
+    let file = file.to_str().expect("a UTF-8 path");
+    // A well-formed previous key starts the node.
+    Server::start("secrets", &[("CELLD_SECRETS_KEY_PREVIOUS_FILE", file)]).await;
+    // A current key file read only at the first load with secrets (not yet
+    // mounted here) does not stop a node with a previous key from starting.
+    Server::start(
+        "secrets",
+        &[
+            ("CELLD_SECRETS_KEY_FILE", missing),
+            ("CELLD_SECRETS_KEY_PREVIOUS_FILE", file),
+        ],
+    )
+    .await;
+    let current = key_text();
+    let cases: [&[(&str, &str)]; 4] = [
+        &[("CELLD_SECRETS_KEY_PREVIOUS_FILE", missing)],
+        // The current key again: its id is the current key's.
+        &[
+            ("CELLD_SECRETS_KEY", current.as_str()),
+            ("CELLD_SECRETS_KEY_PREVIOUS", current.as_str()),
+        ],
+        &[("CELLD_SECRETS_KEY_PREVIOUS", "not a key")],
+        &[
+            ("CELLD_SECRETS_KEY_PREVIOUS", key.as_str()),
+            ("CELLD_SECRETS_KEY_PREVIOUS_FILE", file),
+        ],
+    ];
+    for env in cases {
+        assert!(
+            Server::try_start("secrets", env).await.is_err(),
+            "the node started with {env:?}"
+        );
+    }
 }

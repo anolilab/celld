@@ -968,12 +968,8 @@ async fn load_worker_at_pointer(
     let mut vars = worker_vars(&manifest);
     // Secrets are decrypted here, once per deployment load, and join the vars
     // as string bindings: one bucket read, nothing per request.
-    let script_secrets = crate::secrets::load(
-        bucket,
-        &manifest,
-        crate::secrets::SecretsKey::from_environment,
-    )
-    .await?;
+    let script_secrets =
+        crate::secrets::load(bucket, &manifest, crate::secrets::Keys::from_environment).await?;
     vars.extend(script_secrets.env);
     // Store secrets are bindings of their own, not vars, so `process.env`
     // never holds them. One more bucket read per distinct store.
@@ -985,7 +981,7 @@ async fn load_worker_at_pointer(
         bucket,
         &manifest,
         &dev_values,
-        crate::secrets::SecretsKey::from_environment,
+        crate::secrets::Keys::from_environment,
     )
     .await?;
     // Hyperdrive connection strings are script secrets, or `celld dev` values.

@@ -302,6 +302,9 @@ pub fn validate() -> anyhow::Result<()> {
     // A malformed secrets key stops the node now, not at its first deployment
     // load. The file is read at load, like the operator token file above.
     crate::secrets::SecretsKey::from_variable()?;
+    // The previous key is read in full: it is opened only while a rotation runs,
+    // so a broken file would otherwise fail every load and not the start.
+    crate::secrets::SecretsKey::validate_previous()?;
     crate::egress_filter::from_env()?;
     crate::ai::validate()?;
     crate::tls_roots::extra()?;

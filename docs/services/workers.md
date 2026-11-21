@@ -94,6 +94,7 @@ export CELLD_SECRETS_KEY="$(openssl rand -base64 32)"   # once, for the fleet
 printf %s "$STRIPE_KEY" | celld secret put STRIPE_KEY --script billing --bucket s3://my-cells-bucket
 celld secret list --script billing --bucket s3://my-cells-bucket
 celld secret delete STRIPE_KEY --script billing --bucket s3://my-cells-bucket
+celld secret rotate --bucket s3://my-cells-bucket   # with CELLD_SECRETS_KEY_PREVIOUS set
 ```
 
 `--script` defaults to the `name` of the Wrangler config in the working
@@ -157,8 +158,47 @@ refuse a version whose bindings use the name of a stored secret, so a rollback t
 secret. A secret's value does not appear in a log, in `/state`, in an error
 message, or in the output of `celld deploy`.
 
-Key rotation is not part of this release. To change the key, delete the
-script's secrets, give the new key to every node, and put them again.
+### Rotate the secrets key
+
+To change the key without downtime and without putting the values again, rotate
+in this order:
+
+1. Set the new key as `CELLD_SECRETS_KEY` (or `_FILE`) and the old one as
+   `CELLD_SECRETS_KEY_PREVIOUS` (or `CELLD_SECRETS_KEY_PREVIOUS_FILE`)
+   everywhere: on every node, which you restart or redeploy, and in every
+   environment and CI job that runs `celld secret`. A node opens each entry
+   with the key its id names, and seals only with the current key. It refuses
+   to start on a malformed or unreadable previous key, and setting both the
+   variable and the file is an error.
+2. Run `celld secret rotate --bucket ...`. It reads its keys as a node does:
+   it re-seals under `CELLD_SECRETS_KEY` and uses the previous key only to
+   open, and it refuses to run when no previous key is set. It re-seals every
+   secret of every Worker (`deploy/<script>/secrets.json`) and of every
+   Secrets Store (`stores/<id>/secrets.json`), one conditional write per
+   object, and prints how many objects and secrets it re-sealed, never a
+   value. It lists the owners again afterwards and ends only when a walk finds
+   nothing left under the previous key. If objects keep appearing, it fails
+   and names one.
+3. Drop `CELLD_SECRETS_KEY_PREVIOUS` from the nodes and from every
+   environment.
+
+From step 1 every `put` seals under the new key, so a new object can no longer
+appear under the old key. A `put` into an object that is still under the old
+key is refused until `rotate` reaches it, and works after. `rotate` does not
+change what the fleet pointer selects, so a node that was given the new key
+without the previous one, and failed to load a Worker whose secrets were still
+under the old key, keeps serving its old generation after the run: reload it
+(`POST /reload`) or restart it.
+
+A run that stops resumes when you run it again: an object whose entries are all
+under the current key is skipped. An entry sealed under neither key stops the
+run with an error that names the object and the secret; fix it (delete that
+secret and put it again under the new key, or restore the key it was sealed
+with), then run again. A `put` cannot replace it, because a `put` is refused
+when the object holds entries under two keys. Rotation does not change any
+value, so it does not set `secrets_revisions`, and no node rebuilds. A node
+that finds an entry sealed under a key it does not hold fails that load and
+keeps serving the previous deployment.
 
 ## Secrets Store
 

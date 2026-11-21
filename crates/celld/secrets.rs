@@ -42,6 +42,9 @@ use crate::protocol::Manifest;
 
 pub const KEY_VARIABLE: &str = "CELLD_SECRETS_KEY";
 pub const KEY_FILE_VARIABLE: &str = "CELLD_SECRETS_KEY_FILE";
+/// The key a rotation replaces. A node opens entries with it and never seals.
+pub const PREVIOUS_KEY_VARIABLE: &str = "CELLD_SECRETS_KEY_PREVIOUS";
+pub const PREVIOUS_KEY_FILE_VARIABLE: &str = "CELLD_SECRETS_KEY_PREVIOUS_FILE";
 
 /// Cloudflare's limit for one secret.
 pub const MAX_VALUE_BYTES: usize = 5 * 1024;
@@ -75,6 +78,22 @@ impl Drop for SecretsKey {
     fn drop(&mut self) {
         self.bytes.zeroize();
     }
+}
+
+/// Refuse two keys whose ids match: either they are the same key, or the
+/// short id of two different keys collides and entries could not say which
+/// key sealed them.
+pub(crate) fn ensure_distinct_ids(
+    previous: &SecretsKey,
+    current: &SecretsKey,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        previous.id != current.id,
+        "{PREVIOUS_KEY_VARIABLE} has the key id of {KEY_VARIABLE}: either it is the same key, \
+         or two different keys share an id; set the old key as the previous one, or \
+         generate another new key"
+    );
+    Ok(())
 }
 
 impl SecretsKey {
@@ -114,7 +133,29 @@ impl SecretsKey {
     /// blank. Startup validation uses it, so a node stops at once on a
     /// malformed key without reading the file.
     pub(crate) fn from_variable() -> anyhow::Result<Option<Self>> {
-        let Some(text) = crate::env_vars::value(KEY_VARIABLE)? else {
+        Self::from_named_variable(KEY_VARIABLE)
+    }
+
+    /// Check the previous key at startup, the file included: a node whose
+    /// previous key cannot be read or decoded, or that has both the variable and
+    /// the file, refuses to start and does not fail each load later. An entry
+    /// names its key by a short id, so a previous key with the current key's
+    /// id is refused too: a load could not tell their entries apart.
+    pub(crate) fn validate_previous() -> anyhow::Result<()> {
+        let Some(previous) = Self::previous_from_environment()? else {
+            return Ok(());
+        };
+        // The current key's file may be read only at the first load with
+        // secrets (a mount can come later), so an unreadable one is left to
+        // that load, which checks the pair again.
+        if let Ok(Some(current)) = Self::from_environment() {
+            ensure_distinct_ids(previous, current)?;
+        }
+        Ok(())
+    }
+
+    fn from_named_variable(variable: &str) -> anyhow::Result<Option<Self>> {
+        let Some(text) = crate::env_vars::value(variable)? else {
             return Ok(None);
         };
         let text = Zeroizing::new(text);
@@ -123,23 +164,16 @@ impl SecretsKey {
         }
         Self::parse(&text)
             .map(Some)
-            .with_context(|| format!("{KEY_VARIABLE} is invalid"))
+            .with_context(|| format!("{variable} is invalid"))
     }
 
-    /// The key from `CELLD_SECRETS_KEY` or `CELLD_SECRETS_KEY_FILE`, or `None`
-    /// when neither is set. Setting both is refused, since a node and an
+    /// The key from `variable` or the file that `file_variable` names, or
+    /// `None` when neither is set. Setting both is refused, since a node and an
     /// operator that read different ones would disagree about every value.
-    ///
-    /// The key is read and parsed once per process; a change to the variable or
-    /// the file takes effect at the next start.
-    pub fn from_environment() -> anyhow::Result<Option<&'static Self>> {
-        static KEY: OnceLock<Option<SecretsKey>> = OnceLock::new();
-        if let Some(key) = KEY.get() {
-            return Ok(key.as_ref());
-        }
-        let key = crate::credential_file::variable_or_file(
-            KEY_VARIABLE,
-            KEY_FILE_VARIABLE,
+    fn read_environment(variable: &str, file_variable: &str) -> anyhow::Result<Option<Self>> {
+        crate::credential_file::variable_or_file(
+            variable,
+            file_variable,
             KEY_FILE_MAX_BYTES,
             &SHARED_KEY_FILE,
         )?
@@ -147,8 +181,35 @@ impl SecretsKey {
             Self::parse(&credential.text)
                 .with_context(|| format!("{} is invalid", credential.origin))
         })
-        .transpose()?;
-        Ok(KEY.get_or_init(|| key).as_ref())
+        .transpose()
+    }
+
+    /// The key from `variable` or the file `file_variable` names, read once per
+    /// process into `slot`; a change takes effect at the next start.
+    fn cached(
+        slot: &'static OnceLock<Option<SecretsKey>>,
+        variable: &str,
+        file_variable: &str,
+    ) -> anyhow::Result<Option<&'static Self>> {
+        if let Some(key) = slot.get() {
+            return Ok(key.as_ref());
+        }
+        let key = Self::read_environment(variable, file_variable)?;
+        Ok(slot.get_or_init(|| key).as_ref())
+    }
+
+    /// The key from `CELLD_SECRETS_KEY` or `CELLD_SECRETS_KEY_FILE`, or `None`
+    /// when neither is set.
+    pub fn from_environment() -> anyhow::Result<Option<&'static Self>> {
+        static KEY: OnceLock<Option<SecretsKey>> = OnceLock::new();
+        Self::cached(&KEY, KEY_VARIABLE, KEY_FILE_VARIABLE)
+    }
+
+    /// The key from `CELLD_SECRETS_KEY_PREVIOUS` or its `_FILE`, read as
+    /// [`Self::from_environment`] reads the current one. It only opens.
+    pub fn previous_from_environment() -> anyhow::Result<Option<&'static Self>> {
+        static KEY: OnceLock<Option<SecretsKey>> = OnceLock::new();
+        Self::cached(&KEY, PREVIOUS_KEY_VARIABLE, PREVIOUS_KEY_FILE_VARIABLE)
     }
 
     pub fn id(&self) -> &str {
@@ -208,6 +269,60 @@ impl SecretsKey {
     }
 }
 
+/// The keys a node opens entries with: the one that seals, and during a
+/// rotation the one it replaces. An entry names its key by id, and opens only
+/// under that one.
+#[derive(Clone, Copy)]
+pub struct Keys<'k> {
+    pub current: &'k SecretsKey,
+    pub previous: Option<&'k SecretsKey>,
+}
+
+impl Keys<'static> {
+    /// Both keys of the environment, or `None` without a current one. A node
+    /// reads them when its first deployment with secrets loads.
+    pub fn from_environment() -> anyhow::Result<Option<Self>> {
+        let Some(current) = SecretsKey::from_environment()? else {
+            return Ok(None);
+        };
+        let previous = SecretsKey::previous_from_environment()?;
+        if let Some(previous) = previous {
+            ensure_distinct_ids(previous, current)?;
+        }
+        Ok(Some(Self { current, previous }))
+    }
+}
+
+impl<'k> Keys<'k> {
+    /// Only the sealing key.
+    pub fn only(current: &'k SecretsKey) -> Self {
+        Self {
+            current,
+            previous: None,
+        }
+    }
+
+    /// The decrypted entry. An entry sealed under neither key is an error and
+    /// is not tried against either, so the load fails closed.
+    fn open(&self, scope: Scope<'_>, name: &str, sealed: &Sealed) -> anyhow::Result<Vec<u8>> {
+        let key = [Some(self.current), self.previous]
+            .into_iter()
+            .flatten()
+            .find(|key| key.id == sealed.kid)
+            .ok_or_else(|| {
+                anyhow!(
+                    "secret {name} of {} does not open under the secrets key {} or the previous \
+                     key: it was sealed under key {}; set that key as {PREVIOUS_KEY_VARIABLE} \
+                     or {PREVIOUS_KEY_FILE_VARIABLE}",
+                    scope.label(),
+                    self.current.id(),
+                    sealed.kid
+                )
+            })?;
+        key.open(scope, name, sealed)
+    }
+}
+
 /// What a value is bound to: its script and its name. The separators cannot
 /// occur in either, so two pairs never give the same bytes.
 fn associated_data(script: &str, name: &str) -> Vec<u8> {
@@ -245,10 +360,14 @@ enum Scope<'a> {
 }
 
 impl Scope<'_> {
+    /// Where the owners of each kind keep their objects: `<prefix><id>/secrets.json`.
+    const SCRIPT_PREFIX: &'static str = "deploy/";
+    const STORE_PREFIX: &'static str = "stores/";
+
     fn object_key(self) -> String {
         match self {
-            Self::Script(script) => format!("deploy/{script}/secrets.json"),
-            Self::Store(store) => format!("stores/{store}/secrets.json"),
+            Self::Script(script) => format!("{}{script}/secrets.json", Self::SCRIPT_PREFIX),
+            Self::Store(store) => format!("{}{store}/secrets.json", Self::STORE_PREFIX),
         }
     }
 
@@ -302,6 +421,9 @@ impl Scope<'_> {
         }
     }
 }
+
+mod rotate;
+pub use rotate::{rotate, Rotated};
 
 pub fn object_key(script: &str) -> String {
     Scope::Script(script).object_key()
@@ -573,12 +695,14 @@ impl std::fmt::Debug for ScriptSecrets {
 /// when the script has none or the deployment has no Worker module.
 ///
 /// A script with secrets and no key is an error, so a node never serves a
-/// Worker that silently lacks a credential. `key` runs only when the script
-/// has secrets, so an unreadable key file stops no script that has none.
+/// Worker that silently lacks a credential. `keys` runs only when the script
+/// has secrets, so an unreadable key file stops no script that has none. Each
+/// entry opens under the key its `kid` names; one under neither key fails the
+/// load.
 pub async fn load<'k>(
     bucket: &Bucket,
     manifest: &Manifest,
-    key: impl FnOnce() -> anyhow::Result<Option<&'k SecretsKey>>,
+    keys: impl FnOnce() -> anyhow::Result<Option<Keys<'k>>>,
 ) -> anyhow::Result<ScriptSecrets> {
     if manifest.main_module.is_none() {
         return Ok(ScriptSecrets::default());
@@ -590,7 +714,7 @@ pub async fn load<'k>(
     if set.secrets.is_empty() {
         return Ok(ScriptSecrets::default());
     }
-    let key = key()?.with_context(|| {
+    let keys = keys()?.with_context(|| {
         format!(
             "script {script} has {} secret(s), and no secrets key is configured; \
              set {KEY_VARIABLE} or {KEY_FILE_VARIABLE} to the key they were put under",
@@ -608,7 +732,7 @@ pub async fn load<'k>(
                 return Err(clash(script, name));
             }
         }
-        let value = String::from_utf8(key.open(Scope::Script(script), name, sealed)?)
+        let value = String::from_utf8(keys.open(Scope::Script(script), name, sealed)?)
             .map_err(|_| anyhow!("secret {name} of script {script} is not UTF-8"))?;
         if consumed {
             loaded.consumed.insert(name.clone(), value);
@@ -818,12 +942,12 @@ impl std::fmt::Debug for StoreSecret {
 ///
 /// A secret the store lacks becomes a `get()` that rejects, since it can vanish
 /// after the deploy that checked it. A store with a secret and no key is an
-/// error, as it is for a script's secrets; `key` runs only then.
+/// error, as it is for a script's secrets; `keys` runs only then.
 pub async fn load_stores<'k>(
     bucket: &Bucket,
     manifest: &Manifest,
     dev_values: &BTreeMap<String, String>,
-    key: impl FnOnce() -> anyhow::Result<Option<&'k SecretsKey>>,
+    keys: impl FnOnce() -> anyhow::Result<Option<Keys<'k>>>,
 ) -> anyhow::Result<Vec<StoreSecret>> {
     if manifest.main_module.is_none() {
         return Ok(Vec::new());
@@ -852,8 +976,8 @@ pub async fn load_stores<'k>(
             .and_then(Option::as_ref)
             .and_then(|set| set.secrets.get(binding.secret_name))
     };
-    let mut key = Some(key);
-    let mut opener: Option<&SecretsKey> = None;
+    let mut keys = Some(keys);
+    let mut opener: Option<Keys<'k>> = None;
     let mut loaded = Vec::with_capacity(bindings.len());
     for binding in &bindings {
         let value = match (dev_value(binding), found(binding)) {
@@ -861,7 +985,7 @@ pub async fn load_stores<'k>(
             (None, None) => Err(store_missing(binding)),
             (None, Some(sealed)) => {
                 if opener.is_none() {
-                    let resolve = key.take().expect("the key is resolved once");
+                    let resolve = keys.take().expect("the keys are resolved once");
                     opener = Some(resolve()?.with_context(|| {
                         format!(
                             "a Secrets Store binding of script {} needs the secrets key, and none \
@@ -951,7 +1075,7 @@ mod tests {
         );
     }
 
-    fn key(byte: u8) -> SecretsKey {
+    pub(super) fn key(byte: u8) -> SecretsKey {
         SecretsKey::from_bytes([byte; KEY_BYTES])
     }
 
@@ -1045,7 +1169,7 @@ mod tests {
         );
     }
 
-    fn manifest(bindings: &[&str]) -> Manifest {
+    pub(super) fn manifest(bindings: &[&str]) -> Manifest {
         let bindings: Vec<_> = bindings
             .iter()
             .map(|name| serde_json::json!({ "type": "plain_text", "name": name, "text": "x" }))
@@ -1062,7 +1186,7 @@ mod tests {
         .unwrap()
     }
 
-    fn bucket(directory: &tempfile::TempDir) -> Bucket {
+    pub(super) fn bucket(directory: &tempfile::TempDir) -> Bucket {
         crate::asyncrt::install_test_host_runtime();
         Bucket::open_dev(&directory.path().join("objects.sqlite3")).unwrap()
     }
@@ -1126,7 +1250,7 @@ mod tests {
         ensure_no_clash(&bucket, &manifest(&["DB"])).await.unwrap();
         let clashing = manifest(&["TOKEN"]);
         assert!(ensure_no_clash(&bucket, &clashing).await.is_err());
-        let error = load(&bucket, &clashing, || Ok(Some(&key)))
+        let error = load(&bucket, &clashing, || Ok(Some(Keys::only(&key))))
             .await
             .unwrap_err();
         let text = format!("{error:#}");
@@ -1135,7 +1259,7 @@ mod tests {
             "{text}"
         );
         assert_eq!(
-            load(&bucket, &manifest(&["DB"]), || Ok(Some(&key)))
+            load(&bucket, &manifest(&["DB"]), || Ok(Some(Keys::only(&key))))
                 .await
                 .unwrap()
                 .env,
@@ -1162,7 +1286,7 @@ mod tests {
             "{error:#}"
         );
         let other = key(4);
-        let error = load(&bucket, &manifest, || Ok(Some(&other)))
+        let error = load(&bucket, &manifest, || Ok(Some(Keys::only(&other))))
             .await
             .unwrap_err();
         assert!(
@@ -1196,7 +1320,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let error = load(&bucket, &manifest(&[]), || Ok(Some(&key)))
+        let error = load(&bucket, &manifest(&[]), || Ok(Some(Keys::only(&key))))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("__proto__"), "{error}");
@@ -1284,7 +1408,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let error = load(&bucket, &manifest(&[]), || Ok(Some(&key)))
+        let error = load(&bucket, &manifest(&[]), || Ok(Some(Keys::only(&key))))
             .await
             .unwrap_err();
         assert!(
@@ -1301,7 +1425,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let error = load(&bucket, &manifest(&[]), || Ok(Some(&key)))
+        let error = load(&bucket, &manifest(&[]), || Ok(Some(Keys::only(&key))))
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("byte limit"), "{error:#}");
@@ -1352,7 +1476,7 @@ mod tests {
             .is_err());
     }
 
-    fn store_manifest(bindings: serde_json::Value) -> Manifest {
+    pub(super) fn store_manifest(bindings: serde_json::Value) -> Manifest {
         let mut manifest = manifest(&[]);
         manifest.raw_metadata = serde_json::json!({ "bindings": bindings });
         manifest.required_features = vec![crate::protocol::FEATURE_SECRETS_STORE_V1.to_string()];
@@ -1415,7 +1539,7 @@ mod tests {
         assert_eq!(dev_values_for(&marked, read).unwrap()["A"], "v");
     }
 
-    fn store_binding(name: &str, store: &str, secret: &str) -> serde_json::Value {
+    pub(super) fn store_binding(name: &str, store: &str, secret: &str) -> serde_json::Value {
         serde_json::json!({
             "type": STORE_BINDING_TYPE, "name": name, "store_id": store, "secret_name": secret
         })
@@ -1440,9 +1564,11 @@ mod tests {
         ensure_store_secrets(&bucket, &manifest, false)
             .await
             .unwrap();
-        let loaded = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(Some(&key)))
-            .await
-            .unwrap();
+        let loaded = load_stores(&bucket, &manifest, &BTreeMap::new(), || {
+            Ok(Some(Keys::only(&key)))
+        })
+        .await
+        .unwrap();
         let values: Vec<_> = loaded
             .iter()
             .map(|secret| (secret.binding.as_str(), secret.value.clone().unwrap()))
@@ -1486,9 +1612,11 @@ mod tests {
         // is what fails.
         put_store(&bucket, &key, "st1", "gone", "v").await.unwrap();
         delete_store(&bucket, "st1", "gone").await.unwrap();
-        let loaded = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(Some(&key)))
-            .await
-            .unwrap();
+        let loaded = load_stores(&bucket, &manifest, &BTreeMap::new(), || {
+            Ok(Some(Keys::only(&key)))
+        })
+        .await
+        .unwrap();
         assert!(loaded[0].value.as_ref().unwrap_err().contains("gone"));
     }
 
@@ -1637,5 +1765,128 @@ mod tests {
         assert!(put_store(&bucket, &key, "../x", "k", "v").await.is_err());
         assert!(put_store(&bucket, &key, "st1", "a/b", "v").await.is_err());
         assert!(put_store(&bucket, &key, "st1", "k", "").await.is_err());
+    }
+
+    /// Write one entry sealed under `key`, whatever the others are sealed under:
+    /// the state a rotation that stopped half way leaves, which `put` refuses.
+    pub(super) async fn plant(
+        bucket: &Bucket,
+        scope: Scope<'_>,
+        key: &SecretsKey,
+        name: &str,
+        value: &str,
+    ) {
+        let (mut set, token) = match read(bucket, scope).await.unwrap() {
+            Some((set, token)) => (set, Some(token)),
+            None => (SecretSet::default(), None),
+        };
+        set.secrets.insert(
+            name.to_string(),
+            key.seal(scope, name, value.as_bytes()).unwrap(),
+        );
+        bucket
+            .put_cas(
+                &scope.object_key(),
+                serde_json::to_vec(&set).unwrap(),
+                token.as_deref(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    pub(super) fn values(loaded: ScriptSecrets) -> Vec<(String, String)> {
+        loaded.env
+    }
+
+    #[tokio::test]
+    async fn a_load_opens_entries_under_the_previous_and_the_current_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let (old, new) = (key(3), key(4));
+        plant(&bucket, Scope::Script("app"), &old, "A", "from-old").await;
+        plant(&bucket, Scope::Script("app"), &new, "B", "from-new").await;
+        let keys = Keys {
+            current: &new,
+            previous: Some(&old),
+        };
+        let loaded = load(&bucket, &manifest(&[]), || Ok(Some(keys)))
+            .await
+            .unwrap();
+        assert_eq!(
+            values(loaded),
+            [
+                ("A".to_string(), "from-old".to_string()),
+                ("B".to_string(), "from-new".to_string())
+            ]
+        );
+        // The previous key never seals: a put under it is refused beside entries
+        // of the new key, and a put under the new key beside entries of the old.
+        let none = BTreeSet::new();
+        assert!(put(&bucket, &old, "app", "C", "v", &none).await.is_err());
+        // Stores pick the key by entry too.
+        plant(&bucket, Scope::Store("st1"), &old, "k", "store-old").await;
+        let manifest = store_manifest(serde_json::json!([store_binding("S", "st1", "k")]));
+        let stores = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(Some(keys)))
+            .await
+            .unwrap();
+        assert_eq!(stores[0].value.as_deref().unwrap(), "store-old");
+    }
+
+    #[tokio::test]
+    async fn an_entry_under_an_unknown_key_fails_the_load_closed_without_a_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let (current, previous, stranger) = (key(4), key(3), key(5));
+        plant(&bucket, Scope::Script("app"), &current, "A", "kept-value").await;
+        plant(
+            &bucket,
+            Scope::Script("app"),
+            &stranger,
+            "B",
+            "unknown-value",
+        )
+        .await;
+        let keys = Keys {
+            current: &current,
+            previous: Some(&previous),
+        };
+        let error = load(&bucket, &manifest(&[]), || Ok(Some(keys)))
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("secret B of script app"), "{text}");
+        assert!(text.contains(stranger.id()), "{text}");
+        assert!(!text.contains("kept-value") && !text.contains("unknown-value"));
+
+        // The key is chosen by the entry's id and not found by trying each: a
+        // value the current key could open still fails under a foreign id.
+        let (mut set, token) = read(&bucket, Scope::Script("app")).await.unwrap().unwrap();
+        set.secrets.remove("B");
+        set.secrets.get_mut("A").unwrap().kid = "deadbeef".to_string();
+        bucket
+            .put_cas(
+                &object_key("app"),
+                serde_json::to_vec(&set).unwrap(),
+                Some(&token),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let error = load(&bucket, &manifest(&[]), || Ok(Some(keys)))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("deadbeef"), "{error:#}");
+
+        plant(&bucket, Scope::Store("st1"), &stranger, "k", "store-value").await;
+        let manifest = store_manifest(serde_json::json!([store_binding("S", "st1", "k")]));
+        let error = load_stores(&bucket, &manifest, &BTreeMap::new(), || Ok(Some(keys)))
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(stranger.id()) && !text.contains("store-value"),
+            "{text}"
+        );
     }
 }

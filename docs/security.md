@@ -175,7 +175,26 @@ A node reads and parses the key once per process and clears its copy of the
 decoded bytes and of the file text from memory when it is done with them; the
 key stays in memory while the node runs. A key file may be a symbolic link,
 because a mounted secret is one. celld reads at most 4 KiB from it, and logs a
-warning, without refusing, when other users can read it.
+warning, without refusing, when other users can read it. The same holds for the
+previous key and its file.
+
+To rotate the key, change it in this order:
+
+1. Set the new key as `CELLD_SECRETS_KEY` and the old one as
+   `CELLD_SECRETS_KEY_PREVIOUS` (or `CELLD_SECRETS_KEY_PREVIOUS_FILE`)
+   everywhere: on every node, which you restart or redeploy, and in every
+   environment that runs `celld secret`. The previous key only opens entries;
+   it never seals.
+2. Run `celld secret rotate`. It re-seals every secret of every Worker and
+   store under `CELLD_SECRETS_KEY`, opening with the previous key, checks the
+   fleet again afterwards, and can be run again if it stops. It refuses to run
+   without a previous key.
+3. Drop the previous key.
+
+From step 1 every `put` seals under the new key, so no new object appears under
+the old one. Each entry names its key by a short id; in the rare case that the
+new key's id matches the old one's, a node and `rotate` refuse the pair, and
+you generate another new key. See [Rotate the secrets key](services/workers.md#rotate-the-secrets-key).
 
 ## Limit Worker egress
 

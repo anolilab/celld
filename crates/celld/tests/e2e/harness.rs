@@ -681,6 +681,8 @@ fn try_spawn(
         // Likewise a secrets key would decide whether a secret opens.
         .env_remove("CELLD_SECRETS_KEY")
         .env_remove("CELLD_SECRETS_KEY_FILE")
+        .env_remove("CELLD_SECRETS_KEY_PREVIOUS")
+        .env_remove("CELLD_SECRETS_KEY_PREVIOUS_FILE")
         .envs(
             env.iter()
                 .filter(|(k, _)| k != "CELLD_OPERATOR_TOKEN")
