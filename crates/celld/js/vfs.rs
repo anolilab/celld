@@ -32,8 +32,11 @@ const VFS_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Charged for each entry on top of its path and bytes.
 const VFS_NODE_OVERHEAD: usize = 64;
 
-/// The most spare capacity one append may claim beyond the bytes it needs, so
-/// a single append to a large file cannot take the rest of the request's `/tmp`.
+/// The least spare capacity an append that outgrows its file claims, and the
+/// share of the file (a quarter) it claims once the file is larger than four
+/// times this. A fixed step would copy the whole file once per step; a share
+/// keeps the copies geometric, and the bounded share keeps one append to a
+/// large file from taking the rest of the request's `/tmp`.
 const VFS_APPEND_SLACK: usize = 1024 * 1024;
 
 /// A file has no kind but its bytes; a path-only set would make a file
@@ -210,9 +213,10 @@ impl RequestVfs {
     }
 
     /// The capacity an append needs: unchanged while it fits, otherwise the
-    /// bytes needed plus an equal amount of slack, at most `VFS_APPEND_SLACK`,
-    /// so n small appends reallocate O(log n) times and one append to a large
-    /// file claims a bounded extra. The slack stops at `budget`, the most
+    /// bytes needed plus slack: an equal amount while that is small, at least
+    /// `VFS_APPEND_SLACK` and a quarter of the bytes needed beyond it, so n
+    /// small appends reallocate O(log n) times at every size and one append
+    /// to a large file claims a bounded extra. The slack stops at `budget`, the most
     /// capacity the file may take, so an append whose bytes fit is never
     /// refused for the room its growth would have wanted.
     fn grown_capacity(capacity: usize, len: usize, extra: usize, budget: usize) -> usize {
@@ -221,7 +225,7 @@ impl RequestVfs {
             capacity
         } else {
             needed
-                .saturating_add(needed.min(VFS_APPEND_SLACK))
+                .saturating_add(needed.min(VFS_APPEND_SLACK.max(needed / 4)))
                 .min(budget)
                 .max(needed)
         }
@@ -625,6 +629,31 @@ mod tests {
     }
 
     #[test]
+    fn appends_to_a_large_file_grow_its_capacity_geometrically() {
+        let mut vfs = RequestVfs::default();
+        let chunk = vec![b'x'; 1024];
+        let mut capacity = 0;
+        let mut copies = 0;
+        let mut copied = 0;
+        // 1 KiB appends up to 40 MiB. A growth step of a fixed 1 MiB copies
+        // the file about once per MiB past the first.
+        for _ in 0..40 * 1024 {
+            vfs.write("/tmp/log", chunk.clone(), true).unwrap();
+            let Some(VfsNode::File(bytes)) = vfs.nodes.get("/tmp/log") else {
+                panic!("/tmp/log is not a file");
+            };
+            if bytes.capacity() != capacity {
+                // The bytes held before this append are what a move copies.
+                copied += bytes.len() - chunk.len();
+                capacity = bytes.capacity();
+                copies += 1;
+            }
+        }
+        assert!(copies <= 32, "{copies} reallocations");
+        assert!(copied <= 6 * 40 * 1024 * 1024, "{copied} bytes copied");
+    }
+
+    #[test]
     fn a_shrinking_overwrite_and_a_removal_give_the_charge_back() {
         let mut vfs = RequestVfs::default();
         vfs.write("/tmp/a", vec![1; 4096], false).unwrap();
@@ -697,7 +726,7 @@ mod tests {
         };
         assert_eq!(bytes.len(), len + 1);
         assert!(
-            bytes.capacity() <= len + 1 + super::VFS_APPEND_SLACK,
+            bytes.capacity() <= len + 1 + (len + 1) / 4,
             "capacity {}",
             bytes.capacity()
         );
