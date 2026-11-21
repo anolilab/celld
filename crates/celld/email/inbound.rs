@@ -519,7 +519,7 @@ impl Event {
         let Some(id) = self.message_id.as_ref().filter(|id| threadable(id)) else {
             return Err(EmailError::new(
                 "E_FIELD_MISSING",
-                "the incoming message has no Message-ID, so a reply cannot be threaded",
+                "the incoming message has no Message-ID of printable ASCII, so a reply cannot be threaded",
             ));
         };
         if self.from.is_empty() {
