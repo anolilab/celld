@@ -144,9 +144,10 @@ restart. A build that fails is not retried every interval; a later `put` or
 write and writes it after loses its conditional write; run it again.
 
 A deploy or activation of the same version keeps the revisions, so it rebuilds
-nothing. If `delete` removed the secret but could not update the pointer, run
-`celld secret delete NAME --announce-only`: it deletes nothing and only tells the
-nodes.
+nothing. If `put` or `delete` stored the change but could not update the
+pointer, run the same command again with `--announce-only`: it writes no secret
+and only tells the nodes. Running `put` again would write its value a second
+time, over any newer one.
 
 A secret cannot have the name of a variable or binding of the Worker, or be
 named `__proto__`. `celld secret put` refuses a name that the deployment the

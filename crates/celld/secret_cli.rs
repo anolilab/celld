@@ -35,6 +35,8 @@ enum Step {
         value: String,
     },
     Delete(String),
+    /// Tell the nodes about the secrets of the owner, writing nothing else.
+    Announce,
     List,
 }
 
@@ -127,6 +129,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         ),
     };
     let step = match command.action {
+        _ if command.announce_only => Step::Announce,
         Action::Put(name) => {
             let key = SecretsKey::from_environment()?.with_context(|| {
                 format!(
@@ -155,19 +158,19 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                     secrets::put_store(&bucket, key, store, &name, &value).await?;
                 }
             }
-            let told = announce(&bucket, &owner, "run this command again").await?;
+            let told = announce(
+                &bucket,
+                &owner,
+                "run this command again with --announce-only",
+            )
+            .await?;
             note!("Stored secret {name} for {owner}. {told}");
             Ok(())
         }
         Step::Delete(name) => {
-            // The delete cannot repeat once the name is gone, so a failed
-            // announcement is retried with `--announce-only`, which deletes
-            // nothing.
-            if !command.announce_only {
-                match &owner {
-                    Owner::Script(script) => secrets::delete(&bucket, script, &name).await?,
-                    Owner::Store(store) => secrets::delete_store(&bucket, store, &name).await?,
-                }
+            match &owner {
+                Owner::Script(script) => secrets::delete(&bucket, script, &name).await?,
+                Owner::Store(store) => secrets::delete_store(&bucket, store, &name).await?,
             }
             let told = announce(
                 &bucket,
@@ -175,11 +178,15 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                 "run this command again with --announce-only",
             )
             .await?;
-            if command.announce_only {
-                note!("Announced the secrets of {owner}; nothing was deleted. {told}");
-            } else {
-                note!("Deleted secret {name} of {owner}. {told}");
-            }
+            note!("Deleted secret {name} of {owner}. {told}");
+            Ok(())
+        }
+        // Repeating a put or delete would write again (and could replace a
+        // newer value), so a failed announcement is retried with this, which
+        // writes no secret.
+        Step::Announce => {
+            let told = announce(&bucket, &owner, "run this command again").await?;
+            note!("Announced the secrets of {owner}; no secret was written. {told}");
             Ok(())
         }
         Step::List => {
@@ -301,8 +308,8 @@ impl Command {
         if json && !matches!(action, Action::List) {
             bail!("--json applies to `celld secret list`");
         }
-        if announce_only && !matches!(action, Action::Delete(_)) {
-            bail!("--announce-only applies to `celld secret delete`");
+        if announce_only && matches!(action, Action::List) {
+            bail!("--announce-only applies to `celld secret put` and `delete`");
         }
         Ok(Some(Self {
             action,
@@ -322,6 +329,7 @@ pub fn print_help() {
 
 USAGE
   celld secret put    NAME [--script SCRIPT] [fleet options] < value
+  celld secret put    NAME [--script SCRIPT] [fleet options] --announce-only
   celld secret list        [--script SCRIPT] [fleet options] [--json]
   celld secret delete NAME [--script SCRIPT] [fleet options] [--announce-only]
   celld secret put|list|delete ... --store STORE_ID    (a Secrets Store's secrets)
@@ -349,8 +357,8 @@ so only the nodes whose deployment uses it rebuild, within one poll interval
 (CELLD_DEPLOY_POLL_S). A fleet with no pointer is not touched, and a node on an
 older version needs a deploy, `POST /reload`, or restart. A `celld deploy` that
 races a secret write can lose its pointer write; run it again. If `delete`
-stored the change but could not tell the nodes, run it again with
---announce-only, which deletes nothing and only tells them.
+or `put` stored the change but could not tell the nodes, run it again with
+--announce-only, which writes no secret and only tells them.
 
 SCRIPT defaults to the `name` of the Wrangler config in the working directory;
 `--config PATH` names another.
@@ -390,13 +398,18 @@ mod tests {
     }
 
     #[test]
-    fn announce_only_applies_to_delete_alone() {
+    fn announce_only_applies_to_put_and_delete() {
         let command = parse(&["delete", "TOKEN", "--announce-only"])
             .unwrap()
             .unwrap();
         assert!(command.announce_only);
         assert!(!parse(&["delete", "TOKEN"]).unwrap().unwrap().announce_only);
-        assert!(parse(&["put", "TOKEN", "--announce-only"]).is_err());
+        assert!(
+            parse(&["put", "TOKEN", "--announce-only"])
+                .unwrap()
+                .unwrap()
+                .announce_only
+        );
         assert!(parse(&["list", "--announce-only"]).is_err());
     }
 
