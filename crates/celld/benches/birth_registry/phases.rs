@@ -41,7 +41,7 @@ pub async fn run(phase: &str) {
         "race" => race::race().await,
         "flap" => faults::flap().await,
         "real" => load_phase(Cfg::real()).await,
-        "selftest" => selftest(),
+        "selftest" => selftest().await,
         other => panic!("unknown CELLD_REG_PHASE {other:?}"),
     }
 }
@@ -1026,7 +1026,7 @@ pub fn backstop_waits(covered: &Value, waits: &Value) -> (bool, u64, u64) {
     (failed <= room && within, failed, total)
 }
 
-fn selftest() {
+async fn selftest() {
     let covered = |n: u64, p99: f64| json!({ "n": n, "p99": p99 });
     let waits = |failed: usize| {
         Value::Array(
@@ -1053,6 +1053,66 @@ fn selftest() {
     // Successes slower than the bound fail on their own.
     assert!(!backstop_waits(&covered(59, 4_200.0), &waits(0)).0);
     say!("selftest: backstop_waits ok");
+    selftest_check().await;
+}
+
+/// The start check must neither flood the store nor wait for ever on a node
+/// that is gone: the two ways a paced run's check never ended on a gateway
+/// that closes every connection.
+async fn selftest_check() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let keys = |n: usize| -> Vec<(String, Expect)> {
+        (0..n)
+            .map(|i| (format!("{i:032x}"), Expect::Exists))
+            .collect()
+    };
+    let exists = || Some(("exists".to_owned(), json!({}), 3, 100, 1));
+    // 120 lookups at 60 a second take at least 119/60 s, however many workers
+    // there are: unlimited they would be done in milliseconds.
+    let calls = Arc::new(AtomicU64::new(0));
+    let began = Instant::now();
+    let counted = calls.clone();
+    let check = tokio::time::timeout(
+        Duration::from_secs(20),
+        probe::check_with(
+            keys(120),
+            32,
+            &[0],
+            60.0,
+            Duration::from_secs(5),
+            move |_, _| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                async move { exists() }
+            },
+        ),
+    )
+    .await
+    .expect("a paced check ends");
+    assert_eq!((check.exists, check.misses), (120, 0));
+    assert_eq!(calls.load(Ordering::Relaxed), 120);
+    assert!(
+        began.elapsed() >= Duration::from_millis(1_900),
+        "120 lookups at 60/s took {:?}",
+        began.elapsed()
+    );
+    // Lookups that never answer end at the deadline, every key counted as a miss.
+    let began = Instant::now();
+    let check = tokio::time::timeout(
+        Duration::from_secs(20),
+        probe::check_with(
+            keys(40),
+            32,
+            &[0],
+            1_000.0,
+            Duration::from_secs(1),
+            |_, _| std::future::pending::<probe::Looked>(),
+        ),
+    )
+    .await
+    .expect("a check with no answers ends at its deadline");
+    assert_eq!((check.total, check.unknown, check.misses), (40, 40, 40));
+    assert!(began.elapsed() < Duration::from_secs(5));
+    say!("selftest: check_with ok");
 }
 
 fn gates_of(cfg: &Cfg, result: &Value, gates: &mut Gates) {

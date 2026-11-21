@@ -440,3 +440,12 @@ must be the local one. Fleet-rate load goes through a segment generator that wri
 directly; only 5 real births a second are created, which is the per-node production rate. The counting
 proxy is used by `units2` and `units4` only: it opens a new connection to the store per request, which
 runs a laptop out of ports at lookup-check rates.
+
+A store that answers `Connection: close` costs the nodes one connection per request, and the completeness and
+start checks are three reads a lookup. Unlimited, a check ran the host out of ephemeral ports in seconds (about
+16,000 sockets, each held 30 s), every later connect failed, nodes missed their lease renewals and halted, and the
+check went on looking up against nodes that were gone: a phase that never reached its first gate row.
+`CELLD_REG_CHECK_PER_S` (default 100) limits the checks' lookups a second, and a check ends at a deadline of three
+times its rate's time plus a minute, counting what it did not look up as misses. At 100 a second the host's
+TIME_WAIT count stays near 11,000. Watch `netstat -an -p tcp | grep -c TIME_WAIT` before a run; it must be low.
+A gateway that keeps connections alive does not need the limit.
