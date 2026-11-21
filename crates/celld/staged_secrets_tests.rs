@@ -29,6 +29,10 @@ fn built_requiring(script: &str, version: &str, names: &[&str]) -> Built {
     let mut built = built(script, version, &[]);
     built.manifest.raw_metadata["secrets"] = serde_json::json!({ "required": names });
     built
+        .manifest
+        .required_features
+        .push(crate::protocol::FEATURE_SECRETS_REQUIRED_V1.to_string());
+    built
 }
 
 async fn put_secret(fleet: &Fleet, script: &str, name: &str) {

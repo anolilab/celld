@@ -2758,6 +2758,10 @@ fn read_project(
     // `.dev.vars` or `.env` beside it is residue, not a binding the guard below
     // should refuse in the config's name.
     let declared_vars = !vars.is_empty();
+    let config_vars = vars
+        .keys()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
     let required_secrets = required_secrets(object)?;
     if main.is_none() && required_secrets.is_some() {
         bail!("an asset-only project cannot require secrets");
@@ -2961,8 +2965,24 @@ fn read_project(
     let containers = read_containers(object, &do_classes, &sqlite_classes)?;
     let metadata = Value::Object(metadata);
     // A secret is bound as `env.NAME`, so a var or binding of the same name
-    // would shadow it.
-    crate::secrets::ensure_required_unshadowed(&metadata)?;
+    // would shadow it. A dev build does not carry the requirement, but checks
+    // it all the same, ignoring the vars that `.dev.vars` made of the listed
+    // names: those are the secrets themselves.
+    match (&required_secrets, for_dev) {
+        (Some(required), true) => {
+            let mut checked = metadata.clone();
+            if let Some(bindings) = checked["bindings"].as_array_mut() {
+                bindings.retain(|binding| {
+                    let name = binding["name"].as_str().unwrap_or("");
+                    binding["type"] != "plain_text"
+                        || !required.iter().any(|listed| listed == name)
+                        || config_vars.contains(name)
+                });
+            }
+            crate::secrets::ensure_not_shadowed(&required.iter().cloned().collect(), &checked)?;
+        }
+        _ => crate::secrets::ensure_required_unshadowed(&metadata)?,
+    }
     Ok(Project {
         script_name,
         no_bundle,
@@ -5100,6 +5120,41 @@ mod secrets_required_config_tests {
             read_project(&path, dir.path(), &VarOverrides::DevVars(entries), false).unwrap();
         let names = crate::secrets::binding_names(&project.metadata);
         assert!(names.contains("LISTED") && names.contains("UNLISTED"));
+    }
+
+    #[test]
+    fn a_dev_build_refuses_the_clash_that_a_production_build_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
+        let path = dir.path().join("wrangler.jsonc");
+        let entries = BTreeMap::from([("API_KEY".to_string(), "v".to_string())]);
+        for extra in [
+            r#""vars": { "API_KEY": "x" }, "secrets": { "required": ["API_KEY"] }"#,
+            r#""version_metadata": { "binding": "API_KEY" }, "secrets": { "required": ["API_KEY"] }"#,
+        ] {
+            std::fs::write(&path, base(extra)).unwrap();
+            for overrides in [
+                VarOverrides::None,
+                VarOverrides::DevVars(entries.clone()),
+                VarOverrides::DotEnv(entries.clone()),
+            ] {
+                let error = read_project(&path, dir.path(), &overrides, false)
+                    .err()
+                    .expect("refused");
+                assert!(format!("{error:#}").contains("API_KEY"), "{error:#}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_required_hyperdrive_secret_is_refused_at_build() {
+        let extra = r#""hyperdrive": [{ "binding": "DB", "id": "db-1" }],
+            "secrets": { "required": ["HYPERDRIVE_DB"] }"#;
+        let error = read(&base(extra)).err().expect("refused");
+        assert!(
+            format!("{error:#}").contains("Hyperdrive binding consumes"),
+            "{error:#}"
+        );
     }
 
     #[test]

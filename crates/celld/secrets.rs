@@ -527,19 +527,48 @@ pub fn required_names(metadata: &serde_json::Value) -> anyhow::Result<BTreeSet<S
         .collect())
 }
 
-/// Refuse a deployment whose metadata lists a required secret that a var or
-/// binding of the same name would shadow.
+/// Refuse a deployment whose metadata lists a required secret that never
+/// reaches `env`: a var or binding of the same name would shadow it, and a
+/// Hyperdrive binding consumes the secret named for it.
 pub fn ensure_required_unshadowed(metadata: &serde_json::Value) -> anyhow::Result<()> {
+    ensure_not_shadowed(&required_names(metadata)?, metadata)
+}
+
+/// [`ensure_required_unshadowed`] for `required` names, which `celld dev` checks
+/// although its deployment does not carry them.
+pub fn ensure_not_shadowed(
+    required: &BTreeSet<String>,
+    metadata: &serde_json::Value,
+) -> anyhow::Result<()> {
     let bindings = binding_names(metadata);
-    if let Some(name) = required_names(metadata)?
-        .into_iter()
-        .find(|name| bindings.contains(name))
-    {
-        anyhow::bail!(
+    let consumed = crate::hyperdrive::secret_names(metadata);
+    for name in required {
+        anyhow::ensure!(
+            !bindings.contains(name),
             "`secrets` `required` lists {name}, which a var or binding of the config \
              already uses; rename one of them"
         );
+        anyhow::ensure!(
+            !consumed.contains(name),
+            "`secrets` `required` lists {name}, which a Hyperdrive binding consumes as its \
+             connection string, so it never reaches `env`; remove it from the list"
+        );
     }
+    Ok(())
+}
+
+/// Refuse a manifest that lists required secrets without declaring the feature,
+/// which an older node would serve without enforcing them.
+fn ensure_required_feature(manifest: &Manifest) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        required_names(&manifest.raw_metadata)?.is_empty()
+            || manifest
+                .required_features
+                .iter()
+                .any(|feature| feature == crate::protocol::FEATURE_SECRETS_REQUIRED_V1),
+        "the deployment lists `secrets.required` but does not require the {} feature",
+        crate::protocol::FEATURE_SECRETS_REQUIRED_V1
+    );
     Ok(())
 }
 
@@ -589,6 +618,7 @@ pub fn ensure_unique_binding_names(bindings: &[serde_json::Value]) -> anyhow::Re
 /// binding would shadow, or one that is not stored, naming every one. Reads
 /// names once and needs no key.
 pub async fn ensure_script_secrets(bucket: &Bucket, manifest: &Manifest) -> anyhow::Result<()> {
+    ensure_required_feature(manifest)?;
     if let Some(bindings) = manifest
         .raw_metadata
         .get("bindings")
@@ -1357,7 +1387,39 @@ mod tests {
     fn requiring(names: &[&str]) -> Manifest {
         let mut manifest = manifest(&[]);
         manifest.raw_metadata["secrets"] = serde_json::json!({ "required": names });
+        manifest.required_features = vec![crate::protocol::FEATURE_SECRETS_REQUIRED_V1.to_string()];
         manifest
+    }
+
+    #[tokio::test]
+    async fn a_manifest_that_lists_required_secrets_without_the_feature_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let bucket = bucket(&directory);
+        let mut manifest = requiring(&["API_KEY"]);
+        manifest.required_features.clear();
+        let error = ensure_script_secrets(&bucket, &manifest).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("secrets-required-v1"),
+            "{error:#}"
+        );
+        // With nothing listed the feature is not needed.
+        ensure_script_secrets(&bucket, &self::manifest(&[]))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn a_hyperdrive_binding_consumes_its_secret_so_it_cannot_be_required() {
+        let mut metadata = requiring(&["HYPERDRIVE_DB"]).raw_metadata;
+        metadata["bindings"] =
+            serde_json::json!([{ "type": "hyperdrive", "name": "DB", "id": "x" }]);
+        let error = ensure_required_unshadowed(&metadata).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Hyperdrive binding consumes"),
+            "{error:#}"
+        );
+        metadata["secrets"] = serde_json::json!({ "required": ["OTHER"] });
+        ensure_required_unshadowed(&metadata).unwrap();
     }
 
     #[tokio::test]
