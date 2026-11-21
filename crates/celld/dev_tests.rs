@@ -1088,3 +1088,72 @@ async fn an_unbuilt_project_renamed_onto_a_retained_script_gets_no_values_for_it
     let map = config_map(&deployed).unwrap();
     assert_eq!(config_for(&map, "dev-old"), None, "{map}");
 }
+
+#[tokio::test]
+async fn a_released_queue_goes_back_when_a_later_write_fails() {
+    crate::asyncrt::install_test_host_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let store = store_in(directory.path());
+    let queue = |extra: serde_json::Value| serde_json::json!({ "queues": extra });
+    let producer = serde_json::json!({ "producers": [{ "binding": "JOBS", "queue": "jobs" }] });
+    let consumer = serde_json::json!({ "consumers": [{ "queue": "jobs" }] });
+    let primary = write_project_with(
+        &directory.path().join("p"),
+        "dev-p",
+        "p",
+        queue(producer.clone()),
+    );
+    let other = write_project_with(
+        &directory.path().join("c"),
+        "dev-c",
+        "c",
+        queue(consumer.clone()),
+    );
+    let configs = [primary.clone(), other.clone()];
+    deploy_all(&configs, &store).await.unwrap();
+    let bucket = open_local_bucket(&store.database).unwrap();
+    let key = "deploy/queues/jobs/consumer.json";
+    let holder = || async {
+        let (body, _) = bucket.get(key).await.unwrap().unwrap();
+        serde_json::from_slice::<crate::protocol::QueueConsumerAttachment>(&body).unwrap()
+    };
+    let before = holder().await;
+    assert_eq!(before.consumer.as_ref().unwrap().script_name, "dev-c");
+
+    // The primary takes the queue and the other project drops it, but the
+    // primary's write fails after the release: a container image that the
+    // engine cannot save.
+    write_project_with(
+        &directory.path().join("p"),
+        "dev-p",
+        "p",
+        queue(serde_json::json!({
+            "producers": [{ "binding": "JOBS", "queue": "jobs" }],
+            "consumers": [{ "queue": "jobs" }]
+        })),
+    );
+    write_project_with(&directory.path().join("c"), "dev-c", "c", queue(producer));
+    let mut built = vec![
+        (0, build_project(&primary, false, false).unwrap()),
+        (1, build_project(&other, false, false).unwrap()),
+    ];
+    built[0].1.images = vec!["celld-test-missing-image:0".to_string()];
+    built[0].1.upload_images = true;
+    let batch = built
+        .iter()
+        .map(|(_, built)| &built.manifest)
+        .collect::<Vec<_>>();
+    let error = projects::write_projects(&bucket, &built, &batch, false)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("save container image"),
+        "{error:#}"
+    );
+    assert!(
+        !format!("{error:#}").contains("without a consumer"),
+        "{error:#}"
+    );
+    // The queue is still the other project's, at the deployment it was at.
+    assert_eq!(holder().await, before);
+}
