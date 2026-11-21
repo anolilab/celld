@@ -690,6 +690,8 @@ async fn an_event_ended_inside_a_transaction_rolls_it_back_without_aborting_the_
 
 /// A stateless Worker has no continuation id to look up. When its client
 /// hangs up, the catch block its rejected wait runs must not write through D1.
+/// D1 is a cell behind a stub call, so it is `adopt` that refuses the call
+/// of the ended event; the token-less storage guard is never reached.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stateless_worker_ended_by_a_hang_up_cannot_write_to_d1_while_it_unwinds() {
     let mut vars = vec![
