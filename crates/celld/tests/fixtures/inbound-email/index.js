@@ -15,6 +15,7 @@
 //   forward-throw  forwards to team@example.net, then throws
 //   raw-reply-twice  replies with a streamed raw EmailMessage twice (the second is refused), then
 //               forwards four times at once and reports the second error and the four outcomes
+//   forward-hang  forwards to team@example.net and then waits for an hour
 //   hang        waits for an hour
 //   hang-forward  waits for an hour, and tries to forward from waitUntil after 1.5 s
 //   late        tries to reject the message after the handler returned
@@ -145,6 +146,10 @@ export default {
         message.setReject(first + "|" + second);
         return;
       }
+      case "forward-hang":
+        await message.forward("team@example.net");
+        await new Promise((resolve) => setTimeout(resolve, 3_600_000));
+        return;
       case "hang-forward":
         ctx.waitUntil(
           new Promise((resolve) => setTimeout(resolve, 1500)).then(

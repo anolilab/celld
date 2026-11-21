@@ -468,7 +468,7 @@ fn encoded_words(text: &str) -> String {
 
 /// One header line, folded at white space so no line passes 76 bytes where a
 /// space allows it. Unfolding gives the value back unchanged.
-fn fold_header(name: &str, value: &str) -> String {
+pub(super) fn fold_header(name: &str, value: &str) -> String {
     let mut out = format!("{name}: ");
     let mut line = out.len();
     let mut placed = false;

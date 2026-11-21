@@ -593,6 +593,31 @@ async fn a_handler_cancelled_at_the_deadline_cannot_forward_afterwards() {
 }
 
 #[tokio::test]
+async fn a_forward_in_flight_at_the_deadline_is_waited_for_and_answers_200() {
+    // The relay takes 2.5 s to answer the end of the body; the route's
+    // deadline passes at 1 s with the forward still in flight. The relay then
+    // accepts it, so the route must answer 200: a 504 would have the relay
+    // post the message again.
+    let sink = Sink::start(Behaviour::slow(std::time::Duration::from_millis(2500))).await;
+    let server = start_with(
+        &sink,
+        "inbound-email",
+        &[SHORT, ("CELLD_EMAIL_FORWARD_ALLOW", FORWARD_ALLOW)],
+    )
+    .await;
+    let (status, body) = post_mode(&server, "forward-hang").await;
+    assert_eq!(
+        (status, &body["outcome"]),
+        (200, &Value::from("accepted")),
+        "{body}"
+    );
+    assert_eq!(sink.delivered().len(), 1, "{:?}", sink.transactions());
+    // The place is back.
+    let (status, body) = post_mode(&server, "accept").await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
 async fn an_upload_that_stalls_is_cut_off_and_does_not_hold_a_place() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let sink = Sink::start(Behaviour::default()).await;

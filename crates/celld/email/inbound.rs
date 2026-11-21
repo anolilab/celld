@@ -158,8 +158,53 @@ pub struct Inbound {
     /// Set when the route gives up on the handler, so what it does from then
     /// on is refused.
     pub cancelled: Arc<AtomicBool>,
+    /// What the event's `forward()` and `reply()` sends have done so far.
+    pub sends: Arc<Sends>,
+}
+
+/// The sends of one event: whether the relay has accepted one, and how many
+/// are still talking to it. The route reads both at the deadline.
+#[derive(Debug, Default)]
+pub struct Sends {
     /// Set once a `forward()` or `reply()` has been accepted by the relay.
-    pub delivered: Arc<AtomicBool>,
+    delivered: AtomicBool,
+    active: AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl Sends {
+    /// Wait for the sends in flight to end. Each is bounded by its own SMTP
+    /// transaction deadline.
+    async fn settle(&self) {
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.active.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
+/// One send in flight: counted from the call until it ends or is dropped.
+#[derive(Debug)]
+pub struct SendGuard(Arc<Sends>);
+
+impl SendGuard {
+    /// The relay accepted the message.
+    pub fn delivered(&self) {
+        self.0.delivered.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for SendGuard {
+    fn drop(&mut self) {
+        if self.0.active.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
 }
 
 /// Parse a posted message. `from` and `to` are the envelope as the relay gave
@@ -255,7 +300,7 @@ pub fn parse(
         references,
         permit: None,
         cancelled: Arc::default(),
-        delivered: Arc::default(),
+        sends: Arc::default(),
     })
 }
 
@@ -283,7 +328,7 @@ pub struct Event {
     automatic: Option<&'static str>,
     replied: AtomicBool,
     cancelled: Arc<AtomicBool>,
-    delivered: Arc<AtomicBool>,
+    sends: Arc<Sends>,
     _permit: Option<Permit>,
 }
 
@@ -332,25 +377,31 @@ impl Event {
             automatic: automatic(&inbound.from, &inbound.headers),
             replied: AtomicBool::new(false),
             cancelled: inbound.cancelled.clone(),
-            delivered: inbound.delivered.clone(),
+            sends: inbound.sends.clone(),
             _permit: inbound.permit.take(),
         }
     }
 
-    /// Set when the relay has accepted a message this event sent.
-    pub fn delivered(&self) -> Arc<AtomicBool> {
-        self.delivered.clone()
-    }
-
     /// Refuse what a handler tries once the route has given up on it.
     pub fn check_open(&self) -> Result<(), EmailError> {
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.cancelled.load(Ordering::SeqCst) {
             return Err(EmailError::new(
                 "E_TIMEOUT",
                 "the email event was cancelled because the handler did not finish in time",
             ));
         }
         Ok(())
+    }
+
+    /// Count a send from now until it ends, or refuse it once the route has
+    /// given up. The count comes first and the flag is read after it, so a
+    /// send is either refused or seen by the route when it waits for the sends
+    /// in flight.
+    pub fn track_send(&self) -> Result<SendGuard, EmailError> {
+        self.sends.active.fetch_add(1, Ordering::SeqCst);
+        let guard = SendGuard(self.sends.clone());
+        self.check_open()?;
+        Ok(guard)
     }
 
     /// The original message plus the `X-` headers the handler adds, for
@@ -650,7 +701,7 @@ fn fold_header(name: &str, value: &str) -> String {
     out
 }
 
-/// The `X-` headers a handler gave `forward()`, as lines. Any other header is
+/// The `X-` headers a handler gave `forward()`, as folded lines. Any other header is
 /// dropped, as the relay of the Worker's platform drops it; one that is not
 /// plain ASCII, or holds a line break, is refused.
 fn forward_headers(headers: &[(String, String)]) -> Result<String, EmailError> {
@@ -671,7 +722,15 @@ fn forward_headers(headers: &[(String, String)]) -> Result<String, EmailError> {
                 format!("at most {MAX_FORWARD_HEADERS} headers may be added"),
             ));
         }
-        out.push_str(&format!("{name}: {value}\r\n"));
+        out.push_str(&super::mime::fold_header(name, value));
+    }
+    // A value is folded where it has white space; one with none (a long token)
+    // stays one line, and a strict relay would reject it.
+    if out.split("\r\n").any(|line| line.len() > MAX_LINE_BYTES) {
+        return Err(EmailError::new(
+            "E_LINE_TOO_LONG",
+            format!("an added header line exceeds {MAX_LINE_BYTES} bytes and has no place to fold"),
+        ));
     }
     Ok(out)
 }
@@ -803,7 +862,7 @@ impl GiveUp {
 impl Drop for GiveUp {
     fn drop(&mut self) {
         if let Some(cancelled) = &self.cancelled {
-            cancelled.store(true, Ordering::Release);
+            cancelled.store(true, Ordering::SeqCst);
         }
     }
 }
@@ -838,7 +897,8 @@ pub async fn handle(
             )
         }
     };
-    let delivered = inbound.delivered.clone();
+    let sends = inbound.sends.clone();
+    let cancelled = inbound.cancelled.clone();
     let message_id = inbound.message_id.clone();
     let cancellation = crate::runtime::RequestCancellationLifetime::stateless();
     let mut giveup = GiveUp {
@@ -854,24 +914,30 @@ pub async fn handle(
             Outcome::Failed("the message could not be handled".into())
         }
         Err(_) => {
+            // No new send starts from here. One already talking to the relay
+            // may still be accepted, so it is waited for before the answer is
+            // chosen; the rest of the event is cancelled when `giveup` drops.
+            cancelled.store(true, Ordering::SeqCst);
+            sends.settle().await;
             return after_delivery(
                 (
                     504,
                     r#"{"ok":false,"outcome":"error","error":"the email handler did not finish in time"}"#
                         .to_string(),
                 ),
-                &delivered,
+                &sends.delivered,
                 message_id.as_deref(),
             );
         }
     };
     // The handler is done: what it left in `waitUntil` is not cancelled.
     giveup.disarm();
-    after_delivery(answer(outcome), &delivered, message_id.as_deref())
+    after_delivery(answer(outcome), &sends.delivered, message_id.as_deref())
 }
 
 /// A handler that failed or timed out after the relay accepted a message it
-/// forwarded or replied to has still delivered it, and a retry would send it
+/// forwarded or replied to (a send still in flight at the deadline counts once
+/// the relay has answered it) has still delivered it, and a retry would send it
 /// again: the route answers 200 and logs the failure.
 fn after_delivery(
     answered: (u16, String),
@@ -1005,6 +1071,25 @@ mod tests {
         bytes.extend("é".repeat(MAX_HEADER_SECTION_BYTES).bytes());
         let inbound = parse(bytes, Some("a@b.co"), Some("b@example.com")).unwrap();
         assert_eq!(inbound.from, "a@b.co");
+    }
+
+    #[test]
+    fn an_added_header_is_folded_so_no_line_passes_the_limit() {
+        let event = Event::new(&mut parsed(MESSAGE));
+        let forward = |value: String| {
+            event.prepare_forward(&allow(), "team@example.net", &[("X-Note".into(), value)])
+        };
+        // 2048 bytes of words: folded, and unfolding gives the value back.
+        let words = vec!["word"; 400].join(" ");
+        let sent = forward(words.clone()).unwrap();
+        let text = String::from_utf8(sent.data).unwrap();
+        assert!(text.split("\r\n").all(|line| line.len() <= MAX_LINE_BYTES));
+        let head = text.split("\r\n\r\n").next().unwrap();
+        let unfolded = head.replace("\r\n ", " ");
+        assert!(unfolded.contains(&format!("X-Note: {words}\r\n")));
+        // One token that cannot fold is refused.
+        let error = forward("a".repeat(2048)).unwrap_err();
+        assert_eq!(error.code, "E_LINE_TOO_LONG");
     }
 
     #[test]

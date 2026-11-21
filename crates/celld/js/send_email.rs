@@ -169,7 +169,7 @@ pub(super) async fn send_prepared(
     prepared: Result<Prepared, EmailError>,
     gate: EgressGate,
     script: String,
-    delivered: Option<Arc<AtomicBool>>,
+    tracked: Option<crate::email::inbound::SendGuard>,
 ) -> Result<String, String> {
     // Held until the send ends, and given back if it is dropped.
     let _slot = slot;
@@ -193,8 +193,8 @@ pub(super) async fn send_prepared(
         // own text is never logged or passed on.
         tracing::warn!(event = "send_email_failed", code = error.code, detail = %error.message);
     }
-    if let (Ok(()), Some(delivered)) = (&sent, &delivered) {
-        delivered.store(true, Ordering::Release);
+    if let (Ok(()), Some(tracked)) = (&sent, &tracked) {
+        tracked.delivered();
     }
     Ok(answer(sent.map(|()| prepared.message_id)))
 }

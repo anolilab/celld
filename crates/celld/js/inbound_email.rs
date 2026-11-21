@@ -108,9 +108,10 @@ pub(super) fn op_email_forward(
     let Some(event) = context.inbound_email.get() else {
         return not_an_email_event(scope, "forward");
     };
-    if let Err(error) = event.check_open() {
-        return refuse(scope, rv, error);
-    }
+    let tracked = match event.track_send() {
+        Ok(tracked) => tracked,
+        Err(error) => return refuse(scope, rv, error),
+    };
     let too_long = v8::Local::<v8::String>::try_from(args.get(0)).map_or(true, |text| {
         text.utf8_length(scope) > MAX_FORWARD_CALL_BYTES
     });
@@ -141,8 +142,7 @@ pub(super) fn op_email_forward(
             &call.headers,
         );
     let gate = egress_gate_request(&context, celld_logic::Channel::Fetch);
-    let delivered = context.inbound_email.get().map(|event| event.delivered());
-    let async_id = asyncrt::enqueue(send_prepared(slot, prepared, gate, script, delivered));
+    let async_id = asyncrt::enqueue(send_prepared(slot, prepared, gate, script, Some(tracked)));
     rv.set(promise_for(scope, async_id));
 }
 
@@ -180,11 +180,17 @@ pub(super) fn op_email_reply(
     let Some(event) = context.inbound_email.get() else {
         return not_an_email_event(scope, "reply");
     };
-    if let Err(error) = event.check_open().and_then(|()| event.check_reply_open()) {
-        // A raw message's slot was reserved before this call: give it back.
-        release_reserved(scope, &args, 2);
-        return refuse(scope, rv, error);
-    }
+    let tracked = match event
+        .track_send()
+        .and_then(|tracked| event.check_reply_open().map(|()| tracked))
+    {
+        Ok(tracked) => tracked,
+        Err(error) => {
+            // A raw message's slot was reserved before this call: give it back.
+            release_reserved(scope, &args, 2);
+            return refuse(scope, rv, error);
+        }
+    };
     let (context, slot) = match begin_send(scope, &args, 2) {
         Ok(begun) => begun,
         Err(error) => return refuse(scope, rv, error),
@@ -203,8 +209,7 @@ pub(super) fn op_email_reply(
     let prepared = prepare_reply(event, call, raw);
     let script = actor_runtime_state(scope).declared.script().to_string();
     let gate = egress_gate_request(&context, celld_logic::Channel::Fetch);
-    let delivered = Some(event.delivered());
-    let async_id = asyncrt::enqueue(send_prepared(slot, prepared, gate, script, delivered));
+    let async_id = asyncrt::enqueue(send_prepared(slot, prepared, gate, script, Some(tracked)));
     rv.set(promise_for(scope, async_id));
 }
 
