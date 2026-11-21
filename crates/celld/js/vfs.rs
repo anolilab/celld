@@ -24,6 +24,12 @@ pub(super) struct RequestVfs {
     children: HashMap<String, std::collections::BTreeSet<String>>,
     /// Charged memory: every entry's cost plus each file's capacity.
     used: usize,
+    /// The capacity files hold beyond their length, summed. A charge that
+    /// would fail gives it back, and a write limit counts it as room.
+    spare: usize,
+    /// How many times a reclaim visited the files.
+    #[cfg(test)]
+    reclaim_scans: usize,
 }
 
 /// The most memory one request's `/tmp` may hold.
@@ -73,6 +79,9 @@ impl Default for RequestVfs {
                 ["bundle", "dev", "tmp"].map(String::from).into(),
             )]),
             used: 0,
+            spare: 0,
+            #[cfg(test)]
+            reclaim_scans: 0,
         }
     }
 }
@@ -103,7 +112,10 @@ impl RequestVfs {
     /// Room that only unused file capacity holds is reclaimed first, so spare
     /// capacity never turns a write that fits the data away.
     fn charge(&mut self, extra: usize) -> Result<(), &'static str> {
-        self.try_charge(extra).or_else(|_| {
+        self.try_charge(extra).or_else(|code| {
+            if self.spare == 0 {
+                return Err(code);
+            }
             self.reclaim_capacity();
             self.try_charge(extra)
         })
@@ -121,6 +133,11 @@ impl RequestVfs {
 
     /// Shrink every file's capacity to its length and refund the difference.
     fn reclaim_capacity(&mut self) {
+        #[cfg(test)]
+        {
+            self.reclaim_scans += 1;
+        }
+        self.spare = 0;
         for node in self.nodes.values_mut() {
             if let VfsNode::File(bytes) = node {
                 let before = bytes.capacity();
@@ -216,6 +233,7 @@ impl RequestVfs {
                 let Some(VfsNode::File(bytes)) = self.nodes.get_mut(path) else {
                     unreachable!("the node was a file a moment ago");
                 };
+                self.spare -= bytes.capacity() - bytes.len();
                 if append {
                     // The capacity was charged above, so grow to exactly it.
                     bytes.reserve_exact(after - bytes.len());
@@ -223,10 +241,12 @@ impl RequestVfs {
                 } else {
                     *bytes = data;
                 }
+                self.spare += bytes.capacity() - bytes.len();
                 Ok(())
             }
             None => {
                 self.charge(Self::node_cost(path).saturating_add(data.capacity()))?;
+                self.spare += data.capacity() - data.len();
                 self.insert(path.to_string(), VfsNode::File(data));
                 Ok(())
             }
@@ -282,31 +302,25 @@ impl RequestVfs {
 
     /// The most bytes a write to `path` could carry and still be charged, or
     /// the error the write would answer anyway. Lets a caller refuse an
-    /// oversized buffer before copying it.
+    /// oversized buffer before copying it. Spare capacity counts as room, since
+    /// a charge gives it back; the target's own is counted once.
     fn write_limit(&self, path: &str, append: bool) -> Result<usize, &'static str> {
         if !Self::writable_path(path) {
             return Err("EPERM");
         }
         let remaining = VFS_MAX_BYTES - self.used;
         Ok(match self.nodes.get(path) {
-            Some(VfsNode::File(old)) if !append => remaining.saturating_add(old.capacity()),
-            // An append fills the file's unused capacity before it is charged.
-            Some(VfsNode::File(old)) => remaining.saturating_add(old.capacity() - old.len()),
-            None => remaining.saturating_sub(Self::node_cost(path)),
-            Some(_) => remaining,
+            // The room the old content gives back, and every file's spare.
+            Some(VfsNode::File(old)) if !append => remaining
+                .saturating_add(old.len())
+                .saturating_add(self.spare),
+            // An append keeps the file's bytes.
+            Some(VfsNode::File(_)) => remaining.saturating_add(self.spare),
+            None => remaining
+                .saturating_sub(Self::node_cost(path))
+                .saturating_add(self.spare),
+            Some(_) => remaining.saturating_add(self.spare),
         })
-    }
-
-    /// The capacity files hold beyond their length, which a charge that would
-    /// fail gives back. A write the limit alone would refuse may still fit.
-    fn spare_capacity(&self) -> usize {
-        self.nodes
-            .values()
-            .map(|node| match node {
-                VfsNode::File(bytes) => bytes.capacity() - bytes.len(),
-                VfsNode::Directory { .. } => 0,
-            })
-            .sum()
     }
 
     fn read(&self, path: &str) -> Option<&[u8]> {
@@ -350,7 +364,10 @@ impl RequestVfs {
             }
             freed += Self::node_cost(&entry)
                 + match self.nodes.remove(&entry) {
-                    Some(VfsNode::File(bytes)) => bytes.capacity(),
+                    Some(VfsNode::File(bytes)) => {
+                        self.spare -= bytes.capacity() - bytes.len();
+                        bytes.capacity()
+                    }
                     _ => 0,
                 };
         }
@@ -447,15 +464,7 @@ pub(super) fn op_vfs_write(
     let view = args.get(1).try_cast::<v8::ArrayBufferView>().ok();
     let len = view.map_or(0, |view| view.byte_length());
     // Refuse a buffer that cannot fit before copying it out of the heap.
-    // Spare capacity counts as room, because the write reclaims it.
-    let limit = match with_vfs(scope, |vfs| {
-        let limit = vfs.write_limit(&path, append)?;
-        Ok(if len > limit {
-            limit.saturating_add(vfs.spare_capacity())
-        } else {
-            limit
-        })
-    }) {
+    let limit = match with_vfs(scope, |vfs| vfs.write_limit(&path, append)) {
         Some(limit) => limit,
         None => Err(no_tmp(scope)),
     };
@@ -751,6 +760,92 @@ mod tests {
         ));
     }
 
+    /// The spare capacity as a scan of every file finds it.
+    fn scanned_spare(vfs: &RequestVfs) -> usize {
+        vfs.nodes
+            .values()
+            .map(|node| match node {
+                VfsNode::File(bytes) => bytes.capacity() - bytes.len(),
+                VfsNode::Directory { .. } => 0,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn the_write_limit_counts_each_files_spare_capacity_once() {
+        let mut vfs = RequestVfs::default();
+        let mib = 1024 * 1024;
+        vfs.write("/tmp/a", vec![0; 20 * mib], false).unwrap();
+        vfs.write("/tmp/a", b"x".to_vec(), true).unwrap();
+        vfs.write("/tmp/b", vec![0; 10 * mib], false).unwrap();
+        vfs.write("/tmp/b", b"x".to_vec(), true).unwrap();
+        let spare = scanned_spare(&vfs);
+        assert!(spare > 0);
+        // What a charge could really find after giving all the spare back.
+        let room = VFS_MAX_BYTES - vfs.used + spare;
+        assert_eq!(vfs.write_limit("/tmp/a", true), Ok(room));
+        let len = 20 * mib + 1;
+        assert_eq!(vfs.write_limit("/tmp/a", false), Ok(room + len));
+        assert_eq!(
+            vfs.write_limit("/tmp/new", false),
+            Ok(room - RequestVfs::node_cost("/tmp/new"))
+        );
+    }
+
+    #[test]
+    fn the_spare_total_follows_every_change_to_a_file() {
+        let mut vfs = RequestVfs::default();
+        let check = |vfs: &RequestVfs| assert_eq!(vfs.spare, scanned_spare(vfs));
+        vfs.mkdir("/tmp/d", false);
+        for index in 0..50 {
+            vfs.write(&format!("/tmp/d/f{index}"), b"ab".to_vec(), true)
+                .unwrap();
+            vfs.write("/tmp/d/f0", vec![1; 1000 + index], true).unwrap();
+        }
+        check(&vfs);
+        assert!(vfs.spare > 0);
+        let mut roomy = Vec::with_capacity(4096);
+        roomy.extend_from_slice(b"abc");
+        vfs.write("/tmp/roomy", roomy, false).unwrap();
+        vfs.write("/tmp/d/f1", vec![0; 10], false).unwrap();
+        vfs.write("/tmp/d/f0", b"short".to_vec(), false).unwrap();
+        check(&vfs);
+        vfs.remove("/tmp/d/f2", false).unwrap();
+        vfs.remove("/tmp/roomy", false).unwrap();
+        check(&vfs);
+        vfs.remove("/tmp/d", true).unwrap();
+        check(&vfs);
+        assert_eq!(vfs.spare, 0);
+        vfs.write("/tmp/g", vec![0; 100], true).unwrap();
+        vfs.write("/tmp/g", vec![0; 100], true).unwrap();
+        vfs.reclaim_capacity();
+        assert_eq!(vfs.spare, 0);
+        check(&vfs);
+    }
+
+    #[test]
+    fn a_refused_charge_with_no_spare_capacity_scans_nothing() {
+        let mut vfs = RequestVfs::default();
+        let fill = VFS_MAX_BYTES - RequestVfs::node_cost("/tmp/full") - 10;
+        vfs.write("/tmp/full", vec![0; fill], false).unwrap();
+        assert_eq!(vfs.spare, 0);
+        for index in 0..100 {
+            assert!(matches!(
+                vfs.mkdir(&format!("/tmp/d{index}"), false),
+                VfsMkdirResult::Error("ENOSPC")
+            ));
+        }
+        assert_eq!(vfs.reclaim_scans, 0);
+        // With spare capacity held, the refusal does look for it.
+        vfs.remove("/tmp/full", false).unwrap();
+        let mut spare =
+            Vec::with_capacity(VFS_MAX_BYTES - RequestVfs::node_cost("/tmp/spare") - 10);
+        spare.push(0);
+        vfs.write("/tmp/spare", spare, false).unwrap();
+        vfs.mkdir("/tmp/d", false);
+        assert_eq!(vfs.reclaim_scans, 1);
+    }
+
     #[test]
     fn a_shrinking_overwrite_and_a_removal_give_the_charge_back() {
         let mut vfs = RequestVfs::default();
@@ -803,7 +898,7 @@ mod tests {
         spare.reserve_exact(30 * 1024 * 1024);
         let capacity = spare.capacity();
         vfs.write("/tmp/spare", spare, false).unwrap();
-        let room = vfs.write_limit("/tmp/fill", false).unwrap();
+        let room = VFS_MAX_BYTES - vfs.used - RequestVfs::node_cost("/tmp/fill");
         vfs.write("/tmp/fill", vec![0; room], false).unwrap();
         let limit = vfs.write_limit("/tmp/spare", true).unwrap();
         assert!(limit >= capacity - 10 * 1024 * 1024, "limit {limit}");
