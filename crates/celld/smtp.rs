@@ -28,6 +28,9 @@
 //! unspecified, multicast or reserved address, and a listener of this node,
 //! are refused; see [`crate::egress_filter::smtp_addresses`].
 //!
+//! A relay that answers `EHLO` with 500, 501, 502 or 504 gets `HELO` instead. It has no
+//! extensions then, so it cannot be used with `STARTTLS` or `AUTH`.
+//!
 //! One message is one transaction on one connection: `EHLO`, optional
 //! `STARTTLS`, optional `AUTH`, `MAIL FROM`, `RCPT TO` for each recipient,
 //! `DATA`, `QUIT`. A server's reply text is never passed on, because a server
@@ -52,7 +55,10 @@ pub use settings::{
 
 use settings::Credentials;
 
-/// How long one connection attempt may take.
+/// How long the relay's name may take to resolve.
+const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long connecting may take in all. It is shared by the relay's addresses,
+/// so an unreachable first one does not use it up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the server may take to answer one command.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -302,22 +308,59 @@ async fn handshake(
 /// Connect to `host:port` on the addresses the egress policy for this binding
 /// allows, and to nothing else.
 async fn dial(host: &str, port: u16) -> Result<tokio::net::TcpStream, EmailError> {
-    let addresses = crate::egress_filter::smtp_addresses(host, port)
-        .await
-        .map_err(|refused| failed("connect", refused))?;
-    match crate::asyncrt::timeout(
-        CONNECT_TIMEOUT,
-        tokio::net::TcpStream::connect(&addresses[..]),
+    let addresses = resolve_within(
+        DNS_TIMEOUT,
+        crate::egress_filter::smtp_addresses(host, port),
     )
+    .await?;
+    connect_each(&addresses, CONNECT_TIMEOUT, |address| {
+        tokio::net::TcpStream::connect(address)
+    })
     .await
-    {
-        Ok(Ok(stream)) => Ok(stream),
-        Ok(Err(error)) => Err(failed(
+}
+
+/// `lookup`, which must answer within `limit`.
+async fn resolve_within<E: std::fmt::Display>(
+    limit: Duration,
+    lookup: impl std::future::Future<Output = Result<Vec<std::net::SocketAddr>, E>>,
+) -> Result<Vec<std::net::SocketAddr>, EmailError> {
+    match crate::asyncrt::timeout(limit, lookup).await {
+        Ok(addresses) => addresses.map_err(|refused| failed("connect", refused)),
+        Err(_) => Err(failed(
             "connect",
-            format!("could not connect to the relay ({})", error.kind()),
+            "the relay's name did not resolve in time",
         )),
-        Err(_) => Err(failed("connect", "the connection to the relay timed out")),
     }
+}
+
+/// Try `addresses` in order until `connect` succeeds, within `budget` in all.
+/// Each attempt gets an equal share of what is left, so an address that never
+/// answers costs its share and the next one still has its turn; time an early
+/// address did not use goes to the later ones.
+async fn connect_each<T, F, Fut>(
+    addresses: &[std::net::SocketAddr],
+    budget: Duration,
+    mut connect: F,
+) -> Result<T, EmailError>
+where
+    F: FnMut(std::net::SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let deadline = crate::asyncrt::mono_ms().saturating_add(budget.as_millis() as u64);
+    let mut last = failed("connect", "the relay has no address");
+    for (index, address) in addresses.iter().enumerate() {
+        let left = deadline.saturating_sub(crate::asyncrt::mono_ms());
+        let share = Duration::from_millis(left) / (addresses.len() - index) as u32;
+        last = match crate::asyncrt::timeout(share, connect(*address)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) => failed(
+                "connect",
+                format!("could not connect to the relay ({})", error.kind()),
+            ),
+            Err(_) => failed("connect", "the connection to the relay timed out"),
+        };
+    }
+    Err(last)
 }
 
 /// `data` for `DATA`: every line that starts with `.` gets another, and the
@@ -495,7 +538,29 @@ async fn transaction(
         return Err(refused("greeting", &greeting));
     }
     let ehlo = format!("EHLO {}", settings.helo);
-    let mut capabilities = expect(&mut connection, "ehlo", &ehlo, &[250]).await?;
+    let first = connection.command("ehlo", &ehlo).await?;
+    // A relay that does not know `EHLO` answers it with 500, 501, 502 or 504
+    // (RFC 5321 section 4.2.4) and gets `HELO`. Any other refusal, such as a
+    // 554 for policy, is the relay's answer and is reported as it is. It then offers no extension, so there
+    // is no `STARTTLS`, `AUTH`, `8BITMIME` or `SIZE`.
+    let helo_only = matches!(first.code, 500 | 501 | 502 | 504);
+    let mut capabilities = if helo_only {
+        expect(
+            &mut connection,
+            "helo",
+            &format!("HELO {}", settings.helo),
+            &[250],
+        )
+        .await?
+    } else if first.code == 250 {
+        first
+    } else {
+        return Err(refused("ehlo", &first));
+    };
+    if helo_only {
+        // `HELO`'s reply has no extension lines.
+        capabilities.lines.clear();
+    }
     if settings.tls == TlsMode::StartTls {
         if !has_extension(&capabilities, "STARTTLS") {
             return Err(failed(
@@ -509,6 +574,12 @@ async fn transaction(
         capabilities = expect(&mut connection, "ehlo", &ehlo, &[250]).await?;
     }
     if let Some(credentials) = &settings.credentials {
+        if helo_only {
+            return Err(failed(
+                "auth",
+                "the relay does not support EHLO, so it offers no AUTH, and credentials are configured",
+            ));
+        }
         authenticate(&mut connection, &capabilities, credentials).await?;
     }
     let size = extension_value(&capabilities, "SIZE").and_then(|value| value.parse::<usize>().ok());
@@ -1313,5 +1384,87 @@ mod tests {
         let _other = limits.acquire("quiet").await.unwrap();
         drop(first);
         let _slot = limits.acquire("busy").await.expect("a slot came back");
+    }
+
+    #[tokio::test]
+    async fn an_address_that_never_answers_leaves_time_for_the_next() {
+        crate::asyncrt::install_test_host_runtime();
+        let addresses: Vec<std::net::SocketAddr> = vec![
+            "10.0.0.1:25".parse().unwrap(),
+            "127.0.0.1:25".parse().unwrap(),
+        ];
+        let tried = Arc::new(Mutex::new(Vec::new()));
+        let started = crate::asyncrt::mono_ms();
+        let record = tried.clone();
+        let reached = connect_each(&addresses, Duration::from_millis(600), |address| {
+            record.lock().unwrap().push(address);
+            async move {
+                if address.ip().is_loopback() {
+                    Ok(address)
+                } else {
+                    std::future::pending().await
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(reached, addresses[1]);
+        assert_eq!(*tried.lock().unwrap(), addresses);
+        // The first address was given half of the budget, not all of it.
+        assert!(
+            crate::asyncrt::mono_ms() - started < (500),
+            "{}",
+            crate::asyncrt::mono_ms() - started
+        );
+    }
+
+    #[tokio::test]
+    async fn the_budget_is_shared_by_every_address_and_the_last_error_is_kept() {
+        crate::asyncrt::install_test_host_runtime();
+        let addresses: Vec<std::net::SocketAddr> = (1..=3)
+            .map(|n| format!("10.0.0.{n}:25").parse().unwrap())
+            .collect();
+        let started = crate::asyncrt::mono_ms();
+        let error = connect_each(&addresses, Duration::from_millis(300), |_| async {
+            std::future::pending::<std::io::Result<()>>().await
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "E_DELIVERY_FAILED");
+        assert!(error.message.contains("timed out"), "{error:?}");
+        assert!(
+            crate::asyncrt::mono_ms() - started < (600),
+            "{}",
+            crate::asyncrt::mono_ms() - started
+        );
+        let refused = connect_each(&addresses[..1], Duration::from_millis(300), |_| async {
+            Err::<(), _>(std::io::ErrorKind::ConnectionRefused.into())
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            refused.message.contains("connection refused"),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_does_not_answer_is_cut_off() {
+        crate::asyncrt::install_test_host_runtime();
+        let error = resolve_within(Duration::from_millis(100), async {
+            std::future::pending::<Result<Vec<std::net::SocketAddr>, String>>().await
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            error.message.contains("did not resolve in time"),
+            "{error:?}"
+        );
+        let found = resolve_within(Duration::from_millis(100), async {
+            Ok::<_, String>(vec!["127.0.0.1:25".parse().unwrap()])
+        })
+        .await
+        .unwrap();
+        assert_eq!(found.len(), 1);
     }
 }
