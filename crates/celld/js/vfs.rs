@@ -316,9 +316,11 @@ impl RequestVfs {
                 .saturating_add(self.spare),
             // An append keeps the file's bytes.
             Some(VfsNode::File(_)) => remaining.saturating_add(self.spare),
+            // The new entry's cost comes out of the spare too when the
+            // free room is smaller than it.
             None => remaining
-                .saturating_sub(Self::node_cost(path))
-                .saturating_add(self.spare),
+                .saturating_add(self.spare)
+                .saturating_sub(Self::node_cost(path)),
             Some(_) => remaining.saturating_add(self.spare),
         })
     }
@@ -868,6 +870,19 @@ mod tests {
             .unwrap();
         assert!(vfs.write_limit("/tmp/big", false).unwrap() >= VFS_MAX_BYTES - 1024);
         assert!(vfs.write_limit("/tmp/big", true).unwrap() < VFS_MAX_BYTES / 2 + 1024);
+    }
+
+    #[test]
+    fn a_new_file_near_the_cap_pays_its_entry_out_of_the_spare_too() {
+        let mut vfs = RequestVfs::default();
+        let cost = RequestVfs::node_cost("/tmp/new");
+        // Less free room than the entry costs, and some spare elsewhere.
+        vfs.used = VFS_MAX_BYTES - cost / 2;
+        vfs.spare = 4096;
+        assert_eq!(
+            vfs.write_limit("/tmp/new", false),
+            Ok(4096 + cost / 2 - cost)
+        );
     }
 
     #[test]
