@@ -682,6 +682,27 @@ fn allowed_sql_pragma(name: &str, value: Option<&str>) -> bool {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How long preparing a statement that calls `typeof` takes on this
+    /// thread, for tests of where the statement time bound starts.
+    static PREPARE_DELAY: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn slow_prepare_for_test(action: &rusqlite::hooks::AuthAction<'_>) {
+    let slow = matches!(
+        action,
+        rusqlite::hooks::AuthAction::Function {
+            function_name: "typeof"
+        }
+    );
+    if let Some(delay) = PREPARE_DELAY.with(std::cell::Cell::get).filter(|_| slow) {
+        std::thread::sleep(delay);
+    }
+}
+
 fn authorize_sql(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization {
     use rusqlite::hooks::{AuthAction, Authorization};
 
@@ -689,6 +710,8 @@ fn authorize_sql(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::
     // place that sees everything able to move a schema cookie. See
     // `SchemaCookie`.
     SQL_PREPARES.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    slow_prepare_for_test(&context.action);
 
     let prohibited = match context.action {
         // The Attach deny is also the only thing blocking VACUUM and VACUUM
@@ -1538,7 +1561,18 @@ pub fn sql_exec(scope: &str, query: &str, binds: &[serde_json::Value]) -> Result
         as_user_sql(|| {
             let changes_before = total_changes(c);
             if binds.is_empty() && query.matches(';').count() > 1 {
-                c.execute_batch(query).map_err(|e| e.to_string())?;
+                // Each statement has its own clock, from before it is
+                // prepared, as in `sql_ingest`.
+                use rusqlite::fallible_iterator::FallibleIterator;
+                let mut batch = rusqlite::Batch::new(c, query);
+                loop {
+                    crate::sql_limits::arm();
+                    let Some(mut statement) = batch.next().map_err(|e| e.to_string())? else {
+                        break;
+                    };
+                    let mut rows = statement.query([]).map_err(|e| e.to_string())?;
+                    while rows.next().map_err(|e| e.to_string())?.is_some() {}
+                }
                 return Ok((
                     Vec::new(),
                     Vec::new(),
@@ -2680,18 +2714,18 @@ fn d1_result_limit_error() -> String {
     )
 }
 
-/// Where a D1 statement began: the clock before it was prepared, and the
-/// connection's change count.
+/// Where a D1 statement began: the connection's change count, taken as the
+/// statement's clock starts. That clock, before the statement is prepared, is
+/// the one the time bound and the statistics both read.
 #[derive(Clone, Copy)]
 struct D1Start {
-    at: std::time::Instant,
     changes: u64,
 }
 
 impl D1Start {
     unsafe fn now(database: *mut rusqlite::ffi::sqlite3) -> Self {
+        crate::sql_limits::arm();
         Self {
-            at: std::time::Instant::now(),
             changes: total_changes_for_handle(database),
         }
     }
@@ -2749,7 +2783,7 @@ struct D1Stepped {
 /// on every path. `keep` below the row cap means the caller asked for fewer
 /// rows (`first()` keeps one), so rows past it are dropped without an error;
 /// at the cap, overflow is a refusal. The statement is recorded when this
-/// returns, from `start`.
+/// returns, timed from `start`, where its clock began: before it was prepared.
 unsafe fn d1_step_to_done(
     scope: &str,
     database: *mut rusqlite::ffi::sqlite3,
@@ -2759,7 +2793,6 @@ unsafe fn d1_step_to_done(
     budget: &mut usize,
     start: D1Start,
 ) -> Result<D1Stepped, String> {
-    crate::sql_limits::arm();
     let mut recording = D1Recording {
         scope,
         database,
@@ -2823,9 +2856,11 @@ unsafe fn d1_step_to_done(
                 stepped.rows.push(row);
             }
             rusqlite::ffi::SQLITE_DONE => {
-                recording
-                    .stats
-                    .step(start.at.elapsed(), stepped.rows_read, returned_bytes);
+                recording.stats.step(
+                    crate::sql_limits::elapsed(),
+                    stepped.rows_read,
+                    returned_bytes,
+                );
                 // The statement ran, but its result is refused: a failure.
                 if stepped.over.is_some() {
                     recording.stats.refuse();
@@ -2834,9 +2869,11 @@ unsafe fn d1_step_to_done(
                 return Ok(stepped);
             }
             code => {
-                recording
-                    .stats
-                    .step(start.at.elapsed(), stepped.rows_read, returned_bytes);
+                recording.stats.step(
+                    crate::sql_limits::elapsed(),
+                    stepped.rows_read,
+                    returned_bytes,
+                );
                 recording.stats.fail(sql_outcome(code), code);
                 // Whatever runs next is engine SQL (the failure's own probes,
                 // a migration's bookkeeping): the deadline does not reach it.
@@ -2969,7 +3006,7 @@ unsafe fn d1_run_statements(
             }
             crate::sql_stats::record_refused(
                 scope,
-                start.at.elapsed(),
+                crate::sql_limits::elapsed(),
                 sql_outcome(prepare),
                 prepare,
                 || Some(CStr::from_ptr(source_ptr).to_string_lossy().into_owned()),
@@ -3062,7 +3099,7 @@ unsafe fn d1_run_prepared(
         }
         crate::sql_stats::record_refused(
             scope,
-            start.at.elapsed(),
+            crate::sql_limits::elapsed(),
             sql_outcome(prepare),
             prepare,
             || Some(sql.to_owned()),
@@ -3087,7 +3124,7 @@ unsafe fn d1_run_prepared(
     if expected != binds.len() {
         record_refused_bind(
             scope,
-            start.at.elapsed(),
+            crate::sql_limits::elapsed(),
             statement,
             rusqlite::ffi::SQLITE_RANGE,
         );
@@ -3098,7 +3135,7 @@ unsafe fn d1_run_prepared(
     }
     for (offset, value) in binds.iter().enumerate() {
         if let Err(code) = bind_cursor_value(statement, offset as i32 + 1, value) {
-            record_refused_bind(scope, start.at.elapsed(), statement, code);
+            record_refused_bind(scope, crate::sql_limits::elapsed(), statement, code);
             let failure = d1_sqlite_failure(scope, database, started_in_transaction, code);
             rusqlite::ffi::sqlite3_finalize(statement);
             return Err(d1_error(failure));
@@ -4726,6 +4763,134 @@ mod recycle_tests {
         }));
         assert_eq!(count["ok"]["rows"], serde_json::json!([[0]]), "{count}");
         close(scope);
+    }
+
+    /// A bounded statement of a few thousand rows: well past the handler's
+    /// first check, and far shorter than any bound below. The `typeof` call
+    /// is what [`slow_prepare`] keys on.
+    const SLOW_TO_PREPARE: &str = "WITH RECURSIVE c(x) AS \
+        (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 5000) \
+        SELECT count(typeof(x)) FROM c";
+
+    /// Make preparing a statement that calls `typeof` take `delay` on this
+    /// thread, by sleeping in the authorizer SQLite consults while it prepares.
+    fn slow_prepare(delay: std::time::Duration) {
+        PREPARE_DELAY.with(|slot| slot.set(Some(delay)));
+    }
+
+    /// One rule on every path: the bound starts before the statement is
+    /// prepared, so a slow prepare counts against it. The statement itself
+    /// is far shorter than the bound; only the prepare pushes it over.
+    fn assert_prepare_counts(path: &str, outcome: Result<(), String>) {
+        let error = outcome.expect_err(&format!("{path}: a slow prepare was not charged"));
+        assert!(error.contains("interrupted"), "{path}: {error}");
+    }
+
+    fn slow_cell(dir: &tempfile::TempDir, scope: &str) {
+        limit(Some(300), None);
+        open_in(dir, "cell.sqlite", scope);
+        slow_prepare(std::time::Duration::from_millis(400));
+    }
+
+    #[test]
+    fn the_bound_counts_a_slow_prepare_on_the_first_exec_statement() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        slow_cell(&dir, "prepare-first");
+        assert_prepare_counts(
+            "exec",
+            sql_cursor_start("prepare-first", SLOW_TO_PREPARE, &[]).map(drop),
+        );
+        close("prepare-first");
+    }
+
+    #[test]
+    fn the_bound_counts_a_slow_prepare_on_a_later_exec_statement() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        slow_cell(&dir, "prepare-later");
+        let query = format!("SELECT 1; {SLOW_TO_PREPARE}");
+        assert_prepare_counts(
+            "exec, later statement",
+            sql_cursor_start("prepare-later", &query, &[]).map(drop),
+        );
+        close("prepare-later");
+    }
+
+    #[test]
+    fn the_bound_counts_a_slow_prepare_on_ingest() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        slow_cell(&dir, "prepare-ingest");
+        let input = format!("SELECT 1; {SLOW_TO_PREPARE};");
+        assert_prepare_counts("ingest", sql_ingest("prepare-ingest", &input).map(drop));
+        close("prepare-ingest");
+    }
+
+    #[test]
+    fn the_bound_counts_a_slow_prepare_on_d1() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        slow_cell(&dir, "prepare-d1");
+        let run = |request: serde_json::Value| -> Result<(), String> {
+            let reply: serde_json::Value =
+                serde_json::from_str(&d1_run_json("prepare-d1", &request.to_string())).unwrap();
+            match reply["error"]["message"].as_str() {
+                Some(message) => Err(message.to_string()),
+                None => Ok(()),
+            }
+        };
+        assert_prepare_counts(
+            "d1 prepared",
+            run(serde_json::json!({"mode": "prepared", "sql": SLOW_TO_PREPARE})),
+        );
+        assert_prepare_counts(
+            "d1 exec",
+            run(serde_json::json!({"mode": "exec", "sql": SLOW_TO_PREPARE})),
+        );
+        assert_prepare_counts(
+            "d1 batch",
+            run(serde_json::json!({"mode": "batch", "statements": [{"sql": SLOW_TO_PREPARE}]})),
+        );
+        close("prepare-d1");
+    }
+
+    #[test]
+    fn the_bound_counts_a_slow_prepare_in_the_library_sql_exec() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        slow_cell(&dir, "prepare-lib");
+        assert_prepare_counts(
+            "sql_exec, single",
+            sql_exec("prepare-lib", SLOW_TO_PREPARE, &[]).map(drop),
+        );
+        let batch = format!("SELECT 1; {SLOW_TO_PREPARE}; SELECT 2");
+        assert_prepare_counts(
+            "sql_exec, batch",
+            sql_exec("prepare-lib", &batch, &[]).map(drop),
+        );
+        close("prepare-lib");
+    }
+
+    /// Each statement of a `sql_exec` batch has its own bound. Each statement
+    /// here is inside it (a 200 ms prepare against 300 ms); together they are
+    /// not.
+    #[test]
+    fn a_sql_exec_batch_has_a_bound_per_statement() {
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let dir = tempfile::tempdir().unwrap();
+        limit(Some(300), None);
+        open_in(&dir, "cell.sqlite", "batch-bound");
+        slow_prepare(std::time::Duration::from_millis(200));
+        let batch = format!("{SLOW_TO_PREPARE}; {SLOW_TO_PREPARE}; {SLOW_TO_PREPARE};");
+        sql_exec("batch-bound", &batch, &[]).expect("a statement within its bound was interrupted");
+        close("batch-bound");
     }
 
     thread_local! {

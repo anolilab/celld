@@ -67,9 +67,14 @@ and its value.
 
 - The time bound covers application SQL: `ctx.storage.sql.exec()`, a cursor
   step, and each statement of a D1 `prepare`, `batch`, `exec`, or migration.
-  It does not cover the key-value API or celld's own statements. The clock
-  starts when the statement is handed to SQLite, so time spent before
-  SQLite's first check counts.
+  It does not cover the key-value API or celld's own statements.
+- The clock starts before the statement is prepared, the same on every path:
+  the first and later statements of an `exec`, `ctx.storage.sql.ingest`, D1,
+  and a multi-statement batch. Preparing counts against the bound, and the
+  time a statement records in the [statistics](telemetry.md#sql-statements)
+  runs on that same clock. Each statement of a batch has its own bound, not
+  one shared by the call. A cursor step has its own, from the call that
+  steps it. With the bound at `0`, celld installs no SQLite check at all.
 - A statement interrupted outside a transaction, or a read inside one, is an
   ordinary error and the cell keeps serving. A write interrupted inside a
   `transaction()` or `transactionSync()` makes SQLite discard the whole
