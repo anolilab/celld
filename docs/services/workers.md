@@ -232,7 +232,10 @@ them.
   twice. Both are refused before any build, naming the paths.
 - A Durable Object class that two loaded projects export is refused at start,
   naming both projects. The runtime's own classes (queues, KV, D1, rate limits,
-  workflows) do not count.
+  workflows) do not count. Scripts that an earlier run left in the state count
+  too when a loaded project binds them, and a reload that would load such a
+  clash is refused while the node keeps serving.
+- Two projects that consume the same queue are refused before either is written.
 - Cron triggers run for the first project only, as for any fleet.
 - The local state, and the `--state-dir` hash, are the first project's.
   `celld d1 --local` reads them and supports only the databases of the first
@@ -246,7 +249,10 @@ them.
 - A change in a project rebuilds and writes only that project, then restarts the
   node. A change in a project that no running project reaches rebuilds nothing
   and restarts nothing; the console says so, and the project is built when a
-  later change reaches it. A project that fails to build, or whose new `name`
+  later change reaches it, judged by its config as it is now (a new `name` that
+  a loaded project binds, or a queue a loaded project uses, reaches it). Such a
+  project is not built until then, so a broken one does not stop the other
+  projects from reloading. A project that fails to build, or whose new `name`
   clashes with another's, or whose write is refused (a queue consumer that
   another script holds, a secret that a binding would shadow, a missing Secrets
   Store secret or Hyperdrive connection string), keeps the node serving, and is

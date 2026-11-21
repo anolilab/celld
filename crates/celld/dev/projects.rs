@@ -4,7 +4,7 @@
 use super::{open_local_bucket, read_dev_vars, Store};
 use crate::deploy;
 use crate::protocol::Manifest;
-use anyhow::bail;
+use anyhow::{bail, Context};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -78,14 +78,12 @@ pub(super) fn build_project(
 /// already the one the node serves, so it goes last: a refusal that only the
 /// write can find then never moves what the primary serves.
 async fn write_projects(
-    store: &Store,
+    bucket: &crate::bucket::Bucket,
     rebuilt: &[(usize, deploy::Built)],
     first_start: bool,
 ) -> anyhow::Result<()> {
-    let bucket = open_local_bucket(&store.database)?;
-    crate::wake_format::ensure_ready(&bucket).await?;
     for (_, built) in rebuilt {
-        deploy::check_write(&bucket, built).await?;
+        deploy::check_write(bucket, built).await?;
     }
     let (primary, others): (Vec<_>, Vec<_>) = rebuilt.iter().partition(|(index, _)| *index == 0);
     let order = if first_start {
@@ -99,12 +97,13 @@ async fn write_projects(
         } else {
             deploy::Selection::Activate
         };
-        deploy::write(&bucket, built, selection).await?;
+        deploy::write(bucket, built, selection).await?;
     }
     Ok(())
 }
 
 /// The scripts and queues that one project names.
+#[derive(Default)]
 struct Links {
     services: Vec<String>,
     /// Queues it produces to or consumes, dead-letter queues included.
@@ -112,7 +111,10 @@ struct Links {
     consumes: Vec<String>,
 }
 
-fn links(manifest: &Manifest) -> Links {
+/// A project's Worker name and what it links to.
+type Declared = (String, Links);
+
+fn manifest_links(manifest: &Manifest) -> Declared {
     let named = |kind: &'static str, key: &'static str| {
         crate::secrets::raw_bindings(&manifest.raw_metadata, kind)
             .filter_map(move |binding| binding.get(key).and_then(serde_json::Value::as_str))
@@ -123,7 +125,7 @@ fn links(manifest: &Manifest) -> Links {
         .iter()
         .map(|consumer| consumer.queue.clone())
         .collect::<Vec<_>>();
-    Links {
+    let links = Links {
         services: named("service", "service").collect(),
         queues: named("queue", "queue")
             .chain(consumes.iter().cloned())
@@ -135,35 +137,76 @@ fn links(manifest: &Manifest) -> Links {
             )
             .collect(),
         consumes,
-    }
+    };
+    (manifest.script_name.clone(), links)
 }
 
-/// For each manifest, whether the node loads it: the first one is the
+/// What a config file names, read without building the project. This is the
+/// shape `deploy::build` reads, kept to the keys that link projects.
+fn config_links(config: &serde_json::Value) -> Option<Declared> {
+    let strings = |value: Option<&serde_json::Value>, key: &str| {
+        value
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get(key).and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let queues = config.get("queues");
+    let consumers = queues.and_then(|queues| queues.get("consumers"));
+    let consumes = strings(consumers, "queue");
+    let links = Links {
+        services: strings(config.get("services"), "service"),
+        queues: strings(queues.and_then(|queues| queues.get("producers")), "queue")
+            .into_iter()
+            .chain(consumes.iter().cloned())
+            .chain(strings(consumers, "dead_letter_queue"))
+            .collect(),
+        consumes,
+    };
+    let name = config.get("name")?.as_str()?;
+    Some((name.to_string(), links))
+}
+
+/// What each project names now: its config as it is on disk, so a project
+/// whose config changed since its last build is judged by the new one, and
+/// its last build where the config cannot be read. A project with neither is
+/// empty, and is built anyway.
+fn declared(configs: &[PathBuf], manifests: &[Option<Manifest>]) -> Vec<Declared> {
+    configs
+        .iter()
+        .zip(manifests)
+        .map(|(config, manifest)| {
+            deploy::read_config(Some(config.clone()))
+                .ok()
+                .and_then(|(_, config)| config_links(&config))
+                .or_else(|| manifest.as_ref().map(manifest_links))
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// For each project, whether the node loads it: the first one is the
 /// primary, and the node follows service bindings and queues from every script
 /// it has loaded. This mirrors `generation::dependencies_of`, which reads a
 /// loaded deployment and so cannot run before the node has one.
-fn reachable(manifests: &[&Manifest]) -> Vec<bool> {
-    let links = manifests
-        .iter()
-        .map(|manifest| links(manifest))
-        .collect::<Vec<_>>();
-    let mut loaded = vec![false; manifests.len()];
+fn reachable(declared: &[Declared]) -> Vec<bool> {
+    let mut loaded = vec![false; declared.len()];
     loaded[0] = true;
     loop {
         let mut changed = false;
-        for from in (0..manifests.len())
+        for (_, from) in (0..declared.len())
             .filter(|index| loaded[*index])
+            .map(|index| &declared[index])
             .collect::<Vec<_>>()
         {
-            for to in 0..manifests.len() {
-                let named = links[from]
-                    .services
-                    .iter()
-                    .any(|service| *service == manifests[to].script_name);
-                let queued = links[to]
+            for (to, (name, consumer)) in declared.iter().enumerate() {
+                let named = from.services.contains(name);
+                let queued = consumer
                     .consumes
                     .iter()
-                    .any(|queue| links[from].queues.contains(queue));
+                    .any(|queue| from.queues.contains(queue));
                 if !loaded[to] && (named || queued) {
                     loaded[to] = true;
                     changed = true;
@@ -176,20 +219,73 @@ fn reachable(manifests: &[&Manifest]) -> Vec<bool> {
     }
 }
 
-/// Refuse a Durable Object class that two loaded projects both export: the
+/// The scripts the node loads that this run does not list: a service a loaded
+/// script binds, or the consumer attached to a queue it uses, that an earlier
+/// run left in the store. The node follows the same edges as [`reachable`],
+/// and through the retained scripts too.
+async fn retained_scripts(
+    bucket: &crate::bucket::Bucket,
+    listed: &[Declared],
+    loaded: &[bool],
+) -> anyhow::Result<Vec<Manifest>> {
+    let mut seen = listed
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut queues_seen = BTreeSet::new();
+    let mut retained = Vec::new();
+    let mut work = listed
+        .iter()
+        .zip(loaded)
+        .filter(|(_, loaded)| **loaded)
+        .map(|((_, links), _)| (links.services.clone(), links.queues.clone()))
+        .collect::<Vec<_>>();
+    while let Some((services, queues)) = work.pop() {
+        let mut found = Vec::new();
+        for service in services {
+            if seen.insert(service.clone()) {
+                found.extend(deploy::current_manifest(bucket, &service).await?);
+            }
+        }
+        for queue in queues {
+            // A listed project that consumes it is a project of this run.
+            let listed_consumer = listed
+                .iter()
+                .any(|(_, links)| links.consumes.contains(&queue));
+            if listed_consumer || !queues_seen.insert(queue.clone()) {
+                continue;
+            }
+            let Some(consumer) =
+                crate::fleet::load_queue_consumer_attachment(bucket, &queue).await?
+            else {
+                continue;
+            };
+            if seen.insert(consumer.script_name.clone()) {
+                let key = format!("{}/manifest.json", consumer.prefix);
+                if let Some((body, _)) = bucket.get(&key).await? {
+                    found.push(
+                        serde_json::from_slice::<Manifest>(&body)
+                            .with_context(|| format!("decode {key}"))?,
+                    );
+                }
+            }
+        }
+        for manifest in found {
+            let (_, links) = manifest_links(&manifest);
+            work.push((links.services, links.queues));
+            retained.push(manifest);
+        }
+    }
+    Ok(retained)
+}
+
+/// Refuse a Durable Object class that two loaded scripts both export: the
 /// node resolves a cell from the class name alone, so it cannot tell them
 /// apart. The runtime's own classes repeat legitimately and are not compared.
-fn ensure_distinct_classes(
-    configs: &[PathBuf],
-    manifests: &[&Manifest],
-    loaded: &[bool],
-) -> anyhow::Result<()> {
+/// Each script comes with where it is from, for the message.
+fn ensure_distinct_classes(scripts: &[(&Manifest, String)]) -> anyhow::Result<()> {
     let mut owners: BTreeMap<&str, usize> = BTreeMap::new();
-    for (index, manifest) in manifests
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| loaded[*index])
-    {
+    for (index, (manifest, _)) in scripts.iter().enumerate() {
         for class in manifest
             .do_classes
             .iter()
@@ -200,6 +296,28 @@ fn ensure_distinct_classes(
                     "Durable Object class {class} is exported by both {} ({}) and {} ({}); \
                      the node serves them together and resolves a cell by class name, so \
                      rename one",
+                    scripts[owner].0.script_name,
+                    scripts[owner].1,
+                    manifest.script_name,
+                    scripts[index].1
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a queue that two projects consume. A queue has one consumer, and the
+/// write that attaches it refuses the second only after the first is written,
+/// so projects that are written together are compared before any is.
+fn ensure_distinct_consumers(configs: &[PathBuf], manifests: &[&Manifest]) -> anyhow::Result<()> {
+    let mut owners: BTreeMap<&str, usize> = BTreeMap::new();
+    for (index, manifest) in manifests.iter().enumerate() {
+        for consumer in &manifest.queue_consumers {
+            if let Some(owner) = owners.insert(&consumer.queue, index) {
+                bail!(
+                    "queue {:?} is consumed by both {} ({}) and {} ({}); a queue has one consumer",
+                    consumer.queue,
                     manifests[owner].script_name,
                     configs[owner].display(),
                     manifest.script_name,
@@ -211,23 +329,28 @@ fn ensure_distinct_classes(
     Ok(())
 }
 
-/// Build the projects at the positions in `changed`, and any that `manifests`
-/// holds none for yet, then write them, the first project as the primary. The
-/// other projects keep the version they have. Every rebuilt project is built
-/// and every project checked, names included since a reload can rename one,
-/// before anything is written, so one that fails to build or clashes leaves the
-/// store, the node that runs on it and `manifests` as they were.
+/// Build the projects in `pending` that the node loads, and any that
+/// `manifests` holds none for yet, then write them, the first project as the
+/// primary. The other projects keep the version they have. A pending project
+/// that the node does not load is not built, so one that is broken cannot stop
+/// the rest from reloading; it stays in `pending`, and the others leave it.
+/// Every rebuilt project is built and every project checked, names included
+/// since a reload can rename one, before anything is written, so one that
+/// fails to build or clashes leaves the store, the node that runs on it and
+/// `manifests` as they were.
 pub(super) async fn deploy_projects(
     configs: &[PathBuf],
-    changed: &BTreeSet<usize>,
+    pending: &mut BTreeSet<usize>,
     manifests: &mut [Option<Manifest>],
     store: &Store,
     logs: bool,
     strict_compat_flags: bool,
 ) -> anyhow::Result<Vec<Project>> {
+    let fresh = declared(configs, manifests);
+    let wanted = reachable(&fresh);
     let mut rebuilt = Vec::new();
     for (index, config) in configs.iter().enumerate() {
-        if changed.contains(&index) || manifests[index].is_none() {
+        if (pending.contains(&index) && wanted[index]) || manifests[index].is_none() {
             rebuilt.push((index, build_project(config, logs, strict_compat_flags)?));
         }
     }
@@ -240,13 +363,45 @@ pub(super) async fn deploy_projects(
                 .expect("every project has a build")
         })
         .collect::<Vec<_>>();
+    // A pending project that is not built is named by its config as it is now,
+    // so renaming it onto another project's name is refused here and not when
+    // it is first built.
     let names = current
         .iter()
-        .map(|manifest| manifest.script_name.clone())
+        .enumerate()
+        .map(|(index, manifest)| {
+            if pending.contains(&index) && !wanted[index] {
+                fresh[index].0.clone()
+            } else {
+                manifest.script_name.clone()
+            }
+        })
         .collect::<Vec<_>>();
     ensure_distinct(configs, &names)?;
-    let loaded = reachable(&current);
-    ensure_distinct_classes(configs, &current, &loaded)?;
+    ensure_distinct_consumers(configs, &current)?;
+    let links = current
+        .iter()
+        .map(|manifest| manifest_links(manifest))
+        .collect::<Vec<_>>();
+    let loaded = reachable(&links);
+    let bucket = open_local_bucket(&store.database)?;
+    crate::wake_format::ensure_ready(&bucket).await?;
+    // The node also loads what a loaded project reaches that an earlier run
+    // left in the store, so a clash there is found before the node stops.
+    let retained = retained_scripts(&bucket, &links, &loaded).await?;
+    let scripts = current
+        .iter()
+        .zip(configs)
+        .zip(&loaded)
+        .filter(|(_, loaded)| **loaded)
+        .map(|((manifest, config), _)| (*manifest, config.display().to_string()))
+        .chain(
+            retained
+                .iter()
+                .map(|manifest| (manifest, "retained in the dev store".to_string())),
+        )
+        .collect::<Vec<_>>();
+    ensure_distinct_classes(&scripts)?;
     let projects = names
         .into_iter()
         .zip(configs)
@@ -257,19 +412,26 @@ pub(super) async fn deploy_projects(
             reachable,
         })
         .collect();
-    write_projects(store, &rebuilt, manifests[0].is_none()).await?;
+    write_projects(&bucket, &rebuilt, manifests[0].is_none()).await?;
     // Only the manifest is kept: the modules and assets of a build are large
     // and nothing reads them once they are written.
     for (index, built) in rebuilt {
+        pending.remove(&index);
         manifests[index] = Some(built.manifest);
     }
     Ok(projects)
 }
 
-/// Whether a reload of `pending` changes nothing the node runs: every project
-/// in it is one that the node does not load.
-pub(super) fn changes_nothing_loaded(projects: &[Project], pending: &BTreeSet<usize>) -> bool {
-    pending.iter().all(|index| !projects[*index].reachable)
+/// Whether a reload of `pending` changes nothing the node runs: no project in
+/// it is one that the node loads, judged by the configs as they are now, so a
+/// project that a change makes reachable is not skipped.
+pub(super) fn changes_nothing_loaded(
+    configs: &[PathBuf],
+    pending: &BTreeSet<usize>,
+    manifests: &[Option<Manifest>],
+) -> bool {
+    let wanted = reachable(&declared(configs, manifests));
+    pending.iter().all(|index| !wanted[*index])
 }
 
 /// The warning for each project the node does not load, unless `shown` already

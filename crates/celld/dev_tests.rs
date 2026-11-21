@@ -86,8 +86,8 @@ async fn reload(
     manifests: &mut [Option<Manifest>],
     store: &Store,
 ) -> anyhow::Result<Vec<Project>> {
-    let changed = changed.iter().copied().collect::<BTreeSet<_>>();
-    deploy_projects(configs, &changed, manifests, store, false, false).await
+    let mut changed = changed.iter().copied().collect::<BTreeSet<_>>();
+    deploy_projects(configs, &mut changed, manifests, store, false, false).await
 }
 
 /// Build and write every project, as the first start of a run does.
@@ -459,15 +459,70 @@ fn a_nested_root_and_a_repeated_root_are_watched_once() {
     assert_eq!(watched_roots(&[]), Vec::<&Path>::new());
 }
 
+#[tokio::test]
+async fn a_change_in_a_project_nothing_loads_restarts_nothing() {
+    crate::asyncrt::install_test_host_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let store = store_in(directory.path());
+    let later = serde_json::json!({ "services": [{ "binding": "X", "service": "dev-later" }] });
+    let a = write_project_with(&directory.path().join("a"), "dev-a", "a", later);
+    let b = write_project(&directory.path().join("b"), "dev-b", "b");
+    let configs = [a, b];
+    let mut manifests = no_builds(&configs);
+    reload(&configs, &[], &mut manifests, &store).await.unwrap();
+    let pending = |indexes: &[usize]| indexes.iter().copied().collect::<BTreeSet<_>>();
+    assert!(changes_nothing_loaded(&configs, &pending(&[1]), &manifests));
+    assert!(!changes_nothing_loaded(
+        &configs,
+        &pending(&[0]),
+        &manifests
+    ));
+    assert!(!changes_nothing_loaded(
+        &configs,
+        &pending(&[0, 1]),
+        &manifests
+    ));
+
+    // The change renames B to the service A binds: it is reachable now, though
+    // the deploy before it did not reach it.
+    write_project(&directory.path().join("b"), "dev-later", "b");
+    assert!(!changes_nothing_loaded(
+        &configs,
+        &pending(&[1]),
+        &manifests
+    ));
+    let deployed = reload(&configs, &[1], &mut manifests, &store)
+        .await
+        .unwrap();
+    assert!(deployed[1].reachable);
+    assert!(serving(&store).await.1.contains_key("dev-later"));
+
+    // So does a project that now consumes a queue a loaded project uses.
+    let jobs =
+        serde_json::json!({ "queues": { "producers": [{ "binding": "Q", "queue": "jobs" }] } });
+    write_project_with(&directory.path().join("a"), "dev-a", "a", jobs);
+    let c = write_project(&directory.path().join("c"), "dev-c", "c");
+    let configs = [configs[0].clone(), c.clone()];
+    let mut manifests = no_builds(&configs);
+    reload(&configs, &[], &mut manifests, &store).await.unwrap();
+    assert!(changes_nothing_loaded(&configs, &pending(&[1]), &manifests));
+    write_project_with(
+        &directory.path().join("c"),
+        "dev-c",
+        "c",
+        serde_json::json!({ "queues": { "consumers": [{ "queue": "jobs" }] } }),
+    );
+    assert!(!changes_nothing_loaded(
+        &configs,
+        &pending(&[1]),
+        &manifests
+    ));
+}
+
 #[test]
-fn a_change_in_a_project_nothing_loads_restarts_nothing_and_warns_once() {
+fn the_unreachable_warning_is_given_once_per_set() {
     let mut projects = [project("dev-a", "/w/a"), project("dev-b", "/w/b")];
     projects[1].reachable = false;
-    let pending = |indexes: &[usize]| indexes.iter().copied().collect::<BTreeSet<_>>();
-    assert!(changes_nothing_loaded(&projects, &pending(&[1])));
-    assert!(!changes_nothing_loaded(&projects, &pending(&[0])));
-    assert!(!changes_nothing_loaded(&projects, &pending(&[0, 1])));
-
     let mut shown = BTreeSet::new();
     let first = unreachable_warnings(&projects, &mut shown);
     assert_eq!(first.len(), 1);
@@ -482,6 +537,112 @@ fn a_change_in_a_project_nothing_loads_restarts_nothing_and_warns_once() {
     assert!(unreachable_warnings(&projects, &mut shown).is_empty());
     projects[1].reachable = false;
     assert_eq!(unreachable_warnings(&projects, &mut shown).len(), 1);
+}
+
+#[tokio::test]
+async fn a_broken_project_nothing_loads_does_not_stop_the_others_reloading() {
+    crate::asyncrt::install_test_host_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let store = store_in(directory.path());
+    let a = write_project(&directory.path().join("a"), "dev-a", "a1");
+    let b = write_project(&directory.path().join("b"), "dev-b", "b");
+    let configs = [a, b.clone()];
+    let mut manifests = no_builds(&configs);
+    reload(&configs, &[], &mut manifests, &store).await.unwrap();
+    let before = primary_version(&store).await;
+
+    std::fs::write(&b, "{ not json").unwrap();
+    let mut pending = BTreeSet::from([1]);
+    deploy_projects(&configs, &mut pending, &mut manifests, &store, false, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        pending,
+        BTreeSet::from([1]),
+        "an unbuilt project stays pending"
+    );
+
+    // An edit to A reloads A, and B stays pending.
+    write_project(&directory.path().join("a"), "dev-a", "a2");
+    pending.insert(0);
+    deploy_projects(&configs, &mut pending, &mut manifests, &store, false, false)
+        .await
+        .unwrap();
+    assert_ne!(primary_version(&store).await, before);
+    assert_eq!(pending, BTreeSet::from([1]));
+}
+
+#[tokio::test]
+async fn a_class_clash_with_a_script_left_in_the_store_is_refused_before_any_write() {
+    crate::asyncrt::install_test_host_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let store = store_in(directory.path());
+    let classes = |class: &str| {
+        serde_json::json!({
+            "durable_objects": { "bindings": [{ "name": "OBJ", "class_name": class }] },
+            "migrations": [{ "tag": "v1", "new_sqlite_classes": [class] }],
+        })
+    };
+    // An earlier run left `dev-old` in the store, exporting Counter.
+    let old = write_project_with(
+        &directory.path().join("old"),
+        "dev-old",
+        "o",
+        classes("Counter"),
+    );
+    deploy_all(&[old], &store).await.unwrap();
+    let before = serving(&store).await;
+    let primary_before = primary_version(&store).await;
+
+    // This run lists A and B. B binds `dev-old`, which it does not list, and
+    // exports the same class.
+    let a = write_project_with(
+        &directory.path().join("a"),
+        "dev-a",
+        "a",
+        serde_json::json!({ "services": [{ "binding": "B", "service": "dev-b" }] }),
+    );
+    let mut b_config = classes("Counter");
+    b_config["services"] = serde_json::json!([{ "binding": "O", "service": "dev-old" }]);
+    let b = write_project_with(&directory.path().join("b"), "dev-b", "b", b_config);
+    let error = deploy_all(&[a, b], &store).await.unwrap_err().to_string();
+    for expected in ["Counter", "dev-b", "dev-old", "retained"] {
+        assert!(error.contains(expected), "{error}");
+    }
+    assert_eq!(serving(&store).await.0, before.0);
+    assert_eq!(primary_version(&store).await, primary_before);
+}
+
+#[tokio::test]
+async fn two_projects_that_newly_consume_one_queue_are_refused_before_either_is_written() {
+    crate::asyncrt::install_test_host_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let store = store_in(directory.path());
+    let services = serde_json::json!({ "services": [
+        { "binding": "B", "service": "dev-b" },
+        { "binding": "C", "service": "dev-c" },
+    ] });
+    let a = write_project_with(&directory.path().join("a"), "dev-a", "a", services);
+    let b = write_project(&directory.path().join("b"), "dev-b", "b1");
+    let c = write_project(&directory.path().join("c"), "dev-c", "c1");
+    let configs = [a, b, c];
+    let mut manifests = no_builds(&configs);
+    reload(&configs, &[], &mut manifests, &store).await.unwrap();
+    let before = serving(&store).await.1;
+
+    let consumes = serde_json::json!({ "queues": { "consumers": [{ "queue": "jobs" }] } });
+    write_project_with(&directory.path().join("b"), "dev-b", "b2", consumes.clone());
+    write_project_with(&directory.path().join("c"), "dev-c", "c2", consumes);
+    let error = reload(&configs, &[1, 2], &mut manifests, &store)
+        .await
+        .unwrap_err()
+        .to_string();
+    for expected in ["jobs", "dev-b", "dev-c"] {
+        assert!(error.contains(expected), "{error}");
+    }
+    let after = serving(&store).await.1;
+    assert_eq!(after["dev-b"].version, before["dev-b"].version);
+    assert_eq!(after["dev-c"].version, before["dev-c"].version);
 }
 
 #[test]

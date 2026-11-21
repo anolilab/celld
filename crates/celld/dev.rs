@@ -1022,7 +1022,7 @@ async fn run_stack(
     let mut pending = BTreeSet::new();
     let mut projects = deploy_projects(
         configs,
-        &pending,
+        &mut pending,
         &mut manifests,
         store,
         options.logs,
@@ -1065,7 +1065,7 @@ async fn run_stack(
                 // node serves, so a rebuild and a restart would only drop its
                 // in-flight requests. It stays pending: a later change can make
                 // another project bind it, and it is built then.
-                if changes_nothing_loaded(&projects, &pending) {
+                if changes_nothing_loaded(configs, &pending, &manifests) {
                     console.progress(
                         "change detected in a project that no running project reaches; nothing to restart",
                     );
@@ -1074,7 +1074,7 @@ async fn run_stack(
                 console.progress("change detected; rebuilding the application");
                 match deploy_projects(
                     configs,
-                    &pending,
+                    &mut pending,
                     &mut manifests,
                     store,
                     options.logs,
@@ -1083,7 +1083,6 @@ async fn run_stack(
                 .await
                 {
                     Ok(deployed) => {
-                        pending.clear();
                         warn_unreachable(&deployed, &mut warned, console);
                         projects = deployed;
                     }
