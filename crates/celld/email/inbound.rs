@@ -815,7 +815,8 @@ pub fn read_outcome(bytes: &[u8]) -> Outcome {
 ///
 /// 200 the message was accepted. 550 the handler called `setReject()`: the
 /// relay should bounce with `reason`. 501 the Worker has no `email` handler.
-/// 500 the handler threw: a temporary failure, so the relay retries.
+/// 500 the handler threw: a temporary failure, so the relay retries. The body
+/// does not carry what was thrown.
 pub fn answer(outcome: Outcome) -> (u16, String) {
     match outcome {
         Outcome::Accepted => (200, r#"{"ok":true,"outcome":"accepted"}"#.to_string()),
@@ -832,9 +833,16 @@ pub fn answer(outcome: Outcome) -> (u16, String) {
             })
             .to_string(),
         ),
-        Outcome::Failed(error) => (
+        // The text of what was thrown stays in the log: the poster holds only
+        // the route's token, and a Worker's error may carry a secret.
+        Outcome::Failed(_) => (
             500,
-            serde_json::json!({ "ok": false, "outcome": "error", "error": error }).to_string(),
+            serde_json::json!({
+                "ok": false,
+                "outcome": "error",
+                "error": "the email handler threw",
+            })
+            .to_string(),
         ),
     }
 }
@@ -924,7 +932,17 @@ pub async fn handle(
     let ran =
         crate::asyncrt::timeout(deadline(), runtime.email_worker(inbound, cancellation)).await;
     let outcome = match ran {
-        Ok(Ok(bytes)) => read_outcome(&bytes),
+        Ok(Ok(bytes)) => {
+            let outcome = read_outcome(&bytes);
+            if let Outcome::Failed(detail) = &outcome {
+                tracing::warn!(
+                    event = "inbound_email_failed",
+                    message_id = message_id.as_deref().unwrap_or(""),
+                    %detail,
+                );
+            }
+            outcome
+        }
         Ok(Err(error)) => {
             tracing::warn!(event = "inbound_email_failed", %error);
             Outcome::Failed("the message could not be handled".into())

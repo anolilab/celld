@@ -121,7 +121,9 @@ async fn a_handler_that_throws_is_a_temporary_failure_and_a_missing_handler_is_5
     let (status, body) = post_mode(&server, "throw").await;
     assert_eq!(status, 500, "{body}");
     assert_eq!(body["outcome"], "error");
-    assert!(body["error"].as_str().unwrap().contains("boom"), "{body}");
+    // What the Worker threw is for the log, not for the poster.
+    assert!(!body.to_string().contains("boom"), "{body}");
+    assert_eq!(body["error"], "the email handler threw");
     let other = start(&sink, "send-email").await;
     let (status, body) = post_mode(&other, "accept").await;
     assert_eq!(status, 501, "{body}");
