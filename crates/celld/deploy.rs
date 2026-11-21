@@ -2054,13 +2054,14 @@ fn read_project(
         // The binding names the class of this script only: the runtime
         // resolves a class in the script that declares it, so a binding to
         // another script's class would silently reach this script's namespace.
-        if let Some(script) = binding.get("script_name").and_then(Value::as_str) {
-            if script != script_name {
-                bail!(
-                    "durable object binding {name} sets `script_name` {script:?}; celld binds \
-                     a Durable Object class only in the script that exports it"
-                );
-            }
+        match binding.get("script_name") {
+            None => {}
+            Some(Value::String(script)) if *script == script_name => {}
+            Some(Value::String(script)) => bail!(
+                "durable object binding {name} sets `script_name` {script:?}; celld binds \
+                 a Durable Object class only in the script that exports it"
+            ),
+            Some(_) => bail!("durable object binding {name} `script_name` must be a string"),
         }
         do_classes.push(class_name.to_string());
         bindings.push(json!({
@@ -4647,6 +4648,18 @@ mod durable_object_binding_tests {
             .to_string();
         assert!(
             error.contains("OBJ") && error.contains("\"other\"") && error.contains("script_name"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_binding_whose_script_name_is_not_a_string_is_refused() {
+        let error = read(&binding(r#", "script_name": 7"#))
+            .err()
+            .expect("a non-string script_name")
+            .to_string();
+        assert!(
+            error.contains("OBJ") && error.contains("must be a string"),
             "{error}"
         );
     }
