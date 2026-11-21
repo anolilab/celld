@@ -200,6 +200,7 @@ pub(crate) fn next_pointer(
         prefix: top.prefix,
         rollout: Rollout { percent: 100 },
         components,
+        secrets_revision: None,
     })
 }
 

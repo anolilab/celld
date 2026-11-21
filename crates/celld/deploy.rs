@@ -1377,6 +1377,7 @@ fn unreadable_pointer() -> DeployPointer {
         prefix: String::new(),
         rollout: Rollout { percent: 100 },
         components: BTreeMap::new(),
+        secrets_revision: None,
     }
 }
 
@@ -1427,6 +1428,7 @@ pub(crate) async fn put_named_pointer(
         prefix: selection.prefix.clone(),
         rollout: Rollout { percent: 100 },
         components: BTreeMap::new(),
+        secrets_revision: None,
     };
     put_pointer(
         bucket,

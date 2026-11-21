@@ -763,6 +763,7 @@ pub async fn load_service_worker(
             prefix: selected.prefix.clone(),
             rollout: Rollout { percent: 100 },
             components: Default::default(),
+            secrets_revision: None,
         };
         return load_worker_at_pointer(bucket, pointer, CURRENT_POINTER_KEY, node).await;
     }
@@ -799,6 +800,7 @@ pub async fn load_queue_consumer_worker(
         prefix: consumer.prefix.clone(),
         rollout: Rollout { percent: 100 },
         components: Default::default(),
+        secrets_revision: None,
     };
     let pointer_key = format!("deploy/{}/current.json", consumer.script_name);
     let loaded = load_worker_at_pointer(bucket, pointer, &pointer_key, node).await?;

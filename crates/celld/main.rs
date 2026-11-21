@@ -923,7 +923,7 @@ fn start_pointer_watcher(
                             if !request.force
                                 && failed_pointer
                                     .as_ref()
-                                    .is_some_and(|failed| failed.selects_same(&pointer)) =>
+                                    .is_some_and(|failed| failed.same_build(&pointer)) =>
                         {
                             remembered.clone()
                         }

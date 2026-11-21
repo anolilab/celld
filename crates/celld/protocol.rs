@@ -678,6 +678,11 @@ pub struct DeployPointer {
     /// every script it names together.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub components: BTreeMap<String, ComponentPointer>,
+    /// A random token `celld secret` replaces after every secret write. A
+    /// node that sees it change rebuilds the same version, which re-reads the
+    /// secrets. It is opaque and never derived from a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets_revision: Option<String>,
 }
 
 /// One script's deployment as a [`DeployPointer`] names it.
@@ -706,6 +711,15 @@ impl DeployPointer {
         self.version == other.version
             && self.prefix == other.prefix
             && self.components == other.components
+    }
+}
+
+impl DeployPointer {
+    /// Whether a node builds the same generation from `other`: the same
+    /// deployments and the same secrets revision. A put changes only the
+    /// revision, and must not be answered from the memory of a failed build.
+    pub fn same_build(&self, other: &Self) -> bool {
+        self.selects_same(other) && self.secrets_revision == other.secrets_revision
     }
 }
 
@@ -953,5 +967,35 @@ mod send_email_manifest_tests {
             let manifest = manifest(&["send-email-v1"], json!([broken]));
             assert!(validate_send_email_manifest(&manifest).is_err(), "{change}");
         }
+    }
+}
+
+#[cfg(test)]
+mod pointer_build_tests {
+    use super::*;
+
+    fn pointer(revision: Option<&str>) -> DeployPointer {
+        serde_json::from_value(serde_json::json!({
+            "version": "v1",
+            "prefix": "deploy/app/v1",
+            "rollout": { "percent": 100 },
+            "secrets_revision": revision,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_changed_revision_is_a_different_build_of_the_same_deployment() {
+        let failed = pointer(Some("r1"));
+        assert!(failed.same_build(&pointer(Some("r1"))));
+        assert!(failed.selects_same(&pointer(Some("r2"))));
+        assert!(!failed.same_build(&pointer(Some("r2"))));
+        assert!(!failed.same_build(&pointer(None)));
+    }
+
+    #[test]
+    fn a_pointer_without_a_revision_round_trips_without_the_field() {
+        let text = serde_json::to_string(&pointer(None)).unwrap();
+        assert!(!text.contains("secrets_revision"), "{text}");
     }
 }

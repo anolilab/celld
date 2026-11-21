@@ -74,6 +74,18 @@ impl Record for Name {
     }
 }
 
+/// Tell running nodes the secrets changed. The secrets object is already
+/// written, so a failure here leaves the change stored and says how to
+/// make nodes read it.
+async fn announce(bucket: &Bucket) -> anyhow::Result<()> {
+    secrets::bump_revision(bucket).await.context(
+        "the secret is stored, but running nodes were not told: they read it at their next \
+         load of the deployment (a deploy, `POST /reload`, or a restart), or run this command \
+         again",
+    )?;
+    Ok(())
+}
+
 pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let Some(command) = Command::parse(arguments)? else {
         print_help();
@@ -118,9 +130,10 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                     secrets::put_store(&bucket, key, store, &name, &value).await?;
                 }
             }
+            announce(&bucket).await?;
             note!(
-                "Stored secret {name} for {owner}. A node serves it from its next load of the \
-                 deployment: a deploy, `POST /reload`, or a restart."
+                "Stored secret {name} for {owner}. Running nodes rebuild the deployment and \
+                 serve it within one poll interval (CELLD_DEPLOY_POLL_S)."
             );
             Ok(())
         }
@@ -129,9 +142,10 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                 Owner::Script(script) => secrets::delete(&bucket, script, &name).await?,
                 Owner::Store(store) => secrets::delete_store(&bucket, store, &name).await?,
             }
+            announce(&bucket).await?;
             note!(
-                "Deleted secret {name} of {owner}. A node stops serving it at its next load of \
-                 the deployment."
+                "Deleted secret {name} of {owner}. Running nodes stop serving it within one \
+                 poll interval (CELLD_DEPLOY_POLL_S)."
             );
             Ok(())
         }
@@ -290,8 +304,11 @@ Every node and every `celld secret put` must use the same key, and celld never
 stores it in the bucket. A node refuses to load a deployment whose script has
 secrets when no key is set.
 
-A node reads a script's secrets when it loads a deployment, so a change takes
-effect on the next deploy, `POST /reload`, or restart.
+A node reads a script's secrets when it loads a deployment. `put` and `delete`
+then replace `secrets_revision` in `deploy/current.json`, so every node reloads
+within one poll interval (CELLD_DEPLOY_POLL_S). A fleet with no pointer is not
+touched, and a node on an older version needs a deploy, `POST /reload`, or
+restart.
 
 SCRIPT defaults to the `name` of the Wrangler config in the working directory;
 `--config PATH` names another.
