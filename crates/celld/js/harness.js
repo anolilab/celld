@@ -12014,37 +12014,63 @@ class __FsDirent {
   isFIFO() { return false; }
   isSocket() { return false; }
 }
-const __fsReaddirSync = (value, options) => {
-  const path = __fsPath(value);
+// The encodings `readdir` accepts, as Node reads them: any case, except that
+// `buffer` must be lower case. Any falsy value means utf8.
+const __fsReaddirEncodings = new Set([
+  "utf8", "utf-8", "hex", "base64", "base64url", "latin1", "binary", "ascii",
+  "ucs2", "ucs-2", "utf16le", "utf-16le",
+]);
+const __fsReaddirEncoding = (encoding) => {
+  if (!encoding) return "utf8";
+  if (encoding === "buffer") return "buffer";
+  if (typeof encoding === "string" && __fsReaddirEncodings.has(encoding.toLowerCase())) {
+    return encoding.toLowerCase();
+  }
+  const error = new TypeError(
+    `The argument 'encoding' is invalid encoding. Received ${
+      typeof encoding === "string" ? `'${encoding}'` : String(encoding)
+    }`,
+  );
+  error.code = "ERR_INVALID_ARG_VALUE";
+  throw error;
+};
+const __fsReaddirOptions = (options) => {
   if (typeof options === "string") options = { encoding: options };
   options = __fsOptions(options, ["withFileTypes", "recursive"]);
-  const asBuffer = options.encoding === "buffer";
-  const label = (name) => asBuffer ? Buffer.from(name) : name;
+  return [options, __fsReaddirEncoding(options.encoding)];
+};
+const __fsReaddirSync = (value, options) => {
+  const path = __fsPath(value);
+  let encoding;
+  [options, encoding] = __fsReaddirOptions(options);
+  const label = (name) => encoding === "buffer"
+    ? Buffer.from(name)
+    : encoding === "utf8" || encoding === "utf-8" ? name : Buffer.from(name).toString(encoding);
   const out = [];
-  // An explicit stack: a deep tree must not overflow the call stack, and every
-  // entry goes into `out` one at a time, never as the arguments of one call.
-  const stack = [];
-  const open = (directory, prefix) => {
+  // A queue of directories, read in the order they were found: every entry of
+  // a directory is listed before any entry one level further down, as Node
+  // lists a recursive read. A queue and not recursion, so a deep tree cannot
+  // overflow the call stack, and every entry goes into `out` one at a time,
+  // never as the arguments of one call.
+  const queue = [{ directory: path, prefix: "" }];
+  for (let next = 0; next < queue.length; next++) {
+    const { directory, prefix } = queue[next];
     const names = __vfs_readdir(directory);
     if (typeof names === "string") throw __fsError(names, "scandir", directory);
-    stack.push({ directory, prefix, names, index: 0 });
-  };
-  open(path, "");
-  while (stack.length) {
-    const frame = stack[stack.length - 1];
-    if (frame.index === frame.names.length) {
-      stack.pop();
-      continue;
+    // Nested entries report their directory as the base path joined with the
+    // encoded relative directory, which is what Node reports.
+    const parent = prefix === ""
+      ? directory
+      : (path === "/" ? "" : path) + "/" + label(prefix.slice(0, -1));
+    for (const name of names) {
+      const full = (directory === "/" ? "" : directory) + "/" + name;
+      const kind = __vfs_stat(full)[0];
+      const isDirectory = kind === 1 || kind === 2;
+      out.push(options.withFileTypes
+        ? new __FsDirent(label(name), prefix === "" || encoding !== "buffer" ? parent : Buffer.from(parent), isDirectory)
+        : label(prefix + name));
+      if (options.recursive && isDirectory) queue.push({ directory: full, prefix: prefix + name + "/" });
     }
-    const { directory, prefix } = frame;
-    const name = frame.names[frame.index++];
-    const full = (directory === "/" ? "" : directory) + "/" + name;
-    const kind = __vfs_stat(full)[0];
-    const isDirectory = kind === 1 || kind === 2;
-    out.push(options.withFileTypes
-      ? new __FsDirent(label(name), directory, isDirectory)
-      : label(prefix + name));
-    if (options.recursive && isDirectory) open(full, prefix + name + "/");
   }
   return out;
 };
@@ -12220,7 +12246,7 @@ const __fsAppendFile = (value, data, options, callback) => {
 const __fsReaddir = (value, options, callback) => {
   [options, callback] = __fsCallbackArgs(options, callback);
   __fsCallback(
-    () => __fsPath(value),
+    () => { __fsPath(value); __fsReaddirOptions(options); },
     () => __fsReaddirSync(value, options),
     callback,
   );
