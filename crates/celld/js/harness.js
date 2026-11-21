@@ -12015,13 +12015,13 @@ class __FsDirent {
   isSocket() { return false; }
 }
 // The encodings `readdir` accepts, as Node reads them: any case, except that
-// `buffer` must be lower case. Nothing, null and "" mean utf8.
+// `buffer` must be lower case. Any falsy value means utf8.
 const __fsReaddirEncodings = new Set([
   "utf8", "utf-8", "hex", "base64", "base64url", "latin1", "binary", "ascii",
   "ucs2", "ucs-2", "utf16le", "utf-16le",
 ]);
 const __fsReaddirEncoding = (encoding) => {
-  if (encoding === undefined || encoding === null || encoding === "") return "utf8";
+  if (!encoding) return "utf8";
   if (encoding === "buffer") return "buffer";
   if (typeof encoding === "string" && __fsReaddirEncodings.has(encoding.toLowerCase())) {
     return encoding.toLowerCase();

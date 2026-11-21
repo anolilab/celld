@@ -263,6 +263,8 @@ const fsChecks = {
     is(names("UTF8"), ["a", "é"]);
     is(names(null), ["a", "é"]);
     is(names(""), ["a", "é"]);
+    is(names(false), ["a", "é"]);
+    is(names(0), ["a", "é"]);
     is(names("hex"), ["61", "c3a9"]);
     is(names("base64"), ["YQ==", "w6k="]);
     is(names("base64url"), ["YQ", "w6k"]);
