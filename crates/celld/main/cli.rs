@@ -288,7 +288,7 @@ USAGE:
   celld kv get|put|delete|list|info NAMESPACE --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld queue info|peek|purge|pause|resume|redrive QUEUE --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld secret put|list|delete [NAME] [--script SCRIPT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
-  celld secret rotate --new-key-file PATH --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  celld secret rotate --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld r2 get|head|put|delete|list BUCKET [KEY] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld diagnose --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS] [--peer NODE_ID]...
 

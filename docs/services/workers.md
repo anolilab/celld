@@ -94,7 +94,7 @@ export CELLD_SECRETS_KEY="$(openssl rand -base64 32)"   # once, for the fleet
 printf %s "$STRIPE_KEY" | celld secret put STRIPE_KEY --script billing --bucket s3://my-cells-bucket
 celld secret list --script billing --bucket s3://my-cells-bucket
 celld secret delete STRIPE_KEY --script billing --bucket s3://my-cells-bucket
-celld secret rotate --new-key-file ./new-key --bucket s3://my-cells-bucket
+celld secret rotate --bucket s3://my-cells-bucket   # with CELLD_SECRETS_KEY_PREVIOUS set
 ```
 
 `--script` defaults to the `name` of the Wrangler config in the working
@@ -163,37 +163,38 @@ message, or in the output of `celld deploy`.
 To change the key without downtime and without putting the values again, rotate
 in this order:
 
-1. Give every node the new key as `CELLD_SECRETS_KEY` (or `_FILE`) and the old
-   one as `CELLD_SECRETS_KEY_PREVIOUS` (or `CELLD_SECRETS_KEY_PREVIOUS_FILE`),
-   and restart or redeploy the nodes. A node opens each entry with the key its
-   id names, and seals only with the current key. It refuses to start on a
-   malformed previous key, and setting both the variable and the file is an
-   error.
-2. Switch every operator and CI job that runs `celld secret put` to the new
-   key, so a secret put from now on creates its object under it. A `put` into
-   an object that is still under the old key is refused until `rotate` reaches
-   it.
-3. Run `celld secret rotate --new-key-file PATH --bucket ...`, with the old key
-   in `CELLD_SECRETS_KEY` as for `put`. The new key comes from a file only,
-   never from an argument or the environment. The command re-seals every secret
-   of every Worker (`deploy/<script>/secrets.json`) and of every Secrets Store
-   (`stores/<id>/secrets.json`), one conditional write per object, and prints
-   how many objects and secrets it re-sealed, never a value. It lists the
-   owners again afterwards, and ends only when a walk finds nothing left under
-   another key, so an object created under the old key during the run is
-   re-sealed too. If objects keep appearing, it fails and names one.
-4. Drop `CELLD_SECRETS_KEY_PREVIOUS` from the nodes.
+1. Set the new key as `CELLD_SECRETS_KEY` (or `_FILE`) and the old one as
+   `CELLD_SECRETS_KEY_PREVIOUS` (or `CELLD_SECRETS_KEY_PREVIOUS_FILE`)
+   everywhere: on every node, which you restart or redeploy, and in every
+   environment and CI job that runs `celld secret`. A node opens each entry
+   with the key its id names, and seals only with the current key. It refuses
+   to start on a malformed or unreadable previous key, and setting both the
+   variable and the file is an error.
+2. Run `celld secret rotate --bucket ...`. It reads its keys as a node does:
+   it re-seals under `CELLD_SECRETS_KEY` and uses the previous key only to
+   open, and it refuses to run when no previous key is set. It re-seals every
+   secret of every Worker (`deploy/<script>/secrets.json`) and of every
+   Secrets Store (`stores/<id>/secrets.json`), one conditional write per
+   object, and prints how many objects and secrets it re-sealed, never a
+   value. It lists the owners again afterwards and ends only when a walk finds
+   nothing left under the previous key. If objects keep appearing, it fails
+   and names one.
+3. Drop `CELLD_SECRETS_KEY_PREVIOUS` from the nodes and from every
+   environment.
+
+From step 1 every `put` seals under the new key, so a new object can no longer
+appear under the old key. A `put` into an object that is still under the old
+key is refused until `rotate` reaches it, and works after.
 
 A run that stops resumes when you run it again: an object whose entries are all
-under the new key is skipped. An entry sealed under neither key stops the run
-with an error that names the object and the secret; fix it (delete
-that secret and put it again under the new key, or restore the key it was
-sealed with), then run again. A `put` cannot replace it, because a `put` is
-refused when the object holds entries under two keys. Rotation does not change any
-value, so it does not set `secrets_revisions`, and no node rebuilds. A node that
-finds an entry sealed under a key it does not hold fails that load and keeps
-serving the previous deployment. A `put` with the new key is refused for an
-object until `rotate` has reached it, and works after.
+under the current key is skipped. An entry sealed under neither key stops the
+run with an error that names the object and the secret; fix it (delete that
+secret and put it again under the new key, or restore the key it was sealed
+with), then run again. A `put` cannot replace it, because a `put` is refused
+when the object holds entries under two keys. Rotation does not change any
+value, so it does not set `secrets_revisions`, and no node rebuilds. A node
+that finds an entry sealed under a key it does not hold fails that load and
+keeps serving the previous deployment.
 
 ## Secrets Store
 

@@ -1,4 +1,4 @@
-//! Re-sealing every secrets object of the fleet under a new key.
+//! Re-sealing every secrets object of the fleet under the current key.
 
 use anyhow::{bail, ensure};
 use zeroize::Zeroizing;
@@ -19,15 +19,16 @@ type ScopeOf = fn(&str) -> Scope<'_>;
 pub struct Rotated {
     /// Objects written: script secrets objects and store objects.
     pub objects: usize,
-    /// Entries re-sealed under the new key.
+    /// Entries re-sealed under the current key.
     pub entries: usize,
 }
 
-/// Re-seal every entry of every script and every Secrets Store under `new`.
+/// Re-seal every entry of every script and every Secrets Store under `current`,
+/// the key a node seals with. `previous` only opens.
 ///
 /// Each object is one conditional write through [`update`], so a `put` that
 /// races it either lands first (and is re-sealed with the rest) or retries
-/// against the re-sealed object. An entry already under `new` is left alone,
+/// against the re-sealed object. An entry already under `current` is left alone,
 /// and an object that holds only such entries is not written, so a run that
 /// stopped half way resumes where it stopped. The values do not change, so the
 /// fleet pointer's `secrets_revisions` stays as it is and no node rebuilds.
@@ -37,33 +38,34 @@ pub struct Rotated {
 /// after the first listing is found and re-sealed too. If objects keep
 /// appearing, the run fails and names the last one.
 ///
-/// An entry under neither `current` nor `new` stops the run with an error that
+/// An entry under neither `previous` nor `current` stops the run with an error that
 /// names the object and the entry, never a value. Objects before it stay
 /// re-sealed.
 pub async fn rotate(
     bucket: &Bucket,
+    previous: &SecretsKey,
     current: &SecretsKey,
-    new: &SecretsKey,
 ) -> anyhow::Result<Rotated> {
-    rotate_with(bucket, current, new, async |_| {}).await
+    rotate_with(bucket, previous, current, async |_| {}).await
 }
 
 /// [`rotate`], running `after_walk` with the number of each walk that wrote
 /// something, before the next listing.
 async fn rotate_with(
     bucket: &Bucket,
+    previous: &SecretsKey,
     current: &SecretsKey,
-    new: &SecretsKey,
     mut after_walk: impl AsyncFnMut(usize),
 ) -> anyhow::Result<Rotated> {
     ensure!(
-        current.id != new.id,
-        "the new secrets key is the current one; rotate to a different key"
+        previous.id != current.id,
+        "the previous secrets key is the current one; set the old key as \
+         CELLD_SECRETS_KEY_PREVIOUS"
     );
     let mut total = Rotated::default();
     let mut last = String::new();
     for walk_number in 1..=MAX_WALKS {
-        let (walked, newest) = walk(bucket, current, new).await?;
+        let (walked, newest) = walk(bucket, previous, current).await?;
         if walked.objects == 0 {
             return Ok(total);
         }
@@ -74,7 +76,8 @@ async fn rotate_with(
     }
     bail!(
         "objects kept appearing under another key during {MAX_WALKS} walks, the last one {last}; \
-         switch every `celld secret put` to the new key, then run rotate again"
+         run every `celld secret put` with the new key as CELLD_SECRETS_KEY, then run \
+         rotate again"
     )
 }
 
@@ -82,8 +85,8 @@ async fn rotate_with(
 /// of the last object it wrote.
 async fn walk(
     bucket: &Bucket,
+    previous: &SecretsKey,
     current: &SecretsKey,
-    new: &SecretsKey,
 ) -> anyhow::Result<(Rotated, String)> {
     let kinds: [(&str, ScopeOf); 2] = [
         (Scope::SCRIPT_PREFIX, |id| Scope::Script(id)),
@@ -105,7 +108,7 @@ async fn walk(
             if scope.check().is_err() {
                 continue;
             }
-            let entries = rotate_in(bucket, scope, current, new).await?;
+            let entries = rotate_in(bucket, scope, previous, current).await?;
             if entries > 0 {
                 walked.objects += 1;
                 walked.entries += entries;
@@ -117,14 +120,14 @@ async fn walk(
 }
 
 /// Re-seal one object. Returns how many entries it re-sealed; zero when the
-/// object is absent, empty, or already entirely under `new`.
+/// object is absent, empty, or already entirely under `current`.
 async fn rotate_in(
     bucket: &Bucket,
     scope: Scope<'_>,
+    previous: &SecretsKey,
     current: &SecretsKey,
-    new: &SecretsKey,
 ) -> anyhow::Result<usize> {
-    let behind = |set: &SecretSet| set.secrets.values().any(|entry| entry.kid != new.id);
+    let behind = |set: &SecretSet| set.secrets.values().any(|entry| entry.kid != current.id);
     match read(bucket, scope).await? {
         Some((set, _)) if behind(&set) => {}
         _ => return Ok(0),
@@ -134,20 +137,20 @@ async fn rotate_in(
     update(bucket, scope, |set| {
         resealed = 0;
         for (name, sealed) in &mut set.secrets {
-            if sealed.kid == new.id {
+            if sealed.kid == current.id {
                 continue;
             }
             anyhow::ensure!(
-                sealed.kid == current.id,
-                "{key}: secret {name} is sealed under key {}, which is neither the current key \
-                 {} nor the new key {}; objects before it are re-sealed, so run again after \
+                sealed.kid == previous.id,
+                "{key}: secret {name} is sealed under key {}, which is neither the previous key \
+                 {} nor the current key {}; objects before it are re-sealed, so run again after \
                  fixing this one",
                 sealed.kid,
-                current.id,
-                new.id
+                previous.id,
+                current.id
             );
-            let value = Zeroizing::new(current.open(scope, name, sealed)?);
-            *sealed = new.seal(scope, name, &value)?;
+            let value = Zeroizing::new(previous.open(scope, name, sealed)?);
+            *sealed = current.seal(scope, name, &value)?;
             resealed += 1;
         }
         Ok(())

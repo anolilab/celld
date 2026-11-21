@@ -173,26 +173,19 @@ manager: a lost key cannot be recovered, and the values must be put again.
 
 To rotate the key, change it in this order:
 
-1. Give every node the new key as `CELLD_SECRETS_KEY` and the old one as
-   `CELLD_SECRETS_KEY_PREVIOUS` (or `CELLD_SECRETS_KEY_PREVIOUS_FILE`), and
-   restart or redeploy them. The previous key only opens entries; it never
-   seals.
-2. Switch every operator and CI job that runs `celld secret put` to the new key,
-   so new secrets create their objects under it.
-3. Run `celld secret rotate --new-key-file PATH` with the old key as
-   `CELLD_SECRETS_KEY`. It re-seals every secret of every Worker and store
-   under the new key, checks the fleet again afterwards, and can be run again
-   if it stops.
-4. Drop the previous key.
+1. Set the new key as `CELLD_SECRETS_KEY` and the old one as
+   `CELLD_SECRETS_KEY_PREVIOUS` (or `CELLD_SECRETS_KEY_PREVIOUS_FILE`)
+   everywhere: on every node, which you restart or redeploy, and in every
+   environment that runs `celld secret`. The previous key only opens entries;
+   it never seals.
+2. Run `celld secret rotate`. It re-seals every secret of every Worker and
+   store under `CELLD_SECRETS_KEY`, opening with the previous key, checks the
+   fleet again afterwards, and can be run again if it stops. It refuses to run
+   without a previous key.
+3. Drop the previous key.
 
-The new key is read from a file, never from an argument. See
-[Rotate the secrets key](services/workers.md#rotate-the-secrets-key).
-
-A node reads and parses the key once per process and clears its copy of the
-decoded bytes and of the file text from memory when it is done with them; the
-key stays in memory while the node runs. A key file may be a symbolic link,
-because a mounted secret is one. celld reads at most 4 KiB from it, and logs a
-warning, without refusing, when other users can read it.
+From step 1 every `put` seals under the new key, so no new object appears under
+the old one. See [Rotate the secrets key](services/workers.md#rotate-the-secrets-key).
 
 ## Limit Worker egress
 

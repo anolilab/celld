@@ -113,14 +113,6 @@ impl SecretsKey {
         Ok(key)
     }
 
-    /// The key in the file at `path`, read as a key file of the environment is:
-    /// bounded, through a pipe or a symbolic link as well. The text is cleared
-    /// from memory once parsed.
-    pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
-        let text = Zeroizing::new(crate::credential_file::read(path, KEY_FILE_MAX_BYTES)?);
-        Self::parse(&text).with_context(|| format!("{} is invalid", path.display()))
-    }
-
     /// The key in `CELLD_SECRETS_KEY` alone, or `None` when it is unset or
     /// blank. Startup validation uses it, so a node stops at once on a
     /// malformed key without reading the file.
