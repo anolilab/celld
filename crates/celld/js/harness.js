@@ -12034,11 +12034,15 @@ const __fsReaddirEncoding = (encoding) => {
   error.code = "ERR_INVALID_ARG_VALUE";
   throw error;
 };
-const __fsReaddirSync = (value, options) => {
-  const path = __fsPath(value);
+const __fsReaddirOptions = (options) => {
   if (typeof options === "string") options = { encoding: options };
   options = __fsOptions(options, ["withFileTypes", "recursive"]);
-  const encoding = __fsReaddirEncoding(options.encoding);
+  return [options, __fsReaddirEncoding(options.encoding)];
+};
+const __fsReaddirSync = (value, options) => {
+  const path = __fsPath(value);
+  let encoding;
+  [options, encoding] = __fsReaddirOptions(options);
   const label = (name) => encoding === "buffer"
     ? Buffer.from(name)
     : encoding === "utf8" || encoding === "utf-8" ? name : Buffer.from(name).toString(encoding);
@@ -12242,7 +12246,7 @@ const __fsAppendFile = (value, data, options, callback) => {
 const __fsReaddir = (value, options, callback) => {
   [options, callback] = __fsCallbackArgs(options, callback);
   __fsCallback(
-    () => __fsPath(value),
+    () => { __fsPath(value); __fsReaddirOptions(options); },
     () => __fsReaddirSync(value, options),
     callback,
   );

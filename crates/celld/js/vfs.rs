@@ -297,6 +297,18 @@ impl RequestVfs {
         })
     }
 
+    /// The capacity files hold beyond their length, which a charge that would
+    /// fail gives back. A write the limit alone would refuse may still fit.
+    fn spare_capacity(&self) -> usize {
+        self.nodes
+            .values()
+            .map(|node| match node {
+                VfsNode::File(bytes) => bytes.capacity() - bytes.len(),
+                VfsNode::Directory { .. } => 0,
+            })
+            .sum()
+    }
+
     fn read(&self, path: &str) -> Option<&[u8]> {
         match self.nodes.get(path) {
             Some(VfsNode::File(bytes)) => Some(bytes),
@@ -435,7 +447,15 @@ pub(super) fn op_vfs_write(
     let view = args.get(1).try_cast::<v8::ArrayBufferView>().ok();
     let len = view.map_or(0, |view| view.byte_length());
     // Refuse a buffer that cannot fit before copying it out of the heap.
-    let limit = match with_vfs(scope, |vfs| vfs.write_limit(&path, append)) {
+    // Spare capacity counts as room, because the write reclaims it.
+    let limit = match with_vfs(scope, |vfs| {
+        let limit = vfs.write_limit(&path, append)?;
+        Ok(if len > limit {
+            limit.saturating_add(vfs.spare_capacity())
+        } else {
+            limit
+        })
+    }) {
         Some(limit) => limit,
         None => Err(no_tmp(scope)),
     };

@@ -285,6 +285,24 @@ const fsChecks = {
       throwsCodeSync("ERR_INVALID_ARG_VALUE", () => fs.readdirSync("/tmp/enc", { encoding: bad, recursive: true }));
     }
   },
+  readdirBadEncodingThrowsBeforeTheCallback: async () => {
+    fs.mkdirSync("/tmp/be");
+    let called = false;
+    throwsCodeSync("ERR_INVALID_ARG_VALUE", () => fs.readdir("/tmp/be", { encoding: "nope" }, () => { called = true; }));
+    throwsCodeSync("ERR_INVALID_ARG_VALUE", () => fs.readdir("/tmp/be", "nope", () => { called = true; }));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    is(called, false);
+    await throwsCode("ERR_INVALID_ARG_VALUE", () => fsp.readdir("/tmp/be", { encoding: "nope" }));
+  },
+  writeAfterAppendSlackIsReclaimed: () => {
+    const mib = 1024 * 1024;
+    fs.writeFileSync("/tmp/slack-a", Buffer.alloc(40 * mib));
+    fs.appendFileSync("/tmp/slack-a", "x");
+    fs.writeFileSync("/tmp/slack-b", Buffer.alloc(14 * mib));
+    is(fs.statSync("/tmp/slack-b").size, 14 * mib);
+    fs.rmSync("/tmp/slack-a");
+    fs.rmSync("/tmp/slack-b");
+  },
   readdirManyEntries: () => {
     fs.mkdirSync("/tmp/many");
     for (let index = 0; index < 150000; index++) fs.mkdirSync(`/tmp/many/${index}`);
