@@ -501,3 +501,44 @@ async fn a_queue_two_projects_consume_is_refused_in_a_reload() {
     assert_eq!(server.get_text("/send/two").await, "sent");
     wait_for_body(&server, "/seen", "one,two").await;
 }
+
+#[tokio::test]
+async fn a_reload_takes_a_consumer_from_a_project_nothing_reaches_any_more() {
+    // The second project only consumes the queue the primary produces to, and no
+    // service binding names it.
+    let server =
+        Server::start_projects_watching(&["dev-handover-p", "dev-handover-c"], &[], true, |_| {})
+            .await;
+    let [primary, consumer] = <[PathBuf; 2]>::try_from(server.projects()).expect("two projects");
+    assert_eq!(server.get_text("/send/one").await, "sent");
+
+    // The primary takes the queue while the other project holds it: refused.
+    take_the_consumer(&primary);
+    wait_until(
+        "the clashing reload to be refused",
+        Duration::from_secs(60),
+        || async { server.log_text().contains("reload failed").then_some(()) },
+    )
+    .await;
+
+    // The other project drops it, so nothing reaches that project any more, and
+    // the one reload hands the queue to the primary.
+    let path = consumer.join("wrangler.json");
+    let config = std::fs::read_to_string(&path).expect("read the config");
+    std::fs::write(
+        &path,
+        config.replace(HANDOVER_CONSUMER, r#""producers": []"#),
+    )
+    .expect("edit the config");
+    wait_until(
+        "the primary to receive the queue",
+        Duration::from_secs(60),
+        || async {
+            let response = client().get(server.url("/send/two")).send().await.ok()?;
+            (response.text().await.ok()? == "sent").then_some(())?;
+            let seen = client().get(server.url("/seen")).send().await.ok()?;
+            seen.text().await.ok()?.contains("two").then_some(())
+        },
+    )
+    .await;
+}

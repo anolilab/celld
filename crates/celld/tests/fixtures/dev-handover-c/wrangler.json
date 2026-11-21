@@ -1,0 +1,9 @@
+{
+  "name": "handover-c",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "durable_objects": { "bindings": [{ "name": "INBOX", "class_name": "InboxC" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["InboxC"] }],
+  "queues": { "consumers": [{ "queue": "handover-jobs", "max_batch_size": 10, "max_batch_timeout": 1, "max_retries": 0 }] }
+}

@@ -1141,28 +1141,25 @@ pub async fn check_write(
     prepare_refusals(bucket, built, batch).await.map(drop)
 }
 
-/// The queues `manifest` consumes that another script holds now, with the
-/// script that holds each.
-pub async fn queues_held_by_others(
+/// Release the queues that `manifest` no longer consumes and that are in
+/// `taken`, those another script of the same run consumes now. Only the queue
+/// consumer attachments change: no pointer moves and nothing is uploaded, so
+/// the version the script serves stays as it is. A run that hands a queue from
+/// one script to another releases first, since a queue has one attachment and
+/// the new consumer cannot take it while another script holds it.
+pub async fn release_queue_consumers(
     bucket: &Bucket,
     manifest: &Manifest,
-) -> anyhow::Result<Vec<(String, String)>> {
-    let mut held = Vec::new();
-    for consumer in &manifest.queue_consumers {
-        let key = crate::protocol::queue_consumer_attachment_key(&consumer.queue)
-            .expect("deploy validated the queue name");
-        if let Some((body, _)) = bucket.get(&key).await? {
-            let attachment: QueueConsumerAttachment = serde_json::from_slice(&body)
-                .with_context(|| format!("decode queue consumer attachment {key}"))?;
-            if let Some(owner) = attachment
-                .consumer
-                .filter(|owner| owner.script_name != manifest.script_name)
-            {
-                held.push((consumer.queue.clone(), owner.script_name));
-            }
-        }
-    }
-    Ok(held)
+    batch: &[&Manifest],
+    taken: &BTreeSet<String>,
+) -> anyhow::Result<()> {
+    let states = prepare_queue_attachments(bucket, manifest, batch)
+        .await?
+        .into_iter()
+        .filter(|state| !state.desired && taken.contains(&state.queue))
+        .collect();
+    // Only released queues are published, so the prefix is not read.
+    publish_queue_attachments(bucket, manifest, "", states).await
 }
 
 async fn prepare_refusals(
