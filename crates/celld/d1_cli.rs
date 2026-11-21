@@ -129,7 +129,8 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         let not_running = |why: &dyn std::fmt::Display| {
             anyhow!(
                 "no running `celld dev` node for this project (local state in {state}): {why}\n\
-                 start `celld dev` for this project first"
+                 start `celld dev` for this project first; when it runs several projects, \
+                 run this from the first one, whose state it uses"
             )
         };
         let token = crate::operator_token::OperatorToken::from_file(&token)?

@@ -80,7 +80,9 @@ pub(crate) fn local_node_files(
 
 #[derive(Debug)]
 struct Options {
-    project: Option<PathBuf>,
+    /// The projects to run, in order; the first is the primary. Empty means
+    /// the current directory.
+    projects: Vec<PathBuf>,
     state_dir: Option<PathBuf>,
     clean: bool,
     stack: StackOptions,
@@ -380,6 +382,13 @@ impl Console {
         crate::note!("{}", self.paint(style, line));
     }
 
+    fn warning(&self, message: &str) {
+        crate::note!(
+            "  {} {message}",
+            self.paint(Color::Yellow.bold(), "warning")
+        );
+    }
+
     fn failure(&self, message: &str) {
         crate::note!("  {} {message}", self.paint(Color::Red.bold(), "error"));
     }
@@ -548,11 +557,19 @@ impl ShutdownSignals {
 pub fn print_help() -> anyhow::Result<()> {
     crate::cli_output::Output::new(crate::cli_output::Format::Text).help(
         &format!("celld dev — run an application with persistent local storage\n\n\
-USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--state-dir DIR] [--logs] [--strict-compat-flags] [--no-watch] [--clean]\n\n\
+USAGE:\n  celld dev [PROJECT...] [-c CONFIG]... [--host IP] [--port PORT] [--state-dir DIR] [--logs] [--strict-compat-flags] [--no-watch] [--clean]\n\n\
 PROJECT is a directory or a Wrangler config. It defaults to the current\n\
 directory. celld stores all local state in PROJECT/.celld/dev, and it keeps\n\
-that state across a restart. --state-dir DIR, or CELLD_DEV_STATE_DIR, keeps it\n\
-in DIR/<project hash>/.celld/dev instead. A configuration change does not migrate the\n\
+that state across a restart.\n\n\
+Give several projects, as arguments or with -c/--config, to run them together\n\
+in one node. The first one serves requests at the listener; the others are\n\
+reached through the service bindings of the projects that name them, so a\n\
+project that nothing reaches does not run. Each project needs its own Worker\n\
+name, and its Durable Object classes must differ from the others'. Cron\n\
+triggers run for the first project only. The local state is the first\n\
+project's, and celld d1 --local reads it from there.\n\n\
+Details of one project follow. --state-dir DIR, or CELLD_DEV_STATE_DIR, keeps it\n\
+in DIR/<project hash>/.celld/dev instead, the hash being the first project's. A configuration change does not migrate the\n\
 state, so a cell can keep a value that the new configuration rejects. Use\n\
 --clean to start from an empty local state.\n\n\
 A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
@@ -565,7 +582,7 @@ OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  
 }
 
 fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Options>> {
-    let mut project = None;
+    let mut projects = Vec::new();
     let mut state_dir = None;
     let mut host = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut port = DEFAULT_PORT;
@@ -607,16 +624,19 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
                     .parse::<u16>()
                     .with_context(|| format!("invalid --port value {value:?}"))?;
             }
+            "-c" | "--config" => {
+                let value = arguments.next().context("--config requires a value")?;
+                projects.push(PathBuf::from(value));
+            }
             other if other.starts_with('-') => bail!("unknown argument for `celld dev`: {other}"),
-            value if project.is_none() => project = Some(PathBuf::from(value)),
-            value => bail!("celld dev accepts one PROJECT, but also received {value:?}"),
+            value => projects.push(PathBuf::from(value)),
         }
     }
     if !watch && !watch_ignores.is_empty() {
         bail!("--watch-ignore cannot be used with --no-watch");
     }
     Ok(Some(Options {
-        project,
+        projects,
         state_dir,
         clean,
         stack: StackOptions {
@@ -635,9 +655,8 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         print_help()?;
         return Ok(());
     };
-    let config = deploy::resolve_config(options.project)?;
-    let config = std::fs::canonicalize(&config)
-        .with_context(|| format!("resolve Wrangler config {}", config.display()))?;
+    let configs = resolve_projects(options.projects)?;
+    let config = &configs[0];
     let project = config
         .parent()
         .context("the Wrangler config has no project directory")?;
@@ -649,6 +668,9 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let console = Console::new();
     console.header();
     console.detail("Project", &config.display().to_string());
+    for other in &configs[1..] {
+        console.detail("Also", &other.display().to_string());
+    }
     console.detail("State", &state.path().display().to_string());
     state.prepare_shared_root()?;
     // The delete runs before the directory is recreated, and the console names
@@ -682,7 +704,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let project_hash = project_hash(project);
     let store = open_store(state.path(), &console).await?;
     run_stack(
-        &config,
+        &configs,
         state.path(),
         options.stack,
         &project_hash,
@@ -690,6 +712,55 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         &console,
     )
     .await
+}
+
+/// The config of each project to run, resolved and canonical, in the order
+/// given. Two projects may not be the same config or declare the same Worker
+/// name, since a script name selects one deployment in the shared store.
+#[allow(clippy::disallowed_methods)] // Project resolution uses the operator's host filesystem.
+fn resolve_projects(given: Vec<PathBuf>) -> anyhow::Result<Vec<PathBuf>> {
+    let given = if given.is_empty() {
+        vec![deploy::resolve_config(None)?]
+    } else {
+        given
+            .into_iter()
+            .map(|project| deploy::resolve_config(Some(project)))
+            .collect::<anyhow::Result<Vec<_>>>()?
+    };
+    let configs = given
+        .into_iter()
+        .map(|config| {
+            std::fs::canonicalize(&config)
+                .with_context(|| format!("resolve Wrangler config {}", config.display()))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let names = configs
+        .iter()
+        .map(|config| deploy::read_script_name(Some(config.clone())))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    ensure_distinct(&configs, &names)?;
+    Ok(configs)
+}
+
+/// Refuse a config listed twice, and two configs with one Worker name.
+fn ensure_distinct(configs: &[PathBuf], names: &[String]) -> anyhow::Result<()> {
+    for (later, config) in configs.iter().enumerate() {
+        for earlier in 0..later {
+            if configs[earlier] == *config {
+                bail!("{} is listed twice", config.display());
+            }
+            if names[earlier] == names[later] {
+                bail!(
+                    "{} and {} both declare the Worker name {:?}; every project of one \
+                     run needs its own",
+                    configs[earlier].display(),
+                    config.display(),
+                    names[later]
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::disallowed_methods)] // Local development state is an operator-owned host path.
@@ -740,10 +811,25 @@ fn read_dev_vars(config: &Path) -> anyhow::Result<deploy::VarOverrides> {
 /// `.dev.vars` itself. Only the supervisor sets it.
 const CONFIG_ENV: &str = "CELLD_INTERNAL_DEV_CONFIG";
 
-/// The value of [`CONFIG_ENV`] for `projects`, each a script name and its config.
-fn config_map(projects: &[(String, PathBuf)]) -> anyhow::Result<String> {
-    serde_json::to_string(&projects.iter().cloned().collect::<BTreeMap<_, _>>())
-        .context("a project config path is not valid UTF-8")
+/// A project that this run built and wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Project {
+    script: String,
+    config: PathBuf,
+    /// Whether the node loads it: the primary, and the projects that a loaded
+    /// project binds as a service or reaches through a queue.
+    reachable: bool,
+}
+
+/// The value of [`CONFIG_ENV`] for `projects`.
+fn config_map(projects: &[Project]) -> anyhow::Result<String> {
+    serde_json::to_string(
+        &projects
+            .iter()
+            .map(|project| (&project.script, &project.config))
+            .collect::<BTreeMap<_, _>>(),
+    )
+    .context("a project config path is not valid UTF-8")
 }
 
 /// The config that `script` was built from, in a [`CONFIG_ENV`] value. A script
@@ -928,30 +1014,163 @@ async fn write_projects(store: &Store, built: &[deploy::Built]) -> anyhow::Resul
     Ok(())
 }
 
+/// The scripts and queues that one project names.
+struct Links {
+    services: Vec<String>,
+    /// Queues it produces to or consumes, dead-letter queues included.
+    queues: Vec<String>,
+    consumes: Vec<String>,
+}
+
+fn links(manifest: &Manifest) -> Links {
+    let text = |binding: &serde_json::Value, key: &str| {
+        binding
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let bindings = |kind: &str| {
+        manifest
+            .raw_metadata
+            .get("bindings")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|binding| binding.get("type").and_then(serde_json::Value::as_str) == Some(kind))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let consumes = manifest
+        .queue_consumers
+        .iter()
+        .map(|consumer| consumer.queue.clone())
+        .collect::<Vec<_>>();
+    Links {
+        services: bindings("service")
+            .iter()
+            .filter_map(|binding| text(binding, "service"))
+            .collect(),
+        queues: bindings("queue")
+            .iter()
+            .filter_map(|binding| text(binding, "queue"))
+            .chain(consumes.iter().cloned())
+            .chain(
+                manifest
+                    .queue_consumers
+                    .iter()
+                    .filter_map(|consumer| consumer.dead_letter_queue.clone()),
+            )
+            .collect(),
+        consumes,
+    }
+}
+
+/// For each manifest, whether the node loads it: the first one is the
+/// primary, and the node follows service bindings and queues from every script
+/// it has loaded, as `Generation::build` does.
+fn reachable(manifests: &[&Manifest]) -> Vec<bool> {
+    let links = manifests
+        .iter()
+        .map(|manifest| links(manifest))
+        .collect::<Vec<_>>();
+    let mut loaded = vec![false; manifests.len()];
+    loaded[0] = true;
+    loop {
+        let mut changed = false;
+        for from in (0..manifests.len())
+            .filter(|index| loaded[*index])
+            .collect::<Vec<_>>()
+        {
+            for to in 0..manifests.len() {
+                let named = links[from]
+                    .services
+                    .iter()
+                    .any(|service| *service == manifests[to].script_name);
+                let queued = links[to]
+                    .consumes
+                    .iter()
+                    .any(|queue| links[from].queues.contains(queue));
+                if !loaded[to] && (named || queued) {
+                    loaded[to] = true;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return loaded;
+        }
+    }
+}
+
+/// Refuse a Durable Object class that two loaded projects both export: the
+/// node resolves a cell from the class name alone, so it cannot tell them
+/// apart. The runtime's own classes repeat legitimately and are not compared.
+fn ensure_distinct_classes(
+    configs: &[PathBuf],
+    manifests: &[&Manifest],
+    loaded: &[bool],
+) -> anyhow::Result<()> {
+    let mut owners: BTreeMap<&str, usize> = BTreeMap::new();
+    for (index, manifest) in manifests
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| loaded[*index])
+    {
+        for class in manifest
+            .do_classes
+            .iter()
+            .filter(|class| !deploy::is_reserved_class(class))
+        {
+            if let Some(owner) = owners.insert(class, index) {
+                bail!(
+                    "Durable Object class {class} is exported by both {} ({}) and {} ({}); \
+                     the node serves them together and resolves a cell by class name, so \
+                     rename one",
+                    manifests[owner].script_name,
+                    configs[owner].display(),
+                    manifest.script_name,
+                    configs[index].display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Build the project of each config, then write them, the first as the primary.
-/// Every project is built before anything is written, so one that fails to
-/// build leaves the store, and the node that runs on it, as they were. Returns
-/// each project's script name with its config.
+/// Every project is built and checked before anything is written, so one that
+/// fails to build leaves the store, and the node that runs on it, as they were.
 async fn deploy_projects(
     configs: &[PathBuf],
     store: &Store,
     logs: bool,
     strict_compat_flags: bool,
-) -> anyhow::Result<Vec<(String, PathBuf)>> {
+) -> anyhow::Result<Vec<Project>> {
     let built = configs
         .iter()
         .map(|config| build_project(config, logs, strict_compat_flags))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let manifests = built
+        .iter()
+        .map(|built| &built.manifest)
+        .collect::<Vec<_>>();
+    let loaded = reachable(&manifests);
+    ensure_distinct_classes(configs, &manifests, &loaded)?;
     write_projects(store, &built).await?;
     Ok(built
         .into_iter()
         .zip(configs)
-        .map(|(built, config)| (built.script_name, config.clone()))
+        .zip(loaded)
+        .map(|((built, config), reachable)| Project {
+            script: built.script_name,
+            config: config.clone(),
+            reachable,
+        })
         .collect())
 }
 
 async fn run_stack(
-    config: &Path,
+    configs: &[PathBuf],
     state: &Path,
     options: StackOptions,
     project_hash: &str,
@@ -963,7 +1182,7 @@ async fn run_stack(
     // handler afterwards leaves the new node orphaned under the default Unix
     // signal action.
     let mut signals = ShutdownSignals::install()?;
-    let project = config
+    let project = configs[0]
         .parent()
         .context("the Wrangler config has no project directory")?;
     let mut watcher = options
@@ -972,9 +1191,9 @@ async fn run_stack(
         .transpose()?;
 
     console.progress("building the application");
-    let configs = [config.to_path_buf()];
     let mut projects =
-        deploy_projects(&configs, store, options.logs, options.strict_compat_flags).await?;
+        deploy_projects(configs, store, options.logs, options.strict_compat_flags).await?;
+    warn_unreachable(&projects, console);
     let mut running = start_node(
         &projects,
         state,
@@ -1004,10 +1223,13 @@ async fn run_stack(
             }
             NodeEvent::Reload => {
                 console.progress("change detected; rebuilding the application");
-                match deploy_projects(&configs, store, options.logs, options.strict_compat_flags)
+                match deploy_projects(configs, store, options.logs, options.strict_compat_flags)
                     .await
                 {
-                    Ok(deployed) => projects = deployed,
+                    Ok(deployed) => {
+                        warn_unreachable(&deployed, console);
+                        projects = deployed;
+                    }
                     Err(error) => {
                         console.failure(&format!("reload failed: {error:#}"));
                         continue;
@@ -1030,6 +1252,16 @@ async fn run_stack(
     }
 }
 
+fn warn_unreachable(projects: &[Project], console: &Console) {
+    for project in projects.iter().filter(|project| !project.reachable) {
+        console.warning(&format!(
+            "{} ({}) is not reached by a service binding or queue of the projects that run, so it does not run",
+            project.script,
+            project.config.display()
+        ));
+    }
+}
+
 struct RunningNode {
     child: Child,
     /// The address the node listens on, with the port it was given when the
@@ -1049,7 +1281,7 @@ enum NodeEvent {
 
 #[allow(clippy::disallowed_methods)] // Child supervision uses real host process and time APIs.
 async fn start_node(
-    projects: &[(String, PathBuf)],
+    projects: &[Project],
     state: &Path,
     listener: SocketAddr,
     logs: bool,
@@ -1396,18 +1628,34 @@ mod tests {
 
     /// A project in `directory` that answers `body`, as script `name`.
     fn write_project(directory: &Path, name: &str, body: &str) -> PathBuf {
+        write_project_with(directory, name, body, serde_json::json!({}))
+    }
+
+    /// [`write_project`] with more keys in its config.
+    fn write_project_with(
+        directory: &Path,
+        name: &str,
+        body: &str,
+        extra: serde_json::Value,
+    ) -> PathBuf {
         std::fs::create_dir_all(directory).unwrap();
-        std::fs::write(
-            directory.join("wrangler.json"),
-            format!(
-                r#"{{ "name": "{name}", "main": "index.js", "no_bundle": true,
-                    "compatibility_date": "2026-01-01" }}"#
-            ),
-        )
-        .unwrap();
+        let mut config = serde_json::json!({
+            "name": name, "main": "index.js", "no_bundle": true,
+            "compatibility_date": "2026-01-01",
+        });
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        std::fs::write(directory.join("wrangler.json"), config.to_string()).unwrap();
         std::fs::write(
             directory.join("index.js"),
-            format!("export default {{ fetch: () => new Response({body:?}) }};"),
+            format!(
+                "import {{ DurableObject }} from 'cloudflare:workers';\n\
+                 export class Counter extends DurableObject {{}}\n\
+                 export class Room extends DurableObject {{}}\n\
+                 export default {{ fetch: () => new Response({body:?}) }};"
+            ),
         )
         .unwrap();
         directory.join("wrangler.json")
@@ -1451,7 +1699,7 @@ mod tests {
         let deployed = deploy_projects(&[a.clone(), b.clone()], &store, false, false)
             .await
             .unwrap();
-        assert_eq!(deployed[0].0, "dev-a");
+        assert_eq!(deployed[0].script, "dev-a");
         let (script, components) = serving(&store).await;
         assert_eq!(script, "dev-a");
         assert!(components.contains_key("dev-b") && !components.contains_key("dev-a"));
@@ -1484,11 +1732,171 @@ mod tests {
         assert!(deploy::read_fleet_pointer(&bucket).await.unwrap().is_none());
     }
 
+    fn project(script: &str, config: &str) -> Project {
+        Project {
+            script: script.to_string(),
+            config: PathBuf::from(config),
+            reachable: true,
+        }
+    }
+
+    #[test]
+    fn several_projects_are_listed_in_order_by_argument_or_flag() {
+        let projects = |arguments: &[&str]| parse(arguments).unwrap().unwrap().projects;
+        assert!(projects(&[]).is_empty());
+        assert_eq!(
+            projects(&["./a", "./b"]),
+            [PathBuf::from("./a"), PathBuf::from("./b")]
+        );
+        assert_eq!(
+            projects(&["-c", "a", "--config", "b/wrangler.json"]),
+            [PathBuf::from("a"), PathBuf::from("b/wrangler.json")]
+        );
+        assert_eq!(
+            projects(&["./a", "--port", "0", "-c", "./b", "./c"]),
+            [
+                PathBuf::from("./a"),
+                PathBuf::from("./b"),
+                PathBuf::from("./c")
+            ]
+        );
+        assert!(parse(&["-c"]).is_err());
+    }
+
+    #[test]
+    fn a_config_listed_twice_or_a_name_used_twice_is_refused() {
+        let configs = [
+            PathBuf::from("/w/a/wrangler.json"),
+            PathBuf::from("/w/b/wrangler.json"),
+        ];
+        let name = |names: [&str; 2]| names.map(str::to_string);
+        assert!(ensure_distinct(&configs, &name(["dev-a", "dev-b"])).is_ok());
+        let error = ensure_distinct(&configs, &name(["same", "same"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("/w/a/wrangler.json") && error.contains("/w/b/wrangler.json"));
+        assert!(error.contains("\"same\""), "{error}");
+        let twice = [configs[0].clone(), configs[0].clone()];
+        let error = ensure_distinct(&twice, &name(["x", "y"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("listed twice"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn only_the_projects_a_loaded_project_binds_are_reachable() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store {
+            database: directory.path().join("objects.sqlite3"),
+        };
+        let service =
+            |name: &str| serde_json::json!({ "services": [{ "binding": "X", "service": name }] });
+        // A binds B, B binds C, D is bound by nobody.
+        let a = write_project_with(&directory.path().join("a"), "dev-a", "a", service("dev-b"));
+        let b = write_project_with(&directory.path().join("b"), "dev-b", "b", service("dev-c"));
+        let c = write_project(&directory.path().join("c"), "dev-c", "c");
+        let d = write_project(&directory.path().join("d"), "dev-d", "d");
+        let deployed = deploy_projects(
+            &[a.clone(), d.clone(), c.clone(), b.clone()],
+            &store,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let reached = deployed
+            .iter()
+            .map(|project| (project.script.as_str(), project.reachable))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reached,
+            [
+                ("dev-a", true),
+                ("dev-d", false),
+                ("dev-c", true),
+                ("dev-b", true)
+            ]
+        );
+        // Listed first, D is the primary and binds nothing: the others never load.
+        let deployed = deploy_projects(&[d, a, b, c], &store, false, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            deployed
+                .iter()
+                .map(|project| project.reachable)
+                .collect::<Vec<_>>(),
+            [true, false, false, false]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_class_two_loaded_projects_export_is_refused_naming_both() {
+        crate::asyncrt::install_test_host_runtime();
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store {
+            database: directory.path().join("objects.sqlite3"),
+        };
+        let bindings = |name: &str, class: &str| {
+            serde_json::json!({
+                "services": [{ "binding": "X", "service": name }],
+                "durable_objects": { "bindings": [{ "name": "OBJ", "class_name": class }] },
+                "migrations": [{ "tag": "v1", "new_sqlite_classes": [class] }],
+            })
+        };
+        let a = write_project_with(
+            &directory.path().join("a"),
+            "dev-a",
+            "a",
+            bindings("dev-b", "Counter"),
+        );
+        let b = write_project_with(
+            &directory.path().join("b"),
+            "dev-b",
+            "b",
+            serde_json::json!({
+                "durable_objects": { "bindings": [{ "name": "OBJ", "class_name": "Counter" }] },
+                "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }],
+            }),
+        );
+        let error = deploy_projects(&[a.clone(), b.clone()], &store, false, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        for expected in [
+            "Counter",
+            "dev-a",
+            "dev-b",
+            "a/wrangler.json",
+            "b/wrangler.json",
+        ] {
+            assert!(error.contains(expected), "{error}");
+        }
+        // Nothing was written.
+        let bucket = open_local_bucket(&store.database).unwrap();
+        assert!(deploy::read_fleet_pointer(&bucket).await.unwrap().is_none());
+
+        // A project that nothing binds never loads, so its classes cannot clash.
+        let a = write_project_with(
+            &directory.path().join("a2"),
+            "dev-a",
+            "a",
+            serde_json::json!({
+                "durable_objects": { "bindings": [{ "name": "OBJ", "class_name": "Counter" }] },
+                "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }],
+            }),
+        );
+        deploy_projects(&[a, b], &store, false, false)
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn each_script_reads_the_config_it_was_built_from() {
         let map = config_map(&[
-            ("dev-a".to_string(), PathBuf::from("/work/a/wrangler.jsonc")),
-            ("dev-b".to_string(), PathBuf::from("/work/b/wrangler.jsonc")),
+            project("dev-a", "/work/a/wrangler.jsonc"),
+            project("dev-b", "/work/b/wrangler.jsonc"),
         ])
         .unwrap();
         assert_eq!(
@@ -1503,7 +1911,7 @@ mod tests {
 
     #[test]
     fn a_script_this_run_did_not_build_has_no_config() {
-        let map = config_map(&[("dev-a".to_string(), PathBuf::from("/work/a/w.json"))]).unwrap();
+        let map = config_map(&[project("dev-a", "/work/a/w.json")]).unwrap();
         assert_eq!(config_for(&map, "left-over"), None);
         assert_eq!(config_for("not json", "dev-a"), None);
     }

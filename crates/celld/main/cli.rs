@@ -278,7 +278,7 @@ USAGE:
   celld activate SCRIPT=VERSION... [--primary SCRIPT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld discard SCRIPT=VERSION... --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld invoke SCRIPT=VERSION [PATH] [--header-env NAME=VAR] --bucket [s3://|gs://|az://]NAME[/PREFIX]
-  celld dev [PROJECT] [--host IP] [--port PORT] [--logs]
+  celld dev [PROJECT...] [--host IP] [--port PORT] [--logs]
   celld cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld cell gc --dry-run [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld d1 migrations apply DATABASE [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
