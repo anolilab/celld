@@ -606,17 +606,13 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
         return out.finish();
     }
 
+    let selection = options.selection();
     let bucket = options.bucket.expect("validated deployment bucket");
     let store = bucket_client(&bucket, options.endpoint.as_deref(), &region)?;
     validate_bucket(&store).await?;
     crate::wake_format::ensure_ready(&store).await?;
     let started = std::time::Instant::now();
-    let manifest_write = deploy::write(
-        &store,
-        &built,
-        deploy::Selection::from_flags(options.no_activate, options.primary),
-    )
-    .await?;
+    let manifest_write = deploy::write(&store, &built, selection).await?;
     let location = format!(
         "{}://{}/{}{}",
         store.scheme(),

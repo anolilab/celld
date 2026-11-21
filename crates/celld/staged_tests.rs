@@ -235,12 +235,12 @@ async fn deploy_with_primary_moves_the_old_primary_into_the_component_map() {
 async fn a_plain_deploy_follows_a_script_the_component_map_lists() {
     let fleet = fleet();
     select(&fleet, "a", "v1", Selection::Activate).await;
-    select(&fleet, "b", "v1", Selection::Activate).await;
+    select(&fleet, "b", "v1", Selection::Stage).await;
     activate(&fleet.bucket, &[target("b", "v1")], None)
         .await
         .unwrap();
     select(&fleet, "b", "v2", Selection::Activate).await;
-    // Staging "b" put it in the map, which wins over its own pointer.
+    // Activating the staged "b" put it in the map, which wins over its own pointer.
     let (pointer, _) = fleet_pointer(&fleet).await;
     assert_eq!(pointer.script_name.as_deref(), Some("a"));
     assert_eq!(pointer.selection_for("b").unwrap().version, "v2");
@@ -280,6 +280,57 @@ async fn a_deploy_repairs_a_fleet_pointer_that_names_no_script() {
     assert_eq!(
         fleet_pointer(&fleet).await.0.script_name.as_deref(),
         Some("a")
+    );
+}
+
+/// Overwrite the fleet pointer with one that decodes but has no `script_name`,
+/// as fleets written before the field existed do.
+async fn drop_script_name(fleet: &Fleet, prefix: &str) {
+    let (mut pointer, _) = fleet_pointer(fleet).await;
+    pointer.script_name = None;
+    pointer.prefix = prefix.to_string();
+    let body = serde_json::to_vec(&pointer).unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains("script_name"));
+    fleet
+        .bucket
+        .put(crate::fleet::CURRENT_POINTER_KEY, body)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_plain_deploy_keeps_the_serving_script_of_a_pointer_that_names_none() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    select(&fleet, "c", "v1", Selection::Activate).await;
+    drop_script_name(&fleet, "deploy/a/v1").await;
+
+    select(&fleet, "b", "v1", Selection::Activate).await;
+
+    let (pointer, _) = fleet_pointer(&fleet).await;
+    assert_eq!(pointer.script_name.as_deref(), Some("a"));
+    assert_eq!(pointer.prefix, "deploy/a/v1");
+    assert_eq!(pointer.components["b"].version, "v1");
+    assert_eq!(pointer.components["c"].version, "v1");
+}
+
+#[tokio::test]
+async fn a_pointer_that_names_no_script_and_no_manifest_needs_primary() {
+    let fleet = fleet();
+    select(&fleet, "a", "v1", Selection::Activate).await;
+    select(&fleet, "c", "v1", Selection::Activate).await;
+    drop_script_name(&fleet, "deploy/gone/v1").await;
+
+    let error = crate::deploy::write(&fleet.bucket, &built("b", "v1", &[]), Selection::Activate)
+        .await
+        .expect_err("refused");
+    assert!(error.to_string().contains("--primary"), "{error}");
+    assert!(fleet_pointer(&fleet).await.0.script_name.is_none());
+
+    select(&fleet, "b", "v1", Selection::Primary).await;
+    assert_eq!(
+        fleet_pointer(&fleet).await.0.script_name.as_deref(),
+        Some("b")
     );
 }
 

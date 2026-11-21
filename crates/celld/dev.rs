@@ -869,7 +869,7 @@ async fn deploy_project(
     strict_compat_flags: bool,
 ) -> anyhow::Result<()> {
     let bucket = open_local_bucket(&store.database)?;
-    let built = deploy::build(&deploy::Options {
+    let options = deploy::Options {
         config: Some(config.to_path_buf()),
         bucket: None,
         endpoint: None,
@@ -884,12 +884,13 @@ async fn deploy_project(
         local_images: true,
         sourcemap: None,
         tag: None,
-    })?;
+    };
+    let built = deploy::build(&options)?;
     if logs {
         built.report();
     }
     crate::wake_format::ensure_ready(&bucket).await?;
-    deploy::write(&bucket, &built, deploy::Selection::Primary)
+    deploy::write(&bucket, &built, options.selection())
         .await
         .map(drop)
 }

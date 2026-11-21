@@ -1094,6 +1094,13 @@ pub enum Selection {
     Primary,
 }
 
+impl Options {
+    /// What this deploy selects once the version is uploaded.
+    pub fn selection(&self) -> Selection {
+        Selection::from_flags(self.no_activate, self.primary)
+    }
+}
+
 impl Selection {
     /// The selection `celld deploy` makes for its flags.
     pub fn from_flags(no_activate: bool, primary: bool) -> Self {
@@ -1186,12 +1193,27 @@ pub async fn write(
         },
     )
     .await?;
-    let current = read_fleet_pointer(bucket).await?;
-    // A fleet pointer that names no script cannot be read by any node, so a
-    // deploy repairs it and its script becomes the primary.
-    let repairs = current
-        .as_ref()
-        .is_some_and(|(pointer, _)| pointer.script_name.is_none());
+    let mut current = read_fleet_pointer_checked(bucket).await?;
+    // A pointer that does not decode cannot be read by any node, so a deploy
+    // repairs it and its script becomes the primary. A pointer that decodes
+    // but names no script (an older fleet) is served by the script of its
+    // manifest, which stays primary.
+    let mut repairs = matches!(current, Some((None, _)));
+    if let Some((Some(pointer), _)) = current.as_mut() {
+        if pointer.script_name.is_none() {
+            match serving_script(bucket, pointer).await {
+                Some(script) => pointer.script_name = Some(script),
+                None if selection == Selection::Primary => repairs = true,
+                None => bail!(
+                    "the fleet pointer names no script and its manifest at {} cannot be read, \
+                     so the serving script is unknown; deploy with --primary to take it",
+                    pointer.prefix
+                ),
+            }
+        }
+    }
+    let current =
+        current.map(|(pointer, token)| (pointer.unwrap_or_else(unreadable_pointer), token));
     let primary =
         (selection == Selection::Primary || repairs).then_some(built.script_name.as_str());
     // The fleet pointer is the one thing running nodes watch, so every
@@ -1304,19 +1326,41 @@ pub(crate) async fn write_manifest(
 pub(crate) async fn read_fleet_pointer(
     bucket: &Bucket,
 ) -> anyhow::Result<Option<(DeployPointer, String)>> {
+    Ok(read_fleet_pointer_checked(bucket)
+        .await?
+        .map(|(pointer, token)| (pointer.unwrap_or_else(unreadable_pointer), token)))
+}
+
+/// As [`read_fleet_pointer`], but a pointer that does not decode is `None`
+/// rather than an empty stand-in, so it cannot be mistaken for a valid
+/// pointer that lacks the optional `script_name`.
+async fn read_fleet_pointer_checked(
+    bucket: &Bucket,
+) -> anyhow::Result<Option<(Option<DeployPointer>, String)>> {
     let Some((body, token)) = bucket.get(crate::fleet::CURRENT_POINTER_KEY).await? else {
         return Ok(None);
     };
-    Ok(Some((
-        serde_json::from_slice(&body).unwrap_or_else(|_| DeployPointer {
-            script_name: None,
-            version: String::new(),
-            prefix: String::new(),
-            rollout: Rollout { percent: 100 },
-            components: BTreeMap::new(),
-        }),
-        token,
-    )))
+    Ok(Some((serde_json::from_slice(&body).ok(), token)))
+}
+
+fn unreadable_pointer() -> DeployPointer {
+    DeployPointer {
+        script_name: None,
+        version: String::new(),
+        prefix: String::new(),
+        rollout: Rollout { percent: 100 },
+        components: BTreeMap::new(),
+    }
+}
+
+/// The script a fleet pointer without `script_name` serves: the one its
+/// manifest names.
+async fn serving_script(bucket: &Bucket, pointer: &DeployPointer) -> Option<String> {
+    let (body, _) = bucket
+        .get(&format!("{}/manifest.json", pointer.prefix))
+        .await
+        .ok()??;
+    Some(serde_json::from_slice::<Manifest>(&body).ok()?.script_name)
 }
 
 /// Replace the fleet pointer, only if it still holds what `token` read. A

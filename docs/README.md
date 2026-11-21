@@ -316,9 +316,11 @@ change it unless you ask:
 command refuses the pair. To stage a version and make it primary later, use
 `celld activate SCRIPT=VERSION --primary SCRIPT`.
 
-Requests reach the primary script only. A fleet pointer that names no script,
-which no node can read, is repaired by the next `celld deploy`, and that
-script becomes the primary. `celld dev` runs one project and deploys it as
+Requests reach the primary script only. A fleet pointer that cannot be
+decoded, which no node can read, is repaired by the next `celld deploy`, and
+that script becomes the primary. An older pointer that decodes but names no
+script keeps serving the script of its manifest; if that manifest cannot be
+read, a plain deploy refuses and asks for `--primary`. `celld dev` runs one project and deploys it as
 the primary.
 
 The managed deploy of the control plane differs: it makes the deployed script
