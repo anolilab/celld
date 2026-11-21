@@ -1445,6 +1445,11 @@ pub async fn bump_secrets_revision(
         let Some((body, token)) = bucket.get(key).await? else {
             return Ok(RevisionBump::NoPointer);
         };
+        // A node reads the pointer only when it decodes, so an object that
+        // does not is as unreadable as one that is not an object.
+        if serde_json::from_slice::<DeployPointer>(&body).is_err() {
+            return Ok(RevisionBump::Unreadable);
+        }
         let Ok(Value::Object(mut pointer)) = serde_json::from_slice(&body) else {
             return Ok(RevisionBump::Unreadable);
         };
@@ -4935,18 +4940,21 @@ mod secrets_revision_tests {
 
     #[tokio::test]
     async fn an_unreadable_pointer_is_left_as_it_is() {
-        let directory = tempfile::tempdir().unwrap();
-        let bucket = bucket(&directory);
-        bucket
-            .put_cas(CURRENT_POINTER_KEY, b"[1]".to_vec(), None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            bump_secrets_revision(&bucket, "script:app").await.unwrap(),
-            RevisionBump::Unreadable
-        );
-        let (body, _) = bucket.get(CURRENT_POINTER_KEY).await.unwrap().unwrap();
-        assert_eq!(&body[..], b"[1]");
+        // Not an object, and an object no node can decode as a pointer.
+        for unreadable in [&b"[1]"[..], &b"{}"[..]] {
+            let directory = tempfile::tempdir().unwrap();
+            let bucket = bucket(&directory);
+            bucket
+                .put_cas(CURRENT_POINTER_KEY, unreadable.to_vec(), None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                bump_secrets_revision(&bucket, "script:app").await.unwrap(),
+                RevisionBump::Unreadable
+            );
+            let (body, _) = bucket.get(CURRENT_POINTER_KEY).await.unwrap().unwrap();
+            assert_eq!(&body[..], unreadable);
+        }
     }
 }

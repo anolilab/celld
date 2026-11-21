@@ -175,7 +175,11 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                 "run this command again with --announce-only",
             )
             .await?;
-            note!("Deleted secret {name} of {owner}. {told}");
+            if command.announce_only {
+                note!("Announced the secrets of {owner}; nothing was deleted. {told}");
+            } else {
+                note!("Deleted secret {name} of {owner}. {told}");
+            }
             Ok(())
         }
         Step::List => {
