@@ -440,7 +440,8 @@ a quoted value can span lines, for example a PEM key. Comments after a
 value and variable references are not supported. In `.env` files, the
 command skips, with a warning, an entry that is not a valid binding name
 or that collides with another binding; in `.dev.vars` such an entry stops
-the build. `celld deploy` does not read these files; for production secrets see
+the build. With `secrets.required` in the config, only the listed plain variables are read (a Secrets Store or Hyperdrive value is not limited), and a missing one prints a warning
+([Require secrets](services/workers.md#require-secrets)). `celld deploy` does not read these files; for production secrets see
 [Secrets](services/workers.md#secrets). Add `.dev.vars`,
 `.env`, `.env.local`, and `.celld/` to `.gitignore`.
 

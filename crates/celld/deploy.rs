@@ -20,9 +20,10 @@ use crate::protocol::{
     QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_AI_V1, FEATURE_ASSETS_V1,
     FEATURE_CONTAINERS_V1, FEATURE_CONTAINER_IMAGES_V1, FEATURE_CRON_V1, FEATURE_D1_V1,
     FEATURE_HYPERDRIVE_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1,
-    FEATURE_R2_V1, FEATURE_RATELIMIT_V1, FEATURE_SECRETS_STORE_V1, FEATURE_SEND_EMAIL_V1,
-    FEATURE_SQLITE_VEC_V1, FEATURE_TAIL_CONSUMERS_V1, FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1,
-    FEATURE_WORKFLOWS_V1, QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+    FEATURE_R2_V1, FEATURE_RATELIMIT_V1, FEATURE_SECRETS_REQUIRED_V1, FEATURE_SECRETS_STORE_V1,
+    FEATURE_SEND_EMAIL_V1, FEATURE_SQLITE_VEC_V1, FEATURE_TAIL_CONSUMERS_V1,
+    FEATURE_VERSION_METADATA_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -68,6 +69,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "worker_loaders",
     "version_metadata",
     "secrets_store_secrets",
+    "secrets",
     "hyperdrive",
     "ai",
     "containers",
@@ -898,6 +900,12 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             if project.metadata.get("tail_consumers").is_some() {
                 features.push(FEATURE_TAIL_CONSUMERS_V1.to_string());
             }
+            if project.metadata["secrets"]["required"]
+                .as_array()
+                .is_some_and(|required| !required.is_empty())
+            {
+                features.push(FEATURE_SECRETS_REQUIRED_V1.to_string());
+            }
             features
         },
         raw_metadata: project.metadata,
@@ -1137,7 +1145,7 @@ async fn prepare_refusals(
     let queue_attachments = prepare_queue_attachments(bucket, &built.manifest).await?;
     // A secret is bound as `env.NAME`, so a binding of the same name would be
     // shadowed. Refuse before anything is uploaded; this reads names only.
-    crate::secrets::ensure_no_clash(bucket, &built.manifest).await?;
+    crate::secrets::ensure_script_secrets(bucket, &built.manifest).await?;
     // A Secrets Store binding names a secret its store must already hold, so
     // a missing one is the deploy's error and not a Worker's first `get()`.
     crate::secrets::ensure_store_secrets(bucket, &built.manifest, true).await?;
@@ -1952,6 +1960,18 @@ fn entry_text<'a>(
     }
 }
 
+/// The names in the config's `secrets.required`, or `None` when the config
+/// lists none.
+fn required_secrets(
+    object: &serde_json::Map<String, Value>,
+) -> anyhow::Result<Option<Vec<String>>> {
+    Ok(object
+        .get("secrets")
+        .map(crate::secrets::parse_required)
+        .transpose()?
+        .filter(|required| !required.is_empty()))
+}
+
 /// The binding name of a config key that declares one env binding and nothing
 /// else, as `{ "binding": "NAME" }`. `None` when the key is absent.
 fn single_binding<'a>(
@@ -2738,6 +2758,34 @@ fn read_project(
     // `.dev.vars` or `.env` beside it is residue, not a binding the guard below
     // should refuse in the config's name.
     let declared_vars = !vars.is_empty();
+    let config_vars = vars
+        .keys()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_secrets = required_secrets(object)?;
+    if main.is_none() && required_secrets.is_some() {
+        bail!("an asset-only project cannot require secrets");
+    }
+    // `celld dev` reads a listed key from `.dev.vars` or the dotenv files, and
+    // warns for each one they lack. Only the entries that become plain `env`
+    // variables are limited to the list: a Secrets Store or Hyperdrive dev
+    // value is not an env secret and passes untouched.
+    let for_dev = !matches!(overrides, VarOverrides::None);
+    if let (Some(required), VarOverrides::DevVars(entries) | VarOverrides::DotEnv(entries)) =
+        (&required_secrets, overrides)
+    {
+        for name in required.iter().filter(|name| !entries.contains_key(*name)) {
+            note!(
+                "warning: `secrets.required` lists {name}, which .dev.vars and the dotenv \
+                 files do not set"
+            );
+        }
+    }
+    let plain_var = |name: &str| {
+        required_secrets
+            .as_ref()
+            .is_none_or(|required| required.iter().any(|listed| listed == name))
+    };
     if main.is_some() {
         match overrides {
             VarOverrides::None => {}
@@ -2745,7 +2793,7 @@ fn read_project(
                 for (name, value) in entries {
                     if secret_store_bindings.contains(name) {
                         mark_dev_value(&mut bindings, name);
-                    } else if !hyperdrive_locals.contains(name) {
+                    } else if !hyperdrive_locals.contains(name) && plain_var(name) {
                         vars.insert(name.as_str(), value.as_str());
                     }
                 }
@@ -2773,7 +2821,7 @@ fn read_project(
                         note!("warning: skipped the dotenv entry {name:?}, which is not a valid binding name");
                     } else if secret_store_bindings.contains(name) {
                         store_values.push(name);
-                    } else if !hyperdrive_locals.contains(name) {
+                    } else if !hyperdrive_locals.contains(name) && plain_var(name) {
                         if taken.contains(name.as_str()) {
                             note!("warning: skipped the dotenv entry {name:?}, whose name another binding uses");
                         } else {
@@ -2881,6 +2929,13 @@ fn read_project(
     if let Some(flags) = object.get("compatibility_flags") {
         metadata.insert("compatibility_flags".into(), flags.clone());
     }
+    // A deploy refuses, and a node refuses to load, a script that lacks a
+    // listed secret. `celld dev` takes the values from `.dev.vars` instead and
+    // only warns, so its deployment does not carry the requirement. Part of
+    // the version, like the compatibility flags: a changed list is a new one.
+    if let (Some(required), false) = (&required_secrets, for_dev) {
+        metadata.insert("secrets".into(), json!({ "required": required }));
+    }
     metadata.insert("bindings".into(), Value::Array(bindings));
     if !tail_consumers.is_empty() {
         // Part of the deployment identity, and the list `fleet` loads from.
@@ -2908,13 +2963,33 @@ fn read_project(
     }
 
     let containers = read_containers(object, &do_classes, &sqlite_classes)?;
+    let metadata = Value::Object(metadata);
+    // A secret is bound as `env.NAME`, so a var or binding of the same name
+    // would shadow it. A dev build does not carry the requirement, but checks
+    // it all the same, ignoring the vars that `.dev.vars` made of the listed
+    // names: those are the secrets themselves.
+    match (&required_secrets, for_dev) {
+        (Some(required), true) => {
+            let mut checked = metadata.clone();
+            if let Some(bindings) = checked["bindings"].as_array_mut() {
+                bindings.retain(|binding| {
+                    let name = binding["name"].as_str().unwrap_or("");
+                    binding["type"] != "plain_text"
+                        || !required.iter().any(|listed| listed == name)
+                        || config_vars.contains(name)
+                });
+            }
+            crate::secrets::ensure_not_shadowed(&required.iter().cloned().collect(), &checked)?;
+        }
+        _ => crate::secrets::ensure_required_unshadowed(&metadata)?,
+    }
     Ok(Project {
         script_name,
         no_bundle,
         entry: main,
         bundle,
         assets,
-        metadata: Value::Object(metadata),
+        metadata,
         compatibility_flags,
         compatibility_date,
         do_classes,
@@ -4956,5 +5031,225 @@ mod secrets_revision_tests {
             let (body, _) = bucket.get(CURRENT_POINTER_KEY).await.unwrap().unwrap();
             assert_eq!(&body[..], unreadable);
         }
+    }
+}
+
+#[cfg(test)]
+mod secrets_required_config_tests {
+    use super::version_metadata_config_tests::{base, read};
+    use super::*;
+
+    fn required(extra: &str) -> Option<Value> {
+        read(&base(extra)).unwrap().metadata.get("secrets").cloned()
+    }
+
+    #[test]
+    fn the_list_is_recorded_in_the_manifest_metadata() {
+        let metadata = required(
+            r#"/* the credentials */ "secrets": { "required": ["API_KEY", "DB_PASSWORD",], },"#,
+        );
+        assert_eq!(
+            metadata,
+            Some(json!({ "required": ["API_KEY", "DB_PASSWORD"] }))
+        );
+        assert_eq!(required(r#""vars": { "A": "b" }"#), None);
+        assert_eq!(required(r#""secrets": {}"#), None);
+        assert_eq!(required(r#""secrets": { "required": [] }"#), None);
+    }
+
+    #[test]
+    fn a_malformed_list_is_refused() {
+        for extra in [
+            r#""secrets": ["API_KEY"]"#,
+            r#""secrets": { "required": "API_KEY" }"#,
+            r#""secrets": { "required": [1] }"#,
+            r#""secrets": { "required": ["not valid"] }"#,
+            r#""secrets": { "required": ["1ST"] }"#,
+            r#""secrets": { "required": ["__proto__"] }"#,
+            r#""secrets": { "required": ["A", "A"] }"#,
+        ] {
+            assert!(read(&base(extra)).is_err(), "{extra}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_inside_secrets_is_refused() {
+        let error = read(&base(r#""secrets": { "required": [], "optional": ["A"] }"#))
+            .err()
+            .expect("refused");
+        assert!(
+            format!("{error:#}").contains("`secrets` sets `optional`"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_name_that_a_var_or_binding_uses_is_refused() {
+        for extra in [
+            r#""vars": { "API_KEY": "x" }, "secrets": { "required": ["API_KEY"] }"#,
+            r#""version_metadata": { "binding": "API_KEY" }, "secrets": { "required": ["API_KEY"] }"#,
+        ] {
+            let error = read(&base(extra)).err().expect("refused");
+            assert!(format!("{error:#}").contains("API_KEY"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn dev_takes_only_the_listed_keys_and_the_requirement_stays_out_of_the_deployment() {
+        let config = base(r#""secrets": { "required": ["LISTED", "ABSENT"] }"#);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
+        let path = dir.path().join("wrangler.jsonc");
+        std::fs::write(&path, config).unwrap();
+        let entries = BTreeMap::from([
+            ("LISTED".to_string(), "1".to_string()),
+            ("UNLISTED".to_string(), "2".to_string()),
+        ]);
+        for overrides in [
+            VarOverrides::DevVars(entries.clone()),
+            VarOverrides::DotEnv(entries.clone()),
+        ] {
+            let project = read_project(&path, dir.path(), &overrides, false).unwrap();
+            let names = crate::secrets::binding_names(&project.metadata);
+            assert!(names.contains("LISTED") && !names.contains("UNLISTED"));
+            assert!(project.metadata.get("secrets").is_none());
+        }
+        // Without the field every entry still becomes a var.
+        std::fs::write(&path, base("")).unwrap();
+        let project =
+            read_project(&path, dir.path(), &VarOverrides::DevVars(entries), false).unwrap();
+        let names = crate::secrets::binding_names(&project.metadata);
+        assert!(names.contains("LISTED") && names.contains("UNLISTED"));
+    }
+
+    #[test]
+    fn a_dev_build_refuses_the_clash_that_a_production_build_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
+        let path = dir.path().join("wrangler.jsonc");
+        let entries = BTreeMap::from([("API_KEY".to_string(), "v".to_string())]);
+        for extra in [
+            r#""vars": { "API_KEY": "x" }, "secrets": { "required": ["API_KEY"] }"#,
+            r#""version_metadata": { "binding": "API_KEY" }, "secrets": { "required": ["API_KEY"] }"#,
+        ] {
+            std::fs::write(&path, base(extra)).unwrap();
+            for overrides in [
+                VarOverrides::None,
+                VarOverrides::DevVars(entries.clone()),
+                VarOverrides::DotEnv(entries.clone()),
+            ] {
+                let error = read_project(&path, dir.path(), &overrides, false)
+                    .err()
+                    .expect("refused");
+                assert!(format!("{error:#}").contains("API_KEY"), "{error:#}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_required_hyperdrive_secret_is_refused_at_build() {
+        let extra = r#""hyperdrive": [{ "binding": "DB", "id": "db-1" }],
+            "secrets": { "required": ["HYPERDRIVE_DB"] }"#;
+        let error = read(&base(extra)).err().expect("refused");
+        assert!(
+            format!("{error:#}").contains("Hyperdrive binding consumes"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn dev_leaves_store_and_hyperdrive_values_untouched() {
+        let config = base(
+            r#""secrets": { "required": ["LISTED"] },
+            "secrets_store_secrets": [
+              { "binding": "STORE_KEY", "store_id": "st", "secret_name": "n" }
+            ],
+            "hyperdrive": [{ "binding": "HD", "id": "db-1" }]"#,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
+        let path = dir.path().join("wrangler.jsonc");
+        std::fs::write(&path, config).unwrap();
+        let local = crate::hyperdrive::local_variable("HD");
+        let entries = BTreeMap::from([
+            ("LISTED".to_string(), "1".to_string()),
+            ("UNLISTED".to_string(), "2".to_string()),
+            ("STORE_KEY".to_string(), "3".to_string()),
+            (local.clone(), "postgres://h/d".to_string()),
+        ]);
+        for overrides in [
+            VarOverrides::DevVars(entries.clone()),
+            VarOverrides::DotEnv(entries.clone()),
+        ] {
+            let project = read_project(&path, dir.path(), &overrides, false).unwrap();
+            let marked = |kind| {
+                crate::secrets::raw_bindings(&project.metadata, kind)
+                    .all(|binding| binding["dev_value"] == true)
+            };
+            let names = crate::secrets::binding_names(&project.metadata);
+            assert!(marked(crate::secrets::STORE_BINDING_TYPE), "{names:?}");
+            assert!(marked(crate::hyperdrive::BINDING_TYPE), "{names:?}");
+            assert!(names.contains("LISTED") && !names.contains("UNLISTED"));
+            assert!(!names.contains(&local));
+        }
+    }
+
+    fn build_with(extra: &str) -> Built {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
+        let path = dir.path().join("wrangler.jsonc");
+        std::fs::write(&path, base(extra)).unwrap();
+        let options = options_from_arguments([
+            "--config".to_string(),
+            path.display().to_string(),
+            "--dry-run".to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+        build(&options).unwrap()
+    }
+
+    #[test]
+    fn a_non_empty_list_requires_the_feature_an_older_node_lacks() {
+        let required = |extra: &str| {
+            build_with(extra)
+                .manifest
+                .required_features
+                .contains(&crate::protocol::FEATURE_SECRETS_REQUIRED_V1.to_string())
+        };
+        assert!(required(r#""secrets": { "required": ["A"] }"#));
+        assert!(!required(r#""secrets": { "required": [] }"#));
+        assert!(!required(""));
+        let built = build_with(r#""secrets": { "required": ["A"] }"#);
+        crate::protocol::validate_required_features(&built.manifest.required_features).unwrap();
+        // A node that predates the feature refuses the manifest at load.
+        let error = crate::protocol::validate_required_features(&[
+            "secrets-required-v1".to_string(),
+            "from-the-future-v1".to_string(),
+        ])
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("from-the-future-v1"));
+    }
+
+    #[test]
+    fn the_list_is_part_of_the_version() {
+        let version = |extra: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("index.js"), "export default {}").unwrap();
+            let path = dir.path().join("wrangler.jsonc");
+            std::fs::write(&path, base(extra)).unwrap();
+            let options = options_from_arguments([
+                "--config".to_string(),
+                path.display().to_string(),
+                "--dry-run".to_string(),
+            ])
+            .unwrap()
+            .unwrap();
+            build(&options).unwrap().version
+        };
+        let plain = version("");
+        let one = version(r#""secrets": { "required": ["A"] }"#);
+        let two = version(r#""secrets": { "required": ["A", "B"] }"#);
+        assert!(plain != one && one != two);
     }
 }

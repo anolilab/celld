@@ -262,7 +262,9 @@ mod tests {
         assert!(set.secrets.values().all(|entry| entry.kid == old.id()));
 
         // Fix the stuck object and run again: only what is left is written.
-        delete(&bucket, "other", "BAD").await.unwrap();
+        delete(&bucket, "other", "BAD", &BTreeSet::new())
+            .await
+            .unwrap();
         let rotated = rotate(&bucket, &old, &new).await.unwrap();
         assert_eq!(
             rotated,
