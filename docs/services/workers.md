@@ -308,26 +308,47 @@ holds `request` (`url`, `method`, `headers`, `cf`) and `response.status`; for
   call joined as `console.log` prints them, and not one element for each
   argument.
 - `exceptions[].name` is always `Error`, and an exception has no `stack`.
-- `request.headers` carries the values of every header, `authorization` and
-  `cookie` included, and `cf` is empty. The item has no `getUnredacted()`.
+- `cf` is empty.
 - `outcome` is `ok` or `exception`; the other outcomes Cloudflare reports for
   a limit or a cancellation are not reported.
 - `entrypoint`, `scriptVersion`, `scriptTags`, `dispatchNamespace` and
   `durableObjectId` are absent.
+
+The request in the item is redacted by default, by the rules Cloudflare uses.
+The value of `cookie`, `set-cookie` and every header whose name contains `auth`,
+`jwt`, `key`, `secret` or `token` is `REDACTED`. In the URL, each run of
+letters, digits, `+`, `-` and `_` (a path segment or a query value) that is a
+hex identifier of 32 digits or more, a base64-like identifier of 21 characters
+or more with at least two digits, two upper-case and two lower-case letters, or
+a payment card number (13 to 19 digits that pass the Luhn check) becomes
+`REDACTED`. `event.request.getUnredacted()` returns the request with its
+original headers and URL.
 
 Delivery is best effort and never part of the producer's work:
 
 - The producer pays for recording its `console` calls and for one hand-off per
   invocation. It never waits for a consumer, and a consumer that is slow, throws
   or does not exist changes nothing about its response.
-- Each consumer has a buffer of 256 trace items. A consumer receives the items
-  that have gathered as one `tail(events)` call of at most 100 items, and the
-  next call starts when the last one returns. When the buffer is full, celld
-  drops the new items, and writes a warning that names the producer and the
-  consumer, and later the number dropped.
-- A `tail()` call that runs longer than 30 seconds counts as failed. A failed
-  call, whether it threw or timed out, loses its items. celld writes a warning
-  and the consumer's own console shows the exception.
+- Each consumer has a buffer of 256 trace items. The node holds at most 64 MiB
+  of trace items for all consumers together, in buffers and in the batches
+  being delivered, and one producer can hold at most 16 MiB of that, so a
+  producer whose consumer is stuck cannot starve the others. A consumer receives the items that have gathered as
+  one `tail(events)` call of at most 100 items, and the next call starts when
+  the last one ends, so a consumer never has two calls running for one
+  producer. When a buffer or the node budget is full, celld drops the new
+  items, and writes a warning that names the producer and the consumer, and
+  later the number dropped.
+- A `tail()` call that runs longer than 30 seconds is ended by the runtime,
+  like a handler that runs out of budget (`CELLD_HANDLER_BUDGET_S` sets a
+  shorter limit if it is under 30), and counts as failed. The next call starts
+  after the end, so a consumer never has two calls running for one producer. A
+  failed call, whether it threw or was ended, loses its items. celld writes a
+  warning and the consumer's own console shows the exception.
+- When a deployment is replaced, the producer's old version keeps delivering
+  while it drains. Items still buffered when it has drained are dropped, with a
+  warning that gives their number, and never go to the consumer of the new
+  version.
+- An exception message in an item is cut to 8 KiB.
 - celld records at most 256 KiB of serialized console log records for each
   invocation, and sets `truncated` when it stops recording.
 - An invocation of `tail()` is not itself traced, so two Workers can name each

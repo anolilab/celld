@@ -2911,7 +2911,7 @@ fn tail_request_headers(
 
 impl TailReportState {
     fn record_failure(&mut self, message: String) {
-        self.failure = Some(TailException::new(message));
+        self.failure = Some(TailException::new(crate::telemetry::cap_error(message)));
     }
 
     /// Record the failure a settled reply gate carries, unless the handler
@@ -2950,17 +2950,35 @@ impl TailReportState {
                 url,
                 method,
                 headers,
-            } => serde_json::json!({
-                "request": {
+            } => {
+                // The item shows what Cloudflare's does: credentials and
+                // identifiers redacted. The raw values travel beside them,
+                // only when something was redacted, for the consumer's
+                // `getUnredacted()`, and only to a deployed consumer: a
+                // Dynamic Worker's tail gets the redacted request.
+                let (shown_headers, headers_changed) =
+                    crate::tail_consumers::redact_headers(&headers);
+                let shown_url = crate::tail_consumers::redact_url(&url);
+                let mut request = serde_json::json!({
                     "cf": {},
-                    "headers": headers,
+                    "headers": shown_headers,
                     "method": method,
-                    "url": url,
-                },
-                "response": response_status.map(|status| serde_json::json!({
-                    "status": status,
-                })),
-            }),
+                    "url": shown_url,
+                });
+                if matches!(self.reply, TailReply::Sink(_)) && (headers_changed || shown_url != url)
+                {
+                    request["unredacted"] = serde_json::json!({
+                        "headers": headers,
+                        "url": url,
+                    });
+                }
+                serde_json::json!({
+                    "request": request,
+                    "response": response_status.map(|status| serde_json::json!({
+                        "status": status,
+                    })),
+                })
+            }
             TailEvent::Queue { queue, batch_size } => serde_json::json!({
                 "queue": queue,
                 "batchSize": batch_size,
@@ -12844,6 +12862,39 @@ mod response_status_tests {
             },
             failure: None,
         }
+    }
+
+    #[test]
+    fn an_exception_message_in_a_trace_item_is_capped() {
+        let mut report = tail_report();
+        report.record_failure("x".repeat(50 << 20));
+        let message = report.failure.expect("failure").message;
+        assert!(
+            message.len() <= crate::telemetry::LOG_BODY_CAP,
+            "{}",
+            message.len()
+        );
+    }
+
+    #[test]
+    fn a_dynamic_worker_tail_gets_the_redacted_request_and_no_raw_copy() {
+        let (reply, mut received) = tokio::sync::oneshot::channel();
+        let mut report = tail_report();
+        report.reply = TailReply::Report(reply);
+        report.event = TailEvent::Fetch {
+            url: "http://example.test/0123456789abcdef0123456789abcdef".to_string(),
+            method: "GET".to_string(),
+            headers: serde_json::from_str(r#"{"authorization":"Bearer x","accept":"*/*"}"#)
+                .unwrap(),
+        };
+        report.finish(&IoContext::with_options(None, true), Some(200));
+        let items: serde_json::Value =
+            serde_json::from_str(&received.try_recv().expect("report")).unwrap();
+        let request = &items[0]["event"]["request"];
+        assert_eq!(request["headers"]["authorization"], "REDACTED");
+        assert_eq!(request["headers"]["accept"], "*/*");
+        assert_eq!(request["url"], "http://example.test/REDACTED");
+        assert!(request.get("unredacted").is_none());
     }
 
     #[test]

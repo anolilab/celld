@@ -4,54 +4,167 @@
 //! A traced invocation hands its finished trace item to [`TailSink::submit`],
 //! which is one non-blocking `try_send` per consumer. Everything else happens
 //! on a task of its own: it takes the items that have gathered, sends them as
-//! one `tail(events)` call, and waits for the answer before the next batch.
-//! The producer never waits for, and never sees the result of, that call.
+//! one `tail(events)` call, and waits for that call to end before the next
+//! batch, so a consumer never has two calls running for one producer. The
+//! producer never waits for, and never sees the result of, that call.
 //!
-//! Each consumer has a bounded buffer. A consumer that is slow, hung or
-//! failing lets it fill, and the items that do not fit are dropped and counted.
+//! Each consumer has a bounded buffer, and the node has one byte budget for
+//! all of them. A consumer that is slow, hung or failing lets its buffer fill,
+//! and the items that do not fit are dropped and counted.
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 /// Trace items one consumer can have waiting. A full buffer drops the newest.
 pub(crate) const BUFFER_ITEMS: usize = 256;
 /// The most trace items one `tail()` call carries.
 pub(crate) const BATCH_ITEMS: usize = 100;
-/// How long one `tail()` call may run before delivery gives up on it.
+/// The bytes of trace items the whole node holds for delivery, in buffers and
+/// in the batch of a running call. An item past it is dropped.
+pub(crate) const NODE_BUFFER_BYTES: usize = 64 << 20;
+/// The share of that budget one producer can hold, so one Worker with a stuck
+/// consumer cannot leave the others nothing.
+pub(crate) const PRODUCER_BUFFER_BYTES: usize = NODE_BUFFER_BYTES / 4;
+/// How long one `tail()` call may run before the runtime ends it.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long past that the lane waits for the runtime to report the end, if it
+/// never does.
+const DELIVERY_GRACE: Duration = Duration::from_secs(30);
+
+/// The most a `tail()` call may run: [`DELIVERY_TIMEOUT`], or the handler
+/// budget when that is shorter. The runtime ends the call's event at this
+/// limit, rejecting its pending operations like any handler that runs out of
+/// budget.
+pub(crate) fn delivery_budget() -> Duration {
+    bounded(crate::js::handler_budget())
+}
+
+fn bounded(handler_budget: Duration) -> Duration {
+    DELIVERY_TIMEOUT.min(handler_budget)
+}
 
 /// Sends one batch, a JSON array of trace items, to the `tail()` handler of a
-/// consumer script.
+/// consumer script. The future ends when the call does.
 pub(crate) type Deliver = Arc<
     dyn Fn(String, String) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync,
 >;
 
+/// A byte limit shared by every buffer that draws on it.
+pub(crate) struct Budget {
+    used: AtomicUsize,
+    limit: usize,
+}
+
+static NODE_BUDGET: LazyLock<Arc<Budget>> =
+    LazyLock::new(|| Arc::new(Budget::new(NODE_BUFFER_BYTES)));
+
+impl Budget {
+    fn new(limit: usize) -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    /// Claim `bytes`, or `None` when that would pass the limit.
+    fn reserve(self: &Arc<Self>, bytes: usize) -> Option<Reservation> {
+        let mut used = self.used.load(Ordering::Relaxed);
+        loop {
+            let after = used
+                .checked_add(bytes)
+                .filter(|after| *after <= self.limit)?;
+            match self
+                .used
+                .compare_exchange_weak(used, after, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    return Some(Reservation {
+                        budget: self.clone(),
+                        bytes,
+                    })
+                }
+                Err(current) => used = current,
+            }
+        }
+    }
+}
+
+/// Bytes held in a [`Budget`] until the item they pay for is gone.
+struct Reservation {
+    budget: Arc<Budget>,
+    bytes: usize,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// One buffered trace item and its claim on the budget.
+struct Queued {
+    item: Arc<str>,
+    _producer: Reservation,
+    _node: Reservation,
+}
+
 struct Lane {
-    tx: tokio::sync::mpsc::Sender<Arc<str>>,
+    tx: tokio::sync::mpsc::Sender<Queued>,
     /// Items dropped since the delivery task last reported.
     dropped: Arc<AtomicU64>,
     consumer: String,
 }
 
-/// The buffers of one traced Worker, one per consumer. Dropping the sink ends
-/// the delivery tasks once they have sent what is buffered.
+/// The buffers of one traced Worker, one per consumer. The sink lives as long
+/// as the producer's generation: dropping it retires the buffers, and the
+/// items they still hold are dropped, because the consumer of that generation
+/// is no longer there to take them.
 pub struct TailSink {
     script: String,
     lanes: Vec<Lane>,
+    retired: Arc<AtomicBool>,
+    /// What this producer holds, within `node`.
+    producer: Arc<Budget>,
+    node: Arc<Budget>,
+}
+
+impl Drop for TailSink {
+    fn drop(&mut self) {
+        // Before the senders drop, so a lane that wakes on the closed channel
+        // sees it.
+        self.retired.store(true, Ordering::SeqCst);
+    }
 }
 
 impl TailSink {
     /// `None` for a Worker with no consumers, so an untraced Worker pays
     /// nothing. The delivery tasks run on the process runtime.
     pub(crate) fn new(script: &str, consumers: &[String], deliver: Deliver) -> Option<Arc<Self>> {
+        Self::with_budget(
+            script,
+            consumers,
+            deliver,
+            NODE_BUDGET.clone(),
+            PRODUCER_BUFFER_BYTES,
+        )
+    }
+
+    fn with_budget(
+        script: &str,
+        consumers: &[String],
+        deliver: Deliver,
+        node: Arc<Budget>,
+        producer_bytes: usize,
+    ) -> Option<Arc<Self>> {
         if consumers.is_empty() {
             return None;
         }
+        let retired = Arc::new(AtomicBool::new(false));
         let lanes = consumers
             .iter()
             .map(|consumer| {
@@ -62,6 +175,7 @@ impl TailSink {
                     consumer.clone(),
                     rx,
                     dropped.clone(),
+                    retired.clone(),
                     deliver.clone(),
                 ))
                 .detach();
@@ -75,6 +189,9 @@ impl TailSink {
         Some(Arc::new(Self {
             script: script.to_string(),
             lanes,
+            retired,
+            producer: Arc::new(Budget::new(producer_bytes)),
+            node,
         }))
     }
 
@@ -82,9 +199,17 @@ impl TailSink {
     pub(crate) fn submit(&self, item: String) {
         let item: Arc<str> = item.into();
         for lane in &self.lanes {
-            if lane.tx.try_send(item.clone()).is_err()
-                && lane.dropped.fetch_add(1, Ordering::Relaxed) == 0
-            {
+            let queued = self
+                .producer
+                .reserve(item.len())
+                .zip(self.node.reserve(item.len()))
+                .map(|(producer, node)| Queued {
+                    item: item.clone(),
+                    _producer: producer,
+                    _node: node,
+                })
+                .and_then(|queued| lane.tx.try_send(queued).ok());
+            if queued.is_none() && lane.dropped.fetch_add(1, Ordering::Relaxed) == 0 {
                 // The first drop since the last report; the task reports the
                 // total when it next gets to run.
                 tracing::warn!(
@@ -97,16 +222,147 @@ impl TailSink {
     }
 }
 
+/// What a trace item shows in place of a value it redacts.
+const REDACTED: &str = "REDACTED";
+
+/// Whether a trace item hides the value of this request header. `name` is
+/// lower case. The rule is the one `TraceItem.event.request.headers` applies
+/// on Cloudflare: `cookie`, `set-cookie`, and any name containing `auth`,
+/// `jwt`, `key`, `secret` or `token`.
+fn header_is_redacted(name: &str) -> bool {
+    name == "cookie"
+        || name == "set-cookie"
+        || ["auth", "jwt", "key", "secret", "token"]
+            .iter()
+            .any(|part| name.contains(part))
+}
+
+/// The request headers of a trace item with the values of
+/// [`header_is_redacted`] names replaced, and whether any was.
+pub(crate) fn redact_headers(
+    headers: &serde_json::Map<String, serde_json::Value>,
+) -> (serde_json::Map<String, serde_json::Value>, bool) {
+    let mut changed = false;
+    let redacted = headers
+        .iter()
+        .map(|(name, value)| {
+            if header_is_redacted(name) {
+                changed = true;
+                (
+                    name.clone(),
+                    serde_json::Value::String(REDACTED.to_string()),
+                )
+            } else {
+                (name.clone(), value.clone())
+            }
+        })
+        .collect();
+    (redacted, changed)
+}
+
+/// The counts of one run of URL characters, to tell an identifier from a word.
+#[derive(Default)]
+struct Run {
+    hex: usize,
+    digits: usize,
+    upper: usize,
+    lower: usize,
+    non_hex: bool,
+}
+
+impl Run {
+    fn add(&mut self, byte: u8) {
+        let separator = matches!(byte, b'+' | b'-' | b'_');
+        if byte.is_ascii_hexdigit() {
+            self.hex += 1;
+        } else if !separator {
+            self.non_hex = true;
+        }
+        self.upper += usize::from(byte.is_ascii_uppercase());
+        self.lower += usize::from(byte.is_ascii_lowercase());
+        self.digits += usize::from(byte.is_ascii_digit());
+    }
+
+    /// A hex identifier of 32 digits or more, a base64-like identifier of 21
+    /// characters or more with two each of digits, upper and lower case
+    /// letters, or a payment card number (13 to 19 digits that pass the Luhn
+    /// check).
+    fn is_secret(&self, run: &[u8]) -> bool {
+        (self.hex >= 32 && !self.non_hex)
+            || (run.len() >= 21 && self.digits >= 2 && self.upper >= 2 && self.lower >= 2)
+            || is_card_number(run)
+    }
+}
+
+fn is_card_number(run: &[u8]) -> bool {
+    let (mut digits, mut sum, mut double) = (0u32, 0u32, false);
+    for &byte in run.iter().rev() {
+        if matches!(byte, b'+' | b'-' | b'_') {
+            continue;
+        }
+        if !byte.is_ascii_digit() {
+            return false;
+        }
+        let mut digit = u32::from(byte - b'0');
+        if double {
+            digit *= 2;
+            if digit > 9 {
+                digit -= 9;
+            }
+        }
+        sum += digit;
+        digits += 1;
+        double = !double;
+    }
+    (13..=19).contains(&digits) && sum % 10 == 0
+}
+
+/// The URL of a trace item with each run of letters, digits and `+ - _` that
+/// looks like an identifier or a card number replaced. A run ends at any other
+/// character, so a path segment or a query value is one run. This is the rule
+/// `TraceItem.event.request.url` applies on Cloudflare.
+pub(crate) fn redact_url(url: &str) -> String {
+    let mut out = Vec::with_capacity(url.len());
+    let mut start = 0;
+    let mut run = Run::default();
+    let end_run = |out: &mut Vec<u8>, run: &mut Run, span: &[u8]| {
+        if run.is_secret(span) {
+            out.extend_from_slice(REDACTED.as_bytes());
+        } else {
+            out.extend_from_slice(span);
+        }
+        *run = Run::default();
+    };
+    let bytes = url.as_bytes();
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'_') {
+            run.add(byte);
+        } else {
+            end_run(&mut out, &mut run, &bytes[start..index]);
+            out.push(byte);
+            start = index + 1;
+        }
+    }
+    end_run(&mut out, &mut run, &bytes[start..]);
+    // Only whole ASCII runs were replaced, so the bytes are still UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| REDACTED.to_string())
+}
+
 /// The batch the consumer receives: the array of items.
-fn encode_batch(items: &[Arc<str>]) -> String {
-    let mut body =
-        String::with_capacity(items.iter().map(|item| item.len() + 1).sum::<usize>() + 2);
+fn encode_batch(items: &[Queued]) -> String {
+    let mut body = String::with_capacity(
+        items
+            .iter()
+            .map(|queued| queued.item.len() + 1)
+            .sum::<usize>()
+            + 2,
+    );
     body.push('[');
-    for (index, item) in items.iter().enumerate() {
+    for (index, queued) in items.iter().enumerate() {
         if index != 0 {
             body.push(',');
         }
-        body.push_str(item);
+        body.push_str(&queued.item);
     }
     body.push(']');
     body
@@ -115,14 +371,26 @@ fn encode_batch(items: &[Arc<str>]) -> String {
 async fn deliver_lane(
     script: String,
     consumer: String,
-    mut rx: tokio::sync::mpsc::Receiver<Arc<str>>,
+    mut rx: tokio::sync::mpsc::Receiver<Queued>,
     dropped: Arc<AtomicU64>,
+    retired: Arc<AtomicBool>,
     deliver: Deliver,
 ) {
     let mut batch = Vec::with_capacity(BATCH_ITEMS);
     loop {
         batch.clear();
         if rx.recv_many(&mut batch, BATCH_ITEMS).await == 0 {
+            return;
+        }
+        if retired.load(Ordering::SeqCst) {
+            let mut lost = batch.len();
+            while rx.try_recv().is_ok() {
+                lost += 1;
+            }
+            tracing::warn!(
+                %script, %consumer, dropped = lost,
+                "tail producer retired; its buffered trace items were dropped"
+            );
             return;
         }
         let lost = dropped.swap(0, Ordering::Relaxed);
@@ -132,8 +400,12 @@ async fn deliver_lane(
                 "tail consumer buffer was full; trace items were dropped"
             );
         }
+        // The call ends when the handler returns or throws, or when the
+        // runtime ends its event at `delivery_budget`. The next batch waits
+        // for that, so calls never overlap; the grace only covers a runtime
+        // that never reports.
         let call = deliver(consumer.clone(), encode_batch(&batch));
-        match crate::asyncrt::timeout(DELIVERY_TIMEOUT, call).await {
+        match crate::asyncrt::timeout(delivery_budget() + DELIVERY_GRACE, call).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => tracing::warn!(
                 %script, %consumer, items = batch.len(), %error,
@@ -141,7 +413,7 @@ async fn deliver_lane(
             ),
             Err(_) => tracing::warn!(
                 %script, %consumer, items = batch.len(),
-                "tail consumer timed out; its trace items are lost"
+                "tail consumer did not report; its trace items are lost"
             ),
         }
     }
@@ -180,6 +452,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     /// What a fake consumer saw: each call's consumer and JSON, and how many
     /// calls have started, which a call blocked on the gate has not finished.
@@ -224,6 +497,93 @@ mod tests {
                 }
             })
         })
+    }
+
+    #[test]
+    fn a_url_hides_hex_and_base64_identifiers_and_card_numbers() {
+        // Plain URLs stay as they are.
+        assert_eq!(redact_url(""), "");
+        assert_eq!(
+            redact_url("https://domain/path?a=1&b=2"),
+            "https://domain/path?a=1&b=2"
+        );
+        // Hex identifiers of 32 digits or more, with or without separators.
+        assert_eq!(
+            redact_url("https://domain/0123456789abcdef0123456789abcdef/x"),
+            "https://domain/REDACTED/x"
+        );
+        assert_eq!(
+            redact_url("https://domain/0123456789abcdef-0123456789abcdef/x"),
+            "https://domain/REDACTED/x"
+        );
+        assert_eq!(
+            redact_url("https://domain/0123456789abcdef0123456789abcde/x"),
+            "https://domain/0123456789abcdef0123456789abcde/x"
+        );
+        assert_eq!(
+            redact_url("https://domain/0123456789abcdef0123456789abcdefg/x"),
+            "https://domain/0123456789abcdef0123456789abcdefg/x"
+        );
+        // Base64-like identifiers.
+        assert_eq!(
+            redact_url("https://domain/01234567890123456azAZ/x"),
+            "https://domain/REDACTED/x"
+        );
+        for kept in [
+            "0123456789012345azAZ",
+            "012345678901234567zAZ",
+            "012345678901234567azZ",
+            "IThinkIShallNeverSee0",
+        ] {
+            let url = format!("https://domain/{kept}/x");
+            assert_eq!(redact_url(&url), url);
+        }
+        // Card numbers that pass the Luhn check, with or without separators.
+        for number in ["4222222222222", "378282246310005", "4111-1111-1111-1111"] {
+            assert_eq!(
+                redact_url(&format!("https://domain/path?number={number}")),
+                "https://domain/path?number=REDACTED"
+            );
+        }
+        for kept in ["4111111111111112", "79927398713"] {
+            let url = format!("https://domain/path?number={kept}");
+            assert_eq!(redact_url(&url), url);
+        }
+        // Text around a run, and non-ASCII text, is kept.
+        assert_eq!(
+            redact_url("https://domain/caf\u{e9}?token=0123456789abcdef0123456789abcdef&x=1"),
+            "https://domain/caf\u{e9}?token=REDACTED&x=1"
+        );
+    }
+
+    #[test]
+    fn credential_headers_are_redacted_and_others_are_not() {
+        let headers = serde_json::json!({
+            "authorization": "Bearer abc",
+            "proxy-authorization": "Basic abc",
+            "cookie": "a=b",
+            "set-cookie": "a=b",
+            "x-api-key": "k",
+            "x-jwt-assertion": "j",
+            "x-client-secret": "s",
+            "x-csrf-token": "t",
+            "content-type": "text/plain",
+            "user-agent": "curl",
+        });
+        let (redacted, changed) = redact_headers(headers.as_object().unwrap());
+        assert!(changed);
+        for (name, value) in &redacted {
+            let expected = if name == "content-type" || name == "user-agent" {
+                headers[name].clone()
+            } else {
+                serde_json::json!("REDACTED")
+            };
+            assert_eq!(value, &expected, "{name}");
+        }
+        let plain = serde_json::json!({ "accept": "*/*" });
+        let (same, changed) = redact_headers(plain.as_object().unwrap());
+        assert!(!changed);
+        assert_eq!(serde_json::Value::Object(same), plain);
     }
 
     #[test]
@@ -327,6 +687,149 @@ mod tests {
             .calls()
             .iter()
             .all(|(_, body)| body.matches("{}").count() <= BATCH_ITEMS));
+    }
+
+    #[tokio::test]
+    async fn a_slow_consumer_never_has_two_calls_running() {
+        crate::asyncrt::install_test_host_runtime();
+        let seen = Seen::default();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sink = TailSink::new(
+            "producer",
+            &["slow".to_string()],
+            recording(&seen, Some(gate.clone()), false),
+        )
+        .unwrap();
+        sink.submit(r#"{"n":1}"#.to_string());
+        seen.until("the first call to start", |seen| {
+            seen.entered.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        sink.submit(r#"{"n":2}"#.to_string());
+        // Long enough for any delivery timeout the lane could apply in a test.
+        crate::asyncrt::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            seen.entered.load(Ordering::SeqCst),
+            1,
+            "a second call started"
+        );
+        // The call ends; what gathered meanwhile goes out as the next call.
+        gate.add_permits(2);
+        seen.until("both calls", |seen| seen.calls().len() == 2)
+            .await;
+        assert_eq!(seen.calls()[1].1, r#"[{"n":2}]"#);
+    }
+
+    #[tokio::test]
+    async fn items_still_buffered_when_the_producer_retires_are_dropped() {
+        crate::asyncrt::install_test_host_runtime();
+        let seen = Seen::default();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sink = TailSink::new(
+            "producer",
+            &["a".to_string()],
+            recording(&seen, Some(gate.clone()), false),
+        )
+        .unwrap();
+        sink.submit(r#"{"n":1}"#.to_string());
+        seen.until("the first call to start", |seen| {
+            seen.entered.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        sink.submit(r#"{"n":2}"#.to_string());
+        sink.submit(r#"{"n":3}"#.to_string());
+        // The producer's generation retires: its sink is dropped.
+        drop(sink);
+        gate.add_permits(10);
+        crate::asyncrt::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            seen.calls().len(),
+            1,
+            "items of a retired producer reached a consumer"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_items_of_all_producers_share_one_byte_budget() {
+        crate::asyncrt::install_test_host_runtime();
+        let budget = Arc::new(Budget::new(100));
+        let seen = Seen::default();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sink = |script: &str| {
+            TailSink::with_budget(
+                script,
+                &["slow".to_string()],
+                recording(&seen, Some(gate.clone()), false),
+                budget.clone(),
+                usize::MAX,
+            )
+            .unwrap()
+        };
+        let (first, second) = (sink("first"), sink("second"));
+        // Each producer has a call running on 40 bytes.
+        first.submit("a".repeat(40));
+        second.submit("b".repeat(40));
+        seen.until("both calls to start", |seen| {
+            seen.entered.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        assert_eq!(budget.used.load(Ordering::Relaxed), 80);
+        // 40 more bytes pass the node's 100, whichever producer sends them.
+        first.submit("c".repeat(40));
+        assert_eq!(first.lanes[0].dropped.load(Ordering::Relaxed), 1);
+        // 20 fit.
+        second.submit("d".repeat(20));
+        assert_eq!(second.lanes[0].dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.used.load(Ordering::Relaxed), 100);
+        // What is delivered is released.
+        gate.add_permits(10);
+        seen.until("the budget to be released", |_| {
+            budget.used.load(Ordering::Relaxed) == 0
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn one_producer_at_its_cap_leaves_room_for_another() {
+        crate::asyncrt::install_test_host_runtime();
+        let node = Arc::new(Budget::new(1000));
+        let seen = Seen::default();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sink = |script: &str| {
+            TailSink::with_budget(
+                script,
+                &["slow".to_string()],
+                recording(&seen, Some(gate.clone()), false),
+                node.clone(),
+                100,
+            )
+            .unwrap()
+        };
+        let (greedy, other) = (sink("greedy"), sink("other"));
+        greedy.submit("a".repeat(60));
+        seen.until("the call to start", |seen| {
+            seen.entered.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        greedy.submit("a".repeat(40));
+        // Its cap is 100, whatever the node has left.
+        greedy.submit("a".to_string());
+        assert_eq!(greedy.lanes[0].dropped.load(Ordering::Relaxed), 1);
+        // Another producer still buffers.
+        other.submit("b".repeat(60));
+        assert_eq!(other.lanes[0].dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(node.used.load(Ordering::Relaxed), 160);
+        gate.add_permits(10);
+        seen.until("the budget to be released", |_| {
+            node.used.load(Ordering::Relaxed) == 0
+        })
+        .await;
+    }
+
+    #[test]
+    fn a_call_is_bounded_by_thirty_seconds_or_a_shorter_handler_budget() {
+        assert_eq!(bounded(Duration::from_secs(300)), Duration::from_secs(30));
+        assert_eq!(bounded(Duration::from_secs(2)), Duration::from_secs(2));
     }
 
     #[tokio::test]

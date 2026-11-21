@@ -16,6 +16,10 @@ export default {
       for (let i = 0; i < 2e8; i++) sum += Math.sqrt(i);
       console.log("burned", sum > 0);
     }
+    if (url.pathname === "/hang") {
+      // The consumer never returns from this one.
+      console.log("make-the-consumer-hang");
+    }
     if (url.pathname === "/poison") {
       // The consumer throws on this one; the response must not change.
       console.log("make-the-consumer-throw");

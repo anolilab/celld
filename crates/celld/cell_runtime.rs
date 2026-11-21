@@ -35,6 +35,20 @@ pub(crate) struct Generations {
     pub(crate) draining: Vec<Arc<Generation>>,
 }
 
+impl Generations {
+    /// The current generation for zero or its id, else the draining one with
+    /// that id.
+    fn find(&self, id: GenerationId) -> Option<Arc<Generation>> {
+        if id == 0 || self.current.id == id {
+            return Some(self.current.clone());
+        }
+        self.draining
+            .iter()
+            .find(|generation| generation.id == id)
+            .cloned()
+    }
+}
+
 #[derive(Clone)]
 pub struct CellRuntime {
     /// The generations a call can resolve against. A reader takes one
@@ -103,15 +117,19 @@ impl CellRuntime {
         // the previous one was resolvable, find neither, and fall through to
         // the new graph -- the cross-generation call this exists to prevent.
         let generations = self.generations.read().expect("generation lock poisoned");
-        if id == 0 || generations.current.id == id {
-            return generations.current.clone();
-        }
         generations
-            .draining
-            .iter()
-            .find(|generation| generation.id == id)
-            .cloned()
+            .find(id)
             .unwrap_or_else(|| generations.current.clone())
+    }
+
+    /// [`Self::generation_by_id`] without the fallback: `None` for an id whose
+    /// generation has finished draining. A call that must not reach another
+    /// version of a Worker, such as the delivery of a trace item, uses this.
+    pub fn generation_exact(&self, id: GenerationId) -> Option<Arc<Generation>> {
+        self.generations
+            .read()
+            .expect("generation lock poisoned")
+            .find(id)
     }
 
     /// The id the next generation takes: one past the newest this node has

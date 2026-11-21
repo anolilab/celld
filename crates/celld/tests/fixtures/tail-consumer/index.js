@@ -5,6 +5,13 @@ export default {
   },
   async tail(events) {
     console.log("TAIL " + JSON.stringify(events));
+    for (const event of events) {
+      const request = event.event.request;
+      if (request) console.log("RAW " + JSON.stringify(request.getUnredacted()));
+    }
+    if (events.some((event) => event.logs.some((log) => log.message.includes("make-the-consumer-hang")))) {
+      await new Promise(() => {});
+    }
     if (events.some((event) => event.logs.some((log) => log.message.includes("make-the-consumer-throw")))) {
       throw new Error("consumer exploded");
     }

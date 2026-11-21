@@ -532,14 +532,24 @@ pub enum StatelessVerb {
     Fetch,
     Rpc,
     Queue,
+    Tail,
 }
 
 impl StatelessVerb {
+    /// How long the runtime lets one event of this verb run before it ends it.
+    fn budget(self) -> Duration {
+        match self {
+            Self::Tail => crate::tail_consumers::delivery_budget(),
+            _ => js::handler_budget(),
+        }
+    }
+
     fn task_died(self, error: tokio::task::JoinError) -> anyhow::Error {
         match self {
             Self::Fetch => anyhow!("stateless request task died: {error}"),
             Self::Rpc => anyhow!("stateless RPC task died: {error}"),
             Self::Queue => anyhow!("stateless queue task died: {error}"),
+            Self::Tail => anyhow!("stateless tail task died: {error}"),
         }
     }
 
@@ -548,6 +558,7 @@ impl StatelessVerb {
             Self::Fetch => anyhow!("stateless Worker dropped response"),
             Self::Rpc => anyhow!("stateless Worker dropped RPC result"),
             Self::Queue => anyhow!("stateless Worker dropped queue result"),
+            Self::Tail => anyhow!("stateless Worker dropped tail result"),
         }
     }
 }
@@ -1107,14 +1118,18 @@ impl RuntimeManager {
     }
 
     /// Deliver a batch of trace items to a consumer script. `generation` is
-    /// the producer's, like a service call.
+    /// the producer's, and the consumer is the one of that generation: once it
+    /// has finished draining, the batch is refused and not sent to the
+    /// current version.
     pub async fn tail_service(
         &self,
         generation: GenerationId,
         script: &str,
         items: String,
     ) -> anyhow::Result<Vec<u8>> {
-        let generation = self.generation_by_id(generation);
+        let generation = self
+            .generation_exact(generation)
+            .ok_or_else(|| anyhow!("the generation of the producer has ended"))?;
         generation
             .service(script)
             .ok_or_else(|| anyhow!("no tail consumer Worker for script {script}"))?
@@ -3062,10 +3077,11 @@ impl StatelessRuntime {
         // Spawned rather than awaited inline, because the response and the
         // event are not the same lifetime: `waitUntil` work outlives the
         // answer, and the driver keeps turning until it settles.
-        let driving = tokio::spawn(drive_affiliated(
+        let driving = tokio::spawn(drive_affiliated_with_budget(
             affiliation,
             job,
             Some((self.node.clone(), self.region.clone())),
+            verb.budget(),
         ));
         match receive.await {
             Ok(result) => result,
@@ -3143,7 +3159,7 @@ impl StatelessRuntime {
 
     /// Deliver a batch of trace items to the default entrypoint's `tail()`.
     async fn tail(&self, items: String) -> anyhow::Result<Vec<u8>> {
-        self.dispatch(StatelessVerb::Rpc, move |reply| crate::WorkerJob::Tail {
+        self.dispatch(StatelessVerb::Tail, move |reply| crate::WorkerJob::Tail {
             items,
             reply,
         })

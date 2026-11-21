@@ -135,14 +135,18 @@ compiles the code again.
 - A `WorkerCode.tails` array accepts Service Binding Fetchers. Each Fetcher
   receives one event after a Dynamic Worker fetch invocation finishes.
 - The event contains the request metadata, the response status, the console
-  logs, the uncaught exception, and the invocation outcome.
+  logs, the uncaught exception, and the invocation outcome. The request is
+  redacted as for a deployed consumer (see
+  [Tail Workers](workers.md#tail-workers)), and has no `getUnredacted()`.
 - celld records at most 256 KiB of serialized console log records for each
   invocation. It stops recording when the next complete record exceeds this
   limit.
 - Tail delivery starts after the response is available. A Tail Worker failure
   does not change the response, and celld writes the failure to the console.
-- A deployed Worker uses the same delivery through `tail_consumers`; see
-  [Tail Workers](workers.md#tail-workers).
+- A Dynamic Worker's `tails` receive each report immediately, one event for
+  each invocation. A deployed Worker's `tail_consumers` are buffered: they
+  receive the items that have gathered as one batch from a bounded buffer, and a
+  call that runs longer than 30 seconds is ended; see [Tail Workers](workers.md#tail-workers).
 - celld enforces `cpuMs` and `subRequests` in `WorkerCode.limits` and in a
   `getEntrypoint()` call. It rejects `allowExperimental`.
 - `WorkerCode.env` accepts structured-clone values and Service Binding

@@ -192,6 +192,40 @@ async fn the_consumer_receives_the_trace_item_of_each_request() {
 }
 
 #[tokio::test]
+async fn a_request_is_redacted_unless_the_consumer_asks_for_the_raw_one() {
+    const ID: &str = "0123456789abcdef0123456789abcdef";
+    let server = Server::start_projects(&[TAIL_PRODUCER, TAIL_CONSUMER], &[], |_| {}).await;
+    let response = client()
+        .get(server.url(&format!("/secret/{ID}?page=2")))
+        .header("authorization", "Bearer s3cret")
+        .header("cookie", "session=abc")
+        .header("x-note", "visible")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 200);
+    let item = wait_for_item(&server, "/secret/REDACTED?page=2").await;
+    let request = &item["event"]["request"];
+    assert_eq!(request["headers"]["authorization"], "REDACTED");
+    assert_eq!(request["headers"]["cookie"], "REDACTED");
+    assert_eq!(request["headers"]["x-note"], "visible");
+    assert!(request.get("unredacted").is_none());
+    // The consumer's own `getUnredacted()` returns the request as it was.
+    let raw = wait_until("the raw request", Duration::from_secs(30), || async {
+        server
+            .log_text()
+            .lines()
+            .filter_map(|line| line.split_once("RAW ").map(|(_, raw)| raw.to_string()))
+            .filter_map(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .find(|raw| raw["url"].as_str().is_some_and(|url| url.contains(ID)))
+    })
+    .await;
+    assert_eq!(raw["headers"]["authorization"], "Bearer s3cret");
+    assert_eq!(raw["headers"]["cookie"], "session=abc");
+    assert_eq!(raw["method"], "GET");
+}
+
+#[tokio::test]
 async fn a_failed_request_is_reported_as_an_exception() {
     let server = Server::start_projects(&[TAIL_PRODUCER, TAIL_CONSUMER], &[], |_| {}).await;
     let response = client()
@@ -229,6 +263,23 @@ async fn a_consumer_that_throws_changes_nothing_for_the_producer() {
     // The producer answers, and later items still reach the consumer.
     assert_eq!(server.get_text("/after").await, "produced");
     wait_for_item(&server, "/after").await;
+}
+
+#[tokio::test]
+async fn a_consumer_that_never_returns_is_ended_and_later_items_still_arrive() {
+    // The runtime ends a `tail()` call at the handler budget when that is
+    // shorter than the delivery bound of 30 seconds.
+    let server = Server::start_projects(
+        &[TAIL_PRODUCER, TAIL_CONSUMER],
+        &[("CELLD_HANDLER_BUDGET_S", "2")],
+        |_| {},
+    )
+    .await;
+    assert_eq!(server.get_text("/hang").await, "produced");
+    wait_for_item(&server, "/hang").await;
+    assert_eq!(server.get_text("/after").await, "produced");
+    wait_for_item(&server, "/after").await;
+    assert!(server.log_text().contains("tail consumer failed"));
 }
 
 #[tokio::test]
