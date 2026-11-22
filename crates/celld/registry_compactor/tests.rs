@@ -560,6 +560,82 @@ async fn a_run_streams_back_in_key_order_with_every_record() {
     assert_eq!(back, records);
 }
 
+/// A run as sparse as a month-24 partition is large: many buckets, few records.
+pub(super) async fn sparse_run(
+    store: &Arc<dyn ObjectStore>,
+    buckets: u32,
+) -> (String, RunRef, u32, Vec<Record>) {
+    let mut records: Vec<Record> = (0..5_000)
+        .map(|index| Record::birth(objects::key_of(&cell(index)), 1))
+        .collect();
+    records.sort_by_key(|record| record.key);
+    let mut run = RunRef {
+        epoch: 1,
+        id: 2,
+        buckets,
+        overflow: 0,
+        records: 0,
+    };
+    let key = objects::run_key(PREFIX, 0, 2, &run);
+    let tag = objects::tag_of(0, 2, &run);
+    let stats = merge_to_run(
+        store,
+        &key,
+        0,
+        u64::MAX,
+        tag,
+        buckets,
+        (Source::Records(records.clone(), 0), 5_000),
+        (Source::Nothing, 0),
+    )
+    .await
+    .unwrap();
+    run.overflow = stats.overflow;
+    run.records = stats.records;
+    (key, run, tag, records)
+}
+
+/// The store client ends a request 15 s after it began and asks for the rest
+/// of the body again at most twice inside 30 s, and the jobs' pace stretches a
+/// body to its share of the job rate. A merge of a month-24 partition (701 MB)
+/// read its run as one request and failed with `read a run`; a run is read in
+/// ranges, and no read may ask for more than a range.
+#[tokio::test]
+async fn a_run_is_read_in_ranges_not_as_one_request() {
+    const RANGE: u64 = 8 << 20;
+    let inner = Arc::new(InMemory::new());
+    let scripted = store::Scripted::over(inner);
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    // 32 MiB of buckets: four ranges.
+    let (key, run, tag, records) = sparse_run(&store, 8_192).await;
+    scripted.cap_reads(RANGE);
+    let mut reader = RunReader::open(&store, &key, &run, tag).await.unwrap();
+    let mut back = Vec::new();
+    while let Some(chunk) = reader.next_chunk().await.unwrap() {
+        back.extend(chunk);
+    }
+    assert_eq!(back, records, "every record comes back through the ranges");
+    assert!(scripted.widest_read() <= RANGE);
+    assert_eq!(
+        scripted.reads(&key),
+        4,
+        "32 MiB of buckets are four reads of 8 MiB"
+    );
+}
+
+/// A range inside the client's timeout with every slot of the pace in use:
+/// four requests in flight and the writes sharing the job rate with them.
+#[test]
+fn a_range_fits_the_request_timeout_when_every_slot_shares_the_job_rate() {
+    let range = u64::from(RANGE_BUCKETS) * reg::BUCKET_LEN as u64;
+    let share =
+        crate::registry_pace::JOB_BYTES_PER_S / (crate::registry_pace::JOB_REQUESTS as u64 + 1);
+    assert!(
+        range / share <= 5,
+        "a range of {range} bytes at {share} B/s outlasts a third of the 15 s timeout"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // One round trip per lookup: the bucket reads start beside the root read
 // ---------------------------------------------------------------------------
@@ -576,7 +652,7 @@ mod store {
     };
     use std::fmt;
     use std::ops::Range;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::{Notify, Semaphore};
@@ -590,6 +666,9 @@ mod store {
         held: Mutex<Vec<(String, Arc<Semaphore>)>>,
         seen: Notify,
         batches: Mutex<Vec<Arc<AtomicUsize>>>,
+        /// The bytes of the widest single read, and the most one read may ask for.
+        widest: AtomicU64,
+        range_cap: AtomicU64,
     }
 
     impl Scripted {
@@ -603,6 +682,8 @@ mod store {
                 held: Mutex::new(Vec::new()),
                 seen: Notify::new(),
                 batches: Mutex::new(Vec::new()),
+                widest: AtomicU64::new(0),
+                range_cap: AtomicU64::new(u64::MAX),
             })
         }
 
@@ -630,6 +711,18 @@ mod store {
                 .filter(|key| key.contains(pattern))
                 .cloned()
                 .collect()
+        }
+
+        /// Refuse a read that asks for more than `bytes`, as the store client
+        /// does when a body outlasts its request timeout. A read with no
+        /// bound asks for the whole object.
+        pub(super) fn cap_reads(&self, bytes: u64) {
+            self.range_cap.store(bytes, Ordering::SeqCst);
+        }
+
+        /// The most bytes one read asked for since the store was made.
+        pub(super) fn widest_read(&self) -> u64 {
+            self.widest.load(Ordering::SeqCst)
         }
 
         pub(super) fn fail(&self, pattern: &str, on: bool) {
@@ -731,6 +824,17 @@ mod store {
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
             let key = location.to_string();
+            let asked = match &options.range {
+                Some(object_store::GetRange::Bounded(range)) => range.end - range.start,
+                _ => u64::MAX,
+            };
+            self.widest.fetch_max(asked, Ordering::SeqCst);
+            if asked > self.range_cap.load(Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "scripted",
+                    source: "a read longer than the request timeout".into(),
+                });
+            }
             self.reads.lock().unwrap().push(key.clone());
             self.seen.notify_waiters();
             let gate = self

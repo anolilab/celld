@@ -19,6 +19,7 @@
 
 use super::*;
 use crate::registry::Config;
+use bytes::Bytes;
 use object_store::aws::AmazonS3Builder;
 use serde_json::json;
 
@@ -163,4 +164,127 @@ async fn lookup_against_list_smoke() {
     .unwrap();
     eprintln!("{text}");
     assert_eq!(wrong, 0, "a wrong answer");
+}
+
+// ---------------------------------------------------------------------------
+// A run longer than the store client's request timeout
+// ---------------------------------------------------------------------------
+
+/// A server that answers GETs of one object, with ranges, at a fixed rate:
+/// what a paced read of a large run looks like to the store client.
+async fn throttled_object(object: Bytes, bytes_per_s: usize) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let object = object.clone();
+            tokio::spawn(async move {
+                let mut buffered = Vec::new();
+                loop {
+                    let head = loop {
+                        if let Some(at) = buffered.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break String::from_utf8_lossy(&buffered[..at]).to_ascii_lowercase();
+                        }
+                        let mut chunk = [0_u8; 4096];
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => buffered.extend_from_slice(&chunk[..read]),
+                        }
+                    };
+                    let end = buffered
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .expect("head")
+                        + 4;
+                    buffered.drain(..end);
+                    let total = object.len();
+                    let range = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("range: bytes="))
+                        .and_then(|spec| {
+                            let (a, b) = spec.split_once('-')?;
+                            Some((a.parse().ok()?, b.parse::<usize>().ok()?.min(total - 1)))
+                        });
+                    let (from, to) = range.unwrap_or((0, total - 1));
+                    let status = if range.is_some() {
+                        "206 Partial Content"
+                    } else {
+                        "200 OK"
+                    };
+                    let reply = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\ncontent-range: bytes {from}-{to}/{total}\r\netag: \"run\"\r\nlast-modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n",
+                        to - from + 1
+                    );
+                    if socket.write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    // 100 pieces a second, so the body trickles out at the rate.
+                    let piece = (bytes_per_s / 100).max(1);
+                    for body in object[from..=to].chunks(piece) {
+                        if socket.write_all(body).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// The failure of the forced month-24 base merge, with the production store
+/// client and a body at 4 MiB/s. The client ends a request 15 s after it began
+/// and asks for the rest of the body again (twice at most, inside 30 s from the
+/// first request), so a body that needs more than about 30 s fails with a read
+/// error. A 128 MiB run is 32 s as one request and 2 s in ranges of 8 MiB.
+/// Takes about 40 s.
+///
+/// ```text
+/// cargo test -p celld --lib --profile lab a_paced_run_longer_than_the_request_timeout -- --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "takes 40 s and binds a local port"]
+async fn a_paced_run_longer_than_the_request_timeout_reads_through_the_real_client() {
+    crate::asyncrt::install_test_host_runtime();
+    let memory: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let (key, run, tag, records) = super::tests::sparse_run(&memory, 32_768).await;
+    let object = memory
+        .get(&Path::from(key.as_str()))
+        .await
+        .expect("the run")
+        .bytes()
+        .await
+        .expect("its bytes");
+    let endpoint = throttled_object(object, 4 << 20).await;
+    let bucket = crate::bucket::Bucket::open(
+        "s3://smoke",
+        Some(&endpoint),
+        "us-east-1",
+        Some(crate::bucket::StaticCredentials {
+            access_key_id: "smoke".into(),
+            secret_access_key: "smoke".into(),
+            session_token: None,
+        }),
+        None,
+    )
+    .expect("open the client");
+    let store = bucket.store.clone();
+    // The bucket's name is part of the path, which the server ignores.
+    let started = std::time::Instant::now();
+    let mut reader = RunReader::open(&store, &key, &run, tag)
+        .await
+        .expect("open");
+    let mut back = Vec::new();
+    while let Some(chunk) = reader.next_chunk().await.expect("read the run") {
+        back.extend(chunk);
+    }
+    assert_eq!(back, records);
+    eprintln!("read 128 MiB in {:?}", started.elapsed());
 }

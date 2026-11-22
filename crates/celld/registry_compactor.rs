@@ -13,14 +13,13 @@
 use crate::registry::{push_capped, Io, Registry};
 use crate::registry_objects as objects;
 use anyhow::Context as _;
-use bytes::Bytes;
 use celld_logic::registry::{
     self as reg, Delta, DeltaId, Job, Key, Level, Map, Merge, Record, Root, RunBuilder, RunRef,
 };
-use futures_util::stream::{BoxStream, StreamExt as _};
+use futures_util::stream::StreamExt as _;
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
-use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt as _, UpdateVersion};
+use object_store::{ObjectStore, ObjectStoreExt as _, UpdateVersion};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,6 +41,13 @@ const PART_BYTES: usize = 8 << 20;
 const CHUNK_RECORDS: usize = 60_000;
 /// Main buckets read from a run at a time.
 const CHUNK_BUCKETS: u32 = 1_024;
+/// Main buckets one ranged GET of a run fetches (8 MiB, one multipart part).
+/// The store client ends a request 15 s after it began, body included, and
+/// asks for the rest of the body again at most twice inside 30 s from the
+/// first request. The jobs' pace holds a body back to its share of the job
+/// rate, so a run is never read as one request: a 700 MB run takes about 30 s
+/// at that rate, and one GET of it fails with `read a run`.
+const RANGE_BUCKETS: u32 = 2_048;
 const SAMPLER_EVERY_MS: u64 = 60_000;
 const SAMPLER_CELLS: usize = 16;
 const SWEEP_EVERY_MS: u64 = 120_000;
@@ -54,9 +60,13 @@ const RETRY_GAP_MS: u64 = 100;
 // Runs: reading as a stream, writing as a multipart upload
 // ---------------------------------------------------------------------------
 
-/// A run read as a stream of records in key order.
+/// A run read as a stream of records in key order, in ranged reads of
+/// [`RANGE_BUCKETS`] buckets.
 pub(crate) struct RunReader {
-    stream: BoxStream<'static, object_store::Result<Bytes>>,
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    /// Main buckets fetched so far.
+    fetched: u32,
     rest: Vec<u8>,
     next: u32,
     buckets: u32,
@@ -86,18 +96,10 @@ impl RunReader {
             bytes += tail.len() as u64;
             overflow = tail.chunks(reg::BUCKET_LEN).map(<[u8]>::to_vec).collect();
         }
-        let result = store
-            .get_opts(
-                &path,
-                GetOptions {
-                    range: Some(GetRange::Bounded(0..u64::from(run.buckets) * page)),
-                    ..Default::default()
-                },
-            )
-            .await
-            .with_context(|| format!("read {key}"))?;
         Ok(Self {
-            stream: result.into_stream().boxed(),
+            store: store.clone(),
+            path,
+            fetched: 0,
             rest: Vec::new(),
             next: 0,
             buckets: run.buckets,
@@ -118,15 +120,18 @@ impl RunReader {
             return Ok(None);
         }
         let want = CHUNK_BUCKETS.min(self.buckets - self.next) as usize * reg::BUCKET_LEN;
-        while self.rest.len() < want {
-            match self.stream.next().await {
-                Some(chunk) => {
-                    let chunk = chunk.context("read a run")?;
-                    self.bytes += chunk.len() as u64;
-                    self.rest.extend_from_slice(&chunk);
-                }
-                None => break,
-            }
+        let page = reg::BUCKET_LEN as u64;
+        while self.rest.len() < want && self.fetched < self.buckets {
+            let count = RANGE_BUCKETS.min(self.buckets - self.fetched);
+            let from = u64::from(self.fetched) * page;
+            let chunk = self
+                .store
+                .get_range(&self.path, from..from + u64::from(count) * page)
+                .await
+                .with_context(|| format!("read buckets {} of {}", self.fetched, self.path))?;
+            self.bytes += chunk.len() as u64;
+            self.rest.extend_from_slice(&chunk);
+            self.fetched += count;
         }
         anyhow::ensure!(
             self.rest.len() >= want,
@@ -1347,7 +1352,7 @@ impl Registry {
                             .fetch_add(1, Ordering::Relaxed);
                         tracing::error!(event = "registry_merge_check_failed", %error);
                     } else {
-                        tracing::warn!(%error, "registry job failed");
+                        tracing::warn!(error = %format!("{error:#}"), "registry job failed");
                     }
                 }
             }
