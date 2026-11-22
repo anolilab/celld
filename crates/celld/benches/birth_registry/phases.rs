@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use super::gen::{hex, Generator, Shape, Store};
 use super::probe::{self, ms_p, Expect, Gates, Lookups, Samples};
 use super::{birth_load, env_f64, env_text, out_dir, record, Births, Fleet};
+use crate::{birth_target, failure_summary};
 
 #[path = "phases/faults.rs"]
 mod faults;
@@ -1053,6 +1054,28 @@ async fn selftest() {
     // Successes slower than the bound fail on their own.
     assert!(!backstop_waits(&covered(59, 4_200.0), &waits(0)).0);
     say!("selftest: backstop_waits ok");
+    // A retry stays on one node by default and moves on with the switch.
+    assert_eq!(
+        (0..3)
+            .map(|a| birth_target(1, a, 3, false))
+            .collect::<Vec<_>>(),
+        [2, 2, 2]
+    );
+    assert_eq!(
+        (0..3)
+            .map(|a| birth_target(1, a, 3, true))
+            .collect::<Vec<_>>(),
+        [1, 2, 0]
+    );
+    let failed = [
+        (1.0, 2, "http 503".to_owned()),
+        (4.5, 2, "connect".to_owned()),
+    ];
+    assert_eq!(
+        failure_summary(&failed),
+        json!({ "by_node": { "2": 2 }, "by_last_error": { "connect": 1, "http 503": 1 }, "first_began_s": 1.0, "last_began_s": 4.5 })
+    );
+    say!("selftest: births ok");
     selftest_check().await;
 }
 

@@ -316,6 +316,9 @@ struct Births {
     behind_ms: AtomicU64,
     latencies: Mutex<Vec<u64>>,
     errors: Mutex<std::collections::BTreeMap<String, u64>>,
+    /// Every birth that failed after its budget: seconds since the load began,
+    /// the node it was sent to, and its last error.
+    failures: Mutex<Vec<(f64, usize, String)>>,
     /// Agent name and the scope the node answered with, for every success.
     cells: Mutex<Vec<(String, String)>>,
     stop: AtomicBool,
@@ -333,8 +336,38 @@ impl Births {
             "p50_ms": pct(&latencies, 50.0),
             "p99_ms": pct(&latencies, 99.0),
             "errors": *self.errors.lock().unwrap(),
+            "failures": failure_summary(&self.failures.lock().unwrap()),
         })
     }
+}
+
+/// The failed births by node and by last error, and when the first and the
+/// last one began: a node that was away longer than the retry budget shows as
+/// one node and one window.
+fn failure_summary(failures: &[(f64, usize, String)]) -> Value {
+    let mut by_node = std::collections::BTreeMap::<usize, u64>::new();
+    let mut by_error = std::collections::BTreeMap::<&str, u64>::new();
+    for (_, node, why) in failures {
+        *by_node.entry(*node).or_default() += 1;
+        *by_error.entry(why.as_str()).or_default() += 1;
+    }
+    let first = failures.iter().map(|f| f.0).fold(f64::INFINITY, f64::min);
+    let last = failures.iter().map(|f| f.0).fold(0.0, f64::max);
+    json!({
+        "by_node": by_node,
+        "by_last_error": by_error,
+        "first_began_s": if failures.is_empty() { Value::Null } else { json!(first) },
+        "last_began_s": if failures.is_empty() { Value::Null } else { json!(last) },
+    })
+}
+
+/// The node a birth's request number `attempt` (from 0) goes to. By default
+/// every request of a birth goes to one node, `node + 1`, however often it is
+/// retried: a node that is away for longer than the retry budget fails every
+/// birth sent to it. With `rotate`, a retry goes to the next node, as a load
+/// balancer would send it.
+fn birth_target(node: usize, attempt: u64, count: usize, rotate: bool) -> usize {
+    (node + if rotate { attempt as usize } else { 1 }) % count
 }
 
 /// New agents at `rate` a second, each one request to a fresh id, spread over
@@ -350,6 +383,7 @@ async fn birth_load(
     births: Arc<Births>,
 ) -> u64 {
     let total = (rate * seconds) as u64;
+    let rotate = env_f64("CELLD_REG_BIRTH_ROTATE", 0.0) > 0.0;
     let started = tokio::time::Instant::now();
     let permits = Arc::new(tokio::sync::Semaphore::new(4096));
     let mut sent = 0;
@@ -372,11 +406,13 @@ async fn birth_load(
             let began = Instant::now();
             let mut ok = false;
             let mut scope = String::new();
+            let mut attempt = 0;
+            let mut last_error = String::new();
+            let mut target = node;
             while !ok {
-                let url = format!(
-                    "{}/agent/{name}",
-                    ep.public((node + usize::from(!ok)) % ep.count())
-                );
+                target = birth_target(node, attempt, ep.count(), rotate);
+                attempt += 1;
+                let url = format!("{}/agent/{name}", ep.public(target));
                 let reply = ep.client.post(url).send().await;
                 ok = reply
                     .as_ref()
@@ -389,7 +425,13 @@ async fn birth_load(
                         Err(error) if error.is_timeout() => "timeout".to_owned(),
                         Err(_) => "connect".to_owned(),
                     };
-                    *births.errors.lock().unwrap().entry(why).or_default() += 1;
+                    *births
+                        .errors
+                        .lock()
+                        .unwrap()
+                        .entry(why.clone())
+                        .or_default() += 1;
+                    last_error = why;
                 }
                 if !ok && began.elapsed() >= budget {
                     break;
@@ -408,6 +450,11 @@ async fn birth_load(
                     .push(began.elapsed().as_micros() as u64);
             } else {
                 births.failed.fetch_add(1, Ordering::Relaxed);
+                births.failures.lock().unwrap().push((
+                    due.saturating_duration_since(started).as_secs_f64(),
+                    target,
+                    last_error,
+                ));
             }
             drop(permit);
         });
