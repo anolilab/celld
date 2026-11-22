@@ -407,6 +407,13 @@ impl Registry {
     pub(crate) async fn refresh(&self, io: &Io) -> Option<Snapshot> {
         let (root, _) = self.read_root(io).await.ok().flatten()?;
         let snapshot = self.load(root, io).await;
+        self.observe_snapshot(&snapshot);
+        Some(snapshot)
+    }
+
+    /// Tell the writers which segments the deltas of `snapshot` fold, and wake
+    /// the waits that watch for it.
+    pub(crate) fn observe_snapshot(&self, snapshot: &Snapshot) {
         let covered: HashSet<&String> = snapshot
             .deltas
             .iter()
@@ -414,7 +421,6 @@ impl Registry {
             .collect();
         self.observe_coverage(&covered);
         self.observed.notify_waiters();
-        Some(snapshot)
     }
 
     /// Load the deltas and the map that `root` names. A delta that no root

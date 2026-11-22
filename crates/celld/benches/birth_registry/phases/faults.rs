@@ -562,7 +562,7 @@ pub async fn node_kill() {
                         .flat_map(|node| node["waits"].as_array().cloned().unwrap_or_default())
                         .collect();
                     (
-                        json!({ "backstop_waits": waited, "backstop_lookups": looked, "backstop_exists": exists, "wait_samples": waits.len() }),
+                        json!({ "backstop_waits": waited, "backstop_lookups": looked, "backstop_exists": exists, "wait_samples": waits.len(), "waits": waits }),
                         waited,
                     )
                 } else {

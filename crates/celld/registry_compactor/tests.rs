@@ -279,6 +279,37 @@ async fn a_cell_this_process_queued_waits_for_the_pass_without_a_lookup() {
 }
 
 #[tokio::test]
+async fn a_holder_knows_its_own_cell_is_covered_once_its_root_names_the_delta() {
+    let store = memory();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    let name = cell(7);
+    node.register_at_claim(&name, 1);
+    node.flush_now().await.unwrap();
+    assert!(node.pass(&mut holding).await.unwrap());
+    // No refresh and no lookup: a node inside its role does neither.
+    assert!(node.covered_now(&objects::key_of(&name)));
+    node.ensure_covered(&name).await.unwrap();
+    assert_eq!(node.counters.backstop_waits.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn a_node_that_takes_the_role_knows_the_cells_the_old_deltas_covered() {
+    let store = memory();
+    let first = registry_on(&store, "node-a");
+    let mut holding = holder_of(&first).await;
+    let second = registry_on(&store, "node-b");
+    let name = cell(8);
+    second.register_at_claim(&name, 1);
+    second.flush_now().await.unwrap();
+    assert!(first.pass(&mut holding).await.unwrap());
+    let _taken = take_over(&second).await;
+    assert!(second.covered_now(&objects::key_of(&name)));
+    second.ensure_covered(&name).await.unwrap();
+    assert_eq!(second.counters.backstop_waits.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn a_displaced_holder_writes_nothing_visible_and_stands_down() {
     let store = memory();
     let old = registry_on(&store, "node-a");

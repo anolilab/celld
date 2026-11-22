@@ -800,6 +800,10 @@ impl Registry {
             snapshot.deltas_ok && snapshot.map_ok,
             "the new holder could not load the registry"
         );
+        // The root this node just wrote names these deltas. A node inside its
+        // role never reads the root again, so this is the only time it learns
+        // which of its own cells they already cover.
+        self.observe_snapshot(&snapshot);
         let counts = snapshot
             .deltas
             .iter()
@@ -1015,6 +1019,10 @@ impl Registry {
             return Ok(false);
         }
         if wrote && !folded.is_empty() {
+            // The conditional write succeeded, so the root names the delta that
+            // folds these segments: the holder's own cells in them are covered.
+            self.observe_coverage(&folded.iter().collect());
+            self.observed.notify_waiters();
             if let Some((id, loaded)) = holding.fresh_delta.take() {
                 self.seed_delta(id, loaded);
             }
