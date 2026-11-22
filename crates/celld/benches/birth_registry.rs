@@ -110,11 +110,9 @@ impl Fleet {
         .await;
         let dir = tempfile::TempDir::new().expect("create temp dir");
         // The internal routes ask for the operator token; the public ones ignore it.
-        let mut token = reqwest::header::HeaderValue::from_str(&format!(
-            "Bearer {}",
-            support::OPERATOR_TOKEN
-        ))
-        .expect("operator token header");
+        let mut token =
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", support::OPERATOR_TOKEN))
+                .expect("operator token header");
         token.set_sensitive(true);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
