@@ -105,6 +105,39 @@ fn units(result: &Value) -> Option<Value> {
     }))
 }
 
+/// The registry's stored size by object kind at month 1 and at month 12, each as
+/// the storage check of its phase found it, and the difference, to read next to
+/// the memory a node holds for it.
+fn size_breakdown(month1: &Value, month12: &Value) -> Value {
+    let (a, b) = (
+        &month1["storage"]["breakdown"],
+        &month12["storage"]["breakdown"],
+    );
+    let kinds = [
+        "root",
+        "delta",
+        "map",
+        "segment",
+        "run_l1",
+        "run_l2",
+        "run_other",
+        "other",
+    ];
+    let bytes = |side: &Value, kind: &str| side[kind]["bytes"].as_u64();
+    let difference: BTreeMap<&str, Option<i64>> = kinds
+        .iter()
+        .map(|kind| {
+            (
+                *kind,
+                bytes(a, kind)
+                    .zip(bytes(b, kind))
+                    .map(|(x, y)| y as i64 - x as i64),
+            )
+        })
+        .collect();
+    json!({ "month1": a, "month12": b, "month12_minus_month1_bytes": difference })
+}
+
 pub async fn report() {
     let mut gates = Gates::new();
     let (steady, off, month1, x4) = (read("steady"), read("off"), read("month1"), read("x4"));
@@ -114,10 +147,12 @@ pub async fn report() {
         let added = s.zip(o).map(|(s, o)| s - o);
         let drift = s.zip(m).map(|(s, m)| (s - m).abs());
         let x4_added = x4.as_ref().and_then(window).zip(o).map(|(x, o)| x - o);
+        let breakdown = size_breakdown(month1, steady);
         gates.add(
             "G-h",
             json!({ "rss_mib_added_steady": added, "rss_mib_month12_vs_month1": drift, "rss_mib_added_x4": x4_added,
-                    "rss_mib_steady": s, "rss_mib_off": o, "rss_mib_month1": m, "window_s": "300-600" }),
+                    "rss_mib_steady": s, "rss_mib_off": o, "rss_mib_month1": m, "window_s": "300-600",
+                    "registry_size_by_kind": breakdown }),
             "<= 64 MiB; within 5 MiB; <= 96 MiB in x4 (mean node RSS between 5 and 10 minutes, against the registry-off control at the same real births)",
             Some(added.is_some_and(|v| v <= 64.0) && drift.is_some_and(|v| v <= 5.0) && x4_added.is_some_and(|v| v <= 96.0)),
         );
@@ -250,8 +285,14 @@ pub async fn report() {
             .as_array()
             .and_then(|rows| rows.iter().find(|row| row["gate"] == "G-s"))
             .map(|row| row["measured"].clone());
-        let per = |r: &Value| -> Option<(f64, f64, f64)> {
-            let c = &r["counters"];
+        // `steady` leaves out the forced month-24 merge (measured on its own in
+        // `forced_m24_counters`): it is a one-off job that `x4` does not run.
+        let per_with = |r: &Value, excluding_m24: bool| -> Option<(f64, f64, f64)> {
+            let c = if excluding_m24 && r["counters_excl_m24"].is_object() {
+                &r["counters_excl_m24"]
+            } else {
+                &r["counters"]
+            };
             let n = |name: &str| c[name].as_f64().unwrap_or(0.0);
             let segments =
                 n("segments_written") + r["generator"]["segments"].as_f64().unwrap_or(0.0);
@@ -261,6 +302,7 @@ pub async fn report() {
                 n("bytes_written") / n("spills").max(1.0),
             ))
         };
+        let per = |r: &Value| per_with(r, true);
         if let (Some(row), Some(a), Some(b)) = (row, per(x4), per(steady)) {
             let within = |x: f64, y: f64| ((x - y) / y).abs() <= 0.15;
             let units = within(a.0, b.0) && within(a.1, b.1) && within(a.2, b.2);
@@ -274,7 +316,8 @@ pub async fn report() {
                 && units;
             gates.add(
                 "G-s",
-                json!({ "x4": row, "per_pass_requests": [a.0, b.0], "get_requests_per_segment": [a.1, b.1], "bytes_written_per_spill": [a.2, b.2], "unit_basis": "x4 against steady; the registry compactor's own request counters" }),
+                json!({ "x4": row, "per_pass_requests": [a.0, b.0], "get_requests_per_segment": [a.1, b.1], "bytes_written_per_spill": [a.2, b.2], "steady_with_m24_for_reference": per_with(steady, false), "steady_forced_m24_counters": steady["forced_m24_counters"],
+                    "unit_basis": "x4 against steady without its forced month-24 merge (the job's counters measured on their own); the registry compactor's own request counters" }),
                 ">= 2 spills by record count; live records <= 1.5M; 0 pauses; pass p99 <= 2 s; G-d holds; requests per segment, per pass and per spill within 15 % of steady",
                 Some(ok),
             );

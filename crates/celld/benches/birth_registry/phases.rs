@@ -279,6 +279,34 @@ pub fn total(states: &[Value], name: &str) -> u64 {
         .sum()
 }
 
+/// How much each counter rose between two gathers of every node's state.
+pub fn counters_delta(before: &[Value], after: &[Value]) -> BTreeMap<String, u64> {
+    COUNTERS
+        .iter()
+        .map(|name| {
+            (
+                name.to_string(),
+                total(after, name).saturating_sub(total(before, name)),
+            )
+        })
+        .collect()
+}
+
+/// `all` less `excluded`, counter by counter: a baseline that leaves one job out.
+pub fn counters_without(
+    all: &BTreeMap<String, u64>,
+    excluded: &BTreeMap<String, u64>,
+) -> BTreeMap<String, u64> {
+    all.iter()
+        .map(|(name, count)| {
+            (
+                name.clone(),
+                count.saturating_sub(excluded.get(name).copied().unwrap_or(0)),
+            )
+        })
+        .collect()
+}
+
 pub fn percentiles(values: &[u64]) -> Value {
     json!({
         "n": values.len(), "p50": ms_p(values, 50.0), "p99": ms_p(values, 99.0),
@@ -494,6 +522,7 @@ async fn load_phase(cfg: Cfg) {
     let rss_start = rig.fleet.rss_by_node_mib();
     let mut checks = Vec::new();
     let mut forced = Vec::new();
+    let mut forced_m24: Option<BTreeMap<String, u64>> = None;
     if cfg.registry && cfg.aged.is_some() {
         let before = check_each_node(&rig, aged_keys(&rig, 10_000, 0)).await;
         say!("aged check before: {}", before.json());
@@ -565,7 +594,17 @@ async fn load_phase(cfg: Cfg) {
             };
             merge_at += 1;
             if let Some(partition) = partition.cloned() {
+                // The month-24 merge is measured on its own, so a baseline can leave it out.
+                let before_m24 = if partition.months == 24 {
+                    Some(gather(&rig.fleet, &rig.nodes(), false).await.0)
+                } else {
+                    None
+                };
                 let result = rig.force("base_merge", partition.index).await;
+                if let Some(before) = before_m24 {
+                    let (after, _) = gather(&rig.fleet, &rig.nodes(), false).await;
+                    forced_m24 = Some(counters_delta(&before, &after));
+                }
                 say!(
                     "forced base merge of {} ({} months): {:?}",
                     partition.index,
@@ -581,17 +620,7 @@ async fn load_phase(cfg: Cfg) {
     let counters_window: Option<BTreeMap<String, u64>> = match &counters_before {
         Some(before) => {
             let (after, _) = gather(&rig.fleet, &rig.nodes(), false).await;
-            Some(
-                COUNTERS
-                    .iter()
-                    .map(|name| {
-                        (
-                            name.to_string(),
-                            total(&after, name).saturating_sub(total(before, name)),
-                        )
-                    })
-                    .collect(),
-            )
+            Some(counters_delta(before, &after))
         }
         None => None,
     };
@@ -634,6 +663,9 @@ async fn load_phase(cfg: Cfg) {
         .iter()
         .map(|name| (name.to_string(), total(&states, name)))
         .collect();
+    let counters_excl_m24 = forced_m24
+        .as_ref()
+        .map(|m24| counters_without(&counters, m24));
     let result = json!({
         "cfg": { "name": cfg.name, "nodes": cfg.nodes, "minutes": cfg.minutes, "registry": cfg.registry, "births_per_s": cfg.births,
                  "generator": cfg.generator.map(|(rate, shape)| json!({ "entries_per_s": rate, "shape": match shape { Shape::Births => "births", Shape::Aligned => "aligned", Shape::Bases => "bases" } })),
@@ -662,6 +694,8 @@ async fn load_phase(cfg: Cfg) {
         },
         "guard": guard,
         "counters": counters,
+        "forced_m24_counters": forced_m24,
+        "counters_excl_m24": counters_excl_m24,
         "holder": holder_index,
         "rss_mib_start": rss_start,
         "rss_mib_end": rss_end,
@@ -901,6 +935,65 @@ pub async fn storage_report(rig: &Rig, gap: Duration) -> Value {
         "unnamed_first": first.unnamed.len(), "orphans": orphans.len(),
         "orphan_examples": orphans.iter().take(10).collect::<Vec<_>>(),
         "live_deltas": second.live_deltas, "gap_s": gap.as_secs(),
+        "breakdown": kind_breakdown(&second.kinds, second.levels.0, second.levels.1),
+    })
+}
+
+/// The kind an object under `fleet/reg/v1/` counts as in the size breakdown: a
+/// run is told apart by its level (`run/<partition>/<level>-<epoch>-<id>`).
+pub fn object_kind(name: &str) -> &'static str {
+    match name.split('/').next().unwrap_or("") {
+        "root" => "root",
+        "delta" => "delta",
+        "map" => "map",
+        "seg" => "segment",
+        "run" => match name.rsplit('/').next().and_then(|id| id.split('-').next()) {
+            Some("1") => "run_l1",
+            Some("2") => "run_l2",
+            _ => "run_other",
+        },
+        _ => "other",
+    }
+}
+
+/// What the map says one level holds: runs, their records and buckets (4 KiB each).
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LevelSize {
+    pub runs: u64,
+    pub records: u64,
+    pub buckets: u64,
+    pub overflow: u64,
+}
+
+pub fn level_size<'a>(levels: impl Iterator<Item = &'a reg::Level>) -> LevelSize {
+    let mut size = LevelSize::default();
+    for level in levels {
+        if let reg::Level::Run(run) = level {
+            size.runs += 1;
+            size.records += run.records;
+            size.buckets += u64::from(run.buckets);
+            size.overflow += u64::from(run.overflow);
+        }
+    }
+    size
+}
+
+/// Objects and bytes by kind, the breakdown of the registry's size at one age.
+pub fn kind_breakdown(
+    kinds: &BTreeMap<&'static str, (u64, u64)>,
+    l1: LevelSize,
+    l2: LevelSize,
+) -> Value {
+    let kind = |name: &str| {
+        let (objects, bytes) = kinds.get(name).copied().unwrap_or((0, 0));
+        json!({ "objects": objects, "bytes": bytes })
+    };
+    let level = |size: LevelSize| json!({ "runs": size.runs, "records": size.records, "buckets": size.buckets, "overflow_buckets": size.overflow, "bucket_bytes": size.buckets * 4096 });
+    json!({
+        "root": kind("root"), "delta": kind("delta"), "map": kind("map"), "segment": kind("segment"),
+        "run_l1": kind("run_l1"), "run_l2": kind("run_l2"), "run_other": kind("run_other"), "other": kind("other"),
+        "l1": level(l1), "l2": level(l2),
+        "total_bytes": kinds.values().map(|(_, bytes)| bytes).sum::<u64>(),
     })
 }
 
@@ -909,6 +1002,8 @@ struct Listing {
     records: u64,
     bytes: BTreeMap<&'static str, u64>,
     objects: BTreeMap<&'static str, u64>,
+    kinds: BTreeMap<&'static str, (u64, u64)>,
+    levels: (LevelSize, LevelSize),
     unnamed: HashSet<String>,
     live_deltas: usize,
 }
@@ -919,6 +1014,8 @@ async fn registry_listing(rig: &Rig) -> Listing {
         records: 0,
         bytes: BTreeMap::new(),
         objects: BTreeMap::new(),
+        kinds: BTreeMap::new(),
+        levels: (LevelSize::default(), LevelSize::default()),
         unnamed: HashSet::new(),
         live_deltas: 0,
     };
@@ -942,6 +1039,12 @@ async fn registry_listing(rig: &Rig) -> Listing {
             .map(|p| p.l1.records() + p.l2.records())
             .sum()
     });
+    if let Some(map) = &map {
+        listing.levels = (
+            level_size(map.partitions.iter().map(|p| &p.l1)),
+            level_size(map.partitions.iter().map(|p| &p.l2)),
+        );
+    }
     listing.live_deltas = root.deltas.len();
     let named_runs: HashSet<String> = map
         .as_ref()
@@ -972,6 +1075,9 @@ async fn registry_listing(rig: &Rig) -> Listing {
             .unwrap_or("other");
         *listing.bytes.entry(class).or_default() += meta.size;
         *listing.objects.entry(class).or_default() += 1;
+        let kind = listing.kinds.entry(object_kind(&name)).or_default();
+        kind.0 += 1;
+        kind.1 += meta.size;
         let named = match class {
             "delta" => name
                 .strip_prefix("delta/")
@@ -1076,7 +1182,87 @@ async fn selftest() {
         json!({ "by_node": { "2": 2 }, "by_last_error": { "connect": 1, "http 503": 1 }, "first_began_s": 1.0, "last_began_s": 4.5 })
     );
     say!("selftest: births ok");
+    selftest_baseline();
+    say!("selftest: baseline and breakdown ok");
     selftest_check().await;
+}
+
+/// G-s's baseline leaves the forced month-24 merge out, counter by counter, and
+/// the size breakdown tells a run's level apart.
+fn selftest_baseline() {
+    let state = |bytes: u64, spills: u64, passes: u64| json!({ "counters": { "bytes_written": bytes, "spills": spills, "passes": passes } });
+    let before = [state(100, 1, 10), state(50, 0, 10)];
+    let after = [state(900, 2, 16), state(150, 0, 16)];
+    let delta = counters_delta(&before, &after);
+    assert_eq!(delta["bytes_written"], 900);
+    assert_eq!((delta["spills"], delta["passes"]), (1, 12));
+    assert_eq!(delta["lookups"], 0);
+    // A whole run of 2,286 MB over 10 spills, of which the merge wrote 705 MB in
+    // the window: without it the run writes 158 MB a spill, not 229.
+    let all: BTreeMap<String, u64> = COUNTERS
+        .iter()
+        .map(|name| (name.to_string(), 0))
+        .chain([
+            ("bytes_written".to_owned(), 2_286),
+            ("spills".to_owned(), 10),
+            ("passes".to_owned(), 1_000),
+        ])
+        .collect();
+    let m24: BTreeMap<String, u64> = [("bytes_written".to_owned(), 705), ("passes".to_owned(), 6)]
+        .into_iter()
+        .collect();
+    let without = counters_without(&all, &m24);
+    assert_eq!(
+        (
+            without["bytes_written"],
+            without["spills"],
+            without["passes"]
+        ),
+        (1_581, 10, 994)
+    );
+    // A counter that rose by more than the run total (a restart) stays at zero.
+    let big: BTreeMap<String, u64> = [("spills".to_owned(), 99)].into_iter().collect();
+    assert_eq!(counters_without(&all, &big)["spills"], 0);
+    for (name, kind) in [
+        ("root", "root"),
+        ("delta/1-000000000007", "delta"),
+        ("map/1-0000000003", "map"),
+        ("seg/n0/1/0000000001", "segment"),
+        ("run/0000000000000000/1-2-9", "run_l1"),
+        ("run/0000000000000000/2-2-9", "run_l2"),
+        ("run/0000000000000000/x", "run_other"),
+        ("elsewhere", "other"),
+    ] {
+        assert_eq!(object_kind(name), kind, "{name}");
+    }
+    let run = |records: u64, buckets: u32, overflow: u32| {
+        reg::Level::Run(reg::RunRef {
+            epoch: 1,
+            id: 1,
+            buckets,
+            overflow,
+            records,
+        })
+    };
+    let levels = [run(60, 1, 0), reg::Level::Empty, run(120, 2, 1)];
+    let size = level_size(levels.iter());
+    assert_eq!(
+        size,
+        LevelSize {
+            runs: 2,
+            records: 180,
+            buckets: 3,
+            overflow: 1
+        }
+    );
+    let kinds: BTreeMap<&'static str, (u64, u64)> = [("root", (1, 300)), ("run_l2", (2, 8_192))]
+        .into_iter()
+        .collect();
+    let breakdown = kind_breakdown(&kinds, LevelSize::default(), size);
+    assert_eq!(breakdown["run_l2"], json!({ "objects": 2, "bytes": 8_192 }));
+    assert_eq!(breakdown["run_l1"], json!({ "objects": 0, "bytes": 0 }));
+    assert_eq!(breakdown["l2"]["bucket_bytes"], 3 * 4096);
+    assert_eq!(breakdown["total_bytes"], 8_492);
 }
 
 /// The start check must neither flood the store nor wait for ever on a node
