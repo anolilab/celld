@@ -52,6 +52,11 @@ name = "claim_sample"
 path = "benches/claim_sample.rs"
 harness = false
 
+[[bench]]
+name = "birth_registry"
+path = "benches/birth_registry.rs"
+harness = false
+
 [lints.clippy]
 disallowed_macros = "forbid"
 

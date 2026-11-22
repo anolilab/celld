@@ -42,9 +42,7 @@
 mod scenarios;
 mod support;
 
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use scenarios::{
@@ -54,11 +52,10 @@ use scenarios::{
 };
 use serde_json::{json, Value};
 use support::{
-    class_of, diff, env_text, free_port, git, out, positive, run_turns, target_dir, Class,
-    Classifier, EndRule, Proxy, Report, Tally, PROJECTED_CONCURRENT,
+    class_of, diff, env_text, git, out, positive, run_turns, target_dir, Class, Classifier,
+    EndRule, Node, Proxy, Report, Tally, CELLD, OPERATOR_TOKEN, PROJECTED_CONCURRENT,
 };
 
-const CELLD: &str = env!("CARGO_BIN_EXE_celld");
 const FIXTURE: &str = "bench-agents";
 struct Settings {
     endpoint: String,
@@ -324,9 +321,6 @@ async fn read_states(client: &reqwest::Client, nodes: &[Node]) -> Vec<Value> {
     states
 }
 
-/// The operator token of every node this bench starts, and the one it sends.
-const OPERATOR_TOKEN: &str = "bench-operator-token";
-
 /// How often the retained bundles of the nodes are read while a run goes on.
 const RETENTION_SAMPLE: Duration = Duration::from_secs(2);
 
@@ -369,91 +363,6 @@ fn sample_retention(client: &reqwest::Client, nodes: &[Node]) -> RetentionSample
         }
     });
     RetentionSampler { task, samples }
-}
-
-/// One `celld` fleet node in its own process group, stopped on drop.
-struct Node {
-    child: Child,
-    public: String,
-    internal: String,
-}
-
-impl Node {
-    fn spawn(dir: &Path, index: usize, bucket: &str, endpoint: &str, env: &[(&str, &str)]) -> Node {
-        let (public, internal) = (free_port(), free_port());
-        let home = dir.join(format!("node-{index}"));
-        std::fs::create_dir_all(&home).expect("create node directory");
-        let log = std::fs::File::create(home.join("celld.log")).expect("create node log");
-        let child = Command::new(CELLD)
-            .args([
-                "--bucket",
-                bucket,
-                "--endpoint",
-                endpoint,
-                "--region",
-                "us-east-1",
-            ])
-            .args(["--listen", &format!("127.0.0.1:{public}")])
-            .args(["--internal-listen", &format!("127.0.0.1:{internal}")])
-            .args(["--advertise", &format!("127.0.0.1:{internal}")])
-            .env("CELLD_NODE", format!("node-{index}"))
-            .env("CELLD_WATCH", home.join("state"))
-            // The internal listener asks for this token, and no node writes
-            // a token file into the developer's own configuration directory.
-            .env("CELLD_OPERATOR_TOKEN", OPERATOR_TOKEN)
-            .env("CELLD_CONFIG_DIR", home.join("config"))
-            .envs(env.iter().copied())
-            .current_dir(&home)
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().expect("clone log handle"))
-            .stderr(log)
-            .process_group(0)
-            .spawn()
-            .expect("spawn celld");
-        Node {
-            child,
-            public: format!("http://127.0.0.1:{public}"),
-            internal: format!("http://127.0.0.1:{internal}"),
-        }
-    }
-
-    /// Waits for celld's own health check, which also waits for the fleet
-    /// to settle, and for the Worker to answer.
-    async fn wait_ready(&self, client: &reqwest::Client) {
-        let deadline = Instant::now() + Duration::from_secs(120);
-        let paths = ["/.well-known/celld/health", "/__ready"];
-        while Instant::now() < deadline {
-            let mut ready = true;
-            for path in paths {
-                ready &= client
-                    .get(format!("{}{path}", self.public))
-                    .send()
-                    .await
-                    .is_ok_and(|r| r.status().is_success());
-            }
-            if ready {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        panic!("node at {} did not become ready", self.public);
-    }
-}
-
-impl Drop for Node {
-    fn drop(&mut self) {
-        let group = format!("-{}", self.child.id());
-        let _ = Command::new("kill").args(["-TERM", "--", &group]).status();
-        let deadline = Instant::now() + Duration::from_secs(45);
-        while Instant::now() < deadline {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
-        let _ = self.child.wait();
-    }
 }
 
 fn write_json(settings: &Settings, results: &[ScenarioResult]) {
