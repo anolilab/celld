@@ -348,6 +348,13 @@ impl Registry {
             }
         };
         drop(waiting);
+        tracing::info!(
+            event = "registry_wait",
+            cell,
+            waited_ms = crate::asyncrt::mono_ms().saturating_sub(started),
+            covered = outcome.is_ok(),
+            "a first write waited for registry coverage"
+        );
         outcome
     }
 

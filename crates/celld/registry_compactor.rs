@@ -691,11 +691,16 @@ impl Registry {
     /// Watch the root and hold the role when the rules say so, until `stop`.
     pub(crate) async fn run_compactor(self: Arc<Self>, stop: crate::ltx_repl::StopToken) {
         let mut checked_lease: Option<(u64, Option<bool>)> = None;
+        let mut first = true;
         loop {
-            crate::asyncrt::select_biased! {
-                "a stop request wins a tie with the watch tick";
-                _ = stop.stopped() => return,
-                _ = crate::asyncrt::sleep(Duration::from_millis(1_000)) => {}
+            // The first look is at once, so a node that starts into an empty
+            // bucket has a holder before its first write needs coverage.
+            if !std::mem::take(&mut first) {
+                crate::asyncrt::select_biased! {
+                    "a stop request wins a tie with the watch tick";
+                    _ = stop.stopped() => return,
+                    _ = crate::asyncrt::sleep(Duration::from_millis(1_000)) => {}
+                }
             }
             let now = crate::asyncrt::mono_ms();
             let idle = now.saturating_sub(self.last_read_ms());
@@ -744,8 +749,13 @@ impl Registry {
             let reg::Role::Take { by_stuck } = decision else {
                 continue;
             };
-            let jitter =
-                rand::RngCore::next_u32(&mut crate::asyncrt::rng("registry_takeover")) % 1_000;
+            // With no root at all the create-only write arbitrates, so there is
+            // nothing to stagger.
+            let jitter = if view.is_none() {
+                0
+            } else {
+                rand::RngCore::next_u32(&mut crate::asyncrt::rng("registry_takeover")) % 1_000
+            };
             crate::asyncrt::select_biased! {
                 "a stop request wins a tie with the takeover jitter";
                 _ = stop.stopped() => return,
