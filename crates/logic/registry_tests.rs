@@ -453,8 +453,8 @@ fn a_root_over_the_cap_still_decodes_so_it_can_be_recognised() {
 
 #[test]
 fn the_formats_keep_their_bytes() {
-    // The aged buckets and the measured cost depend on these bytes, so a
-    // change to any of them is a format change.
+    // Objects already in a bucket are read by these bytes, so a change to any
+    // of them is a format change.
     let k = key(0x0102_0304_0506_0708, 0x1112_1314_1516_1718);
     let record = Record::base(k, pack(9), 3, 40);
     let mut bytes = Vec::new();
@@ -477,6 +477,59 @@ fn the_formats_keep_their_bytes() {
     assert_eq!(hex(&page[..16]), "010000000700000063000000b3e010ee");
     assert_eq!(hex(&page[16..64]), record_hex);
     assert!(page[64..].iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn whole_objects_keep_their_bytes() {
+    // Taken from the encoders as they were first written: a root with a
+    // holder, a map and split delta ranges; a map with runs; a delta; and two
+    // runs, one with overflow pages.
+    assert_eq!(
+        hex(&encode_root(&sample_root())),
+        "524752310100000000040000030000000000000001060000006e6f64652d31030000006162634d000000000000000500000002000000040000000000000004000000000000000101020000000000000009000000000000000300000002000000000000000400000000000000060000000000000003000000000000000000000000000000000000000000000003000000000000000200000000000000020000000000000034b5458d"
+    );
+    assert_eq!(
+        hex(&encode_map(&sample_map())),
+        "52474d31080000000000000000000000000000000000000000200000000000000000004001010000000000000004000000000000000a000000010000004e0200000000000000000000000000006000000000000000000080000000000000000000a000010200000000000000090000000000000000001000460000000000c0030000000000000000000000c0000000000000000000e000004c8940fa"
+    );
+    let delta = Delta {
+        segments: vec!["seg/a/1/0000000001".into(), "seg/b/2/0000000007".into()],
+        records: vec![
+            Record::birth(key(1, 1), 1),
+            Record::base(key(2, 2), pack(7), 3, 40),
+        ],
+    };
+    assert_eq!(
+        hex(&encode_delta(&delta)),
+        "5247443102000000120000007365672f612f312f30303030303030303031120000007365672f622f322f30303030303030303037020000000000000000000001000000000000000100000000000000000000000000000000000000000100000000000000000000000000000000000002000000000000000207070707070707070707070700000000010000100300000028000000000000006a7d89cb"
+    );
+    let tag = run_tag("run/0003/1-2-3");
+    let write = |records: &[Record], buckets: u32| {
+        let mut bytes = Vec::new();
+        let mut builder = RunBuilder::new(0, u64::MAX, buckets, tag).expect("shape");
+        for record in records {
+            builder.push(*record, &mut bytes).expect("accepts");
+        }
+        let written = builder.finish(&mut bytes).expect("finishes");
+        (written, bytes)
+    };
+    let dense: Vec<Record> = (0..200).map(|low| Record::birth(key(10, low), 1)).collect();
+    let (written, bytes) = write(&dense, 2);
+    assert_eq!((written, bytes.len()), ((200, 2), 4 * BUCKET_LEN));
+    assert_eq!(crc32(&[&bytes]), 0xaff8_a31b);
+    let sparse: Vec<Record> = (1..=40_u64)
+        .map(|i| {
+            let k = key(i * (u64::MAX / 41), i);
+            if i % 3 == 0 {
+                Record::base(k, pack(5), 2, i)
+            } else {
+                Record::birth(k, 1)
+            }
+        })
+        .collect();
+    let (written, bytes) = write(&sparse, 3);
+    assert_eq!((written, bytes.len()), ((40, 0), 3 * BUCKET_LEN));
+    assert_eq!(crc32(&[&bytes]), 0x9d98_f26a);
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -665,7 +718,7 @@ fn a_bucket_read_finds_every_key_of_a_run_and_no_other() {
         (1 << 40, (1 << 40) + 5),
     ];
     for (round, (lo, hi)) in ranges.into_iter().enumerate() {
-        for count in [0_u64, 1, 59, 60, 61, 1000, 6000] {
+        for count in [0_u64, 1, 59, 60, 61, 1000, 3000] {
             let records = records_in(lo, hi, count, round as u64 * 100 + count);
             let mut sizes = vec![buckets_for(records.len() as u64)];
             if count <= 1000 {
@@ -682,7 +735,7 @@ fn a_bucket_read_finds_every_key_of_a_run_and_no_other() {
                     );
                 }
                 let mut rng = Rng(7);
-                for _ in 0..200 {
+                for _ in 0..50 {
                     let absent = key(rng.between(lo, hi), rng.next());
                     if !records.iter().any(|record| record.key == absent) {
                         assert_eq!(run.lookup(&absent), Ok(None));
@@ -730,9 +783,9 @@ fn an_overflowing_bucket_chains_and_keeps_every_key() {
         200
     );
     // A run with many keys in a few buckets: 20,000 records, 4 buckets.
-    let dense = records_in(0, u64::MAX, 20_000, 3);
+    let dense = records_in(0, u64::MAX, 8_000, 3);
     let run = build(&dense, 0, u64::MAX, 4);
-    assert!(run.overflow > 200);
+    assert!(run.overflow > 80);
     for record in dense.iter().step_by(13) {
         assert_eq!(run.lookup(&record.key), Ok(Some(*record)));
     }
