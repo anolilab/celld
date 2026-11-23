@@ -22,12 +22,29 @@ use std::sync::{Arc, Mutex};
 struct OwnerWire<'a> {
     node: &'a str,
     epoch: u64,
+    /// The tag of the session that writes the record. Absent for a process
+    /// with `CELLD_LAZY_BIRTH=off`, so its bytes are those of an older binary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    by: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
 struct OwnerWireOwned {
     node: String,
     epoch: u64,
+    #[serde(default)]
+    by: Option<String>,
+}
+
+/// The session a node lease advertises: its tag, the tags of a preserved
+/// restart that it carries, and its mode. A lease with this field has the
+/// capability to read records that name a session.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct LeaseSessionWire {
+    pub(crate) tag: String,
+    #[serde(default)]
+    pub(crate) carried: Vec<String>,
+    pub(crate) mode: crate::session::Mode,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -59,6 +76,10 @@ pub(crate) struct NodeLeaseWire {
     pub(crate) log: Option<NodeLogWire>,
     #[serde(default)]
     pub(crate) load: NodeLoadWire,
+    /// The session of this process. Absent from an older binary and from a
+    /// process with `CELLD_LAZY_BIRTH=off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session: Option<LeaseSessionWire>,
 }
 
 // A separate, versioned key keeps advisory samples out of the node-lease
@@ -190,6 +211,8 @@ struct NodeLeaseWireRaw {
     log: Option<NodeLogWire>,
     #[serde(default)]
     load: NodeLoadWire,
+    #[serde(default)]
+    session: Option<LeaseSessionWire>,
 }
 
 impl From<NodeLeaseWireRaw> for NodeLeaseWire {
@@ -209,6 +232,7 @@ impl From<NodeLeaseWireRaw> for NodeLeaseWire {
             generation,
             log: raw.log,
             load: raw.load,
+            session: raw.session,
         }
     }
 }
@@ -617,7 +641,7 @@ impl BucketOwnership {
         let record = OwnerRecord {
             node: (!owner.node.is_empty()).then_some(owner.node),
             epoch: owner.epoch,
-            by: None,
+            by: owner.by,
             etag,
         };
         Ok(Some(record))
@@ -993,14 +1017,56 @@ impl BucketOwnership {
         let Some(current) = self.read_owner(cell).await? else {
             return Ok(CasOutcome::Rejected);
         };
-        if current.node.as_deref() != Some(self.node.as_str()) || current.epoch != epoch {
+        if !crate::session::names_this_process(&self.node, &current) || current.epoch != epoch {
             return Ok(CasOutcome::Rejected);
         }
         let key = format!("cells/{cell}/own.json");
-        let body = serde_json::to_vec(&OwnerWire { node: "", epoch })?;
+        let by = crate::session::current().map(|session| session.tag());
+        let body = serde_json::to_vec(&OwnerWire {
+            node: "",
+            epoch,
+            by: by.as_deref(),
+        })?;
         match self.bucket.put_cas(&key, body, Some(&current.etag)).await? {
             Some(_) => Ok(CasOutcome::Applied),
             None => Ok(CasOutcome::Rejected),
+        }
+    }
+
+    /// Replace the tag in the record of a cell that this process serves, and
+    /// nothing else: the record must name this node, `epoch` and `from`. One
+    /// conditional write; an answer that is an error is settled by one read,
+    /// and the write is never sent again.
+    pub async fn retag_owner(
+        &self,
+        cell: &str,
+        epoch: u64,
+        from: &str,
+        to: &str,
+    ) -> anyhow::Result<bool> {
+        let key = format!("cells/{cell}/own.json");
+        let names = |record: &OwnerRecord, by: &str| {
+            record.node.as_deref() == Some(self.node.as_str())
+                && record.epoch == epoch
+                && record.by.as_deref() == Some(by)
+        };
+        let Some(current) = self.read_owner(cell).await? else {
+            return Ok(false);
+        };
+        if !names(&current, from) {
+            return Ok(false);
+        }
+        let body = serde_json::to_vec(&OwnerWire {
+            node: &self.node,
+            epoch,
+            by: Some(to),
+        })?;
+        match self.bucket.put_cas(&key, body, Some(&current.etag)).await {
+            Ok(applied) => Ok(applied.is_some()),
+            Err(_) => Ok(self
+                .read_owner(cell)
+                .await?
+                .is_some_and(|record| names(&record, to))),
         }
     }
 
@@ -1011,9 +1077,12 @@ impl BucketOwnership {
         epoch: u64,
     ) -> anyhow::Result<CasOutcome> {
         let key = format!("cells/{cell}/own.json");
+        let session = crate::session::current();
+        let by = session.map(|session| session.tag());
         let body = serde_json::to_vec(&OwnerWire {
             node: &self.node,
             epoch,
+            by: by.as_deref(),
         })?;
         let etag = match &guard {
             CasGuard::Absent => None,
@@ -1021,6 +1090,10 @@ impl BucketOwnership {
         };
         match self.bucket.put_cas(&key, body, etag).await? {
             Some(_) => {
+                // The record now carries this process's own tag.
+                if let Some(session) = session {
+                    session.forget_resumed(cell);
+                }
                 // A create-only write is the cell's first claim, at epoch one:
                 // the record exists, and LTX can follow. Queueing the
                 // registration now lets the cell's first LTX write find its
@@ -1076,6 +1149,11 @@ impl BucketOwnership {
             // UNCHANGED: the full object lives in own_log, written only by
             // the log tier's own core-mediated updates.
             log,
+            session: crate::session::current().map(|session| LeaseSessionWire {
+                tag: session.tag(),
+                carried: session.tags().all().split_off(1),
+                mode: session.mode(),
+            }),
         })
         .map_err(|error| LeaseCasError::NotCommitted(error.into()))?;
         let etag = match &guard {
@@ -1231,7 +1309,11 @@ pub(crate) async fn load_node_lease(
             expires_ms: lease.expires_ms,
             peer_protocol: lease.peer_protocol,
             generation: lease.generation,
-            tags: Vec::new(),
+            tags: lease.session.map_or_else(Vec::new, |session| {
+                std::iter::once(session.tag)
+                    .chain(session.carried)
+                    .collect()
+            }),
             etag,
         }))
 }

@@ -10170,6 +10170,17 @@ fn op_do_id(
             return;
         }
         "unique" => {
+            // A session that is established mints `tag || counter` in the
+            // tagged domain; every other process mints random bytes.
+            if let Some(minted) = crate::session::current().and_then(|session| session.mint(&key)) {
+                crate::storage_counters::id_minted(&minted);
+                rv.set(
+                    v8::String::new(scope, &durable_object_id_hex(&minted))
+                        .unwrap()
+                        .into(),
+                );
+                return;
+            }
             if getrandom::fill(&mut id[..16]).is_err() {
                 throw_durable_object_id_error(scope, "secure random generation failed");
                 return;
@@ -10184,10 +10195,7 @@ fn op_do_id(
                 );
                 return;
             };
-            if durable_object_id_hmac(&key, &decoded[..16])
-                .verify_truncated_left(&decoded[16..])
-                .is_err()
-            {
+            if crate::session::check_id(crate::session::current(), &key, &decoded).is_err() {
                 throw_durable_object_id_error(
                     scope,
                     "Durable Object ID is not valid for this namespace",

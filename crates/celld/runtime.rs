@@ -15,8 +15,10 @@ pub(crate) use crate::engine_api::StopMode;
 use crate::generation::{Generation, GenerationId};
 use crate::js::{self, CellJob, CellStorage, HttpResponse, Worker, WorkerConfig};
 
+pub use crate::clean_reload::take_clean_reload;
 pub use crate::clean_reload::take_clean_reload_generation;
 pub use crate::clean_reload::write_clean_reload_marker;
+pub use crate::clean_reload::ReloadSession;
 pub use crate::engine_api::admission_wait;
 pub use crate::engine_api::AlarmObserver;
 pub use crate::engine_api::RuntimeFetch;
