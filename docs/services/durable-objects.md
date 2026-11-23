@@ -10,15 +10,19 @@ for the standard API.
 
 The [counter example](../../examples/counter) keeps a counter in the key-value
 storage of a Durable Object, and it uses `idFromName()` to give each name a
-separate counter.
+separate counter. A name that the caller already has is the case for
+`idFromName()`; to create a new object per session, see
+[Create a new agent with `newUniqueId()`](#create-a-new-agent-with-newuniqueid).
 
 <!-- celld-example: counter -->
 
 ## API
 
-- `env.COUNTER.idFromName(name)` returns an id, and `env.COUNTER.get(id)`
-  returns a stub. `getByName(name)` performs both steps.
-- `newUniqueId()` and `idFromString()` create and parse a random id.
+- `env.AGENT.newUniqueId()` creates a new object with a random id, and
+  `env.AGENT.get(id)` returns a stub. `id.toString()` and `idFromString()`
+  convert the id to text and back.
+- `env.COUNTER.idFromName(name)` returns the id for a stable name, and
+  `getByName(name)` performs both steps.
 - `ctx.storage.get()`, `put()`, `delete()`, `list()`, and `deleteAll()` are
   the key-value methods.
 - `ctx.storage.sql.exec()` runs SQL on the database of the object.
@@ -43,6 +47,49 @@ routes correctly.
 `newUniqueId()` draws random bytes, so keep its `toString()` form to reach the
 object again. `idFromString()` verifies the HMAC, so celld refuses an id from a
 different namespace.
+
+### Create a new agent with `newUniqueId()`
+
+`newUniqueId()` is the default way to create a new agent: one object per
+session, conversation, upload, or job. Make the first call to the object in
+the same request that creates the id, and return `id.toString()` so that the
+client can come back to the object later.
+
+```js
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === "/agents") {
+      const id = env.AGENT.newUniqueId();
+      // The first call to the new object happens in this request.
+      const stub = env.AGENT.get(id);
+      const init = await stub.fetch("https://agent/init", { method: "POST", body: await request.text() });
+      if (!init.ok) return init;
+      return Response.json({ id: id.toString() });
+    }
+    // Check here that the caller may use this agent; see below.
+    const id = env.AGENT.idFromString(url.searchParams.get("id"));
+    return env.AGENT.get(id).fetch(request);
+  },
+};
+```
+
+An id is a reference, not a permission: anyone who holds `id.toString()` can
+reach the object through a route like the one above. For a private session or
+conversation, authenticate the caller and check that it may use that id before
+forwarding, for example by storing the owner with the id.
+
+Use `idFromName()` when the caller already has a stable name for the object,
+such as a room name or a user key, so that every request derives the same id
+and no one has to store it. `idFromName()` stays supported and is the right
+choice in that case.
+
+Calling the new object in the request that creates its id is the recommended
+pattern, because celld can then set the object up as part of that request. celld
+also supports ids that are minted ahead of time in batches, or handed out and
+first used much later, such as after the node restarted. Those first calls
+work, but they take a slower path and cost more bucket requests than a first
+call in the request that minted the id.
 
 A rename of the Worker script therefore reaches new, empty objects, and the old
 objects keep their storage under the old ids.
