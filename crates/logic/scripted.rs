@@ -92,6 +92,7 @@ impl Shell {
                 peer_protocol: 1,
                 generation: generation.into(),
                 log_state: None,
+                tags: Vec::new(),
                 etag: "previous-etag".into(),
             })),
         });
@@ -180,6 +181,7 @@ impl Shell {
                     result: Ok(self.owners.get(&cell).map(|epoch| OwnerRecord {
                         node: Some(self.state.node().to_string()),
                         epoch: *epoch,
+                        by: None,
                         etag: format!("etag-{epoch}"),
                     })),
                 },

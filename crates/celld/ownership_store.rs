@@ -617,6 +617,7 @@ impl BucketOwnership {
         let record = OwnerRecord {
             node: (!owner.node.is_empty()).then_some(owner.node),
             epoch: owner.epoch,
+            by: None,
             etag,
         };
         Ok(Some(record))
@@ -1230,6 +1231,7 @@ pub(crate) async fn load_node_lease(
             expires_ms: lease.expires_ms,
             peer_protocol: lease.peer_protocol,
             generation: lease.generation,
+            tags: Vec::new(),
             etag,
         }))
 }

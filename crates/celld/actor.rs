@@ -357,6 +357,7 @@ impl Ownership {
                         OwnerRecord {
                             node: Some(node),
                             epoch,
+                            by: None,
                             etag,
                         },
                     );
@@ -393,6 +394,7 @@ impl Ownership {
                         OwnerRecord {
                             node: None,
                             epoch,
+                            by: None,
                             etag,
                         },
                     );

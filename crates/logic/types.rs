@@ -188,6 +188,9 @@ pub struct OwnerRecord {
     pub node: Option<NodeId>,
     pub epoch: Epoch,
     pub etag: String,
+    /// The tag of the session that wrote the record. `None` is a record of a
+    /// binary that wrote no session, which is compared by node name.
+    pub by: Option<String>,
 }
 
 /// The routing and authority fields read from `nodes/<node>.json`.
@@ -208,6 +211,11 @@ pub struct NodeLeaseRecord {
     /// a fleet log — it never acked past the bucket. Anything not sealed
     /// gates a takeover of this node's cells behind node-log recovery.
     pub log_state: Option<crate::log_tier::LogState>,
+    /// The session tags this process carries: its own first, then the carried
+    /// set of a preserved restart. Empty for a process that writes no session
+    /// (an older binary, or `CELLD_LAZY_BIRTH=off`), which leaves its records
+    /// to be compared by node name.
+    pub tags: Vec<String>,
     /// Object version observed by the read. Empty only in synthetic events.
     pub etag: String,
 }
