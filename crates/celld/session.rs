@@ -527,7 +527,7 @@ impl Session {
     pub async fn seal(&self, bucket: &Bucket) -> anyhow::Result<()> {
         self.closed.store(true, Ordering::SeqCst);
         let gather = self.granted.lock().expect("granted poisoned").clone();
-        store::seal_session(bucket, &self.tag(), &gather).await
+        store::seal_session(bucket, &self.tag(), &gather, &BTreeSet::new()).await
     }
 }
 
@@ -543,7 +543,7 @@ pub async fn seal_predecessor(bucket: &Bucket, node: &str, generation: &str) -> 
     let lease: crate::ownership_store::NodeLeaseWire = serde_json::from_slice(&bytes)?;
     match lease.session {
         Some(session) if lease.generation != generation => {
-            store::seal_session(bucket, &session.tag, &BTreeSet::new()).await
+            store::seal_session(bucket, &session.tag, &BTreeSet::new(), &BTreeSet::new()).await
         }
         _ => Ok(()),
     }

@@ -818,6 +818,10 @@ impl LiveLogTransition<'_> {
 //                  u8 complete u32 count entry*
 //   entry:         "CLE1" u64 seq u16 cell_len cell u64 cell_epoch
 //                  u64 txid u32 len bytes
+//   mark entry:    "CLG1", the same fields with txid `MARK_TXID`: a mark of the
+//                  session (a `Grant`) is not a row. A decoder that does not know
+//                  the magic rejects the whole body, so marks are appended only
+//                  while every member of the ensemble advertises the capability.
 
 const APPEND_MAGIC: &[u8; 4] = b"CLA1";
 // Keep distinct layouts and decoded variants: reading an old peer's entries
@@ -825,6 +829,10 @@ const APPEND_MAGIC: &[u8; 4] = b"CLA1";
 const LEGACY_TAIL_MAGIC: &[u8; 4] = b"CLT1";
 const TAIL_MAGIC: &[u8; 4] = b"CLT2";
 const ENTRY_MAGIC: &[u8; 4] = b"CLE1";
+const MARK_MAGIC: &[u8; 4] = b"CLG1";
+
+/// The `txid` of a mark entry, which no transaction has.
+pub const MARK_TXID: u64 = u64::MAX;
 
 pub struct Entry {
     pub seq: u64,
@@ -894,9 +902,20 @@ fn take_string(buf: &mut &[u8], what: &str) -> anyhow::Result<String> {
         .to_string())
 }
 
+impl Entry {
+    /// Whether this is a mark of the session and not a row of a cell.
+    pub fn is_mark(&self) -> bool {
+        self.txid == MARK_TXID
+    }
+}
+
 #[doc(hidden)]
 pub fn encode_entry(entry: &Entry, out: &mut Vec<u8>) {
-    out.extend_from_slice(ENTRY_MAGIC);
+    out.extend_from_slice(if entry.is_mark() {
+        MARK_MAGIC
+    } else {
+        ENTRY_MAGIC
+    });
     out.extend_from_slice(&entry.seq.to_le_bytes());
     out.extend_from_slice(&(entry.cell.len() as u16).to_le_bytes());
     out.extend_from_slice(entry.cell.as_bytes());
@@ -907,7 +926,9 @@ pub fn encode_entry(entry: &Entry, out: &mut Vec<u8>) {
 }
 
 fn decode_entry(buf: &mut &[u8]) -> anyhow::Result<Entry> {
-    if take(buf, 4, "entry magic")? != ENTRY_MAGIC {
+    let magic = take(buf, 4, "entry magic")?;
+    let mark = magic == MARK_MAGIC;
+    if magic != ENTRY_MAGIC && !mark {
         return Err(anyhow!("log wire: bad entry magic"));
     }
     let seq = take_u64(buf, "entry seq")?;
@@ -916,6 +937,10 @@ fn decode_entry(buf: &mut &[u8]) -> anyhow::Result<Entry> {
     let txid = take_u64(buf, "entry txid")?;
     let len = take_u32(buf, "entry len")? as usize;
     let bytes = take(buf, len, "entry bytes")?.to_vec();
+    anyhow::ensure!(
+        mark == (txid == MARK_TXID),
+        "log wire: a mark and a row differ by txid"
+    );
     Ok(Entry {
         seq,
         cell,
@@ -4990,6 +5015,8 @@ impl NodeLogManager {
             // possible fleet acknowledgements may declare bounded loss.
             let mut inconclusive = 0_usize;
             let mut gathered: BTreeMap<(String, u64, u64), Vec<u8>> = BTreeMap::new();
+            // The cells whose `Grant` the followers hold.
+            let mut granted_marks: BTreeSet<String> = BTreeSet::new();
             // "A blink is not death" applies to loss declaration too: a
             // member whose lease merely lapsed (a restart, a fleet-wide
             // power cycle) is NOT conclusively gone — its fsync'd fragments
@@ -5146,6 +5173,10 @@ impl NodeLogManager {
                     }
                 }
                 for entry in tail.entries {
+                    if entry.is_mark() {
+                        granted_marks.insert(entry.cell);
+                        continue;
+                    }
                     gathered.insert((entry.cell, entry.cell_epoch, entry.txid), entry.bytes);
                 }
             }
@@ -5325,8 +5356,13 @@ impl NodeLogManager {
             // The dead session's header and chunks are sealed after the gather
             // and before its log record is marked sealed.
             if let Some(session) = wire.session.as_ref() {
-                crate::session_store::seal_session(&self.bucket, &session.tag, &BTreeSet::new())
-                    .await?;
+                crate::session_store::seal_session(
+                    &self.bucket,
+                    &session.tag,
+                    &BTreeSet::new(),
+                    &granted_marks,
+                )
+                .await?;
             }
             // The record is re-read for the token the beats moved.
             let mut sealed = false;
@@ -6930,7 +6966,7 @@ impl NodeLogManager {
                 );
             }
             for entry in tail.entries {
-                if entry.cell != cell {
+                if entry.cell != cell || entry.is_mark() {
                     continue;
                 }
                 gathered
@@ -7052,5 +7088,87 @@ mod seal_absent_log_tests {
             seal_absent_log(&bucket, "dead").await.unwrap();
             assert!(bucket.get(&lease_key("dead")).await.unwrap().is_none());
         });
+    }
+}
+
+#[cfg(test)]
+mod mark_wire_tests {
+    use super::*;
+
+    fn row() -> Entry {
+        Entry {
+            seq: 7,
+            cell: "C:ab".into(),
+            cell_epoch: 3,
+            txid: 9,
+            bytes: vec![1, 2, 3],
+        }
+    }
+
+    fn mark() -> Entry {
+        Entry {
+            seq: 8,
+            cell: "C:ab".into(),
+            cell_epoch: 1,
+            txid: MARK_TXID,
+            bytes: vec![b'G'],
+        }
+    }
+
+    /// A row is encoded as before marks existed: the bytes of a node with the
+    /// flag `off` are unchanged.
+    #[test]
+    fn a_row_keeps_its_bytes() {
+        let mut out = Vec::new();
+        encode_entry(&row(), &mut out);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"CLE1");
+        expected.extend_from_slice(&7_u64.to_le_bytes());
+        expected.extend_from_slice(&4_u16.to_le_bytes());
+        expected.extend_from_slice(b"C:ab");
+        expected.extend_from_slice(&3_u64.to_le_bytes());
+        expected.extend_from_slice(&9_u64.to_le_bytes());
+        expected.extend_from_slice(&3_u32.to_le_bytes());
+        expected.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn a_mark_has_its_own_magic_and_round_trips_in_an_append_and_a_tail() {
+        let mut out = Vec::new();
+        encode_entry(&mark(), &mut out);
+        assert_eq!(&out[..4], b"CLG1");
+        let request = AppendReq {
+            leader: "n/g".into(),
+            epoch: 1,
+            truncate_to: 0,
+            entries: vec![row(), mark()],
+        };
+        let decoded = decode_append(&encode_append(&request)).unwrap();
+        assert!(!decoded.entries[0].is_mark());
+        assert!(decoded.entries[1].is_mark());
+        assert_eq!(decoded.entries[1].cell, "C:ab");
+        // A decoder that only knows `CLE1` rejects the body: the first entry of
+        // a batch of marks is refused, and so is a mark behind a row.
+        let body = encode_append(&request);
+        let first_mark = body
+            .windows(4)
+            .position(|window| window == b"CLG1")
+            .expect("a mark in the body");
+        let mut old = body.clone();
+        old[first_mark + 3] = b'E';
+        assert!(decode_append(&old).is_err(), "a mark is not a row");
+    }
+
+    #[test]
+    fn a_row_cannot_pose_as_a_mark_or_the_reverse() {
+        let mut out = Vec::new();
+        encode_entry(&mark(), &mut out);
+        out[..4].copy_from_slice(b"CLE1");
+        assert!(decode_entry(&mut out.as_slice()).is_err());
+        let mut out = Vec::new();
+        encode_entry(&row(), &mut out);
+        out[..4].copy_from_slice(b"CLG1");
+        assert!(decode_entry(&mut out.as_slice()).is_err());
     }
 }

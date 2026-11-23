@@ -307,6 +307,32 @@ async fn seal_chunk(
     anyhow::bail!("sealing {} lost every race", chunk_key(tag, chunk))
 }
 
+/// The counters of the cells in `marks` that carry `tag`, read with the key in
+/// the header. A header without a usable key reads none.
+fn counters_of_marks(header: &Header, tag: &str, marks: &BTreeSet<String>) -> BTreeSet<u64> {
+    let key: Option<[u8; 32]> = (0..header.key.len() / 2)
+        .map(|i| u8::from_str_radix(header.key.get(2 * i..2 * i + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()
+        .and_then(|bytes| bytes.try_into().ok());
+    let Some(key) = key else {
+        return BTreeSet::new();
+    };
+    marks
+        .iter()
+        .filter_map(|scope| {
+            let (_, id) = scope.rsplit_once(':')?;
+            let id = crate::engine_api::decode_durable_object_id(id)?;
+            if crate::session::hex(&id[..8]) != tag {
+                return None;
+            }
+            Some(crate::session::decrypt_counter(
+                &key,
+                id[8..16].try_into().ok()?,
+            ))
+        })
+        .collect()
+}
+
 /// The seal of a session, in the order that fixes what the gather found
 /// (steps 2, 4 and 5 of the seal): close the header, seal each counted chunk,
 /// seal the header. Any node may continue a seal that another began. A missing
@@ -314,13 +340,14 @@ async fn seal_chunk(
 /// it. A seal writes no `own.json`.
 ///
 /// `gather` holds the granted counters that the sealer knows and no chunk may
-/// hold yet: the session's own, at its graceful close. A seal of another
-/// session's header passes none, because this build records a grant in the chunk
-/// only.
+/// hold yet: the session's own, at its graceful close. `marks` holds the cells
+/// whose `Grant` a recoverer found on the followers; their counters are read
+/// with the key in the header and added to the gather.
 pub async fn seal_session(
     bucket: &Bucket,
     tag: &str,
     gather: &BTreeSet<u64>,
+    marks: &BTreeSet<String>,
 ) -> anyhow::Result<()> {
     let mut closed: Option<Header> = None;
     for _ in 0..6 {
@@ -363,8 +390,10 @@ pub async fn seal_session(
         }
     }
     let header = closed.with_context(|| format!("closing {} lost every race", header_key(tag)))?;
+    let mut gather = gather.clone();
+    gather.extend(counters_of_marks(&header, tag, marks));
     for chunk in 0..header.chunks {
-        seal_chunk(bucket, tag, chunk, gather).await?;
+        seal_chunk(bucket, tag, chunk, &gather).await?;
     }
     for _ in 0..6 {
         match read_header(bucket, tag).await? {
