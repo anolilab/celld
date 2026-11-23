@@ -160,6 +160,9 @@ pub enum RunError {
     BucketFull,
     /// More overflow pages than a bucket header can name.
     TooManyOverflowPages,
+    /// A bucket of this builder failed to be written, so its records are
+    /// gone from it; the run cannot be finished.
+    Failed,
 }
 
 impl fmt::Display for RunError {
@@ -170,6 +173,7 @@ impl fmt::Display for RunError {
             Self::OutOfRange => "a key lies outside the run's range",
             Self::BucketFull => "more records than a bucket holds",
             Self::TooManyOverflowPages => "more overflow pages than a header can name",
+            Self::Failed => "an earlier bucket of this run failed to be written",
         };
         out.write_str(what)
     }
@@ -639,6 +643,7 @@ pub struct RunBuilder {
     overflow: Vec<[u8; BUCKET_LEN]>,
     count: u64,
     last: Option<Key>,
+    failed: bool,
 }
 
 impl RunBuilder {
@@ -658,6 +663,7 @@ impl RunBuilder {
             overflow: Vec::new(),
             count: 0,
             last: None,
+            failed: false,
         })
     }
 
@@ -666,7 +672,18 @@ impl RunBuilder {
         self.count
     }
 
+    /// Write the current bucket. Its records leave the builder first, so a
+    /// failure here leaves the builder unusable: every later call fails.
     fn flush_bucket(&mut self, out: &mut Vec<u8>) -> Result<(), RunError> {
+        if self.failed {
+            return Err(RunError::Failed);
+        }
+        let result = self.write_bucket(out);
+        self.failed = result.is_err();
+        result
+    }
+
+    fn write_bucket(&mut self, out: &mut Vec<u8>) -> Result<(), RunError> {
         let records = std::mem::take(&mut self.pending);
         let main = records.len().min(BUCKET_CAPACITY);
         let chunks = records[main..].chunks(BUCKET_CAPACITY).count();
@@ -704,6 +721,9 @@ impl RunBuilder {
     /// is not above the last one, or whose key is outside the run's range, is
     /// refused: it could not be found at the bucket a lookup computes.
     pub fn push(&mut self, record: Record, out: &mut Vec<u8>) -> Result<(), RunError> {
+        if self.failed {
+            return Err(RunError::Failed);
+        }
         let top = top64(&record.key);
         if top < self.lo || top > self.hi {
             return Err(RunError::OutOfRange);
@@ -724,6 +744,9 @@ impl RunBuilder {
     /// The last main buckets and the overflow pages. Returns the records
     /// written and the number of overflow pages.
     pub fn finish(mut self, out: &mut Vec<u8>) -> Result<(u64, u32), RunError> {
+        if self.failed {
+            return Err(RunError::Failed);
+        }
         while self.next < self.buckets {
             self.flush_bucket(out)?;
         }
@@ -1192,6 +1215,7 @@ impl Map {
         Aim {
             lo: partition.lo,
             hi: self.hi(index),
+            level_no,
             level: if level_no == 1 {
                 partition.l1
             } else {
@@ -1209,6 +1233,9 @@ impl Map {
 pub struct Aim {
     pub lo: u64,
     pub hi: u64,
+    /// 1 or 2: the level is part of a run object's key, so two levels that
+    /// name equal run references still name different objects.
+    pub level_no: u8,
     pub level: Level,
 }
 

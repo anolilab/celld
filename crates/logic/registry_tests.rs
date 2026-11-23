@@ -1717,3 +1717,36 @@ fn a_faulty_writer_that_drops_a_key_fails_the_check() {
         Err(MergeCheckError::Inputs { .. })
     ));
 }
+
+#[test]
+fn equal_runs_in_both_levels_are_separate_aims() {
+    let run = Level::Run(RunRef {
+        epoch: 1,
+        id: 7,
+        buckets: 4,
+        overflow: 0,
+        records: 10,
+    });
+    let mut map = Map::empty(4);
+    let probe = key(u64::MAX / 2 + 10, 0);
+    let index = map.partition_for(&probe);
+    map.partitions[index].l1 = run;
+    map.partitions[index].l2 = run;
+    assert_ne!(map.aim(&probe, 1), map.aim(&probe, 2));
+}
+
+#[test]
+fn a_run_builder_whose_bucket_failed_cannot_finish() {
+    let mut builder = RunBuilder::new(0, u64::MAX, 4, 1).expect("a shape");
+    let mut out = Vec::new();
+    builder
+        .push(Record::birth(key(1, 1), 1), &mut out)
+        .expect("a record");
+    // A failed bucket write took its records out of the builder.
+    builder.failed = true;
+    assert_eq!(
+        builder.push(Record::birth(key(u64::MAX, 1), 1), &mut out),
+        Err(RunError::Failed)
+    );
+    assert_eq!(builder.finish(&mut out), Err(RunError::Failed));
+}
