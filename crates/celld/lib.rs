@@ -86,6 +86,7 @@ pub mod runtime;
 pub mod secret_cli;
 pub mod secrets;
 pub mod session;
+pub mod session_store;
 pub mod smtp;
 pub(crate) mod sql_fingerprint;
 pub(crate) mod sql_limits;

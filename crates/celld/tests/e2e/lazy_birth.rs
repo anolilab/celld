@@ -234,3 +234,130 @@ async fn a_cell_resident_through_two_preserved_restarts_still_acknowledges_and_d
     let record = own_record(server.project());
     assert_eq!(record["epoch"], 1, "{record}");
 }
+
+fn counter_of(header: &Value, id: &str) -> u64 {
+    let unhex = |text: &str| -> Vec<u8> {
+        (0..text.len() / 2)
+            .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).expect("hex"))
+            .collect()
+    };
+    let key: [u8; 32] = unhex(header["key"].as_str().expect("a key"))
+        .try_into()
+        .expect("32 bytes");
+    celld::session::decrypt_counter(&key, unhex(&id[16..32]).try_into().expect("8 bytes"))
+}
+
+fn headers(project: &Path) -> Vec<(String, Value)> {
+    bodies(project, "%fleet/sessions/%.json")
+}
+
+fn tag_of_key(key: &str) -> String {
+    key.rsplit('/')
+        .next()
+        .and_then(|name| name.strip_suffix(".json"))
+        .expect("a tag")
+        .to_string()
+}
+
+/// In `shadow`, the sealed chunk of a session holds exactly the ids whose
+/// create-only record applied, once the next process started; the header of an
+/// ended session is sealed and only the current one is open.
+#[tokio::test]
+async fn a_sealed_chunk_holds_exactly_the_ids_that_got_a_record() {
+    let mut server = Server::start("do-ids", SHADOW).await;
+    let ids = minted(&server).await;
+    let (tag, header) = header_tag(server.project());
+    assert_eq!(header["chunks"], 1);
+    assert_eq!(bump(&server, &ids[0]).await, 1);
+    assert_eq!(bump(&server, &ids[2]).await, 1);
+    // A second use of an id adds nothing.
+    assert_eq!(bump(&server, &ids[2]).await, 2);
+    server.restart().await;
+    let sealed = headers(server.project());
+    assert_eq!(sealed.len(), 2, "{sealed:?}");
+    for (key, body) in &sealed {
+        let state = if tag_of_key(key) == tag {
+            "sealed"
+        } else {
+            "open"
+        };
+        assert_eq!(body["state"], state, "{key}: {body}");
+    }
+    let chunks = bodies(server.project(), &format!("%fleet/sessions/{tag}/c/%"));
+    assert_eq!(chunks.len(), 1);
+    let chunk = &chunks[0].1;
+    assert_eq!(chunk["state"], "sealed", "{chunk}");
+    let granted: Vec<u64> = chunk["granted"]
+        .as_array()
+        .expect("granted")
+        .iter()
+        .map(|counter| counter.as_u64().expect("a counter"))
+        .collect();
+    let expected = vec![counter_of(&header, &ids[0]), counter_of(&header, &ids[2])];
+    assert_eq!(granted, expected, "{chunk}");
+    assert!(chunk.get("unknown").is_none());
+}
+
+/// A header that is missing is created again as sealed and lost, a counted
+/// chunk that is missing as sealed and unknown, and the next process starts.
+#[tokio::test]
+async fn a_lost_session_object_is_sealed_as_lost_or_unknown_and_the_node_starts() {
+    let mut server = Server::start("do-ids", SHADOW).await;
+    let ids = minted(&server).await;
+    let (first, _) = header_tag(server.project());
+    assert_eq!(bump(&server, &ids[0]).await, 1);
+    server
+        .restart_after(|project| {
+            let store = store(project);
+            // The predecessor's seal never happened: open the header again and
+            // lose its chunk.
+            let body: Vec<u8> = store
+                .query_row(
+                    "SELECT body FROM objects WHERE key LIKE '%fleet/sessions/%.json'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("the header");
+            let mut header: Value = serde_json::from_slice(&body).expect("a header");
+            header["state"] = "open".into();
+            store
+                .execute(
+                    "UPDATE objects SET body = ?1 WHERE key LIKE '%fleet/sessions/%.json'",
+                    [serde_json::to_vec(&header).expect("encode")],
+                )
+                .expect("reopen the header");
+            store
+                .execute("DELETE FROM objects WHERE key LIKE '%/c/0'", [])
+                .expect("lose the chunk");
+        })
+        .await;
+    assert_eq!(bump(&server, &ids[0]).await, 2, "the node serves again");
+    let chunks = bodies(server.project(), &format!("%fleet/sessions/{first}/c/%"));
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].1["state"], "sealed");
+    assert_eq!(chunks[0].1["unknown"], true, "{:?}", chunks[0].1);
+    // Now lose the header of the session that just ended.
+    let second = headers(server.project())
+        .iter()
+        .map(|(key, _)| tag_of_key(key))
+        .find(|tag| *tag != first)
+        .expect("the second session");
+    server
+        .restart_after(|project| {
+            store(project)
+                .execute(
+                    "DELETE FROM objects WHERE key LIKE ?1",
+                    [format!("%fleet/sessions/{second}.json")],
+                )
+                .expect("lose the header");
+        })
+        .await;
+    assert_eq!(bump(&server, &ids[0]).await, 3, "the node serves again");
+    let lost: Vec<_> = headers(server.project())
+        .into_iter()
+        .filter(|(key, _)| tag_of_key(key) == second)
+        .collect();
+    assert_eq!(lost.len(), 1);
+    assert_eq!(lost[0].1["state"], "sealed");
+    assert_eq!(lost[0].1["lost"], true, "{:?}", lost[0].1);
+}

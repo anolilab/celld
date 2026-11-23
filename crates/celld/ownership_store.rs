@@ -638,6 +638,14 @@ impl BucketOwnership {
         let Some((owner, etag)) = load_json::<OwnerWireOwned>(&self.bucket, &key).await? else {
             return Ok(None);
         };
+        // A record of epoch 1 that this session wrote proves that its
+        // create-only write applied, also when the answer to the write was an
+        // error: the id is granted.
+        if let (Some(session), Some(by)) = (crate::session::current(), owner.by.as_deref()) {
+            if owner.epoch == 1 && by == session.tag() && owner.node == self.node {
+                session.grant_scope(cell);
+            }
+        }
         let record = OwnerRecord {
             node: (!owner.node.is_empty()).then_some(owner.node),
             epoch: owner.epoch,
@@ -1100,6 +1108,11 @@ impl BucketOwnership {
                 // registration now lets the cell's first LTX write find its
                 // segment already written. A claim whose answer was lost, or
                 // that reaches LTX another way, registers when it writes.
+                if matches!(guard, CasGuard::Absent) && epoch == 1 {
+                    if let Some(session) = session {
+                        session.grant_scope(cell);
+                    }
+                }
                 if matches!(guard, CasGuard::Absent) {
                     if let Some(directory) = &self.cell_directory {
                         directory.register_at_claim(cell);

@@ -17,6 +17,7 @@ use crate::bucket::Bucket;
 use crate::engine_api::{
     durable_object_id_key, namespace_key, tagged_object_id, verify_object_id, IdKind,
 };
+use crate::session_store::{self as store, Chunk, Header, CHUNK};
 use anyhow::Context;
 use celld_logic::session::SessionTags;
 use celld_logic::OwnerRecord;
@@ -72,6 +73,16 @@ pub struct Session {
     /// header, which nodes read and clients never see, so an id minted by this
     /// session cannot be guessed from another id.
     counter_key: [u8; 32],
+    /// Chunks counted in the header. An id is minted only for a counter whose
+    /// chunk is counted; a process without a bucket has no chunks and no limit.
+    counted: AtomicU64,
+    /// The counters whose create-only record applied, and the chunks that hold
+    /// a counter the bucket does not know yet.
+    granted: Mutex<BTreeSet<u64>>,
+    dirty: Mutex<BTreeSet<u64>>,
+    /// The session stopped granting: its header closed, or its seal began.
+    closed: AtomicBool,
+    held: tokio::sync::Mutex<Held>,
     /// The next counter to issue: every counter below it was issued.
     issued: AtomicU64,
     /// The header is written and the lease can carry the tag; minting waits
@@ -108,6 +119,11 @@ impl Session {
             counter_key,
             tags: SessionTags::new(&hex(&tag), marker),
             issued: AtomicU64::new(0),
+            counted: AtomicU64::new(u64::MAX),
+            granted: Mutex::default(),
+            dirty: Mutex::default(),
+            closed: AtomicBool::new(false),
+            held: tokio::sync::Mutex::default(),
             established: AtomicBool::new(false),
             resumed: Mutex::default(),
         }
@@ -137,10 +153,14 @@ impl Session {
     /// The next id of this session, or `None` before the session is
     /// established.
     pub(crate) fn mint(&self, key: &[u8; 32]) -> Option<[u8; 32]> {
-        if !self.is_established() {
+        if !self.is_established() || self.is_closed() {
             return None;
         }
         let counter = self.issued.fetch_add(1, Ordering::SeqCst);
+        let counted = self.counted.load(Ordering::SeqCst);
+        if counted != u64::MAX && counter / CHUNK >= counted {
+            return None;
+        }
         let block = encrypt_counter(&self.counter_key, counter);
         Some(tagged_object_id(key, self.tag, block))
     }
@@ -322,69 +342,210 @@ fn tag_of_scope(scope: &str) -> Option<String> {
         })
 }
 
-#[derive(Serialize, Deserialize)]
-struct HeaderWire {
-    node: String,
-    generation: String,
-    mode: Mode,
-    state: String,
-    chunks: u64,
-    rev: u64,
-    /// The key that encrypts the counters of this session's ids, as hex.
-    key: String,
+/// What the session holds of its objects in the bucket: its header and chunks
+/// as it last wrote them, with the tokens of those writes.
+#[derive(Default)]
+pub(crate) struct Held {
+    header: Option<(Header, String)>,
+    chunks: BTreeMap<u64, (Chunk, String)>,
 }
 
-pub(crate) fn header_key(tag: &str) -> String {
-    format!("fleet/sessions/{tag}.json")
+/// How often the session writes the chunks that changed.
+pub fn checkpoint_interval() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("CELLD_LAZY_BIRTH_CHECKPOINT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(30_000),
+    )
 }
 
-/// Create the header of `session` with a create-only write. An answer that is
-/// an error is settled by a read: the header must name this node and
-/// generation, or the process does not start. The tag cannot change after the
-/// lease carries it, and a collision of 8 random bytes is not an event to plan
-/// for.
-pub async fn create_header(
-    bucket: &Bucket,
-    session: &Session,
-    node: &str,
-    generation: &str,
-) -> anyhow::Result<()> {
-    let key = header_key(&session.tag());
-    let wire = HeaderWire {
-        node: node.to_string(),
-        generation: generation.to_string(),
-        mode: session.mode,
-        state: "open".to_string(),
-        chunks: 0,
-        rev: 0,
-        key: hex(&session.counter_key),
-    };
-    let body = serde_json::to_vec(&wire)?;
-    let ours = |bytes: &[u8]| {
-        serde_json::from_slice::<HeaderWire>(bytes)
-            .is_ok_and(|found| found.node == node && found.generation == generation)
-    };
-    match bucket.put_cas(&key, body, None).await {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => {
-            let found = bucket.get(&key).await?;
-            anyhow::ensure!(
-                found.is_some_and(|(bytes, _)| ours(&bytes)),
-                "the session header {key} already exists and is not this process's"
-            );
-            Ok(())
+impl Session {
+    /// The start order from the header on: create the header (create-only),
+    /// create chunk 0 and count it in the header by compare-and-swap, and only
+    /// then establish the session, so no id is minted before its chunk is
+    /// counted. The caller has recovered and sealed the predecessor, and
+    /// installs the lease after this returns. An answer that is an error is
+    /// settled by a read; the tag cannot change once the lease carries it, and
+    /// a collision of 8 random bytes is not an event to plan for.
+    pub async fn open(&self, bucket: &Bucket, node: &str, generation: &str) -> anyhow::Result<()> {
+        let tag = self.tag();
+        let mut header = Header {
+            node: node.to_string(),
+            generation: generation.to_string(),
+            mode: self.mode,
+            state: store::State::Open,
+            chunks: 0,
+            rev: 0,
+            key: hex(&self.counter_key),
+            lost: false,
+        };
+        let token = store::create_header(bucket, &tag, &header).await?;
+        let (chunk, chunk_token) = store::create_chunk(bucket, &tag, 0).await?;
+        header.chunks = 1;
+        header.rev = 1;
+        let token = store::swap_header(bucket, &tag, &header, &token)
+            .await?
+            .context("the session header changed before chunk 0 was counted")?;
+        {
+            let mut held = self.held.lock().await;
+            held.header = Some((header, token));
+            held.chunks.insert(0, (chunk, chunk_token));
         }
-        Err(error) => {
-            let found = bucket
-                .get(&key)
-                .await
-                .with_context(|| format!("read back {key} after: {error:#}"))?;
-            anyhow::ensure!(
-                found.is_some_and(|(bytes, _)| ours(&bytes)),
-                "could not create the session header {key}: {error:#}"
-            );
-            Ok(())
+        self.counted.store(1, Ordering::SeqCst);
+        self.established.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Count the next chunk once the counters run within half a chunk of the
+    /// last counted one. Minting returns random ids, as a process without a
+    /// session does, until the header write applied.
+    pub async fn ensure_chunk_ahead(&self, bucket: &Bucket) -> anyhow::Result<()> {
+        let counted = self.counted.load(Ordering::SeqCst);
+        if counted == u64::MAX || self.is_closed() {
+            return Ok(());
         }
+        if self.issued.load(Ordering::SeqCst) + CHUNK / 2 < counted * CHUNK {
+            return Ok(());
+        }
+        let tag = self.tag();
+        let (chunk, chunk_token) = store::create_chunk(bucket, &tag, counted).await?;
+        let mut held = self.held.lock().await;
+        let (mut header, token) = held.header.clone().context("the session is not open")?;
+        header.chunks = counted + 1;
+        header.rev += 1;
+        let Some(token) = store::swap_header(bucket, &tag, &header, &token).await? else {
+            self.closed.store(true, Ordering::SeqCst);
+            anyhow::bail!("the session header changed: the session stops granting");
+        };
+        held.header = Some((header, token));
+        held.chunks.insert(counted, (chunk, chunk_token));
+        self.counted.store(counted + 1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Record that the create-only record of the cell `scope` applied: the id's
+    /// counter is *granted*. The bit is set after the write returned, never
+    /// before. Idempotent, and a no-op for any id that this session did not
+    /// mint.
+    pub fn grant_scope(&self, scope: &str) {
+        if self.is_closed() {
+            return;
+        }
+        let Some(counter) = self.own_counter_of_scope(scope) else {
+            return;
+        };
+        if self
+            .granted
+            .lock()
+            .expect("granted poisoned")
+            .insert(counter)
+        {
+            self.dirty
+                .lock()
+                .expect("dirty poisoned")
+                .insert(counter / CHUNK);
+        }
+    }
+
+    /// The counter of a scope `Class:<64 hex digits>` whose id carries this
+    /// session's tag.
+    pub fn own_counter_of_scope(&self, scope: &str) -> Option<u64> {
+        let (_, id) = scope.rsplit_once(':')?;
+        let id = crate::engine_api::decode_durable_object_id(id)?;
+        if id[..8] != self.tag {
+            return None;
+        }
+        Some(decrypt_counter(
+            &self.counter_key,
+            id[8..16].try_into().ok()?,
+        ))
+    }
+
+    /// Whether the counter's grant is recorded in memory.
+    pub fn is_granted(&self, counter: u64) -> bool {
+        self.granted
+            .lock()
+            .expect("granted poisoned")
+            .contains(&counter)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Write the chunks whose bits changed, each by a compare-and-swap on the
+    /// token of this session's last write of it. A lost write reads the chunk:
+    /// a sealed one ends the session's grants, an open one replaces what the
+    /// session holds and is written again at the next checkpoint.
+    pub async fn checkpoint(&self, bucket: &Bucket) -> anyhow::Result<()> {
+        let tag = self.tag();
+        let dirty: Vec<u64> = self
+            .dirty
+            .lock()
+            .expect("dirty poisoned")
+            .iter()
+            .copied()
+            .collect();
+        for chunk in dirty {
+            let granted = self.granted.lock().expect("granted poisoned").clone();
+            let mut held = self.held.lock().await;
+            let Some((current, token)) = held.chunks.get(&chunk).cloned() else {
+                continue;
+            };
+            let mut next = current.clone();
+            next.granted
+                .extend(granted.range(chunk * CHUNK..(chunk + 1) * CHUNK));
+            if next == current {
+                self.dirty.lock().expect("dirty poisoned").remove(&chunk);
+                continue;
+            }
+            next.rev += 1;
+            match store::swap_chunk(bucket, &tag, chunk, &next, &token).await? {
+                Some(token) => {
+                    held.chunks.insert(chunk, (next, token));
+                    self.dirty.lock().expect("dirty poisoned").remove(&chunk);
+                }
+                None => match store::read_chunk(bucket, &tag, chunk).await? {
+                    store::Read::Found(found, token) if found.state == store::State::Open => {
+                        held.chunks.insert(chunk, (found, token));
+                    }
+                    _ => {
+                        self.closed.store(true, Ordering::SeqCst);
+                        anyhow::bail!(
+                            "chunk {chunk} is sealed or lost: the session stops granting"
+                        );
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
+
+    /// The graceful close: stop granting, then seal this session's header and
+    /// chunks with the grants that no chunk holds yet.
+    pub async fn seal(&self, bucket: &Bucket) -> anyhow::Result<()> {
+        self.closed.store(true, Ordering::SeqCst);
+        let gather = self.granted.lock().expect("granted poisoned").clone();
+        store::seal_session(bucket, &self.tag(), &gather).await
+    }
+}
+
+/// Seal the session whose tag the lease being replaced carries, before this
+/// process installs its own lease (the start order), also when that session
+/// never opened a log. A predecessor that sealed itself leaves nothing to do.
+/// This build records a grant in the chunk only, so the gather is empty.
+pub async fn seal_predecessor(bucket: &Bucket, node: &str, generation: &str) -> anyhow::Result<()> {
+    let key = format!("nodes/{node}.json");
+    let Some((bytes, _)) = bucket.get(&key).await? else {
+        return Ok(());
+    };
+    let lease: crate::ownership_store::NodeLeaseWire = serde_json::from_slice(&bytes)?;
+    match lease.session {
+        Some(session) if lease.generation != generation => {
+            store::seal_session(bucket, &session.tag, &BTreeSet::new()).await
+        }
+        _ => Ok(()),
     }
 }
 
@@ -656,6 +817,42 @@ mod tests {
         // Its own claim ends the resumption.
         session.forget_resumed("c");
         assert!(!names("c", 4, Some("old")));
+    }
+
+    #[test]
+    fn no_id_is_minted_for_a_chunk_that_is_not_counted() {
+        let session = Session::with_tag(Mode::Shadow, [2; 8], &[]);
+        session.counted.store(1, Ordering::SeqCst);
+        session.established.store(true, Ordering::SeqCst);
+        for _ in 0..CHUNK {
+            assert!(session.mint(&key()).is_some());
+        }
+        assert!(session.mint(&key()).is_none(), "chunk 1 is not counted");
+        session.counted.store(2, Ordering::SeqCst);
+        assert!(session.mint(&key()).is_some());
+        session.closed.store(true, Ordering::SeqCst);
+        assert!(
+            session.mint(&key()).is_none(),
+            "a closed session mints nothing"
+        );
+    }
+
+    #[test]
+    fn a_grant_is_recorded_once_for_an_id_of_this_session_only() {
+        let session = established([2; 8]);
+        let own = durable_object_id_hex(&session.mint(&key()).expect("established"));
+        let other = durable_object_id_hex(&tagged_object_id(&key(), [3; 8], [1; 8]));
+        let named = durable_object_id_hex(&durable_object_id_for_name(
+            &namespace_key(SCRIPT, CLASS),
+            "alpha",
+        ));
+        session.grant_scope(&format!("{CLASS}:{own}"));
+        session.grant_scope(&format!("{CLASS}:{other}"));
+        session.grant_scope(&format!("{CLASS}:{named}"));
+        session.grant_scope("not-a-scope");
+        assert!(session.is_granted(0));
+        assert_eq!(session.granted.lock().unwrap().len(), 1);
+        assert_eq!(session.dirty.lock().unwrap().len(), 1);
     }
 
     #[test]

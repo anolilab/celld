@@ -4579,15 +4579,29 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // before the lease that carries its tag is installed.
     if let Some(session) = celld::session::current() {
         if let Ownership::Bucket(bucket_ownership) = &actor.ownership {
-            celld::session::create_header(
-                &bucket_ownership.bucket_client(),
-                session,
-                &node,
-                &process_generation,
-            )
-            .await?;
+            let bucket = bucket_ownership.bucket_client();
+            celld::session::seal_predecessor(&bucket, &node, &process_generation).await?;
+            session.open(&bucket, &node, &process_generation).await?;
+            let bucket = Arc::new(bucket);
+            tokio::spawn(async move {
+                let interval = celld::session::checkpoint_interval();
+                let mut last = tokio::time::Instant::now();
+                while !session.is_closed() {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if let Err(error) = session.ensure_chunk_ahead(&bucket).await {
+                        tracing::warn!(%error, "session chunk");
+                    }
+                    if last.elapsed() >= interval {
+                        last = tokio::time::Instant::now();
+                        if let Err(error) = session.checkpoint(&bucket).await {
+                            tracing::warn!(%error, "session checkpoint");
+                        }
+                    }
+                }
+            });
+        } else {
+            session.establish();
         }
-        session.establish();
     }
     let mut durability_owner = durability_owner.select();
     let (do_call_tx, mut do_call_rx) = mpsc::unbounded_channel();

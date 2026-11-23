@@ -5322,6 +5322,12 @@ impl NodeLogManager {
                     .await?;
                 upload_ms += mono_ms().saturating_sub(upload_started);
             }
+            // The dead session's header and chunks are sealed after the gather
+            // and before its log record is marked sealed.
+            if let Some(session) = wire.session.as_ref() {
+                crate::session_store::seal_session(&self.bucket, &session.tag, &BTreeSet::new())
+                    .await?;
+            }
             // The record is re-read for the token the beats moved.
             let mut sealed = false;
             for _ in 0..3 {
@@ -5429,6 +5435,16 @@ impl NodeLogManager {
     /// recovery a whole epoch of already-drained bundles to re-fold.
     /// Best-effort: any failure leaves the record Open, and recovery
     /// does what it always does.
+    /// Seal the session's header and chunks when it has no log to seal. A
+    /// failure leaves them open for the next process to seal.
+    async fn seal_session_without_log(&self) {
+        if let Some(session) = crate::session::current() {
+            if let Err(error) = session.seal(&self.bucket).await {
+                eprintln!("node-log close: session seal failed: {error:#}");
+            }
+        }
+    }
+
     pub async fn close_gracefully(&self) {
         let shipper = {
             let mut transition = self.live_log.lock().await;
@@ -5441,7 +5457,12 @@ impl NodeLogManager {
             self.closing.store(true, Ordering::SeqCst);
             self.inner.lock().unwrap().clone()
         };
-        let Some(shipper) = shipper else { return };
+        let Some(shipper) = shipper else {
+            // No shipper: this session never acknowledged past the bucket, so
+            // nothing gates the seal of its header and chunks.
+            self.seal_session_without_log().await;
+            return;
+        };
         shipper.degrade("graceful shutdown");
         for _ in 0..50 {
             if self.ltx.all_shipped_tiered() {
@@ -5461,6 +5482,7 @@ impl NodeLogManager {
         // and buffered stdout may never flush before exit.
         let Some(current) = transition.current() else {
             eprintln!("node-log close: no folded log; nothing to seal");
+            self.seal_session_without_log().await;
             return;
         };
         let Ok(record) = log_from_wire(&current) else {
@@ -5494,6 +5516,14 @@ impl NodeLogManager {
                 record.epoch, record.state, shipper.epoch
             );
             return;
+        }
+        // The seal of the session's header and chunks comes before the log is
+        // marked sealed. A failure leaves both open for the next process.
+        if let Some(session) = crate::session::current() {
+            if let Err(error) = session.seal(&self.bucket).await {
+                eprintln!("node-log close: session seal failed: {error:#}");
+                return;
+            }
         }
         let sealed = log_tier::LogRecord {
             state: LogState::Sealed,
