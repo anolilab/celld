@@ -20,7 +20,7 @@ use crate::ownership_store::{BucketOwnership, OwnerForm};
 use crate::session::{self, decrypt_counter, hex};
 use crate::session_store::{self as store, Read, CHUNK};
 use celld_logic::session_take::{self as take, Take};
-use celld_logic::OwnerRecord;
+use celld_logic::{CasGuard, OwnerRecord};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -32,6 +32,26 @@ pub(crate) struct K5Plan {
     pub over: Vec<String>,
     pub tag: String,
     pub counter: u64,
+    /// The etag of the record that was judged, `None` for no record: the plan
+    /// applies only to the write that replaces exactly that record.
+    pub etag: Option<String>,
+}
+
+impl K5Plan {
+    /// Whether the plan belongs to a conditional write with this guard.
+    pub(crate) fn applies_to(&self, guard: &CasGuard) -> bool {
+        match (guard, &self.etag) {
+            (CasGuard::Absent, None) => true,
+            (CasGuard::Match(etag), Some(judged)) => etag == judged,
+            _ => false,
+        }
+    }
+
+    /// Whether the chunk already holds an entry for the cell that this plan
+    /// does not account for: its own nonce, or one it replaces.
+    pub(crate) fn conflicts_with(&self, taken: Option<&String>) -> bool {
+        taken.is_some_and(|taken| *taken != self.nonce && !self.over.contains(taken))
+    }
 }
 
 #[derive(Default)]
@@ -112,16 +132,18 @@ impl BucketOwnership {
         else {
             return Ok(Verdict::Proceed);
         };
-        let mut counter = 0;
-        if let Some(header) = header.as_ref().filter(|header| !header.lost) {
-            let key: Option<[u8; 32]> = unhex(&header.key).and_then(|key| key.try_into().ok());
-            let Some(key) = key else {
-                return Ok(Verdict::Refuse("session record lost"));
-            };
-            counter = decrypt_counter(&key, id[8..16].try_into().expect("8 bytes"));
-            if counter / CHUNK >= header.chunks {
-                return Ok(Verdict::Refuse("the id was never minted"));
-            }
+        // Without a readable header there is no counter, so no chunk is read and
+        // nothing is marked: the cell is refused.
+        let Some(header_ok) = header.as_ref().filter(|header| !header.lost) else {
+            return Ok(Verdict::Refuse("session record lost"));
+        };
+        let key: Option<[u8; 32]> = unhex(&header_ok.key).and_then(|key| key.try_into().ok());
+        let Some(key) = key else {
+            return Ok(Verdict::Refuse("session record lost"));
+        };
+        let counter = decrypt_counter(&key, id[8..16].try_into().expect("8 bytes"));
+        if counter / CHUNK >= header_ok.chunks {
+            return Ok(Verdict::Refuse("the id was never minted"));
         }
         let chunk = match store::read_chunk(&bucket, &tag, counter / CHUNK).await? {
             Read::Found(chunk, _) => Some(chunk),
@@ -145,11 +167,13 @@ impl BucketOwnership {
         if let (Some((record, form)), Some(entries)) = (record, cell_entries.as_mut()) {
             if let (Some(nonce), Some(by)) = (&form.nonce, &record.by) {
                 if *by == own.tag() && entries.taken.is_none() && !entries.unknown {
-                    if let store::Marked::Ours =
-                        store::mark_taken(&bucket, &tag, counter, nonce).await?
-                    {
-                        entries.taken = Some(nonce.clone());
-                    }
+                    entries.taken = Some(
+                        match store::mark_taken(&bucket, &tag, counter, nonce).await? {
+                            store::Marked::Ours => nonce.clone(),
+                            // Another nonce is the entry: the decision judges it.
+                            store::Marked::Foreign(other) => other,
+                        },
+                    );
                 }
             }
         }
@@ -199,11 +223,13 @@ impl BucketOwnership {
             author_live,
             placed: false,
         });
+        let judged = record.map(|(record, _)| record.etag.clone());
         let plan = |over: Vec<String>| K5Plan {
             nonce: new_nonce(),
             over,
             tag: tag.clone(),
             counter,
+            etag: judged.clone(),
         };
         Ok(match verdict {
             Take::Refuse(reason) => Verdict::Refuse(reason),
@@ -234,5 +260,56 @@ impl BucketOwnership {
             | Take::Forward
             | Take::ValidTakeover { .. } => Verdict::Proceed,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(etag: Option<&str>, over: &[&str]) -> K5Plan {
+        K5Plan {
+            nonce: "mine".into(),
+            over: over.iter().map(|nonce| nonce.to_string()).collect(),
+            tag: "t".into(),
+            counter: 3,
+            etag: etag.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_plan_applies_only_to_the_write_over_the_record_it_was_judged_against() {
+        let new_cell = plan(None, &[]);
+        assert!(new_cell.applies_to(&CasGuard::Absent));
+        assert!(!new_cell.applies_to(&CasGuard::Match("e1".into())));
+        let over_record = plan(Some("e1"), &[]);
+        assert!(over_record.applies_to(&CasGuard::Match("e1".into())));
+        assert!(
+            !over_record.applies_to(&CasGuard::Match("e2".into())),
+            "the record changed"
+        );
+        assert!(!over_record.applies_to(&CasGuard::Absent));
+    }
+
+    #[test]
+    fn a_plan_conflicts_with_an_entry_it_does_not_account_for() {
+        let replace = plan(Some("e1"), &["old"]);
+        assert!(!replace.conflicts_with(None));
+        assert!(
+            !replace.conflicts_with(Some(&"old".to_string())),
+            "the nonce it replaces"
+        );
+        assert!(
+            !replace.conflicts_with(Some(&"mine".to_string())),
+            "its own nonce"
+        );
+        assert!(replace.conflicts_with(Some(&"other".to_string())));
+    }
+
+    #[test]
+    fn the_id_hex_decoder_refuses_an_odd_or_non_hex_text() {
+        assert_eq!(unhex("0aff"), Some(vec![0x0a, 0xff]));
+        assert_eq!(unhex("0af"), None);
+        assert_eq!(unhex("zz"), None);
     }
 }

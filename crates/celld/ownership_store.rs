@@ -1131,6 +1131,26 @@ impl BucketOwnership {
         // The claim of a cell by the rules of a sealed session: a first-form
         // record with a new nonce, and then that nonce in the chunk.
         let plan = self.k5.take(cell);
+        // A plan belongs to the record it was judged against. A write that is
+        // not that record's replacement is lost: the core reads the cell again
+        // and it is judged again. So is a write over a cell whose chunk already
+        // holds an entry that the plan does not account for.
+        if let Some(plan) = &plan {
+            if !plan.applies_to(&guard) {
+                return Ok(CasOutcome::Rejected);
+            }
+            if let crate::session_store::Read::Found(chunk, _) = crate::session_store::read_chunk(
+                &self.bucket,
+                &plan.tag,
+                plan.counter / crate::session_store::CHUNK,
+            )
+            .await?
+            {
+                if plan.conflicts_with(chunk.taken.get(&plan.counter)) {
+                    return Ok(CasOutcome::Rejected);
+                }
+            }
+        }
         let body = serde_json::to_vec(&OwnerWire {
             node: &self.node,
             epoch,
