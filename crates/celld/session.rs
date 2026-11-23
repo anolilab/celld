@@ -68,6 +68,10 @@ pub struct Session {
     tag: [u8; 8],
     mode: Mode,
     tags: SessionTags,
+    /// The key that encrypts the counter in an id. It is stored in the session
+    /// header, which nodes read and clients never see, so an id minted by this
+    /// session cannot be guessed from another id.
+    counter_key: [u8; 32],
     /// The next counter to issue: every counter below it was issued.
     issued: AtomicU64,
     /// The header is written and the lease can carry the tag; minting waits
@@ -96,9 +100,12 @@ impl Session {
     }
 
     pub(crate) fn with_tag(mode: Mode, tag: [u8; 8], marker: &[String]) -> Self {
+        let mut counter_key = [0_u8; 32];
+        getrandom::fill(&mut counter_key).expect("secure random generation");
         Self {
             tag,
             mode,
+            counter_key,
             tags: SessionTags::new(&hex(&tag), marker),
             issued: AtomicU64::new(0),
             established: AtomicBool::new(false),
@@ -134,7 +141,8 @@ impl Session {
             return None;
         }
         let counter = self.issued.fetch_add(1, Ordering::SeqCst);
-        Some(tagged_object_id(key, self.tag, counter))
+        let block = encrypt_counter(&self.counter_key, counter);
+        Some(tagged_object_id(key, self.tag, block))
     }
 
     /// Record the tag of the record of a cell this process resumed.
@@ -172,6 +180,40 @@ impl Session {
             .get(cell)
             .map_or_else(|| self.tags.own().to_string(), |(tag, _)| tag.clone())
     }
+}
+
+const FEISTEL_ROUNDS: u8 = 6;
+
+fn round(key: &[u8; 32], round: u8, half: u32) -> u32 {
+    use hmac::Mac;
+    let mut input = [0_u8; 5];
+    input[0] = round;
+    input[1..].copy_from_slice(&half.to_be_bytes());
+    let digest = crate::engine_api::durable_object_id_hmac(key, &input)
+        .finalize()
+        .into_bytes();
+    u32::from_be_bytes(digest[..4].try_into().expect("4 bytes"))
+}
+
+/// Encrypt a counter into 8 bytes with a balanced Feistel network over 32-bit
+/// halves, whose round function is HMAC-SHA-256 under `key`. It is a
+/// permutation of the 64-bit values, so distinct counters give distinct ids.
+pub fn encrypt_counter(key: &[u8; 32], counter: u64) -> [u8; 8] {
+    let (mut left, mut right) = ((counter >> 32) as u32, counter as u32);
+    for index in 0..FEISTEL_ROUNDS {
+        (left, right) = (right, left ^ round(key, index, right));
+    }
+    ((u64::from(left) << 32) | u64::from(right)).to_be_bytes()
+}
+
+/// The counter that [`encrypt_counter`] hid in `block`.
+pub fn decrypt_counter(key: &[u8; 32], block: [u8; 8]) -> u64 {
+    let value = u64::from_be_bytes(block);
+    let (mut left, mut right) = ((value >> 32) as u32, value as u32);
+    for index in (0..FEISTEL_ROUNDS).rev() {
+        (left, right) = (right ^ round(key, index, left), left);
+    }
+    (u64::from(left) << 32) | u64::from(right)
 }
 
 static SESSION: OnceLock<Session> = OnceLock::new();
@@ -213,7 +255,12 @@ pub(crate) fn names_with(
 
 /// What a session makes of an id that verified as `kind`.
 pub(crate) fn check_issued(session: Option<&Session>, kind: IdKind) -> Result<IdKind, IdRefusal> {
-    if let (Some(session), IdKind::Tagged { tag, counter }) = (session, kind) {
+    // Only an id of this session's own tag is judged here. An id of another
+    // session's tag needs that session's header key to read its counter, and
+    // what to do with one is decided on the standard path, not at an entry
+    // point: it is accepted as it was before.
+    if let (Some(session), IdKind::Tagged { tag, block }) = (session, kind) {
+        let counter = decrypt_counter(&session.counter_key, block);
         if tag == session.tag && counter >= session.issued.load(Ordering::SeqCst) {
             return Err(IdRefusal::Unissued);
         }
@@ -277,6 +324,8 @@ struct HeaderWire {
     state: String,
     chunks: u64,
     rev: u64,
+    /// The key that encrypts the counters of this session's ids, as hex.
+    key: String,
 }
 
 pub(crate) fn header_key(tag: &str) -> String {
@@ -302,6 +351,7 @@ pub async fn create_header(
         state: "open".to_string(),
         chunks: 0,
         rev: 0,
+        key: hex(&session.counter_key),
     };
     let body = serde_json::to_vec(&wire)?;
     let ours = |bytes: &[u8]| {
@@ -431,16 +481,63 @@ mod tests {
         let first = session.mint(&key()).expect("established");
         let second = session.mint(&key()).expect("established");
         assert_ne!(first, second);
-        assert_eq!(
-            verify_object_id(&key(), &second),
-            Some(IdKind::Tagged {
-                tag: [1, 2, 3, 4, 5, 6, 7, 8],
-                counter: 1
-            })
-        );
+        let Some(IdKind::Tagged { tag, block }) = verify_object_id(&key(), &second) else {
+            panic!("a minted id verifies as tagged");
+        };
+        assert_eq!(tag, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(decrypt_counter(&session.counter_key, block), 1);
+        let Some(IdKind::Tagged { block, .. }) = verify_object_id(&key(), &first) else {
+            panic!("tagged");
+        };
+        assert_eq!(decrypt_counter(&session.counter_key, block), 0);
         assert!(check_id(Some(&session), &key(), &second).is_ok());
         // The hex form is what a Worker sees and hands back.
         assert_eq!(durable_object_id_hex(&second).len(), 64);
+    }
+
+    #[test]
+    fn consecutive_ids_do_not_reveal_their_counters() {
+        let session = established([8; 8]);
+        let blocks: Vec<[u8; 8]> = (0..64)
+            .map(|_| session.mint(&key()).expect("established"))
+            .map(|id| id[8..16].try_into().unwrap())
+            .collect();
+        for (counter, block) in blocks.iter().enumerate() {
+            assert_ne!(
+                *block,
+                (counter as u64).to_be_bytes(),
+                "counter in the clear"
+            );
+            assert_eq!(
+                decrypt_counter(&session.counter_key, *block),
+                counter as u64
+            );
+        }
+        for pair in blocks.windows(2) {
+            let (a, b) = (u64::from_be_bytes(pair[0]), u64::from_be_bytes(pair[1]));
+            assert_ne!(b, a.wrapping_add(1), "sequential");
+            let differing = pair[0].iter().zip(&pair[1]).filter(|(x, y)| x != y).count();
+            assert!(differing >= 4, "{pair:?} differ in only {differing} bytes");
+        }
+        // Another session's key gives other blocks for the same counters.
+        let other = established([8; 8]);
+        assert_ne!(
+            encrypt_counter(&session.counter_key, 0),
+            encrypt_counter(&other.counter_key, 0)
+        );
+    }
+
+    #[test]
+    fn the_counter_cipher_is_a_permutation() {
+        let key = [42_u8; 32];
+        let mut seen = std::collections::HashSet::new();
+        let samples =
+            (0..20_000_u64).chain([u64::MAX, u64::MAX - 1, 1 << 32, (1 << 32) - 1, 1 << 63]);
+        for counter in samples {
+            let block = encrypt_counter(&key, counter);
+            assert!(seen.insert(block), "two counters share a block");
+            assert_eq!(decrypt_counter(&key, block), counter);
+        }
     }
 
     #[test]
@@ -472,10 +569,15 @@ mod tests {
         let session = established([4; 8]);
         session.mint(&key()).expect("counter 0");
         session.mint(&key()).expect("counter 1");
-        let issued = tagged_object_id(&key(), [4; 8], 1);
-        let unissued = tagged_object_id(&key(), [4; 8], 2);
-        let far = tagged_object_id(&key(), [4; 8], u64::MAX);
-        let other_session = tagged_object_id(&key(), [5; 8], 900);
+        let at = |counter| {
+            tagged_object_id(
+                &key(),
+                [4; 8],
+                encrypt_counter(&session.counter_key, counter),
+            )
+        };
+        let (issued, unissued, far) = (at(1), at(2), at(u64::MAX));
+        let other_session = tagged_object_id(&key(), [5; 8], [9; 8]);
         assert!(check_id(Some(&session), &key(), &issued).is_ok());
         assert_eq!(
             check_id(Some(&session), &key(), &unissued),
@@ -502,7 +604,7 @@ mod tests {
     #[test]
     fn the_claim_path_reads_the_tag_from_the_class_and_the_mac() {
         register_class(SCRIPT, CLASS);
-        let tagged = durable_object_id_hex(&tagged_object_id(&key(), [6; 8], 3));
+        let tagged = durable_object_id_hex(&tagged_object_id(&key(), [6; 8], [3; 8]));
         assert_eq!(
             tag_of_scope(&format!("{CLASS}:{tagged}")),
             Some(hex(&[6; 8]))

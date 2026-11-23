@@ -584,8 +584,9 @@ const TAGGED_DOMAIN: u8 = b't';
 pub(crate) enum IdKind {
     /// A name id, or an older random id: the plain domain.
     Plain,
-    /// An id minted by a session: 8 bytes of session tag, then an 8-byte counter.
-    Tagged { tag: [u8; 8], counter: u64 },
+    /// An id minted by a session: 8 bytes of session tag, then the session's
+    /// counter encrypted under the session's key (see `session::encrypt_counter`).
+    Tagged { tag: [u8; 8], block: [u8; 8] },
 }
 
 fn tagged_mac(key: &[u8; 32], payload: &[u8]) -> hmac::Hmac<sha2::Sha256> {
@@ -595,13 +596,13 @@ fn tagged_mac(key: &[u8; 32], payload: &[u8]) -> hmac::Hmac<sha2::Sha256> {
     durable_object_id_hmac(key, &input)
 }
 
-/// The id a session mints: the 8-byte session tag, an 8-byte counter, then the
-/// 16-byte MAC of the tagged domain.
-pub(crate) fn tagged_object_id(key: &[u8; 32], tag: [u8; 8], counter: u64) -> [u8; 32] {
+/// The id a session mints: the 8-byte session tag, the 8-byte encrypted
+/// counter `block`, then the 16-byte MAC of the tagged domain.
+pub(crate) fn tagged_object_id(key: &[u8; 32], tag: [u8; 8], block: [u8; 8]) -> [u8; 32] {
     use hmac::Mac;
     let mut id = [0_u8; 32];
     id[..8].copy_from_slice(&tag);
-    id[8..16].copy_from_slice(&counter.to_be_bytes());
+    id[8..16].copy_from_slice(&block);
     let digest = tagged_mac(key, &id[..16]).finalize().into_bytes();
     id[16..].copy_from_slice(&digest[..16]);
     id
@@ -623,7 +624,7 @@ pub(crate) fn verify_object_id(key: &[u8; 32], id: &[u8; 32]) -> Option<IdKind> 
         .ok()?;
     Some(IdKind::Tagged {
         tag: id[..8].try_into().expect("8 bytes"),
-        counter: u64::from_be_bytes(id[8..16].try_into().expect("8 bytes")),
+        block: id[8..16].try_into().expect("8 bytes"),
     })
 }
 

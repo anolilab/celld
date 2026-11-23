@@ -299,6 +299,7 @@ async fn the_startup_probe_refuses_a_store_that_does_not_serialize() {
 /// library retries for an ordinary write; for the client of conditional
 /// writes it must produce exactly one request.
 #[tokio::test]
+#[allow(clippy::disallowed_methods)]
 async fn a_conditional_write_is_sent_once() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

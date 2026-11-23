@@ -106,7 +106,26 @@ async fn a_session_creates_its_header_mints_tagged_ids_and_names_itself() {
     for (counter, id) in ids.iter().enumerate() {
         assert_eq!(id.len(), 64);
         assert_eq!(&id[..16], tag, "the id starts with the session tag");
-        assert_eq!(id[16..32], format!("{counter:016x}"), "then its counter");
+        // The counter is encrypted under the key in the header.
+        let unhex = |text: &str| -> Vec<u8> {
+            (0..text.len() / 2)
+                .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let key: [u8; 32] = unhex(header["key"].as_str().expect("a key"))
+            .try_into()
+            .expect("32 bytes");
+        let block: [u8; 8] = unhex(&id[16..32]).try_into().expect("8 bytes");
+        assert_ne!(
+            id[16..32],
+            format!("{counter:016x}"),
+            "counter in the clear"
+        );
+        assert_eq!(
+            celld::session::decrypt_counter(&key, block),
+            counter as u64,
+            "then its counter"
+        );
     }
     // A tagged id round trips and reaches its cell.
     assert_eq!(bump(&server, &ids[0]).await, 1);
