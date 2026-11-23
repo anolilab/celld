@@ -113,6 +113,13 @@ pub enum Answer {
 /// every part read and clean, from a root read after the record read returned
 /// absent, with the gate open and inside the deadline. Anything else is
 /// `Unknown`.
+///
+/// `New` rests on the writer rule: a node writes a cell's first per-cell
+/// object, or credits a pack row for it, only after it read a root that covers
+/// the cell, and every node that does not follow that rule closes the gate
+/// first. So a cell with stored state outside the node log is always in a part
+/// the root names, and a registration still waiting to be folded belongs to a
+/// cell that has no such state yet.
 pub fn answer(facts: &Facts) -> Answer {
     if facts.root == RootRead::Unreadable {
         return Answer::Unknown(Doubt::RootUnreadable);
