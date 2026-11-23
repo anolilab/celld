@@ -63,14 +63,21 @@ export default {
       const id = env.AGENT.newUniqueId();
       // The first call to the new object happens in this request.
       const stub = env.AGENT.get(id);
-      await stub.fetch("https://agent/init", { method: "POST", body: await request.text() });
+      const init = await stub.fetch("https://agent/init", { method: "POST", body: await request.text() });
+      if (!init.ok) return init;
       return Response.json({ id: id.toString() });
     }
+    // Check here that the caller may use this agent; see below.
     const id = env.AGENT.idFromString(url.searchParams.get("id"));
     return env.AGENT.get(id).fetch(request);
   },
 };
 ```
+
+An id is a reference, not a permission: anyone who holds `id.toString()` can
+reach the object through a route like the one above. For a private session or
+conversation, authenticate the caller and check that it may use that id before
+forwarding, for example by storing the owner with the id.
 
 Use `idFromName()` when the caller already has a stable name for the object,
 such as a room name or a user key, so that every request derives the same id

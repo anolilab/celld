@@ -15,7 +15,7 @@
 //! id that this process minted can be in the minted set, and the other kinds
 //! show up in the rings only.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{LazyLock, Mutex, OnceLock};
 
@@ -168,7 +168,6 @@ pub(crate) struct Counts {
     pub minted_untracked: u64,
     pub first_claims_minted_local: u64,
     pub first_claims_minted_local_no_ensemble: u64,
-    pub first_claims_minted_elsewhere: u64,
     pub second_claims_prior_released: u64,
     pub second_claims_prior_self: u64,
     pub second_claims_prior_other: u64,
@@ -185,7 +184,6 @@ pub(crate) struct ClaimProvenance {
     minted_untracked: AtomicU64,
     first_claims_minted_local: AtomicU64,
     first_claims_minted_local_no_ensemble: AtomicU64,
-    first_claims_minted_elsewhere: AtomicU64,
     second_claims_prior_released: AtomicU64,
     second_claims_prior_self: AtomicU64,
     second_claims_prior_other: AtomicU64,
@@ -193,9 +191,6 @@ pub(crate) struct ClaimProvenance {
     releases_handoff: AtomicU64,
     preserved_resumes: AtomicU64,
     minted: Mutex<MintedSet>,
-    /// The id keys of the namespaces this process serves, by class, so that a
-    /// first claim can be told to be of a minted id by its HMAC.
-    namespaces: Mutex<HashMap<String, Vec<[u8; 32]>>>,
     rings: Mutex<Rings>,
 }
 
@@ -210,7 +205,6 @@ impl ClaimProvenance {
             minted_untracked: AtomicU64::new(0),
             first_claims_minted_local: AtomicU64::new(0),
             first_claims_minted_local_no_ensemble: AtomicU64::new(0),
-            first_claims_minted_elsewhere: AtomicU64::new(0),
             second_claims_prior_released: AtomicU64::new(0),
             second_claims_prior_self: AtomicU64::new(0),
             second_claims_prior_other: AtomicU64::new(0),
@@ -221,7 +215,6 @@ impl ClaimProvenance {
                 order: VecDeque::new(),
                 members: HashSet::new(),
             }),
-            namespaces: Mutex::new(HashMap::new()),
             rings: Mutex::new(Rings {
                 mints: Ring::new(),
                 first_claims: Ring::new(),
@@ -230,38 +223,6 @@ impl ClaimProvenance {
                 resumes: Ring::new(),
             }),
         }
-    }
-
-    /// A class this process serves, with the key of its id namespace.
-    pub(crate) fn register_namespace(&self, class: &str, key: [u8; 32]) {
-        let mut namespaces = self.namespaces.lock().unwrap();
-        let keys = namespaces.entry(class.to_owned()).or_default();
-        if !keys.contains(&key) {
-            keys.push(key);
-        }
-    }
-
-    /// Whether the id at the end of `cell` has the shape of a minted one in a
-    /// namespace of this process: its second half is the HMAC of its first.
-    fn minted_format(&self, cell: &str) -> bool {
-        use hmac::Mac;
-        let Some((class, id)) = cell.rsplit_once(':') else {
-            return false;
-        };
-        let Some(id) = crate::engine_api::decode_durable_object_id(id) else {
-            return false;
-        };
-        self.namespaces
-            .lock()
-            .unwrap()
-            .get(class)
-            .is_some_and(|keys| {
-                keys.iter().any(|key| {
-                    crate::engine_api::durable_object_id_hmac(key, &id[..16])
-                        .verify_truncated_left(&id[16..])
-                        .is_ok()
-                })
-            })
     }
 
     fn sampled(&self, key: u64) -> bool {
@@ -307,8 +268,6 @@ impl ClaimProvenance {
                     self.first_claims_minted_local_no_ensemble
                         .fetch_add(1, Relaxed);
                 }
-            } else if self.minted_format(claim.cell) {
-                self.first_claims_minted_elsewhere.fetch_add(1, Relaxed);
             }
             if let Some(key) = key.filter(|key| self.sampled(*key)) {
                 self.rings.lock().unwrap().first_claims.push(FirstClaim {
@@ -417,10 +376,6 @@ impl ClaimProvenance {
                     &self.first_claims_minted_local_no_ensemble,
                 ),
                 (
-                    "first_claims_minted_elsewhere",
-                    &self.first_claims_minted_elsewhere,
-                ),
-                (
                     "second_claims_prior_released",
                     &self.second_claims_prior_released,
                 ),
@@ -442,7 +397,6 @@ impl ClaimProvenance {
             first_claims_minted_local_no_ensemble: self
                 .first_claims_minted_local_no_ensemble
                 .load(Relaxed),
-            first_claims_minted_elsewhere: self.first_claims_minted_elsewhere.load(Relaxed),
             second_claims_prior_released: self.second_claims_prior_released.load(Relaxed),
             second_claims_prior_self: self.second_claims_prior_self.load(Relaxed),
             second_claims_prior_other: self.second_claims_prior_other.load(Relaxed),
@@ -483,17 +437,6 @@ pub(crate) fn start(session: String, process_start_ms: u64) -> anyhow::Result<()
 
 pub(crate) fn minted(id: &[u8; 32]) {
     GLOBAL.minted(key_of_id(id), crate::ownership_store::now_ms());
-}
-
-/// Record that this process serves `classes` of `script`, so that a first
-/// claim of one of their ids can be told to be of a minted id.
-pub(crate) fn register_namespaces(script: &str, classes: &[String]) {
-    for class in classes {
-        let key = crate::engine_api::durable_object_id_key(&crate::engine_api::namespace_key(
-            script, class,
-        ));
-        GLOBAL.register_namespace(class, key);
-    }
 }
 
 pub(crate) fn claim_applied(claim: &Claimed<'_>) {
