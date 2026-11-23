@@ -655,7 +655,7 @@ impl Registry {
     /// One level of one partition: a read of the bucket the key falls in, and
     /// of its overflow chain.
     async fn probe(&self, key: &Key, aim: reg::Aim, level_no: u8, io: &Io) -> Probe {
-        let reg::Aim { lo, hi, level } = aim;
+        let reg::Aim { lo, hi, level, .. } = aim;
         let Level::Run(run) = level else {
             return Probe::Empty;
         };
