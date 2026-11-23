@@ -57,12 +57,69 @@ pub struct Chunk {
     /// unknown, and a reader refuses every id of it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unknown: bool,
-    /// Reserved for the left entries and the taken table of later rules.
+    /// The cells that left the lazy state, by counter. Nothing writes one yet.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub left: BTreeMap<u64, serde_json::Value>,
+    pub left: BTreeMap<u64, Left>,
+    /// The nonce of the first record that a node other than the minting
+    /// process wrote for a cell, by counter. Written by a compare-and-swap, also
+    /// after the seal; the seal keeps what it finds.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub taken: BTreeMap<u64, String>,
     pub rev: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Left {
+    pub epoch: u64,
+    pub nonces: Vec<String>,
+    #[serde(default)]
+    pub done: Option<String>,
+}
+
+/// How a write of a nonce into the taken table of a chunk ended.
+#[derive(Debug, Eq, PartialEq)]
+pub enum Marked {
+    /// This nonce is the entry of the cell.
+    Ours,
+    /// Another nonce is the entry: an earlier record of the cell was marked.
+    Foreign(String),
+}
+
+/// Put `nonce` in the taken table of the cell with `counter`, by a
+/// compare-and-swap on the token of a read of the chunk. A lost write reads the
+/// chunk again: no entry for the cell means another cell changed the chunk, so
+/// the write is tried again; this nonce means the write had applied.
+pub async fn mark_taken(
+    bucket: &Bucket,
+    tag: &str,
+    counter: u64,
+    nonce: &str,
+) -> anyhow::Result<Marked> {
+    let chunk = counter / CHUNK;
+    for _ in 0..8 {
+        match read_chunk(bucket, tag, chunk).await? {
+            Read::Found(found, token) => {
+                if let Some(taken) = found.taken.get(&counter) {
+                    return Ok(if taken == nonce {
+                        Marked::Ours
+                    } else {
+                        Marked::Foreign(taken.clone())
+                    });
+                }
+                let mut next = found.clone();
+                next.taken.insert(counter, nonce.to_string());
+                next.rev += 1;
+                if swap_chunk(bucket, tag, chunk, &next, &token)
+                    .await?
+                    .is_some()
+                {
+                    return Ok(Marked::Ours);
+                }
+            }
+            _ => anyhow::bail!("{} is missing or unreadable", chunk_key(tag, chunk)),
+        }
+    }
+    anyhow::bail!("marking {} lost every race", chunk_key(tag, chunk))
 }
 
 pub fn header_key(tag: &str) -> String {

@@ -26,6 +26,12 @@ struct OwnerWire<'a> {
     /// with `CELLD_LAZY_BIRTH=off`, so its bytes are those of an older binary.
     #[serde(skip_serializing_if = "Option::is_none")]
     by: Option<&'a str>,
+    /// A first-form record: 8 random bytes, new for every write, and the
+    /// nonces of the records it replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nonce: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    over: &'a [String],
 }
 
 #[derive(Deserialize)]
@@ -34,6 +40,21 @@ struct OwnerWireOwned {
     epoch: u64,
     #[serde(default)]
     by: Option<String>,
+    #[serde(default)]
+    nonce: Option<String>,
+    #[serde(default)]
+    over: Vec<String>,
+    #[serde(default)]
+    leave: Option<String>,
+}
+
+/// The form of a record beyond its node, epoch and `by`: a first-form record
+/// has a nonce and the nonces it replaced, a leave-form record a leave nonce.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OwnerForm {
+    pub(crate) nonce: Option<String>,
+    pub(crate) over: Vec<String>,
+    pub(crate) leave: Option<String>,
 }
 
 /// The session a node lease advertises: its tag, the tags of a preserved
@@ -446,6 +467,8 @@ pub struct BucketOwnership {
     /// only shadows the lost-record listing; see [`Self::directory_answer`].
     cell_directory: Option<Arc<crate::cell_directory::CellDirectory>>,
     directory_answers: DirectoryAnswers,
+    /// The first-form record that the next conditional write of a cell carries.
+    pub(crate) k5: crate::session_reader::K5Plans,
 }
 
 /// How often the fleet directory answered a claim guard, by its answer and by
@@ -581,6 +604,7 @@ impl BucketOwnership {
             lost_records: std::sync::Mutex::default(),
             cell_directory: None,
             directory_answers: DirectoryAnswers::default(),
+            k5: crate::session_reader::K5Plans::default(),
         }
     }
 
@@ -634,6 +658,13 @@ impl BucketOwnership {
     }
 
     pub async fn read_owner(&self, cell: &str) -> anyhow::Result<Option<OwnerRecord>> {
+        Ok(self.read_owner_form(cell).await?.map(|(record, _)| record))
+    }
+
+    pub(crate) async fn read_owner_form(
+        &self,
+        cell: &str,
+    ) -> anyhow::Result<Option<(OwnerRecord, OwnerForm)>> {
         let key = format!("cells/{cell}/own.json");
         let Some((owner, etag)) = load_json::<OwnerWireOwned>(&self.bucket, &key).await? else {
             return Ok(None);
@@ -646,13 +677,18 @@ impl BucketOwnership {
                 session.grant_scope(cell);
             }
         }
+        let form = OwnerForm {
+            nonce: owner.nonce,
+            over: owner.over,
+            leave: owner.leave,
+        };
         let record = OwnerRecord {
             node: (!owner.node.is_empty()).then_some(owner.node),
             epoch: owner.epoch,
             by: owner.by,
             etag,
         };
-        Ok(Some(record))
+        Ok(Some((record, form)))
     }
 
     /// Whether the bucket holds any LTX for `cell`. LTX exists only under an
@@ -1035,6 +1071,8 @@ impl BucketOwnership {
             node: "",
             epoch,
             by: by.as_deref(),
+            nonce: None,
+            over: &[],
         })?;
         match self.bucket.put_cas(&key, body, Some(&current.etag)).await? {
             Some(_) => Ok(CasOutcome::Applied),
@@ -1069,6 +1107,8 @@ impl BucketOwnership {
             node: &self.node,
             epoch,
             by: Some(to),
+            nonce: None,
+            over: &[],
         })?;
         match self.bucket.put_cas(&key, body, Some(&current.etag)).await {
             Ok(applied) => Ok(applied.is_some()),
@@ -1088,10 +1128,15 @@ impl BucketOwnership {
         let key = format!("cells/{cell}/own.json");
         let session = crate::session::current();
         let by = session.map(|session| session.tag());
+        // The claim of a cell by the rules of a sealed session: a first-form
+        // record with a new nonce, and then that nonce in the chunk.
+        let plan = self.k5.take(cell);
         let body = serde_json::to_vec(&OwnerWire {
             node: &self.node,
             epoch,
             by: by.as_deref(),
+            nonce: plan.as_ref().map(|plan| plan.nonce.as_str()),
+            over: plan.as_ref().map_or(&[], |plan| plan.over.as_slice()),
         })?;
         let etag = match &guard {
             CasGuard::Absent => None,
@@ -1102,6 +1147,22 @@ impl BucketOwnership {
                 // The record now carries this process's own tag.
                 if let Some(session) = session {
                     session.forget_resumed(cell);
+                }
+                // The cell acts only after its nonce is in the chunk. If the
+                // mark fails, the answer is an error and the claim is settled by
+                // a read, which finishes the mark before it returns the record.
+                if let Some(plan) = &plan {
+                    let marked = crate::session_store::mark_taken(
+                        &self.bucket,
+                        &plan.tag,
+                        plan.counter,
+                        &plan.nonce,
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        marked == crate::session_store::Marked::Ours,
+                        "the first record of {cell} was marked by another nonce"
+                    );
                 }
                 // A create-only write is the cell's first claim, at epoch one:
                 // the record exists, and LTX can follow. Queueing the
@@ -1439,6 +1500,8 @@ mod session_wire_tests {
             node: "n1",
             epoch: 7,
             by: None,
+            nonce: None,
+            over: &[],
         })
         .unwrap();
         assert_eq!(body, br#"{"node":"n1","epoch":7}"#);
@@ -1446,6 +1509,8 @@ mod session_wire_tests {
             node: "n1",
             epoch: 7,
             by: Some("ab"),
+            nonce: None,
+            over: &[],
         })
         .unwrap();
         assert_eq!(body, br#"{"node":"n1","epoch":7,"by":"ab"}"#);

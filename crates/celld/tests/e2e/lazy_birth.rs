@@ -389,3 +389,207 @@ async fn an_unparseable_session_header_is_replaced_by_a_lost_one() {
     assert_eq!(replaced[0].1["state"], "sealed");
     assert_eq!(replaced[0].1["lost"], true, "{:?}", replaced[0].1);
 }
+
+fn drop_certificate(project: &Path) {
+    let _ = std::fs::remove_file(project.join(".celld/dev/runtime/.clean-reload.json"));
+}
+
+fn chunk_of(project: &Path, tag: &str) -> Value {
+    let chunks = bodies(project, &format!("%fleet/sessions/{tag}/c/0"));
+    assert_eq!(chunks.len(), 1);
+    chunks[0].1.clone()
+}
+
+fn edit_chunk(project: &Path, tag: &str, change: impl FnOnce(&mut Value)) {
+    let mut chunk = chunk_of(project, tag);
+    change(&mut chunk);
+    store(project)
+        .execute(
+            "UPDATE objects SET body = ?1 WHERE key LIKE ?2",
+            rusqlite::params![
+                serde_json::to_vec(&chunk).expect("encode"),
+                format!("%fleet/sessions/{tag}/c/0")
+            ],
+        )
+        .expect("edit the chunk");
+}
+
+/// K8 rule 1: a node that is not the minting process claims an id that was
+/// never granted by a first-form record at epoch 2 and then its nonce in the
+/// chunk; with that entry and no record the cell is refused.
+#[tokio::test]
+async fn a_new_tagged_cell_is_claimed_by_a_first_form_record_and_a_mark() {
+    let mut server = Server::start("do-ids", SHADOW).await;
+    let ids = minted(&server).await;
+    let (tag, header) = header_tag(server.project());
+    server.restart_after(drop_certificate).await;
+    assert_eq!(bump(&server, &ids[0]).await, 1);
+    let record = own_record(server.project());
+    assert_eq!(record["epoch"], 2, "{record}");
+    let nonce = record["nonce"].as_str().expect("a first-form record");
+    let counter = counter_of(&header, &ids[0]);
+    let chunk = chunk_of(server.project(), &tag);
+    assert_eq!(chunk["taken"][counter.to_string()], nonce, "{chunk}");
+    // The record is lost: the cell has a taken entry, so it is refused.
+    server
+        .restart_after(|project| {
+            drop_certificate(project);
+            store(project)
+                .execute("DELETE FROM objects WHERE key LIKE '%cells/%/own.json'", [])
+                .expect("lose the record");
+        })
+        .await;
+    assert!(!server
+        .get_status(&format!("/bump?id={}", ids[0]))
+        .await
+        .is_success());
+    assert!(server
+        .log_text()
+        .contains("a later record was written and is lost"));
+    // Another id of the session is unaffected.
+    assert_eq!(bump(&server, &ids[1]).await, 1);
+}
+
+/// K8 rule 3: in `shadow` a granted id without a record is a lost record.
+#[tokio::test]
+async fn a_granted_tagged_cell_without_a_record_is_refused() {
+    let mut server = Server::start("do-ids", SHADOW).await;
+    let ids = minted(&server).await;
+    assert_eq!(bump(&server, &ids[0]).await, 1);
+    server
+        .restart_after(|project| {
+            drop_certificate(project);
+            store(project)
+                .execute("DELETE FROM objects WHERE key LIKE '%cells/%/own.json'", [])
+                .expect("lose the record");
+        })
+        .await;
+    assert!(!server
+        .get_status(&format!("/bump?id={}", ids[0]))
+        .await
+        .is_success());
+    assert!(server.log_text().contains("celld ownership record lost"));
+    assert_eq!(
+        count(server.project(), "%cells/%/own.json"),
+        0,
+        "nothing was claimed"
+    );
+}
+
+/// K8 rule 2: the session's plain record at epoch 1 for a cell that its chunk
+/// does not hold as granted is taken over by a first-form record.
+#[tokio::test]
+async fn the_session_record_of_an_ungranted_cell_is_taken_over_by_a_first_form_record() {
+    let mut server = Server::start("do-ids", SHADOW).await;
+    let ids = minted(&server).await;
+    let (tag, header) = header_tag(server.project());
+    assert_eq!(bump(&server, &ids[0]).await, 1);
+    let counter = counter_of(&header, &ids[0]);
+    server
+        .restart_after(|project| {
+            drop_certificate(project);
+            // The record landed and the grant did not.
+            edit_chunk(project, &tag, |chunk| {
+                chunk["granted"] = serde_json::json!([]);
+            });
+        })
+        .await;
+    assert_eq!(bump(&server, &ids[0]).await, 2, "the chain is restored");
+    let record = own_record(server.project());
+    assert!(record["epoch"].as_u64().unwrap() >= 2, "{record}");
+    let nonce = record["nonce"].as_str().expect("a first-form record");
+    let chunk = chunk_of(server.project(), &tag);
+    assert_eq!(chunk["taken"][counter.to_string()], nonce, "{chunk}");
+}
+
+/// K6: a first-form record whose nonce the chunk does not hold is not finished;
+/// its author is gone, so the record is replaced at the next epoch with a new
+/// nonce, and the old one in `over`.
+#[tokio::test]
+async fn an_unfinished_first_form_record_is_replaced_with_the_old_nonce_in_over() {
+    let mut server = Server::start("do-ids", SHADOW).await;
+    let ids = minted(&server).await;
+    let (tag, _) = header_tag(server.project());
+    server.restart_after(drop_certificate).await;
+    assert_eq!(bump(&server, &ids[0]).await, 1);
+    let first = own_record(server.project());
+    server
+        .restart_after(|project| {
+            drop_certificate(project);
+            // The mark was lost.
+            edit_chunk(project, &tag, |chunk| {
+                chunk.as_object_mut().unwrap().remove("taken");
+            });
+        })
+        .await;
+    assert_eq!(bump(&server, &ids[0]).await, 2);
+    let second = own_record(server.project());
+    assert!(second["epoch"].as_u64().unwrap() > first["epoch"].as_u64().unwrap());
+    assert_eq!(
+        second["over"],
+        serde_json::json!([first["nonce"]]),
+        "{second}"
+    );
+    assert_ne!(second["nonce"], first["nonce"]);
+}
+
+/// A chunk that exists and does not parse is replaced by a sealed and unknown
+/// one when its session is sealed, and its ids are then refused.
+#[tokio::test]
+async fn an_unparseable_chunk_is_replaced_by_an_unknown_one_and_its_ids_are_refused() {
+    let mut server = Server::start("do-ids", SHADOW).await;
+    let ids = minted(&server).await;
+    let (tag, _) = header_tag(server.project());
+    server
+        .restart_after(|project| {
+            drop_certificate(project);
+            let store = store(project);
+            // The seal never happened, and the chunk is garbage.
+            let body: Vec<u8> = store
+                .query_row(
+                    "SELECT body FROM objects WHERE key LIKE '%fleet/sessions/%.json'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("the header");
+            let mut header: Value = serde_json::from_slice(&body).expect("a header");
+            header["state"] = "open".into();
+            store
+                .execute(
+                    "UPDATE objects SET body = ?1 WHERE key LIKE '%fleet/sessions/%.json'",
+                    [serde_json::to_vec(&header).expect("encode")],
+                )
+                .expect("reopen the header");
+            store
+                .execute(
+                    "UPDATE objects SET body = ?1 WHERE key LIKE '%/c/0'",
+                    [b"garbage".to_vec()],
+                )
+                .expect("corrupt the chunk");
+        })
+        .await;
+    let chunk = chunk_of(server.project(), &tag);
+    assert_eq!(chunk["state"], "sealed", "{chunk}");
+    assert_eq!(chunk["unknown"], true, "{chunk}");
+    assert!(!server
+        .get_status(&format!("/bump?id={}", ids[0]))
+        .await
+        .is_success());
+    assert!(server.log_text().contains("celld ownership record lost"));
+}
+
+/// An id whose counter no chunk of its session counts was never minted.
+#[tokio::test]
+async fn an_id_that_was_never_minted_is_refused() {
+    // The id is forged from a real one: only its tag-and-counter block changes,
+    // so its MAC no longer verifies and the isolate refuses it before the claim
+    // path is reached.
+    let server = Server::start("do-ids", SHADOW).await;
+    let ids = minted(&server).await;
+    let mut forged = ids[0].clone();
+    forged.replace_range(16..17, if &forged[16..17] == "0" { "1" } else { "0" });
+    assert!(!server
+        .get_status(&format!("/bump?id={forged}"))
+        .await
+        .is_success());
+}

@@ -5,6 +5,8 @@ use crate::lazy_birth::{self as model, Design};
 use crate::session::LeftEntry;
 use crate::session_take as prod;
 
+type LeftCase = Option<(u8, Vec<u8>, Option<u8>)>;
+
 const MINTER: u8 = 7;
 const OTHER: u8 = 5;
 
@@ -41,7 +43,7 @@ fn same(model_take: model::Take, prod_take: prod::Take) -> bool {
 fn the_reader_decision_matches_the_model_over_the_whole_domain() {
     let design = Design::rev4();
     let nonces: [Option<u8>; 3] = [None, Some(1), Some(2)];
-    let lefts: [Option<(u8, Vec<u8>, Option<u8>)>; 4] = [
+    let lefts: [LeftCase; 4] = [
         None,
         Some((1, vec![1], None)),
         Some((1, vec![1], Some(1))),
@@ -93,13 +95,13 @@ fn check(
     chunk_state: usize,
     granted: bool,
     taken: Option<u8>,
-    left: &Option<(u8, Vec<u8>, Option<u8>)>,
+    left: &LeftCase,
     rec_state: usize,
     author_live: bool,
     over: Vec<u8>,
 ) -> u32 {
     let (model_mode, prod_mode) = mode_pair(mode);
-    let m_hdr = (hdr_state > 0).then(|| model::Hdr {
+    let m_hdr = (hdr_state > 0).then_some(model::Hdr {
         mode: model_mode,
         state: model::HState::Sealed,
         chunks: 1,
@@ -107,7 +109,7 @@ fn check(
         rev: 0,
         token: 0,
     });
-    let p_hdr = (hdr_state > 0).then(|| prod::Hdr {
+    let p_hdr = (hdr_state > 0).then_some(prod::Hdr {
         mode: prod_mode,
         lost: hdr_state == 1,
     });
