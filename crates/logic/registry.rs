@@ -219,7 +219,7 @@ pub struct Record {
     pub key: Key,
     pub pack: [u8; 12],
     pub offset: u32,
-    pub len_kind: u32,
+    len_kind: u32,
     pub epoch: u32,
     pub max_txid: u64,
 }
