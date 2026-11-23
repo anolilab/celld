@@ -54,6 +54,7 @@ const MAX_ALARM_HANDLER_BUDGET_MS: u64 = 365 * 24 * 60 * 60 * 1000;
 fn with_session(mut state: State) -> State {
     if let Some(session) = crate::session::current() {
         state.set_session(session.tags().clone(), crate::session::id_tag_of_scope);
+        state.set_resumed(session.resumed_snapshot());
     }
     state
 }

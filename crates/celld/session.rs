@@ -155,6 +155,12 @@ impl Session {
         }
     }
 
+    /// Every cell this process resumed under a predecessor's tag, with the
+    /// tag and epoch of its record.
+    pub fn resumed_snapshot(&self) -> BTreeMap<String, (String, u64)> {
+        self.resumed.lock().expect("resumed cells poisoned").clone()
+    }
+
     /// Whether this process resumed `cell` under `tag` at `epoch`.
     pub(crate) fn resumed_at(&self, cell: &str, tag: &str, epoch: u64) -> bool {
         self.resumed

@@ -886,6 +886,9 @@ pub struct State {
     /// `None` is a process that writes no session: every record is compared
     /// by node name, as an older binary does.
     session: Option<(session::SessionTags, session::IdTagOf)>,
+    /// The tag and epoch of the record of each cell this process resumed in a
+    /// preserved restart. A predecessor's tag names this process only here.
+    resumed: BTreeMap<CellId, (String, Epoch)>,
 }
 
 impl State {
@@ -952,7 +955,14 @@ impl State {
             memory_headroom: false,
             shed_reason: None,
             session: None,
+            resumed: BTreeMap::new(),
         }
+    }
+
+    /// The cells a preserved restart resumed, with the tag and epoch of each
+    /// cell's record.
+    pub fn set_resumed(&mut self, resumed: BTreeMap<CellId, (String, Epoch)>) {
+        self.resumed = resumed;
     }
 
     /// Run as a session: `tags` are written in this process's records and
@@ -963,12 +973,17 @@ impl State {
 
     /// Whether `record` names this process, or a predecessor whose cell this
     /// process resumed in a preserved restart.
-    fn names_this_process(&self, record: &OwnerRecord) -> bool {
+    fn names_this_process(&self, cell: &str, record: &OwnerRecord) -> bool {
         record.node.as_deref() == Some(self.node.as_str())
-            && self
-                .session
-                .as_ref()
-                .is_none_or(|(tags, _)| tags.answers_for(record.by.as_deref()))
+            && self.session.as_ref().is_none_or(|(tags, _)| {
+                record.by.as_deref().is_none_or(|by| {
+                    tags.is_own(Some(by))
+                        || self
+                            .resumed
+                            .get(cell)
+                            .is_some_and(|(tag, epoch)| tag == by && *epoch == record.epoch)
+                })
+            })
     }
 
     /// Whether `record` is a write of this very process. A second process of
@@ -4294,7 +4309,7 @@ impl State {
                 // dormant at that epoch, exactly as an idle eviction does,
                 // and the next request wakes it through the usual claim.
                 let phase = match result {
-                    Ok(Some(record)) if self.names_this_process(&record) => Phase::Dormant {
+                    Ok(Some(record)) if self.names_this_process(&id, &record) => Phase::Dormant {
                         epoch: record.epoch,
                     },
                     _ => Phase::Inactive,

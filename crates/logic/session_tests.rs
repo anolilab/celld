@@ -232,3 +232,23 @@ fn the_carried_set_rules_match_the_model() {
     }
     assert_eq!(lazy_birth::standard_epoch(&Design::rev4()), 2);
 }
+
+#[test]
+fn a_predecessors_tag_names_this_process_only_for_a_resumed_cell_at_its_epoch() {
+    let mut state = session_node(&["old"]);
+    state.set_resumed(std::collections::BTreeMap::from([(
+        "c".to_string(),
+        ("old".to_string(), 4),
+    )]));
+    let record = |epoch, by| OwnerRecord {
+        node: Some("ingress".into()),
+        epoch,
+        by,
+        etag: String::new(),
+    };
+    assert!(state.names_this_process("c", &record(4, Some("old".into()))));
+    assert!(!state.names_this_process("c", &record(5, Some("old".into()))));
+    assert!(!state.names_this_process("d", &record(4, Some("old".into()))));
+    assert!(state.names_this_process("d", &record(4, Some(OWN.into()))));
+    assert!(state.names_this_process("d", &record(4, None)));
+}
