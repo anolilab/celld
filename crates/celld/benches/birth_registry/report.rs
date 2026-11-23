@@ -296,8 +296,12 @@ pub async fn report() {
             let n = |name: &str| c[name].as_f64().unwrap_or(0.0);
             let segments =
                 n("segments_written") + r["generator"]["segments"].as_f64().unwrap_or(0.0);
+            // Per pass is read over the load window only: the near-idle passes of
+            // the start check and the settling make up a different share of each
+            // phase and would set the ratio, not the load.
+            let w = |name: &str| r["counters_window"][name].as_f64().unwrap_or(0.0);
             Some((
-                (n("list_requests") + n("put_requests") + n("get_requests")) / n("passes").max(1.0),
+                (w("list_requests") + w("put_requests") + w("get_requests")) / w("passes").max(1.0),
                 n("get_requests") / segments.max(1.0),
                 n("bytes_written") / n("spills").max(1.0),
             ))
@@ -316,8 +320,8 @@ pub async fn report() {
                 && units;
             gates.add(
                 "G-s",
-                json!({ "x4": row, "per_pass_requests": [a.0, b.0], "get_requests_per_segment": [a.1, b.1], "bytes_written_per_spill": [a.2, b.2], "steady_with_m24_for_reference": per_with(steady, false), "steady_forced_m24_counters": steady["forced_m24_counters"],
-                    "unit_basis": "x4 against steady without its forced month-24 merge (the job's counters measured on their own); the registry compactor's own request counters" }),
+                json!({ "x4": row, "per_pass_requests": { "x4": a.0, "steady": b.0 }, "get_requests_per_segment": { "x4": a.1, "steady": b.1 }, "bytes_written_per_spill": { "x4": a.2, "steady": b.2 }, "steady_with_m24_for_reference": per_with(steady, false), "steady_forced_m24_counters": steady["forced_m24_counters"],
+                    "unit_basis": "x4 against steady without its forced month-24 merge (the job's counters measured on their own); the registry compactor's own request counters; requests per pass over the load window" }),
                 ">= 2 spills by record count; live records <= 1.5M; 0 pauses; pass p99 <= 2 s; G-d holds; requests per segment, per pass and per spill within 15 % of steady",
                 Some(ok),
             );
