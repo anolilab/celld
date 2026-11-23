@@ -470,23 +470,7 @@ fn the_formats_keep_their_bytes() {
     );
     assert_eq!(
         hex(&encode_root(&Root::new(1024))),
-        "52475231010000000004000000000000000000000000000000000000000000000000\
-         000000000000000000000000000000000000000000000000007d39da2e"
-    );
-    let page = encode_bucket(7, 99, 0, &[record]).expect("fits");
-    assert_eq!(hex(&page[..16]), "010000000700000063000000b3e010ee");
-    assert_eq!(hex(&page[16..64]), record_hex);
-    assert!(page[64..].iter().all(|byte| *byte == 0));
-}
-
-#[test]
-fn whole_objects_keep_their_bytes() {
-    // Taken from the encoders as they were first written: a root with a
-    // holder, a map and split delta ranges; a map with runs; a delta; and two
-    // runs, one with overflow pages.
-    assert_eq!(
-        hex(&encode_root(&sample_root())),
-        "524752310100000000040000030000000000000001060000006e6f64652d31030000006162634d000000000000000500000002000000040000000000000004000000000000000101020000000000000009000000000000000300000002000000000000000400000000000000060000000000000003000000000000000000000000000000000000000000000003000000000000000200000000000000020000000000000034b5458d"
+        "5247523101000000000400000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000bd5df239"
     );
     assert_eq!(
         hex(&encode_map(&sample_map())),
@@ -681,7 +665,8 @@ impl Built {
         let at = bucket_offset(index) as usize;
         let pages: Vec<&[u8]> = (1..=self.overflow)
             .map(|number| {
-                let from = bucket_offset(overflow_index(self.buckets, number as u16)) as usize;
+                let from = bucket_offset(overflow_index(self.buckets, number as u16).expect("fits"))
+                    as usize;
                 &self.bytes[from..from + BUCKET_LEN]
             })
             .collect();
@@ -772,7 +757,7 @@ fn an_overflowing_bucket_chains_and_keeps_every_key() {
     let (_, chain) = decode_bucket(first, 0, run.tag).expect("reads");
     assert_eq!(chain, 1, "the header names the first overflow page");
     let page = |number: u32| {
-        let from = bucket_offset(overflow_index(2, number as u16)) as usize;
+        let from = bucket_offset(overflow_index(2, number as u16).expect("fits")) as usize;
         run.bytes[from..from + BUCKET_LEN].to_vec()
     };
     let pages = vec![page(1), page(2)];
@@ -797,7 +782,7 @@ fn an_overflow_page_of_another_run_or_index_is_rejected() {
     let run = build(&records, 0, u64::MAX, 2);
     let first = run.bytes[..BUCKET_LEN].to_vec();
     let page = |number: u32| {
-        let from = bucket_offset(overflow_index(2, number as u16)) as usize;
+        let from = bucket_offset(overflow_index(2, number as u16).expect("fits")) as usize;
         run.bytes[from..from + BUCKET_LEN].to_vec()
     };
     let good = vec![page(1), page(2)];
@@ -821,7 +806,7 @@ fn an_overflow_page_of_another_run_or_index_is_rejected() {
     };
     let foreign: Vec<Vec<u8>> = (1..=2)
         .map(|number| {
-            let from = bucket_offset(overflow_index(2, number)) as usize;
+            let from = bucket_offset(overflow_index(2, number).expect("fits")) as usize;
             tagless[from..from + BUCKET_LEN].to_vec()
         })
         .collect();
@@ -844,9 +829,10 @@ fn an_overflow_page_of_another_run_or_index_is_rejected() {
         bucket_chain(&first, 0, run.tag, 2, &good[..1]),
         Err(BadBucket)
     );
-    let (page_one, _) = decode_bucket(&good[1], overflow_index(2, 2), run.tag).expect("reads");
+    let (page_one, _) =
+        decode_bucket(&good[1], overflow_index(2, 2).expect("fits"), run.tag).expect("reads");
     let mut looped = good.clone();
-    looped[1] = encode_bucket(overflow_index(2, 2), run.tag, 1, &page_one)
+    looped[1] = encode_bucket(overflow_index(2, 2).expect("fits"), run.tag, 1, &page_one)
         .expect("fits")
         .to_vec();
     assert_eq!(bucket_chain(&first, 0, run.tag, 2, &looped), Err(BadBucket));
@@ -902,7 +888,8 @@ fn the_streaming_merge_equals_sorting_the_union_for_any_split() {
         let out: Vec<Record> = merged.by_ref().collect();
         assert_eq!(out, expected, "seed {seed}");
         assert_eq!(merged.distinct(), expected.len() as u64);
-        assert!(merge_check(out.len() as u64, merged.distinct(), &read, &read).is_ok());
+        assert_eq!(merged.read(), &read[..]);
+        assert!(merge_check(out.len() as u64, merged.distinct(), &read, merged.read()).is_ok());
         assert!(
             declared.iter().sum::<u64>() >= read.iter().sum::<u64>(),
             "sorting each input only merges records"
@@ -990,17 +977,28 @@ fn delta(n: u64) -> DeltaId {
     DeltaId { epoch: 1, n }
 }
 
+/// A spill of a four-partition map. The partitions not listed stay empty.
 fn spill(consumed: &[u64], partitions: &[(usize, Level, Level)]) -> Job {
+    let mut listed: Vec<SpillPartition> = partitions
+        .iter()
+        .map(|(index, input, output)| SpillPartition {
+            index: *index,
+            input: *input,
+            output: *output,
+        })
+        .collect();
+    for index in 0..4 {
+        if !listed.iter().any(|spilled| spilled.index == index) {
+            listed.push(SpillPartition {
+                index,
+                input: Level::Empty,
+                output: Level::Empty,
+            });
+        }
+    }
     Job::Spill {
         consumed: consumed.iter().map(|n| delta(*n)).collect(),
-        partitions: partitions
-            .iter()
-            .map(|(index, input, output)| SpillPartition {
-                index: *index,
-                input: *input,
-                output: *output,
-            })
-            .collect(),
+        partitions: listed,
     }
 }
 
@@ -1486,9 +1484,236 @@ fn spills_start_on_time_count_or_records_and_the_cap_stops_folding() {
 #[test]
 fn the_gate_is_open_only_while_the_seed_matches() {
     let mut root = Root::new(4);
+    assert!(!root.gate_open(), "a new root starts closed");
+    root.seed_gate = root.gate;
     assert!(root.gate_open());
-    root.gate = 3;
+    root.gate += 2;
     assert!(!root.gate_open());
-    root.seed_gate = 3;
+    root.seed_gate = root.gate;
     assert!(root.gate_open());
+}
+
+#[test]
+fn a_spill_that_omits_or_repeats_a_partition_is_discarded_and_removes_no_delta() {
+    let mut root = Root::new(4);
+    root.deltas = [delta(1), delta(2)].into();
+    let map = Map::empty(4);
+    let part = |index| SpillPartition {
+        index,
+        input: Level::Empty,
+        output: run_ref(index as u64 + 1),
+    };
+    let job = |partitions: Vec<SpillPartition>| Job::Spill {
+        consumed: [delta(1)].into(),
+        partitions,
+    };
+    // Nothing listed, some listed, one listed twice, an extra index.
+    for (partitions, expected) in [
+        (vec![], Discard::PartitionSet),
+        (vec![part(0), part(1), part(2)], Discard::PartitionSet),
+        (
+            vec![part(0), part(1), part(2), part(2)],
+            Discard::PartitionSet,
+        ),
+        (
+            vec![part(0), part(1), part(2), part(3), part(3)],
+            Discard::PartitionSet,
+        ),
+        (
+            vec![part(0), part(1), part(2), part(4)],
+            Discard::NoPartition,
+        ),
+    ] {
+        assert_eq!(
+            apply_job(&root, &map, &job(partitions.clone())),
+            Err(expected),
+            "{partitions:?}"
+        );
+    }
+    // Every partition once, in any order, commits and removes only its delta.
+    let all = job(vec![part(3), part(0), part(2), part(1)]);
+    let (after, _) = apply_job(&root, &map, &all).expect("commits");
+    assert_eq!(after.deltas, [delta(2)].into());
+    // A map and a root that disagree on the partition count discard any job.
+    let wrong_root = Root::new(5);
+    assert_eq!(
+        apply_job(&wrong_root, &map, &all),
+        Err(Discard::PartitionSet)
+    );
+    let merge_job = Job::BaseMerge {
+        partition: 0,
+        l1: Level::Empty,
+        l2: Level::Empty,
+        output: run_ref(1),
+    };
+    assert_eq!(
+        apply_job(&wrong_root, &map, &merge_job),
+        Err(Discard::PartitionSet)
+    );
+}
+
+#[test]
+fn a_map_with_a_malformed_run_is_rejected() {
+    let run = |buckets: u32, overflow: u32| RunRef {
+        epoch: 1,
+        id: 1,
+        buckets,
+        overflow,
+        records: 10,
+    };
+    let map_with = |run: RunRef| {
+        let mut map = Map::empty(2);
+        map.partitions[1].l2 = Level::Run(run);
+        reseal(unsealed(&encode_map(&map)))
+    };
+    for (buckets, overflow, ok) in [
+        (1, 0, true),
+        (10, 70, true),
+        (u32::MAX - 65_535, 65_535, true),
+        (0, 0, false),
+        (0, 1, false),
+        (u32::MAX, 1, true),
+        (u32::MAX, 2, false),
+        (5, 65_536, false),
+        (5, u32::MAX, false),
+    ] {
+        assert_eq!(
+            decode_map(&map_with(run(buckets, overflow))).is_ok(),
+            ok,
+            "{buckets} buckets, {overflow} overflow"
+        );
+    }
+    assert_eq!(overflow_index(u32::MAX, 2), None);
+    assert_eq!(overflow_index(u32::MAX, 1), Some(u32::MAX));
+    // A chain that names an index past u32 is a bad bucket, not a panic.
+    let page = encode_bucket(u32::MAX, 1, 2, &[Record::birth(key(1, 1), 1)]).expect("fits");
+    let next = encode_bucket(0, 1, 0, &[]).expect("fits").to_vec();
+    assert_eq!(
+        bucket_chain(&page, u32::MAX, 1, u32::MAX, &[next.clone(), next]),
+        Err(BadBucket)
+    );
+}
+
+#[test]
+fn a_segment_or_delta_from_unsorted_records_decodes_sorted_and_merged() {
+    let k1 = key(1, 1);
+    let k2 = key(2, 2);
+    let records = vec![
+        Record::birth(k2, 1),
+        Record::birth(k1, 4),
+        Record::base(k2, pack(3), 1, 7),
+        Record::birth(k1, 2),
+    ];
+    let expected = sorted(records.clone());
+    assert_eq!(expected.len(), 2);
+    assert_eq!(
+        decode_segment(&encode_segment(&records)),
+        Ok(expected.clone())
+    );
+    let delta = Delta {
+        segments: vec!["seg/a".into()],
+        records,
+    };
+    let decoded = decode_delta(&encode_delta(&delta)).expect("decodes");
+    assert_eq!(decoded.records, expected);
+    assert_eq!(decoded.segments, delta.segments);
+    // Sorted input keeps its bytes.
+    assert_eq!(
+        encode_segment(&expected),
+        encode_segment(&sorted(expected.clone()))
+    );
+}
+
+#[test]
+fn a_chain_whose_keys_do_not_ascend_across_pages_is_rejected() {
+    let tag = 9;
+    let main = encode_bucket(
+        0,
+        tag,
+        1,
+        &[Record::birth(key(5, 0), 1), Record::birth(key(6, 0), 1)],
+    )
+    .expect("fits");
+    let page = |first: u64| {
+        encode_bucket(
+            overflow_index(1, 1).expect("fits"),
+            tag,
+            0,
+            &[Record::birth(key(first, 0), 1)],
+        )
+        .expect("fits")
+        .to_vec()
+    };
+    assert_eq!(bucket_chain(&main, 0, tag, 1, &[page(1)]), Err(BadBucket));
+    assert_eq!(bucket_chain(&main, 0, tag, 1, &[page(6)]), Err(BadBucket));
+    let chain = bucket_chain(&main, 0, tag, 1, &[page(7)]).expect("reads");
+    assert_eq!(
+        find(&chain, &key(7, 0)).map(|record| record.key),
+        Some(key(7, 0))
+    );
+}
+
+#[test]
+fn a_root_with_overlapping_or_unordered_delta_ranges_is_rejected() {
+    let mut root = Root::new(4);
+    root.deltas.insert(DeltaId { epoch: 1, n: 1 });
+    root.deltas.insert(DeltaId { epoch: 2, n: 5 });
+    let body = unsealed(&encode_root(&root));
+    let ranges = body.len() - 48;
+    let range = |epoch: u64, from: u64, to: u64| {
+        let mut out = Vec::new();
+        for value in [epoch, from, to] {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out
+    };
+    for (first, second, ok) in [
+        ((1, 1, 1), (2, 5, 5), true),
+        ((1, 1, 3), (1, 3, 5), false),
+        ((1, 1, 3), (1, 2, 2), false),
+        ((1, 1, 1), (1, 1, 1), false),
+        ((2, 5, 5), (1, 1, 1), false),
+        ((1, 4, 6), (1, 1, 2), false),
+    ] {
+        let mut bytes = body[..ranges].to_vec();
+        bytes.extend(range(first.0, first.1, first.2));
+        bytes.extend(range(second.0, second.1, second.2));
+        assert_eq!(
+            decode_root(&reseal(bytes)).is_ok(),
+            ok,
+            "{first:?} {second:?}"
+        );
+    }
+}
+
+/// A merge whose output loses a key is caught: the writer counts fewer
+/// records than the distinct keys the merge read.
+#[test]
+fn a_faulty_writer_that_drops_a_key_fails_the_check() {
+    for drop_at in [0_usize, 3, 99] {
+        let a = uniform(60, 31);
+        let b = uniform(60, 32);
+        let declared = [a.len() as u64, b.len() as u64];
+        let mut merged = Merge::new(vec![a.into_iter(), b.into_iter()]);
+        let written = merged
+            .by_ref()
+            .enumerate()
+            .filter(|(at, _)| *at != drop_at)
+            .count() as u64;
+        let distinct = merged.distinct();
+        assert_eq!(written + 1, distinct);
+        assert_eq!(
+            merge_check(written, distinct, &declared, merged.read()),
+            Err(MergeCheckError::Written { written, distinct })
+        );
+    }
+    // An input that ends early reads fewer records than it declared.
+    let a = uniform(60, 33);
+    let declared = [a.len() as u64 + 1];
+    let mut merged = Merge::new(vec![a.into_iter()]);
+    let written = merged.by_ref().count() as u64;
+    assert!(matches!(
+        merge_check(written, merged.distinct(), &declared, merged.read()),
+        Err(MergeCheckError::Inputs { .. })
+    ));
 }

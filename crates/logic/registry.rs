@@ -481,11 +481,12 @@ fn take_records(input: &mut Reader<'_>) -> Result<Vec<Record>, DecodeError> {
     Ok(records)
 }
 
-/// A segment: the entries one node queued in one window, sorted by key with
-/// one record per key (see [`sorted`]).
+/// A segment: the entries one node queued in one window. The records are
+/// sorted by key with one record per key (see [`sorted`]), so the object always
+/// decodes; input that is already sorted is written as it is.
 pub fn encode_segment(records: &[Record]) -> Vec<u8> {
     let mut out = Writer::new(SEGMENT_MAGIC);
-    put_records(&mut out, records);
+    put_records(&mut out, &sorted(records.to_vec()));
     out.seal()
 }
 
@@ -504,13 +505,14 @@ pub struct Delta {
     pub records: Vec<Record>,
 }
 
+/// Like [`encode_segment`], the records are sorted and merged per key first.
 pub fn encode_delta(delta: &Delta) -> Vec<u8> {
     let mut out = Writer::new(DELTA_MAGIC);
     out.u32(delta.segments.len() as u32);
     for segment in &delta.segments {
         out.text(segment);
     }
-    put_records(&mut out, &delta.records);
+    put_records(&mut out, &sorted(delta.records.clone()));
     out.seal()
 }
 
@@ -617,9 +619,10 @@ pub fn bucket_offset(index: u32) -> u64 {
 }
 
 /// The index, in the run's object, of overflow page `number` (1-based) of a
-/// run with `buckets` main buckets. It is the index the page carries.
-pub fn overflow_index(buckets: u32, number: u16) -> u32 {
-    buckets + u32::from(number) - 1
+/// run with `buckets` main buckets. It is the index the page carries, or
+/// `None` when it does not fit.
+pub fn overflow_index(buckets: u32, number: u16) -> Option<u32> {
+    buckets.checked_add(u32::from(number).checked_sub(1)?)
 }
 
 /// Builds a run from records in strictly ascending key order. Main buckets
@@ -689,7 +692,7 @@ impl RunBuilder {
             } else {
                 0
             };
-            let index = overflow_index(self.buckets, number);
+            let index = overflow_index(self.buckets, number).ok_or(RunError::Shape)?;
             self.overflow
                 .push(encode_bucket(index, self.tag, next, chunk)?);
         }
@@ -748,7 +751,14 @@ pub fn bucket_chain<P: AsRef<[u8]>>(
             return Err(BadBucket);
         }
         let page = overflow.get(usize::from(next) - 1).ok_or(BadBucket)?;
-        let (more, after) = decode_bucket(page.as_ref(), overflow_index(buckets, next), tag)?;
+        let at = overflow_index(buckets, next).ok_or(BadBucket)?;
+        let (more, after) = decode_bucket(page.as_ref(), at, tag)?;
+        // `find` searches the joined list, so the pages must continue in order.
+        if let (Some(last), Some(first)) = (records.last(), more.first()) {
+            if last.key >= first.key {
+                return Err(BadBucket);
+            }
+        }
         records.extend(more);
         next = after;
     }
@@ -768,24 +778,33 @@ pub fn find(records: &[Record], key: &Key) -> Option<Record> {
 // ---------------------------------------------------------------------------
 
 /// A k-way merge of record streams, each in ascending key order, that keeps
-/// one record per key by the merge rule and counts the distinct keys it saw,
-/// so a writer can check that it wrote every one.
+/// one record per key by the merge rule. It counts the distinct keys it read
+/// from all inputs and the records it read from each input, so a writer can
+/// check with [`merge_check`] that it wrote every key and that no input ended
+/// early.
 pub struct Merge<I: Iterator<Item = Record>> {
     inputs: Vec<std::iter::Peekable<I>>,
     distinct: u64,
+    read: Vec<u64>,
 }
 
 impl<I: Iterator<Item = Record>> Merge<I> {
     pub fn new(inputs: Vec<I>) -> Self {
         Self {
+            read: vec![0; inputs.len()],
             inputs: inputs.into_iter().map(Iterator::peekable).collect(),
             distinct: 0,
         }
     }
 
-    /// Distinct keys returned so far.
+    /// Distinct keys read from all inputs so far.
     pub fn distinct(&self) -> u64 {
         self.distinct
+    }
+
+    /// Records read from each input so far, in input order.
+    pub fn read(&self) -> &[u64] {
+        &self.read
     }
 }
 
@@ -799,8 +818,9 @@ impl<I: Iterator<Item = Record>> Iterator for Merge<I> {
             .filter_map(|input| input.peek().map(|record| record.key))
             .min()?;
         let mut kept: Option<Record> = None;
-        for input in &mut self.inputs {
+        for (input, read) in self.inputs.iter_mut().zip(&mut self.read) {
             while let Some(record) = input.next_if(|record| record.key == key) {
+                *read += 1;
                 kept = Some(kept.map_or(record, |kept| merge(kept, record)));
             }
         }
@@ -906,7 +926,9 @@ impl Root {
             heartbeat: 0,
             streak: 0,
             stuck: 0,
-            gate: 0,
+            // A new root starts closed: the registry may answer `New` only
+            // after a seed made for the current gate number.
+            gate: 1,
             seed_gate: 0,
             packs: false,
             map: None,
@@ -1049,11 +1071,19 @@ pub fn decode_root(bytes: &[u8]) -> Result<Root, DecodeError> {
     }
     let mut deltas = BTreeSet::new();
     let mut named = 0_u64;
+    let mut previous: Option<(u64, u64)> = None;
     for _ in 0..count {
         let (epoch, from, to) = (input.u64()?, input.u64()?, input.u64()?);
         if to < from {
             return Err(DecodeError::Invalid("delta range"));
         }
+        // Ranges ascend and never overlap, as the encoder writes them.
+        if previous.is_some_and(|(last_epoch, last_to)| {
+            epoch < last_epoch || (epoch == last_epoch && from <= last_to)
+        }) {
+            return Err(DecodeError::Invalid("delta range order"));
+        }
+        previous = Some((epoch, to));
         named = named.saturating_add(to - from).saturating_add(1);
         if named > MAX_ROOT_DELTAS {
             return Err(DecodeError::Invalid("delta count"));
@@ -1202,13 +1232,26 @@ fn take_level(input: &mut Reader<'_>) -> Result<Level, DecodeError> {
     if !input.flag("level flag")? {
         return Ok(Level::Empty);
     }
-    Ok(Level::Run(RunRef {
+    let run = RunRef {
         epoch: input.u64()?,
         id: input.u64()?,
         buckets: input.u32()?,
         overflow: input.u32()?,
         records: input.u64()?,
-    }))
+    };
+    // A run has main buckets, no more overflow pages than a header can name,
+    // and every page index fits the 4-byte index a bucket carries. Without
+    // these an overflow page could share the index of a main bucket.
+    let last_overflow = u16::try_from(run.overflow).ok();
+    let fits = match last_overflow {
+        Some(0) => true,
+        Some(last) => overflow_index(run.buckets, last).is_some(),
+        None => false,
+    };
+    if run.buckets == 0 || !fits {
+        return Err(DecodeError::Invalid("run shape"));
+    }
+    Ok(Level::Run(run))
 }
 
 pub fn encode_map(map: &Map) -> Vec<u8> {
@@ -1287,6 +1330,10 @@ pub enum Discard {
     DeltaGone,
     /// The job names a partition the map does not have.
     NoPartition,
+    /// A spill does not list every partition of the map exactly once, or the
+    /// map and the root disagree on the number of partitions. A spill removes
+    /// the consumed deltas, so a partition it left out would lose their keys.
+    PartitionSet,
 }
 
 /// Apply `job` to the current root and map, or say why it must be discarded.
@@ -1294,7 +1341,15 @@ pub enum Discard {
 /// partition's level 1 while a base merge was reading it, the merge would
 /// publish a level 2 that lacks the spilled keys. Pure: the caller writes the
 /// result, by a conditional write of the root.
+///
+/// A spill lists every partition of the map exactly once. Partitions are
+/// matched by position and compared by their [`Level`]s only, not by their
+/// first key: a change that splits or moves partitions must also change how a
+/// job names them here.
 pub fn apply_job(root: &Root, map: &Map, job: &Job) -> Result<(Root, Map), Discard> {
+    if root.k as usize != map.partitions.len() {
+        return Err(Discard::PartitionSet);
+    }
     let mut root = root.clone();
     let mut map = map.clone();
     match job {
@@ -1304,6 +1359,17 @@ pub fn apply_job(root: &Root, map: &Map, job: &Job) -> Result<(Root, Map), Disca
         } => {
             if !consumed.is_subset(&root.deltas) {
                 return Err(Discard::DeltaGone);
+            }
+            let mut listed = vec![false; map.partitions.len()];
+            for spilled in partitions {
+                match listed.get_mut(spilled.index) {
+                    None => return Err(Discard::NoPartition),
+                    Some(seen) if *seen => return Err(Discard::PartitionSet),
+                    Some(seen) => *seen = true,
+                }
+            }
+            if listed.contains(&false) {
+                return Err(Discard::PartitionSet);
             }
             for spilled in partitions {
                 let partition = map
