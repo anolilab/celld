@@ -278,6 +278,9 @@ pub struct Registry {
     /// Live nodes and their addresses, for the holder's root push.
     pub(crate) fleet: Mutex<Vec<(String, String)>>,
     pub(crate) last_pass_request_ms: AtomicU64,
+    /// Nodes whose node log this process recovered, and when: a holder that is
+    /// one of them is dead, so the role can be taken at once.
+    pub(crate) recovered: Mutex<HashMap<String, u64>>,
 }
 
 impl std::fmt::Debug for Registry {
@@ -341,12 +344,22 @@ impl Registry {
             peer_addr: Mutex::new(HashMap::new()),
             fleet: Mutex::new(Vec::new()),
             last_pass_request_ms: AtomicU64::new(0),
+            recovered: Mutex::new(HashMap::new()),
         })
     }
 
     /// Make this registry the one the routes serve.
     pub(crate) fn install(self: &Arc<Self>) {
         let _ = GLOBAL.set(self.clone());
+    }
+
+    /// This process recovered the node log of `node`, which is dead: if it holds
+    /// the role, the role is taken at once instead of after the lease wait.
+    pub fn note_recovered(&self, node: &str) {
+        self.recovered
+            .lock()
+            .unwrap()
+            .insert(node.to_owned(), crate::asyncrt::mono_ms());
     }
 
     /// Give the registry what it needs to ask the holder for a pass.

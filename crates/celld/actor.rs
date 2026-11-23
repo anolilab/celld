@@ -3281,6 +3281,7 @@ impl Actor {
             Effect::RecoverNodeLog { op, cell, owner } => {
                 self.route_effect_started(&cell);
                 let interlock = self.node_log.lock().unwrap().clone();
+                let ownership = self.ownership.clone();
                 let timing_cell = cell.clone();
                 out.spawn_scoped(async move {
                     let started = crate::asyncrt::mono_ms();
@@ -3298,6 +3299,11 @@ impl Actor {
                                 Failure::Ambiguous
                             }),
                     };
+                    if result.is_ok() {
+                        if let Ownership::Bucket(bucket) = &ownership {
+                            bucket.note_node_recovered(&owner);
+                        }
+                    }
                     CompletedEffect::timed(
                         Event::NodeLogRecovered { op, result },
                         timing_cell,

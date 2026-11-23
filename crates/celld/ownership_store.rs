@@ -746,6 +746,14 @@ impl BucketOwnership {
         }
     }
 
+    /// This node recovered the node log of `node`: the registry may take the
+    /// compactor role from it at once.
+    pub(crate) fn note_node_recovered(&self, node: &str) {
+        if let Some(registry) = &self.registry {
+            registry.note_recovered(node);
+        }
+    }
+
     /// The registry's role, queue and counters, or `None` on a node without one.
     pub(crate) fn registry_state(&self) -> Option<serde_json::Value> {
         self.registry.as_ref().map(|registry| registry.state())

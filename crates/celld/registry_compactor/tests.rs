@@ -56,7 +56,14 @@ async fn holder_of(registry: &Arc<Registry>) -> Holding {
     let now = crate::asyncrt::mono_ms();
     holding.last_spill_ms = Some(now);
     holding.last_base_ms = now;
+    open_gate(registry, &mut holding).await;
     holding
+}
+
+/// What a finished seed does: the root's seed belongs to its gate number.
+async fn open_gate(registry: &Arc<Registry>, holding: &mut Holding) {
+    holding.root.seed_gate = holding.root.gate;
+    assert!(registry.write_root(holding).await.unwrap());
 }
 
 async fn take_over(registry: &Arc<Registry>) -> Holding {
@@ -108,8 +115,15 @@ async fn a_lookup_with_no_root_reads_unknown_and_a_missing_root_is_never_an_empt
     let store = memory();
     let node = registry_on(&store, "node-a");
     assert!(matches!(answer(&node, &cell(1)).await, Answer::Unknown(_)));
-    let _holding = holder_of(&node).await;
+    let mut holding = holder_of(&node).await;
     assert_eq!(answer(&node, &cell(1)).await, Answer::New);
+    holding.root.seed_gate = 0;
+    assert!(node.write_root(&mut holding).await.unwrap());
+    assert_eq!(
+        answer(&node, &cell(1)).await,
+        Answer::Unknown(celld_logic::lost_record::Doubt::GateClosed),
+        "before a seed the gate is closed, and a closed gate is never New"
+    );
 }
 
 #[tokio::test]
@@ -1817,4 +1831,16 @@ async fn two_compactors_that_watched_one_root_take_the_role_once() {
     let (root, _) = old.read_root(&io).await.unwrap().expect("the root exists");
     assert_eq!(root.epoch, 2);
     assert!(root.holder.is_some());
+}
+
+#[tokio::test]
+async fn a_recovered_node_log_marks_that_node_dead_for_a_minute() {
+    let store = memory();
+    let node = registry_on(&store, "node-b");
+    let now = crate::asyncrt::mono_ms();
+    assert!(!node.recovered_recently("node-a", now));
+    node.note_recovered("node-a");
+    assert!(node.recovered_recently("node-a", now));
+    assert!(!node.recovered_recently("node-c", now));
+    assert!(!node.recovered_recently("node-a", now + 61_000));
 }

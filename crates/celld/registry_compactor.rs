@@ -465,12 +465,24 @@ pub(crate) async fn prepare_spill(
         objects::delete_many(store.as_ref(), &outputs).await;
         return Err(error);
     }
+    // A spill lists every partition: one that no consumed record falls in keeps
+    // its level 1, and the commit still checks that it did not move.
+    for (index, partition) in map.partitions.iter().enumerate() {
+        if !partitions.iter().any(|spilled| spilled.index == index) {
+            partitions.push(reg::SpillPartition {
+                index,
+                input: partition.l1,
+                output: partition.l1,
+            });
+        }
+    }
+    let touched = outputs.len();
     partitions.sort_by_key(|spilled| spilled.index);
     retire.extend(consumed.keys().map(|id| objects::delta_key(prefix, *id)));
     Ok(Prepared {
         epoch,
         kind: "spill",
-        partitions: partitions.len(),
+        partitions: touched,
         job: Job::Spill {
             consumed: consumed.keys().copied().collect(),
             partitions,
@@ -664,7 +676,18 @@ async fn lease_gone(registry: &Registry, node: &str) -> Option<bool> {
     Some(expires <= crate::ownership_store::now_ms())
 }
 
+/// How long a recovery of a node log counts as proof that the node is dead.
+const RECOVERY_VALID_MS: u64 = 60_000;
+
 impl Registry {
+    fn recovered_recently(&self, node: &str, now: u64) -> bool {
+        self.recovered
+            .lock()
+            .unwrap()
+            .get(node)
+            .is_some_and(|at| now.saturating_sub(*at) < RECOVERY_VALID_MS)
+    }
+
     /// Watch the root and hold the role when the rules say so, until `stop`.
     pub(crate) async fn run_compactor(self: Arc<Self>, stop: crate::ltx_repl::StopToken) {
         let mut checked_lease: Option<(u64, Option<bool>)> = None;
@@ -708,7 +731,9 @@ impl Registry {
                             own,
                             unchanged_ms: unchanged,
                             lease_gone: lease,
-                            recovered_holder: false,
+                            recovered_holder: root.holder.as_ref().is_some_and(|holder| {
+                                !own && self.recovered_recently(&holder.node, now)
+                            }),
                             stuck: root.stuck,
                             pass_ms: self.cfg.pass_ms,
                         }),
