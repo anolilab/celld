@@ -106,3 +106,12 @@ pub fn author_live(by: Option<&str>, lease_tags: &[String]) -> bool {
         _ => true,
     }
 }
+
+/// A left entry of a chunk: the epoch of the record that the session announced
+/// for a cell, the nonces it announced, and the one it saw applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeftEntry {
+    pub epoch: u64,
+    pub nonces: Vec<String>,
+    pub done: Option<String>,
+}
