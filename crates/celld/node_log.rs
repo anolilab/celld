@@ -5459,7 +5459,9 @@ impl NodeLogManager {
         };
         let Some(shipper) = shipper else {
             // No shipper: this session never acknowledged past the bucket, so
-            // nothing gates the seal of its header and chunks.
+            // no row is left for a gather and nothing gates the seal of its
+            // header and chunks. A sealed header says that every acknowledged
+            // row is a per-cell object, which holds here trivially.
             self.seal_session_without_log().await;
             return;
         };
@@ -5482,6 +5484,7 @@ impl NodeLogManager {
         // and buffered stdout may never flush before exit.
         let Some(current) = transition.current() else {
             eprintln!("node-log close: no folded log; nothing to seal");
+            // No log means no acknowledgement past the bucket (see above).
             self.seal_session_without_log().await;
             return;
         };

@@ -361,3 +361,31 @@ async fn a_lost_session_object_is_sealed_as_lost_or_unknown_and_the_node_starts(
     assert_eq!(lost[0].1["state"], "sealed");
     assert_eq!(lost[0].1["lost"], true, "{:?}", lost[0].1);
 }
+
+/// A header that exists and does not parse is replaced, on its current token,
+/// by a sealed and lost one.
+#[tokio::test]
+async fn an_unparseable_session_header_is_replaced_by_a_lost_one() {
+    let mut server = Server::start("do-ids", SHADOW).await;
+    let ids = minted(&server).await;
+    let (first, _) = header_tag(server.project());
+    assert_eq!(bump(&server, &ids[0]).await, 1);
+    server
+        .restart_after(|project| {
+            store(project)
+                .execute(
+                    "UPDATE objects SET body = ?1 WHERE key LIKE '%fleet/sessions/%.json'",
+                    [b"not json".to_vec()],
+                )
+                .expect("corrupt the header");
+        })
+        .await;
+    assert_eq!(bump(&server, &ids[0]).await, 2, "the node serves again");
+    let replaced: Vec<_> = headers(server.project())
+        .into_iter()
+        .filter(|(key, _)| tag_of_key(key) == first)
+        .collect();
+    assert_eq!(replaced.len(), 1);
+    assert_eq!(replaced[0].1["state"], "sealed");
+    assert_eq!(replaced[0].1["lost"], true, "{:?}", replaced[0].1);
+}

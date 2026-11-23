@@ -77,7 +77,8 @@ pub fn chunk_key(tag: &str, chunk: u64) -> String {
 pub enum Read<T> {
     Missing,
     Found(T, String),
-    Unreadable,
+    /// The object exists and does not parse; the token is its current one.
+    Unreadable(String),
 }
 
 async fn read<T: for<'de> Deserialize<'de>>(bucket: &Bucket, key: &str) -> anyhow::Result<Read<T>> {
@@ -85,7 +86,7 @@ async fn read<T: for<'de> Deserialize<'de>>(bucket: &Bucket, key: &str) -> anyho
         None => Read::Missing,
         Some((bytes, token)) => match serde_json::from_slice(&bytes) {
             Ok(value) => Read::Found(value, token),
-            Err(_) => Read::Unreadable,
+            Err(_) => Read::Unreadable(token),
         },
     })
 }
@@ -176,6 +177,27 @@ pub async fn swap_chunk(
     swap(bucket, &chunk_key(tag, chunk), body, token).await
 }
 
+fn unknown_chunk() -> Chunk {
+    Chunk {
+        state: State::Sealed,
+        unknown: true,
+        ..Chunk::default()
+    }
+}
+
+fn lost_header() -> Header {
+    Header {
+        node: String::new(),
+        generation: String::new(),
+        mode: Mode::Off,
+        state: State::Sealed,
+        chunks: 0,
+        rev: 0,
+        key: String::new(),
+        lost: true,
+    }
+}
+
 /// Seal one counted chunk. The first seal of a chunk fixes its content for
 /// every sealer and every reader: a sealed chunk is kept as it is, an open one
 /// is sealed with what it holds and what `gather` adds, and a missing one is
@@ -203,13 +225,20 @@ async fn seal_chunk(
                     return Ok(());
                 }
             }
-            Read::Missing | Read::Unreadable => {
-                let lost = Chunk {
-                    state: State::Sealed,
-                    unknown: true,
-                    ..Chunk::default()
-                };
-                if create(bucket, &chunk_key(tag, chunk), &lost)
+            Read::Missing => {
+                if create(bucket, &chunk_key(tag, chunk), &unknown_chunk())
+                    .await?
+                    .is_some()
+                {
+                    return Ok(());
+                }
+            }
+            // A chunk that exists and does not parse is replaced, on the token
+            // of that read, by the same sealed and unknown chunk.
+            Read::Unreadable(token) => {
+                let body = serde_json::to_vec(&unknown_chunk())?;
+                if bucket
+                    .put_cas(&chunk_key(tag, chunk), body, Some(&token))
                     .await?
                     .is_some()
                 {
@@ -253,23 +282,24 @@ pub async fn seal_session(
                     break;
                 }
             }
-            // A header that exists and does not parse cannot be created again.
-            // A reader refuses every id of it; a sealer has nothing to write.
-            Read::Unreadable => {
-                anyhow::bail!("the session header {} does not parse", header_key(tag))
+            // A header that exists and does not parse is replaced, by a write on
+            // the token of that read, by a sealed and lost one. Every reader
+            // refuses the ids of a lost header until the operator repairs it.
+            Read::Unreadable(token) => {
+                let body = serde_json::to_vec(&lost_header())?;
+                if bucket
+                    .put_cas(&header_key(tag), body, Some(&token))
+                    .await?
+                    .is_some()
+                {
+                    return Ok(());
+                }
             }
             Read::Missing => {
-                let lost = Header {
-                    node: String::new(),
-                    generation: String::new(),
-                    mode: Mode::Off,
-                    state: State::Sealed,
-                    chunks: 0,
-                    rev: 0,
-                    key: String::new(),
-                    lost: true,
-                };
-                if create(bucket, &header_key(tag), &lost).await?.is_some() {
+                if create(bucket, &header_key(tag), &lost_header())
+                    .await?
+                    .is_some()
+                {
                     return Ok(());
                 }
             }
@@ -290,7 +320,7 @@ pub async fn seal_session(
                     return Ok(());
                 }
             }
-            Read::Missing | Read::Unreadable => break,
+            Read::Missing | Read::Unreadable(_) => break,
         }
     }
     anyhow::bail!("sealing {} lost every race", header_key(tag))
