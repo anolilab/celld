@@ -578,6 +578,46 @@ async fn an_unparseable_chunk_is_replaced_by_an_unknown_one_and_its_ids_are_refu
     assert!(server.log_text().contains("celld ownership record lost"));
 }
 
+/// A lost header refuses every id of its session, whether or not the id has a
+/// record, and nothing is read from or written to a chunk for it.
+#[tokio::test]
+async fn the_ids_of_a_lost_header_are_refused_and_no_chunk_is_marked() {
+    let mut server = Server::start("do-ids", SHADOW).await;
+    let ids = minted(&server).await;
+    let (tag, _) = header_tag(server.project());
+    assert_eq!(bump(&server, &ids[0]).await, 1);
+    server
+        .restart_after(|project| {
+            drop_certificate(project);
+            store(project)
+                .execute(
+                    "DELETE FROM objects WHERE key LIKE '%fleet/sessions/%.json'",
+                    [],
+                )
+                .expect("lose the header");
+        })
+        .await;
+    let before = chunk_of(server.project(), &tag);
+    // One id with a record, one that never had one.
+    for id in [&ids[0], &ids[1]] {
+        assert!(!server
+            .get_status(&format!("/bump?id={id}"))
+            .await
+            .is_success());
+    }
+    assert!(server.log_text().contains("session record lost"));
+    assert_eq!(
+        chunk_of(server.project(), &tag),
+        before,
+        "the chunk was written"
+    );
+    assert_eq!(
+        count(server.project(), "%cells/%/own.json"),
+        1,
+        "nothing was claimed"
+    );
+}
+
 /// An id whose counter no chunk of its session counts was never minted.
 #[tokio::test]
 async fn an_id_that_was_never_minted_is_refused() {
