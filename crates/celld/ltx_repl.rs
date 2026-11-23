@@ -1374,11 +1374,12 @@ impl LtxRepl {
         };
         let (store, registry) = match birth_registry_mode()? {
             Some(()) => {
-                anyhow::ensure!(
-                    directory.is_none(),
-                    "CELLD_BIRTH_REGISTRY=shadow cannot run with CELLD_CELL_DIRECTORY_SHADOW=1: \
-                     two store wrappers would stack two waits"
-                );
+                if directory.is_some() {
+                    tracing::warn!(
+                        "CELLD_BIRTH_REGISTRY=shadow with CELLD_CELL_DIRECTORY_SHADOW=1: \
+                         a first write can wait for both"
+                    );
+                }
                 let config = crate::registry::Config::from_env(durability_timeout_ms)?;
                 crate::registry_writer::check_bound(config.bound, durability_timeout_ms)?;
                 let registry = crate::registry::Registry::new(
