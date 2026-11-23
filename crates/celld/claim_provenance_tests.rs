@@ -114,6 +114,66 @@ fn a_named_id_and_an_id_minted_elsewhere_are_not_minted_here() {
 }
 
 #[test]
+fn a_first_claim_of_a_minted_format_id_from_elsewhere_is_counted_apart() {
+    use hmac::Mac;
+    let key = [3_u8; 32];
+    let mut minted = [0_u8; 32];
+    minted[..16].copy_from_slice(&[7; 16]);
+    let digest = crate::engine_api::durable_object_id_hmac(&key, &minted[..16])
+        .finalize()
+        .into_bytes();
+    minted[16..].copy_from_slice(&digest[..16]);
+    let minted_scope = format!(
+        "Agent:{}",
+        crate::engine_api::durable_object_id_hex(&minted)
+    );
+    // A named id is a full HMAC of the name, so its halves do not match.
+    let named_scope = cell(7);
+
+    let p = ClaimProvenance::new(1);
+    p.register_namespace("Agent", key);
+    p.claim_applied(
+        &claimed(&named_scope, 1, true, ClaimPrior::Released, true),
+        200,
+    );
+    // The same id under a class this process does not serve is not counted.
+    p.claim_applied(
+        &claimed(
+            &minted_scope.replace("Agent", "Other"),
+            1,
+            true,
+            ClaimPrior::Released,
+            true,
+        ),
+        200,
+    );
+    // A second claim is not a first claim.
+    p.claim_applied(
+        &claimed(&minted_scope, 2, false, ClaimPrior::Released, true),
+        200,
+    );
+    assert_eq!(counter(&p, "first_claims_minted_elsewhere"), 0);
+
+    p.claim_applied(
+        &claimed(&minted_scope, 1, true, ClaimPrior::Released, true),
+        300,
+    );
+    assert_eq!(counter(&p, "first_claims_minted_elsewhere"), 1);
+    assert_eq!(counter(&p, "first_claims_minted_local"), 0);
+
+    // An id this process minted is counted as local, not as elsewhere.
+    let local = ClaimProvenance::new(1);
+    local.register_namespace("Agent", key);
+    local.minted(key_of_id(&minted), 100);
+    local.claim_applied(
+        &claimed(&minted_scope, 1, true, ClaimPrior::Released, true),
+        300,
+    );
+    assert_eq!(counter(&local, "first_claims_minted_local"), 1);
+    assert_eq!(counter(&local, "first_claims_minted_elsewhere"), 0);
+}
+
+#[test]
 fn a_second_claim_lands_by_whom_it_displaces() {
     let p = ClaimProvenance::new(1);
     for (key, prior, takeover) in [

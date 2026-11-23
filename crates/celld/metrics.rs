@@ -425,6 +425,12 @@ const FAMILIES: &[Family] = &[
         )],
     ),
     counter(
+        "celld_first_claims_minted_elsewhere_total",
+        "First claims of minted-format ids that this process did not mint.",
+        "",
+        &[("", |r| n(r.store.provenance.first_claims_minted_elsewhere))],
+    ),
+    counter(
         "celld_second_claims_total",
         "Second claims of a cell, by who held it before.",
         "prior",

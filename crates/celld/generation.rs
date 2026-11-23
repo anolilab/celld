@@ -727,6 +727,7 @@ impl Generation {
                 assets.insert(script.clone(), resolver);
             }
             let classes = options.do_classes.clone();
+            crate::claim_provenance::register_namespaces(&script, &classes);
             let config = Arc::new(
                 WorkerConfig::new(options)
                     .with_services(services)

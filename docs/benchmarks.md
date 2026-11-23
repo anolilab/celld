@@ -289,6 +289,7 @@ New fields under `storage_counters` in `/state`, per process, from its start:
 | `step0_sample` | the sampling divisor in force |
 | `minted_untracked` | keys pushed out of the minted set because it was full (at most 1,000,000 keys, oldest first) |
 | `first_claims_minted_local` | first claims that the store accepted for an id this process minted and had not yet claimed. A lower bound of the minted share: an id minted here and first used through another node is missed |
+| `first_claims_minted_elsewhere` | first claims that the store accepted for an id that has the shape of a minted id in a namespace this process serves (its second half is the HMAC of its first) and that this process did not mint, or no longer tracks (see `minted_untracked`): ids first used after the minting process ended, or through another node. Named ids never have this shape. It is the measure of ids first used after the minting process ended |
 | `first_claims_minted_local_no_ensemble` | the part of the line above made while the node had no active fleet ensemble, which a grant could not serve |
 | `second_claims_prior_released`, `_self`, `_other` | accepted claims at epoch 2, by whom the record they replaced named: no node, this node (a restart of it), another node |
 | `releases_drain`, `releases_handoff` | releases that the store accepted while the node was draining, and while it was not (a balancing move) |
