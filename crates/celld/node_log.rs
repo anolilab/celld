@@ -6115,7 +6115,7 @@ impl NodeLogManager {
         Ok(matches!(
             self.ownership.read_owner(cell).await?,
             Some(record)
-                if crate::session::names_this_process(&self.node, &record)
+                if crate::session::names_this_process(&self.node, cell, &record)
                     && record.epoch == epoch
         ))
     }

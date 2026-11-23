@@ -552,7 +552,8 @@ impl WakeFlusher {
             .map_err(|_| anyhow::anyhow!("wake retirement ownership read failed"))?;
         anyhow::ensure!(
             owner.is_some_and(|owner| {
-                owner.epoch == source.id.epoch && crate::session::names_this_process(node, &owner)
+                owner.epoch == source.id.epoch
+                    && crate::session::names_this_process(node, cell, &owner)
             }),
             "wake retirement lost writer authority"
         );

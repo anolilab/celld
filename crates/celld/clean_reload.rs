@@ -18,6 +18,9 @@ const CLEAN_RELOAD_MARKER: &str = ".clean-reload.json";
 pub struct ReloadSession {
     pub tags: Vec<String>,
     pub cells: BTreeMap<String, String>,
+    /// The epoch each captured cell was resumed at.
+    #[serde(default)]
+    pub epochs: BTreeMap<String, u64>,
 }
 
 #[derive(Serialize)]
@@ -103,6 +106,7 @@ mod tests {
         let session = ReloadSession {
             tags: vec!["b".into(), "a".into()],
             cells: BTreeMap::from([("c1".into(), "a".into())]),
+            epochs: BTreeMap::from([("c1".into(), 3)]),
         };
         let body = serde_json::to_vec(&CleanReloadMarker {
             node: "n",

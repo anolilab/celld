@@ -1017,7 +1017,8 @@ impl BucketOwnership {
         let Some(current) = self.read_owner(cell).await? else {
             return Ok(CasOutcome::Rejected);
         };
-        if !crate::session::names_this_process(&self.node, &current) || current.epoch != epoch {
+        if !crate::session::names_this_process(&self.node, cell, &current) || current.epoch != epoch
+        {
             return Ok(CasOutcome::Rejected);
         }
         let key = format!("cells/{cell}/own.json");
@@ -1410,5 +1411,53 @@ pub(crate) fn process_load(live: &LiveLoad) -> NodeLoadWire {
         // Published each renewal, so a peer sees a start or stop within a
         // renewal and a sample refresh. Empty on a node with no engine.
         container_instances: crate::container::running_instances_by_class(),
+    }
+}
+
+#[cfg(test)]
+mod session_wire_tests {
+    use super::*;
+
+    /// With no session (the flag `off`, or an older binary) the bytes of the
+    /// ownership record and of the lease are the ones written before sessions.
+    #[test]
+    fn without_a_session_the_wire_bytes_are_unchanged() {
+        let body = serde_json::to_vec(&OwnerWire {
+            node: "n1",
+            epoch: 7,
+            by: None,
+        })
+        .unwrap();
+        assert_eq!(body, br#"{"node":"n1","epoch":7}"#);
+        let body = serde_json::to_vec(&OwnerWire {
+            node: "n1",
+            epoch: 7,
+            by: Some("ab"),
+        })
+        .unwrap();
+        assert_eq!(body, br#"{"node":"n1","epoch":7,"by":"ab"}"#);
+
+        let lease: NodeLeaseWire = serde_json::from_value(serde_json::json!({
+            "node": "n1", "expires_ms": 5, "addr": "a",
+            "probe_public_key": "k", "peer_protocol": 1,
+        }))
+        .unwrap();
+        assert!(lease.session.is_none());
+        let value = serde_json::to_value(&lease).unwrap();
+        assert!(value.get("session").is_none(), "{value}");
+    }
+
+    #[test]
+    fn a_lease_session_round_trips_and_a_record_without_by_reads() {
+        let lease: NodeLeaseWire = serde_json::from_value(serde_json::json!({
+            "node": "n1", "expires_ms": 5, "probe_public_key": "k",
+            "session": {"tag": "aa", "carried": ["bb"], "mode": "shadow"},
+        }))
+        .unwrap();
+        let again: NodeLeaseWire =
+            serde_json::from_slice(&serde_json::to_vec(&lease).unwrap()).unwrap();
+        assert_eq!(again.session, lease.session);
+        let owner: OwnerWireOwned = serde_json::from_str(r#"{"node":"n","epoch":1}"#).unwrap();
+        assert_eq!(owner.by, None);
     }
 }

@@ -294,3 +294,86 @@ async fn the_startup_probe_refuses_a_store_that_does_not_serialize() {
     let reason = violation(bucket_on(&store).probe_startup_storage_steps().await);
     assert!(reason.contains("racing conditional creates"), "{reason}");
 }
+
+/// A2: a conditional write is sent once. The server answers 503, which the
+/// library retries for an ordinary write; for the client of conditional
+/// writes it must produce exactly one request.
+#[tokio::test]
+async fn a_conditional_write_is_sent_once() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = requests.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut buffer = vec![0_u8; 16 * 1024];
+                let mut pending = Vec::new();
+                loop {
+                    let Ok(read) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    pending.extend_from_slice(&buffer[..read]);
+                    while let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&pending[..end]).to_string();
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if pending.len() < end + 4 + length {
+                            break;
+                        }
+                        pending.drain(..end + 4 + length);
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        let reply =
+                            b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n";
+                        if socket.write_all(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let bucket = Bucket::open(
+        "s3://a2-test",
+        Some(&format!("http://127.0.0.1:{port}")),
+        "us-east-1",
+        Some(StaticCredentials {
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+            session_token: None,
+        }),
+        Some("a2-test"),
+    )
+    .expect("open");
+    let outcome = bucket.put_cas("record", b"body".to_vec(), None).await;
+    assert!(outcome.is_err(), "a 503 is an ambiguous error: {outcome:?}");
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "the conditional write was sent again"
+    );
+    let outcome = bucket
+        .put_cas("record", b"body".to_vec(), Some("etag"))
+        .await;
+    assert!(outcome.is_err());
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        2,
+        "an update is sent once too"
+    );
+    server.abort();
+}

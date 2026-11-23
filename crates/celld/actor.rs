@@ -3899,7 +3899,7 @@ impl Actor {
                 out.spawn_scoped(async move {
                     let result = match ownership.read_owner(&cell).await {
                         Ok(Some(record))
-                            if crate::session::names_this_process(&node, &record)
+                            if crate::session::names_this_process(&node, &cell, &record)
                                 && record.epoch == epoch =>
                         {
                             Ok(())

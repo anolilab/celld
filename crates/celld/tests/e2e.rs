@@ -32,6 +32,7 @@ mod e2e {
     pub mod inbound_email;
     pub mod invoke;
     pub mod isolates;
+    pub mod lazy_birth;
     pub mod loader_defects;
     pub mod loader_isolation;
     pub mod node_compat;

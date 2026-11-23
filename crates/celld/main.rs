@@ -4396,7 +4396,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         let session =
             celld::session::install(celld::session::Session::new(lazy_birth, &reloaded.tags)?);
         for (cell, tag) in &reloaded.cells {
-            session.note_resumed(cell, tag);
+            let epoch = reloaded.epochs.get(cell).copied().unwrap_or(0);
+            session.note_resumed(cell, tag, epoch);
         }
     }
     let clean_reload_candidate = resume_generation.is_some();
