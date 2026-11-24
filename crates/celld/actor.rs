@@ -236,19 +236,23 @@ impl Ownership {
             let listed = bucket.ltx_exists(cell).await;
             (listed, crate::asyncrt::mono_us().saturating_sub(began))
         };
-        let (directory, registry, (listed, list_us)) = futures_util::join!(
-            bucket.directory_answer(cell),
-            bucket.registry_answer(cell),
-            timed_list
-        );
+        // The registry's lookup runs detached: a claim never waits for it, and
+        // its answer is recorded when it completes.
+        let shadow = bucket.start_registry_shadow(cell);
+        let (directory, (listed, list_us)) =
+            futures_util::join!(bucket.directory_answer(cell), timed_list);
         let listed = listed.map_err(ownership_read_failed)?;
         if let Some(answer) = directory {
             bucket.record_directory_answer(answer, listed);
         }
-        if let Some((answer, lookup_us)) = registry {
-            bucket.record_registry_answer(answer, listed, lookup_us, list_us);
-        }
         if !listed {
+            if let Some(shadow) = shadow {
+                let _ = shadow.send(crate::ownership_store::ShadowVerdict {
+                    listed,
+                    list_us,
+                    lost: false,
+                });
+            }
             return Ok(record);
         }
         // A claim writes the record before any LTX, and celld never deletes
@@ -257,27 +261,19 @@ impl Ownership {
         // read. Only a read after the listing that finds no record proves a
         // loss; without it, this node fails a request that it can forward and
         // reports a record that exists.
-        if let Some(record) = self.read_owner(cell).await? {
-            return Ok(Some(record));
+        let reread = self.read_owner(cell).await?;
+        // The registry's answer is compared once the loss is proven: only a
+        // `ClaimNew` here is wrong, since the cell has LTX and the record is
+        // still absent. Nothing is decided from the registry in `shadow`.
+        if let Some(shadow) = shadow {
+            let _ = shadow.send(crate::ownership_store::ShadowVerdict {
+                listed,
+                list_us,
+                lost: reread.is_none(),
+            });
         }
-        // The registry's decision beside the listing's: only a `ClaimNew`
-        // here is wrong, since the cell has LTX and the record is still absent.
-        // Nothing is decided from the registry in `shadow`; the listing does.
-        let registry_decision = registry.map(|(answer, _)| {
-            celld_logic::lost_record::decide(
-                false,
-                Some(answer),
-                celld_logic::lost_record::Packs::Absent,
-                0,
-            )
-        });
-        if registry_decision == Some(celld_logic::lost_record::Decision::ClaimNew) {
-            bucket.record_registry_mismatch();
-            tracing::error!(
-                event = "registry_mismatch",
-                cell,
-                "the birth registry called a cell new while its LTX exists"
-            );
+        if let Some(record) = reread {
+            return Ok(Some(record));
         }
         // The listing decides. A directory that calls a cell new whose record
         // is lost beside its LTX is the gap that must stay empty before the
@@ -4342,7 +4338,7 @@ impl Actor {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"ownership\":{:?},\"owned_cells\":{},\"occupied\":{},\"quiescing\":{},\"evicting\":{},\"releasing\":{},\"adopting\":{},\"restoring\":{},\"activating\":{},\"activation_waiting\":{},\"capacity_waiting\":{},\"phases\":{{{}}},\"handed_off\":{},\"handoff_failed\":{},\"rebalanced\":{},\"rebalance_failed\":{},\"remote_route_refreshes\":{},\"shedding\":{},\"rss_bytes\":{},\"in_use_bytes\":{},\"allocator\":{},\"libc_malloc\":{},\"cgroup_working_set_bytes\":{},\"cgroup_current_bytes\":{},\"node_load\":{},\"cell_directory_answers\":{},\"registry_answers\":{},\"registry\":{},\"storage_counters\":{},\"residents\":[{}],\"published\":[{}],\"publishes\":{},\"stops\":{}}}",
+            "{{\"ownership\":{:?},\"owned_cells\":{},\"occupied\":{},\"quiescing\":{},\"evicting\":{},\"releasing\":{},\"adopting\":{},\"restoring\":{},\"activating\":{},\"activation_waiting\":{},\"capacity_waiting\":{},\"phases\":{{{}}},\"handed_off\":{},\"handoff_failed\":{},\"rebalanced\":{},\"rebalance_failed\":{},\"remote_route_refreshes\":{},\"shedding\":{},\"rss_bytes\":{},\"in_use_bytes\":{},\"allocator\":{},\"libc_malloc\":{},\"cgroup_working_set_bytes\":{},\"cgroup_current_bytes\":{},\"node_load\":{},\"cell_directory_answers\":{}{},\"storage_counters\":{},\"residents\":[{}],\"published\":[{}],\"publishes\":{},\"stops\":{}}}",
             self.ownership.name(),
             self.state.owned_cells(),
             self.state.occupied(),
@@ -4384,17 +4380,16 @@ impl Actor {
                     .map_or_else(|| "null".to_string(), |answers| answers.to_string()),
                 Ownership::Memory(_) => "null".to_string(),
             },
+            // The keys exist only on a node that runs the registry, so a node
+            // without one reports exactly what it always did.
             match &self.ownership {
-                Ownership::Bucket(bucket) => bucket
-                    .registry_answers()
-                    .map_or_else(|| "null".to_string(), |answers| answers.to_string()),
-                Ownership::Memory(_) => "null".to_string(),
-            },
-            match &self.ownership {
-                Ownership::Bucket(bucket) => bucket
-                    .registry_state()
-                    .map_or_else(|| "null".to_string(), |state| state.to_string()),
-                Ownership::Memory(_) => "null".to_string(),
+                Ownership::Bucket(bucket) => match (bucket.registry_answers(), bucket.registry_state()) {
+                    (Some(answers), Some(state)) => {
+                        format!(",\"registry_answers\":{answers},\"registry\":{state}")
+                    }
+                    _ => String::new(),
+                },
+                Ownership::Memory(_) => String::new(),
             },
             self.storage_counters_json(),
             residents,

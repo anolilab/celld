@@ -462,6 +462,16 @@ impl DirectoryAnswers {
     }
 }
 
+/// What the claim guard found beside the registry's lookup of the same cell.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShadowVerdict {
+    /// The listing found LTX.
+    pub listed: bool,
+    pub list_us: u64,
+    /// The record was still absent after the listing found LTX.
+    pub lost: bool,
+}
+
 /// How often the birth registry answered a claim guard, by its answer and by
 /// whether the listing beside it found LTX, with the latencies of both.
 #[derive(Debug, Default)]
@@ -703,23 +713,53 @@ impl BucketOwnership {
         Some(directory.lookup(cell, crate::asyncrt::mono_ms()).await)
     }
 
-    /// What the birth registry says about `cell`, with the time it took in
-    /// microseconds, or `None` on a node without one.
-    pub(crate) async fn registry_answer(
-        &self,
+    /// Start the birth registry's lookup of `cell` beside the claim's listing, or
+    /// `None` on a node without one. The lookup runs detached, so the claim never
+    /// waits for it; the claim sends its [`ShadowVerdict`] when it knows what the
+    /// listing found, and the answer is counted then.
+    pub(crate) fn start_registry_shadow(
+        self: &Arc<Self>,
         cell: &str,
-    ) -> Option<(celld_logic::lost_record::Answer, u64)> {
-        let registry = self.registry.as_ref()?;
-        let result = registry
-            .lookup(&crate::registry_objects::key_of(cell))
-            .await;
-        tracing::debug!(
-            gets = result.gets,
-            bytes = result.bytes,
-            micros = result.micros,
-            "birth registry lookup"
-        );
-        Some((result.answer, result.micros))
+    ) -> Option<tokio::sync::oneshot::Sender<ShadowVerdict>> {
+        let registry = self.registry.clone()?;
+        let (verdict, arrived) = tokio::sync::oneshot::channel::<ShadowVerdict>();
+        let (this, cell) = (self.clone(), cell.to_owned());
+        crate::asyncrt::spawn(async move {
+            let result = registry
+                .lookup(&crate::registry_objects::key_of(&cell))
+                .await;
+            tracing::debug!(
+                gets = result.gets,
+                bytes = result.bytes,
+                micros = result.micros,
+                "birth registry lookup"
+            );
+            // A claim that failed before it knew drops the sender: nothing to compare.
+            let Ok(verdict) = arrived.await else {
+                return;
+            };
+            this.record_registry_answer(
+                result.answer,
+                verdict.listed,
+                result.micros,
+                verdict.list_us,
+            );
+            let decision = celld_logic::lost_record::decide(
+                false,
+                Some(result.answer),
+                celld_logic::lost_record::Packs::Absent,
+                0,
+            );
+            if verdict.lost && decision == celld_logic::lost_record::Decision::ClaimNew {
+                this.record_registry_mismatch();
+                tracing::error!(
+                    event = "registry_mismatch",
+                    cell,
+                    "the birth registry called a cell new while its LTX exists"
+                );
+            }
+        });
+        Some(verdict)
     }
 
     /// Count one answer of the registry beside the listing of the same claim.

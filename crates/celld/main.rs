@@ -3176,8 +3176,12 @@ async fn handle_internal(
     let result = match path.as_str() {
         "/peer/probe" => internal_probe(request, app).await,
         "/peer/handoff" => internal_handoff(request, app).await,
-        "/peer/registry/pass" => internal_registry_pass(request, app).await,
-        "/peer/registry/root" => internal_registry_root(request, app).await,
+        "/peer/registry/pass" if celld::registry::global().is_some() => {
+            internal_registry_pass(request, app).await
+        }
+        "/peer/registry/root" if celld::registry::global().is_some() => {
+            internal_registry_root(request, app).await
+        }
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),
         "/metrics" => metrics_reply(app.counts().await),
@@ -4448,11 +4452,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let peer_auth = Arc::new(
         PeerAuth::new(peer_key, node.clone())?.with_operator_token(Some(operator_token.clone())),
     );
-    let registry_peer_client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(1))
-        .build()?;
     if let Some(registry) = celld::registry::global() {
-        registry.set_peer(peer_auth.clone(), registry_peer_client);
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(1))
+            .build()?;
+        registry.set_peer(peer_auth.clone(), client);
     }
     // Connect-only timeout: a peer request may legitimately run through a
     // restore, but a handshake that never completes provably ran nothing.
