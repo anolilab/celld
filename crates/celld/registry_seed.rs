@@ -10,6 +10,16 @@
 //! sorted seed objects per partition, and folds them into level 1 with the same
 //! merge code as a spill. The commit that names the merged runs also sets the
 //! root's seed number to the gate number the seed was made for.
+//!
+//! Cutover assumption. The marker keeps a binary from before the registry from
+//! starting, but a process that read the format record just before the marker
+//! landed can still publish its lease afterwards and then create cells. Two
+//! listings of the leases are point in time and can both miss it. So a seed
+//! commits only once the marker has been durable for two lease lifetimes, measured
+//! on the holder's monotonic clock from the marker write's confirmation, and the
+//! leases are listed again at that point. The assumption is that an older process
+//! publishes its lease within one lease lifetime of its format check, or it is
+//! fenced; the second lifetime is the margin.
 
 use crate::bucket::Bucket;
 use crate::registry::Registry;
@@ -148,7 +158,7 @@ pub async fn close_until_done(
     mut lease_ready: impl FnMut() -> futures_util::future::BoxFuture<'static, bool>,
     mut close: impl FnMut() -> futures_util::future::BoxFuture<'static, anyhow::Result<Option<u64>>>,
     first_pause: std::time::Duration,
-) -> Option<u64> {
+) -> Result<Option<u64>, GateRefused> {
     let mut pause = first_pause;
     let longest = first_pause.saturating_mul(16);
     while !lease_ready().await {
@@ -160,7 +170,11 @@ pub async fn close_until_done(
         match close().await {
             Ok(gate) => {
                 hold.release();
-                return gate;
+                return Ok(gate);
+            }
+            // A refusal is a misconfiguration: retrying cannot fix it.
+            Err(error) if error.downcast_ref::<GateRefused>().is_some() => {
+                return Err(GateRefused(format!("{error:#}")));
             }
             Err(error) => {
                 tracing::error!(
@@ -376,10 +390,11 @@ pub async fn close_gate(store: &dyn ObjectStore, prefix: &str) -> anyhow::Result
             return Ok(None);
         };
         let closed = gate::close_gate(&read.value).map_err(|_| {
-            anyhow::anyhow!(
+            anyhow::Error::new(GateRefused(
                 "this node is outside the birth registry's writer rule and shared packs exist: \
                  refusing to start (set CELLD_BIRTH_REGISTRY and fleet durability)"
-            )
+                    .to_owned(),
+            ))
         })?;
         if objects::write_root_versioned(store, prefix, &closed, Some(read.version))
             .await?
@@ -392,11 +407,27 @@ pub async fn close_gate(store: &dyn ObjectStore, prefix: &str) -> anyhow::Result
     anyhow::bail!("could not raise the registry's gate number: the root keeps changing")
 }
 
+/// The registry refuses a node outside its writer rule: not a failure to retry but
+/// a misconfiguration, for the supervisor to see.
+#[derive(Debug)]
+pub struct GateRefused(pub String);
+
+impl std::fmt::Display for GateRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for GateRefused {}
+
 /// What a seed wrote.
 #[derive(Debug, Default)]
 pub(crate) struct SeedObjects {
     /// The gate number the seed was made for.
     pub gate: u64,
+    /// When the format marker's write was confirmed, on the holder's monotonic
+    /// clock: the seed commits two lease lifetimes after.
+    pub marker_ms: u64,
     /// Distinct cells listed.
     pub cells: u64,
     /// Seed objects per partition, sorted by key inside each.

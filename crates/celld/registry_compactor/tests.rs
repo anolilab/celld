@@ -22,6 +22,7 @@ fn config() -> Config {
         created_cap: crate::registry_writer::CREATED_CAP,
         waiting_cap: crate::registry_writer::WAITING_CAP,
         seed_page: 1_000,
+        lease_ttl_ms: 20,
         sampler_recheck_ms: 20_000,
         job_pacing: false,
         pass_read: Duration::ZERO,
@@ -2564,6 +2565,12 @@ async fn the_seed_lists_every_cell_once_and_opens_the_gate() {
         );
     }
     assert_eq!(answer(&reader, "Agent:never").await, Answer::New);
+    assert_eq!(node.counters.seed_commits.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        node.counters.base_merges.load(Ordering::Relaxed),
+        0,
+        "a seed is not counted as a base merge"
+    );
 }
 
 #[tokio::test]
@@ -2639,8 +2646,8 @@ async fn a_lease_without_the_field_keeps_the_marker_and_the_seed_from_happening(
         .unwrap();
     assert_eq!(
         &marker[..],
-        br#"{"format":2,"registry":1}"#,
-        "the marker is written first, so the binary that runs cannot restart"
+        br#"{"format":2}"#,
+        "no marker is written while a node that is still running would be locked out"
     );
     assert!(
         keys_under(&store, &objects::seed_root(PREFIX))
@@ -3994,7 +4001,8 @@ async fn the_gate_is_closed_only_after_this_process_lease_shows_it_and_every_fai
         },
         Duration::from_millis(1),
     )
-    .await;
+    .await
+    .expect("the registry did not refuse");
     assert_eq!(gate, Some(2));
     assert!(
         polls.load(Ordering::SeqCst) >= 6,
@@ -4181,6 +4189,7 @@ async fn close_when_visible(
         Duration::from_millis(1),
     )
     .await
+    .expect("the registry did not refuse")
 }
 
 #[tokio::test]
@@ -4350,4 +4359,125 @@ fn a_lease_says_it_follows_the_rule_exactly_when_the_node_holds_nothing() {
     // built it: one that never starts a replication included.
     let load = crate::ownership_store::process_load(&crate::ownership_store::LiveLoad::default());
     assert_eq!(load.registry, !crate::registry_seed::needs_gate_close());
+}
+
+#[tokio::test]
+async fn an_older_binary_that_publishes_its_lease_inside_the_cutover_window_blocks_the_commit() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    ensure_format_record(&plain).await;
+    bucket_with_cells(&plain, &["Agent:00aa".to_owned(), "Agent:00bb".to_owned()]).await;
+    // A lease lifetime of 150 ms: the seed may commit 300 ms after its marker.
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            lease_ttl_ms: 150,
+            ..config()
+        },
+    );
+    let mut holding = closed_holder(&node).await;
+    pass_until_listed(&node, &mut holding).await;
+    let listed_at = crate::asyncrt::mono_ms();
+    // Both listings were clean, and then a process that was past its format check
+    // when the marker landed publishes its lease.
+    lease(&plain, "node-old", "{}", far()).await;
+    node.pass(&mut holding).await.unwrap();
+    assert!(
+        !holding.root.gate_open(),
+        "the window has not passed: no commit"
+    );
+    assert_eq!(
+        holding.prepared.lock().unwrap().len(),
+        0,
+        "and no merge was started"
+    );
+    // The window passes; the commit's own look at the leases finds it.
+    crate::asyncrt::sleep(Duration::from_millis(350)).await;
+    for _ in 0..6 {
+        holding.last_seed_ms = Some(crate::asyncrt::mono_ms());
+        node.pass(&mut holding).await.unwrap();
+        crate::asyncrt::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(!holding.root.gate_open());
+    assert!(node.counters.seed_blocked.load(Ordering::Relaxed) > 0);
+    assert!(
+        keys_under(&plain, &objects::seed_root(PREFIX))
+            .await
+            .is_empty(),
+        "the listing is dropped"
+    );
+    // It leaves; a new listing waits out its own window, then a clean look commits.
+    objects::delete(plain.as_ref(), &format!("{PREFIX}nodes/node-old.json")).await;
+    let began = crate::asyncrt::mono_ms();
+    pass_until_open(&node, &mut holding).await;
+    assert!(
+        crate::asyncrt::mono_ms() - began >= 250,
+        "the new seed also waited out its window"
+    );
+    assert!(crate::asyncrt::mono_ms() - listed_at >= 300);
+}
+
+#[tokio::test]
+async fn the_marker_is_not_written_while_a_lease_without_the_field_is_live() {
+    let store = memory();
+    ensure_format_record(&store).await;
+    lease(&store, "node-old", "{}", far()).await;
+    let node = registry_on(&store, "node-a");
+    let mut holding = closed_holder(&node).await;
+    for _ in 0..3 {
+        holding.last_seed_ms = None;
+        node.pass(&mut holding).await.unwrap();
+        crate::asyncrt::sleep(Duration::from_millis(30)).await;
+    }
+    let marker = store
+        .get(&object_store::path::Path::from(format!(
+            "{PREFIX}wake/format.json"
+        )))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&marker[..], br#"{"format":2}"#);
+    assert!(node.counters.seed_blocked.load(Ordering::Relaxed) > 0);
+    assert_eq!(node.counters.seeds.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn a_refusal_of_the_gate_is_returned_not_retried() {
+    let (scripted, _) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let (bucket, _dir) = test_bucket(&store);
+    let mut root = Root::new(8);
+    root.packs = true;
+    objects::write_root_versioned(store.as_ref(), PREFIX, &root, None)
+        .await
+        .unwrap();
+    let hold = leaked_hold();
+    hold.require();
+    let outcome = close_when_visible_result(hold, &bucket).await;
+    let refused = outcome.expect_err("a root with packs refuses a node outside the rule");
+    assert!(refused.0.contains("shared packs exist"), "{}", refused.0);
+    assert_eq!(scripted.reads("/root"), 1, "it did not retry");
+    assert!(hold.is_pending(), "per-cell work stays held");
+}
+
+async fn close_when_visible_result(
+    hold: &'static crate::registry_seed::GateHold,
+    bucket: &crate::bucket::Bucket,
+) -> Result<Option<u64>, crate::registry_seed::GateRefused> {
+    let bucket = bucket.clone();
+    crate::registry_seed::close_until_done(
+        hold,
+        || Box::pin(async { true }),
+        move || {
+            let bucket = bucket.clone();
+            Box::pin(async move {
+                crate::registry_seed::close_gate(bucket.store.as_ref(), &bucket.prefix).await
+            })
+        },
+        Duration::from_millis(1),
+    )
+    .await
 }

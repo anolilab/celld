@@ -2877,6 +2877,15 @@ async fn close_registry_gate(ownership: &Arc<celld::ownership_store::BucketOwner
         std::time::Duration::from_millis(200),
     )
     .await;
+    let gate = match gate {
+        Ok(gate) => gate,
+        // Not a failure to retry: the node is outside the rule and the registry
+        // says no. Exit so the supervisor sees the misconfiguration.
+        Err(refused) => {
+            eprintln!("celld: {refused}");
+            std::process::exit(1);
+        }
+    };
     if let Some(gate) = gate {
         tracing::info!(
             event = "registry_gate_closed",

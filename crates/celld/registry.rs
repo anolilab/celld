@@ -92,6 +92,8 @@ pub(crate) struct Config {
     pub waiting_cap: usize,
     /// Common prefixes one listing request of the seed asks for.
     pub seed_page: usize,
+    /// The node-lease lifetime, which the seed's cutover window is two of.
+    pub lease_ttl_ms: u64,
     /// How long after a miss the sampler looks again.
     pub sampler_recheck_ms: u64,
     /// `CELLD_REGISTRY_JOB_PACING`: limit the requests and bytes per second of
@@ -162,6 +164,7 @@ impl Config {
             created_cap: crate::registry_writer::CREATED_CAP,
             waiting_cap: crate::registry_writer::WAITING_CAP,
             seed_page: 1_000,
+            lease_ttl_ms: crate::machine::lease_ttl_ms_from_environment(),
             sampler_recheck_ms: 20_000,
             job_pacing,
             pass_read: Duration::from_millis(pass_read_ms),
@@ -278,6 +281,8 @@ pub(crate) struct Counters {
     /// Seeds started, the cells they listed, and the ones that waited for a node
     /// outside the writer rule or stopped for a binary without the lease field.
     pub seeds: AtomicU64,
+    /// Seeds that committed and opened the gate for their number.
+    pub seed_commits: AtomicU64,
     pub seed_cells: AtomicU64,
     pub seed_waits: AtomicU64,
     pub seed_blocked: AtomicU64,
@@ -989,6 +994,7 @@ impl Registry {
             ("prefetch_skipped", &counters.prefetch_skipped),
             ("prefetch_loads", &counters.prefetch_loads),
             ("seeds", &counters.seeds),
+            ("seed_commits", &counters.seed_commits),
             ("seed_cells", &counters.seed_cells),
             ("seed_waits", &counters.seed_waits),
             ("seed_blocked", &counters.seed_blocked),

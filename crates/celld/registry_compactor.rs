@@ -1559,6 +1559,7 @@ impl Registry {
                     }
                     match job.kind {
                         "spill" => self.counters.spills.fetch_add(1, Ordering::Relaxed),
+                        "seed" => self.counters.seed_commits.fetch_add(1, Ordering::Relaxed),
                         _ => self.counters.base_merges.fetch_add(1, Ordering::Relaxed),
                     };
                     self.record_job(&job, "committed");
@@ -1591,6 +1592,17 @@ impl Registry {
             crate::ownership_store::now_ms(),
         )
         .await;
+        // The cutover window must have passed as well as the leases being clean.
+        let waited_out = holding
+            .seed_slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|seed| self.cutover_passed(seed));
+        if !waited_out {
+            objects::delete_many(self.store.as_ref(), &job.outputs).await;
+            return false;
+        }
         let decision = match &leases {
             Ok(leases) => seed_decision(&holding.root, leases),
             Err(_) => {
@@ -1661,10 +1673,16 @@ impl Registry {
             }
         }
         if !holding.root.gate_open() && !holding.seeding.load(Ordering::SeqCst) {
-            if holding.seed_slot.lock().unwrap().is_some() {
+            let listed = holding
+                .seed_slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|seed| self.cutover_passed(seed));
+            if let Some(passed) = listed {
                 // Listed and written: the merge that commits it is a job, and runs
-                // when no other does.
-                if !busy {
+                // when no other does, once the cutover window has passed.
+                if !busy && passed {
                     self.start_seed_merge(holding);
                     return;
                 }
@@ -1852,7 +1870,13 @@ impl Registry {
         attempt: &str,
         map: &Map,
     ) -> anyhow::Result<Option<crate::registry_seed::SeedObjects>> {
-        use celld_logic::registry_gate::{seed_decision, SeedDecision};
+        use celld_logic::registry_gate::SeedDecision;
+        // Before the marker: while a lease without the field is live the marker
+        // is not written, since it would lock out a node that is still running.
+        let before = self.seed_leases_decision(root).await?;
+        if !matches!(before, SeedDecision::Start) {
+            return Ok(None);
+        }
         if !crate::wake_format::mark_registry(self.store.as_ref(), &self.prefix).await? {
             self.counters.seed_blocked.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
@@ -1861,30 +1885,15 @@ impl Registry {
             );
             return Ok(None);
         }
-        let leases = crate::registry_seed::live_leases(
-            self.store.as_ref(),
-            &self.prefix,
-            crate::ownership_store::now_ms(),
-        )
-        .await?;
-        match seed_decision(root, &leases) {
-            SeedDecision::NotNeeded => Ok(None),
-            SeedDecision::OlderBinaryLive => {
-                self.counters.seed_blocked.fetch_add(1, Ordering::Relaxed);
-                tracing::error!(
-                    event = "registry_seed_blocked",
-                    "a live node lease has no `registry` field: a binary from before the \
-                     registry runs, so the seed waits for it to leave"
-                );
-                Ok(None)
-            }
-            SeedDecision::WaitForNonW1 => {
-                self.counters.seed_waits.fetch_add(1, Ordering::Relaxed);
-                Ok(None)
-            }
+        let marker_ms = crate::asyncrt::mono_ms();
+        // After it: from here a binary from before the registry that restarts reads
+        // the marker and does not start, and one that was already past its format
+        // check is waited out by the cutover window before the seed commits.
+        match self.seed_leases_decision(root).await? {
             SeedDecision::Start => {
                 self.counters.seeds.fetch_add(1, Ordering::Relaxed);
-                let seed = self.write_seed(root.gate, attempt, map).await?;
+                let mut seed = self.write_seed(root.gate, attempt, map).await?;
+                seed.marker_ms = marker_ms;
                 tracing::info!(
                     event = "registry_seed_listed",
                     gate = root.gate,
@@ -1893,7 +1902,44 @@ impl Registry {
                 );
                 Ok(Some(seed))
             }
+            _ => Ok(None),
         }
+    }
+
+    /// The seed decision from the leases as they are now, counting what blocks it.
+    async fn seed_leases_decision(
+        &self,
+        root: &Root,
+    ) -> anyhow::Result<celld_logic::registry_gate::SeedDecision> {
+        use celld_logic::registry_gate::{seed_decision, SeedDecision};
+        let leases = crate::registry_seed::live_leases(
+            self.store.as_ref(),
+            &self.prefix,
+            crate::ownership_store::now_ms(),
+        )
+        .await?;
+        let decision = seed_decision(root, &leases);
+        match decision {
+            SeedDecision::OlderBinaryLive => {
+                self.counters.seed_blocked.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    event = "registry_seed_blocked",
+                    "a live node lease has no `registry` field: a binary from before the \
+                     registry runs, so the seed waits for it to leave"
+                );
+            }
+            SeedDecision::WaitForNonW1 => {
+                self.counters.seed_waits.fetch_add(1, Ordering::Relaxed);
+            }
+            SeedDecision::Start | SeedDecision::NotNeeded => {}
+        }
+        Ok(decision)
+    }
+
+    /// Whether a listed seed has waited out the cutover window: two lease
+    /// lifetimes since its marker was confirmed.
+    fn cutover_passed(&self, seed: &crate::registry_seed::SeedObjects) -> bool {
+        crate::asyncrt::mono_ms().saturating_sub(seed.marker_ms) >= 2 * self.cfg.lease_ttl_ms
     }
 
     /// Start the job that merges a listed seed into level 1. A merge that is
@@ -1902,6 +1948,7 @@ impl Registry {
         let Some(seed) = holding.seed_slot.lock().unwrap().as_ref().map(|seed| {
             crate::registry_seed::SeedObjects {
                 gate: seed.gate,
+                marker_ms: seed.marker_ms,
                 cells: seed.cells,
                 by_partition: seed.by_partition.clone(),
             }
