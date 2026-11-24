@@ -1644,6 +1644,14 @@ impl Registry {
                 Ok((root, map)) => {
                     let named: HashSet<DeltaId> = root.deltas.iter().copied().collect();
                     holding.counts.retain(|id, _| named.contains(id));
+                    // The map this commit replaces is named by no root once the
+                    // root that names the new one is written: it retires with
+                    // the job's other objects.
+                    if let Some((epoch, number)) = holding.root.map {
+                        holding
+                            .retire_next
+                            .push(objects::map_key(&self.prefix, epoch, number));
+                    }
                     holding.root = root;
                     holding.map = Arc::new(map);
                     holding.retire_next.extend(job.retire.iter().cloned());
