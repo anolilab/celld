@@ -205,17 +205,24 @@ fn ownership_read_failed(error: anyhow::Error) -> Failure {
     Failure::Definite
 }
 
-/// The refusal that the reader rules of a sealed session give for `cell`, if
-/// any. A refusal is held and logged like any lost record.
+/// What the reader rules say about a cell of a tagged id.
+enum Judged {
+    Proceed,
+    /// A refusal, held and logged like any lost record.
+    Refuse(Failure),
+    /// A record that stands for the minting node's claim to come.
+    Forward(OwnerRecord),
+}
+
 async fn judged_refusal(
     bucket: &BucketOwnership,
     cell: &str,
     record: Option<&OwnerRecord>,
     form: Option<&crate::ownership_store::OwnerForm>,
-) -> Result<Option<Failure>, Failure> {
+) -> Result<Judged, Failure> {
     use crate::session_reader::Verdict;
     if crate::session::current().is_none() {
-        return Ok(None);
+        return Ok(Judged::Proceed);
     }
     // The session wrote a record for this id and none exists: it is lost, and the
     // session never writes a first record for the id again.
@@ -226,7 +233,7 @@ async fn judged_refusal(
             crate::ownership_store::LOST_RECORD_RECHECK_MS / 1_000
         );
         bucket.hold_lost_record(cell, crate::asyncrt::mono_ms());
-        return Ok(Some(Failure::Definite));
+        return Ok(Judged::Refuse(Failure::Definite));
     }
     let plain = crate::ownership_store::OwnerForm::default();
     let rec = record.map(|record| (record, form.unwrap_or(&plain)));
@@ -235,7 +242,8 @@ async fn judged_refusal(
         .await
         .map_err(ownership_read_failed)?
     {
-        Verdict::Proceed => Ok(None),
+        Verdict::Proceed => Ok(Judged::Proceed),
+        Verdict::Forward(record) => Ok(Judged::Forward(record)),
         Verdict::Refuse(reason) => {
             eprintln!(
                 "celld ownership record lost: {cell}: {reason}; refusing the cell for {} s. \
@@ -243,7 +251,7 @@ async fn judged_refusal(
                 crate::ownership_store::LOST_RECORD_RECHECK_MS / 1_000
             );
             bucket.hold_lost_record(cell, crate::asyncrt::mono_ms());
-            Ok(Some(Failure::Definite))
+            Ok(Judged::Refuse(Failure::Definite))
         }
     }
 }
@@ -290,8 +298,10 @@ impl Ownership {
             .map_or((None, None), |(record, form)| (Some(record), Some(form)));
         // A cell of an id that another session minted, once that session's
         // header is sealed: the reader rules of its chunk decide.
-        if let Some(refusal) = judged_refusal(bucket, cell, record.as_ref(), form.as_ref()).await? {
-            return Err(refusal);
+        match judged_refusal(bucket, cell, record.as_ref(), form.as_ref()).await? {
+            Judged::Proceed => {}
+            Judged::Refuse(refusal) => return Err(refusal),
+            Judged::Forward(synthetic) => return Ok(Some(synthetic)),
         }
         if record.is_some() {
             return Ok(record);

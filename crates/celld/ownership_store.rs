@@ -486,6 +486,9 @@ pub struct BucketOwnership {
     /// Whether a `Grant` may be appended, and when that was decided: it is read
     /// from the leases of the ensemble at most every [`MARKS_GATE_MS`].
     marks_gate: std::sync::Mutex<(u64, bool)>,
+    /// The same for the capability of every live lease, for the records that an
+    /// older build would misread.
+    records_gate: std::sync::Mutex<(u64, bool)>,
 }
 
 /// How often the fleet directory answered a claim guard, by its answer and by
@@ -623,6 +626,7 @@ impl BucketOwnership {
             directory_answers: DirectoryAnswers::default(),
             k5: crate::session_reader::K5Plans::default(),
             marks_gate: std::sync::Mutex::new((0, false)),
+            records_gate: std::sync::Mutex::new((0, false)),
         }
     }
 
@@ -1164,6 +1168,48 @@ impl BucketOwnership {
         allowed
     }
 
+    /// This node's name.
+    pub(crate) fn node_name(&self) -> &str {
+        &self.node
+    }
+
+    /// Whether every live lease advertises the session capability. A first-form
+    /// or leave-form record is written only then. Cached for [`MARKS_GATE_MS`].
+    pub(crate) async fn all_leases_capable(&self) -> bool {
+        let now = crate::asyncrt::mono_ms();
+        {
+            let gate = self.records_gate.lock().unwrap();
+            if gate.0 != 0 && now.saturating_sub(gate.0) < MARKS_GATE_MS {
+                return gate.1;
+            }
+        }
+        let mut capable = true;
+        match self.bucket.list("nodes/").await {
+            Ok(listed) => {
+                for meta in listed {
+                    let key = meta.location.as_ref();
+                    let Some(node) = key
+                        .rsplit('/')
+                        .next()
+                        .and_then(|name| name.strip_suffix(".json"))
+                    else {
+                        continue;
+                    };
+                    match load_node_lease(&self.bucket, node).await {
+                        Ok(Some(lease)) if lease.expires_ms > now_ms() => {
+                            capable &= !lease.tags.is_empty();
+                        }
+                        Ok(_) => {}
+                        Err(_) => capable = false,
+                    }
+                }
+            }
+            Err(_) => capable = false,
+        }
+        *self.records_gate.lock().unwrap() = (now.max(1), capable);
+        capable
+    }
+
     /// What happens to the id of `cell` after its create-only record applied.
     ///
     /// The waive is decided before the append. While no capable ensemble
@@ -1222,6 +1268,12 @@ impl BucketOwnership {
         guard: CasGuard,
         epoch: u64,
     ) -> anyhow::Result<CasOutcome> {
+        // A claim over the record that the reader rules made up (B3: no record
+        // yet, the minting node decides) is over nothing: it writes nothing and
+        // is lost, so the cell is read and judged again.
+        if matches!(&guard, CasGuard::Match(etag) if etag.is_empty()) {
+            return Ok(CasOutcome::Rejected);
+        }
         let key = format!("cells/{cell}/own.json");
         let session = crate::session::current();
         let by = session.map(|session| session.tag());

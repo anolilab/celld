@@ -693,3 +693,42 @@ async fn a_release_leaves_a_trace_in_the_chunk_first() {
     let left = left_of(&chunk, counter);
     assert_eq!(left["done"], left["nonces"][0], "{chunk}");
 }
+
+/// In a run with no fault, the reader rules never refuse a cell that today's
+/// path would serve: across preserved restarts, restarts without the
+/// certificate (takeovers of granted and ungranted ids) and a drain, the log
+/// holds no refusal, and every id is served.
+#[tokio::test]
+async fn in_a_clean_run_the_reader_rules_refuse_nothing() {
+    let mut server = Server::start("do-ids", SHADOW).await;
+    let ids = minted(&server).await;
+    for id in &ids {
+        assert_eq!(bump(&server, id).await, 1);
+    }
+    server.restart().await;
+    for id in &ids {
+        assert_eq!(bump(&server, id).await, 2);
+    }
+    server.restart_after(drop_certificate).await;
+    for id in &ids {
+        assert_eq!(bump(&server, id).await, 3);
+    }
+    let fresh = minted(&server).await;
+    for id in &fresh {
+        assert_eq!(bump(&server, id).await, 1);
+    }
+    server.restart_after(drop_certificate).await;
+    for id in ids.iter().chain(&fresh) {
+        assert!(server
+            .get_status(&format!("/bump?id={id}"))
+            .await
+            .is_success());
+    }
+    let log = server.log_text();
+    for refusal in ["celld ownership record lost", "pending_grant"] {
+        assert!(
+            !log.contains(refusal),
+            "a clean run refused a cell: {refusal}"
+        );
+    }
+}

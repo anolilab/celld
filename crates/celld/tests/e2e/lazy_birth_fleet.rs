@@ -649,3 +649,119 @@ async fn a_grant_without_a_timely_proof_is_pending_and_never_waived() {
     })
     .await;
 }
+
+/// B3: a request for an id with no record, reaching a node other than the
+/// minting one while the session is open, is forwarded to the minting node,
+/// which makes the first claim at epoch 1. Without the forward the other node
+/// would claim epoch 2.
+#[tokio::test]
+async fn an_id_without_a_record_is_forwarded_to_the_live_minting_node() {
+    let Some(fleet) = Fleet::start("do-ids", 3, SHADOW).await else {
+        return;
+    };
+    with_fleet(fleet, |fleet| async move {
+        let minted = fleet.get_json(0, "/mint").await.expect("mint");
+        let id = minted["ids"][0].as_str().unwrap().to_string();
+        let tag = id[..16].to_string();
+        let out = fleet
+            .get_json(1, &format!("/bump?id={id}"))
+            .await
+            .expect("bump through another node");
+        assert_eq!(out["n"], 1);
+        let records: Vec<_> = fleet
+            .keys("cells/")
+            .await
+            .into_iter()
+            .filter(|key| key.ends_with("/own.json"))
+            .collect();
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = fleet.object(&records[0]).await.expect("the record");
+        assert_eq!(record["epoch"], 1, "the minting node claimed: {record}");
+        assert_eq!(record["node"], "lazy-0", "{record}");
+        assert_eq!(record["by"], tag.as_str(), "{record}");
+        assert!(fleet.nodes[1].log().contains("b3_forward"));
+        fleet
+    })
+    .await;
+}
+
+/// B3: with the minting node dead and its session not sealed, a request through
+/// another node recovers the dead node first, which seals the header, and the id
+/// is then claimed by the sealed chunk's rules.
+#[tokio::test]
+async fn an_id_without_a_record_of_a_dead_minting_node_waits_for_its_seal() {
+    let Some(fleet) = Fleet::start("do-ids", 3, SHADOW).await else {
+        return;
+    };
+    with_fleet(fleet, |mut fleet| async move {
+        let minted = fleet.get_json(0, "/mint").await.expect("mint");
+        let id = minted["ids"][0].as_str().unwrap().to_string();
+        let tag = id[..16].to_string();
+        fleet.nodes[0].kill();
+        wait_until(
+            "another node to serve the id",
+            Duration::from_secs(240),
+            || async {
+                for node in [1, 2] {
+                    if let Some(out) = fleet.get_json(node, &format!("/bump?id={id}")).await {
+                        return Some(out);
+                    }
+                }
+                None
+            },
+        )
+        .await;
+        let header = fleet
+            .object(&format!("fleet/sessions/{tag}.json"))
+            .await
+            .expect("the header");
+        assert_eq!(header["state"], "sealed", "{header}");
+        let records: Vec<_> = fleet
+            .keys("cells/")
+            .await
+            .into_iter()
+            .filter(|key| key.ends_with("/own.json"))
+            .collect();
+        let record = fleet.object(&records[0]).await.expect("the record");
+        assert_eq!(
+            record["epoch"], 2,
+            "a new cell of a sealed session: {record}"
+        );
+        assert!(record["nonce"].is_string(), "{record}");
+        fleet
+    })
+    .await;
+}
+
+/// First-form records only behind the marker: while a live lease lacks the
+/// capability, a node that takes a cell of a sealed session writes a plain
+/// record, which an older build reads correctly, and no nonce.
+#[tokio::test]
+async fn a_first_form_record_is_not_written_while_a_lease_lacks_the_capability() {
+    let off: &[(&str, &str)] = &[];
+    let Some(fleet) = Fleet::start_each("do-ids", &[SHADOW, SHADOW, off]).await else {
+        return;
+    };
+    with_fleet(fleet, |mut fleet| async move {
+        let minted = fleet.get_json(0, "/mint").await.expect("mint");
+        let id = minted["ids"][0].as_str().unwrap().to_string();
+        fleet.nodes[0].kill();
+        wait_until(
+            "node 1 to serve the id",
+            Duration::from_secs(240),
+            || async { fleet.get_json(1, &format!("/bump?id={id}")).await },
+        )
+        .await;
+        let records: Vec<_> = fleet
+            .keys("cells/")
+            .await
+            .into_iter()
+            .filter(|key| key.ends_with("/own.json"))
+            .collect();
+        let record = fleet.object(&records[0]).await.expect("the record");
+        assert!(record["nonce"].is_null(), "no first-form record: {record}");
+        assert!(fleet.nodes[1].log().contains("marker_gate"));
+        fleet
+    })
+    .await;
+}
