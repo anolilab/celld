@@ -87,6 +87,7 @@ pub mod runtime;
 pub mod secret_cli;
 pub mod secrets;
 pub mod session;
+pub(crate) mod session_leave;
 pub(crate) mod session_reader;
 pub mod session_store;
 pub mod smtp;

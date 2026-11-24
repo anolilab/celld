@@ -24,6 +24,11 @@ use celld_logic::{CasGuard, OwnerRecord};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// The etag of the stand-in record for a cell with no record that a taker
+/// claims by a create-only first-form record: the claim is a takeover, so the
+/// core reads it as a released record and restores the chain.
+pub(crate) const K5_ETAG: &str = "k5-from-nothing";
+
 /// The first-form record that the next conditional write of a cell must carry,
 /// and the entry it then puts in the chunk.
 #[derive(Clone, Debug)]
@@ -245,6 +250,15 @@ impl BucketOwnership {
             author_live,
             placed: false,
         });
+        // A birth-form record that no grant covers is also held to the guard of
+        // the standard path: the strictest of the two rules decides.
+        let verdict = match (&verdict, record) {
+            (Take::FirstOverRecord { .. }, Some((_, form))) if form.birth => {
+                let exists = self.ltx_exists(cell).await?;
+                take::birth_guard(verdict, true, exists)
+            }
+            _ => verdict,
+        };
         let judged = record.map(|(record, _)| record.etag.clone());
         let plan = |over: Vec<String>| K5Plan {
             nonce: new_nonce(),
@@ -258,9 +272,18 @@ impl BucketOwnership {
         // plain records and would ignore the nonce.
         let writes_marked_records = !matches!(
             verdict,
-            Take::FirstNew { .. } | Take::FirstOverRecord { .. } | Take::ReplaceFirst { .. }
+            Take::FirstNew { .. }
+                | Take::FirstOverRecord { .. }
+                | Take::ReplaceFirst { .. }
+                | Take::FirstFromNothing { .. }
         ) || self.all_leases_capable().await;
         if !writes_marked_records {
+            // A lazy cell has no record: the standard path would claim it as a
+            // new cell and restore nothing, so it is refused until the fleet is
+            // capable.
+            if matches!(verdict, Take::FirstFromNothing { .. }) {
+                return Ok(Verdict::Refuse("a lease lacks the capability"));
+            }
             tracing::info!(
                 event = "session_rule",
                 kind = "marker_gate",
@@ -290,8 +313,22 @@ impl BucketOwnership {
                 self.k5.set(cell, plan(over));
                 Verdict::Proceed
             }
-            Take::FirstFromNothing { .. } => {
-                Verdict::Refuse("a lazy cell, which this build does not take")
+            Take::FirstFromNothing { epoch } => {
+                self.k5.set(
+                    cell,
+                    K5Plan {
+                        etag: Some(K5_ETAG.to_string()),
+                        ..plan(Vec::new())
+                    },
+                );
+                // A released record one epoch below: the core claims `epoch` as a
+                // takeover and restores what the session left in `e1/`.
+                Verdict::Forward(OwnerRecord {
+                    node: None,
+                    epoch: epoch - 1,
+                    etag: K5_ETAG.to_string(),
+                    by: Some(tag.clone()),
+                })
             }
             Take::Standard { .. }
             | Take::Plain { .. }

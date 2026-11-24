@@ -109,6 +109,20 @@ pub fn decide(view: &View) -> Take {
     }
 }
 
+/// The guard that a birth-form record gets beside the reader rules. A
+/// birth-form record that no grant covers was written by the session without a
+/// read, so it can hide a cell that a node of the fleet already claimed: when
+/// the rules would replace it by a first-form record and the cell has LTX under
+/// its prefix, the record was created over a lost one and is refused instead.
+pub fn birth_guard(take: Take, birth: bool, ltx_exists: bool) -> Take {
+    match take {
+        Take::FirstOverRecord { .. } if birth && ltx_exists => {
+            Take::Refuse("a birth-form record over a cell that has LTX")
+        }
+        other => other,
+    }
+}
+
 fn decide_absent(view: &View, chunk: &ChunkCell, mode: Mode) -> Take {
     if chunk.taken.is_some() {
         return Take::Refuse("a later record was written and is lost");

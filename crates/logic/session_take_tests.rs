@@ -199,3 +199,25 @@ fn check(
     );
     1
 }
+
+#[test]
+fn a_birth_form_record_over_a_cell_with_ltx_is_refused_and_nothing_else_changes() {
+    use prod::{birth_guard, Take};
+    let over = Take::FirstOverRecord { epoch: 2 };
+    assert!(matches!(
+        birth_guard(over.clone(), true, true),
+        Take::Refuse(_)
+    ));
+    assert_eq!(birth_guard(over.clone(), true, false), over);
+    assert_eq!(
+        birth_guard(over.clone(), false, true),
+        over,
+        "a plain record"
+    );
+    let plain = Take::Plain { epoch: 2 };
+    assert_eq!(
+        birth_guard(plain.clone(), true, true),
+        plain,
+        "a granted cell"
+    );
+}

@@ -32,6 +32,15 @@ struct OwnerWire<'a> {
     nonce: Option<&'a str>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     over: &'a [String],
+    /// A birth-form record: the minting session's record at epoch 1 that it
+    /// wrote without reading first. It is read as a plain record, beside the
+    /// guard that a reader runs over it when no grant covers it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    birth: bool,
+    /// A leave-form record: the nonce of the leave that the session announced
+    /// before it wrote this record. A release keeps it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leave: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -46,6 +55,8 @@ struct OwnerWireOwned {
     over: Vec<String>,
     #[serde(default)]
     leave: Option<String>,
+    #[serde(default)]
+    birth: bool,
 }
 
 /// The form of a record beyond its node, epoch and `by`: a first-form record
@@ -55,6 +66,7 @@ pub(crate) struct OwnerForm {
     pub(crate) nonce: Option<String>,
     pub(crate) over: Vec<String>,
     pub(crate) leave: Option<String>,
+    pub(crate) birth: bool,
 }
 
 /// The session a node lease advertises: its tag, the tags of a preserved
@@ -695,6 +707,7 @@ impl BucketOwnership {
             nonce: owner.nonce,
             over: owner.over,
             leave: owner.leave,
+            birth: owner.birth,
         };
         let record = OwnerRecord {
             node: (!owner.node.is_empty()).then_some(owner.node),
@@ -1072,7 +1085,12 @@ impl BucketOwnership {
     /// claim. Rejection is an ordinary outcome, not an error -- the record
     /// keeps naming whoever it names, and nothing was lost.
     pub async fn release_owner(&self, cell: &str, epoch: u64) -> anyhow::Result<CasOutcome> {
-        let Some(current) = self.read_owner(cell).await? else {
+        // A lazy cell has no record to release: it gets one first, and its leave
+        // is confirmed in the chunk before the release starts.
+        if let Some(session) = crate::session::current().filter(|s| s.is_lazy_scope(cell)) {
+            session.leave(&self.bucket, &self.node, cell, epoch).await?;
+        }
+        let Some((current, form)) = self.read_owner_form(cell).await? else {
             return Ok(CasOutcome::Rejected);
         };
         if !crate::session::names_this_process(&self.node, cell, &current) || current.epoch != epoch
@@ -1096,6 +1114,8 @@ impl BucketOwnership {
             by: by.as_deref(),
             nonce: None,
             over: &[],
+            birth: false,
+            leave: form.leave.as_deref(),
         })?;
         match self.bucket.put_cas(&key, body, Some(&current.etag)).await? {
             Some(_) => Ok(CasOutcome::Applied),
@@ -1132,6 +1152,8 @@ impl BucketOwnership {
             by: Some(to),
             nonce: None,
             over: &[],
+            birth: false,
+            leave: None,
         })?;
         match self.bucket.put_cas(&key, body, Some(&current.etag)).await {
             Ok(applied) => Ok(applied.is_some()),
@@ -1140,6 +1162,14 @@ impl BucketOwnership {
                 .await?
                 .is_some_and(|record| names(&record, to))),
         }
+    }
+
+    /// B1, the conditions under which this session may grant an id, read at
+    /// the moment a request first asks for the id: the ensemble is open and every
+    /// lease advertises the capability, so the record about to be written is
+    /// read by every live node.
+    pub(crate) async fn may_grant(&self) -> bool {
+        self.marks_allowed().await && self.all_leases_capable().await
     }
 
     /// Whether a `Grant` may be appended now: the node log is open with an
@@ -1171,6 +1201,22 @@ impl BucketOwnership {
     /// This node's name.
     pub(crate) fn node_name(&self) -> &str {
         &self.node
+    }
+
+    /// The leave of a lazy cell, written only while every live lease advertises
+    /// the capability: a node of an older build reads a leave-form record as a
+    /// plain one and would ignore its nonce.
+    pub(crate) async fn leave_cell(
+        &self,
+        session: &crate::session::Session,
+        cell: &str,
+        epoch: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.all_leases_capable().await,
+            "a lease lacks the capability: the leave of {cell} is not written"
+        );
+        session.leave(&self.bucket, &self.node, cell, epoch).await
     }
 
     /// Whether every live lease advertises the session capability. A first-form
@@ -1236,18 +1282,7 @@ impl BucketOwnership {
             return Ok(());
         };
         if self.marks_allowed().await {
-            session.grant_scope(cell);
-            let proof = crate::session::enqueue_mark(cell, counter);
-            if let Ok(Ok(true)) = crate::asyncrt::timeout(mark_proof_wait(), proof).await {
-                return Ok(());
-            }
-            session.mark_pending(counter);
-            tracing::warn!(
-                event = "pending_grant",
-                cell,
-                "no fleet proof of the grant in time"
-            );
-            anyhow::bail!("no fleet proof of the grant of {cell}: the grant is pending");
+            return self.append_grant(session, cell, counter).await;
         }
         match crate::session_store::read_header(&self.bucket, &session.tag()).await? {
             crate::session_store::Read::Found(header, _)
@@ -1260,6 +1295,29 @@ impl BucketOwnership {
             }
             _ => anyhow::bail!("no evidence that the record of {cell} was written before a seal"),
         }
+    }
+
+    /// Append the `Grant` of `cell` and wait (bounded) for its fleet proof. The
+    /// id is granted from the append on; a request that gives up leaves the grant
+    /// pending, and the cell does not activate.
+    async fn append_grant(
+        &self,
+        session: &crate::session::Session,
+        cell: &str,
+        counter: u64,
+    ) -> anyhow::Result<()> {
+        session.grant_scope(cell);
+        let proof = crate::session::enqueue_mark(cell, counter);
+        if let Ok(Ok(true)) = crate::asyncrt::timeout(mark_proof_wait(), proof).await {
+            return Ok(());
+        }
+        session.mark_pending(counter);
+        tracing::warn!(
+            event = "pending_grant",
+            cell,
+            "no fleet proof of the grant in time"
+        );
+        anyhow::bail!("no fleet proof of the grant of {cell}: the grant is pending");
     }
 
     pub async fn cas_owner(
@@ -1276,6 +1334,35 @@ impl BucketOwnership {
         }
         let key = format!("cells/{cell}/own.json");
         let session = crate::session::current();
+        if let Some(session) = session {
+            // The wake of a lazy cell at a new epoch: its record is written now,
+            // by the leave, at that epoch.
+            if matches!(&guard, CasGuard::Match(etag) if etag == crate::session_leave::LAZY_ETAG) {
+                self.leave_cell(session, cell, epoch).await?;
+                return Ok(CasOutcome::Applied);
+            }
+            // A session in mode `on` grants an id without a record: the cell is
+            // lazy. Only while a `Grant` can still be appended; otherwise the id
+            // is waived and takes the standard path.
+            if matches!(guard, CasGuard::Absent)
+                && epoch == 1
+                && session.mode() == crate::session::Mode::On
+                && session.is_birth_scope(cell)
+            {
+                if self.marks_allowed().await {
+                    let counter = session
+                        .own_counter_of_scope(cell)
+                        .context("a birth scope has a counter")?;
+                    session.note_lazy(counter);
+                    self.append_grant(session, cell, counter).await?;
+                    if let Some(directory) = &self.cell_directory {
+                        directory.register_at_claim(cell);
+                    }
+                    return Ok(CasOutcome::Applied);
+                }
+                session.forget_birth(cell);
+            }
+        }
         let by = session.map(|session| session.tag());
         // The claim of a cell by the rules of a sealed session: a first-form
         // record with a new nonce, and then that nonce in the chunk.
@@ -1306,9 +1393,14 @@ impl BucketOwnership {
             by: by.as_deref(),
             nonce: plan.as_ref().map(|plan| plan.nonce.as_str()),
             over: plan.as_ref().map_or(&[], |plan| plan.over.as_slice()),
+            birth: matches!(guard, CasGuard::Absent)
+                && epoch == 1
+                && session.is_some_and(|session| session.is_birth_scope(cell)),
+            leave: None,
         })?;
         let etag = match &guard {
             CasGuard::Absent => None,
+            CasGuard::Match(etag) if etag == crate::session_reader::K5_ETAG => None,
             CasGuard::Match(etag) => Some(etag.as_str()),
         };
         match self.bucket.put_cas(&key, body, etag).await? {
@@ -1657,6 +1749,22 @@ pub(crate) fn process_load(live: &LiveLoad) -> NodeLoadWire {
     }
 }
 
+/// The leave-form record of a lazy cell: the session names itself, the epoch
+/// of the leave and the nonce it announced.
+pub(crate) fn leave_record(node: &str, epoch: u64, by: &str, nonce: &str) -> serde_json::Value {
+    serde_json::json!({"node": node, "epoch": epoch, "by": by, "leave": nonce})
+}
+
+/// The `by` and `leave` of the record at `key`, if there is one.
+pub(crate) async fn read_record_form(
+    bucket: &Bucket,
+    key: &str,
+) -> anyhow::Result<Option<(String, Option<String>)>> {
+    Ok(load_json::<OwnerWireOwned>(bucket, key)
+        .await?
+        .map(|(owner, _)| (owner.by.unwrap_or_default(), owner.leave)))
+}
+
 #[cfg(test)]
 mod session_wire_tests {
     use super::*;
@@ -1671,6 +1779,8 @@ mod session_wire_tests {
             by: None,
             nonce: None,
             over: &[],
+            birth: false,
+            leave: None,
         })
         .unwrap();
         assert_eq!(body, br#"{"node":"n1","epoch":7}"#);
@@ -1680,6 +1790,8 @@ mod session_wire_tests {
             by: Some("ab"),
             nonce: None,
             over: &[],
+            birth: false,
+            leave: None,
         })
         .unwrap();
         assert_eq!(body, br#"{"node":"n1","epoch":7,"by":"ab"}"#);

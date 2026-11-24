@@ -91,6 +91,12 @@ pub struct Session {
     claimed: Mutex<BTreeSet<u64>>,
     /// The cells that left this session with a confirmed left entry in a chunk.
     left: Mutex<BTreeSet<u64>>,
+    /// The ids whose first request was already decided: the session grants an id
+    /// at its first request or never, so a waived id is never granted later and a
+    /// rejected birth write is followed by a real read.
+    decided: Mutex<BTreeSet<u64>>,
+    /// The ids granted without a read: their record is a birth-form record.
+    births: Mutex<BTreeSet<u64>>,
     /// The cell of each granted counter, for the marks that ride a bundle.
     granted_scopes: Mutex<BTreeMap<u64, String>>,
     /// A write that waits for a bit asks for a checkpoint now.
@@ -101,7 +107,14 @@ pub struct Session {
     sealing: AtomicBool,
     /// The session's seal finished and every bit it holds is in a sealed chunk.
     sealed_with_bits: AtomicBool,
-    held: tokio::sync::Mutex<Held>,
+    pub(crate) held: tokio::sync::Mutex<Held>,
+    /// The chunk edits that wait for the next write of their chunk.
+    pub(crate) edits: crate::session_leave::Edits,
+    /// The granted cells that have no record: lazy in this session until they
+    /// leave. Only a session in mode `on` has any.
+    lazy: Mutex<BTreeSet<u64>>,
+    /// The pending grants that already refused a request.
+    pending_refused: Mutex<BTreeSet<u64>>,
     /// The next counter to issue: every counter below it was issued.
     issued: AtomicU64,
     /// The header is written and the lease can carry the tag; minting waits
@@ -144,6 +157,8 @@ impl Session {
             checkpointed: Mutex::default(),
             granted_scopes: Mutex::default(),
             claimed: Mutex::default(),
+            decided: Mutex::default(),
+            births: Mutex::default(),
             left: Mutex::default(),
             pending: Mutex::default(),
             nudge: tokio::sync::Notify::new(),
@@ -151,6 +166,9 @@ impl Session {
             sealing: AtomicBool::new(false),
             sealed_with_bits: AtomicBool::new(false),
             held: tokio::sync::Mutex::default(),
+            edits: crate::session_leave::Edits::default(),
+            lazy: Mutex::default(),
+            pending_refused: Mutex::default(),
             established: AtomicBool::new(false),
             resumed: Mutex::default(),
         }
@@ -377,6 +395,16 @@ pub(crate) struct Held {
     chunks: BTreeMap<u64, (Chunk, String)>,
 }
 
+impl Held {
+    pub(crate) fn chunk(&self, chunk: u64) -> Option<&(Chunk, String)> {
+        self.chunks.get(&chunk)
+    }
+
+    pub(crate) fn set_chunk(&mut self, chunk: u64, body: Chunk, token: String) {
+        self.chunks.insert(chunk, (body, token));
+    }
+}
+
 /// Hold a write under `e1/` of the cell `scope` until the bit of its grant is in
 /// a chunk, when the cell is one that this session granted. Any other cell
 /// passes at once. A session that began its seal passes too: the seal writes
@@ -557,6 +585,48 @@ impl Session {
         }
     }
 
+    /// The decision of the first request for an id of this session, in a mode
+    /// that skips today's read and lookup: `Some(counter)` when the id is this
+    /// session's, not granted and not yet decided. The caller then calls
+    /// [`Self::decide_birth`] once.
+    pub(crate) fn undecided_own_counter(&self, scope: &str) -> Option<u64> {
+        let counter = self.own_counter_of_scope(scope)?;
+        let decided = self.decided.lock().expect("decided poisoned");
+        (!decided.contains(&counter) && !self.is_granted(counter)).then_some(counter)
+    }
+
+    /// Fix the decision for `counter`: grant it without a read (its record is a
+    /// birth-form record), or waive it (the standard path, for ever).
+    pub(crate) fn decide_birth(&self, counter: u64, grant: bool) {
+        self.decided
+            .lock()
+            .expect("decided poisoned")
+            .insert(counter);
+        if grant {
+            self.births.lock().expect("births poisoned").insert(counter);
+        }
+    }
+
+    /// The id is not granted without a record after all.
+    pub(crate) fn forget_birth(&self, scope: &str) {
+        if let Some(counter) = self.own_counter_of_scope(scope) {
+            self.births
+                .lock()
+                .expect("births poisoned")
+                .remove(&counter);
+        }
+    }
+
+    /// Whether the record about to be written for `scope` is a birth-form one.
+    pub(crate) fn is_birth_scope(&self, scope: &str) -> bool {
+        self.own_counter_of_scope(scope).is_some_and(|counter| {
+            self.births
+                .lock()
+                .expect("births poisoned")
+                .contains(&counter)
+        })
+    }
+
     /// The counter of a scope `Class:<64 hex digits>` whose id carries this
     /// session's tag.
     pub fn own_counter_of_scope(&self, scope: &str) -> Option<u64> {
@@ -596,7 +666,8 @@ impl Session {
     /// (granted, or waived and claimed) and that record is expected to exist.
     pub fn expects_record(&self, scope: &str) -> bool {
         self.own_counter_of_scope(scope).is_some_and(|counter| {
-            self.is_granted(counter)
+            (self.is_granted(counter)
+                && !self.lazy.lock().expect("lazy poisoned").contains(&counter))
                 || self
                     .claimed
                     .lock()
@@ -716,6 +787,80 @@ impl Session {
             .lock()
             .expect("granted poisoned")
             .contains(&counter)
+    }
+
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// The chunk was written: every bit and left entry in it is in the bucket.
+    pub(crate) fn note_chunk_written(&self, chunk: &Chunk) {
+        self.checkpointed
+            .lock()
+            .expect("checkpointed poisoned")
+            .extend(chunk.granted.iter().copied());
+    }
+
+    pub(crate) fn has_left(&self, counter: u64) -> bool {
+        self.left.lock().expect("left poisoned").contains(&counter)
+    }
+
+    /// The cell left the lazy state: its record exists and the leave is
+    /// confirmed in a chunk.
+    pub(crate) fn note_left(&self, counter: u64) {
+        self.left.lock().expect("left poisoned").insert(counter);
+        self.lazy.lock().expect("lazy poisoned").remove(&counter);
+        self.pending
+            .lock()
+            .expect("pending poisoned")
+            .remove(&counter);
+    }
+
+    /// The id was granted without a record: it is lazy until it leaves.
+    pub(crate) fn note_lazy(&self, counter: u64) {
+        self.lazy.lock().expect("lazy poisoned").insert(counter);
+    }
+
+    /// Whether a request for `scope` fails because its grant is pending. A
+    /// session in mode `on` refuses once per give-up and then wakes the cell; a
+    /// session that wrote a record before its `Grant` has no wake for it.
+    pub(crate) fn refuses_pending(&self, scope: &str) -> bool {
+        let Some(counter) = self.own_counter_of_scope(scope) else {
+            return false;
+        };
+        if !self
+            .pending
+            .lock()
+            .expect("pending poisoned")
+            .contains(&counter)
+        {
+            return false;
+        }
+        self.mode != Mode::On
+            || self
+                .pending_refused
+                .lock()
+                .expect("pending refused poisoned")
+                .insert(counter)
+    }
+
+    /// Whether `scope` is a cell of this session that has no record and has not
+    /// left.
+    pub fn is_lazy_scope(&self, scope: &str) -> bool {
+        self.own_counter_of_scope(scope)
+            .is_some_and(|counter| self.lazy.lock().expect("lazy poisoned").contains(&counter))
+    }
+
+    /// The lazy cells, by scope.
+    pub fn lazy_scopes(&self) -> Vec<String> {
+        let lazy = self.lazy.lock().expect("lazy poisoned");
+        self.granted_scopes
+            .lock()
+            .expect("granted scopes poisoned")
+            .iter()
+            .filter(|(counter, _)| lazy.contains(counter))
+            .map(|(_, scope)| scope.clone())
+            .collect()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -847,12 +992,22 @@ pub async fn prepare_reload(
         let Some(counter) = session.own_counter_of_scope(&cell.id) else {
             continue;
         };
-        if session.is_claimed_scope(&cell.id) {
+        if session.is_lazy_scope(&cell.id) {
+            // A lazy cell has no record: it gets one, with its leave confirmed
+            // in a chunk, before the log is sealed. After the seal the leave
+            // cannot be announced.
+            ownership.leave_cell(session, &cell.id, cell.epoch).await?;
+        } else if session.is_claimed_scope(&cell.id) {
             session.confirm_left(&bucket, &cell.id).await?;
         } else if session.is_granted(counter) {
             wait_until_checkpointed(&cell.id).await?;
         }
     }
+    // The capture fails for a cell of this session that is still lazy.
+    anyhow::ensure!(
+        cells.iter().all(|cell| !session.is_lazy_scope(&cell.id)),
+        "a resident cell of this session has no record and no confirmed leave"
+    );
     let all = session.tags().all();
     let mut tags: BTreeMap<String, String> = cells
         .iter()

@@ -281,15 +281,46 @@ impl Ownership {
             return Err(Failure::Definite);
         }
         // A grant whose request gave up before its fleet proof is pending: the
-        // cell does not activate, and every request for it fails the same way
-        // and may be retried.
-        if crate::session::current().is_some_and(|session| session.is_pending_scope(cell)) {
+        // cell does not activate, and the requests that follow fail the same way
+        // and may be retried. In mode `on` the first request after the give-up
+        // (the settling read of the failed claim, or a client) fails; the next
+        // wakes the cell at a new epoch.
+        if crate::session::current().is_some_and(|session| session.refuses_pending(cell)) {
             tracing::warn!(
                 event = "pending_grant",
                 cell,
                 "the grant of the cell is pending"
             );
             return Err(Failure::Definite);
+        }
+        // A lazy cell of this session has no record: a stand-in names this process
+        // at epoch 1. A request that wakes it claims the next epoch, which is the
+        // leave.
+        if let Some(session) = crate::session::current().filter(|s| s.is_lazy_scope(cell)) {
+            return Ok(Some(OwnerRecord {
+                node: Some(bucket.node_name().to_string()),
+                epoch: 1,
+                etag: crate::session_leave::LAZY_ETAG.to_string(),
+                by: Some(session.tag()),
+            }));
+        }
+        // A session in mode `read` or `on` skips today's read and lookup for an id
+        // that it minted and has not decided: with the conditions of B1 it writes
+        // the record at epoch 1 with a create-only write and nothing before it. A
+        // rejected write, or an id that was waived, is read as usual.
+        if let Some(session) = crate::session::current() {
+            if matches!(
+                session.mode(),
+                crate::session::Mode::Read | crate::session::Mode::On
+            ) {
+                if let Some(counter) = session.undecided_own_counter(cell) {
+                    let grant = !session.is_closed() && bucket.may_grant().await;
+                    session.decide_birth(counter, grant);
+                    if grant {
+                        return Ok(None);
+                    }
+                }
+            }
         }
         let (record, form) = bucket
             .read_owner_form(cell)
@@ -3971,6 +4002,23 @@ impl Actor {
                 let ownership = self.ownership.clone();
                 let node = self.state.node().to_string();
                 out.spawn_scoped(async move {
+                    // A lazy cell gets its record before this acknowledgement.
+                    if let (Ownership::Bucket(bucket), Some(session)) =
+                        (&ownership, crate::session::current())
+                    {
+                        if session.is_lazy_scope(&cell) {
+                            if let Err(error) = session
+                                .leave(&bucket.bucket_client(), &node, &cell, epoch)
+                                .await
+                            {
+                                eprintln!("celld lazy cell {cell}: the leave failed: {error:#}");
+                                return CompletedEffect::plain(Event::OwnershipVerified {
+                                    op,
+                                    result: Err(Failure::Definite),
+                                });
+                            }
+                        }
+                    }
                     let result = match ownership.read_owner(&cell).await {
                         Ok(Some(record))
                             if crate::session::names_this_process(&node, &cell, &record)
