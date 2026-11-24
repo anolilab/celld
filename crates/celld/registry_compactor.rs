@@ -1636,13 +1636,12 @@ impl Registry {
         for cell in cells {
             self.counters.sampler_cells.fetch_add(1, Ordering::Relaxed);
             let key = objects::key_of(&cell);
-            if !matches!(
+            let known = matches!(
                 self.lookup(&key).await.answer,
                 celld_logic::lost_record::Answer::Exists(_)
-            ) {
-                if !misses.iter().any(|(held, _, _)| *held == cell) {
-                    misses.push((cell, crate::asyncrt::mono_ms(), 0));
-                }
+            );
+            if !known && !misses.iter().any(|(held, _, _)| *held == cell) {
+                misses.push((cell, crate::asyncrt::mono_ms(), 0));
             }
         }
         let mut state = state.lock().unwrap();
