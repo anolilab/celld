@@ -694,13 +694,15 @@ async fn an_upload_that_stalls_is_cut_off_and_does_not_hold_a_place() {
 }
 
 /// The log lines of one event, with the message id the node logged for it.
-/// The log lines of `event`. The response can reach the test before the node
-/// has written its log line, so wait up to 5 s for the first one.
+/// The complete log lines of `event`. The response can reach the test before
+/// the node has written its log line, so wait up to 5 s for the first one; a
+/// last line without its newline is still being written and is not counted.
 async fn log_lines(server: &Server, event: &str) -> Vec<String> {
     let read = || -> Vec<String> {
         server
             .log_text()
-            .lines()
+            .split_inclusive('\n')
+            .filter_map(|line| line.strip_suffix('\n'))
             .filter(|line| line.contains(event))
             .map(str::to_string)
             .collect()
