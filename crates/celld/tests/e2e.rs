@@ -4,6 +4,7 @@ mod e2e {
     pub mod ai;
     pub mod alarms;
     pub mod body_clone;
+    pub mod boot_recovery_kill;
     pub mod burst_lease;
     pub mod claim_provenance;
     pub mod client_streams;

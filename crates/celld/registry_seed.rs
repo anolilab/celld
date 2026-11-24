@@ -90,6 +90,19 @@ impl Default for GateHold {
 
 static HOLD: GateHold = GateHold::new();
 
+tokio::task_local! {
+    static PREDECESSOR_REPAIR: ();
+}
+
+/// Run `future` as a repair of a dead predecessor's log: its per-cell writes pass
+/// [`GatedStore`] without waiting. A boot recovers its predecessor before it takes
+/// a lease, and the gate closes only once that lease is visible, so a recovery
+/// that waited for the gate would wait for itself. The objects are the ones the
+/// predecessor's own upload would have written, under the gate it closed.
+pub(crate) async fn repairing_predecessor<F: std::future::Future>(future: F) -> F::Output {
+    PREDECESSOR_REPAIR.scope((), future).await
+}
+
 /// The hold of this process.
 pub fn hold() -> &'static GateHold {
     &HOLD
@@ -219,7 +232,9 @@ impl GatedStore {
     }
 
     async fn gate(&self, location: &Path) {
-        if objects::cell_of_ltx_key(&self.prefix, location.as_ref()).is_some() {
+        if PREDECESSOR_REPAIR.try_with(|()| ()).is_err()
+            && objects::cell_of_ltx_key(&self.prefix, location.as_ref()).is_some()
+        {
             self.hold.wait().await;
         }
     }
