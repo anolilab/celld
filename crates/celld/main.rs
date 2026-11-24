@@ -4522,6 +4522,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 app.peer_auth.clone(),
                 celld::node_log::eviction_policy_from_env()?,
             ));
+            let probe = Arc::downgrade(&manager);
+            bucket_ownership.set_ensemble_probe(move || {
+                probe.upgrade().is_some_and(|manager| manager.proving())
+            });
             *actor.node_log.lock().unwrap() = Some(manager.clone());
             // Recovery-before-install is fatal for every posture: the
             // predecessor's folded state lives in the lease record this

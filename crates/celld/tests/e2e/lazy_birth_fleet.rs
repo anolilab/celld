@@ -2518,6 +2518,20 @@ async fn s8_rolling_and_preserved_restarts_under_a_stream_of_new_agents() {
         for client in clients {
             let _ = client.await;
         }
+        for (index, node) in fleet.nodes.iter().enumerate() {
+            let log = node.log();
+            for needle in ["SELF-FENCE", "clean_reload_abandoned", "pending_grant", "NodeFenced"] {
+                let lines: Vec<&str> = log.lines().filter(|line| line.contains(needle)).collect();
+                if let Some(first) = lines.first() {
+                    eprintln!("S8 node {index} {needle}: {} lines, first: {}", lines.len(), &first[..first.len().min(300)]);
+                }
+            }
+        }
+        if let Ok(dir) = std::env::var("LAZY_FLEET_KEEP_LOGS") {
+            for (index, node) in fleet.nodes.iter().enumerate() {
+                let _ = std::fs::write(format!("{dir}/s8-node-{index}.log"), node.log());
+            }
+        }
         let (ok, bad) = (
             ok.load(std::sync::atomic::Ordering::SeqCst),
             bad.load(std::sync::atomic::Ordering::SeqCst),

@@ -495,9 +495,14 @@ pub struct BucketOwnership {
     directory_answers: DirectoryAnswers,
     /// The first-form record that the next conditional write of a cell carries.
     pub(crate) k5: crate::session_reader::K5Plans,
-    /// Whether a `Grant` may be appended, and when that was decided: it is read
-    /// from the leases of the ensemble at most every [`MARKS_GATE_MS`].
-    marks_gate: std::sync::Mutex<(u64, bool)>,
+    /// Whether the leases of an ensemble carry the capability, and when that was
+    /// read, for which members: at most every [`MARKS_GATE_MS`]. Liveness is not
+    /// cached; see `ensemble_live`.
+    marks_gate: std::sync::Mutex<(u64, bool, Vec<String>)>,
+    /// Whether the node log has an installed ensemble that proves marks now: the
+    /// state the ship loop proves with. Set once by the process that owns the log;
+    /// without it the stored log record alone decides.
+    ensemble_live: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
     /// The same for the capability of every live lease, for the records that an
     /// older build would misread.
     records_gate: std::sync::Mutex<(u64, bool)>,
@@ -637,7 +642,8 @@ impl BucketOwnership {
             cell_directory: None,
             directory_answers: DirectoryAnswers::default(),
             k5: crate::session_reader::K5Plans::default(),
-            marks_gate: std::sync::Mutex::new((0, false)),
+            marks_gate: std::sync::Mutex::new((0, false, Vec::new())),
+            ensemble_live: std::sync::OnceLock::new(),
             records_gate: std::sync::Mutex::new((0, false)),
         }
     }
@@ -1185,26 +1191,39 @@ impl BucketOwnership {
     /// ensemble, and every member of the ensemble advertises the capability in
     /// its lease. Without that the id is granted by the chunk alone.
     async fn marks_allowed(&self) -> bool {
-        let now = crate::asyncrt::mono_ms();
-        {
-            let gate = self.marks_gate.lock().unwrap();
-            if gate.0 != 0 && now.saturating_sub(gate.0) < MARKS_GATE_MS {
-                return gate.1;
-            }
+        // The id is granted only into an ensemble that can prove the mark now: the
+        // shipper is installed and not degraded. A stored record that says `open`
+        // outlives a failed member for as long as the maintenance pass needs to
+        // replace it, and a grant made in that time cannot be proven.
+        if self.ensemble_live.get().is_some_and(|live| !live()) {
+            return false;
         }
         let ensemble = match &self.own_log.lock().unwrap().1 {
             Some(log) if log.state == "open" && !log.ensemble.is_empty() => log.ensemble.clone(),
-            _ => Vec::new(),
+            _ => return false,
         };
-        let mut allowed = !ensemble.is_empty();
+        let now = crate::asyncrt::mono_ms();
+        {
+            let gate = self.marks_gate.lock().unwrap();
+            if gate.0 != 0 && now.saturating_sub(gate.0) < MARKS_GATE_MS && gate.2 == ensemble {
+                return gate.1;
+            }
+        }
+        let mut allowed = true;
         for member in &ensemble {
             allowed &= matches!(
                 load_node_lease(&self.bucket, member).await,
                 Ok(Some(lease)) if !lease.tags.is_empty()
             );
         }
-        *self.marks_gate.lock().unwrap() = (now.max(1), allowed);
+        *self.marks_gate.lock().unwrap() = (now.max(1), allowed, ensemble);
         allowed
+    }
+
+    /// Tell the store how to ask whether the node log's ensemble can prove a mark
+    /// now. Called once, where the log is built.
+    pub fn set_ensemble_probe(&self, live: impl Fn() -> bool + Send + Sync + 'static) {
+        let _ = self.ensemble_live.set(Box::new(live));
     }
 
     /// This node's name.
@@ -1322,9 +1341,25 @@ impl BucketOwnership {
         counter: u64,
     ) -> anyhow::Result<()> {
         session.grant_scope(cell);
-        let proof = crate::session::enqueue_mark(cell, counter, crate::session::MarkKind::Grant);
-        if let Ok(Ok(true)) = crate::asyncrt::timeout(mark_proof_wait(), proof).await {
-            return Ok(());
+        // A round that failed because a member of the ensemble was gone says nothing
+        // about the next ensemble: the same mark is sent again, until the wait ends.
+        // The `Grant` of a counter is idempotent, and only a proof that covers it
+        // activates the cell.
+        let deadline = crate::asyncrt::mono_ms().saturating_add(
+            u64::try_from(mark_proof_wait().as_millis()).unwrap_or(u64::MAX),
+        );
+        loop {
+            let left = deadline.saturating_sub(crate::asyncrt::mono_ms());
+            if left == 0 {
+                break;
+            }
+            let proof =
+                crate::session::enqueue_mark(cell, counter, crate::session::MarkKind::Grant);
+            match crate::asyncrt::timeout(std::time::Duration::from_millis(left), proof).await {
+                Ok(Ok(true)) => return Ok(()),
+                Ok(_) => crate::asyncrt::sleep(std::time::Duration::from_millis(100)).await,
+                Err(_) => break,
+            }
         }
         session.mark_pending(counter);
         tracing::warn!(

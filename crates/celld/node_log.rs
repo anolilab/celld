@@ -2743,6 +2743,9 @@ impl StreamWindow {
     }
 }
 
+/// How long an ensemble must have been active before a grant relies on it.
+const PROVING_SETTLE_MS: u64 = 1_500;
+
 /// The fleet shipper for ONE ensemble at one epoch: assigns sequence
 /// numbers, POSTs one in-flight batch to every member, and reports
 /// all-acked. One batch at a time is what keeps each follower's fragment
@@ -2787,6 +2790,8 @@ pub struct FleetShipper {
     /// The stream window, when `CELLD_LOG_WINDOW` enables it. `None` keeps
     /// the round-bounded ship loop unchanged.
     stream: Option<Arc<StreamWindow>>,
+    /// When this shipper was installed, in monotonic milliseconds.
+    installed_ms: u64,
 }
 
 impl crate::ltx_repl::Shipper for FleetShipper {
@@ -5700,6 +5705,19 @@ impl NodeLogManager {
             .is_some_and(|shipper| shipper.is_active() && !shipper.members.is_empty())
     }
 
+    /// Whether the installed ensemble can be expected to prove a mark: it is
+    /// active and has outlived [`PROVING_SETTLE_MS`]. A member that is gone
+    /// but whose lease has not expired fails the first append of every ensemble
+    /// that names it, a second or less after the ensemble opens, so a mark
+    /// taken by a younger ensemble would not be proven.
+    pub fn proving(&self) -> bool {
+        self.inner.lock().unwrap().as_ref().is_some_and(|shipper| {
+            shipper.is_active()
+                && !shipper.members.is_empty()
+                && mono_ms().saturating_sub(shipper.installed_ms) >= PROVING_SETTLE_MS
+        })
+    }
+
     fn shutdown_local_fallback(&self) {
         self.task_stop.request_stop();
         self.closing.store(true, Ordering::SeqCst);
@@ -5933,6 +5951,7 @@ impl NodeLogManager {
             outstanding: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             policy: self.policy.clone(),
             stream,
+            installed_ms: mono_ms(),
         }));
         // The successor record and its in-memory shipper form one state
         // transition. Keep shutdown excluded until both values are visible.
