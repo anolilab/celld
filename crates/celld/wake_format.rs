@@ -243,3 +243,50 @@ async fn ensure_legacy_layout(bucket: &Bucket) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::ObjectStoreExt as _;
+
+    #[tokio::test]
+    async fn the_registry_marker_is_written_once_and_this_binary_still_reads_the_record() {
+        let store = InMemory::new();
+        assert!(
+            !mark_registry(&store, "fleet/").await.unwrap(),
+            "no record yet"
+        );
+        store
+            .put(
+                &Path::from("fleet/wake/format.json"),
+                br#"{"format":2}"#.to_vec().into(),
+            )
+            .await
+            .unwrap();
+        assert!(mark_registry(&store, "fleet/").await.unwrap());
+        let body = store
+            .get(&Path::from("fleet/wake/format.json"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let record = decode(&body).unwrap();
+        assert_eq!(record.registry, 1);
+        assert!(!record.migrating);
+        assert!(
+            mark_registry(&store, "fleet/").await.unwrap(),
+            "a second call changes nothing"
+        );
+        let again = store
+            .get(&Path::from("fleet/wake/format.json"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(body, again);
+    }
+}

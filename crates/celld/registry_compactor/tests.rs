@@ -2423,6 +2423,224 @@ fn the_registry_bound_shrinks_by_the_directory_wait_and_the_sum_stays_under_half
     assert!(wait(10_000, 6_000).is_err());
     assert_eq!(wait(5_000, 1_000).unwrap(), Duration::from_millis(500));
     assert!(wait(5_000, 2_500).is_err());
+
+// ---------------------------------------------------------------------------
+// The gate, the seed and the format marker
+// ---------------------------------------------------------------------------
+
+/// The role with the gate still closed, as a new root leaves it.
+async fn closed_holder(registry: &Arc<Registry>) -> Holding {
+    let mut holding = registry
+        .take(None, false)
+        .await
+        .unwrap()
+        .expect("took the role");
+    let now = crate::asyncrt::mono_ms();
+    holding.last_spill_ms = Some(now);
+    holding.last_base_ms = now;
+    assert!(!holding.root.gate_open());
+    holding
+}
+
+/// Passes until the gate is open, trying the seed at every pass.
+async fn pass_until_open(registry: &Arc<Registry>, holding: &mut Holding) {
+    crate::asyncrt::timeout(Duration::from_secs(10), async {
+        while !holding.root.gate_open() {
+            holding.last_seed_ms = None;
+            registry.pass(holding).await.unwrap();
+            crate::asyncrt::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the seed opened the gate");
+}
+
+async fn put_object(store: &Arc<dyn ObjectStore>, key: &str, body: &str) {
+    objects::put_create(store.as_ref(), key, body.as_bytes().to_vec())
+        .await
+        .unwrap();
+}
+
+/// A bucket with cells across the name ranges, each with a record and LTX.
+async fn bucket_with_cells(store: &Arc<dyn ObjectStore>, names: &[String]) {
+    for name in names {
+        put_object(store, &format!("{PREFIX}cells/{name}/own.json"), "{}").await;
+        put_object(
+            store,
+            &format!("{PREFIX}cells/{name}/ltx/e1/0/1-1.ltx"),
+            "x",
+        )
+        .await;
+    }
+}
+
+fn seeded_names() -> Vec<String> {
+    let mut names: Vec<String> = (0..150).map(|index| format!("Agent:{index:06}")).collect();
+    names.extend((0..30).map(|index| format!("9digit-{index}")));
+    names.extend((0..30).map(|index| format!("__KvNamespace:{index}")));
+    names.extend((0..30).map(|index| format!("zed{index}")));
+    names.extend((0..10).map(|index| format!("Counter:{index}")));
+    names
+}
+
+async fn lease(store: &Arc<dyn ObjectStore>, node: &str, load: &str, expires_ms: u64) {
+    let body = format!(r#"{{"node":"{node}","expires_ms":{expires_ms},"load":{load}}}"#);
+    let key = format!("{PREFIX}nodes/{node}.json");
+    objects::delete(store.as_ref(), &key).await;
+    put_object(store, &key, &body).await;
+}
+
+fn far() -> u64 {
+    crate::ownership_store::now_ms() + 3_600_000
+}
+
+#[tokio::test]
+async fn the_seed_lists_every_cell_once_and_opens_the_gate() {
+    let store = memory();
+    let names = seeded_names();
+    bucket_with_cells(&store, &names).await;
+    let node = registry_on(&store, "node-a");
+    let mut holding = closed_holder(&node).await;
+    let reader = registry_on(&store, "node-b");
+    assert!(matches!(
+        answer(&reader, "Agent:never").await,
+        Answer::Unknown(celld_logic::lost_record::Doubt::GateClosed)
+    ));
+    pass_until_open(&node, &mut holding).await;
+    // The count the claim guard's listing would see.
+    let listed = store
+        .list_with_delimiter(Some(&object_store::path::Path::from(format!(
+            "{PREFIX}cells"
+        ))))
+        .await
+        .unwrap()
+        .common_prefixes
+        .len() as u64;
+    assert_eq!(listed, names.len() as u64);
+    assert_eq!(node.counters.seed_cells.load(Ordering::Relaxed), listed);
+    let in_runs: u64 = holding
+        .map
+        .partitions
+        .iter()
+        .map(|partition| partition.l1.records())
+        .sum();
+    assert_eq!(in_runs, listed, "the runs hold exactly the listed cells");
+    for name in &names {
+        assert!(
+            matches!(answer(&reader, name).await, Answer::Exists(_)),
+            "{name}"
+        );
+    }
+    assert_eq!(answer(&reader, "Agent:never").await, Answer::New);
+}
+
+#[tokio::test]
+async fn a_node_outside_the_rule_closes_the_gate_and_a_new_seed_reopens_it() {
+    let store = memory();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    let reader = registry_on(&store, "node-b");
+    assert_eq!(answer(&reader, "Agent:fresh").await, Answer::New);
+    // A node with bucket durability (or the flag off) starts: it advertises that
+    // it is outside the rule, then raises the gate number.
+    lease(&store, "node-c", r#"{"registry":false}"#, far()).await;
+    let raised = crate::registry_seed::close_gate(store.as_ref(), PREFIX)
+        .await
+        .unwrap();
+    assert_eq!(raised, Some(2));
+    assert!(matches!(
+        answer(&reader, "Agent:fresh").await,
+        Answer::Unknown(celld_logic::lost_record::Doubt::GateClosed)
+    ));
+    // The holder's next write meets the raised number, keeps it, and no seed
+    // starts while that node's lease is live.
+    for _ in 0..3 {
+        holding.last_seed_ms = None;
+        node.register_at_claim(&cell(1), 1);
+        node.flush_now().await.unwrap();
+        let _ = node.pass(&mut holding).await;
+        crate::asyncrt::sleep(Duration::from_millis(30)).await;
+    }
+    assert_eq!(holding.root.gate, 2, "the holder never lowers the gate");
+    assert!(!holding.root.gate_open());
+    assert!(node.counters.seed_waits.load(Ordering::Relaxed) > 0);
+    assert!(matches!(
+        answer(&reader, "Agent:fresh").await,
+        Answer::Unknown(_)
+    ));
+    // The node leaves: a new seed reopens the gate.
+    objects::delete(store.as_ref(), &format!("{PREFIX}nodes/node-c.json")).await;
+    pass_until_open(&node, &mut holding).await;
+    assert_eq!(holding.root.seed_gate, 2);
+    assert_eq!(answer(&reader, "Agent:fresh").await, Answer::New);
+}
+
+#[tokio::test]
+async fn a_lease_without_the_field_keeps_the_marker_and_the_seed_from_happening() {
+    let store = memory();
+    put_object(
+        &store,
+        &format!("{PREFIX}wake/format.json"),
+        r#"{"format":2}"#,
+    )
+    .await;
+    lease(&store, "node-old", "{}", far()).await;
+    let node = registry_on(&store, "node-a");
+    let mut holding = closed_holder(&node).await;
+    for _ in 0..3 {
+        holding.last_seed_ms = None;
+        node.pass(&mut holding).await.unwrap();
+        crate::asyncrt::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(node.counters.seed_blocked.load(Ordering::Relaxed) > 0);
+    assert_eq!(node.counters.seeds.load(Ordering::Relaxed), 0);
+    assert!(!holding.root.gate_open());
+    let marker = store
+        .get(&object_store::path::Path::from(format!(
+            "{PREFIX}wake/format.json"
+        )))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&marker[..], br#"{"format":2}"#, "no marker while it runs");
+    // An expired lease does not count.
+    lease(&store, "node-old", "{}", 1).await;
+    pass_until_open(&node, &mut holding).await;
+}
+
+#[tokio::test]
+async fn the_marker_is_written_before_the_seed_and_an_older_binary_cannot_read_it() {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct OlderFormatRecord {
+        format: u8,
+        #[serde(default)]
+        migrating: bool,
+    }
+    let store = memory();
+    let marker_key = object_store::path::Path::from(format!("{PREFIX}wake/format.json"));
+    put_object(
+        &store,
+        &format!("{PREFIX}wake/format.json"),
+        r#"{"format":2}"#,
+    )
+    .await;
+    let read = || async { store.get(&marker_key).await.unwrap().bytes().await.unwrap() };
+    assert!(serde_json::from_slice::<OlderFormatRecord>(&read().await).is_ok());
+    lease(&store, "node-new", r#"{"registry":true}"#, far()).await;
+    let node = registry_on(&store, "node-a");
+    let mut holding = closed_holder(&node).await;
+    pass_until_open(&node, &mut holding).await;
+    let marked = read().await;
+    assert!(
+        serde_json::from_slice::<OlderFormatRecord>(&marked).is_err(),
+        "a binary that predates the marker does not read the record, so it does not start: {}",
+        String::from_utf8_lossy(&marked)
+    );
+    assert!(String::from_utf8_lossy(&marked).contains("\"registry\":1"));
 }
 
 #[tokio::test]

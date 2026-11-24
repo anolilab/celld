@@ -446,6 +446,7 @@ pub(crate) async fn prepare_spill(
 
 /// Prepare the seed: every partition's seed objects folded into its level 1.
 /// Consumes no delta, and the commit sets the root's seed number to `gate`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_seed(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
