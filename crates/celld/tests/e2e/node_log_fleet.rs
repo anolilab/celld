@@ -25,6 +25,10 @@ use super::harness::{client, fixture_dir, signal_group, wait_until};
 const CELLD: &str = env!("CARGO_BIN_EXE_celld");
 const TOKEN: &str = "node-log-fleet-token";
 
+/// The lease lifetime of every node, so the window of the recruitment check
+/// follows it.
+const TTL_MS: u64 = 10_000;
+
 /// New cells per second, over all clients.
 const RATE_PER_SECOND: u64 = 50;
 
@@ -58,6 +62,7 @@ impl Node {
             .env("CELLD_NODE", format!("nodelog-{index}"))
             .env("CELLD_WATCH", home.join("state"))
             .env("CELLD_DURABILITY", "fleet")
+            .env("CELLD_TTL_MS", TTL_MS.to_string())
             .env("CELLD_OPERATOR_TOKEN", TOKEN)
             .env("CELLD_CONFIG_DIR", home.join("config"))
             .current_dir(&home)
@@ -166,11 +171,11 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 
 /// The ensembles that opened with a member whose very process had failed an
 /// append a moment before: `(node, generation, seconds since the failure)`.
-/// A failed process sits out until its lease lapses, which is longer than
-/// `WITHIN_S`; a successor process has a new generation and may be recruited
-/// at once.
+/// A failed process sits out for at least one lease lifetime, `TTL_MS`; a
+/// successor process has a new generation and may be recruited at once.
 fn recruited_after_failing(log: &str) -> Vec<(String, String, f64)> {
-    const WITHIN_S: f64 = 9.0;
+    // Half a second short of the lifetime, for the clocks of two log lines.
+    let within_s = TTL_MS as f64 / 1000.0 - 0.5;
     let mut failed: std::collections::BTreeMap<String, (String, f64)> = Default::default();
     let mut recruited = Vec::new();
     for line in log.lines() {
@@ -200,7 +205,7 @@ fn recruited_after_failing(log: &str) -> Vec<(String, String, f64)> {
                     continue;
                 };
                 if let Some((held, since)) = failed.get(*node) {
-                    if held == generation && at - since < WITHIN_S {
+                    if held == generation && at - since < within_s {
                         recruited.push((node.to_string(), generation.to_string(), at - since));
                     }
                 }
@@ -224,6 +229,15 @@ fn opens_naming(nodes: &[Node], except: usize, name: &str) -> usize {
                 .count()
         })
         .sum()
+}
+
+/// Stop the traffic task and wait for it; harmless when it has ended.
+async fn stop_traffic(stop: &AtomicBool, driver: &Mutex<Option<tokio::task::JoinHandle<()>>>) {
+    stop.store(true, Ordering::SeqCst);
+    let handle = driver.lock().unwrap().take();
+    if let Some(handle) = handle {
+        let _ = handle.await;
+    }
 }
 
 /// Lines of `log` that contain `needle`.
@@ -262,12 +276,7 @@ async fn a_rolling_restart_does_not_recruit_the_restarting_peer() {
         String::from_utf8_lossy(&deployed.stderr)
     );
     let client = client();
-    let mut nodes: Vec<Node> = (0..3)
-        .map(|index| Node::spawn(home.path(), index, &spec, &endpoint))
-        .collect();
-    for node in &nodes {
-        node.wait_ready(&client).await;
-    }
+    // The cleanup covers node startup and readiness from here on.
     let store = Bucket::open(
         &spec,
         Some(&endpoint),
@@ -276,8 +285,17 @@ async fn a_rolling_restart_does_not_recruit_the_restarting_peer() {
         Some("node-log-fleet"),
     )
     .unwrap_or_else(|error| panic!("open {spec}: {error:#}"));
+    // Outside the body, so a failure in it still stops the traffic and the
+    // nodes before the bucket is cleaned.
+    let mut nodes: Vec<Node> = Vec::new();
+    let stop = Arc::new(AtomicBool::new(false));
+    let driver: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
     let body = async {
+        nodes.extend((0..3).map(|index| Node::spawn(home.path(), index, &spec, &endpoint)));
+        for node in &nodes {
+            node.wait_ready(&client).await;
+        }
         // The followers form their ensembles a few seconds after they are
         // ready.
         wait_until(
@@ -297,10 +315,9 @@ async fn a_rolling_restart_does_not_recruit_the_restarting_peer() {
                 .map(|node| node.public.clone())
                 .collect::<Vec<_>>(),
         ));
-        let stop = Arc::new(AtomicBool::new(false));
         let ok = Arc::new(AtomicU64::new(0));
         let bad = Arc::new(AtomicU64::new(0));
-        let driver = {
+        *driver.lock().unwrap() = Some({
             let (addresses, stop, ok, bad, client) = (
                 addresses.clone(),
                 stop.clone(),
@@ -342,7 +359,7 @@ async fn a_rolling_restart_does_not_recruit_the_restarting_peer() {
                     let _ = call.await;
                 }
             })
-        };
+        });
 
         let started = Instant::now();
         let mut restarts = Vec::new();
@@ -371,8 +388,7 @@ async fn a_rolling_restart_does_not_recruit_the_restarting_peer() {
             )
             .await;
         }
-        stop.store(true, Ordering::SeqCst);
-        let _ = driver.await;
+        stop_traffic(&stop, &driver).await;
 
         let (ok, bad) = (ok.load(Ordering::SeqCst), bad.load(Ordering::SeqCst));
         let success = 100.0 * ok as f64 / (ok + bad).max(1) as f64;
@@ -423,6 +439,7 @@ async fn a_rolling_restart_does_not_recruit_the_restarting_peer() {
         }
     };
     let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+    stop_traffic(&stop, &driver).await;
     if let Ok(dir) = std::env::var("NODE_LOG_FLEET_KEEP_LOGS") {
         for (index, node) in nodes.iter().enumerate() {
             let _ = std::fs::write(format!("{dir}/node-{index}.log"), node.log());

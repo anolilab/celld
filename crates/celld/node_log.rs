@@ -2581,6 +2581,38 @@ struct Removed {
     quarantined: usize,
 }
 
+/// Record a failed append, or a failed probe, against the member's process:
+/// when the connection failed outright the peer is restarting or gone, and the
+/// process that failed sits out until its lease lapses, or one lease lifetime
+/// from now if that is later (a lease it renews). A timeout is not this: a
+/// slow member stays on the gray path and recruitable at once. Returns whether
+/// the member was sat out.
+fn note_failed_append(
+    health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
+    member: &Member,
+    error: &anyhow::Error,
+) -> bool {
+    if !is_connection_failure(error) {
+        return false;
+    }
+    let now = crate::ownership_store::now_ms();
+    warn!(
+        member = member.node,
+        generation = member.generation,
+        %error,
+        "follower append failed; sitting out of recruitment while its lease lasts"
+    );
+    health.lock().unwrap().append_failed(
+        &member.node,
+        &member.generation,
+        now,
+        member
+            .lease_expires_ms
+            .max(now.saturating_add(member.lease_ttl_ms)),
+    );
+    true
+}
+
 /// A peer connection that failed outright, as opposed to one that was slow.
 #[derive(Debug)]
 struct ConnectionLost(&'static str);
@@ -3046,30 +3078,11 @@ fn resolve_append(
                 .append_incapable(policy, &member.node, done);
             None
         }
-        AppendSend::Failed(error) if is_connection_failure(&error) => {
-            // The peer's connection failed outright: it is restarting or
-            // gone. The process that failed sits out until its lease lapses,
-            // or one lease lifetime from now if that is later (a lease it
-            // renews). A timeout is not this: a slow member stays on the
-            // gray path and recruitable at once.
-            let now = crate::ownership_store::now_ms();
-            warn!(
-                member = member.node,
-                generation = member.generation,
-                %error,
-                "follower append failed; sitting out of recruitment while its lease lasts"
-            );
-            health.lock().unwrap().append_failed(
-                &member.node,
-                &member.generation,
-                now,
-                member
-                    .lease_expires_ms
-                    .max(now.saturating_add(member.lease_ttl_ms)),
-            );
+        AppendSend::Failed(error) => {
+            note_failed_append(health, member, &error);
             None
         }
-        AppendSend::Answered(_) | AppendSend::Failed(_) => None,
+        AppendSend::Answered(_) => None,
     };
     // The window accounting settles BEFORE the round future can
     // resolve: by the time the ship loop sees a completed round, every
@@ -4774,7 +4787,11 @@ impl NodeLogManager {
                                 .unwrap()
                                 .append_incapable(&shipper.policy, &node, done);
                         }
-                        AppendSend::Failed(_) => {}
+                        // A probe that cannot connect sits the process out like
+                        // a failed batch; a timeout stays on the latency path.
+                        AppendSend::Failed(error) => {
+                            note_failed_append(&health, member, &error);
+                        }
                     }
                 });
         }
@@ -7366,6 +7383,47 @@ mod seal_absent_log_tests {
             .await;
             server.join().unwrap();
             assert!(!is_connection_failure(&error), "{error:#}");
+        });
+    }
+
+    #[test]
+    fn a_failed_probe_sits_out_only_for_a_connection_failure() {
+        run(async {
+            let now = crate::ownership_store::now_ms();
+            let member = Member {
+                node: "peer".into(),
+                addr: "peer:1".into(),
+                generation: "g1".into(),
+                lease_expires_ms: now + 60_000,
+                lease_ttl_ms: 10_000,
+            };
+            let health = Arc::new(Mutex::new(celld_logic::log_evict::FollowerHealth::default()));
+            let sat_out = |health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>| {
+                health.lock().unwrap().failed_recently(
+                    "peer",
+                    "g1",
+                    crate::ownership_store::now_ms(),
+                )
+            };
+            // A probe that timed out is the latency path's business.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let timeout = post_error(
+                format!("http://127.0.0.1:{port}/"),
+                std::time::Duration::from_millis(150),
+            )
+            .await;
+            assert!(!note_failed_append(&health, &member, &timeout));
+            assert!(!sat_out(&health));
+            // A probe that is refused sits the process out until its lease.
+            drop(listener);
+            let refused = post_error(
+                format!("http://127.0.0.1:{port}/"),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            assert!(note_failed_append(&health, &member, &refused));
+            assert!(sat_out(&health));
         });
     }
 
