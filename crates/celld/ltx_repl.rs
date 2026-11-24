@@ -2097,7 +2097,10 @@ impl LtxRepl {
     }
 
     /// Recovery's primitive: PUT one gathered L0 segment to the exact key
-    /// the dead leader's own upload would have used. Idempotent by key.
+    /// the dead leader's own upload would have used. Idempotent by key. It
+    /// passes the registry gate only when the caller runs inside
+    /// `registry_seed::repairing_predecessor` (a boot's own predecessor); a
+    /// sweep or cold-route recovery waits for the gate like any per-cell write.
     pub async fn upload_raw_l0(
         &self,
         cell: &str,
@@ -2106,16 +2109,12 @@ impl LtxRepl {
         max_txid: u64,
         bytes: &[u8],
     ) -> anyhow::Result<()> {
-        crate::registry_seed::repairing_predecessor(self.client_for(cell, epoch).write_ltx_file(
-            0,
-            TXID(min_txid),
-            TXID(max_txid),
-            bytes,
-        ))
-        .await
-        .map_err(|error| {
-            anyhow!("upload recovered l0 {cell} e{epoch} t{min_txid}-{max_txid}: {error}")
-        })?;
+        self.client_for(cell, epoch)
+            .write_ltx_file(0, TXID(min_txid), TXID(max_txid), bytes)
+            .await
+            .map_err(|error| {
+                anyhow!("upload recovered l0 {cell} e{epoch} t{min_txid}-{max_txid}: {error}")
+            })?;
         self.note_covered(cell, epoch, max_txid);
         Ok(())
     }
