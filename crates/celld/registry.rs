@@ -322,6 +322,9 @@ pub struct Registry {
     /// Live nodes and their addresses, for the holder's root push.
     pub(crate) fleet: Mutex<Vec<(String, String)>>,
     pub(crate) last_pass_request_ms: AtomicU64,
+    /// When a peer last asked this node for a pass, so that a peer that asks
+    /// too often cannot run passes back to back.
+    pub(crate) last_peer_pass_ms: AtomicU64,
     /// When a dropped cell was last logged, so the log is once a minute.
     pub(crate) last_drop_log_ms: AtomicU64,
     /// Shadow lookups beside claims in flight at once.
@@ -393,6 +396,7 @@ impl Registry {
             peer_addr: Mutex::new(HashMap::new()),
             fleet: Mutex::new(Vec::new()),
             last_pass_request_ms: AtomicU64::new(0),
+            last_peer_pass_ms: AtomicU64::new(0),
             last_drop_log_ms: AtomicU64::new(0),
             shadow_slots: Arc::new(tokio::sync::Semaphore::new(SHADOW_LOOKUPS)),
             recovered: Mutex::new(HashMap::new()),

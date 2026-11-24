@@ -237,13 +237,20 @@ impl Registry {
         }
     }
 
-    /// Ask the holder for a pass now, best effort. The next regular pass
-    /// covers a request that fails.
-    /// A pass was asked of this node: run one now if it holds the role.
+    /// A peer asked this node for a pass: run one now if it holds the role,
+    /// at most once per request gap, whoever asks.
     pub fn request_pass_here(&self) {
+        let now = crate::asyncrt::mono_ms();
+        let last = self.last_peer_pass_ms.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < PASS_REQUEST_GAP_MS {
+            return;
+        }
+        self.last_peer_pass_ms.store(now, Ordering::Relaxed);
         self.pass_now.notify_one();
     }
 
+    /// Ask the holder for a pass now, best effort. The next regular pass
+    /// covers a request that fails.
     pub(crate) async fn request_pass(&self) {
         let now = crate::asyncrt::mono_ms();
         let last = self.last_pass_request_ms.load(Ordering::Relaxed);
