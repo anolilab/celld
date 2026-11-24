@@ -125,19 +125,7 @@ async fn a_burst_of_cell_wakes_does_not_fence_the_node() {
             "burst of {count} cells acknowledged in {:.1}s",
             took.as_secs_f64()
         );
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        let fenced = log.lines().any(|line| line.contains("SELF-FENCE"));
-        let failed = results.iter().filter(|ok| !**ok).count();
-        if fenced {
-            let lease: Vec<&str> = log
-                .lines()
-                .filter(|line| line.contains("lease") || line.contains("FENCE"))
-                .take(30)
-                .collect();
-            eprintln!("lease lines:\n{}", lease.join("\n"));
-        }
-        assert!(!fenced, "the node fenced itself under the burst");
-        assert_eq!(failed, 0, "{failed} of {count} requests failed");
+        results.iter().filter(|ok| !**ok).count()
     })
     .catch_unwind()
     .await;
@@ -151,6 +139,18 @@ async fn a_burst_of_cell_wakes_does_not_fence_the_node() {
         signal_group(child.id(), "KILL");
         let _ = child.wait();
     }
+    // The node writes its log through a non-blocking writer, so read it only
+    // after the process has exited and flushed it.
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let fenced = log.lines().any(|line| line.contains("SELF-FENCE"));
+    if fenced {
+        let lease: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("lease") || line.contains("FENCE"))
+            .take(30)
+            .collect();
+        eprintln!("lease lines:\n{}", lease.join("\n"));
+    }
     let store = Bucket::open(&spec, Some(&endpoint), &region(), None, Some("burst-lease"))
         .unwrap_or_else(|error| panic!("open {spec}: {error:#}"));
     let keys: Vec<String> = store
@@ -160,8 +160,17 @@ async fn a_burst_of_cell_wakes_does_not_fence_the_node() {
         .into_iter()
         .map(|meta| meta.location.to_string())
         .collect();
-    store.delete_many(&keys).await;
-    if let Err(panic) = outcome {
-        std::panic::resume_unwind(panic);
-    }
+    let gone = store.delete_many(&keys).await;
+    let failed = match outcome {
+        Ok(failed) => failed,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    assert!(!fenced, "the node fenced itself under the burst");
+    assert_eq!(failed, 0, "{failed} of {count} requests failed");
+    assert_eq!(
+        gone.len(),
+        keys.len(),
+        "cleanup left {} of the run's objects in the bucket",
+        keys.len() - gone.len()
+    );
 }
