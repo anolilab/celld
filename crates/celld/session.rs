@@ -168,9 +168,14 @@ impl Session {
         Some(tagged_object_id(key, self.tag, block))
     }
 
-    /// Record the tag of the record of a cell this process resumed.
+    /// Offer the tag of the record of a cell that the predecessor's
+    /// certificate named. `tag` is empty for a record without `by`. A tag this
+    /// process does not carry is refused, so the cell is not resumed and takes
+    /// the normal claim path. The core settles which of the offered cells it
+    /// resumes in the end (see [`Self::settle_resumed`]).
     pub fn note_resumed(&self, cell: &str, tag: &str, epoch: u64) {
-        if tag != self.tags.own() {
+        let carried = tag.is_empty() || self.tags.all().iter().any(|carried| carried == tag);
+        if carried && tag != self.tags.own() {
             self.resumed
                 .lock()
                 .expect("resumed cells poisoned")
@@ -184,13 +189,31 @@ impl Session {
         self.resumed.lock().expect("resumed cells poisoned").clone()
     }
 
-    /// Whether this process resumed `cell` under `tag` at `epoch`.
+    /// Keep the offered cells that the local scan found live at the offered
+    /// epoch, and none at all if the scan failed (`None`). The core resumes
+    /// no cell beyond these.
+    pub fn settle_resumed(&self, local: Option<&[celld_logic::LocalCell]>) {
+        let mut resumed = self.resumed.lock().expect("resumed cells poisoned");
+        match local {
+            Some(local) => resumed.retain(|cell, (_, epoch)| {
+                local
+                    .iter()
+                    .any(|found| found.live && found.id == *cell && found.epoch == *epoch)
+            }),
+            None => resumed.clear(),
+        }
+    }
+
+    /// Whether this process resumed `cell` under `tag` at `epoch`, and still
+    /// carries `tag`.
     pub(crate) fn resumed_at(&self, cell: &str, tag: &str, epoch: u64) -> bool {
-        self.resumed
-            .lock()
-            .expect("resumed cells poisoned")
-            .get(cell)
-            .is_some_and(|(resumed, at)| resumed == tag && *at == epoch)
+        self.tags.all().iter().any(|carried| carried == tag)
+            && self
+                .resumed
+                .lock()
+                .expect("resumed cells poisoned")
+                .get(cell)
+                .is_some_and(|(resumed, at)| resumed == tag && *at == epoch)
     }
 
     /// A claim of `cell` wrote this process's own tag.
@@ -199,15 +222,6 @@ impl Session {
             .lock()
             .expect("resumed cells poisoned")
             .remove(cell);
-    }
-
-    /// The tag of the record of a resident `cell`.
-    pub fn tag_of(&self, cell: &str) -> String {
-        self.resumed
-            .lock()
-            .expect("resumed cells poisoned")
-            .get(cell)
-            .map_or_else(|| self.tags.own().to_string(), |(tag, _)| tag.clone())
     }
 }
 
@@ -282,6 +296,44 @@ pub(crate) fn names_with(
     }
 }
 
+static CARRIED_VERIFIED: AtomicU64 = AtomicU64::new(0);
+
+/// A read after a bucket proof found a record that names a predecessor's tag
+/// that this process carries. Counted, so a test and an operator can see that
+/// the carried set is what let the write pass.
+pub(crate) fn note_verified(record: &OwnerRecord) {
+    if let Some(session) = current() {
+        if record
+            .by
+            .as_deref()
+            .is_some_and(|by| by != session.tags.own())
+        {
+            CARRIED_VERIFIED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The counters of a session, for `/state`; none without a session.
+pub(crate) fn counters_json() -> Option<serde_json::Value> {
+    let session = current()?;
+    Some(serde_json::json!({
+        "tag": session.tag(),
+        "verified_under_carried_tag": CARRIED_VERIFIED.load(Ordering::Relaxed),
+    }))
+}
+
+/// Whether `record` names this process at `epoch`: the owner check of epoch
+/// GC, which may delete only as the owner.
+pub(crate) fn owns_epoch(
+    session: Option<&Session>,
+    node: &str,
+    cell: &str,
+    epoch: u64,
+    record: Option<&OwnerRecord>,
+) -> bool {
+    record.is_some_and(|record| names_with(session, node, record, cell) && record.epoch == epoch)
+}
+
 /// What a session makes of an id that verified as `kind`.
 pub(crate) fn check_issued(session: Option<&Session>, kind: IdKind) -> Result<IdKind, IdRefusal> {
     // Only an id of this session's own tag is judged here. An id of another
@@ -333,16 +385,41 @@ pub(crate) fn id_tag_of_scope(scope: &str) -> Option<String> {
     tag_of_scope(scope)
 }
 
+/// Whether `scope` is the id of this process's own session with a counter that
+/// the session never issued. A ready-made scope that a peer placed here must
+/// not create the first record of such a cell. An id of another session's tag
+/// needs that session's key to be judged, which the chunk rules do later.
+pub(crate) fn scope_unissued(scope: &str) -> bool {
+    scope_unissued_by(current(), scope)
+}
+
+fn scope_unissued_by(session: Option<&Session>, scope: &str) -> bool {
+    let Some(session) = session else {
+        return false;
+    };
+    match kind_of_scope(scope) {
+        Some(IdKind::Tagged { tag, block }) => {
+            tag == session.tag
+                && decrypt_counter(&session.counter_key, block)
+                    >= session.issued.load(Ordering::SeqCst)
+        }
+        _ => false,
+    }
+}
+
 fn tag_of_scope(scope: &str) -> Option<String> {
+    match kind_of_scope(scope)? {
+        IdKind::Tagged { tag, .. } => Some(hex(&tag)),
+        IdKind::Plain => None,
+    }
+}
+
+fn kind_of_scope(scope: &str) -> Option<IdKind> {
     let (class, id) = scope.split_once(':')?;
     let id = crate::engine_api::decode_durable_object_id(id)?;
     let namespaces = NAMESPACES.read().expect("namespaces poisoned");
     let keys = namespaces.as_ref()?.get(class)?;
-    keys.iter()
-        .find_map(|key| match verify_object_id(key, &id) {
-            Some(IdKind::Tagged { tag, .. }) => Some(hex(&tag)),
-            _ => None,
-        })
+    keys.iter().find_map(|key| verify_object_id(key, &id))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -414,25 +491,47 @@ pub async fn create_header(
 /// Name the session in the records of a preserved restart's cells, before the
 /// log is sealed.
 ///
-/// The successor carries the tags that the resident cells' records still
-/// have, at most [`celld_logic::session::CARRIED_BOUND`] with its own. When
-/// this process's set is full, every cell whose record has the oldest tag is
-/// re-tagged to this process's own tag, by one conditional write that changes
-/// `by` and nothing else. Any failure is an error and no certificate is
-/// written.
+/// The record of every resident cell is read, and the certificate lists the
+/// tag that record really carries (empty for a record without `by`). The
+/// successor carries those tags, at most [`celld_logic::session::CARRIED_BOUND`]
+/// with its own. When this process's set is full, every cell whose record has
+/// the oldest tag is re-tagged to this process's own tag, by one conditional
+/// write that changes `by` and nothing else. Any failure is an error and no
+/// certificate is written.
 pub async fn prepare_reload(
     session: &Session,
     ownership: &crate::ownership_store::BucketOwnership,
     cells: &[celld_logic::PresenceCell],
 ) -> anyhow::Result<crate::clean_reload::ReloadSession> {
     use celld_logic::session::{retag_needed, CARRIED_BOUND};
+    use futures_util::StreamExt as _;
+    const READS: usize = 32;
     let all = session.tags().all();
-    let mut tags: BTreeMap<String, String> = cells
-        .iter()
-        .map(|cell| (cell.id.clone(), session.tag_of(&cell.id)))
-        .collect();
-    let in_use: BTreeSet<String> = tags.values().cloned().collect();
-    if let Some(oldest) = retag_needed(&all, &in_use, CARRIED_BOUND) {
+    let mut tags: BTreeMap<String, String> = BTreeMap::new();
+    let mut reads = futures_util::stream::iter(cells)
+        .map(|cell| async move { (cell, ownership.read_owner(&cell.id).await) })
+        .buffer_unordered(READS);
+    while let Some((cell, record)) = reads.next().await {
+        let record = record?;
+        anyhow::ensure!(
+            record
+                .as_ref()
+                .is_some_and(|record| ownership.serves(record, cell.epoch)),
+            "the record of {} does not name this node at epoch {}",
+            cell.id,
+            cell.epoch
+        );
+        let by = record.and_then(|record| record.by).unwrap_or_default();
+        tags.insert(cell.id.clone(), by);
+    }
+    drop(reads);
+    let in_use = |tags: &BTreeMap<String, String>| -> BTreeSet<String> {
+        tags.values()
+            .filter(|tag| !tag.is_empty())
+            .cloned()
+            .collect()
+    };
+    if let Some(oldest) = retag_needed(&all, &in_use(&tags), CARRIED_BOUND) {
         let own = session.tags().own().to_string();
         let stale: Vec<_> = cells
             .iter()
@@ -451,10 +550,10 @@ pub async fn prepare_reload(
             tags.insert(cell.id.clone(), own.clone());
         }
     }
-    let in_use: BTreeSet<&String> = tags.values().collect();
+    let in_use = in_use(&tags);
     let carried: Vec<String> = all
         .iter()
-        .filter(|tag| in_use.contains(tag))
+        .filter(|tag| in_use.contains(*tag))
         .cloned()
         .collect();
     anyhow::ensure!(
@@ -679,6 +778,296 @@ mod tests {
         // Its own claim ends the resumption.
         session.forget_resumed("c");
         assert!(!names("c", 4, Some("old")));
+    }
+
+    #[test]
+    fn a_tag_the_process_does_not_carry_is_not_resumed() {
+        let session = Session::with_tag(Mode::Shadow, [1; 8], &["old".to_string()]);
+        session.note_resumed("kept", "old", 4);
+        session.note_resumed("older", "dropped", 4);
+        session.note_resumed("plain", "", 4);
+        let cells: Vec<_> = session.resumed_snapshot().into_keys().collect();
+        assert_eq!(cells, ["kept", "plain"]);
+        // The scan found `kept` at another epoch and never saw `plain`.
+        session.settle_resumed(Some(&[celld_logic::LocalCell {
+            id: "kept".into(),
+            epoch: 5,
+            live: true,
+        }]));
+        assert!(session.resumed_snapshot().is_empty());
+        session.note_resumed("kept", "old", 4);
+        session.settle_resumed(None);
+        assert!(session.resumed_snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_resumed_cell_is_counted_only_under_a_tag_the_set_still_carries() {
+        let session = Session::with_tag(Mode::Shadow, [1; 8], &["old".to_string()]);
+        session
+            .resumed
+            .lock()
+            .unwrap()
+            .insert("c".into(), ("gone".into(), 4));
+        assert!(!session.resumed_at("c", "gone", 4));
+        session.note_resumed("c", "old", 4);
+        assert!(session.resumed_at("c", "old", 4));
+    }
+
+    #[test]
+    fn a_claim_of_an_unissued_counter_of_the_own_session_is_refused() {
+        register_class(SCRIPT, CLASS);
+        let session = established([7; 8]);
+        let scope_unissued = |scope: &str| scope_unissued_by(Some(&session), scope);
+        let at = |counter| {
+            let block = encrypt_counter(&session.counter_key, counter);
+            let id = tagged_object_id(&key(), [7; 8], block);
+            format!("{CLASS}:{}", durable_object_id_hex(&id))
+        };
+        session.mint(&key()).expect("counter 0");
+        assert!(!scope_unissued(&at(0)));
+        assert!(!scope_unissued_by(None, &at(1)));
+        assert!(scope_unissued(&at(1)));
+        let other = tagged_object_id(&key(), [8; 8], [3; 8]);
+        assert!(!scope_unissued(&format!(
+            "{CLASS}:{}",
+            durable_object_id_hex(&other)
+        )));
+        assert!(!scope_unissued("Agent:plain"));
+    }
+
+    mod preserved_restart {
+        use super::*;
+        use crate::bucket::Bucket;
+        use crate::ownership_store::BucketOwnership;
+
+        const NODE: &str = "node-a";
+
+        fn tag(n: u8) -> String {
+            hex(&[n; 8])
+        }
+
+        struct World {
+            _dir: tempfile::TempDir,
+            bucket: Bucket,
+            ownership: BucketOwnership,
+        }
+
+        fn world() -> World {
+            crate::asyncrt::install_test_host_runtime();
+            let dir = tempfile::tempdir().unwrap();
+            let bucket = Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+            let ownership = BucketOwnership::new(
+                bucket.clone(),
+                bucket.clone(),
+                NODE.to_owned(),
+                "key".to_owned(),
+            );
+            World {
+                _dir: dir,
+                bucket,
+                ownership,
+            }
+        }
+
+        async fn put(world: &World, cell: &str, node: &str, epoch: u64, by: Option<&str>) {
+            let mut record = serde_json::json!({"node": node, "epoch": epoch});
+            if let Some(by) = by {
+                record["by"] = by.into();
+            }
+            world
+                .bucket
+                .put_cas(
+                    &format!("cells/{cell}/own.json"),
+                    serde_json::to_vec(&record).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap()
+                .expect("a new record");
+        }
+
+        fn cell(id: &str, epoch: u64) -> celld_logic::PresenceCell {
+            celld_logic::PresenceCell {
+                id: id.into(),
+                epoch,
+            }
+        }
+
+        #[tokio::test]
+        async fn retag_owner_changes_by_and_nothing_else() {
+            let world = world();
+            put(&world, "c", NODE, 5, Some("old")).await;
+            let retag = |from: &'static str| world.ownership.retag_owner("c", 5, from, "new");
+            assert!(!retag("other").await.unwrap(), "another tag");
+            assert!(!world
+                .ownership
+                .retag_owner("c", 6, "old", "new")
+                .await
+                .unwrap());
+            assert!(retag("old").await.unwrap());
+            let record = world.ownership.read_owner("c").await.unwrap().unwrap();
+            assert_eq!(record.by.as_deref(), Some("new"));
+            assert_eq!(record.node.as_deref(), Some(NODE));
+            assert_eq!(record.epoch, 5);
+            assert!(!retag("old").await.unwrap(), "no longer names the old tag");
+            put(&world, "d", "node-b", 5, Some("old")).await;
+            assert!(!world
+                .ownership
+                .retag_owner("d", 5, "old", "new")
+                .await
+                .unwrap());
+        }
+
+        #[tokio::test]
+        async fn retag_owner_waits_for_the_gate_hold() {
+            crate::asyncrt::install_test_host_runtime();
+            let hold: &'static crate::registry_seed::GateHold =
+                Box::leak(Box::new(crate::registry_seed::GateHold::new()));
+            let dir = tempfile::tempdir().unwrap();
+            let bucket = Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+            let ownership = std::sync::Arc::new(
+                BucketOwnership::new(
+                    bucket.clone(),
+                    bucket.clone(),
+                    NODE.to_owned(),
+                    "key".to_owned(),
+                )
+                .with_gate_hold(hold),
+            );
+            let record = serde_json::json!({"node": NODE, "epoch": 5, "by": "old"});
+            bucket
+                .put_cas(
+                    "cells/c/own.json",
+                    serde_json::to_vec(&record).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap()
+                .expect("a new record");
+            hold.require();
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let retag = {
+                let (ownership, done) = (ownership.clone(), done.clone());
+                crate::asyncrt::spawn(async move {
+                    let applied = ownership.retag_owner("c", 5, "old", "new").await;
+                    done.store(true, std::sync::atomic::Ordering::SeqCst);
+                    applied
+                })
+            };
+            crate::asyncrt::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(!done.load(std::sync::atomic::Ordering::SeqCst), "it waits");
+            let held = ownership.read_owner("c").await.unwrap().unwrap();
+            assert_eq!(held.by.as_deref(), Some("old"), "nothing was written");
+            hold.release();
+            assert!(retag.await.unwrap().unwrap());
+            let record = ownership.read_owner("c").await.unwrap().unwrap();
+            assert_eq!(record.by.as_deref(), Some("new"));
+        }
+
+        #[tokio::test]
+        async fn the_certificate_lists_the_tags_the_records_really_carry() {
+            let world = world();
+            let session = Session::with_tag(Mode::Shadow, [1; 8], &[tag(2)]);
+            put(&world, "a", NODE, 3, Some(&tag(2))).await;
+            put(&world, "b", NODE, 4, Some(&tag(1))).await;
+            put(&world, "plain", NODE, 1, None).await;
+            // The process believes nothing about `a`: the record decides.
+            let reload = prepare_reload(
+                &session,
+                &world.ownership,
+                &[cell("a", 3), cell("b", 4), cell("plain", 1)],
+            )
+            .await
+            .unwrap();
+            assert_eq!(reload.tags, [tag(1), tag(2)]);
+            assert_eq!(reload.cells["a"], tag(2));
+            assert_eq!(reload.cells["b"], tag(1));
+            assert_eq!(reload.cells["plain"], "");
+            assert_eq!(reload.epochs["a"], 3);
+        }
+
+        #[tokio::test]
+        async fn a_record_that_does_not_name_this_node_refuses_the_certificate() {
+            let world = world();
+            let session = Session::with_tag(Mode::Shadow, [1; 8], &[]);
+            put(&world, "a", "node-b", 3, Some(&tag(1))).await;
+            assert!(prepare_reload(&session, &world.ownership, &[cell("a", 3)])
+                .await
+                .is_err());
+            assert!(
+                prepare_reload(&session, &world.ownership, &[cell("missing", 1)])
+                    .await
+                    .is_err()
+            );
+            put(&world, "b", NODE, 3, Some("stranger")).await;
+            assert!(prepare_reload(&session, &world.ownership, &[cell("b", 3)])
+                .await
+                .is_err());
+        }
+
+        /// The set is full after three preserved restarts: the oldest tag is
+        /// written into the records that still carry it, and the certificate
+        /// lists the rest.
+        #[tokio::test]
+        async fn a_full_set_retags_the_cells_of_its_oldest_tag() {
+            let world = world();
+            let marker = [tag(2), tag(3), tag(4)];
+            let session = Session::with_tag(Mode::Shadow, [1; 8], &marker);
+            assert_eq!(session.tags().all().len(), 4);
+            put(&world, "oldest", NODE, 5, Some(&tag(4))).await;
+            put(&world, "middle", NODE, 5, Some(&tag(3))).await;
+            put(&world, "own", NODE, 5, Some(&tag(1))).await;
+            session.note_resumed("oldest", &tag(4), 5);
+            let reload = prepare_reload(
+                &session,
+                &world.ownership,
+                &[cell("oldest", 5), cell("middle", 5), cell("own", 5)],
+            )
+            .await
+            .unwrap();
+            assert_eq!(reload.tags, [tag(1), tag(3)]);
+            assert_eq!(reload.cells["oldest"], tag(1));
+            let record = world.ownership.read_owner("oldest").await.unwrap().unwrap();
+            assert_eq!(record.by.as_deref(), Some(tag(1).as_str()));
+            assert_eq!(record.epoch, 5);
+            assert!(session.resumed_snapshot().is_empty());
+            // The successor of that certificate carries its own tag and these.
+            let next = Session::with_tag(Mode::Shadow, [9; 8], &reload.tags);
+            assert_eq!(next.tags().all(), [hex(&[9; 8]), tag(1), tag(3)]);
+        }
+
+        #[tokio::test]
+        async fn a_set_that_is_not_full_rewrites_nothing() {
+            let world = world();
+            let session = Session::with_tag(Mode::Shadow, [1; 8], &[tag(2)]);
+            put(&world, "a", NODE, 5, Some(&tag(2))).await;
+            let before = world.ownership.read_owner("a").await.unwrap().unwrap();
+            let reload = prepare_reload(&session, &world.ownership, &[cell("a", 5)])
+                .await
+                .unwrap();
+            assert_eq!(reload.tags, [tag(2)]);
+            let after = world.ownership.read_owner("a").await.unwrap().unwrap();
+            assert_eq!(before.etag, after.etag);
+        }
+    }
+
+    #[test]
+    fn the_owner_check_of_epoch_gc_accepts_a_resumed_cell_under_a_carried_tag() {
+        let session = Session::with_tag(Mode::Shadow, [1; 8], &["old".to_string()]);
+        session.note_resumed("c", "old", 3);
+        let owns = |epoch, record: Option<&OwnerRecord>| {
+            owns_epoch(Some(&session), "n", "c", epoch, record)
+        };
+        assert!(owns(3, Some(&record("n", 3, Some("old")))));
+        assert!(
+            !owns(3, Some(&record("n", 4, Some("old")))),
+            "another epoch"
+        );
+        assert!(!owns(4, Some(&record("n", 3, Some("old")))));
+        assert!(!owns(3, Some(&record("n", 3, Some("stranger")))));
+        assert!(!owns(3, Some(&record("m", 3, Some("old")))), "another node");
+        assert!(!owns(3, None));
+        assert!(owns(3, Some(&record("n", 3, Some(&hex(&[1; 8]))))));
     }
 
     #[test]

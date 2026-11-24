@@ -87,7 +87,7 @@ fn the_first_record_of_a_tagged_id_is_epoch_two_for_every_other_session() {
 fn a_second_process_of_one_node_does_not_count_its_predecessors_claim() {
     for (by, own_claim) in [
         (Some(OWN), true),
-        (None, true),
+        (None, false),
         (Some(OLD), false),
         (Some(FOREIGN), false),
     ] {
@@ -308,4 +308,158 @@ fn a_cached_lease_from_before_a_restart_never_takes_over_the_restarted_cell() {
         )),
         "{effects:?}"
     );
+}
+
+fn resuming(session: bool, offered: &[(&str, &str, u64)]) -> crate::scripted::Shell {
+    let mut shell = crate::scripted::Shell::reloaded(crate::test_support::config());
+    if session {
+        shell.state.set_session(SessionTags::new(OWN, &[]));
+        shell.state.set_resumed(
+            offered
+                .iter()
+                .map(|(cell, tag, epoch)| (cell.to_string(), (tag.to_string(), *epoch)))
+                .collect(),
+        );
+    }
+    shell.local_cells(&[("a", 3), ("b", 2), ("c", 9)]);
+    shell
+}
+
+/// A process that runs as a session resumes a cell only when its
+/// predecessor's certificate named it at that epoch, so it knows the tag of
+/// the record it serves under. A certificate without a session (a predecessor
+/// that ran with the flag off) names nothing, and every cell claims normally.
+#[test]
+fn a_session_resumes_only_the_cells_its_certificate_named() {
+    let shell = resuming(true, &[("a", OLD, 3), ("c", OLD, 4)]);
+    let resumed: Vec<&str> = shell.state.resumed.keys().map(String::as_str).collect();
+    assert_eq!(resumed, ["a"], "c is at another epoch, b was not named");
+    assert!(shell.state.cells.contains_key("a"));
+    assert!(!shell.state.cells.contains_key("b"));
+    assert!(!shell.state.cells.contains_key("c"));
+
+    let shell = resuming(true, &[]);
+    assert!(shell.state.resumed.is_empty());
+    assert!(shell.state.cells.is_empty(), "nothing is resumed");
+
+    let shell = resuming(false, &[]);
+    assert_eq!(shell.state.cells.len(), 3, "without a session as before");
+}
+
+/// A claim the process made and settles by a read is its own only when the
+/// record carries its tag. A record without `by` at the claimed epoch is a
+/// delayed write of the process that ran before sessions (the upgrade window).
+#[test]
+fn a_delayed_write_of_a_process_without_a_session_is_not_this_processs_claim() {
+    let mut state = session_node(&[]);
+    let op = request(&mut state, 1, "cell");
+    let effects = owner_read(&mut state, op, None);
+    let (_, epoch, op) = cas_owner(&effects).expect("first claim");
+    let effects = on_event(
+        &mut state,
+        Event::OwnerCasCompleted {
+            op,
+            result: Err(Failure::Ambiguous),
+        },
+    );
+    let read = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::ReadOwner { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("a read settles the claim");
+    let effects = owner_read(&mut state, read, Some(("ingress", epoch, None)));
+    let (guard, next, _) = cas_owner(&effects).expect("a claim of the next epoch");
+    assert!(matches!(guard, CasGuard::Match(_)));
+    assert_eq!(next, epoch + 1);
+}
+
+fn unissued(cell: &str) -> bool {
+    cell == "tagged-own-tag-unissued"
+}
+
+/// A ready-made scope with this process's tag and a counter it never issued
+/// must not create the first record of a cell.
+#[test]
+fn a_cell_of_an_unissued_counter_is_never_claimed() {
+    let mut state = session_node(&[]);
+    state.set_id_unissued(unissued);
+    let op = request(&mut state, 1, "tagged-own-tag-unissued");
+    let effects = owner_read(&mut state, op, None);
+    assert!(cas_owner(&effects).is_none(), "{effects:?}");
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Complete {
+                result: Err(RequestError::ResolveFailed),
+                ..
+            }
+        )),
+        "{effects:?}"
+    );
+    let op = request(&mut state, 2, "tagged-own-tag");
+    let effects = owner_read(&mut state, op, None);
+    assert!(cas_owner(&effects).is_some());
+}
+
+/// The lease a session publishes carries its predecessor's tags only when it
+/// resumes the predecessor's cells. A certificate that names another
+/// generation than the lease it finds is rejected, and with it every tag and
+/// resumed cell, before the lease is written.
+#[test]
+fn a_rejected_resume_publishes_no_carried_tag_and_resumes_nothing() {
+    let written = |found: Option<&str>| {
+        let mut state = started_state_for_lease();
+        state.set_resumed(BTreeMap::from([("a".to_string(), (OLD.to_string(), 3))]));
+        let started = on_event(
+            &mut state,
+            Event::StartNodeLease {
+                now_ms: NOW_MS,
+                now_mono_ms: NOW_MS,
+                spec: NodeLeaseSpec {
+                    addr: "node:8081".into(),
+                    peer_protocol: 1,
+                    generation: "g".into(),
+                    resume_generation: Some("previous".into()),
+                    ttl_ms: 30_000,
+                },
+            },
+        );
+        let op = started
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::ReadSelfNodeLease { op } => Some(*op),
+                _ => None,
+            })
+            .expect("a self lease read");
+        let found = found.map(|generation| {
+            let mut lease = lease_record("ingress", NOW_MS + 30_000, None);
+            lease.generation = generation.into();
+            lease
+        });
+        let effects = on_event(
+            &mut state,
+            Event::SelfNodeLeaseRead {
+                op,
+                now_ms: NOW_MS,
+                now_mono_ms: NOW_MS,
+                result: Ok(found),
+            },
+        );
+        let tags = effects.iter().find_map(|effect| match effect {
+            Effect::CasNodeLease { record, .. } => Some(record.tags.clone()),
+            _ => None,
+        });
+        (tags.expect("a lease write"), state.resumed.len())
+    };
+    assert_eq!(written(Some("previous")), (tags(&[OWN, OLD]), 1), "resumed");
+    assert_eq!(written(Some("another")), (tags(&[OWN]), 0), "stale");
+    assert_eq!(written(None), (tags(&[OWN]), 0), "no predecessor lease");
+}
+
+fn started_state_for_lease() -> State {
+    let mut state = State::new("ingress", crate::test_support::config());
+    state.set_session(SessionTags::new(OWN, &tags(&[OLD])));
+    state
 }

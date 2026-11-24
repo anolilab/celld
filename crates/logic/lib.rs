@@ -896,6 +896,9 @@ pub struct State {
     /// tagged ids, with or without a session of its own: a tagged id belongs
     /// to the session that minted it at epoch 1, whoever else claims it.
     id_tag: Option<session::IdTagOf>,
+    /// Whether the id of a cell is this process's own and names a counter it
+    /// never issued: such a cell is never claimed.
+    id_unissued: Option<fn(&str) -> bool>,
     /// The tag and epoch of the record of each cell this process resumed in a
     /// preserved restart. A predecessor's tag names this process only here.
     resumed: BTreeMap<CellId, (String, Epoch)>,
@@ -967,6 +970,7 @@ impl State {
             shed_reason: None,
             session: None,
             id_tag: None,
+            id_unissued: None,
             resumed: BTreeMap::new(),
         }
     }
@@ -989,6 +993,11 @@ impl State {
         self.id_tag = Some(id_tag);
     }
 
+    /// Refuse to claim a cell for which `unissued` answers true.
+    pub fn set_id_unissued(&mut self, unissued: fn(&str) -> bool) {
+        self.id_unissued = Some(unissued);
+    }
+
     /// Whether `record` names this process, or a predecessor whose cell this
     /// process resumed in a preserved restart.
     fn names_this_process(&self, cell: &str, record: &OwnerRecord) -> bool {
@@ -1005,13 +1014,15 @@ impl State {
     }
 
     /// Whether `record` is a write of this very process. A second process of
-    /// one node never counts its predecessor's write as its own.
+    /// one node never counts its predecessor's write as its own, and under a
+    /// session every write carries `by`, so a record without it is a delayed
+    /// write of an older binary or of a process that ran without a session.
     fn written_by_this_process(&self, record: &OwnerRecord) -> bool {
         record.node.as_deref() == Some(self.node.as_str())
             && self
                 .session
                 .as_ref()
-                .is_none_or(|tags| tags.is_own(record.by.as_deref()))
+                .is_none_or(|tags| record.by.as_deref() == Some(tags.own()))
     }
 
     /// The epoch of the first record of `cell`.
@@ -2202,6 +2213,7 @@ impl State {
         effects: &mut Vec<Effect>,
     ) {
         if self.confirming {
+            self.resumed.clear();
             self.confirm_local_cells(result, effects);
             return;
         }
@@ -2210,16 +2222,31 @@ impl State {
         }
         let Ok(mut cells) = result else {
             self.resuming = false;
+            self.resumed.clear();
             return;
         };
         // A preserved eviction copy is not a resumable epoch.
         cells.retain(|cell| cell.live);
+        // A process that runs as a session resumes a cell only at the epoch
+        // its predecessor's certificate named, so that it knows the tag of the
+        // record it serves under and carries it in its lease. Any other cell
+        // takes the normal claim path.
+        if self.session.is_some() {
+            cells.retain(|cell| {
+                self.resumed
+                    .get(&cell.id)
+                    .is_some_and(|(_, epoch)| *epoch == cell.epoch)
+            });
+        }
         cells.sort();
         cells.dedup();
         if cells.len() > self.config.max_resident || !self.cells.is_empty() {
             self.resuming = false;
+            self.resumed.clear();
             return;
         }
+        let resumed: BTreeSet<&CellId> = cells.iter().map(|cell| &cell.id).collect();
+        self.resumed.retain(|id, _| resumed.contains(id));
         for local in cells {
             let mut cell = Cell {
                 resume_demand: true,
@@ -2504,7 +2531,12 @@ impl State {
             // state was recovered before this install (the engine's
             // startup order), so None is the truth, not a reset.
             log_state: None,
-            tags: Vec::new(),
+            // The tags this process answers for: its own and, until the
+            // resume is decided, the ones its predecessor's certificate named.
+            tags: self
+                .session
+                .as_ref()
+                .map_or_else(Vec::new, session::SessionTags::all),
             etag: String::new(),
         };
         let pending = PendingNodeLease {
@@ -2866,9 +2898,21 @@ impl State {
                     && record.expires_ms > now_ms
                     && pending.spec.resume_generation.as_deref()
                         == Some(record.generation.as_str());
+                if !pending.resume_local {
+                    // A rejected resume (a stale certificate, another
+                    // generation) carries no predecessor's tag and resumes no
+                    // cell, before any lease says otherwise.
+                    pending.desired.tags.truncate(1);
+                    self.resumed.clear();
+                }
                 self.begin_node_lease_write(pending, CasGuard::Match(record.etag), effects);
             }
-            Ok(None) => self.begin_node_lease_write(pending, CasGuard::Absent, effects),
+            Ok(None) => {
+                let mut pending = pending;
+                pending.desired.tags.truncate(1);
+                self.resumed.clear();
+                self.begin_node_lease_write(pending, CasGuard::Absent, effects);
+            }
         }
     }
 
@@ -3208,7 +3252,7 @@ impl State {
                     // renewal carries the folded log state through
                     // unchanged.
                     log_state: prior.record.log_state,
-                    tags: Vec::new(),
+                    tags: prior.record.tags.clone(),
                     etag: String::new(),
                 };
                 let guard = CasGuard::Match(prior.record.etag.clone());
@@ -4486,6 +4530,10 @@ impl State {
                         owner,
                     });
                 }
+            }
+            Ok(None) if self.id_unissued.is_some_and(|unissued| unissued(&id)) => {
+                set_phase(&mut self.occupied, &mut cell, Phase::Inactive);
+                self.finish_requests(&id, &mut cell, Err(RequestError::ResolveFailed), effects);
             }
             Ok(None) => {
                 self.place_unowned(

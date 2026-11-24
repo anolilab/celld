@@ -36,8 +36,14 @@ fn ring<'a>(step0: &'a Value, name: &str) -> &'a [Value] {
         .unwrap_or_else(|| panic!("no ring {name}"))
 }
 
+/// The key a node gives an id: its first 8 bytes folded with the next 8.
+fn key_of(id: &str) -> String {
+    let word = |range: std::ops::Range<usize>| u64::from_str_radix(&id[range], 16).expect("hex");
+    format!("{:016x}", word(0..16) ^ word(16..32))
+}
+
 fn has_key(entries: &[Value], id: &str) -> bool {
-    entries.iter().any(|entry| entry["key"] == id[..16])
+    entries.iter().any(|entry| entry["key"] == key_of(id))
 }
 
 #[tokio::test]
@@ -67,7 +73,7 @@ async fn a_minted_id_is_told_from_a_named_one_at_its_first_claim() {
     let flag = |id: &str| {
         claims
             .iter()
-            .find(|entry| entry["key"] == id[..16])
+            .find(|entry| entry["key"] == key_of(id))
             .unwrap_or_else(|| panic!("no first claim of {id}"))["minted_local"]
             .clone()
     };
@@ -103,7 +109,7 @@ async fn a_preserved_restart_resumes_each_cell_once_and_claims_nothing() {
     for id in [&minted, &named] {
         let entry = resumes
             .iter()
-            .find(|entry| entry["key"] == id[..16])
+            .find(|entry| entry["key"] == key_of(id))
             .unwrap_or_else(|| panic!("no resume of {id}: {resumes:?}"));
         assert_eq!(entry["epoch"], 1);
     }
@@ -144,5 +150,5 @@ async fn a_cell_claimed_again_by_a_new_process_is_a_second_claim() {
     let step0 = read(&server, "/state/step0").await;
     let claims = ring(&step0, "second_claims");
     assert_eq!(claims.len(), 1, "{claims:?}");
-    assert_eq!(claims[0]["key"], named[..16]);
+    assert_eq!(claims[0]["key"], key_of(&named));
 }

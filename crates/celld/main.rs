@@ -4542,11 +4542,13 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         .tcp_nodelay(true)
         .build()
         .unwrap();
+    // An unsupported value fails before the certificate of a preserved
+    // restart is consumed.
+    let lazy_birth = celld::session::Mode::from_env()?;
     let clean_reload = celld::runtime::take_clean_reload(&data_dir, &node);
     let resume_generation = clean_reload
         .as_ref()
         .map(|reload| reload.generation.clone());
-    let lazy_birth = celld::session::Mode::from_env()?;
     if lazy_birth != celld::session::Mode::Off {
         let reloaded = clean_reload
             .as_ref()
@@ -5927,17 +5929,19 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         {
             let prepared = match before_process_deadline(process_deadline, app.presence()).await {
                 Some(Some(presence)) => {
-                    before_process_deadline(
+                    let prepared = before_process_deadline(
                         process_deadline,
                         celld::session::prepare_reload(session, bucket_ownership, &presence.cells),
                     )
-                    .await
+                    .await;
+                    prepared.ok_or("timeout while naming the session in the cell records")
                 }
-                _ => None,
+                Some(None) => Err("no snapshot of the resident cells"),
+                None => Err("timeout while reading the resident cells"),
             };
             match prepared {
-                Some(Ok(prepared)) => reload_session = Some(prepared),
-                Some(Err(error)) => {
+                Ok(Ok(prepared)) => reload_session = Some(prepared),
+                Ok(Err(error)) => {
                     reload_session_ok = false;
                     tracing::warn!(
                         event = "clean_reload_abandoned",
@@ -5945,12 +5949,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         "could not name the session in the records of the resident cells"
                     );
                 }
-                None => {
+                Err(reason) => {
                     reload_session_ok = false;
                     tracing::warn!(
                         event = "clean_reload_abandoned",
-                        reason = "timeout",
-                        "the process deadline passed before the resident cells were named in the session"
+                        reason,
+                        "could not name the session in the records of the resident cells"
                     );
                 }
             }

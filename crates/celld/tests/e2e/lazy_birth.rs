@@ -61,10 +61,35 @@ async fn bump(server: &Server, id: &str) -> u64 {
     out["n"].as_u64().expect("a count")
 }
 
+async fn carried_verified(server: &Server) -> u64 {
+    let state: Value = server
+        .internal_get("/state")
+        .await
+        .send()
+        .await
+        .expect("read the node")
+        .json()
+        .await
+        .expect("decode the node");
+    state["storage_counters"]["lazy_birth_session"]["verified_under_carried_tag"]
+        .as_u64()
+        .expect("a session counter")
+}
+
 fn own_record(project: &Path) -> Value {
     let records = bodies(project, "%cells/%/own.json");
     assert_eq!(records.len(), 1, "{records:?}");
     records[0].1.clone()
+}
+
+fn header_tags(project: &Path) -> Vec<String> {
+    bodies(project, "%fleet/sessions/%.json")
+        .into_iter()
+        .filter_map(|(key, _)| {
+            let name = key.rsplit('/').next()?;
+            Some(name.strip_suffix(".json")?.to_string())
+        })
+        .collect()
 }
 
 fn header_tag(project: &Path) -> (String, Value) {
@@ -207,8 +232,8 @@ async fn a_tagged_cell_first_claimed_by_another_session_starts_at_epoch_two() {
     assert_eq!(bump(&server, &ids[0]).await, 2);
     assert_eq!(own_record(server.project())["epoch"], 3);
     assert_eq!(count(server.project(), "%/e1/%"), 0);
-    // Epoch GC runs on its maintenance pass and leaves the cell served.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // A dev node keeps no node log, so epoch GC does not run here; its owner
+    // check is covered by `session::tests::the_owner_check_of_epoch_gc_...`.
     assert_eq!(bump(&server, &ids[0]).await, 3);
 }
 
@@ -230,6 +255,10 @@ async fn a_cell_resident_through_two_preserved_restarts_still_acknowledges_and_d
     }
     let sessions = bodies(server.project(), "%fleet/sessions/%.json").len();
     assert_eq!(sessions, 3, "one header per process");
+    assert!(
+        carried_verified(&server).await > 0,
+        "the read after a bucket proof passed on a carried tag"
+    );
 
     let url = server.internal_url("/shutdown").await;
     let token = server.operator_token().await;
@@ -258,4 +287,81 @@ async fn a_cell_resident_through_two_preserved_restarts_still_acknowledges_and_d
     .await;
     let record = own_record(server.project());
     assert_eq!(record["epoch"], 1, "{record}");
+}
+
+/// Records name the process that wrote them. A cell that stays resident
+/// through more preserved restarts than a lease can carry tags for has its
+/// record re-tagged before the restart, and every cell still passes the read
+/// after a bucket proof.
+#[tokio::test]
+async fn the_oldest_tag_is_written_into_a_record_before_the_set_overflows() {
+    let mut server = Server::start("do-ids", SHADOW).await;
+    let first_tag = header_tag(server.project()).0;
+    let mut cells = vec![(minted(&server).await[0].clone(), 0_u64)];
+    for round in 1..=4 {
+        for (id, count) in &mut cells {
+            *count = bump(&server, id).await;
+        }
+        if round < 4 {
+            server.restart().await;
+            let fresh = minted(&server).await[0].clone();
+            cells.push((fresh, 0));
+        }
+    }
+    server.restart().await;
+    for (id, count) in &cells {
+        assert_eq!(bump(&server, id).await, count + 1, "{id}");
+    }
+    let records = bodies(server.project(), "%cells/%/own.json");
+    assert_eq!(records.len(), 4);
+    for (key, record) in &records {
+        assert_eq!(record["epoch"], 1, "resumed without a claim: {key}");
+    }
+    let oldest = records
+        .iter()
+        .find(|(key, _)| key.contains(&cells[0].0))
+        .map(|(_, record)| record.clone())
+        .expect("the record of the oldest cell");
+    assert_ne!(oldest["by"], first_tag.as_str(), "re-tagged: {oldest}");
+    assert!(carried_verified(&server).await > 0);
+}
+
+/// `shadow`, then a preserved restart into a process that writes no session,
+/// then a preserved restart into `shadow` again. The last process was told
+/// nothing about the record, which still names the first one, so it must not
+/// serve the cell under a tag its lease does not carry: a peer would call the
+/// author dead and claim the next epoch beside it. It claims the cell
+/// itself, at the next epoch, when the cell is next asked for.
+#[tokio::test]
+async fn a_cell_that_passed_through_a_process_without_a_session_is_claimed_not_resumed() {
+    let mut server = Server::start("do-ids", SHADOW).await;
+    let ids = minted(&server).await;
+    let (first_tag, _) = header_tag(server.project());
+    assert_eq!(bump(&server, &ids[0]).await, 1);
+
+    server.set_env("CELLD_LAZY_BIRTH", None);
+    server.restart().await;
+    assert_eq!(bump(&server, &ids[0]).await, 2);
+    let record = own_record(server.project());
+    assert_eq!(
+        record["epoch"], 1,
+        "the process without a session resumed it"
+    );
+    assert_eq!(record["by"], first_tag.as_str());
+
+    let before: Vec<String> = header_tags(server.project());
+    server.set_env("CELLD_LAZY_BIRTH", Some("shadow"));
+    server.restart().await;
+    assert_eq!(bump(&server, &ids[0]).await, 3);
+    let after = header_tags(server.project());
+    let [last_tag] = &after
+        .iter()
+        .filter(|tag| !before.contains(tag))
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("one new session header: {before:?} -> {after:?}");
+    };
+    let record = own_record(server.project());
+    assert_eq!(record["by"], last_tag.as_str(), "{record}");
+    assert_eq!(record["epoch"], 2, "{record}");
 }

@@ -49,6 +49,7 @@ const MAX_ALARM_HANDLER_BUDGET_MS: u64 = 365 * 24 * 60 * 60 * 1000;
 /// tag of an id from its class and its MAC.
 fn with_session(mut state: State) -> State {
     state.set_id_tag(crate::session::id_tag_of_scope);
+    state.set_id_unissued(crate::session::scope_unissued);
     if let Some(session) = crate::session::current() {
         state.set_session(session.tags().clone());
         state.set_resumed(session.resumed_snapshot());
@@ -3248,6 +3249,9 @@ impl Actor {
                         .unwrap_or(Err(Failure::Definite)),
                         None => Err(Failure::Definite),
                     };
+                    if let Some(session) = crate::session::current() {
+                        session.settle_resumed(result.as_deref().ok());
+                    }
                     CompletedEffect::plain(Event::LocalCellsRead { result })
                 });
             }
@@ -3938,6 +3942,7 @@ impl Actor {
                             if crate::session::names_this_process(&node, &cell, &record)
                                 && record.epoch == epoch =>
                         {
+                            crate::session::note_verified(&record);
                             Ok(())
                         }
                         Ok(record) => {

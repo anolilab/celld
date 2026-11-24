@@ -81,6 +81,9 @@ pub(crate) fn to_json() -> serde_json::Value {
         .as_object_mut()
         .expect("an object")
         .extend(claim_provenance::counters_json());
+    if let Some(session) = crate::session::counters_json() {
+        counters["lazy_birth_session"] = session;
+    }
     counters
 }
 

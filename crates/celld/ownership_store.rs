@@ -1277,6 +1277,11 @@ impl BucketOwnership {
         }
     }
 
+    /// Whether `record` names this node at `epoch`, not released.
+    pub(crate) fn serves(&self, record: &OwnerRecord, epoch: u64) -> bool {
+        record.node.as_deref() == Some(self.node.as_str()) && record.epoch == epoch
+    }
+
     /// Replace the tag in the record of a cell that this process serves, and
     /// nothing else: the record must name this node, `epoch` and `from`. One
     /// conditional write; an answer that is an error is settled by one read,
@@ -1288,6 +1293,8 @@ impl BucketOwnership {
         from: &str,
         to: &str,
     ) -> anyhow::Result<bool> {
+        // A record that waits for the gate waits here too.
+        self.gate_hold.wait().await;
         let key = format!("cells/{cell}/own.json");
         let names = |record: &OwnerRecord, by: &str| {
             record.node.as_deref() == Some(self.node.as_str())
@@ -1400,10 +1407,17 @@ impl BucketOwnership {
             // UNCHANGED: the full object lives in own_log, written only by
             // the log tier's own core-mediated updates.
             log,
-            session: crate::session::current().map(|session| LeaseSessionWire {
-                tag: session.tag(),
-                carried: session.tags().all().split_off(1),
-                mode: session.mode(),
+            session: crate::session::current().map(|session| {
+                // The core carries the predecessor's tags only when it
+                // resumes; a lease with its own tag alone ends the resumption.
+                if record.tags.len() <= 1 {
+                    session.settle_resumed(None);
+                }
+                LeaseSessionWire {
+                    tag: session.tag(),
+                    carried: record.tags.iter().skip(1).cloned().collect(),
+                    mode: session.mode(),
+                }
             }),
         })
         .map_err(|error| LeaseCasError::NotCommitted(error.into()))?;

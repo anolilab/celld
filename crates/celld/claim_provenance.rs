@@ -47,9 +47,12 @@ pub(crate) struct Claimed<'a> {
     pub ensemble: bool,
 }
 
-/// The key of an id: the first 8 bytes of its payload.
+/// The key of an id: its first 8 bytes of payload folded with the next 8. The
+/// ids of one session share their first 8 bytes (the tag), so the first half
+/// alone would give every one of them the same key.
 pub(crate) fn key_of_id(id: &[u8; 32]) -> u64 {
-    u64::from_be_bytes(id[..8].try_into().expect("a slice of 8 bytes"))
+    let word = |bytes: &[u8]| u64::from_be_bytes(bytes.try_into().expect("a slice of 8 bytes"));
+    word(&id[..8]) ^ word(&id[8..16])
 }
 
 /// The key of the id at the end of a cell scope: the text after the last `:`

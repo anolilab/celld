@@ -1,8 +1,9 @@
 use super::*;
 
-/// A cell scope whose id starts with `key`, as the id of a Durable Object does.
+/// A cell scope whose id has the key `key`: its first 8 bytes, folded with the
+/// next 8, which are zero here.
 fn cell(key: u64) -> String {
-    format!("Agent:{key:016x}{}", "ab".repeat(24))
+    format!("Agent:{key:016x}{}{}", "00".repeat(8), "ab".repeat(16))
 }
 
 fn claimed(cell: &str, epoch: u64, first: bool, prior: ClaimPrior, ensemble: bool) -> Claimed<'_> {
@@ -46,7 +47,15 @@ fn the_key_is_the_first_eight_bytes_of_the_id_at_the_end_of_a_scope() {
     );
     let mut payload = [9_u8; 32];
     payload[..8].copy_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
-    assert_eq!(key_of_id(&payload), 0x0123_4567_89ab_cdef);
+    assert_eq!(
+        key_of_id(&payload),
+        0x0123_4567_89ab_cdef ^ 0x0909_0909_0909_0909
+    );
+    // The ids of one session share their first 8 bytes and still differ.
+    let (mut first, mut second) = ([1_u8; 32], [1_u8; 32]);
+    first[8] = 1;
+    second[8] = 2;
+    assert_ne!(key_of_id(&first), key_of_id(&second));
     for scope in [
         "Agent",
         "Agent:short",
