@@ -694,13 +694,22 @@ async fn an_upload_that_stalls_is_cut_off_and_does_not_hold_a_place() {
 }
 
 /// The log lines of one event, with the message id the node logged for it.
-fn log_lines(server: &Server, event: &str) -> Vec<String> {
-    server
-        .log_text()
-        .lines()
-        .filter(|line| line.contains(event))
-        .map(str::to_string)
-        .collect()
+/// The log lines of `event`. The response can reach the test before the node
+/// has written its log line, so wait up to 5 s for the first one.
+async fn log_lines(server: &Server, event: &str) -> Vec<String> {
+    for attempt in 0..100 {
+        let lines: Vec<String> = server
+            .log_text()
+            .lines()
+            .filter(|line| line.contains(event))
+            .map(str::to_string)
+            .collect();
+        if !lines.is_empty() || attempt == 99 {
+            return lines;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    unreachable!("the last attempt returns")
 }
 
 #[tokio::test]
@@ -714,7 +723,7 @@ async fn a_reject_after_a_forward_is_accepted_so_the_relay_does_not_bounce_a_del
         "{body}"
     );
     assert_eq!(sink.delivered().len(), 1, "{:?}", sink.transactions());
-    let lines = log_lines(&server, "inbound_email_rejected_after_delivery");
+    let lines = log_lines(&server, "inbound_email_rejected_after_delivery").await;
     assert!(
         lines.len() == 1 && lines[0].contains(MESSAGE_ID),
         "{lines:?}"
@@ -780,14 +789,14 @@ async fn a_deadline_and_a_failure_are_logged_with_the_message_id() {
     .await;
     let (status, body) = post_mode(&server, "hang").await;
     assert_eq!(status, 504, "{body}");
-    let lines = log_lines(&server, "inbound_email_timeout");
+    let lines = log_lines(&server, "inbound_email_timeout").await;
     assert!(
         lines.len() == 1 && lines[0].contains(MESSAGE_ID),
         "{lines:?}"
     );
     let (status, body) = post_mode(&server, "throw").await;
     assert_eq!(status, 500, "{body}");
-    let lines = log_lines(&server, "inbound_email_failed");
+    let lines = log_lines(&server, "inbound_email_failed").await;
     assert!(
         lines.len() == 1 && lines[0].contains(MESSAGE_ID),
         "{lines:?}"
