@@ -166,6 +166,10 @@ pub struct FollowerHealth {
     /// node, and a late failure of an old process never erases the sit-out of
     /// the current one.
     failed: BTreeMap<(NodeId, String), u64>,
+    /// The process generation of each member of the current ensemble, so a
+    /// late failure of an old process cannot clear the health of the
+    /// replacement lane that took its place.
+    active_generation: BTreeMap<NodeId, String>,
     last_swap_ms: Option<u64>,
 }
 
@@ -176,14 +180,42 @@ impl FollowerHealth {
         self.members.clear();
     }
 
-    /// An append POST went out to `member`.
-    pub fn append_started(&mut self, member: &str, now_ms: u64) {
+    /// The ensemble that just opened recruited `member` as `generation`.
+    pub fn activate(&mut self, member: &str, generation: &str) {
+        self.active_generation
+            .insert(member.to_string(), generation.to_string());
+    }
+
+    /// Is `generation` the process the current ensemble recruited as
+    /// `member`, or is none recorded? A callback of an old process's lane or
+    /// probe is not, and must not touch the replacement's health.
+    fn is_active(&self, member: &str, generation: &str) -> bool {
+        self.active_generation
+            .get(member)
+            .is_none_or(|active| active == generation)
+    }
+
+    /// An append POST of the lane of `generation` went out to `member`.
+    pub fn append_started(&mut self, member: &str, generation: &str, now_ms: u64) {
+        if !self.is_active(member, generation) {
+            return;
+        }
         let health = self.members.entry(member.to_string()).or_default();
         health.outstanding_since.get_or_insert(now_ms);
     }
 
-    /// The append completed (ok or not) after `latency_ms`.
-    pub fn append_completed(&mut self, member: &str, now_ms: u64, latency_ms: u64) {
+    /// The append completed (ok or not) after `latency_ms`. A completion of
+    /// an old process's lane or probe is ignored.
+    pub fn append_completed(
+        &mut self,
+        member: &str,
+        generation: &str,
+        now_ms: u64,
+        latency_ms: u64,
+    ) {
+        if !self.is_active(member, generation) {
+            return;
+        }
         let health = self.members.entry(member.to_string()).or_default();
         health.outstanding_since = None;
         health.samples.push_back((now_ms, latency_ms));
@@ -331,14 +363,28 @@ impl FollowerHealth {
     /// until `until_ms` (wall clock). A later failure of the same process never
     /// shortens the sit-out. A timeout is not recorded here: a slow member is
     /// judged by the latency rule and stays recruitable.
-    pub fn append_failed(&mut self, member: &str, generation: &str, now_ms: u64, until_ms: u64) {
+    ///
+    /// Returns whether this process was newly sat out, so a caller can log the
+    /// sit-out once and its repeats quietly. The member's health is cleared
+    /// only when the failing process is the one the current ensemble
+    /// recruited (or none is recorded): the failure of an old process says
+    /// nothing about a replacement lane.
+    pub fn append_failed(
+        &mut self,
+        member: &str,
+        generation: &str,
+        now_ms: u64,
+        until_ms: u64,
+    ) -> bool {
         self.failed.retain(|_, until| *until > now_ms);
-        let entry = self
-            .failed
-            .entry((member.to_string(), generation.to_string()))
-            .or_insert(0);
+        let key = (member.to_string(), generation.to_string());
+        let newly = !self.failed.contains_key(&key);
+        let entry = self.failed.entry(key).or_insert(0);
         *entry = (*entry).max(until_ms);
-        self.members.remove(member);
+        if self.is_active(member, generation) {
+            self.members.remove(member);
+        }
+        newly
     }
 
     /// Must a candidate that publishes `generation` sit out because that very
@@ -448,6 +494,41 @@ mod tests {
         assert!(health.failed_recently("b", "g1", 10_999));
         // And it is not a quarantine: the incapability ledger is untouched.
         assert!(!health.quarantined("b", 1_000));
+    }
+
+    #[test]
+    fn a_failure_of_an_old_process_leaves_the_replacement_lanes_health() {
+        let mut health = FollowerHealth::default();
+        health.activate("b", "new");
+        health.append_started("b", "new", 1_000);
+        health.append_completed("b", "new", 1_010, 10);
+        // The old process's lane fails late.
+        assert!(health.append_failed("b", "old", 1_020, 11_000));
+        assert!(health.members.contains_key("b"));
+        // The recruited process failing clears it.
+        assert!(health.append_failed("b", "new", 1_030, 11_000));
+        assert!(!health.members.contains_key("b"));
+        // A repeat of the same failure is not new.
+        assert!(!health.append_failed("b", "new", 1_040, 11_000));
+    }
+
+    #[test]
+    fn an_old_process_callback_neither_records_nor_recreates_health() {
+        let mut health = FollowerHealth::default();
+        health.activate("b", "new");
+        // A late old-process probe starts and completes: nothing is recorded.
+        health.append_started("b", "old", 1_000);
+        health.append_completed("b", "old", 1_900, 900);
+        assert!(!health.members.contains_key("b"));
+        // The replacement's own samples are recorded, and a later old
+        // completion leaves them alone.
+        health.append_started("b", "new", 2_000);
+        health.append_completed("b", "new", 2_010, 10);
+        health.append_completed("b", "old", 2_020, 900);
+        assert_eq!(health.members["b"].samples.len(), 1);
+        // The old process failing does not clear them either.
+        health.append_failed("b", "old", 2_030, 12_000);
+        assert!(health.members.contains_key("b"));
     }
 
     #[test]
