@@ -166,6 +166,14 @@ impl Session {
         }
         let chunk = counter / CHUNK;
         let said = kind.clone();
+        // The announcement may have gone as a mark that no chunk holds yet: a
+        // confirmation through the chunk writes the whole entry.
+        let known = self
+            .left_memory
+            .lock()
+            .expect("left memory poisoned")
+            .get(&counter)
+            .cloned();
         self.edit_chunk(bucket, chunk, move |chunk| {
             chunk.granted.insert(counter);
             match &kind {
@@ -178,7 +186,13 @@ impl Session {
                     store::merge_left(&mut chunk.left, counter, &add);
                 }
                 MarkKind::Left { nonce } => {
-                    if let Some(left) = chunk.left.get_mut(&counter) {
+                    if let Some(known) = &known {
+                        let mut whole = known.clone();
+                        if whole.nonces.contains(nonce) {
+                            whole.done = Some(nonce.clone());
+                            store::merge_left(&mut chunk.left, counter, &whole);
+                        }
+                    } else if let Some(left) = chunk.left.get_mut(&counter) {
                         if left.nonces.contains(nonce) {
                             left.done = Some(nonce.clone());
                         }

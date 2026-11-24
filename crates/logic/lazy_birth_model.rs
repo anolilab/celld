@@ -384,6 +384,9 @@ pub(crate) enum Act {
     ServeBucket(Cell),
     K3Begin(Cell, Epoch),
     K3Step(Cell),
+    /// The step that waits for a fleet proof gives up after its timeout and
+    /// goes through the chunk instead.
+    K3ViaChunk(Cell),
     K3Partial(Cell),
     K3ChunkLeft(Cell),
     Release(Cell),
@@ -1268,7 +1271,14 @@ impl Lazy {
         };
     }
 
-    fn k3_step(&self, w: &mut World, k: u8, c: Cell, labels: &mut Vec<&'static str>) {
+    fn k3_step(
+        &self,
+        w: &mut World,
+        k: u8,
+        c: Cell,
+        force_chunk: bool,
+        labels: &mut Vec<&'static str>,
+    ) {
         let ki = usize::from(k) - 1;
         let Cs::Leaving { e, n, st, tries } = w.ps[ki].cs[c] else {
             return;
@@ -1276,7 +1286,7 @@ impl Lazy {
         match st {
             LSt::Announce => {
                 let entry = Entry::Leaving(c, e, n);
-                if self.append(w, k, &[entry], 0) {
+                if !force_chunk && self.append(w, k, &[entry], 0) {
                     Self::mark_proven(w, k, &[entry]);
                     w.ps[ki].granted[c] = true;
                     w.ps[ki].cs[c] = Cs::Leaving {
@@ -1285,8 +1295,9 @@ impl Lazy {
                         st: LSt::Put,
                         tries,
                     };
-                } else if !w.ens && !w.s.log[usize::from(k)].sealed {
-                    // Without an ensemble the announcement goes into the chunk.
+                } else if (!w.ens || force_chunk) && !w.s.log[usize::from(k)].sealed {
+                    // Without an ensemble, or after a timeout without a proof, the
+                    // announcement goes into the chunk.
                     if let Some(mut ch) = w.s.chunk[usize::from(k)].clone() {
                         if !ch.sealed {
                             ch.granted[c] = true;
@@ -1365,13 +1376,26 @@ impl Lazy {
             LSt::Applied => {
                 let entry = Entry::Left(c, n);
                 let mut done = false;
-                if self.append(w, k, &[entry], 0) {
+                if !force_chunk && self.append(w, k, &[entry], 0) {
                     Self::mark_proven(w, k, &[entry]);
                     done = true;
-                } else if !w.ens && !w.s.log[usize::from(k)].sealed {
+                } else if (!w.ens || force_chunk) && !w.s.log[usize::from(k)].sealed {
                     if let Some(mut ch) = w.s.chunk[usize::from(k)].clone() {
                         if !ch.sealed {
-                            if let Some(l) = ch.left[c].as_mut() {
+                            if self.d().chunk_confirm_whole_entry {
+                                // The announcement may have gone as a mark that no
+                                // chunk holds yet: the entry is written whole.
+                                ch.granted[c] = true;
+                                let l = ch.left[c].get_or_insert(Left {
+                                    epoch: e,
+                                    nonces: vec![n],
+                                    done: None,
+                                });
+                                if !l.nonces.contains(&n) && l.nonces.len() < 4 {
+                                    l.nonces.push(n);
+                                }
+                                l.done = Some(n);
+                            } else if let Some(l) = ch.left[c].as_mut() {
                                 l.done = Some(n);
                             }
                             ch.rev += 1;
@@ -3020,6 +3044,12 @@ impl Model for Lazy {
                             if st != LSt::Await {
                                 a.push(Act::K3Step(c));
                             }
+                            if self.d().leave_chunk_fallback
+                                && w.ens
+                                && matches!(st, LSt::Announce | LSt::Applied)
+                            {
+                                a.push(Act::K3ViaChunk(c));
+                            }
                             if st == LSt::Announce && w.b.partial > 0 && w.ens {
                                 a.push(Act::K3Partial(c));
                             }
@@ -3211,7 +3241,11 @@ impl Model for Lazy {
                 .filter(|x| {
                     matches!(
                         x,
-                        Act::Mint(..) | Act::K3Step(_) | Act::TkStep(_) | Act::SlStep(..)
+                        Act::Mint(..)
+                            | Act::K3Step(_)
+                            | Act::K3ViaChunk(_)
+                            | Act::TkStep(_)
+                            | Act::SlStep(..)
                     )
                 })
                 .cloned()
@@ -3287,7 +3321,11 @@ impl Model for Lazy {
             }
             Act::K3Step(c) => {
                 let k = self.active_k(&w, *c);
-                self.k3_step(&mut w, k, *c, &mut l);
+                self.k3_step(&mut w, k, *c, false, &mut l);
+            }
+            Act::K3ViaChunk(c) => {
+                let k = self.active_k(&w, *c);
+                self.k3_step(&mut w, k, *c, true, &mut l);
             }
             Act::K3Partial(c) => {
                 w.b.partial -= 1;

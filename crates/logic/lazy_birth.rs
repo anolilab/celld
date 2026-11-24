@@ -166,6 +166,12 @@ pub(crate) struct Design {
     pub release_guard: [bool; 4],
     // K3 order.
     pub confirm_before_later_epoch: bool,
+    /// A step of the leave that waits for a fleet proof and gets none within its
+    /// timeout goes through the chunk instead of failing.
+    pub leave_chunk_fallback: bool,
+    /// The confirmation of a leave through the chunk writes the whole left entry,
+    /// because the announcement may have gone as a mark that no chunk holds.
+    pub chunk_confirm_whole_entry: bool,
     // Records name sessions (B5).
     pub settle_by_session: bool,
     pub nonce_in_bodies: bool,
@@ -261,6 +267,8 @@ impl Design {
             left_in_chunk_before_release: true,
             release_guard: [true; 4],
             confirm_before_later_epoch: true,
+            leave_chunk_fallback: true,
+            chunk_confirm_whole_entry: true,
             settle_by_session: true,
             nonce_in_bodies: true,
             gate_keyed_by_node: true,

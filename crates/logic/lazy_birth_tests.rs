@@ -766,3 +766,32 @@ fn explore_scenario() {
     r.print_violations();
     r.print_labels();
 }
+
+/// A leave whose steps give up waiting for a fleet proof and go through the chunk
+/// is safe only if the confirmation writes the whole left entry: the announcement
+/// may have gone as a mark that no chunk holds. With the fallback on, every
+/// scenario of the design holds (the main test of this file runs them); without
+/// the whole entry, the preserved restart finds a second writer.
+#[test]
+fn the_chunk_fallback_of_a_leave_needs_the_whole_entry() {
+    let mut design = Design::rev4();
+    assert!(design.leave_chunk_fallback);
+    design.chunk_confirm_whole_entry = false;
+    let mut cfg = scenario("q2_final")(design);
+    cfg.ignore.clear();
+    let report = run("q2_final without the whole entry", cfg, false, 3_000_000);
+    assert!(
+        report.violations.contains_key("a1_one_acting_writer"),
+        "{:?}",
+        report.violations.keys().collect::<Vec<_>>()
+    );
+    let held = run_design(
+        "q2_final with it",
+        "q2_final",
+        "rev4",
+        &[],
+        false,
+        3_000_000,
+    );
+    assert!(held.passed());
+}
