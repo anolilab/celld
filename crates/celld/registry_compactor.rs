@@ -1553,7 +1553,8 @@ impl Registry {
             while let Some(Ok(meta)) = listing.next().await {
                 let key = meta.location.to_string();
                 let old = wall - meta.last_modified.timestamp_millis() >= self.cfg.grace_ms as i64;
-                let lower = objects::epoch_of(&key).is_some_and(|epoch| epoch < root.epoch);
+                let lower =
+                    objects::epoch_of(&self.prefix, &key).is_some_and(|epoch| epoch < root.epoch);
                 if old && lower && !named.contains(&key) && !retired.contains(&key) {
                     stale.push(key);
                 }

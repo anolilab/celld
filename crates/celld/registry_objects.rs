@@ -245,15 +245,21 @@ pub(crate) async fn delete_many(store: &dyn ObjectStore, keys: &[String]) -> Vec
 }
 
 /// The compactor epoch an object of a compactor was written under, from its
-/// key: `delta/<epoch>-<n>`, `map/<epoch>-<m>` and `run/<partition>/<level>-<epoch>-<id>`.
-pub(crate) fn epoch_of(key: &str) -> Option<u64> {
-    let name = key.rsplit('/').next()?;
-    let mut parts = name.split('-');
-    let first = parts.next()?.parse::<u64>().ok()?;
-    if key.contains("/run/") {
-        parts.next()?.parse().ok()
-    } else {
-        Some(first)
+/// key under the registry's own root: `delta/<epoch>-<n>`, `map/<epoch>-<m>` and
+/// `run/<partition>/<level>-<epoch>-<id>`. The bucket prefix is removed first, so
+/// text in it that looks like a directory of the layout is never read as one.
+pub(crate) fn epoch_of(prefix: &str, key: &str) -> Option<u64> {
+    let rest = key
+        .strip_prefix(&format!("{prefix}{ROOT}"))?
+        .strip_prefix('/')?;
+    let (kind, tail) = rest.split_once('/')?;
+    match kind {
+        "delta" | "map" => tail.split('-').next()?.parse().ok(),
+        "run" => {
+            let (_, name) = tail.split_once('/')?;
+            name.split('-').nth(1)?.parse().ok()
+        }
+        _ => None,
     }
 }
 
@@ -275,6 +281,34 @@ mod tests {
         assert!(!key.contains("fleet/dir/v2"));
         assert_eq!(key_of("Agent:abc"), key_of("Agent:abc"));
         assert_ne!(key_of("Agent:abc"), key_of("Agent:abd"));
+    }
+
+    #[test]
+    fn the_epoch_of_an_object_is_read_from_the_layout_under_the_prefix_only() {
+        let prefix = "tenant/run/map/fleet-a/";
+        let run = RunRef {
+            epoch: 7,
+            id: 3,
+            buckets: 1,
+            overflow: 0,
+            records: 1,
+        };
+        assert_eq!(
+            epoch_of(prefix, &delta_key(prefix, DeltaId { epoch: 4, n: 9 })),
+            Some(4)
+        );
+        assert_eq!(epoch_of(prefix, &map_key(prefix, 5, 2)), Some(5));
+        assert_eq!(epoch_of(prefix, &run_key(prefix, 0x10, 2, &run)), Some(7));
+        // A prefix that holds the directory names of the layout is not the layout.
+        assert_eq!(
+            epoch_of(prefix, &format!("{prefix}fleet/reg/v1/seg/n/g/0")),
+            None
+        );
+        assert_eq!(epoch_of(prefix, "other/run/x/1-2-3"), None);
+        assert_eq!(
+            epoch_of("", &delta_key("", DeltaId { epoch: 1, n: 1 })),
+            Some(1)
+        );
     }
 
     #[test]
