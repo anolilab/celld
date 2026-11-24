@@ -697,19 +697,22 @@ async fn an_upload_that_stalls_is_cut_off_and_does_not_hold_a_place() {
 /// The log lines of `event`. The response can reach the test before the node
 /// has written its log line, so wait up to 5 s for the first one.
 async fn log_lines(server: &Server, event: &str) -> Vec<String> {
-    for attempt in 0..100 {
-        let lines: Vec<String> = server
+    let read = || -> Vec<String> {
+        server
             .log_text()
             .lines()
             .filter(|line| line.contains(event))
             .map(str::to_string)
-            .collect();
-        if !lines.is_empty() || attempt == 99 {
+            .collect()
+    };
+    for _ in 0..100 {
+        let lines = read();
+        if !lines.is_empty() {
             return lines;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    unreachable!("the last attempt returns")
+    read()
 }
 
 #[tokio::test]
