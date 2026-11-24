@@ -478,8 +478,62 @@ pub(crate) struct ShadowVerdict {
 pub(crate) struct RegistryAnswers {
     counts: [[AtomicU64; 2]; 3],
     mismatches: AtomicU64,
-    lookup_us: std::sync::Mutex<Vec<u64>>,
-    list_us: std::sync::Mutex<Vec<u64>>,
+    lookup_us: LatencyHistogram,
+    list_us: LatencyHistogram,
+}
+
+/// Latencies in microseconds by power-of-two bucket: bucket `i` holds values
+/// below `2^i`, the last one everything above. Fixed size, no lock.
+#[derive(Debug)]
+struct LatencyHistogram {
+    buckets: [AtomicU64; 32],
+}
+
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl LatencyHistogram {
+    fn record(&self, micros: u64) {
+        let at = (u64::BITS - micros.leading_zeros()).min(31) as usize;
+        self.buckets[at].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The upper bound, in microseconds, of the bucket the `p`th percentile
+    /// falls in, or `None` with no samples.
+    fn percentile(counts: &[u64], p: f64) -> Option<u64> {
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        let rank = ((total as f64) * p / 100.0).ceil().max(1.0) as u64;
+        let mut seen = 0;
+        for (at, count) in counts.iter().enumerate() {
+            seen += count;
+            if seen >= rank {
+                return Some(1_u64 << at);
+            }
+        }
+        None
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let counts: Vec<u64> = self
+            .buckets
+            .iter()
+            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .collect();
+        serde_json::json!({
+            "count": counts.iter().sum::<u64>(),
+            "p50_us": Self::percentile(&counts, 50.0),
+            "p99_us": Self::percentile(&counts, 99.0),
+            "buckets_log2_us": counts,
+        })
+    }
 }
 
 impl RegistryAnswers {
@@ -497,12 +551,8 @@ impl RegistryAnswers {
             Answer::Unknown(_) => 2,
         };
         self.counts[row][usize::from(ltx_found)].fetch_add(1, Ordering::Relaxed);
-        for (samples, value) in [(&self.lookup_us, lookup_us), (&self.list_us, list_us)] {
-            let mut samples = samples.lock().unwrap();
-            if samples.len() < 400_000 {
-                samples.push(value);
-            }
-        }
+        self.lookup_us.record(lookup_us);
+        self.list_us.record(list_us);
     }
 
     fn to_json(&self) -> serde_json::Value {
@@ -517,8 +567,8 @@ impl RegistryAnswers {
             "exists": pair(&self.counts[1]),
             "unknown": pair(&self.counts[2]),
             "mismatches": self.mismatches.load(Ordering::Relaxed),
-            "lookup_us": *self.lookup_us.lock().unwrap(),
-            "list_us": *self.list_us.lock().unwrap(),
+            "lookup_us": self.lookup_us.to_json(),
+            "list_us": self.list_us.to_json(),
         })
     }
 }
@@ -1495,5 +1545,33 @@ pub(crate) fn process_load(live: &LiveLoad) -> NodeLoadWire {
         // Published each renewal, so a peer sees a start or stop within a
         // renewal and a sample refresh. Empty on a node with no engine.
         container_instances: crate::container::running_instances_by_class(),
+    }
+}
+
+#[cfg(test)]
+mod registry_answer_tests {
+    use super::*;
+    use celld_logic::lost_record::Answer;
+
+    #[test]
+    fn latencies_fill_a_fixed_histogram_and_report_counts_and_percentiles() {
+        let answers = RegistryAnswers::default();
+        for micros in 0..10_000_u64 {
+            answers.record(Answer::New, false, 100 + micros % 50, 3_000);
+        }
+        answers.record(Answer::New, false, u64::MAX, 3_000);
+        let json = answers.to_json();
+        assert_eq!(json["lookup_us"]["count"], 10_001);
+        assert_eq!(json["lookup_us"]["p50_us"], 128, "below 2^7 microseconds");
+        assert_eq!(json["list_us"]["p99_us"], 4_096);
+        assert_eq!(json["new"]["no_ltx"], 10_001);
+        assert!(
+            json["lookup_us"]["buckets_log2_us"]
+                .as_array()
+                .unwrap()
+                .len()
+                == 32
+        );
+        assert!(RegistryAnswers::default().to_json()["lookup_us"]["p50_us"].is_null());
     }
 }
