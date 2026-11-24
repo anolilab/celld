@@ -2824,39 +2824,64 @@ async fn internal_registry_root(request: Request<Incoming>, app: AppHandle) -> H
     peer_response(response(StatusCode::OK, "{\"ok\":true}"))
 }
 
-/// A node outside the birth registry's writer rule (the flag is off, or it has
-/// bucket durability) raises the registry's gate number before it serves, once
-/// its own lease says it is outside the rule: a seed that started before the
-/// lease cannot then open the gate over this node's writes. With no root it
-/// writes nothing. A node that finds shared packs refuses to start.
+/// A node outside the birth registry's writer rule (the flag is `shadow` and it has
+/// bucket durability) raises the registry's gate number before it does any
+/// per-cell work, once its own lease, matched by generation, says it is outside
+/// the rule: a seed that started before the lease cannot then open the gate over
+/// this node's writes. Claims, own-record writes and per-cell object writes wait
+/// for it (`registry_seed::hold`); every failure is retried with a growing pause
+/// and nothing falls through. With no root nothing is written. A node with the
+/// flag off does none of this and reads and writes no registry object.
+///
+/// A lapsed lease fences the process (it halts), so the lease is never taken again
+/// within one process and the gate needs closing only here.
 async fn close_registry_gate(ownership: &Arc<celld::ownership_store::BucketOwnership>, node: &str) {
-    if celld::registry::is_w1() {
+    let hold = celld::registry_seed::hold();
+    if !hold.is_pending() {
         return;
     }
     let bucket = ownership.bucket_client();
-    for _ in 0..300 {
-        let live = match ownership.read_capacity_peers().await {
-            Ok(peers) => peers.iter().any(|peer| {
-                peer.node == node && peer.expires_ms > celld::ownership_store::now_ms()
-            }),
-            Err(_) => false,
-        };
-        if live {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-    match celld::registry_seed::close_gate(bucket.store.as_ref(), &bucket.prefix).await {
-        Ok(Some(gate)) => tracing::info!(
+    let Some(generation) = ownership.process_generation().map(str::to_owned) else {
+        eprintln!("celld: the node lease has no generation; the registry gate stays closed");
+        return;
+    };
+    let lease_key = format!("nodes/{node}.json");
+    let gate = celld::registry_seed::close_until_done(
+        hold,
+        {
+            let (bucket, key, generation) = (bucket.clone(), lease_key, generation);
+            move || {
+                let (bucket, key, generation) = (bucket.clone(), key.clone(), generation.clone());
+                Box::pin(async move {
+                    match bucket.get(&key).await {
+                        Ok(Some((body, _))) => celld::registry_seed::lease_shows_gate_closed(
+                            &body,
+                            &generation,
+                            celld::ownership_store::now_ms(),
+                        ),
+                        _ => false,
+                    }
+                })
+            }
+        },
+        {
+            let bucket = bucket.clone();
+            move || {
+                let bucket = bucket.clone();
+                Box::pin(async move {
+                    celld::registry_seed::close_gate(bucket.store.as_ref(), &bucket.prefix).await
+                })
+            }
+        },
+        std::time::Duration::from_millis(200),
+    )
+    .await;
+    if let Some(gate) = gate {
+        tracing::info!(
             event = "registry_gate_closed",
             gate,
             "this node is outside the birth registry's writer rule: the gate is closed"
-        ),
-        Ok(None) => {}
-        Err(error) => {
-            eprintln!("celld: {error:#}");
-            std::process::exit(1);
-        }
+        );
     }
 }
 
@@ -3797,6 +3822,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let action = action_from_process()?;
     let host_runtime = tokio::runtime::Handle::current();
     celld::asyncrt::set_host_handle(host_runtime.clone());
+    // Outside the birth registry's writer rule (flag `shadow`, bucket durability):
+    // per-cell work waits until the gate is closed. Nothing changes with the flag off.
+    if celld::registry_seed::needs_gate_close() {
+        celld::registry_seed::hold().require();
+    }
     // Docker and journald can stop consuming the process pipe during a log
     // burst. Logging must lose diagnostics under that backpressure rather
     // than block the Tokio workers that route requests and renew authority.
@@ -4873,7 +4903,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 }
             });
         }
-        (Some(ownership), _) if !celld::registry::is_w1() => {
+        (Some(ownership), _) if celld::registry_seed::hold().is_pending() => {
             let (ownership, node, ready) =
                 (ownership.clone(), node.clone(), app.fleet_ready.clone());
             tokio::spawn(async move {

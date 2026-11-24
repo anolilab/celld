@@ -1218,6 +1218,7 @@ impl BucketOwnership {
     /// claim. Rejection is an ordinary outcome, not an error -- the record
     /// keeps naming whoever it names, and nothing was lost.
     pub async fn release_owner(&self, cell: &str, epoch: u64) -> anyhow::Result<CasOutcome> {
+        crate::registry_seed::hold().wait().await;
         let Some(current) = self.read_owner(cell).await? else {
             return Ok(CasOutcome::Rejected);
         };
@@ -1238,6 +1239,8 @@ impl BucketOwnership {
         guard: CasGuard,
         epoch: u64,
     ) -> anyhow::Result<CasOutcome> {
+        // A node outside the writer rule claims nothing before the gate is closed.
+        crate::registry_seed::hold().wait().await;
         let key = format!("cells/{cell}/own.json");
         let body = serde_json::to_vec(&OwnerWire {
             node: &self.node,

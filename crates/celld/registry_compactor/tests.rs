@@ -21,6 +21,7 @@ fn config() -> Config {
         grace_ms: crate::registry_compactor::GRACE_MS,
         created_cap: crate::registry_writer::CREATED_CAP,
         waiting_cap: crate::registry_writer::WAITING_CAP,
+        seed_page: 1_000,
         sampler_recheck_ms: 20_000,
         job_pacing: false,
         pass_read: Duration::ZERO,
@@ -736,6 +737,9 @@ mod store {
         ops: Mutex<Vec<String>>,
         /// Deletes answer an error for every key while set.
         failing_deletes: std::sync::atomic::AtomicBool,
+        /// Deletes answer `NotFound` for every key while set, as GCS and Azure do for
+        /// a delete that is repeated.
+        missing_deletes: std::sync::atomic::AtomicBool,
         /// Writes of keys that contain a pattern are applied once and then
         /// answer an error, as a write whose answer was lost does.
         ambiguous: Mutex<Vec<String>>,
@@ -761,6 +765,7 @@ mod store {
                 yielding: std::sync::atomic::AtomicBool::new(false),
                 ops: Mutex::new(Vec::new()),
                 failing_deletes: std::sync::atomic::AtomicBool::new(false),
+                missing_deletes: std::sync::atomic::AtomicBool::new(false),
                 ambiguous: Mutex::new(Vec::new()),
                 refused: Mutex::new(Vec::new()),
                 failing: Mutex::new(Vec::new()),
@@ -776,6 +781,10 @@ mod store {
         pub(super) fn refuse_puts(&self, pattern: &str, times: usize) {
             let mut refused = self.refused.lock().unwrap();
             refused.extend(std::iter::repeat_n(pattern.to_owned(), times));
+        }
+
+        pub(super) fn missing_deletes(&self, on: bool) {
+            self.missing_deletes.store(on, Ordering::SeqCst);
         }
 
         pub(super) fn fail_deletes(&self, on: bool) {
@@ -1045,6 +1054,18 @@ mod store {
         ) -> BoxStream<'static, object_store::Result<Path>> {
             use futures_util::StreamExt as _;
             // One call is one request: it carries every key it is given.
+            if self.missing_deletes.load(Ordering::SeqCst) {
+                return locations
+                    .map(|location| {
+                        location.and_then(|path| {
+                            Err(object_store::Error::NotFound {
+                                path: path.to_string(),
+                                source: "already deleted".into(),
+                            })
+                        })
+                    })
+                    .boxed();
+            }
             if self.failing_deletes.load(Ordering::SeqCst) {
                 return locations
                     .map(|location| {
@@ -1071,10 +1092,9 @@ mod store {
             &self,
             prefix: Option<&Path>,
         ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            self.lists
-                .lock()
-                .unwrap()
-                .push(prefix.map(ToString::to_string).unwrap_or_default());
+            let listed = prefix.map(ToString::to_string).unwrap_or_default();
+            self.ops.lock().unwrap().push(format!("list {listed}"));
+            self.lists.lock().unwrap().push(listed);
             self.inner.list(prefix)
         }
 
@@ -2429,8 +2449,19 @@ fn the_registry_bound_shrinks_by_the_directory_wait_and_the_sum_stays_under_half
 // The gate, the seed and the format marker
 // ---------------------------------------------------------------------------
 
+/// The fleet's format record, which every started fleet has and the marker goes in.
+async fn ensure_format_record(store: &Arc<dyn ObjectStore>) {
+    let _ = objects::put_create(
+        store.as_ref(),
+        &format!("{PREFIX}wake/format.json"),
+        br#"{"format":2}"#.to_vec(),
+    )
+    .await;
+}
+
 /// The role with the gate still closed, as a new root leaves it.
 async fn closed_holder(registry: &Arc<Registry>) -> Holding {
+    ensure_format_record(&registry.store).await;
     let mut holding = registry
         .take(None, false)
         .await
@@ -2538,6 +2569,7 @@ async fn the_seed_lists_every_cell_once_and_opens_the_gate() {
 #[tokio::test]
 async fn a_node_outside_the_rule_closes_the_gate_and_a_new_seed_reopens_it() {
     let store = memory();
+    ensure_format_record(&store).await;
     let node = registry_on(&store, "node-a");
     let mut holding = holder_of(&node).await;
     let reader = registry_on(&store, "node-b");
@@ -2605,7 +2637,17 @@ async fn a_lease_without_the_field_keeps_the_marker_and_the_seed_from_happening(
         .bytes()
         .await
         .unwrap();
-    assert_eq!(&marker[..], br#"{"format":2}"#, "no marker while it runs");
+    assert_eq!(
+        &marker[..],
+        br#"{"format":2,"registry":1}"#,
+        "the marker is written first, so the binary that runs cannot restart"
+    );
+    assert!(
+        keys_under(&store, &objects::seed_root(PREFIX))
+            .await
+            .is_empty(),
+        "and no cell is listed while it runs"
+    );
     // An expired lease does not count.
     lease(&store, "node-old", "{}", 1).await;
     pass_until_open(&node, &mut holding).await;
@@ -3612,11 +3654,19 @@ async fn the_seed_lists_cells_by_delimiter_in_about_a_request_per_thousand_cells
         )
         .await;
     }
-    let node = registry_on(&store, "node-a");
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            seed_page: 50,
+            ..config()
+        },
+    );
     node.set_lister(crate::bucket::Bucket::for_test(
         store.clone(),
         pages.clone(),
         PREFIX,
+        crate::bucket::StorageBackend::Local,
     ));
     assert!(node.lister.get().is_some());
     let mut holding = closed_holder(&node).await;
@@ -3639,10 +3689,458 @@ async fn the_seed_lists_cells_by_delimiter_in_about_a_request_per_thousand_cells
     let classes = 4;
     let ranges = 19;
     let requests = pages.requests.load(Ordering::SeqCst);
-    let bound = names.len() / 1_000 + classes + 1 + classes * ranges + classes * 2;
+    // Pages of 50: the walk and every range page through their cells.
+    let bound = names.len() / 50 + classes + 1 + classes * (ranges + 3) + 8;
     assert!(
         requests <= bound,
         "{requests} listing requests for {} cells, at most {bound}",
         names.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Seed attempts, the order of the marker, the hold and the leftovers
+// ---------------------------------------------------------------------------
+
+/// Passes until the listing of a seed is done and waits in the slot.
+async fn pass_until_listed(registry: &Arc<Registry>, holding: &mut Holding) {
+    crate::asyncrt::timeout(Duration::from_secs(10), async {
+        loop {
+            holding.last_seed_ms = None;
+            registry.pass(holding).await.unwrap();
+            if holding.seed_slot.lock().unwrap().is_some() {
+                return;
+            }
+            crate::asyncrt::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the seed was listed");
+}
+
+#[tokio::test]
+async fn a_failed_seed_attempt_leaves_nothing_the_next_one_can_use() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    ensure_format_record(&plain).await;
+    let first: Vec<String> = (0..30).map(|index| format!("Agent:{index:04x}")).collect();
+    bucket_with_cells(&plain, &first).await;
+    let node = registry_on(&store, "node-a");
+    let holding = closed_holder(&node).await;
+    // The first attempt writes some objects, cannot write one, and cannot delete
+    // what it wrote either.
+    scripted.refuse_puts("/seed/", 1);
+    scripted.fail_deletes(true);
+    let error = node
+        .write_seed(1, "1-0", &holding.map)
+        .await
+        .expect_err("a seed object could not be written");
+    let Some(crate::registry_compactor::Stranded(left)) =
+        error.downcast_ref::<crate::registry_compactor::Stranded>()
+    else {
+        panic!("the objects left are handed back: {error:#}");
+    };
+    let leftovers = keys_under(&plain, &objects::seed_root(PREFIX)).await;
+    assert!(!leftovers.is_empty());
+    assert!(
+        leftovers.iter().all(|key| left.contains(key)),
+        "every object it left is handed back to be deleted"
+    );
+    scripted.fail_deletes(false);
+    // The cells change; the second attempt lists different ones, under keys of its own.
+    for name in &first[..10] {
+        objects::delete(
+            plain.as_ref(),
+            &format!("{PREFIX}cells/{name}/ltx/e1/0/1-1.ltx"),
+        )
+        .await;
+        objects::delete(plain.as_ref(), &format!("{PREFIX}cells/{name}/own.json")).await;
+    }
+    let second: Vec<String> = (0..20)
+        .map(|index| format!("Counter:{index:04x}"))
+        .collect();
+    bucket_with_cells(&plain, &second).await;
+    let seed = node
+        .write_seed(1, "1-1000000", &holding.map)
+        .await
+        .expect("the second attempt");
+    assert!(seed.keys().iter().all(|key| !leftovers.contains(key)));
+    assert_eq!(seed.cells as usize, 20 + 20);
+    // The sweep of a later epoch removes what the first attempt left.
+    let mut holding = holding;
+    *holding.seed_slot.lock().unwrap() = Some(seed);
+    holding.last_seed_ms = Some(crate::asyncrt::mono_ms());
+    pass_until_open(&node, &mut holding).await;
+    let reader = registry_on(&plain, "node-b");
+    for name in first[10..].iter().chain(second.iter()) {
+        assert!(
+            matches!(answer(&reader, name).await, Answer::Exists(_)),
+            "{name}"
+        );
+    }
+    for name in &first[..10] {
+        assert_eq!(
+            answer(&reader, name).await,
+            Answer::New,
+            "{name} was only in the first attempt's listing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_seed_attempt_never_overwrites_an_object_and_numbers_ranges_by_what_they_cover() {
+    let store = memory();
+    ensure_format_record(&store).await;
+    bucket_with_cells(&store, &seeded_names()).await;
+    let node = registry_on(&store, "node-a");
+    let holding = closed_holder(&node).await;
+    let one = node.write_seed(1, "1-0", &holding.map).await.unwrap();
+    let again = node.write_seed(1, "1-0", &holding.map).await;
+    assert!(again.is_err(), "the same attempt's keys are taken");
+    let two = node.write_seed(1, "1-1000000", &holding.map).await.unwrap();
+    assert_eq!(
+        one.keys()
+            .iter()
+            .map(|key| key.rsplit('/').next().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        two.keys()
+            .iter()
+            .map(|key| key.rsplit('/').next().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        "the same cells fall in the same ranges, whatever order the listings finish in"
+    );
+}
+
+#[tokio::test]
+async fn the_marker_is_written_first_then_the_leases_are_read_then_the_cells_are_written() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    ensure_format_record(&plain).await;
+    bucket_with_cells(&plain, &["Agent:00aa".to_owned()]).await;
+    let node = registry_on(&store, "node-a");
+    let mut holding = closed_holder(&node).await;
+    pass_until_open(&node, &mut holding).await;
+    let ops = scripted.ops();
+    let at = |what: &str| {
+        ops.iter()
+            .position(|op| op.contains(what))
+            .unwrap_or_else(|| panic!("{what} not in {ops:?}"))
+    };
+    let marker = ops
+        .iter()
+        .position(|op| op.starts_with("put ") && op.ends_with("wake/format.json"))
+        .expect("the marker was written");
+    assert!(marker < at("list fleet-a/nodes"), "{ops:?}");
+    assert!(at("list fleet-a/nodes") < at("/seed/"), "{ops:?}");
+}
+
+#[tokio::test]
+async fn without_a_format_record_the_seed_waits_instead_of_going_on_without_a_marker() {
+    let store = memory();
+    let node = registry_on(&store, "node-a");
+    // `closed_holder` would write the record; take the role without it.
+    let mut holding = node.take(None, false).await.unwrap().unwrap();
+    for _ in 0..3 {
+        holding.last_seed_ms = None;
+        node.pass(&mut holding).await.unwrap();
+        crate::asyncrt::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(node.counters.seed_blocked.load(Ordering::Relaxed) > 0);
+    assert_eq!(node.counters.seeds.load(Ordering::Relaxed), 0);
+    assert!(!holding.root.gate_open());
+}
+
+#[tokio::test]
+async fn an_older_binary_that_appears_before_the_seed_commits_stops_the_commit() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    ensure_format_record(&plain).await;
+    bucket_with_cells(&plain, &["Agent:00aa".to_owned(), "Agent:00bb".to_owned()]).await;
+    let node = registry_on(&store, "node-a");
+    let mut holding = closed_holder(&node).await;
+    pass_until_listed(&node, &mut holding).await;
+    // The marker was written and the leases were clean; now an older binary starts.
+    lease(&plain, "node-old", "{}", far()).await;
+    for _ in 0..6 {
+        holding.last_seed_ms = Some(crate::asyncrt::mono_ms());
+        node.pass(&mut holding).await.unwrap();
+        crate::asyncrt::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(!holding.root.gate_open(), "the gate stays closed");
+    assert!(node.counters.seed_blocked.load(Ordering::Relaxed) > 0);
+    assert!(
+        keys_under(&plain, &objects::seed_root(PREFIX))
+            .await
+            .is_empty(),
+        "and the listing is dropped"
+    );
+    // It leaves: a new listing is made and the gate opens.
+    objects::delete(plain.as_ref(), &format!("{PREFIX}nodes/node-old.json")).await;
+    pass_until_open(&node, &mut holding).await;
+}
+
+#[tokio::test]
+async fn a_gate_raised_while_a_seed_is_listed_stays_closed_and_a_second_seed_opens_it() {
+    let store = memory();
+    ensure_format_record(&store).await;
+    bucket_with_cells(&store, &seeded_names()[..40]).await;
+    let node = registry_on(&store, "node-a");
+    let mut holding = closed_holder(&node).await;
+    pass_until_listed(&node, &mut holding).await;
+    // A node outside the rule starts after the listing: it raises the gate number.
+    crate::registry_seed::close_gate(store.as_ref(), PREFIX)
+        .await
+        .unwrap();
+    pass_until_open(&node, &mut holding).await;
+    assert_eq!(holding.root.gate, 2);
+    assert_eq!(
+        holding.root.seed_gate, 2,
+        "the second seed was made for gate 2"
+    );
+    assert!(node.counters.seeds.load(Ordering::Relaxed) >= 2);
+}
+
+#[tokio::test]
+async fn a_seed_is_not_a_job_so_spills_go_on_while_it_lists() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    ensure_format_record(&plain).await;
+    bucket_with_cells(&plain, &["Agent:00aa".to_owned()]).await;
+    let node = registry_on(&store, "node-a");
+    let mut holding = closed_holder(&node).await;
+    // Hold the listing of cells: the seed is listing and cannot finish.
+    scripted.hold("fleet-a/cells");
+    holding.last_seed_ms = None;
+    register_and_fold(&node, &mut holding, &[cell(1)]).await;
+    crate::asyncrt::timeout(Duration::from_secs(5), async {
+        while !holding.seeding.load(Ordering::SeqCst) {
+            holding.last_seed_ms = None;
+            node.pass(&mut holding).await.unwrap();
+            crate::asyncrt::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the seed started listing");
+    assert_eq!(
+        holding.running.load(Ordering::SeqCst),
+        0,
+        "listing is not a job"
+    );
+    holding.last_spill_ms = None;
+    node.schedule(&mut holding);
+    wait_jobs_idle(&holding).await;
+    assert_eq!(
+        holding.prepared.lock().unwrap().len(),
+        1,
+        "a spill was prepared while the seed was listing"
+    );
+}
+
+#[tokio::test]
+async fn the_gate_hold_waits_until_released_and_not_at_all_when_nothing_is_required() {
+    let hold = Arc::new(crate::registry_seed::GateHold::new());
+    hold.wait().await;
+    hold.require();
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waiter = {
+        let (hold, done) = (hold.clone(), done.clone());
+        crate::asyncrt::spawn(async move {
+            hold.wait().await;
+            done.store(true, Ordering::SeqCst);
+        })
+    };
+    crate::asyncrt::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !done.load(Ordering::SeqCst),
+        "it waits while the gate is open"
+    );
+    hold.release();
+    crate::asyncrt::timeout(Duration::from_secs(2), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn the_gate_is_closed_only_after_this_process_lease_shows_it_and_every_failure_is_retried() {
+    let hold = Arc::new(crate::registry_seed::GateHold::new());
+    hold.require();
+    let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let released_early = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gate = crate::registry_seed::close_until_done(
+        &hold,
+        {
+            let polls = polls.clone();
+            move || {
+                let seen = polls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { seen >= 5 })
+            }
+        },
+        {
+            let (closes, hold, early) = (closes.clone(), hold.clone(), released_early.clone());
+            move || {
+                let attempt = closes.fetch_add(1, Ordering::SeqCst);
+                if !hold.is_pending() {
+                    early.store(true, Ordering::SeqCst);
+                }
+                Box::pin(async move {
+                    if attempt < 3 {
+                        anyhow::bail!("the root cannot be written yet")
+                    }
+                    Ok(Some(2))
+                })
+            }
+        },
+        Duration::from_millis(1),
+    )
+    .await;
+    assert_eq!(gate, Some(2));
+    assert!(
+        polls.load(Ordering::SeqCst) >= 6,
+        "it kept looking for its lease"
+    );
+    assert_eq!(
+        closes.load(Ordering::SeqCst),
+        4,
+        "three failures, then it closed"
+    );
+    assert!(
+        !released_early.load(Ordering::SeqCst),
+        "nothing was released before the raise"
+    );
+    assert!(!hold.is_pending());
+}
+
+#[test]
+fn a_lease_is_this_process_by_generation_and_not_by_node_name() {
+    let lease = |generation: &str, expires: u64, registry: &str| {
+        format!(
+            r#"{{"node":"n","ownership_index_generation":"{generation}","expires_ms":{expires},"load":{{"registry":{registry}}}}}"#
+        )
+    };
+    let check = |body: String, generation: &str| {
+        crate::registry_seed::lease_shows_gate_closed(body.as_bytes(), generation, 1_000)
+    };
+    assert!(check(lease("g1", 2_000, "false"), "g1"));
+    assert!(
+        !check(lease("g0", 2_000, "false"), "g1"),
+        "a lease of an earlier process"
+    );
+    assert!(!check(lease("g1", 500, "false"), "g1"), "expired");
+    assert!(
+        !check(lease("g1", 2_000, "true"), "g1"),
+        "it says it follows the rule"
+    );
+    assert!(
+        !check(r#"{"node":"n","expires_ms":2000}"#.to_owned(), "g1"),
+        "no field"
+    );
+}
+
+#[tokio::test]
+async fn per_cell_writes_wait_for_the_gate_and_everything_else_passes() {
+    let hold: &'static crate::registry_seed::GateHold =
+        Box::leak(Box::new(crate::registry_seed::GateHold::new()));
+    hold.require();
+    let store = Arc::new(crate::registry_seed::GatedStore::new(
+        memory(),
+        PREFIX.to_owned(),
+        hold,
+    ));
+    // A write outside `cells/` and every read go at once.
+    store
+        .put(
+            &Path::from(format!("{PREFIX}nodes/n.json")),
+            vec![1_u8].into(),
+        )
+        .await
+        .unwrap();
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let blocked = {
+        let (store, done) = (store.clone(), done.clone());
+        crate::asyncrt::spawn(async move {
+            let written = store
+                .put(
+                    &Path::from(format!("{PREFIX}cells/Agent:x/ltx/e1/0/1-1.ltx")),
+                    vec![1_u8].into(),
+                )
+                .await;
+            done.store(true, Ordering::SeqCst);
+            written
+        })
+    };
+    crate::asyncrt::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !done.load(Ordering::SeqCst),
+        "a per-cell write waits for the gate"
+    );
+    hold.release();
+    crate::asyncrt::timeout(Duration::from_secs(2), blocked)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_lister_is_not_used_on_a_backend_that_cannot_resume_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let local =
+        Arc::new(crate::local_store::LocalStore::open(dir.path().join("db.sqlite")).unwrap());
+    let store: Arc<dyn ObjectStore> = local.clone();
+    let azure = registry_on(&store, "node-a");
+    azure.set_lister(crate::bucket::Bucket::for_test(
+        store.clone(),
+        local.clone(),
+        PREFIX,
+        crate::bucket::StorageBackend::Azure,
+    ));
+    assert!(azure.lister.get().is_none(), "Azure lists flat");
+    let s3 = registry_on(&store, "node-b");
+    s3.set_lister(crate::bucket::Bucket::for_test(
+        store.clone(),
+        local,
+        PREFIX,
+        crate::bucket::StorageBackend::S3,
+    ));
+    assert!(s3.lister.get().is_some());
+}
+
+#[tokio::test]
+async fn a_delete_of_an_object_that_is_already_gone_counts_as_deleted() {
+    let (scripted, _) = scripted();
+    scripted.missing_deletes(true);
+    let gone =
+        objects::delete_many(scripted.as_ref(), &["a/one".to_owned(), "a/two".to_owned()]).await;
+    assert_eq!(gone.len(), 2);
+}
+
+#[tokio::test]
+async fn the_sweep_removes_seed_objects_of_earlier_epochs_and_keeps_its_own() {
+    let store = memory();
+    let cfg = Config {
+        grace_ms: 0,
+        ..config()
+    };
+    let old = registry_with(&store, "node-a", cfg.clone());
+    let _old_holding = holder_of(&old).await;
+    let new = registry_with(&store, "node-b", cfg);
+    let holding = take_over(&new).await;
+    assert_eq!(holding.epoch, 2);
+    let root = objects::seed_root(PREFIX);
+    let stray = format!("{root}/000000000001/1-0/00000/000");
+    let own = format!("{root}/000000000001/2-0/00000/000");
+    for key in [&stray, &own] {
+        objects::put_create(store.as_ref(), key, b"x".to_vec())
+            .await
+            .unwrap();
+    }
+    new.sweep(&HashSet::new()).await;
+    let left = keys_under(&store, &root).await;
+    assert_eq!(
+        left,
+        vec![own],
+        "an earlier holder's attempt goes, this one's stays"
     );
 }

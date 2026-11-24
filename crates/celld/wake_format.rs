@@ -34,33 +34,37 @@ pub(crate) async fn mark_registry(
 ) -> anyhow::Result<bool> {
     use object_store::{ObjectStoreExt as _, PutMode, PutOptions, PutPayload, UpdateVersion};
     let path = object_store::path::Path::from(format!("{prefix}{KEY}"));
-    let read = match store.get(&path).await {
-        Ok(read) => read,
-        Err(object_store::Error::NotFound { .. }) => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    let version = UpdateVersion {
-        e_tag: read.meta.e_tag.clone(),
-        version: read.meta.version.clone(),
-    };
-    let mut record = decode(&read.bytes().await?)?;
-    if record.registry != 0 {
-        return Ok(true);
+    // A conditional write that another node won is read back: the record is
+    // marked only when what is there says so.
+    for _ in 0..8 {
+        let read = match store.get(&path).await {
+            Ok(read) => read,
+            Err(object_store::Error::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let version = UpdateVersion {
+            e_tag: read.meta.e_tag.clone(),
+            version: read.meta.version.clone(),
+        };
+        let mut record = decode(&read.bytes().await?)?;
+        if record.registry != 0 {
+            return Ok(true);
+        }
+        record.registry = 1;
+        match store
+            .put_opts(
+                &path,
+                PutPayload::from_bytes(serde_json::to_vec(&record)?.into()),
+                PutOptions::from(PutMode::Update(version)),
+            )
+            .await
+        {
+            Ok(_) => return Ok(true),
+            Err(error) if crate::bucket::is_clean_cas_rejection(&error) => continue,
+            Err(error) => return Err(error.into()),
+        }
     }
-    record.registry = 1;
-    match store
-        .put_opts(
-            &path,
-            PutPayload::from_bytes(serde_json::to_vec(&record)?.into()),
-            PutOptions::from(PutMode::Update(version)),
-        )
-        .await
-    {
-        Ok(_) => Ok(true),
-        // Another node wrote it first: whatever it wrote is read next time.
-        Err(error) if crate::bucket::is_clean_cas_rejection(&error) => Ok(true),
-        Err(error) => Err(error.into()),
-    }
+    anyhow::bail!("the format record keeps changing: the registry marker is not confirmed")
 }
 
 fn decode(bytes: &[u8]) -> anyhow::Result<FormatRecord> {

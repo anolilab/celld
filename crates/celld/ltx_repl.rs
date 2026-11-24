@@ -1404,6 +1404,16 @@ impl LtxRepl {
                 );
                 (wrapped, Some(registry))
             }
+            // Outside the writer rule with the registry on: per-cell writes wait for
+            // the gate to be closed. With the flag off nothing changes.
+            None if crate::registry_seed::needs_gate_close() => (
+                Arc::new(crate::registry_seed::GatedStore::new(
+                    store,
+                    prefix.clone(),
+                    crate::registry_seed::hold(),
+                )) as Arc<dyn ObjectStore>,
+                None,
+            ),
             None => (store, None),
         };
         // The tiering flush interval: with a healthy shipper, at most one

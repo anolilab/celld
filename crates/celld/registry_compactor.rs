@@ -474,9 +474,6 @@ pub(crate) async fn prepare_seed(
         partitions_at_a_time,
     )
     .await?;
-    let objects: Vec<String> = seed.by_partition.values().flatten().cloned().collect();
-    prepared.outputs.extend(objects.iter().cloned());
-    prepared.retire.extend(objects);
     prepared.seed_gate = Some(gate);
     Ok(prepared)
 }
@@ -799,6 +796,12 @@ struct Holding {
     last_base_ms: u64,
     /// When a seed was last started (`None` until one was).
     last_seed_ms: Option<u64>,
+    /// A seed is being listed and written. It is not a job: passes and spills go
+    /// on, and only the merge that commits it is.
+    seeding: Arc<AtomicBool>,
+    /// The seed objects of a listing that is done and not yet committed, kept so a
+    /// merge that was discarded is prepared again without listing again.
+    seed_slot: Arc<Mutex<Option<crate::registry_seed::SeedObjects>>>,
     base_next: usize,
     /// Jobs that ended with nothing to do (an empty partition, no delta): the
     /// scheduling state moves past them at the next pass.
@@ -1096,6 +1099,8 @@ impl Registry {
             last_folded: 0,
             last_base_ms: now,
             last_seed_ms: None,
+            seeding: Arc::new(AtomicBool::new(false)),
+            seed_slot: Arc::default(),
             base_next: 0,
             advanced: Arc::default(),
             last_sweep_ms: now,
@@ -1511,6 +1516,9 @@ impl Registry {
             if job.epoch != holding.epoch {
                 continue;
             }
+            if job.seed_gate.is_some() && !self.seed_may_commit(holding, &job).await {
+                continue;
+            }
             let mut stray = None;
             match commit_job(
                 self.store.as_ref(),
@@ -1530,6 +1538,12 @@ impl Registry {
                     holding.root = root;
                     holding.map = Arc::new(map);
                     holding.retire_next.extend(job.retire.iter().cloned());
+                    if job.seed_gate.is_some() {
+                        // The seed is in level 1: its objects are retired.
+                        if let Some(seed) = holding.seed_slot.lock().unwrap().take() {
+                            holding.retire_next.extend(seed.keys());
+                        }
+                    }
                     // Scheduling moves on only when a job committed, so a job that
                     // failed or was discarded is tried again on a later pass.
                     let committed_at = crate::asyncrt::mono_ms();
@@ -1564,6 +1578,56 @@ impl Registry {
         Ok(changed)
     }
 
+    /// The leases once more, immediately before a seed commits: a node that
+    /// appeared since the listing (an older binary, or one outside the writer
+    /// rule) may write cells the listing did not see, so the seed is dropped and
+    /// made again later. A lease that cannot be read keeps the listing and tries
+    /// the merge again.
+    async fn seed_may_commit(&self, holding: &mut Holding, job: &Prepared) -> bool {
+        use celld_logic::registry_gate::{seed_decision, SeedDecision};
+        let leases = crate::registry_seed::live_leases(
+            self.store.as_ref(),
+            &self.prefix,
+            crate::ownership_store::now_ms(),
+        )
+        .await;
+        let decision = match &leases {
+            Ok(leases) => seed_decision(&holding.root, leases),
+            Err(_) => {
+                objects::delete_many(self.store.as_ref(), &job.outputs).await;
+                return false;
+            }
+        };
+        if matches!(decision, SeedDecision::Start) {
+            return true;
+        }
+        self.counters.jobs_discarded.fetch_add(1, Ordering::Relaxed);
+        if matches!(decision, SeedDecision::OlderBinaryLive) {
+            self.counters.seed_blocked.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                event = "registry_seed_blocked",
+                "a lease without the `registry` field appeared before the seed committed"
+            );
+        } else {
+            self.counters.seed_waits.fetch_add(1, Ordering::Relaxed);
+        }
+        objects::delete_many(self.store.as_ref(), &job.outputs).await;
+        let dropped = holding.seed_slot.lock().unwrap().take();
+        if let Some(seed) = dropped {
+            let keys = seed.keys();
+            let gone: HashSet<String> = objects::delete_many(self.store.as_ref(), &keys)
+                .await
+                .into_iter()
+                .collect();
+            holding
+                .stranded
+                .lock()
+                .unwrap()
+                .extend(keys.into_iter().filter(|key| !gone.contains(key)));
+        }
+        false
+    }
+
     fn record_job(&self, job: &Prepared, outcome: &str) {
         tracing::info!(
             event = "registry_job",
@@ -1585,9 +1649,6 @@ impl Registry {
     fn schedule(self: &Arc<Self>, holding: &mut Holding) {
         let busy = holding.running.load(Ordering::SeqCst) > 0
             || !holding.prepared.lock().unwrap().is_empty();
-        if busy {
-            return;
-        }
         let now = crate::asyncrt::mono_ms();
         for (kind, partition) in std::mem::take(&mut *holding.advanced.lock().unwrap()) {
             match (kind, partition) {
@@ -1599,15 +1660,25 @@ impl Registry {
                 _ => {}
             }
         }
-        // A closed gate needs a seed. It waits for nodes outside the writer rule
-        // to leave, so it is tried again every few seconds, and the other jobs go
-        // on meanwhile.
-        if !holding.root.gate_open()
-            && holding
+        if !holding.root.gate_open() && !holding.seeding.load(Ordering::SeqCst) {
+            if holding.seed_slot.lock().unwrap().is_some() {
+                // Listed and written: the merge that commits it is a job, and runs
+                // when no other does.
+                if !busy {
+                    self.start_seed_merge(holding);
+                    return;
+                }
+            } else if holding
                 .last_seed_ms
                 .is_none_or(|at| now.saturating_sub(at) >= SEED_RETRY_MS)
-        {
-            self.start_seed(holding, now);
+            {
+                // A closed gate needs a seed. It waits for nodes outside the writer
+                // rule to leave, so it is tried again every few seconds. Listing
+                // and writing are not a job: spills go on meanwhile.
+                self.start_seed_listing(holding, now);
+            }
+        }
+        if busy {
             return;
         }
         let live: u64 = holding.counts.values().sum();
@@ -1727,48 +1798,69 @@ impl Registry {
         });
     }
 
-    /// Start the seed job: look at the leases, and if the gate may reopen write
-    /// the format marker, list the cells and prepare the merge that sets the
-    /// root's seed number. Nothing is prepared while a node outside the writer
-    /// rule is live.
-    fn start_seed(self: &Arc<Self>, holding: &mut Holding, now: u64) {
+    /// Start a seed: write the format marker, look at the leases, and if the gate
+    /// may reopen list the cells and write them as seed objects of this attempt.
+    /// Nothing is listed while a node outside the writer rule is live.
+    fn start_seed_listing(self: &Arc<Self>, holding: &mut Holding, now: u64) {
         holding.last_seed_ms = Some(now);
         let root = holding.root.clone();
-        let (epoch, map) = (holding.epoch, holding.map.clone());
-        let mut next_run = holding.next_run;
+        let map = holding.map.clone();
+        // An attempt's keys carry this holder's epoch and a run-number base that no
+        // other attempt of it uses.
+        let attempt = format!("{}-{}", holding.epoch, holding.next_run);
         holding.next_run += 1_000_000;
-        let (running, prepared, abandon) = (
-            holding.running.clone(),
-            holding.prepared.clone(),
+        holding.seeding.store(true, Ordering::SeqCst);
+        let (seeding, slot, abandon, stranded) = (
+            holding.seeding.clone(),
+            holding.seed_slot.clone(),
             holding.abandon.clone(),
+            holding.stranded.clone(),
         );
-        running.fetch_add(1, Ordering::SeqCst);
         let registry = self.clone();
         crate::asyncrt::spawn(async move {
-            match registry.seed_job(&root, epoch, &map, &mut next_run).await {
-                Ok(Some(job)) if !abandon.load(Ordering::SeqCst) => {
-                    prepared.lock().unwrap().push(job)
+            match registry.seed_listing(&root, &attempt, &map).await {
+                Ok(Some(seed)) if !abandon.load(Ordering::SeqCst) => {
+                    *slot.lock().unwrap() = Some(seed);
                 }
-                Ok(Some(job)) => {
-                    objects::delete_many(registry.store.as_ref(), &job.outputs).await;
+                // Another holder has the role now: only this attempt's objects go.
+                Ok(Some(seed)) => {
+                    let gone = objects::delete_many(registry.store.as_ref(), &seed.keys()).await;
+                    let gone: HashSet<String> = gone.into_iter().collect();
+                    stranded
+                        .lock()
+                        .unwrap()
+                        .extend(seed.keys().into_iter().filter(|key| !gone.contains(key)));
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    if let Some(Stranded(keys)) = error.downcast_ref::<Stranded>() {
+                        stranded.lock().unwrap().extend(keys.iter().cloned());
+                    }
                     tracing::warn!(error = %format!("{error:#}"), "registry seed failed");
                 }
             }
-            running.fetch_sub(1, Ordering::SeqCst);
+            seeding.store(false, Ordering::SeqCst);
         });
     }
 
-    async fn seed_job(
+    /// The listing half of a seed. The marker comes first: from then a binary from
+    /// before the registry that restarts reads it and does not start. The leases
+    /// are read after it, so one that appears later is seen by the next look.
+    async fn seed_listing(
         &self,
         root: &Root,
-        epoch: u64,
+        attempt: &str,
         map: &Map,
-        next_run: &mut u64,
-    ) -> anyhow::Result<Option<Prepared>> {
+    ) -> anyhow::Result<Option<crate::registry_seed::SeedObjects>> {
         use celld_logic::registry_gate::{seed_decision, SeedDecision};
+        if !crate::wake_format::mark_registry(self.store.as_ref(), &self.prefix).await? {
+            self.counters.seed_blocked.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                event = "registry_seed_blocked",
+                "the fleet has no format record, so the marker cannot be written: the seed waits"
+            );
+            return Ok(None);
+        }
         let leases = crate::registry_seed::live_leases(
             self.store.as_ref(),
             &self.prefix,
@@ -1782,7 +1874,7 @@ impl Registry {
                 tracing::error!(
                     event = "registry_seed_blocked",
                     "a live node lease has no `registry` field: a binary from before the \
-                     registry runs, so the format marker and the seed wait for it to leave"
+                     registry runs, so the seed waits for it to leave"
                 );
                 Ok(None)
             }
@@ -1791,37 +1883,75 @@ impl Registry {
                 Ok(None)
             }
             SeedDecision::Start => {
-                // The marker comes first: from here a binary from before the
-                // registry that restarts reads it and does not start.
-                crate::wake_format::mark_registry(self.store.as_ref(), &self.prefix).await?;
                 self.counters.seeds.fetch_add(1, Ordering::Relaxed);
-                let seed = self.write_seed(root.gate, map).await?;
+                let seed = self.write_seed(root.gate, attempt, map).await?;
                 tracing::info!(
                     event = "registry_seed_listed",
                     gate = root.gate,
                     cells = seed.cells,
                     delimiter_listing = self.lister.get().is_some()
                 );
-                let spill_partitions = if self.cfg.job_pacing {
-                    crate::registry_pace::PACED_SPILL_PARTITIONS
-                } else {
-                    SPILL_CONCURRENCY
-                };
-                Ok(Some(
-                    prepare_seed(
-                        &self.job_store,
-                        &self.prefix,
-                        epoch,
-                        map,
-                        &seed,
-                        root.gate,
-                        next_run,
-                        spill_partitions,
-                    )
-                    .await?,
-                ))
+                Ok(Some(seed))
             }
         }
+    }
+
+    /// Start the job that merges a listed seed into level 1. A merge that is
+    /// discarded because a level 1 moved is prepared again from the same objects.
+    fn start_seed_merge(self: &Arc<Self>, holding: &mut Holding) {
+        let Some(seed) = holding.seed_slot.lock().unwrap().as_ref().map(|seed| {
+            crate::registry_seed::SeedObjects {
+                gate: seed.gate,
+                cells: seed.cells,
+                by_partition: seed.by_partition.clone(),
+            }
+        }) else {
+            return;
+        };
+        let (epoch, map) = (holding.epoch, holding.map.clone());
+        let mut next_run = holding.next_run;
+        holding.next_run += 1_000_000;
+        let (running, prepared, abandon) = (
+            holding.running.clone(),
+            holding.prepared.clone(),
+            holding.abandon.clone(),
+        );
+        let store = self.job_store.clone();
+        let prefix = self.prefix.clone();
+        let partitions_at_a_time = if self.cfg.job_pacing {
+            crate::registry_pace::PACED_SPILL_PARTITIONS
+        } else {
+            SPILL_CONCURRENCY
+        };
+        running.fetch_add(1, Ordering::SeqCst);
+        let registry = self.clone();
+        let stranded = holding.stranded.clone();
+        crate::asyncrt::spawn(async move {
+            match prepare_seed(
+                &store,
+                &prefix,
+                epoch,
+                &map,
+                &seed,
+                seed.gate,
+                &mut next_run,
+                partitions_at_a_time,
+            )
+            .await
+            {
+                Ok(job) if !abandon.load(Ordering::SeqCst) => prepared.lock().unwrap().push(job),
+                Ok(job) => {
+                    objects::delete_many(registry.store.as_ref(), &job.outputs).await;
+                }
+                Err(error) => {
+                    if let Some(Stranded(keys)) = error.downcast_ref::<Stranded>() {
+                        stranded.lock().unwrap().extend(keys.iter().cloned());
+                    }
+                    tracing::warn!(error = %format!("{error:#}"), "registry seed merge failed");
+                }
+            }
+            running.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 
     /// Delete what is due, sweep and sample, in a task of its own: none of it
@@ -1925,6 +2055,7 @@ impl Registry {
             objects::deltas_root(&self.prefix),
             objects::maps_root(&self.prefix),
             objects::runs_root(&self.prefix),
+            objects::seed_root(&self.prefix),
         ] {
             self.counters.list_requests.fetch_add(1, Ordering::Relaxed);
             let mut listing = self.store.list(Some(&Path::from(root_prefix)));

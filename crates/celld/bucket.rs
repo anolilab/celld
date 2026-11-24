@@ -583,12 +583,13 @@ impl Bucket {
         store: Arc<dyn ObjectStore>,
         paginated: Arc<dyn PaginatedListStore>,
         prefix: &str,
+        backend: StorageBackend,
     ) -> Bucket {
         Bucket {
             store: store.clone(),
             paginated,
             cas_store: store,
-            backend: StorageBackend::Local,
+            backend,
             name: "test".to_owned(),
             prefix: prefix.to_owned(),
         }

@@ -90,6 +90,8 @@ pub(crate) struct Config {
     /// Cells queued for the next segment at once; a cell over it is dropped and
     /// counted, and its first per-cell write queues it again.
     pub waiting_cap: usize,
+    /// Common prefixes one listing request of the seed asks for.
+    pub seed_page: usize,
     /// How long after a miss the sampler looks again.
     pub sampler_recheck_ms: u64,
     /// `CELLD_REGISTRY_JOB_PACING`: limit the requests and bytes per second of
@@ -159,6 +161,7 @@ impl Config {
             grace_ms: crate::registry_compactor::GRACE_MS,
             created_cap: crate::registry_writer::CREATED_CAP,
             waiting_cap: crate::registry_writer::WAITING_CAP,
+            seed_page: 1_000,
             sampler_recheck_ms: 20_000,
             job_pacing,
             pass_read: Duration::from_millis(pass_read_ms),
@@ -456,7 +459,10 @@ impl Registry {
     /// The bucket handle the seed lists cells through, when it scopes the same
     /// prefix as the registry's store.
     pub(crate) fn set_lister(&self, bucket: crate::bucket::Bucket) {
-        if bucket.prefix == self.prefix {
+        // A backend that cannot resume a listing by name (Azure) keeps the flat
+        // listing, which the seed resumes by name too: only stores whose paginated
+        // listing takes a start-after are used.
+        if bucket.prefix == self.prefix && bucket.backend != crate::bucket::StorageBackend::Azure {
             let _ = self.lister.set(bucket);
         }
     }
