@@ -73,7 +73,11 @@ async fn a_burst_of_cell_wakes_does_not_fence_the_node() {
     std::fs::create_dir_all(&node_home).expect("create the node directory");
     let log_path = node_home.join("celld.log");
     let log = std::fs::File::create(&log_path).expect("create the node log");
-    let (public, internal) = (free_port(), free_port());
+    let public = free_port();
+    // Two free ports picked one after the other can be the same one.
+    let internal = std::iter::repeat_with(free_port)
+        .find(|port| *port != public)
+        .expect("a second free port");
     let mut child = Command::new(CELLD)
         .args(["--bucket", &spec, "--endpoint", &endpoint])
         .args(["--region", &region()])
