@@ -2437,7 +2437,6 @@ async fn s16_a_declared_loss_leaves_no_agent_with_two_writers() {
 /// by a preserved restart with resident cells. A call that fails is tried on the
 /// next node. Reports the success of new ids and the time of each restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "slow (minutes) and, under load, 98.7-99.9% instead of 99.9%: a restart that takes long also fences the new ids of the other nodes. Run with --ignored"]
 async fn s8_rolling_and_preserved_restarts_under_a_stream_of_new_agents() {
     let mode: &'static str = Box::leak(
         std::env::var("LAZY_FLEET_S8_MODE")
