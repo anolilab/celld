@@ -50,6 +50,8 @@ const CHUNK_BUCKETS: u32 = 1_024;
 const RANGE_BUCKETS: u32 = 2_048;
 const SAMPLER_EVERY_MS: u64 = 60_000;
 const SAMPLER_CELLS: usize = 16;
+/// Rechecks that read `Unknown` before the sampler gives up on a cell.
+const SAMPLER_UNKNOWN_ATTEMPTS: u32 = 5;
 const SWEEP_EVERY_MS: u64 = 120_000;
 /// A budget that never runs out in practice.
 const NO_LIMIT_MS: u64 = 365 * 86_400_000;
@@ -626,7 +628,9 @@ pub(crate) async fn write_delta(
 #[derive(Default)]
 struct SamplerState {
     after: Option<String>,
-    misses: Vec<(String, u64)>,
+    /// Cells the registry did not show: the cell, when, and how many times a
+    /// recheck could not tell.
+    misses: Vec<(String, u64, u32)>,
 }
 
 struct Holding {
@@ -1567,23 +1571,42 @@ impl Registry {
             let mut state = state.lock().unwrap();
             (std::mem::take(&mut state.misses), state.after.clone())
         };
-        let mut misses: Vec<(String, u64)> = Vec::new();
-        for (cell, at) in recheck {
-            if now.saturating_sub(at) < 20_000 {
-                misses.push((cell, at));
+        let mut misses: Vec<(String, u64, u32)> = Vec::new();
+        for (cell, at, attempts) in recheck {
+            if now.saturating_sub(at) < self.cfg.sampler_recheck_ms {
+                misses.push((cell, at, attempts));
                 continue;
             }
             let key = objects::key_of(&cell);
-            if !matches!(
-                self.lookup(&key).await.answer,
-                celld_logic::lost_record::Answer::Exists(_)
-            ) {
-                self.counters.sampler_misses.fetch_add(1, Ordering::Relaxed);
-                tracing::error!(
-                    event = "registry_incomplete",
-                    cell,
-                    "the registry misses a cell that holds LTX"
-                );
+            match self.lookup(&key).await.answer {
+                celld_logic::lost_record::Answer::Exists(_) => {}
+                // Only a lookup that read everything and found nothing says the
+                // registry is incomplete.
+                celld_logic::lost_record::Answer::New => {
+                    self.counters.sampler_misses.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        event = "registry_incomplete",
+                        cell,
+                        "the registry misses a cell that holds LTX"
+                    );
+                }
+                // A read failed or the gate is closed: nothing is known, so the
+                // cell is looked at again on a later sample.
+                celld_logic::lost_record::Answer::Unknown(doubt) => {
+                    self.counters
+                        .sampler_unknown
+                        .fetch_add(1, Ordering::Relaxed);
+                    if attempts + 1 < SAMPLER_UNKNOWN_ATTEMPTS {
+                        misses.push((cell, crate::asyncrt::mono_ms(), attempts + 1));
+                    } else {
+                        tracing::warn!(
+                            event = "registry_sampler_unknown",
+                            cell,
+                            ?doubt,
+                            "the sampler could not tell whether the registry knows a cell"
+                        );
+                    }
+                }
             }
         }
         let cells_prefix = Path::from(format!("{}cells", self.prefix));
@@ -1617,7 +1640,9 @@ impl Registry {
                 self.lookup(&key).await.answer,
                 celld_logic::lost_record::Answer::Exists(_)
             ) {
-                misses.push((cell, crate::asyncrt::mono_ms()));
+                if !misses.iter().any(|(held, _, _)| *held == cell) {
+                    misses.push((cell, crate::asyncrt::mono_ms(), 0));
+                }
             }
         }
         let mut state = state.lock().unwrap();

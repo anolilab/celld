@@ -20,6 +20,7 @@ fn config() -> Config {
         enforce: true,
         grace_ms: crate::registry_compactor::GRACE_MS,
         created_cap: crate::registry_writer::CREATED_CAP,
+        sampler_recheck_ms: 20_000,
         job_pacing: false,
         pass_read: Duration::ZERO,
     }
@@ -2398,4 +2399,59 @@ fn the_registry_bound_shrinks_by_the_directory_wait_and_the_sum_stays_under_half
     assert!(wait(10_000, 6_000).is_err());
     assert_eq!(wait(5_000, 1_000).unwrap(), Duration::from_millis(500));
     assert!(wait(5_000, 2_500).is_err());
+}
+
+#[tokio::test]
+async fn the_sampler_reports_incomplete_only_on_a_definite_miss() {
+    let (scripted, plain) = scripted();
+    let view: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_with(
+        &view,
+        "node-a",
+        Config {
+            sampler_recheck_ms: 0,
+            ..config()
+        },
+    );
+    let mut holding = holder_of(&node).await;
+    // `known` is registered; `unknown` holds LTX and the registry has never heard of it.
+    for name in ["Agent:known", "Agent:unknown"] {
+        objects::put_create(
+            plain.as_ref(),
+            &format!("{PREFIX}cells/{name}/ltx/e1/0/1-1.ltx"),
+            b"x".to_vec(),
+        )
+        .await
+        .unwrap();
+    }
+    register_and_fold(&node, &mut holding, &["Agent:known".to_owned()]).await;
+    let state = Mutex::new(SamplerState {
+        after: None,
+        misses: vec![
+            ("Agent:known".to_owned(), 0, 0),
+            ("Agent:unknown".to_owned(), 0, 0),
+        ],
+    });
+    // The recheck cannot read the root: nothing is known, and nothing is reported.
+    scripted.fail("/root", true);
+    node.sample(&state).await;
+    assert_eq!(node.counters.sampler_misses.load(Ordering::Relaxed), 0);
+    assert!(node.counters.sampler_unknown.load(Ordering::Relaxed) >= 2);
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .misses
+            .iter()
+            .any(|(cell, _, _)| cell == "Agent:unknown"),
+        "the cell is tried again on a later sample"
+    );
+    // The store answers again: the known cell is fine, the other is a definite miss.
+    scripted.fail("/root", false);
+    node.sample(&state).await;
+    assert_eq!(
+        node.counters.sampler_misses.load(Ordering::Relaxed),
+        1,
+        "only the cell the registry does not hold is incomplete"
+    );
 }

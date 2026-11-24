@@ -81,6 +81,8 @@ pub(crate) struct Config {
     /// Cells whose own segment a node tracks at once; more are queued but found
     /// by a lookup during the wait.
     pub created_cap: usize,
+    /// How long after a miss the sampler looks again.
+    pub sampler_recheck_ms: u64,
     /// `CELLD_REGISTRY_JOB_PACING`: limit the requests and bytes per second of
     /// spills and base merges, so they do not stall the store the lookups read.
     pub job_pacing: bool,
@@ -147,6 +149,7 @@ impl Config {
             enforce: false,
             grace_ms: crate::registry_compactor::GRACE_MS,
             created_cap: crate::registry_writer::CREATED_CAP,
+            sampler_recheck_ms: 20_000,
             job_pacing,
             pass_read: Duration::from_millis(pass_read_ms),
         })
@@ -239,6 +242,8 @@ pub(crate) struct Counters {
     pub cap_pauses: AtomicU64,
     pub sampler_cells: AtomicU64,
     pub sampler_misses: AtomicU64,
+    /// Rechecks that could not tell (a failed read, a closed gate).
+    pub sampler_unknown: AtomicU64,
     pub mismatches: AtomicU64,
     pub bytes_written: AtomicU64,
     pub bytes_read: AtomicU64,
@@ -907,6 +912,7 @@ impl Registry {
             ("cap_pauses", &counters.cap_pauses),
             ("sampler_cells", &counters.sampler_cells),
             ("sampler_misses", &counters.sampler_misses),
+            ("sampler_unknown", &counters.sampler_unknown),
             ("mismatches", &counters.mismatches),
             ("bytes_written", &counters.bytes_written),
             ("bytes_read", &counters.bytes_read),
