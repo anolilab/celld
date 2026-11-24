@@ -1095,12 +1095,12 @@ async fn a_pending_grant_of_a_lazy_cell_wakes_at_epoch_two() {
         assert_eq!(record["epoch"], 2, "{record}");
         assert!(record["leave"].is_string(), "{record}");
         assert_eq!(record["by"], tag);
-        let chunk = fleet
-            .object(&format!("fleet/sessions/{tag}/c/0"))
-            .await
-            .unwrap();
-        let left = &chunk["left"][counter.to_string()];
-        assert_eq!(left["done"], record["leave"], "{chunk}");
+        // The marks reach the chunk by the checkpoint.
+        wait_until("the left entry", Duration::from_secs(30), || async {
+            let chunk = fleet.object(&format!("fleet/sessions/{tag}/c/0")).await?;
+            (chunk["left"][counter.to_string()]["done"] == record["leave"]).then_some(())
+        })
+        .await;
         fleet
     })
     .await;
@@ -1149,6 +1149,75 @@ async fn a_drain_gives_a_lazy_cell_its_record_before_the_release() {
             .unwrap();
         let left = &chunk["left"][counter.to_string()];
         assert!(left["done"].is_string(), "the leave is confirmed: {chunk}");
+        fleet
+    })
+    .await;
+}
+
+/// A leave that only the followers' log and the bundles know (no checkpoint has
+/// written it) is sealed into the chunk by the recoverer: the taker finds the
+/// confirmed left entry that matches the leave-form record, and takes the cell
+/// at the next epoch with the acknowledged write.
+#[tokio::test]
+async fn a_leave_that_only_the_followers_hold_is_sealed_into_the_chunk() {
+    let env: &[(&str, &str)] = &[
+        ("CELLD_LAZY_BIRTH", "on"),
+        ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "600000"),
+        ("CELLD_LAZY_BIRTH_PROOF_WAIT_MS", "1"),
+    ];
+    let Some(fleet) = Fleet::start("do-ids", 3, env).await else {
+        return;
+    };
+    with_fleet(fleet, |mut fleet| async move {
+        wait_for_ensemble(&fleet).await;
+        let minted = fleet.get_json(0, "/mint").await.expect("mint");
+        let id = minted["ids"][0].as_str().unwrap().to_string();
+        let tag = id[..16].to_string();
+        let header = fleet
+            .object(&format!("fleet/sessions/{tag}.json"))
+            .await
+            .expect("the header");
+        let counter = counter_of(&header, &id);
+        assert!(fleet.get_json(0, &format!("/bump?id={id}")).await.is_none());
+        let woken = wait_until("the cell to wake", Duration::from_secs(30), || async {
+            fleet.get_json(0, &format!("/bump?id={id}")).await
+        })
+        .await;
+        assert_eq!(woken["n"], 1);
+        let record = fleet
+            .object(&format!("cells/Cell:{id}/own.json"))
+            .await
+            .expect("the leave-form record");
+        let chunk = fleet
+            .object(&format!("fleet/sessions/{tag}/c/0"))
+            .await
+            .unwrap();
+        assert!(
+            chunk["left"][counter.to_string()].is_null(),
+            "no checkpoint ran: {chunk}"
+        );
+        fleet.nodes[0].kill();
+        let out = wait_until(
+            "a peer to take the cell",
+            Duration::from_secs(180),
+            || async {
+                for node in [1, 2] {
+                    if let Some(out) = fleet.get_json(node, &format!("/bump?id={id}")).await {
+                        return Some(out);
+                    }
+                }
+                None
+            },
+        )
+        .await;
+        assert_eq!(out["n"], 2);
+        let chunk = fleet
+            .object(&format!("fleet/sessions/{tag}/c/0"))
+            .await
+            .unwrap();
+        let left = &chunk["left"][counter.to_string()];
+        assert_eq!(left["done"], record["leave"], "{chunk}");
+        assert_eq!(chunk["state"], "sealed");
         fleet
     })
     .await;

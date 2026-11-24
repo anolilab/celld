@@ -941,7 +941,7 @@ fn credit_percell_upload(handle: &Cell, txid: u64) {
 #[derive(Default)]
 struct ShipBatch {
     cells: Vec<(CellHandle, u64)>,
-    marks: Vec<u64>,
+    marks: Vec<crate::session::MarkRef>,
 }
 
 fn ship_batch_covered(cells: &[(CellHandle, u64)]) -> bool {
@@ -5152,15 +5152,23 @@ async fn ship_loop(
         if credits.is_empty() && marks.is_empty() {
             continue;
         }
-        let mut mark_waiters: Vec<(u64, tokio::sync::oneshot::Sender<bool>)> = Vec::new();
+        let mut mark_waiters: Vec<(crate::session::MarkRef, tokio::sync::oneshot::Sender<bool>)> =
+            Vec::new();
         for mark in marks {
+            let (epoch, bytes) = mark.kind.encode();
             entries.push(ShipEntry {
                 cell: mark.scope,
-                epoch: 1,
+                epoch,
                 txid: crate::node_log::MARK_TXID,
-                bytes: vec![b'G'],
+                bytes,
             });
-            mark_waiters.push((mark.counter, mark.done));
+            mark_waiters.push((
+                crate::session::MarkRef {
+                    counter: mark.counter,
+                    kind: mark.kind,
+                },
+                mark.done,
+            ));
         }
         ledger.advance(|batch| {
             ship_batch_covered(&batch.cells) && crate::session::marks_checkpointed(&batch.marks)
@@ -5230,7 +5238,7 @@ enum ShipRoundCompletion {
 /// One pipelined round's completion, applied strictly in submission order.
 struct ShipRound {
     /// The marks of this round and who waits for their fleet proof.
-    marks: Vec<(u64, tokio::sync::oneshot::Sender<bool>)>,
+    marks: Vec<(crate::session::MarkRef, tokio::sync::oneshot::Sender<bool>)>,
     completion: ShipRoundCompletion,
     credits: Vec<(CellHandle, u64, u64)>,
     covered_seq: u64,
@@ -5284,11 +5292,16 @@ fn apply_round(
                             .iter()
                             .map(|(handle, _, position)| (handle.clone(), *position))
                             .collect(),
-                        marks: marks.iter().map(|(counter, _)| *counter).collect(),
+                        marks: marks.iter().map(|(mark, _)| mark.clone()).collect(),
                     },
                 );
             }
-            for (_, waiter) in marks {
+            for (mark, waiter) in marks {
+                // A mark that a fleet proof covers is the session's own fact now:
+                // a checkpoint writes it into the chunk.
+                if let Some(session) = crate::session::current() {
+                    session.note_mark(mark.counter, &mark.kind);
+                }
                 let _ = waiter.send(true);
             }
             Some(last_seq)

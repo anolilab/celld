@@ -91,6 +91,12 @@ pub struct Session {
     claimed: Mutex<BTreeSet<u64>>,
     /// The cells that left this session with a confirmed left entry in a chunk.
     left: Mutex<BTreeSet<u64>>,
+    /// The left entries of the cells that announced a leave, as the session's
+    /// marks and its chunk writes make them: a checkpoint writes them into the
+    /// chunks.
+    pub(crate) left_memory: Mutex<BTreeMap<u64, store::Left>>,
+    /// The left entries that a chunk in the bucket holds.
+    pub(crate) left_written: Mutex<BTreeMap<u64, store::Left>>,
     /// The ids whose first request was already decided: the session grants an id
     /// at its first request or never, so a waived id is never granted later and a
     /// rejected birth write is followed by a real read.
@@ -157,6 +163,8 @@ impl Session {
             checkpointed: Mutex::default(),
             granted_scopes: Mutex::default(),
             claimed: Mutex::default(),
+            left_memory: Mutex::default(),
+            left_written: Mutex::default(),
             decided: Mutex::default(),
             births: Mutex::default(),
             left: Mutex::default(),
@@ -442,24 +450,76 @@ async fn wait_with(session: &Session, scope: &str) -> anyhow::Result<()> {
     anyhow::bail!("the grant of {scope} is not in a chunk")
 }
 
-/// A `Grant` that waits for its fleet proof: the cell, its counter, and the
-/// channel that the ship loop answers when the round that carried it completed.
+/// What a mark of the session says. A mark is an entry of the followers' log and
+/// of a bundle with no row behind it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MarkKind {
+    /// The id was granted.
+    Grant,
+    /// The session announced a leave at `epoch` under `nonce`.
+    Leaving { epoch: u64, nonce: String },
+    /// The record that carries `nonce` applied.
+    Left { nonce: String },
+}
+
+impl MarkKind {
+    /// The epoch of the entry and its bytes.
+    pub(crate) fn encode(&self) -> (u64, Vec<u8>) {
+        match self {
+            Self::Grant => (1, vec![b'G']),
+            Self::Leaving { epoch, nonce } => (*epoch, [&b"L"[..], nonce.as_bytes()].concat()),
+            Self::Left { nonce } => (1, [&b"D"[..], nonce.as_bytes()].concat()),
+        }
+    }
+
+    /// The mark of an entry. A bundle writes a `Grant` with no bytes.
+    pub(crate) fn decode(epoch: u64, bytes: &[u8]) -> Option<Self> {
+        let nonce = |rest: &[u8]| String::from_utf8(rest.to_vec()).ok();
+        match bytes.split_first() {
+            None | Some((b'G', _)) => Some(Self::Grant),
+            Some((b'L', rest)) => Some(Self::Leaving {
+                epoch,
+                nonce: nonce(rest)?,
+            }),
+            Some((b'D', rest)) => Some(Self::Left {
+                nonce: nonce(rest)?,
+            }),
+            Some(_) => None,
+        }
+    }
+}
+
+/// A mark of one cell of this session, by counter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MarkRef {
+    pub counter: u64,
+    pub kind: MarkKind,
+}
+
+/// A mark that waits for its fleet proof: the cell, its counter, what it says,
+/// and the channel that the ship loop answers when the round that carried it
+/// completed.
 pub(crate) struct PendingMark {
     pub scope: String,
     pub counter: u64,
+    pub kind: MarkKind,
     pub done: tokio::sync::oneshot::Sender<bool>,
 }
 
 static MARKS: Mutex<Vec<PendingMark>> = Mutex::new(Vec::new());
 
-/// Queue the `Grant` of `scope` for the next ship round. The answer is `true`
-/// when every member of the ensemble confirmed it, `false` when the round
-/// failed.
-pub(crate) fn enqueue_mark(scope: &str, counter: u64) -> tokio::sync::oneshot::Receiver<bool> {
+/// Queue a mark of `scope` for the next ship round. The answer is `true` when
+/// every member of the ensemble confirmed it, `false` when the round failed.
+pub(crate) fn enqueue_mark(
+    scope: &str,
+    counter: u64,
+    kind: MarkKind,
+) -> tokio::sync::oneshot::Receiver<bool> {
     let (done, wait) = tokio::sync::oneshot::channel();
     MARKS.lock().expect("marks poisoned").push(PendingMark {
         scope: scope.to_string(),
         counter,
+        kind,
         done,
     });
     wait
@@ -473,14 +533,13 @@ pub(crate) fn marks_pending() -> bool {
     !MARKS.lock().expect("marks poisoned").is_empty()
 }
 
-/// Whether the bit of every counter is in a chunk in the bucket. A follower
-/// may truncate a batch with marks only then.
-pub(crate) fn marks_checkpointed(counters: &[u64]) -> bool {
-    counters.is_empty()
-        || current().is_none_or(|session| {
-            let written = session.checkpointed.lock().expect("checkpointed poisoned");
-            counters.iter().all(|counter| written.contains(counter))
-        })
+/// Whether every mark is in a chunk in the bucket: a bit for a `Grant`, a left
+/// entry that names the nonce of a `Leaving`, a confirmed one for a `Left`. A
+/// follower may truncate a batch with marks, and a bundle with marks may be
+/// released, only then.
+pub(crate) fn marks_checkpointed(marks: &[MarkRef]) -> bool {
+    marks.is_empty()
+        || current().is_none_or(|session| marks.iter().all(|mark| session.mark_in_chunk(mark)))
 }
 
 /// How often the session writes the chunks that changed.
@@ -799,6 +858,106 @@ impl Session {
             .lock()
             .expect("checkpointed poisoned")
             .extend(chunk.granted.iter().copied());
+        self.left_written
+            .lock()
+            .expect("left written poisoned")
+            .extend(chunk.left.iter().map(|(c, l)| (*c, l.clone())));
+    }
+
+    /// Whether the chunk in the bucket holds what `mark` says.
+    pub(crate) fn mark_in_chunk(&self, mark: &MarkRef) -> bool {
+        match &mark.kind {
+            MarkKind::Grant => self.is_checkpointed(mark.counter),
+            MarkKind::Leaving { nonce, .. } => self
+                .left_written
+                .lock()
+                .expect("left written poisoned")
+                .get(&mark.counter)
+                .is_some_and(|left| left.nonces.contains(nonce)),
+            MarkKind::Left { nonce } => self
+                .left_written
+                .lock()
+                .expect("left written poisoned")
+                .get(&mark.counter)
+                .is_some_and(|left| left.done.as_ref() == Some(nonce)),
+        }
+    }
+
+    /// A mark that a fleet proof covers says this about the cell: the session
+    /// holds it, and a checkpoint writes it into the chunk.
+    pub(crate) fn note_mark(&self, counter: u64, kind: &MarkKind) {
+        let mut memory = self.left_memory.lock().expect("left memory poisoned");
+        match kind {
+            MarkKind::Grant => return,
+            MarkKind::Leaving { epoch, nonce } => {
+                let entry = memory.entry(counter).or_insert_with(|| store::Left {
+                    epoch: *epoch,
+                    nonces: Vec::new(),
+                    done: None,
+                });
+                if !entry.nonces.contains(nonce) {
+                    entry.nonces.push(nonce.clone());
+                }
+                entry.epoch = *epoch;
+            }
+            MarkKind::Left { nonce } => {
+                if let Some(entry) = memory.get_mut(&counter) {
+                    entry.done = Some(nonce.clone());
+                }
+            }
+        }
+        drop(memory);
+        self.dirty
+            .lock()
+            .expect("dirty poisoned")
+            .insert(counter / CHUNK);
+    }
+
+    /// The left entries that no chunk holds yet, with the cell of each: a bundle
+    /// carries them with its rows, so a recoverer that finds the bundle finds
+    /// the mark.
+    pub(crate) fn unchecked_left_marks(&self) -> Vec<(MarkRef, String)> {
+        let memory = self.left_memory.lock().expect("left memory poisoned");
+        let scopes = self.granted_scopes.lock().expect("granted scopes poisoned");
+        let mut out = Vec::new();
+        for (counter, left) in memory.iter() {
+            let Some(scope) = scopes.get(counter) else {
+                continue;
+            };
+            for nonce in &left.nonces {
+                let kind = MarkKind::Leaving {
+                    epoch: left.epoch,
+                    nonce: nonce.clone(),
+                };
+                let mark = MarkRef {
+                    counter: *counter,
+                    kind,
+                };
+                if !self.mark_in_chunk(&mark) {
+                    out.push((mark, scope.clone()));
+                }
+            }
+            if let Some(done) = &left.done {
+                let mark = MarkRef {
+                    counter: *counter,
+                    kind: MarkKind::Left {
+                        nonce: done.clone(),
+                    },
+                };
+                if !self.mark_in_chunk(&mark) {
+                    out.push((mark, scope.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// The left entries of the session, for its seal.
+    pub(crate) fn left_entries(&self) -> BTreeMap<u64, store::Left> {
+        self.left_memory
+            .lock()
+            .expect("left memory poisoned")
+            .clone()
     }
 
     pub(crate) fn has_left(&self, counter: u64) -> bool {
@@ -889,6 +1048,13 @@ impl Session {
             let mut next = current.clone();
             next.granted
                 .extend(granted.range(chunk * CHUNK..(chunk + 1) * CHUNK));
+            // The left entries that the marks made: the chunk holds them, so the
+            // bundles and the followers' batches that carry the marks may go.
+            let lefts = self.left_entries();
+            for (counter, left) in lefts.range(chunk * CHUNK..(chunk + 1) * CHUNK) {
+                next.granted.insert(*counter);
+                store::merge_left(&mut next.left, *counter, left);
+            }
             if next == current {
                 self.dirty.lock().expect("dirty poisoned").remove(&chunk);
                 continue;
@@ -896,10 +1062,7 @@ impl Session {
             next.rev += 1;
             match store::swap_chunk(bucket, &tag, chunk, &next, &token).await? {
                 Some(token) => {
-                    self.checkpointed
-                        .lock()
-                        .expect("checkpointed poisoned")
-                        .extend(next.granted.iter().copied());
+                    self.note_chunk_written(&next);
                     held.chunks.insert(chunk, (next, token));
                     self.dirty.lock().expect("dirty poisoned").remove(&chunk);
                 }
@@ -926,7 +1089,15 @@ impl Session {
         self.closed.store(true, Ordering::SeqCst);
         let gather = self.granted.lock().expect("granted poisoned").clone();
         let tag = self.tag();
-        store::seal_session(bucket, &tag, &gather, &BTreeSet::new()).await?;
+        store::seal_session(
+            bucket,
+            &tag,
+            &gather,
+            &BTreeSet::new(),
+            &self.left_entries(),
+            &BTreeMap::new(),
+        )
+        .await?;
         // A chunk that a rival sealed first keeps its own content: only when
         // every bit this session holds is in a sealed chunk may a held write
         // go on.
@@ -962,7 +1133,15 @@ pub async fn seal_predecessor(bucket: &Bucket, node: &str, generation: &str) -> 
     let lease: crate::ownership_store::NodeLeaseWire = serde_json::from_slice(&bytes)?;
     match lease.session {
         Some(session) if lease.generation != generation => {
-            store::seal_session(bucket, &session.tag, &BTreeSet::new(), &BTreeSet::new()).await
+            store::seal_session(
+                bucket,
+                &session.tag,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            )
+            .await
         }
         _ => Ok(()),
     }
@@ -997,6 +1176,8 @@ pub async fn prepare_reload(
             // in a chunk, before the log is sealed. After the seal the leave
             // cannot be announced.
             ownership.leave_cell(session, &cell.id, cell.epoch).await?;
+            // The trace in a chunk, before the log is sealed.
+            session.write_left_trace(&bucket, &cell.id).await?;
         } else if session.is_claimed_scope(&cell.id) {
             session.confirm_left(&bucket, &cell.id).await?;
         } else if session.is_granted(counter) {

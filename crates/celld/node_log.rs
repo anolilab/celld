@@ -325,7 +325,7 @@ struct BundleIndex {
     evicted: BTreeMap<(String, u64), u64>,
     /// The counters of the `Grant` marks that each bundle carries. Bundle GC
     /// keeps a bundle until every one of them is in a chunk.
-    marks: HashMap<String, Vec<u64>>,
+    marks: HashMap<String, Vec<crate::session::MarkRef>>,
 }
 
 /// One cell epoch's view of the index. The rows, the evicted bundles, and
@@ -431,13 +431,13 @@ impl BundleIndex {
         }
     }
 
-    fn set_marks(&mut self, key: &str, counters: Vec<u64>) {
-        if !counters.is_empty() {
-            self.marks.insert(key.to_string(), counters);
+    fn set_marks(&mut self, key: &str, marks: Vec<crate::session::MarkRef>) {
+        if !marks.is_empty() {
+            self.marks.insert(key.to_string(), marks);
         }
     }
 
-    fn marks_of(&self, key: &str) -> Vec<u64> {
+    fn marks_of(&self, key: &str) -> Vec<crate::session::MarkRef> {
         self.marks.get(key).cloned().unwrap_or_default()
     }
 
@@ -5031,6 +5031,8 @@ impl NodeLogManager {
             let mut gathered: BTreeMap<(String, u64, u64), Vec<u8>> = BTreeMap::new();
             // The cells whose `Grant` the followers hold.
             let mut granted_marks: BTreeSet<String> = BTreeSet::new();
+            // The leaves that the followers and the bundles announced or confirmed.
+            let mut left_marks: BTreeMap<String, crate::session_store::Left> = BTreeMap::new();
             // "A blink is not death" applies to loss declaration too: a
             // member whose lease merely lapsed (a restart, a fleet-wide
             // power cycle) is NOT conclusively gone — its fsync'd fragments
@@ -5188,7 +5190,13 @@ impl NodeLogManager {
                 }
                 for entry in tail.entries {
                     if entry.is_mark() {
-                        granted_marks.insert(entry.cell);
+                        note_gathered_mark(
+                            &mut granted_marks,
+                            &mut left_marks,
+                            entry.cell,
+                            entry.cell_epoch,
+                            &entry.bytes,
+                        );
                         continue;
                     }
                     gathered.insert((entry.cell, entry.cell_epoch, entry.txid), entry.bytes);
@@ -5324,10 +5332,17 @@ impl NodeLogManager {
                     let (key, bytes) = fetched?;
                     let rows = celld_ltx::bundle::decode_rows(&bytes)
                         .with_context(|| format!("decode retained recovery bundle {key}"))?;
-                    granted_marks.extend(
-                        celld_ltx::bundle::decode_marks(&bytes)
-                            .with_context(|| format!("decode the marks of bundle {key}"))?,
-                    );
+                    for (cell, epoch, mark_bytes) in celld_ltx::bundle::decode_mark_entries(&bytes)
+                        .with_context(|| format!("decode the marks of bundle {key}"))?
+                    {
+                        note_gathered_mark(
+                            &mut granted_marks,
+                            &mut left_marks,
+                            cell,
+                            epoch,
+                            &mark_bytes,
+                        );
+                    }
                     for row in rows {
                         let payload = celld_ltx::bundle::slice(&bytes, &row)
                             .with_context(|| format!("read a row from recovery bundle {key}"))?;
@@ -5385,6 +5400,8 @@ impl NodeLogManager {
                     &session.tag,
                     &BTreeSet::new(),
                     &granted_marks,
+                    &BTreeMap::new(),
+                    &left_marks,
                 )
                 .await?;
             }
@@ -6335,15 +6352,16 @@ impl NodeLogManager {
                     };
                     // A bundle that this process did not index: its marks are
                     // in its footer.
-                    if let (Some(session), Ok(cells)) = (
+                    if let (Some(session), Ok(entries)) = (
                         crate::session::current(),
-                        celld_ltx::bundle::decode_marks(&bytes),
+                        celld_ltx::bundle::decode_mark_entries(&bytes),
                     ) {
-                        marks.extend(
-                            cells
-                                .iter()
-                                .filter_map(|cell| session.own_counter_of_scope(cell)),
-                        );
+                        marks.extend(entries.iter().filter_map(|(cell, epoch, bytes)| {
+                            Some(crate::session::MarkRef {
+                                counter: session.own_counter_of_scope(cell)?,
+                                kind: crate::session::MarkKind::decode(*epoch, bytes)?,
+                            })
+                        }));
                     }
                     match celld_ltx::bundle::decode_rows(&bytes) {
                         Ok(rows) => rows,
@@ -6719,18 +6737,33 @@ impl NodeLogManager {
         // The `Grant` marks that no chunk holds yet ride the bundle with its
         // rows, as entries with no bytes.
         let mut entries = entries;
-        let mark_counters: Vec<u64> = match crate::session::current() {
+        let mark_refs: Vec<crate::session::MarkRef> = match crate::session::current() {
             Some(session) => {
-                let marks = session.unchecked_mark_scopes();
-                for (_, scope) in &marks {
+                let mut refs = Vec::new();
+                for (counter, scope) in session.unchecked_mark_scopes() {
                     entries.push(celld_ltx::bundle::BundleEntry {
-                        cell: scope.clone(),
+                        cell: scope,
                         cell_epoch: 1,
                         txid: celld_ltx::bundle::MARK_TXID,
                         bytes: Vec::new(),
                     });
+                    refs.push(crate::session::MarkRef {
+                        counter,
+                        kind: crate::session::MarkKind::Grant,
+                    });
                 }
-                marks.into_iter().map(|(counter, _)| counter).collect()
+                // The left entries that no chunk holds ride the bundle too.
+                for (mark, scope) in session.unchecked_left_marks() {
+                    let (epoch, bytes) = mark.kind.encode();
+                    entries.push(celld_ltx::bundle::BundleEntry {
+                        cell: scope,
+                        cell_epoch: epoch,
+                        txid: celld_ltx::bundle::MARK_TXID,
+                        bytes,
+                    });
+                    refs.push(mark);
+                }
+                refs
             }
             None => Vec::new(),
         };
@@ -6789,7 +6822,7 @@ impl NodeLogManager {
                 }
                 {
                     let mut index = self.bundle_index.lock().unwrap();
-                    index.set_marks(&key, mark_counters);
+                    index.set_marks(&key, mark_refs);
                     index.insert(key, rows);
                 }
                 true
@@ -7234,5 +7267,56 @@ mod mark_wire_tests {
         encode_entry(&row(), &mut out);
         out[..4].copy_from_slice(b"CLG1");
         assert!(decode_entry(&mut out.as_slice()).is_err());
+    }
+}
+
+/// Sort a mark that a recoverer found into the grants and the left entries it
+/// seals. A leave is announced before it is confirmed, so a confirmation counts
+/// only for a nonce that was announced, in the seal's merge.
+fn note_gathered_mark(
+    granted: &mut BTreeSet<String>,
+    lefts: &mut BTreeMap<String, crate::session_store::Left>,
+    cell: String,
+    epoch: u64,
+    bytes: &[u8],
+) {
+    use crate::session::MarkKind;
+    match MarkKind::decode(epoch, bytes) {
+        Some(MarkKind::Grant) | None => {
+            granted.insert(cell);
+        }
+        Some(MarkKind::Leaving { epoch, nonce }) => {
+            let entry = lefts
+                .entry(cell.clone())
+                .or_insert_with(|| crate::session_store::Left {
+                    epoch,
+                    nonces: Vec::new(),
+                    done: None,
+                });
+            if !entry.nonces.contains(&nonce) && entry.nonces.len() < 4 {
+                entry.nonces.push(nonce);
+            }
+            entry.epoch = epoch;
+            granted.insert(cell);
+        }
+        Some(MarkKind::Left { nonce }) => {
+            if let Some(entry) = lefts.get_mut(&cell) {
+                if entry.nonces.contains(&nonce) {
+                    entry.done = Some(nonce);
+                }
+            } else {
+                // Its announcement is in another tail: keep the confirmation
+                // until the nonces are united.
+                lefts.insert(
+                    cell.clone(),
+                    crate::session_store::Left {
+                        epoch: 0,
+                        nonces: vec![nonce.clone()],
+                        done: Some(nonce),
+                    },
+                );
+            }
+            granted.insert(cell);
+        }
     }
 }

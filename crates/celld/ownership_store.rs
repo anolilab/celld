@@ -449,7 +449,7 @@ const MARKS_GATE_MS: u64 = 5_000;
 
 /// How long a record waits for the fleet proof of its `Grant`
 /// (`CELLD_LAZY_BIRTH_PROOF_WAIT_MS`, 10 s by default).
-fn mark_proof_wait() -> std::time::Duration {
+pub(crate) fn mark_proof_wait() -> std::time::Duration {
     std::time::Duration::from_millis(
         std::env::var("CELLD_LAZY_BIRTH_PROOF_WAIT_MS")
             .ok()
@@ -1088,7 +1088,12 @@ impl BucketOwnership {
         // A lazy cell has no record to release: it gets one first, and its leave
         // is confirmed in the chunk before the release starts.
         if let Some(session) = crate::session::current().filter(|s| s.is_lazy_scope(cell)) {
-            session.leave(&self.bucket, &self.node, cell, epoch).await?;
+            self.leave_cell(session, cell, epoch).await?;
+        }
+        // Step 4 of the leave: the chunk holds the confirmed left entry before the
+        // release starts.
+        if let Some(session) = crate::session::current() {
+            session.write_left_trace(&self.bucket, cell).await?;
         }
         let Some((current, form)) = self.read_owner_form(cell).await? else {
             return Ok(CasOutcome::Rejected);
@@ -1216,7 +1221,10 @@ impl BucketOwnership {
             self.all_leases_capable().await,
             "a lease lacks the capability: the leave of {cell} is not written"
         );
-        session.leave(&self.bucket, &self.node, cell, epoch).await
+        let via_marks = self.marks_allowed().await;
+        session
+            .leave(&self.bucket, &self.node, cell, epoch, via_marks)
+            .await
     }
 
     /// Whether every live lease advertises the session capability. A first-form
@@ -1307,7 +1315,7 @@ impl BucketOwnership {
         counter: u64,
     ) -> anyhow::Result<()> {
         session.grant_scope(cell);
-        let proof = crate::session::enqueue_mark(cell, counter);
+        let proof = crate::session::enqueue_mark(cell, counter, crate::session::MarkKind::Grant);
         if let Ok(Ok(true)) = crate::asyncrt::timeout(mark_proof_wait(), proof).await {
             return Ok(());
         }

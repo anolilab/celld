@@ -76,6 +76,32 @@ pub struct Left {
     pub done: Option<String>,
 }
 
+/// Add what the session knows of a leave to the left entry that a chunk holds. A
+/// confirmed entry is final; otherwise the nonces are united (at most four) and a
+/// confirmation that names one of them is taken.
+pub fn merge_left(into: &mut BTreeMap<u64, Left>, counter: u64, add: &Left) {
+    let Some(have) = into.get_mut(&counter) else {
+        into.insert(counter, add.clone());
+        return;
+    };
+    if have.done.is_some() {
+        return;
+    }
+    for nonce in &add.nonces {
+        if !have.nonces.contains(nonce) && have.nonces.len() < 4 {
+            have.nonces.push(nonce.clone());
+        }
+    }
+    have.epoch = add.epoch;
+    if add
+        .done
+        .as_ref()
+        .is_some_and(|done| have.nonces.contains(done))
+    {
+        have.done = add.done.clone();
+    }
+}
+
 /// How a write of a nonce into the taken table of a chunk ended.
 #[derive(Debug, Eq, PartialEq)]
 pub enum Marked {
@@ -264,6 +290,7 @@ async fn seal_chunk(
     tag: &str,
     chunk: u64,
     gather: &BTreeSet<u64>,
+    lefts: &BTreeMap<u64, Left>,
 ) -> anyhow::Result<()> {
     for _ in 0..6 {
         match read_chunk(bucket, tag, chunk).await? {
@@ -274,6 +301,11 @@ async fn seal_chunk(
                 sealed
                     .granted
                     .extend(gather.range(chunk * CHUNK..(chunk + 1) * CHUNK));
+                // A left entry implies the granted bit.
+                for (counter, left) in lefts.range(chunk * CHUNK..(chunk + 1) * CHUNK) {
+                    sealed.granted.insert(*counter);
+                    merge_left(&mut sealed.left, *counter, left);
+                }
                 sealed.rev += 1;
                 if swap_chunk(bucket, tag, chunk, &sealed, &token)
                     .await?
@@ -391,6 +423,8 @@ pub async fn seal_session(
     tag: &str,
     gather: &BTreeSet<u64>,
     marks: &BTreeSet<String>,
+    lefts: &BTreeMap<u64, Left>,
+    left_marks: &BTreeMap<String, Left>,
 ) -> anyhow::Result<()> {
     let mut closed: Option<Header> = None;
     for _ in 0..6 {
@@ -435,8 +469,16 @@ pub async fn seal_session(
     let header = closed.with_context(|| format!("closing {} lost every race", header_key(tag)))?;
     let mut gather = gather.clone();
     gather.extend(counters_of_marks(&header, tag, marks));
+    // The left entries that the sealer found as marks, by counter.
+    let mut lefts = lefts.clone();
+    for (scope, left) in left_marks {
+        let scopes = BTreeSet::from([scope.clone()]);
+        for counter in counters_of_marks(&header, tag, &scopes) {
+            merge_left(&mut lefts, counter, left);
+        }
+    }
     for chunk in 0..header.chunks {
-        seal_chunk(bucket, tag, chunk, &gather).await?;
+        seal_chunk(bucket, tag, chunk, &gather, &lefts).await?;
     }
     for _ in 0..6 {
         match read_header(bucket, tag).await? {

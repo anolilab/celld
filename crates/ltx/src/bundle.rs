@@ -113,6 +113,21 @@ pub fn decode_marks(bundle: &[u8]) -> Result<Vec<String>> {
         .collect())
 }
 
+/// The marks a bundle carries, each with the epoch of its entry and its bytes,
+/// which say what kind of mark it is.
+pub fn decode_mark_entries(bundle: &[u8]) -> Result<Vec<(String, u64, Vec<u8>)>> {
+    let rows: Vec<BundleRow> = decode_footer(bundle)?
+        .into_iter()
+        .filter(|row| row.txid == MARK_TXID)
+        .collect();
+    rows.into_iter()
+        .map(|row| {
+            let bytes = slice(bundle, &row)?.to_vec();
+            Ok((row.cell, row.cell_epoch, bytes))
+        })
+        .collect()
+}
+
 fn decode_footer(bundle: &[u8]) -> Result<Vec<BundleRow>> {
     let (_, mut footer) = split_data_and_footer(bundle)?;
     let mut rows = Vec::new();

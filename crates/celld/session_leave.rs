@@ -16,7 +16,7 @@
 //! taker finds an open left entry and takes the cell at the next epoch.
 
 use crate::bucket::Bucket;
-use crate::session::{hex, Session};
+use crate::session::{hex, MarkKind, Session};
 use crate::session_store::{self as store, Chunk, CHUNK};
 use anyhow::Context;
 use std::sync::{Arc, Mutex};
@@ -37,6 +37,17 @@ pub(crate) struct Edits {
 /// The most announcements of one leave: a nonce whose record may or may not have
 /// applied is never reused.
 const ANNOUNCEMENTS: usize = 4;
+
+/// How long a leave waits for the fleet proof of one of its marks
+/// (`CELLD_LAZY_BIRTH_LEAVE_WAIT_MS`, 10 s by default).
+fn leave_proof_wait() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("CELLD_LAZY_BIRTH_LEAVE_WAIT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10_000),
+    )
+}
 
 fn new_nonce() -> String {
     let mut bytes = [0_u8; 8];
@@ -134,15 +145,64 @@ impl Session {
         anyhow::bail!("the write of chunk {chunk} lost every race")
     }
 
-    /// Leave the lazy state of the cell `scope` at `epoch`: the four steps of
-    /// the leave, with the chunk as the proof of each. After it the cell has a
-    /// leave-form record that names this session and a confirmed left entry.
+    /// Announce or confirm a leave: as a mark that a fleet proof covers when the
+    /// node log has an ensemble, otherwise as an edit of the chunk.
+    async fn say(
+        &self,
+        bucket: &Bucket,
+        scope: &str,
+        counter: u64,
+        kind: MarkKind,
+        via_marks: bool,
+    ) -> anyhow::Result<()> {
+        if via_marks {
+            let proof = crate::session::enqueue_mark(scope, counter, kind.clone());
+            match crate::asyncrt::timeout(leave_proof_wait(), proof).await {
+                Ok(Ok(true)) => return Ok(()),
+                _ => anyhow::bail!("no fleet proof of the leave of {scope}: it is tried again"),
+            }
+        }
+        let chunk = counter / CHUNK;
+        let said = kind.clone();
+        self.edit_chunk(bucket, chunk, move |chunk| {
+            chunk.granted.insert(counter);
+            match &kind {
+                MarkKind::Leaving { epoch, nonce } => {
+                    let add = store::Left {
+                        epoch: *epoch,
+                        nonces: vec![nonce.clone()],
+                        done: None,
+                    };
+                    store::merge_left(&mut chunk.left, counter, &add);
+                }
+                MarkKind::Left { nonce } => {
+                    if let Some(left) = chunk.left.get_mut(&counter) {
+                        if left.nonces.contains(nonce) {
+                            left.done = Some(nonce.clone());
+                        }
+                    }
+                }
+                MarkKind::Grant => {}
+            }
+        })
+        .await?;
+        self.note_mark(counter, &said);
+        Ok(())
+    }
+
+    /// Leave the lazy state of the cell `scope` at `epoch`: the steps of the
+    /// leave. After it the cell has a leave-form record that names this session
+    /// and a confirmed left entry (in the followers' log and the session's
+    /// memory, and in a chunk before any release). An attempt that failed is
+    /// resumed by the next call: the nonces it announced stay in the left entry,
+    /// and a record that carries one of them is confirmed, not written again.
     pub(crate) async fn leave(
         &self,
         bucket: &Bucket,
         node: &str,
         scope: &str,
         epoch: u64,
+        via_marks: bool,
     ) -> anyhow::Result<()> {
         let Some(counter) = self.own_counter_of_scope(scope) else {
             return Ok(());
@@ -154,25 +214,34 @@ impl Session {
             !self.is_closed(),
             "the session closed before the leave of {scope}"
         );
-        let chunk = counter / CHUNK;
         let key = format!("cells/{scope}/own.json");
-        let mut nonces: Vec<String> = Vec::new();
-        for _ in 0..ANNOUNCEMENTS {
+        let mut nonces = self.announced(counter);
+        // A record that an earlier attempt wrote: confirm its nonce.
+        if !nonces.is_empty() {
+            if let Ok(Some((by, Some(leave)))) =
+                crate::ownership_store::read_record_form(bucket, &key).await
+            {
+                if by == self.tag() && nonces.contains(&leave) {
+                    return self
+                        .confirm_leave(bucket, scope, counter, leave, via_marks)
+                        .await;
+                }
+            }
+        }
+        while nonces.len() < ANNOUNCEMENTS {
             let nonce = new_nonce();
             nonces.push(nonce.clone());
-            // 1. Announce: the left entry names every nonce that may have applied.
-            let announced = nonces.clone();
-            self.edit_chunk(bucket, chunk, move |chunk| {
-                chunk.granted.insert(counter);
-                chunk.left.insert(
-                    counter,
-                    store::Left {
-                        epoch,
-                        nonces: announced.clone(),
-                        done: None,
-                    },
-                );
-            })
+            // 1. Announce.
+            self.say(
+                bucket,
+                scope,
+                counter,
+                MarkKind::Leaving {
+                    epoch,
+                    nonce: nonce.clone(),
+                },
+                via_marks,
+            )
             .await?;
             // 2. Write the record, once.
             let body = serde_json::to_vec(&crate::ownership_store::leave_record(
@@ -182,51 +251,102 @@ impl Session {
                 &nonce,
             ))?;
             let applied = match bucket.put_cas(&key, body, None).await {
-                Ok(Some(_)) => true,
+                Ok(Some(_)) => Some(nonce.clone()),
+                // The write may have applied: only a nonce of ours in the record
+                // says so. Anything else is not final.
                 Ok(None) | Err(_) => {
-                    // The write may have applied: only this nonce in the record
-                    // says so. Anything else is not final.
                     match crate::ownership_store::read_record_form(bucket, &key).await {
-                        Ok(Some((by, leave))) if by == self.tag() && leave.as_deref() == Some(&nonce) => true,
-                        Ok(Some((by, leave)))
-                            if by == self.tag()
-                                && leave.as_ref().is_some_and(|l| nonces.contains(l)) =>
-                        {
-                            // An earlier announcement of this leave applied.
-                            let applied = leave.expect("checked");
-                            return self.confirm_leave(bucket, counter, chunk, applied).await;
+                        Ok(Some((by, Some(leave)))) if by == self.tag() && nonces.contains(&leave) => {
+                            Some(leave)
                         }
                         Ok(Some(_)) => anyhow::bail!(
                             "{scope}: a record that this session did not write stands where its leave goes"
                         ),
-                        Ok(None) | Err(_) => false,
+                        Ok(None) | Err(_) => None,
                     }
                 }
             };
-            if applied {
+            if let Some(applied) = applied {
                 // 3. Confirm.
-                return self.confirm_leave(bucket, counter, chunk, nonce).await;
+                return self
+                    .confirm_leave(bucket, scope, counter, applied, via_marks)
+                    .await;
             }
         }
         anyhow::bail!("the leave of {scope} was announced {ANNOUNCEMENTS} times and never applied")
     }
 
+    /// The nonces that this session announced for the leave of a counter.
+    fn announced(&self, counter: u64) -> Vec<String> {
+        let mut nonces = self
+            .left_memory
+            .lock()
+            .expect("left memory poisoned")
+            .get(&counter)
+            .map(|left| left.nonces.clone())
+            .unwrap_or_default();
+        if let Some(left) = self
+            .left_written
+            .lock()
+            .expect("left written poisoned")
+            .get(&counter)
+        {
+            for nonce in &left.nonces {
+                if !nonces.contains(nonce) {
+                    nonces.push(nonce.clone());
+                }
+            }
+        }
+        nonces
+    }
+
     async fn confirm_leave(
         &self,
         bucket: &Bucket,
+        scope: &str,
         counter: u64,
-        chunk: u64,
         nonce: String,
+        via_marks: bool,
     ) -> anyhow::Result<()> {
-        self.edit_chunk(bucket, chunk, move |chunk| {
-            if let Some(left) = chunk.left.get_mut(&counter) {
-                if left.nonces.contains(&nonce) {
-                    left.done = Some(nonce.clone());
-                }
-            }
-        })
-        .await?;
+        self.say(bucket, scope, counter, MarkKind::Left { nonce }, via_marks)
+            .await?;
         self.note_left(counter);
         Ok(())
+    }
+
+    /// Step 4 of the leave, before a release: the chunk holds the left entry of
+    /// the cell with its confirmation, by a compare-and-swap that has returned.
+    pub(crate) async fn write_left_trace(
+        &self,
+        bucket: &Bucket,
+        scope: &str,
+    ) -> anyhow::Result<()> {
+        let Some(counter) = self.own_counter_of_scope(scope) else {
+            return Ok(());
+        };
+        let Some(left) = self
+            .left_memory
+            .lock()
+            .expect("left memory poisoned")
+            .get(&counter)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if left.done.is_none()
+            || self
+                .left_written
+                .lock()
+                .expect("left written poisoned")
+                .get(&counter)
+                .is_some_and(|written| written.done == left.done)
+        {
+            return Ok(());
+        }
+        self.edit_chunk(bucket, counter / CHUNK, move |chunk| {
+            chunk.granted.insert(counter);
+            store::merge_left(&mut chunk.left, counter, &left);
+        })
+        .await
     }
 }

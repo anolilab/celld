@@ -4007,10 +4007,7 @@ impl Actor {
                         (&ownership, crate::session::current())
                     {
                         if session.is_lazy_scope(&cell) {
-                            if let Err(error) = session
-                                .leave(&bucket.bucket_client(), &node, &cell, epoch)
-                                .await
-                            {
+                            if let Err(error) = bucket.leave_cell(session, &cell, epoch).await {
                                 eprintln!("celld lazy cell {cell}: the leave failed: {error:#}");
                                 return CompletedEffect::plain(Event::OwnershipVerified {
                                     op,
