@@ -802,6 +802,11 @@ struct Holding {
     /// The seed objects of a listing that is done and not yet committed, kept so a
     /// merge that was discarded is prepared again without listing again.
     seed_slot: Arc<Mutex<Option<crate::registry_seed::SeedObjects>>>,
+    /// The lease check of the listed seed, which runs outside the pass.
+    seed_check: Arc<Mutex<SeedCheck>>,
+    /// A prepared seed that waits for its lease verdict. It is not in `prepared`, so
+    /// it does not keep other jobs from starting.
+    seed_waiting: Option<Prepared>,
     base_next: usize,
     /// Jobs that ended with nothing to do (an empty partition, no delta): the
     /// scheduling state moves past them at the next pass.
@@ -850,6 +855,36 @@ async fn lease_gone(registry: &Registry, node: &str) -> Option<bool> {
     let lease: serde_json::Value = serde_json::from_slice(&body).ok()?;
     let expires = lease.get("expires_ms")?.as_u64()?;
     Some(expires <= crate::ownership_store::now_ms())
+}
+
+/// What a pass does with a prepared seed.
+enum SeedStep {
+    /// The leases are clean and the window has passed: commit.
+    Commit,
+    /// The lease check is not back: the next pass looks again.
+    Wait,
+    /// Dropped (or its merge to be prepared again); nothing to commit.
+    Rejected,
+}
+
+/// What the leases said, for one listed seed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedVerdict {
+    Clean,
+    /// A lease without the `registry` field is live.
+    OlderBinary,
+    /// A node outside the writer rule is live.
+    NonW1,
+    /// The leases could not be read.
+    Unreadable,
+}
+
+/// The lease check of the seed in the slot: whether one runs, and what it found
+/// for which listing.
+#[derive(Default)]
+struct SeedCheck {
+    running: bool,
+    verdict: Option<(String, SeedVerdict)>,
 }
 
 /// What the watcher last learned about the holder's lease, and whose.
@@ -1101,6 +1136,8 @@ impl Registry {
             last_seed_ms: None,
             seeding: Arc::new(AtomicBool::new(false)),
             seed_slot: Arc::default(),
+            seed_check: Arc::default(),
+            seed_waiting: None,
             base_next: 0,
             advanced: Arc::default(),
             last_sweep_ms: now,
@@ -1508,8 +1545,12 @@ impl Registry {
 
     /// Apply the jobs prepared since the last pass, spills first. A job whose
     /// inputs changed is discarded and its objects deleted.
-    async fn commit_prepared(&self, holding: &mut Holding) -> anyhow::Result<bool> {
+    async fn commit_prepared(self: &Arc<Self>, holding: &mut Holding) -> anyhow::Result<bool> {
         let mut prepared: Vec<Prepared> = std::mem::take(&mut *holding.prepared.lock().unwrap());
+        // A seed that waits for its lease verdict is looked at again at every pass.
+        if let Some(job) = holding.seed_waiting.take() {
+            prepared.push(job);
+        }
         prepared.sort_by_key(|job| job.kind != "spill");
         let mut changed = false;
         for job in prepared {
@@ -1522,11 +1563,18 @@ impl Registry {
                 // dropped and a new one is made for the new number.
                 if gate != holding.root.gate {
                     self.counters.jobs_discarded.fetch_add(1, Ordering::Relaxed);
-                    self.drop_seed(holding, &job).await;
+                    self.drop_seed(holding, &job);
                     continue;
                 }
-                if !self.seed_may_commit(holding, &job).await {
-                    continue;
+                match self.seed_step(holding, &job) {
+                    SeedStep::Commit => {}
+                    // Held outside `prepared` until the verdict is back, so a lease read
+                    // that is slow does not keep a spill from starting.
+                    SeedStep::Wait => {
+                        holding.seed_waiting = Some(job);
+                        continue;
+                    }
+                    SeedStep::Rejected => continue,
                 }
             }
             let mut stray = None;
@@ -1589,76 +1637,141 @@ impl Registry {
         Ok(changed)
     }
 
-    /// The leases once more, immediately before a seed commits: a node that
-    /// appeared since the listing (an older binary, or one outside the writer
-    /// rule) may write cells the listing did not see, so the seed is dropped and
-    /// made again later. A lease that cannot be read keeps the listing and tries
-    /// the merge again.
-    async fn seed_may_commit(&self, holding: &mut Holding, job: &Prepared) -> bool {
-        use celld_logic::registry_gate::{seed_decision, SeedDecision};
-        let leases = crate::registry_seed::live_leases(
-            self.store.as_ref(),
-            &self.prefix,
-            crate::ownership_store::now_ms(),
-        )
-        .await;
+    /// What a prepared seed does at this pass. The leases are read once more
+    /// immediately before it commits, but not in the pass: the read runs in a task
+    /// of its own and its verdict is applied by a later pass, so a slow listing
+    /// never holds a pass. A node that appeared since the listing (an older binary,
+    /// or one outside the writer rule) may write cells the listing did not see, so
+    /// the seed is dropped and made again later; a lease that cannot be read keeps
+    /// the listing and the merge is tried again.
+    fn seed_step(self: &Arc<Self>, holding: &mut Holding, job: &Prepared) -> SeedStep {
+        let listed = holding.seed_slot.lock().unwrap().as_ref().map(|seed| {
+            (
+                format!("{}-{}", seed.gate, seed.marker_ms),
+                self.cutover_passed(seed),
+            )
+        });
+        let Some((attempt, passed)) = listed else {
+            self.strand_in_background(holding, job.outputs.clone());
+            return SeedStep::Rejected;
+        };
         // The cutover window must have passed as well as the leases being clean.
-        let waited_out = holding
-            .seed_slot
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|seed| self.cutover_passed(seed));
-        if !waited_out {
-            self.delete_or_strand(holding, job.outputs.clone()).await;
-            return false;
+        if !passed {
+            self.strand_in_background(holding, job.outputs.clone());
+            return SeedStep::Rejected;
         }
-        let decision = match &leases {
-            Ok(leases) => seed_decision(&holding.root, leases),
-            Err(_) => {
-                self.delete_or_strand(holding, job.outputs.clone()).await;
-                return false;
+        let verdict = {
+            let mut check = holding.seed_check.lock().unwrap();
+            match check.verdict.take() {
+                Some((made_for, verdict)) if made_for == attempt => Some(verdict),
+                _ => None,
             }
         };
-        if matches!(decision, SeedDecision::Start) {
-            return true;
+        match verdict {
+            Some(SeedVerdict::Clean) => SeedStep::Commit,
+            Some(SeedVerdict::Unreadable) => {
+                self.strand_in_background(holding, job.outputs.clone());
+                SeedStep::Rejected
+            }
+            Some(blocked) => {
+                self.counters.jobs_discarded.fetch_add(1, Ordering::Relaxed);
+                if blocked == SeedVerdict::OlderBinary {
+                    self.counters.seed_blocked.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        event = "registry_seed_blocked",
+                        "a lease without the `registry` field appeared before the seed committed"
+                    );
+                } else {
+                    self.counters.seed_waits.fetch_add(1, Ordering::Relaxed);
+                }
+                self.drop_seed(holding, job);
+                SeedStep::Rejected
+            }
+            None => {
+                self.start_seed_check(holding, attempt);
+                SeedStep::Wait
+            }
         }
-        self.counters.jobs_discarded.fetch_add(1, Ordering::Relaxed);
-        if matches!(decision, SeedDecision::OlderBinaryLive) {
-            self.counters.seed_blocked.fetch_add(1, Ordering::Relaxed);
-            tracing::error!(
-                event = "registry_seed_blocked",
-                "a lease without the `registry` field appeared before the seed committed"
-            );
-        } else {
-            self.counters.seed_waits.fetch_add(1, Ordering::Relaxed);
-        }
-        self.drop_seed(holding, job).await;
-        false
     }
 
-    /// Drop a rejected seed: its merge outputs and its listing, with what cannot be
-    /// deleted now kept for later, and the slot cleared so a new seed is made.
-    async fn drop_seed(&self, holding: &mut Holding, job: &Prepared) {
-        self.delete_or_strand(holding, job.outputs.clone()).await;
-        let dropped = holding.seed_slot.lock().unwrap().take();
-        if let Some(seed) = dropped {
-            self.delete_or_strand(holding, seed.keys()).await;
+    /// Read the leases for a seed in a task of its own, once at a time.
+    fn start_seed_check(self: &Arc<Self>, holding: &Holding, attempt: String) {
+        {
+            let mut check = holding.seed_check.lock().unwrap();
+            if check.running {
+                return;
+            }
+            check.running = true;
         }
+        let (registry, check, root) = (
+            self.clone(),
+            holding.seed_check.clone(),
+            holding.root.clone(),
+        );
+        crate::asyncrt::spawn(async move {
+            use celld_logic::registry_gate::{seed_decision, SeedDecision};
+            // A read that does not come back is an unreadable lease: the listing is
+            // kept and the merge tried again later.
+            let leases = crate::asyncrt::timeout(
+                Duration::from_millis(registry.cfg.seed_check_ms),
+                crate::registry_seed::live_leases(
+                    registry.store.as_ref(),
+                    &registry.prefix,
+                    crate::ownership_store::now_ms(),
+                ),
+            )
+            .await;
+            let verdict = match leases {
+                Err(_) | Ok(Err(_)) => SeedVerdict::Unreadable,
+                Ok(Ok(leases)) => match seed_decision(&root, &leases) {
+                    SeedDecision::Start => SeedVerdict::Clean,
+                    SeedDecision::OlderBinaryLive => SeedVerdict::OlderBinary,
+                    SeedDecision::WaitForNonW1 | SeedDecision::NotNeeded => SeedVerdict::NonW1,
+                },
+            };
+            let mut check = check.lock().unwrap();
+            check.verdict = Some((attempt, verdict));
+            check.running = false;
+        });
     }
 
-    /// Delete `keys`; those whose delete is not confirmed go to the retired list's
-    /// intake, so they are deleted after the grace.
-    async fn delete_or_strand(&self, holding: &Holding, keys: Vec<String>) {
-        let gone: HashSet<String> = objects::delete_many(self.store.as_ref(), &keys)
-            .await
-            .into_iter()
-            .collect();
+    /// Drop a rejected seed: its merge outputs and its listing go in the
+    /// background, with what cannot be deleted kept for later, and the slot is
+    /// cleared so a new seed is made.
+    fn drop_seed(self: &Arc<Self>, holding: &mut Holding, job: &Prepared) {
+        let mut keys = job.outputs.clone();
+        if let Some(seed) = holding.seed_slot.lock().unwrap().take() {
+            keys.extend(seed.keys());
+        }
+        self.strand_in_background(holding, keys);
+    }
+
+    /// Delete `keys` in a task of its own. Every key is in `stranded` before the
+    /// delete starts and leaves it only once its delete is confirmed, so a delete
+    /// that stalls, or a holder that stops, leaves them for the sweep and the retired
+    /// list. The delete is bounded.
+    fn strand_in_background(self: &Arc<Self>, holding: &Holding, keys: Vec<String>) {
+        if keys.is_empty() {
+            return;
+        }
         holding
             .stranded
             .lock()
             .unwrap()
-            .extend(keys.into_iter().filter(|key| !gone.contains(key)));
+            .extend(keys.iter().cloned());
+        let (registry, stranded) = (self.clone(), holding.stranded.clone());
+        crate::asyncrt::spawn(async move {
+            let deleted = crate::asyncrt::timeout(
+                Duration::from_millis(registry.cfg.background_delete_ms),
+                objects::delete_many(registry.store.as_ref(), &keys),
+            )
+            .await;
+            let Ok(gone) = deleted else {
+                return;
+            };
+            let gone: HashSet<String> = gone.into_iter().collect();
+            stranded.lock().unwrap().retain(|key| !gone.contains(key));
+        });
     }
 
     fn record_job(&self, job: &Prepared, outcome: &str) {
@@ -1703,7 +1816,7 @@ impl Registry {
             if let Some(passed) = listed {
                 // Listed and written: the merge that commits it is a job, and runs
                 // when no other does, once the cutover window has passed.
-                if !busy && passed {
+                if !busy && passed && holding.seed_waiting.is_none() {
                     self.start_seed_merge(holding);
                     return;
                 }

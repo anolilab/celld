@@ -23,6 +23,8 @@ fn config() -> Config {
         waiting_cap: crate::registry_writer::WAITING_CAP,
         seed_page: 1_000,
         lease_ttl_ms: 20,
+        seed_check_ms: 10_000,
+        background_delete_ms: 60_000,
         sampler_recheck_ms: 20_000,
         job_pacing: false,
         pass_read: Duration::ZERO,
@@ -741,6 +743,8 @@ mod store {
         /// Deletes answer `NotFound` for every key while set, as GCS and Azure do for
         /// a delete that is repeated.
         missing_deletes: std::sync::atomic::AtomicBool,
+        /// A delete never answers.
+        hanging_deletes: std::sync::atomic::AtomicBool,
         /// Writes of keys that contain a pattern are applied once and then
         /// answer an error, as a write whose answer was lost does.
         ambiguous: Mutex<Vec<String>>,
@@ -767,6 +771,7 @@ mod store {
                 ops: Mutex::new(Vec::new()),
                 failing_deletes: std::sync::atomic::AtomicBool::new(false),
                 missing_deletes: std::sync::atomic::AtomicBool::new(false),
+                hanging_deletes: std::sync::atomic::AtomicBool::new(false),
                 ambiguous: Mutex::new(Vec::new()),
                 refused: Mutex::new(Vec::new()),
                 failing: Mutex::new(Vec::new()),
@@ -782,6 +787,10 @@ mod store {
         pub(super) fn refuse_puts(&self, pattern: &str, times: usize) {
             let mut refused = self.refused.lock().unwrap();
             refused.extend(std::iter::repeat_n(pattern.to_owned(), times));
+        }
+
+        pub(super) fn hang_deletes(&self, on: bool) {
+            self.hanging_deletes.store(on, Ordering::SeqCst);
         }
 
         pub(super) fn missing_deletes(&self, on: bool) {
@@ -1055,6 +1064,9 @@ mod store {
         ) -> BoxStream<'static, object_store::Result<Path>> {
             use futures_util::StreamExt as _;
             // One call is one request: it carries every key it is given.
+            if self.hanging_deletes.load(Ordering::SeqCst) {
+                return futures_util::stream::pending().boxed();
+            }
             if self.missing_deletes.load(Ordering::SeqCst) {
                 return locations
                     .map(|location| {
@@ -2779,9 +2791,11 @@ async fn a_failed_base_merge_keeps_its_partition_and_is_tried_again_at_once() {
     register_and_fold(&node, &mut holding, &(0..40).map(cell).collect::<Vec<_>>()).await;
     let spill = spill_now(&node, &mut holding).await;
     run_job(&node, &mut holding, spill).await;
-    // Whatever the passes above started on their own has ended.
+    // Whatever the passes above started on their own has ended, and what it left
+    // for the scheduler to learn (an empty partition it passed over) is forgotten.
     wait_jobs_idle(&holding).await;
     holding.prepared.lock().unwrap().clear();
+    holding.advanced.lock().unwrap().clear();
     let index = holding
         .map
         .partitions
@@ -3384,12 +3398,20 @@ async fn a_failed_spill_hands_back_the_run_outputs_it_could_not_delete() {
         .extend(keys.iter().cloned());
     scripted.fail("/run/", false);
     scripted.fail_deletes(false);
-    node.housekeeping(&mut holding);
-    wait_housekeeping(&holding).await;
-    assert_eq!(
-        keys_under(&plain, &objects::runs_root(PREFIX)).await,
-        before
-    );
+    // A housekeeping task that an earlier pass started may still be running, and
+    // then this call does nothing: ask again until the stranded run is gone.
+    crate::asyncrt::timeout(Duration::from_secs(20), async {
+        loop {
+            node.housekeeping(&mut holding);
+            wait_housekeeping(&holding).await;
+            if keys_under(&plain, &objects::runs_root(PREFIX)).await == before {
+                return;
+            }
+            crate::asyncrt::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the stranded run was deleted");
 }
 
 #[tokio::test]
@@ -4533,6 +4555,36 @@ fn a_seed_job(outputs: Vec<String>) -> Prepared {
     }
 }
 
+/// Ask for the step until the lease check has answered, as passes would.
+async fn seed_step_decided(node: &Arc<Registry>, holding: &mut Holding, job: &Prepared) -> bool {
+    crate::asyncrt::timeout(Duration::from_secs(5), async {
+        loop {
+            match node.seed_step(holding, job) {
+                SeedStep::Commit => return true,
+                SeedStep::Rejected => return false,
+                SeedStep::Wait => crate::asyncrt::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("the lease check answered")
+}
+
+async fn wait_stranded(holding: &Holding, expected: &[String]) {
+    crate::asyncrt::timeout(Duration::from_secs(5), async {
+        while holding.stranded.lock().unwrap().len() < expected.len() {
+            crate::asyncrt::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the unconfirmed deletes were kept");
+    let mut kept = holding.stranded.lock().unwrap().clone();
+    kept.sort();
+    let mut expected = expected.to_vec();
+    expected.sort();
+    assert_eq!(kept, expected);
+}
+
 #[tokio::test]
 async fn every_rejection_of_a_seed_commit_keeps_the_outputs_it_could_not_delete() {
     let (scripted, plain) = scripted();
@@ -4553,28 +4605,71 @@ async fn every_rejection_of_a_seed_commit_keeps_the_outputs_it_could_not_delete(
             by_partition: Default::default(),
         })
     };
-    let stranded = |holding: &Holding| holding.stranded.lock().unwrap().clone();
     scripted.fail_deletes(true);
 
     // 1. The cutover window has not passed.
     *holding.seed_slot.lock().unwrap() = slot(crate::asyncrt::mono_ms());
-    assert!(!node.seed_may_commit(&mut holding, &job).await);
-    assert_eq!(stranded(&holding), vec![output.clone()], "window");
+    assert!(!seed_step_decided(&node, &mut holding, &job).await);
+    wait_stranded(&holding, std::slice::from_ref(&output)).await;
     holding.stranded.lock().unwrap().clear();
 
     // 2. A lease cannot be read.
     *holding.seed_slot.lock().unwrap() = slot(0);
     lease(&plain, "node-x", r#"{"registry":true}"#, far()).await;
     scripted.fail("/nodes/", true);
-    assert!(!node.seed_may_commit(&mut holding, &job).await);
-    assert_eq!(stranded(&holding), vec![output.clone()], "unreadable lease");
+    assert!(!seed_step_decided(&node, &mut holding, &job).await);
+    wait_stranded(&holding, std::slice::from_ref(&output)).await;
     scripted.fail("/nodes/", false);
     holding.stranded.lock().unwrap().clear();
 
     // 3. A lease without the field is live.
     lease(&plain, "node-old", "{}", far()).await;
-    assert!(!node.seed_may_commit(&mut holding, &job).await);
-    assert_eq!(stranded(&holding), vec![output], "blocking lease");
+    assert!(!seed_step_decided(&node, &mut holding, &job).await);
+    wait_stranded(&holding, &[output]).await;
+    assert!(
+        holding.seed_slot.lock().unwrap().is_none(),
+        "the listing is dropped"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_lease_listing_for_a_seed_does_not_delay_the_next_pass() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    ensure_format_record(&plain).await;
+    bucket_with_cells(&plain, &["Agent:00aa".to_owned(), "Agent:00bb".to_owned()]).await;
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            lease_ttl_ms: 20,
+            ..config()
+        },
+    );
+    let mut holding = closed_holder(&node).await;
+    // The seed is listed and merged with the leases readable; only then do they
+    // stall, so the check that precedes the commit is the one that hangs.
+    pass_until_listed(&node, &mut holding).await;
+    lease(&plain, "node-x", r#"{"registry":true}"#, far()).await;
+    scripted.hold("/nodes/");
+    let mut slowest = 0;
+    for _ in 0..12 {
+        holding.last_seed_ms = Some(crate::asyncrt::mono_ms());
+        let began = crate::asyncrt::mono_ms();
+        node.pass(&mut holding).await.unwrap();
+        slowest = slowest.max(crate::asyncrt::mono_ms() - began);
+        crate::asyncrt::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(
+        slowest < 300,
+        "a pass took {slowest} ms while the lease listing was stalled"
+    );
+    assert!(
+        !holding.root.gate_open(),
+        "and the seed waits for its check"
+    );
+    scripted.release("/nodes/");
+    pass_until_open(&node, &mut holding).await;
 }
 
 #[test]
@@ -4641,4 +4736,136 @@ async fn a_seed_whose_gate_was_raised_during_the_cutover_window_is_dropped_and_m
         leftover.iter().all(|key| !first_objects.contains(key)),
         "the first seed's objects are gone"
     );
+}
+
+#[tokio::test]
+async fn a_lease_read_that_never_returns_does_not_stop_a_spill_from_committing() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    ensure_format_record(&plain).await;
+    bucket_with_cells(&plain, &["Agent:00aa".to_owned(), "Agent:00bb".to_owned()]).await;
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            lease_ttl_ms: 20,
+            ..config()
+        },
+    );
+    let mut holding = closed_holder(&node).await;
+    pass_until_listed(&node, &mut holding).await;
+    lease(&plain, "node-x", r#"{"registry":true}"#, far()).await;
+    scripted.hold("/nodes/");
+    // Passes until the seed is prepared and waits for its verdict, which hangs.
+    crate::asyncrt::timeout(Duration::from_secs(5), async {
+        while holding.seed_waiting.is_none() {
+            holding.last_seed_ms = Some(crate::asyncrt::mono_ms());
+            node.pass(&mut holding).await.unwrap();
+            crate::asyncrt::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the seed waits for its lease check");
+    assert!(
+        holding.prepared.lock().unwrap().is_empty(),
+        "the waiting seed is not in the prepared jobs"
+    );
+    // Births arrive and a spill is due: it starts and commits beside the stalled read.
+    register_and_fold(&node, &mut holding, &(0..20).map(cell).collect::<Vec<_>>()).await;
+    holding.last_spill_ms = None;
+    crate::asyncrt::timeout(Duration::from_secs(5), async {
+        while node.counters.spills.load(Ordering::Relaxed) == 0 {
+            holding.last_seed_ms = Some(crate::asyncrt::mono_ms());
+            node.pass(&mut holding).await.unwrap();
+            crate::asyncrt::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a spill committed while the lease read hung");
+    assert!(!holding.root.gate_open(), "the seed is still waiting");
+    scripted.release("/nodes/");
+    pass_until_open(&node, &mut holding).await;
+}
+
+#[tokio::test]
+async fn a_lease_read_that_takes_too_long_counts_as_unreadable_and_is_tried_again() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    ensure_format_record(&plain).await;
+    bucket_with_cells(&plain, &["Agent:00aa".to_owned()]).await;
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            lease_ttl_ms: 20,
+            seed_check_ms: 150,
+            ..config()
+        },
+    );
+    let mut holding = closed_holder(&node).await;
+    pass_until_listed(&node, &mut holding).await;
+    lease(&plain, "node-x", r#"{"registry":true}"#, far()).await;
+    scripted.hold("/nodes/");
+    let began = crate::asyncrt::mono_ms();
+    crate::asyncrt::timeout(Duration::from_secs(5), async {
+        while scripted.reads("/nodes/") < 2 {
+            holding.last_seed_ms = Some(crate::asyncrt::mono_ms());
+            node.pass(&mut holding).await.unwrap();
+            crate::asyncrt::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the check was started again after its bound");
+    assert!(
+        crate::asyncrt::mono_ms() - began >= 150,
+        "not before the bound"
+    );
+    assert!(
+        holding.seed_slot.lock().unwrap().is_some(),
+        "the listing is kept"
+    );
+    assert!(!holding.root.gate_open());
+    scripted.release("/nodes/");
+    pass_until_open(&node, &mut holding).await;
+}
+
+#[tokio::test]
+async fn keys_of_a_background_delete_stay_tracked_while_it_stalls_and_after_its_bound() {
+    let (scripted, _) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            background_delete_ms: 150,
+            ..config()
+        },
+    );
+    let holding = closed_holder(&node).await;
+    scripted.hang_deletes(true);
+    let keys: Vec<String> = (0..3)
+        .map(|n| format!("{PREFIX}fleet/reg/v1/seed/x/{n}"))
+        .collect();
+    node.strand_in_background(&holding, keys.clone());
+    // Tracked before the delete has started, let alone finished.
+    let mut tracked = holding.stranded.lock().unwrap().clone();
+    tracked.sort();
+    assert_eq!(tracked, keys);
+    crate::asyncrt::sleep(Duration::from_millis(400)).await;
+    let mut tracked = holding.stranded.lock().unwrap().clone();
+    tracked.sort();
+    assert_eq!(
+        tracked, keys,
+        "a delete that never returned confirmed nothing"
+    );
+    // A delete that works takes them off the list once confirmed.
+    scripted.hang_deletes(false);
+    node.strand_in_background(&holding, keys.clone());
+    crate::asyncrt::timeout(Duration::from_secs(2), async {
+        while !holding.stranded.lock().unwrap().is_empty() {
+            crate::asyncrt::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("confirmed deletes leave the list");
 }

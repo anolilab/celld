@@ -94,6 +94,10 @@ pub(crate) struct Config {
     pub seed_page: usize,
     /// The node-lease lifetime, which the seed's cutover window is two of.
     pub lease_ttl_ms: u64,
+    /// The longest the lease read before a seed commits may take.
+    pub seed_check_ms: u64,
+    /// The longest a background delete of a rejected seed's objects may take.
+    pub background_delete_ms: u64,
     /// How long after a miss the sampler looks again.
     pub sampler_recheck_ms: u64,
     /// `CELLD_REGISTRY_JOB_PACING`: limit the requests and bytes per second of
@@ -170,6 +174,8 @@ impl Config {
             waiting_cap: crate::registry_writer::WAITING_CAP,
             seed_page: 1_000,
             lease_ttl_ms,
+            seed_check_ms: 10_000,
+            background_delete_ms: 60_000,
             sampler_recheck_ms: 20_000,
             job_pacing,
             pass_read: Duration::from_millis(pass_read_ms),
