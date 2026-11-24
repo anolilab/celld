@@ -4114,6 +4114,44 @@ async fn per_cell_writes_wait_for_the_gate_and_everything_else_passes() {
 }
 
 #[tokio::test]
+async fn a_predecessor_repair_writes_through_a_closed_gate() {
+    let hold: &'static crate::registry_seed::GateHold =
+        Box::leak(Box::new(crate::registry_seed::GateHold::new()));
+    hold.require();
+    let store = Arc::new(crate::registry_seed::GatedStore::new(
+        memory(),
+        PREFIX.to_owned(),
+        hold,
+    ));
+    // Boot recovery runs before this node's lease exists, so the gate cannot
+    // close until it is done: its writes must not wait for the gate.
+    crate::asyncrt::timeout(
+        Duration::from_secs(2),
+        crate::registry_seed::repairing_predecessor(store.put(
+            &Path::from(format!("{PREFIX}cells/Agent:x/ltx/e1/0/1-1.ltx")),
+            vec![1_u8].into(),
+        )),
+    )
+    .await
+    .expect("a repair of the predecessor's log does not wait for the gate")
+    .unwrap();
+    assert!(hold.is_pending(), "the gate itself is still closed");
+    // Outside the repair the same write still waits.
+    let waiting = crate::asyncrt::timeout(
+        Duration::from_millis(100),
+        store.put(
+            &Path::from(format!("{PREFIX}cells/Agent:y/ltx/e1/0/1-1.ltx")),
+            vec![1_u8].into(),
+        ),
+    )
+    .await;
+    assert!(
+        waiting.is_err(),
+        "a write outside the repair waits for the gate"
+    );
+}
+
+#[tokio::test]
 async fn a_lister_is_not_used_on_a_backend_that_cannot_resume_by_name() {
     let dir = tempfile::tempdir().unwrap();
     let local =

@@ -473,6 +473,18 @@ pub(crate) enum RecoverMode {
     /// until the log is sealed, so it waits behind the claimant and takes
     /// the claim over only once its heartbeat is stale.
     Boot,
+    /// A boot recovering this node's own predecessor session, before the
+    /// node's lease exists: the registry's gate cannot close until it is done,
+    /// so its uploads pass the gate. A boot recovering another node's log, and
+    /// a sweep, stay behind the gate.
+    Predecessor,
+}
+
+impl RecoverMode {
+    /// Whether this recovery's per-cell uploads pass a closed registry gate.
+    pub(crate) fn passes_gate(self) -> bool {
+        self == Self::Predecessor
+    }
 }
 
 /// The claimant's heartbeat while it gathers, beaten cooperatively at each
@@ -4441,7 +4453,7 @@ impl NodeLogManager {
                     == log_tier::TakeoverGate::RecoverFirst
             {
                 info!(session, "recovering a predecessor session's node log");
-                self.recover_as(&session, RecoverMode::Boot).await?;
+                self.recover_as(&session, RecoverMode::Predecessor).await?;
             }
         }
         // The install about to follow erases the record's only pointer to
@@ -4806,7 +4818,7 @@ impl NodeLogManager {
         // for a boot or a cold route, has nothing to add; waiting here held
         // the maintenance ticker for the length of the recovery.
         let _single_flight = match mode {
-            RecoverMode::Boot => recovery_lock.lock().await,
+            RecoverMode::Boot | RecoverMode::Predecessor => recovery_lock.lock().await,
             RecoverMode::Sweep => match recovery_lock.try_lock() {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -4815,7 +4827,12 @@ impl NodeLogManager {
                 }
             },
         };
-        self.recover_serial(dead, mode).await
+        let recovery = self.recover_serial(dead, mode);
+        if mode.passes_gate() {
+            crate::registry_seed::repairing_predecessor(recovery).await
+        } else {
+            recovery.await
+        }
     }
 
     /// Refresh the claim's heartbeat once `RECOVERY_HEARTBEAT` has passed.
@@ -6371,6 +6388,7 @@ impl NodeLogManager {
                 warn!(session, %error, "eager node-log recovery failed");
             }
         }
+        info!("dead-leader sweep complete");
         Ok(())
     }
 
@@ -7018,5 +7036,23 @@ mod seal_absent_log_tests {
             seal_absent_log(&bucket, "dead").await.unwrap();
             assert!(bucket.get(&lease_key("dead")).await.unwrap().is_none());
         });
+    }
+}
+
+#[cfg(test)]
+mod recover_mode_tests {
+    use super::RecoverMode;
+
+    #[test]
+    fn only_a_boots_own_predecessor_recovery_passes_the_registry_gate() {
+        assert!(RecoverMode::Predecessor.passes_gate());
+        assert!(
+            !RecoverMode::Sweep.passes_gate(),
+            "a sweep stays behind the gate"
+        );
+        assert!(
+            !RecoverMode::Boot.passes_gate(),
+            "another node's log recovered on a cold route stays behind the gate"
+        );
     }
 }
