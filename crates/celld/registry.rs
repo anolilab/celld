@@ -72,6 +72,12 @@ pub(crate) struct Config {
     pub wait: bool,
     /// The longest a first write waits for coverage.
     pub bound: Duration,
+    /// At the bound, fail the write. Off in `shadow`, where nothing is decided
+    /// from the registry: the write goes on and the miss is counted and logged.
+    pub enforce: bool,
+    /// How long an object that no root names stays before it is deleted: far
+    /// longer than the 2 s a lookup lasts.
+    pub grace_ms: u64,
     /// `CELLD_REGISTRY_JOB_PACING`: limit the requests and bytes per second of
     /// spills and base merges, so they do not stall the store the lookups read.
     pub job_pacing: bool,
@@ -119,6 +125,8 @@ impl Config {
             base_ms: base_days * 86_400_000,
             wait,
             bound,
+            enforce: false,
+            grace_ms: crate::registry_compactor::GRACE_MS,
             job_pacing,
             pass_read: Duration::from_millis(pass_read_ms),
         })
@@ -278,9 +286,10 @@ pub struct Registry {
     /// Live nodes and their addresses, for the holder's root push.
     pub(crate) fleet: Mutex<Vec<(String, String)>>,
     pub(crate) last_pass_request_ms: AtomicU64,
-    /// Nodes whose node log this process recovered, and when: a holder that is
-    /// one of them is dead, so the role can be taken at once.
-    pub(crate) recovered: Mutex<HashMap<String, u64>>,
+    /// Holders (node and session) whose node log this process recovered, and
+    /// when: such a holder is dead, so the role can be taken at once. A later
+    /// session of the same node is not one of them.
+    pub(crate) recovered: Mutex<HashMap<(String, String), u64>>,
 }
 
 impl std::fmt::Debug for Registry {
@@ -356,10 +365,18 @@ impl Registry {
     /// This process recovered the node log of `node`, which is dead: if it holds
     /// the role, the role is taken at once instead of after the lease wait.
     pub fn note_recovered(&self, node: &str) {
-        self.recovered
-            .lock()
-            .unwrap()
-            .insert(node.to_owned(), crate::asyncrt::mono_ms());
+        // The session is the one the root named when this node last read it:
+        // only that holder is known to be dead.
+        let Some((root, _, _)) = self.last_root() else {
+            return;
+        };
+        let Some(holder) = root.holder.as_ref().filter(|holder| holder.node == node) else {
+            return;
+        };
+        self.recovered.lock().unwrap().insert(
+            (holder.node.clone(), holder.session.clone()),
+            crate::asyncrt::mono_ms(),
+        );
     }
 
     /// Give the registry what it needs to ask the holder for a pass.
@@ -438,6 +455,17 @@ impl Registry {
     /// names is never counted. The cache keeps a delta a newer root names, so a
     /// lookup that holds an older root does not evict it.
     pub(crate) async fn load(&self, root: Arc<Root>, io: &Io) -> Snapshot {
+        self.load_with(root, io, &self.store).await
+    }
+
+    /// [`Self::load`] through `store`: a spill reads the deltas it consumes
+    /// through the paced one.
+    pub(crate) async fn load_with(
+        &self,
+        root: Arc<Root>,
+        io: &Io,
+        store: &Arc<dyn ObjectStore>,
+    ) -> Snapshot {
         let over_cap = reg::over_cap(root.deltas.len());
         let cells: Vec<(reg::DeltaId, Arc<tokio::sync::OnceCell<Arc<Loaded>>>)> = {
             let mut view = self.view.lock().unwrap();
@@ -456,7 +484,7 @@ impl Registry {
         };
         let mut deltas_ok = !over_cap;
         let loaded: Vec<Option<Arc<Loaded>>> = futures_util::stream::iter(cells)
-            .map(|(id, cell)| async move { self.delta_in(id, &cell, io, false).await })
+            .map(|(id, cell)| async move { self.delta_in(id, &cell, io, false, store).await })
             .buffered(16)
             .collect()
             .await;
@@ -476,7 +504,7 @@ impl Registry {
                 match cached {
                     Some(map) => (map, true),
                     None => {
-                        match objects::read_map(self.store.as_ref(), &self.prefix, named.0, named.1)
+                        match objects::read_map(store.as_ref(), &self.prefix, named.0, named.1)
                             .await
                         {
                             Ok((map, size)) => {
@@ -510,11 +538,11 @@ impl Registry {
         cell: &tokio::sync::OnceCell<Arc<Loaded>>,
         io: &Io,
         pushed: bool,
+        store: &Arc<dyn ObjectStore>,
     ) -> Option<Arc<Loaded>> {
         let load = cell
             .get_or_try_init(|| async {
-                let (delta, size) =
-                    objects::read_delta(self.store.as_ref(), &self.prefix, id).await?;
+                let (delta, size) = objects::read_delta(store.as_ref(), &self.prefix, id).await?;
                 io.get(size);
                 if pushed {
                     &self.counters.prefetch_loads
@@ -591,11 +619,13 @@ impl Registry {
         };
         let io = Io::default();
         for (id, cell) in cells {
-            let fetched =
-                crate::asyncrt::timeout(LOOKUP_DEADLINE, self.delta_in(id, &cell, &io, true))
-                    .await
-                    .ok()
-                    .flatten();
+            let fetched = crate::asyncrt::timeout(
+                LOOKUP_DEADLINE,
+                self.delta_in(id, &cell, &io, true, &self.store),
+            )
+            .await
+            .ok()
+            .flatten();
             if fetched.is_none() {
                 let mut view = self.view.lock().unwrap();
                 if view

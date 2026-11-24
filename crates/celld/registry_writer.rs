@@ -34,6 +34,10 @@ use std::time::Duration;
 
 /// How long the flusher waits after a failed segment write.
 const RETRY_AFTER: Duration = Duration::from_secs(1);
+/// The longest the flusher spends on its last write when the node stops.
+const FINAL_FLUSH: Duration = Duration::from_secs(2);
+/// Cells whose coverage a node waits on at once; more are queued but not tracked.
+pub(crate) const CREATED_CAP: usize = 200_000;
 /// How often a waiting write reads the root.
 const POLL: Duration = Duration::from_millis(250);
 /// Pass requests from one node are at least this far apart.
@@ -58,10 +62,12 @@ impl Registry {
                 .entry(key)
                 .and_modify(|held| *held = reg::merge(*held, record))
                 .or_insert(record);
-            queue.created.entry(key).or_insert(Created {
-                created_here: epoch == 1,
-                seg: None,
-            });
+            if queue.created.len() < CREATED_CAP {
+                queue.created.entry(key).or_insert(Created {
+                    created_here: epoch == 1,
+                    seg: None,
+                });
+            }
         }
         self.queued.notify_one();
     }
@@ -162,27 +168,40 @@ impl Registry {
         self.flush().await
     }
 
-    /// Flush once per batch window until `stop` ends the loop.
+    /// Flush once per batch window until `stop` ends the loop, then once more
+    /// for what is still queued, so a graceful stop loses no claim.
     pub(crate) async fn run_flusher(self: Arc<Self>, stop: crate::ltx_repl::StopToken) {
         loop {
             crate::asyncrt::select_biased! {
                 "a stop request wins a tie with a queued cell, so shutdown never flushes first";
-                _ = stop.stopped() => return,
+                _ = stop.stopped() => break,
                 _ = self.queued.notified() => {}
             }
             crate::asyncrt::select_biased! {
                 "a stop request ends the window, so shutdown never waits for it";
-                _ = stop.stopped() => return,
+                _ = stop.stopped() => break,
                 _ = crate::asyncrt::sleep(Duration::from_millis(self.cfg.batch_ms)) => {}
             }
             if let Err(error) = self.flush_now().await {
                 tracing::warn!(%error, "registry segment write failed; retrying");
                 crate::asyncrt::select_biased! {
                     "a stop request ends the retry pause, so shutdown never waits for it";
-                    _ = stop.stopped() => return,
+                    _ = stop.stopped() => break,
                     _ = crate::asyncrt::sleep(RETRY_AFTER) => {}
                 }
                 self.queued.notify_one();
+            }
+        }
+        match crate::asyncrt::timeout(FINAL_FLUSH, self.flush_now()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(event = "registry_final_flush_failed", %error, "queued claims were not written");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    event = "registry_final_flush_failed",
+                    "queued claims were not written in time"
+                );
             }
         }
     }
@@ -259,7 +278,10 @@ impl Registry {
     }
 
     /// The backstop: make sure the registry covers `cell` before a first
-    /// per-cell write, or fail at the bound.
+    /// per-cell write. The whole wait, the lookup included, lasts at most the
+    /// bound. At the bound the mode decides: an enforcing registry fails the
+    /// write as any failed PUT fails, and its caller retries; in `shadow` the
+    /// write goes on, since nothing is decided from the registry yet.
     pub(crate) async fn ensure_covered(&self, cell: &str) -> object_store::Result<()> {
         let key = objects::key_of(cell);
         if self.covered_now(&key) {
@@ -270,92 +292,110 @@ impl Registry {
             return Ok(());
         }
         let started = crate::asyncrt::mono_ms();
+        let covered = !self.cfg.bound.is_zero()
+            && (crate::asyncrt::timeout(self.cfg.bound, self.cover(&key))
+                .await
+                .is_ok()
+                || self.covered_now(&key));
+        if !covered {
+            // The cell stays queued, so a retry finds it folded.
+            self.queue_for_coverage(&key);
+            self.counters.bound_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        tracing::info!(
+            event = "registry_wait",
+            cell,
+            waited_ms = crate::asyncrt::mono_ms().saturating_sub(started),
+            covered,
+            enforced = self.cfg.enforce,
+            "a first write waited for registry coverage"
+        );
+        if covered || !self.cfg.enforce {
+            return Ok(());
+        }
+        Err(object_store::Error::Generic {
+            store: "registry",
+            source: format!("cell {cell} is not covered by the registry yet").into(),
+        })
+    }
+
+    /// Queue a cell that was not queued at its claim (or whose entry is gone).
+    fn queue_for_coverage(&self, key: &Key) {
+        let mut queue = self.queue.lock().unwrap();
+        queue.waiting.entry(*key).or_insert(Record::birth(*key, 0));
+        if queue.created.len() < CREATED_CAP {
+            queue.created.entry(*key).or_insert(Created {
+                created_here: false,
+                seg: None,
+            });
+        }
+        drop(queue);
+        self.queued.notify_one();
+    }
+
+    /// Return once coverage of `key` is observed. The caller bounds it.
+    async fn cover(&self, key: &Key) {
         let created = self
             .queue
             .lock()
             .unwrap()
             .created
-            .get(&key)
+            .get(key)
             .is_some_and(|created| created.created_here);
         if !created {
             self.counters
                 .backstop_lookups
                 .fetch_add(1, Ordering::Relaxed);
-            if let Answer::Exists(_) = self.lookup(&key).await.answer {
+            if let Answer::Exists(_) = self.lookup(key).await.answer {
                 self.counters
                     .backstop_exists
                     .fetch_add(1, Ordering::Relaxed);
-                self.add_evidence(&key);
-                return Ok(());
+                self.add_evidence(key);
+                return;
             }
-            let mut queue = self.queue.lock().unwrap();
-            queue.waiting.entry(key).or_insert(Record::birth(key, 0));
-            queue.created.entry(key).or_insert(Created {
-                created_here: false,
-                seg: None,
-            });
+            self.queue_for_coverage(key);
         }
         self.counters.backstop_waits.fetch_add(1, Ordering::Relaxed);
         self.waiters.fetch_add(1, Ordering::Relaxed);
-        let waiting = Waiting(self);
-        // The segment write, the request to the holder and every root read have
-        // no deadline of their own, so the bound is enforced around all of them:
-        // a store that stalls inside one must not hold the write past it.
-        let remaining = self.cfg.bound.saturating_sub(Duration::from_millis(
-            crate::asyncrt::mono_ms().saturating_sub(started),
-        ));
-        let waited = async {
-            let _ = self.flush_now().await;
-            self.request_pass().await;
-            loop {
-                if self.covered_now(&key) {
-                    break;
-                }
-                let io = Io::default();
-                let _ = self.refresh(&io).await;
-                if self.covered_now(&key) {
-                    break;
-                }
-                let flushed = self
-                    .queue
-                    .lock()
-                    .unwrap()
-                    .created
-                    .get(&key)
-                    .is_some_and(|created| created.seg.is_none());
-                if flushed {
-                    let _ = self.flush_now().await;
-                }
-                crate::asyncrt::select_biased! {
-                    "a root observation ends the poll pause";
-                    _ = self.observed.notified() => {}
-                    _ = crate::asyncrt::sleep(POLL) => {}
-                }
-                if !self.covered_now(&key) {
-                    self.request_pass().await;
-                }
+        let _waiting = Waiting(self);
+        let _ = self.flush_now().await;
+        self.request_pass().await;
+        loop {
+            if self.covered_now(key) {
+                return;
             }
-        };
-        let outcome = match crate::asyncrt::timeout(remaining, waited).await {
-            Ok(()) => Ok(()),
-            Err(_) if self.covered_now(&key) => Ok(()),
-            Err(_) => {
-                self.counters.bound_hits.fetch_add(1, Ordering::Relaxed);
-                Err(object_store::Error::Generic {
-                    store: "registry",
-                    source: format!("cell {cell} is not covered by the registry yet").into(),
-                })
+            let io = Io::default();
+            let _ = self.refresh(&io).await;
+            if self.covered_now(key) {
+                return;
             }
-        };
-        drop(waiting);
-        tracing::info!(
-            event = "registry_wait",
-            cell,
-            waited_ms = crate::asyncrt::mono_ms().saturating_sub(started),
-            covered = outcome.is_ok(),
-            "a first write waited for registry coverage"
-        );
-        outcome
+            let (flushed, folded_away) = {
+                let queue = self.queue.lock().unwrap();
+                let created = queue.created.get(key);
+                (
+                    created.is_some_and(|created| created.seg.is_none()),
+                    created.is_some_and(|created| created.seg.is_some()),
+                )
+            };
+            if flushed {
+                let _ = self.flush_now().await;
+            }
+            // Its segment is written but no delta the root names lists it: the
+            // delta may have been spilled into a run before this node saw it,
+            // so only a lookup can still show the cell.
+            if folded_away && matches!(self.lookup(key).await.answer, Answer::Exists(_)) {
+                self.add_evidence(key);
+                return;
+            }
+            crate::asyncrt::select_biased! {
+                "a root observation ends the poll pause";
+                _ = self.observed.notified() => {}
+                _ = crate::asyncrt::sleep(POLL) => {}
+            }
+            if !self.covered_now(key) {
+                self.request_pass().await;
+            }
+        }
     }
 
     pub(crate) async fn guard_for(&self, location: &Path) -> object_store::Result<()> {

@@ -17,6 +17,8 @@ fn config() -> Config {
         base_ms: 86_400_000,
         wait: true,
         bound: Duration::from_millis(600),
+        enforce: true,
+        grace_ms: crate::registry_compactor::GRACE_MS,
         job_pacing: false,
         pass_read: Duration::ZERO,
     }
@@ -352,21 +354,34 @@ async fn a_displaced_holder_writes_nothing_visible_and_stands_down() {
 }
 
 #[tokio::test]
-async fn passes_stop_folding_at_the_hard_cap_and_resume_after_a_spill() {
+async fn passes_stop_folding_at_the_hard_cap_and_resume_after_a_real_spill() {
     let store = memory();
     let node = registry_on(&store, "node-a");
     let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &[cell(0)]).await;
+    assert_eq!(holding.root.deltas.len(), 1);
+    // Live records at the cap: a delta that a spill consumes and then drops
+    // from the count, as every spill does.
+    let stale = DeltaId { epoch: 1, n: 999 };
+    holding.counts.insert(stale, reg::CAP_RECORDS);
     node.register_at_claim(&cell(1), 1);
     node.flush_now().await.unwrap();
-    holding
-        .counts
-        .insert(DeltaId { epoch: 1, n: 999 }, reg::CAP_RECORDS);
     assert!(node.pass(&mut holding).await.unwrap());
     assert_eq!(node.counters.cap_pauses.load(Ordering::Relaxed), 1);
-    assert!(holding.root.deltas.is_empty(), "nothing folded at the cap");
-    holding.counts.clear();
-    assert!(node.pass(&mut holding).await.unwrap());
-    assert_eq!(holding.root.deltas.len(), 1, "folding resumed");
+    assert_eq!(holding.root.deltas.len(), 1, "nothing folded at the cap");
+    // The spill commits in the next pass, which then folds what waited.
+    let spill = spill_now(&node, &mut holding).await;
+    run_job(&node, &mut holding, spill).await;
+    assert!(
+        !holding.counts.contains_key(&stale),
+        "the spill left the count"
+    );
+    assert_eq!(
+        holding.root.deltas.len(),
+        1,
+        "folding resumed: one new delta"
+    );
+    assert_eq!(node.counters.spills.load(Ordering::Relaxed), 1);
 }
 
 /// A holder with births in deltas, a level 1 and a level 2 in partition `index`
@@ -711,6 +726,14 @@ mod store {
         inner: Arc<InMemory>,
         reads: Mutex<Vec<String>>,
         lists: Mutex<Vec<String>>,
+        /// Every request yields to the runtime before it runs, so tasks that
+        /// start together interleave their reads and writes.
+        yielding: std::sync::atomic::AtomicBool,
+        /// Every read and write in the order it ran, after any pause.
+        ops: Mutex<Vec<String>>,
+        /// Writes of keys that contain a pattern are applied once and then
+        /// answer an error, as a write whose answer was lost does.
+        ambiguous: Mutex<Vec<String>>,
         failing: Mutex<Vec<String>>,
         held: Mutex<Vec<(String, Arc<Semaphore>)>>,
         seen: Notify,
@@ -728,6 +751,9 @@ mod store {
                 inner,
                 reads: Mutex::new(Vec::new()),
                 lists: Mutex::new(Vec::new()),
+                yielding: std::sync::atomic::AtomicBool::new(false),
+                ops: Mutex::new(Vec::new()),
+                ambiguous: Mutex::new(Vec::new()),
                 failing: Mutex::new(Vec::new()),
                 held: Mutex::new(Vec::new()),
                 seen: Notify::new(),
@@ -735,6 +761,28 @@ mod store {
                 widest: AtomicU64::new(0),
                 range_cap: AtomicU64::new(u64::MAX),
             })
+        }
+
+        pub(super) fn yield_each_request(&self, on: bool) {
+            self.yielding.store(on, Ordering::SeqCst);
+        }
+
+        /// The next write of a key containing `pattern` lands and answers an error.
+        pub(super) fn lose_next_answer(&self, pattern: &str) {
+            self.ambiguous.lock().unwrap().push(pattern.to_owned());
+        }
+
+        /// The requests that ran, in order, as `get <key>` and `put <key>`.
+        pub(super) fn ops(&self) -> Vec<String> {
+            self.ops.lock().unwrap().clone()
+        }
+
+        async fn pause(&self) {
+            if self.yielding.load(Ordering::SeqCst) {
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+            }
         }
 
         pub(super) fn reset(&self) {
@@ -868,7 +916,24 @@ mod store {
             if let Some(gate) = gate {
                 gate.acquire().await.expect("the gate stays open").forget();
             }
-            self.inner.put_opts(location, payload, options).await
+            self.pause().await;
+            self.ops.lock().unwrap().push(format!("put {key}"));
+            let lose = {
+                let mut ambiguous = self.ambiguous.lock().unwrap();
+                ambiguous
+                    .iter()
+                    .position(|pattern| key.contains(pattern.as_str()))
+                    .map(|at| ambiguous.remove(at))
+                    .is_some()
+            };
+            let written = self.inner.put_opts(location, payload, options).await;
+            if lose && written.is_ok() {
+                return Err(object_store::Error::Generic {
+                    store: "scripted",
+                    source: "the answer was lost".into(),
+                });
+            }
+            written
         }
 
         async fn put_multipart_opts(
@@ -896,6 +961,8 @@ mod store {
                     source: "a read longer than the request timeout".into(),
                 });
             }
+            self.pause().await;
+            self.ops.lock().unwrap().push(format!("get {key}"));
             self.reads.lock().unwrap().push(key.clone());
             self.seen.notify_waiters();
             let gate = self
@@ -1781,12 +1848,33 @@ async fn readers_never_request_a_segment() {
     assert!(scripted.reads("/root") > 0, "the lookups did read the root");
 }
 
+/// Both takes have read the root before either one writes it.
+fn read_before_any_root_write(ops: &[String]) -> bool {
+    let first_write = ops
+        .iter()
+        .position(|op| op.starts_with("put ") && op.ends_with("/root"));
+    let reads = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| op.starts_with("get ") && op.ends_with("/root"))
+        .map(|(at, _)| at)
+        .collect::<Vec<_>>();
+    reads.len() >= 2 && first_write.is_some_and(|write| reads.iter().take(2).all(|at| *at < write))
+}
+
 #[tokio::test]
 async fn two_compactors_start_from_nothing_and_one_root_names_one_holder() {
-    let store = memory();
+    let (scripted, _) = scripted();
+    scripted.yield_each_request(true);
+    let store: Arc<dyn ObjectStore> = scripted.clone();
     let first = registry_on(&store, "node-a");
     let second = registry_on(&store, "node-b");
     let (one, two) = futures_util::join!(first.take(None, false), second.take(None, false));
+    assert!(
+        read_before_any_root_write(&scripted.ops()),
+        "both read an absent root before either wrote: {:?}",
+        scripted.ops()
+    );
     let (one, two) = (one.unwrap(), two.unwrap());
     assert_eq!(
         usize::from(one.is_some()) + usize::from(two.is_some()),
@@ -1805,16 +1893,24 @@ async fn two_compactors_start_from_nothing_and_one_root_names_one_holder() {
 
 #[tokio::test]
 async fn two_compactors_that_watched_one_root_take_the_role_once() {
-    let store = memory();
+    let (scripted, _) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
     let old = registry_on(&store, "node-a");
     let mut old_holding = holder_of(&old).await;
     let (first, second) = (registry_on(&store, "node-b"), registry_on(&store, "node-c"));
     let io = Io::default();
     let watched_first = first.read_root(&io).await.unwrap().expect("a root").0;
     let watched_second = second.read_root(&io).await.unwrap().expect("a root").0;
+    scripted.yield_each_request(true);
+    let before = scripted.ops().len();
     let (one, two) = futures_util::join!(
         first.take(Some(watched_first), true),
         second.take(Some(watched_second), true)
+    );
+    let raced = scripted.ops().split_off(before);
+    assert!(
+        read_before_any_root_write(&raced),
+        "both read the root before either wrote: {raced:?}"
     );
     let (one, two) = (one.unwrap(), two.unwrap());
     assert_eq!(
@@ -1824,6 +1920,7 @@ async fn two_compactors_that_watched_one_root_take_the_role_once() {
     );
     let taker = one.or(two).expect("one took the role");
     assert_eq!(taker.epoch, 2);
+    scripted.yield_each_request(false);
     // The one root fences the old holder: its next fold cannot write.
     old.register_at_claim(&cell(9), 1);
     old.flush_now().await.unwrap();
@@ -1834,13 +1931,280 @@ async fn two_compactors_that_watched_one_root_take_the_role_once() {
 }
 
 #[tokio::test]
-async fn a_recovered_node_log_marks_that_node_dead_for_a_minute() {
+async fn a_cell_created_here_is_found_by_a_lookup_when_its_delta_was_spilled_unseen() {
     let store = memory();
+    let holder = registry_on(&store, "node-a");
+    let mut holding = holder_of(&holder).await;
+    let writer = registry_on(&store, "node-b");
+    let name = cell(1);
+    writer.register_at_claim(&name, 1);
+    writer.flush_now().await.unwrap();
+    assert!(holder.pass(&mut holding).await.unwrap());
+    let spill = spill_now(&holder, &mut holding).await;
+    run_job(&holder, &mut holding, spill).await;
+    assert!(
+        holding.root.deltas.is_empty(),
+        "no delta names the segment now"
+    );
+    writer.ensure_covered(&name).await.unwrap();
+    assert_eq!(writer.counters.bound_hits.load(Ordering::Relaxed), 0);
+    assert!(writer.covered_now(&objects::key_of(&name)));
+}
+
+#[tokio::test]
+async fn a_map_key_is_never_reused_after_a_write_whose_answer_was_lost() {
+    let (scripted, _) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    let cells: Vec<String> = (0..20).map(cell).collect();
+    register_and_fold(&node, &mut holding, &cells).await;
+    scripted.lose_next_answer("/map/");
+    let spill = spill_now(&node, &mut holding).await;
+    run_job(&node, &mut holding, spill).await;
+    assert_eq!(node.counters.jobs_discarded.load(Ordering::Relaxed), 1);
+    // The next job must not meet the key the lost answer left behind.
+    let spill = spill_now(&node, &mut holding).await;
+    run_job(&node, &mut holding, spill).await;
+    assert_eq!(node.counters.spills.load(Ordering::Relaxed), 1);
+    assert!(holding.root.deltas.is_empty());
+    assert!(holding.root.map.is_some());
+}
+
+#[tokio::test]
+async fn a_root_write_whose_answer_was_lost_does_not_displace_its_holder() {
+    let (scripted, _) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &[cell(1)]).await;
+    node.register_at_claim(&cell(2), 1);
+    node.flush_now().await.unwrap();
+    scripted.lose_next_answer("/root");
+    assert!(
+        node.pass(&mut holding).await.unwrap(),
+        "the root names this holder, so it carries on"
+    );
+    assert_eq!(holding.root.deltas.len(), 2);
+    node.register_at_claim(&cell(3), 1);
+    node.flush_now().await.unwrap();
+    assert!(node.pass(&mut holding).await.unwrap());
+    assert_eq!(
+        holding.root.deltas.len(),
+        3,
+        "its next write used the right version"
+    );
+}
+
+#[tokio::test]
+async fn a_takeover_whose_root_write_answered_an_error_still_holds() {
+    let (scripted, _) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let old = registry_on(&store, "node-a");
+    let _old_holding = holder_of(&old).await;
+    let new = registry_on(&store, "node-b");
+    scripted.lose_next_answer("/root");
+    let holding = take_over(&new).await;
+    assert_eq!(holding.epoch, 2);
+    let (root, _) = new.read_root(&Io::default()).await.unwrap().unwrap();
+    assert!(root.held_by(&new.session, 2));
+}
+
+#[tokio::test]
+async fn the_grace_of_a_retired_object_starts_at_the_root_write_that_stopped_naming_it() {
+    let store = memory();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &(0..20).map(cell).collect::<Vec<_>>()).await;
+    let spill = spill_now(&node, &mut holding).await;
+    holding.prepared.lock().unwrap().push(spill);
+    assert!(node.commit_prepared(&mut holding).await.unwrap());
+    assert!(holding.retired.is_empty(), "committed in memory only");
+    assert!(!holding.retire_next.is_empty());
+    node.register_at_claim(&cell(99), 1);
+    node.flush_now().await.unwrap();
+    assert!(node.pass(&mut holding).await.unwrap());
+    assert!(holding.retire_next.is_empty());
+    assert!(
+        !holding.retired.is_empty(),
+        "the root write started the grace"
+    );
+}
+
+#[tokio::test]
+async fn a_sweep_deletes_only_unnamed_objects_of_lower_epochs() {
+    let store = memory();
+    let cfg = Config {
+        grace_ms: 0,
+        ..config()
+    };
+    let old = registry_with(&store, "node-a", cfg.clone());
+    let mut old_holding = holder_of(&old).await;
+    register_and_fold(
+        &old,
+        &mut old_holding,
+        &(0..20).map(cell).collect::<Vec<_>>(),
+    )
+    .await;
+    let spill = spill_now(&old, &mut old_holding).await;
+    run_job(&old, &mut old_holding, spill).await;
+    let named_runs = keys_under(&store, &objects::runs_root(PREFIX)).await;
+    assert!(!named_runs.is_empty());
+    let new = registry_with(&store, "node-b", cfg);
+    let holding = take_over(&new).await;
+    assert_eq!(holding.epoch, 2);
+    let stray_old = objects::delta_key(PREFIX, DeltaId { epoch: 1, n: 99 });
+    let stray_own = objects::delta_key(PREFIX, DeltaId { epoch: 2, n: 99 });
+    for key in [&stray_old, &stray_own] {
+        objects::put_create(store.as_ref(), key, b"x".to_vec())
+            .await
+            .unwrap();
+    }
+    new.sweep(&HashSet::new()).await;
+    let deltas = keys_under(&store, &objects::deltas_root(PREFIX)).await;
+    assert!(
+        !deltas.contains(&stray_old),
+        "an unnamed lower-epoch delta goes"
+    );
+    assert!(
+        deltas.contains(&stray_own),
+        "this epoch's objects stay: a job may own them"
+    );
+    assert_eq!(
+        keys_under(&store, &objects::runs_root(PREFIX)).await,
+        named_runs,
+        "the runs the map names stay"
+    );
+}
+
+async fn keys_under(store: &Arc<dyn ObjectStore>, prefix: &str) -> Vec<String> {
+    let mut listing = store.list(Some(&object_store::path::Path::from(prefix)));
+    let mut keys = Vec::new();
+    while let Some(Ok(meta)) = listing.next().await {
+        keys.push(meta.location.to_string());
+    }
+    keys.sort();
+    keys
+}
+
+#[tokio::test]
+async fn in_shadow_the_bound_lets_the_write_go_on_and_counts_the_miss() {
+    let store = memory();
+    let cfg = Config {
+        enforce: false,
+        bound: Duration::from_millis(100),
+        ..config()
+    };
+    let node = registry_with(&store, "node-a", cfg);
+    node.register_at_claim(&cell(1), 1);
+    node.ensure_covered(&cell(1)).await.unwrap();
+    assert_eq!(node.counters.bound_hits.load(Ordering::Relaxed), 1);
+    assert!(
+        node.queue
+            .lock()
+            .unwrap()
+            .waiting
+            .contains_key(&objects::key_of(&cell(1))),
+        "the cell stays queued for the next write"
+    );
+}
+
+#[tokio::test]
+async fn a_zero_bound_does_not_wait_at_all() {
+    let store = memory();
+    let shadow = registry_with(
+        &store,
+        "node-a",
+        Config {
+            enforce: false,
+            bound: Duration::ZERO,
+            ..config()
+        },
+    );
+    let started = crate::asyncrt::mono_ms();
+    shadow.ensure_covered(&cell(1)).await.unwrap();
+    assert!(crate::asyncrt::mono_ms() - started < 100);
+    assert_eq!(shadow.waiters.load(Ordering::Relaxed), 0);
+    let enforcing = registry_with(
+        &store,
+        "node-b",
+        Config {
+            bound: Duration::ZERO,
+            ..config()
+        },
+    );
+    assert!(enforcing.ensure_covered(&cell(2)).await.is_err());
+}
+
+#[tokio::test]
+async fn the_whole_wait_including_the_backstop_lookup_stays_inside_the_bound() {
+    let (scripted, _) = scripted();
+    scripted.hold("/root");
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_on(&store, "node-a");
+    let started = crate::asyncrt::mono_ms();
+    assert!(node.ensure_covered(&cell(5)).await.is_err());
+    assert!(
+        crate::asyncrt::mono_ms() - started < 1_500,
+        "a lookup that never returns is cut at the bound"
+    );
+    scripted.release("/root");
+}
+
+#[tokio::test]
+async fn a_recovered_holder_is_matched_by_session_not_by_node_name() {
+    let store = memory();
+    let dead = registry_on(&store, "node-a");
+    let _holding = holder_of(&dead).await;
     let node = registry_on(&store, "node-b");
+    node.refresh(&Io::default()).await.unwrap();
     let now = crate::asyncrt::mono_ms();
-    assert!(!node.recovered_recently("node-a", now));
     node.note_recovered("node-a");
-    assert!(node.recovered_recently("node-a", now));
-    assert!(!node.recovered_recently("node-c", now));
-    assert!(!node.recovered_recently("node-a", now + 61_000));
+    assert!(node.recovered_recently("node-a", "session-node-a", now));
+    assert!(
+        !node.recovered_recently("node-a", "a-later-session", now),
+        "a restarted node holding the role is not the recovered one"
+    );
+    assert!(!node.recovered_recently("node-a", "session-node-a", now + 61_000));
+    node.note_recovered("node-c");
+    assert!(!node.recovered_recently("node-c", "session-node-c", now));
+}
+
+#[tokio::test]
+async fn a_graceful_stop_writes_the_claims_still_queued() {
+    let store = memory();
+    let node = registry_on(&store, "node-a");
+    node.register_at_claim(&cell(1), 1);
+    let stop = crate::ltx_repl::StopToken::new();
+    stop.request_stop();
+    node.clone().run_flusher(stop).await;
+    assert_eq!(
+        keys_under(&store, &objects::segments_root(PREFIX))
+            .await
+            .len(),
+        1,
+        "the last flush wrote the queue"
+    );
+}
+
+#[tokio::test]
+async fn a_folded_segment_leaves_the_seen_set_only_when_its_delete_is_confirmed() {
+    let store = memory();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &[cell(1)]).await;
+    assert_eq!(
+        holding.seen.len(),
+        1,
+        "still there until the delete is confirmed"
+    );
+    crate::asyncrt::timeout(Duration::from_secs(2), async {
+        while holding.deleted.lock().unwrap().is_empty() {
+            crate::asyncrt::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the delete was confirmed");
+    assert!(node.pass(&mut holding).await.unwrap());
+    assert!(holding.seen.is_empty());
 }

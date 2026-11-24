@@ -28,7 +28,7 @@ use tokio::io::AsyncWriteExt as _;
 
 /// How long an object that no root names stays before the sweep deletes it,
 /// which is far longer than the 2 s a lookup lasts.
-const GRACE_MS: u64 = 300_000;
+pub(crate) const GRACE_MS: u64 = 300_000;
 /// Segments one pass folds.
 const MAX_SEGMENTS: usize = 4_000;
 /// Segments fetched at a time.
@@ -586,7 +586,10 @@ pub(crate) async fn commit_job(
     prepared: &Prepared,
 ) -> Result<(Root, Map), reg::Discard> {
     let (mut root, map) = reg::apply_job(root, map, &prepared.job)?;
+    // A map key is never reused: a write that landed but returned an error
+    // would otherwise make every later commit find the key taken and discard.
     let number = *next_map;
+    *next_map += 1;
     if objects::put_create(
         store,
         &objects::map_key(prefix, epoch, number),
@@ -597,7 +600,6 @@ pub(crate) async fn commit_job(
     {
         return Err(reg::Discard::InputChanged);
     }
-    *next_map += 1;
     root.map = Some((epoch, number));
     Ok((root, map))
 }
@@ -636,6 +638,11 @@ struct Holding {
     next_map: u64,
     next_run: u64,
     seen: HashSet<String>,
+    /// Folded segments whose delete is confirmed, to leave `seen`.
+    deleted: Arc<Mutex<Vec<String>>>,
+    /// Objects a committed job stopped naming, until the root write that says
+    /// so is durable: their grace starts there.
+    retire_next: Vec<String>,
     counts: HashMap<DeltaId, u64>,
     retired: Vec<(String, u64)>,
     last_root_ms: u64,
@@ -656,6 +663,16 @@ struct Holding {
     deferred: bool,
     /// The delta the last fold wrote, with its content, until its root is written.
     fresh_delta: Option<(DeltaId, crate::registry::Loaded)>,
+}
+
+/// What a root read says after a write of the root did not succeed.
+enum Reconciled {
+    /// It is the root the failed write carried: the write landed.
+    Landed(UpdateVersion),
+    /// It names this holder but is an older root.
+    Holds(UpdateVersion),
+    /// It names someone else, or no one.
+    Lost,
 }
 
 enum Ended {
@@ -680,11 +697,11 @@ async fn lease_gone(registry: &Registry, node: &str) -> Option<bool> {
 const RECOVERY_VALID_MS: u64 = 60_000;
 
 impl Registry {
-    fn recovered_recently(&self, node: &str, now: u64) -> bool {
+    fn recovered_recently(&self, node: &str, session: &str, now: u64) -> bool {
         self.recovered
             .lock()
             .unwrap()
-            .get(node)
+            .get(&(node.to_owned(), session.to_owned()))
             .is_some_and(|at| now.saturating_sub(*at) < RECOVERY_VALID_MS)
     }
 
@@ -737,7 +754,7 @@ impl Registry {
                             unchanged_ms: unchanged,
                             lease_gone: lease,
                             recovered_holder: root.holder.as_ref().is_some_and(|holder| {
-                                !own && self.recovered_recently(&holder.node, now)
+                                !own && self.recovered_recently(&holder.node, &holder.session, now)
                             }),
                             stuck: root.stuck,
                             pass_ms: self.cfg.pass_ms,
@@ -811,17 +828,34 @@ impl Registry {
         if by_stuck {
             root.stuck += 1;
         }
-        let Some(written) =
-            objects::write_root_versioned(self.store.as_ref(), &self.prefix, &root, version)
-                .await?
-        else {
-            return Ok(None);
+        let attempt =
+            objects::write_root_versioned(self.store.as_ref(), &self.prefix, &root, version).await;
+        let written = match attempt {
+            Ok(Some(written)) => written,
+            // A write that landed and answered with an error leaves a root that
+            // names this node: without this it would sit as holder while no
+            // pass runs, and the others would wait the stuck threshold.
+            other => match self.reconcile_root(&root).await {
+                Some(Reconciled::Landed(written)) => written,
+                _ => return other.map(|_| None),
+            },
         };
         let snapshot = self.load(Arc::new(root.clone()), &io).await;
-        anyhow::ensure!(
-            snapshot.deltas_ok && snapshot.map_ok,
-            "the new holder could not load the registry"
-        );
+        if !(snapshot.deltas_ok && snapshot.map_ok) {
+            // The root names this node and nothing will run: give the role back
+            // at once, best effort.
+            let mut released = root.clone();
+            released.holder = None;
+            released.heartbeat += 1;
+            let _ = objects::write_root_versioned(
+                self.store.as_ref(),
+                &self.prefix,
+                &released,
+                Some(written),
+            )
+            .await;
+            anyhow::bail!("the new holder could not load the registry");
+        }
         // The root this node just wrote names these deltas. A node inside its
         // role never reads the root again, so this is the only time it learns
         // which of its own cells they already cover.
@@ -842,6 +876,8 @@ impl Registry {
             next_map: 0,
             next_run: 0,
             seen: HashSet::new(),
+            deleted: Arc::default(),
+            retire_next: Vec::new(),
             counts,
             retired: Vec::new(),
             last_root_ms: now,
@@ -870,21 +906,47 @@ impl Registry {
         holding.root.streak = streak;
         holding.root.stuck = stuck;
         self.counters.put_requests.fetch_add(1, Ordering::Relaxed);
-        match objects::write_root_versioned(
+        let attempt = objects::write_root_versioned(
             self.store.as_ref(),
             &self.prefix,
             &holding.root,
             Some(holding.version.clone()),
         )
-        .await?
-        {
-            Some(version) => {
+        .await;
+        if let Ok(Some(version)) = attempt {
+            holding.version = version;
+            holding.last_root_ms = crate::asyncrt::mono_ms();
+            return Ok(true);
+        }
+        // An error may be a write that landed, and a refusal may be the retry
+        // of one: read the root before standing down from a role it still names.
+        match self.reconcile_root(&holding.root).await {
+            Some(Reconciled::Landed(version)) => {
                 holding.version = version;
                 holding.last_root_ms = crate::asyncrt::mono_ms();
                 Ok(true)
             }
-            None => Ok(false),
+            Some(Reconciled::Holds(version)) => {
+                holding.version = version;
+                anyhow::bail!("the root moved under this holder; the next pass writes again")
+            }
+            Some(Reconciled::Lost) => Ok(false),
+            None => attempt.map(|_| false),
         }
+    }
+
+    /// Read the root after a write that failed or was refused, and say whether
+    /// it is the root `intended`, another root that still names this holder, or
+    /// one that names someone else. `None` when it cannot be read.
+    async fn reconcile_root(&self, intended: &Root) -> Option<Reconciled> {
+        let (root, version) = self.read_root(&Io::default()).await.ok().flatten()?;
+        Some(if *root == *intended {
+            Reconciled::Landed(version)
+        } else if root.held_by(&self.session, intended.epoch) {
+            Reconciled::Holds(version)
+        } else {
+            Reconciled::Lost
+        })
     }
 
     async fn hold(
@@ -1017,6 +1079,14 @@ impl Registry {
         if wrote && !self.write_root(holding).await? {
             return Ok(false);
         }
+        if wrote {
+            // The root that stopped naming these is durable: the grace starts now.
+            let now = crate::asyncrt::mono_ms();
+            let next = std::mem::take(&mut holding.retire_next);
+            holding
+                .retired
+                .extend(next.into_iter().map(|key| (key, now)));
+        }
         if wrote && !folded.is_empty() {
             // The conditional write succeeded, so the root names the delta that
             // folds these segments: the holder's own cells in them are covered.
@@ -1030,9 +1100,10 @@ impl Registry {
         // The root already names the delta, so coverage does not wait for the
         // deletes, and neither does the next pass.
         if !folded.is_empty() {
-            let registry = self.clone();
+            let (registry, deleted) = (self.clone(), holding.deleted.clone());
             crate::asyncrt::spawn(async move {
-                objects::delete_many(registry.store.as_ref(), &folded).await;
+                let gone = objects::delete_many(registry.store.as_ref(), &folded).await;
+                deleted.lock().unwrap().extend(gone);
             });
         }
         holding.last_pass_ms = crate::asyncrt::mono_ms();
@@ -1055,6 +1126,11 @@ impl Registry {
         };
         let deadline = crate::asyncrt::mono_ms().saturating_add(budget);
         holding.deferred = false;
+        // A folded segment leaves the set only once its delete is confirmed, so
+        // one that is still in the bucket is never folded twice.
+        for key in std::mem::take(&mut *holding.deleted.lock().unwrap()) {
+            holding.seen.remove(&key);
+        }
         self.counters.list_requests.fetch_add(1, Ordering::Relaxed);
         let mut listing = self
             .store
@@ -1152,9 +1228,6 @@ impl Registry {
         holding.root.deltas.insert(id);
         holding.counts.insert(id, count);
         holding.seen.extend(segments.iter().cloned());
-        if holding.seen.len() > 200_000 {
-            holding.seen.clear();
-        }
         Ok(segments)
     }
 
@@ -1184,10 +1257,7 @@ impl Registry {
                     holding.counts.retain(|id, _| named.contains(id));
                     holding.root = root;
                     holding.map = Arc::new(map);
-                    let now = crate::asyncrt::mono_ms();
-                    holding
-                        .retired
-                        .extend(job.retire.iter().map(|key| (key.clone(), now)));
+                    holding.retire_next.extend(job.retire.iter().cloned());
                     match job.kind {
                         "spill" => self.counters.spills.fetch_add(1, Ordering::Relaxed),
                         _ => self.counters.base_merges.fetch_add(1, Ordering::Relaxed),
@@ -1290,7 +1360,9 @@ impl Registry {
         crate::asyncrt::spawn(async move {
             let outcome = match (kind, spill_root) {
                 ("spill", Some(root)) => {
-                    let snapshot = registry.load(root.clone(), &Io::default()).await;
+                    let snapshot = registry
+                        .load_with(root.clone(), &Io::default(), &store)
+                        .await;
                     if snapshot.deltas_ok {
                         let consumed: HashMap<DeltaId, Arc<crate::registry::Loaded>> =
                             root.deltas.iter().copied().zip(snapshot.deltas).collect();
@@ -1355,7 +1427,7 @@ impl Registry {
         let due: Vec<String> = holding
             .retired
             .iter()
-            .filter(|(_, at)| now.saturating_sub(*at) >= GRACE_MS)
+            .filter(|(_, at)| now.saturating_sub(*at) >= self.cfg.grace_ms)
             .map(|(key, _)| key.clone())
             .collect();
         let sweep = now.saturating_sub(holding.last_sweep_ms) >= SWEEP_EVERY_MS;
@@ -1372,17 +1444,21 @@ impl Registry {
             holding.last_sample_ms = now;
         }
         holding.housekeeping.store(true, Ordering::SeqCst);
-        let (this, map, flag, sampler) = (
+        let (this, flag, sampler) = (
             self.clone(),
-            holding.map.clone(),
             holding.housekeeping.clone(),
             holding.sampler.clone(),
         );
-        let retired: HashSet<String> = holding.retired.iter().map(|(key, _)| key.clone()).collect();
+        let retired: HashSet<String> = holding
+            .retired
+            .iter()
+            .map(|(key, _)| key.clone())
+            .chain(holding.retire_next.iter().cloned())
+            .collect();
         crate::asyncrt::spawn(async move {
             objects::delete_many(this.store.as_ref(), &due).await;
             if sweep {
-                this.sweep(&map, &retired).await;
+                this.sweep(&retired).await;
             }
             if sample {
                 this.sample(&sampler).await;
@@ -1391,9 +1467,12 @@ impl Registry {
         });
     }
 
-    /// Delete the objects no root names that are older than the grace: a job
-    /// that lost its role, or a delta a failed commit left.
-    async fn sweep(&self, map: &Map, retired: &HashSet<String>) {
+    /// Delete the objects of lower compactor epochs that the current root and
+    /// its map do not name and that are older than the grace: a job that lost
+    /// its role, or a delta a failed commit left. Objects of this holder's own
+    /// epoch are never swept, so a job that is prepared or running keeps its
+    /// outputs; they leave through the retired lists and the discard path.
+    pub(crate) async fn sweep(&self, retired: &HashSet<String>) {
         let Some((root, _)) = self.read_root(&Io::default()).await.ok().flatten() else {
             return;
         };
@@ -1408,11 +1487,17 @@ impl Registry {
             .collect();
         if let Some((epoch, number)) = root.map {
             named.insert(objects::map_key(&self.prefix, epoch, number));
-        }
-        for partition in &map.partitions {
-            for (no, level) in [(1_u8, partition.l1), (2, partition.l2)] {
-                if let Some(run) = level_run(&level) {
-                    named.insert(objects::run_key(&self.prefix, partition.lo, no, &run));
+            // The map of the root this sweep read, not one it held earlier.
+            let Ok((map, _)) =
+                objects::read_map(self.store.as_ref(), &self.prefix, epoch, number).await
+            else {
+                return;
+            };
+            for partition in &map.partitions {
+                for (no, level) in [(1_u8, partition.l1), (2, partition.l2)] {
+                    if let Some(run) = level_run(&level) {
+                        named.insert(objects::run_key(&self.prefix, partition.lo, no, &run));
+                    }
                 }
             }
         }
@@ -1427,8 +1512,9 @@ impl Registry {
             let mut listing = self.store.list(Some(&Path::from(root_prefix)));
             while let Some(Ok(meta)) = listing.next().await {
                 let key = meta.location.to_string();
-                let old = wall - meta.last_modified.timestamp_millis() >= GRACE_MS as i64;
-                if old && !named.contains(&key) && !retired.contains(&key) {
+                let old = wall - meta.last_modified.timestamp_millis() >= self.cfg.grace_ms as i64;
+                let lower = objects::epoch_of(&key).is_some_and(|epoch| epoch < root.epoch);
+                if old && lower && !named.contains(&key) && !retired.contains(&key) {
                     stale.push(key);
                 }
             }

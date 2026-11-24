@@ -227,9 +227,9 @@ pub(crate) async fn delete(store: &dyn ObjectStore, key: &str) {
 /// Delete `keys` in as few requests as the store allows: an S3-compatible
 /// store sends one DeleteObjects per 1,000 keys. A key that fails stays and is
 /// found again by the sweep.
-pub(crate) async fn delete_many(store: &dyn ObjectStore, keys: &[String]) {
+pub(crate) async fn delete_many(store: &dyn ObjectStore, keys: &[String]) -> Vec<String> {
     if keys.is_empty() {
-        return;
+        return Vec::new();
     }
     let locations = futures_util::stream::iter(
         keys.iter()
@@ -237,7 +237,24 @@ pub(crate) async fn delete_many(store: &dyn ObjectStore, keys: &[String]) {
             .collect::<Vec<_>>(),
     )
     .boxed();
-    store.delete_stream(locations).for_each(|_| async {}).await;
+    store
+        .delete_stream(locations)
+        .filter_map(|deleted| async move { deleted.ok().map(|path| path.to_string()) })
+        .collect()
+        .await
+}
+
+/// The compactor epoch an object of a compactor was written under, from its
+/// key: `delta/<epoch>-<n>`, `map/<epoch>-<m>` and `run/<partition>/<level>-<epoch>-<id>`.
+pub(crate) fn epoch_of(key: &str) -> Option<u64> {
+    let name = key.rsplit('/').next()?;
+    let mut parts = name.split('-');
+    let first = parts.next()?.parse::<u64>().ok()?;
+    if key.contains("/run/") {
+        parts.next()?.parse().ok()
+    } else {
+        Some(first)
+    }
 }
 
 #[cfg(test)]
