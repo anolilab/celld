@@ -208,6 +208,49 @@ fn ownership_read_failed(error: anyhow::Error) -> Failure {
     Failure::Definite
 }
 
+/// The refusal that the reader rules of a sealed session give for `cell`, if
+/// any. A refusal is held and logged like any lost record.
+async fn judged_refusal(
+    bucket: &BucketOwnership,
+    cell: &str,
+    record: Option<&OwnerRecord>,
+    form: Option<&crate::ownership_store::OwnerForm>,
+) -> Result<Option<Failure>, Failure> {
+    use crate::session_reader::Verdict;
+    if crate::session::current().is_none() {
+        return Ok(None);
+    }
+    // The session wrote a record for this id and none exists: it is lost, and the
+    // session never writes a first record for the id again.
+    if record.is_none() && crate::session::current().is_some_and(|s| s.expects_record(cell)) {
+        eprintln!(
+            "celld ownership record lost: {cell}: the session wrote a record and it is lost; \
+             refusing the cell for {} s. See the ownership record repair in docs/guarantees.md.",
+            crate::ownership_store::LOST_RECORD_RECHECK_MS / 1_000
+        );
+        bucket.hold_lost_record(cell, crate::asyncrt::mono_ms());
+        return Ok(Some(Failure::Definite));
+    }
+    let plain = crate::ownership_store::OwnerForm::default();
+    let rec = record.map(|record| (record, form.unwrap_or(&plain)));
+    match bucket
+        .judge_tagged(cell, rec)
+        .await
+        .map_err(ownership_read_failed)?
+    {
+        Verdict::Proceed => Ok(None),
+        Verdict::Refuse(reason) => {
+            eprintln!(
+                "celld ownership record lost: {cell}: {reason}; refusing the cell for {} s. \
+                 See the ownership record repair in docs/guarantees.md.",
+                crate::ownership_store::LOST_RECORD_RECHECK_MS / 1_000
+            );
+            bucket.hold_lost_record(cell, crate::asyncrt::mono_ms());
+            Ok(Some(Failure::Definite))
+        }
+    }
+}
+
 impl Ownership {
     /// Read the record as it is stored. A missing record here means only that
     /// no record exists now, so this read must not decide a claim; the core
@@ -239,7 +282,27 @@ impl Ownership {
         if bucket.lost_record_held(cell, crate::asyncrt::mono_ms()) {
             return Err(Failure::Definite);
         }
-        let record = self.read_owner(cell, RecordReader::Claim).await?;
+        // A grant whose request gave up before its fleet proof is pending: the
+        // cell does not activate, and every request for it fails the same way
+        // and may be retried.
+        if crate::session::current().is_some_and(|session| session.is_pending_scope(cell)) {
+            tracing::warn!(
+                event = "pending_grant",
+                cell,
+                "the grant of the cell is pending"
+            );
+            return Err(Failure::Definite);
+        }
+        let (record, form) = bucket
+            .resolve_owner_form(cell, RecordReader::Claim)
+            .await
+            .map_err(ownership_read_failed)?
+            .map_or((None, None), |(record, form)| (Some(record), Some(form)));
+        // A cell of an id that another session minted, once that session's
+        // header is sealed: the reader rules of its chunk decide.
+        if let Some(refusal) = judged_refusal(bucket, cell, record.as_ref(), form.as_ref()).await? {
+            return Err(refusal);
+        }
         if record.is_some() {
             return Ok(record);
         }

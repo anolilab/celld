@@ -129,6 +129,37 @@ const CI_CONTROLS: &[&str] = &[
     "placed",
 ];
 
+/// Marks that never ride a bundle are not equivalent to the design: when the
+/// followers tails are lost in a declared loss, the rows of a cell survive in a
+/// bundle while its mark does not, a recoverer uploads those rows, and the sealed
+/// chunk lacks the grant of a cell that has an object. The build therefore puts
+/// the marks in the bundle, as the design says.
+#[test]
+fn marks_that_never_ride_a_bundle_leave_a_sealed_chunk_without_a_grant() {
+    let r = run_design(
+        "chunk-only marks r4b",
+        "r4b",
+        "rev4_chunk_only_marks",
+        &[],
+        true,
+        CAP,
+    );
+    assert!(
+        found(
+            "marks only on the followers",
+            &r,
+            &["a8_sealed_chunk_incomplete"]
+        ),
+        "the counterexample is gone: {:?}",
+        r.violations.keys().collect::<Vec<_>>()
+    );
+    let control = run_design("control r4b", "r4b", "rev4", &[], false, CAP);
+    assert!(
+        control.passed(),
+        "the design with marks in the bundle holds"
+    );
+}
+
 #[test]
 fn the_design_holds_every_invariant_in_every_scenario() {
     let mut labels = std::collections::BTreeSet::new();

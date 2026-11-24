@@ -544,6 +544,12 @@ pub(super) fn design_named(which: &str) -> Design {
         "rev2" => Design::rev2(),
         "rev3" => Design::rev3(),
         "rev4" => Design::rev4(),
+        // Revision 4 as the build has it: marks stay on the followers and reach
+        // the bucket as a bit in the chunk, never in a bundle.
+        "rev4_chunk_only_marks" => Design {
+            marks_ride_bundles: false,
+            ..Design::rev4()
+        },
         // Revision 3 with today's epochs: every first record at epoch 1.
         "rev3e1" => Design {
             tagged_first_record_epoch2: false,

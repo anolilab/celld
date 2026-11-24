@@ -18,6 +18,7 @@ use crate::engine_api::{
     durable_object_id_key, namespace_key, tagged_object_id, verify_object_id, IdKind,
 };
 use crate::ownership_store::RecordReader;
+use crate::session_store::{self as store, Chunk, Header, CHUNK};
 use anyhow::Context;
 use celld_logic::session::SessionTags;
 use celld_logic::OwnerRecord;
@@ -95,6 +96,35 @@ pub struct Session {
     /// header, which nodes read and clients never see, so an id minted by this
     /// session cannot be guessed from another id.
     counter_key: [u8; 32],
+    /// Chunks counted in the header. An id is minted only for a counter whose
+    /// chunk is counted; a process without a bucket has no chunks and no limit.
+    counted: AtomicU64,
+    /// The counters whose create-only record applied, and the chunks that hold
+    /// a counter the bucket does not know yet.
+    granted: Mutex<BTreeSet<u64>>,
+    dirty: Mutex<BTreeSet<u64>>,
+    /// The counters whose bit a chunk in the bucket holds.
+    checkpointed: Mutex<BTreeSet<u64>>,
+    /// The grants whose request gave up before a fleet proof. A proof that
+    /// comes later does not end this: the cell is served again only by the
+    /// wake at a new epoch, which is not built.
+    pending: Mutex<BTreeSet<u64>>,
+    /// The waived ids whose standard-path record this session wrote: it never
+    /// writes a first record for them again, and a missing record is lost.
+    claimed: Mutex<BTreeSet<u64>>,
+    /// The cells that left this session with a confirmed left entry in a chunk.
+    left: Mutex<BTreeSet<u64>>,
+    /// The cell of each granted counter, for the marks that ride a bundle.
+    granted_scopes: Mutex<BTreeMap<u64, String>>,
+    /// A write that waits for a bit asks for a checkpoint now.
+    nudge: tokio::sync::Notify,
+    /// The session stopped granting: its header closed, or its seal began.
+    closed: AtomicBool,
+    /// The close is the session's own graceful seal, which is running.
+    sealing: AtomicBool,
+    /// The session's seal finished and every bit it holds is in a sealed chunk.
+    sealed_with_bits: AtomicBool,
+    held: tokio::sync::Mutex<Held>,
     /// The next counter to issue: every counter below it was issued.
     issued: AtomicU64,
     /// The header is written and the lease can carry the tag; minting waits
@@ -139,6 +169,19 @@ impl Session {
             counter_key,
             tags: SessionTags::new(&hex(&tag), marker),
             issued: AtomicU64::new(0),
+            counted: AtomicU64::new(u64::MAX),
+            granted: Mutex::default(),
+            dirty: Mutex::default(),
+            checkpointed: Mutex::default(),
+            granted_scopes: Mutex::default(),
+            claimed: Mutex::default(),
+            left: Mutex::default(),
+            pending: Mutex::default(),
+            nudge: tokio::sync::Notify::new(),
+            closed: AtomicBool::new(false),
+            sealing: AtomicBool::new(false),
+            sealed_with_bits: AtomicBool::new(false),
+            held: tokio::sync::Mutex::default(),
             established: AtomicBool::new(false),
             resumed: Mutex::default(),
         }
@@ -180,10 +223,14 @@ impl Session {
     /// The next id of this session, or `None` before the session is
     /// established.
     pub(crate) fn mint(&self, key: &[u8; 32]) -> Option<[u8; 32]> {
-        if !self.is_established() {
+        if !self.is_established() || self.is_closed() {
             return None;
         }
         let counter = self.issued.fetch_add(1, Ordering::SeqCst);
+        let counted = self.counted.load(Ordering::SeqCst);
+        if counted != u64::MAX && counter / CHUNK >= counted {
+            return None;
+        }
         let block = encrypt_counter(&self.counter_key, counter);
         Some(tagged_object_id(key, self.tag, block))
     }
@@ -442,69 +489,457 @@ fn kind_of_scope(scope: &str) -> Option<IdKind> {
     keys.iter().find_map(|key| verify_object_id(key, &id))
 }
 
-#[derive(Serialize, Deserialize)]
-struct HeaderWire {
-    node: String,
-    generation: String,
-    mode: Mode,
-    state: String,
-    chunks: u64,
-    rev: u64,
-    /// The key that encrypts the counters of this session's ids, as hex.
-    key: String,
+/// What the session holds of its objects in the bucket: its header and chunks
+/// as it last wrote them, with the tokens of those writes.
+#[derive(Default)]
+pub(crate) struct Held {
+    header: Option<(Header, String)>,
+    chunks: BTreeMap<u64, (Chunk, String)>,
 }
 
-pub(crate) fn header_key(tag: &str) -> String {
-    format!("fleet/sessions/{tag}.json")
+/// Hold a write under `e1/` of the cell `scope` until the bit of its grant is in
+/// a chunk, when the cell is one that this session granted. Any other cell
+/// passes at once. A session that began its seal passes too: the seal writes
+/// the bits.
+pub(crate) async fn wait_until_checkpointed(scope: &str) -> anyhow::Result<()> {
+    match current() {
+        Some(session) => wait_with(session, scope).await,
+        None => Ok(()),
+    }
 }
 
-/// Create the header of `session` with a create-only write. An answer that is
-/// an error is settled by a read: the header must name this node and
-/// generation, or the process does not start. The tag cannot change after the
-/// lease carries it, and a collision of 8 random bytes is not an event to plan
-/// for.
-pub async fn create_header(
-    bucket: &Bucket,
-    session: &Session,
-    node: &str,
-    generation: &str,
-) -> anyhow::Result<()> {
-    let key = header_key(&session.tag());
-    let wire = HeaderWire {
-        node: node.to_string(),
-        generation: generation.to_string(),
-        mode: session.mode,
-        state: "open".to_string(),
-        chunks: 0,
-        rev: 0,
-        key: hex(&session.counter_key),
+async fn wait_with(session: &Session, scope: &str) -> anyhow::Result<()> {
+    let Some(counter) = session.own_counter_of_scope(scope) else {
+        return Ok(());
     };
-    let body = serde_json::to_vec(&wire)?;
-    let ours = |bytes: &[u8]| {
-        serde_json::from_slice::<HeaderWire>(bytes)
-            .is_ok_and(|found| found.node == node && found.generation == generation)
+    if !session.is_granted(counter) || session.is_checkpointed(counter) {
+        return Ok(());
+    }
+    session.nudge.notify_one();
+    let deadline = crate::asyncrt::mono_ms() + 30_000;
+    while crate::asyncrt::mono_ms() < deadline {
+        // The seal of this session writes the bits: a write goes on once the
+        // seal finished with them. A session that closed for any other reason
+        // (a chunk or a header that was lost or changed under it) never writes
+        // the object.
+        if session.is_checkpointed(counter) || session.sealed_with_bits.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if session.is_closed() && !session.sealing.load(Ordering::SeqCst) {
+            anyhow::bail!("the session closed before the grant of {scope} was in a chunk");
+        }
+        session.nudge.notify_one();
+        crate::asyncrt::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    anyhow::bail!("the grant of {scope} is not in a chunk")
+}
+
+/// A `Grant` that waits for its fleet proof: the cell, its counter, and the
+/// channel that the ship loop answers when the round that carried it completed.
+pub(crate) struct PendingMark {
+    pub scope: String,
+    pub counter: u64,
+    pub done: tokio::sync::oneshot::Sender<bool>,
+}
+
+static MARKS: Mutex<Vec<PendingMark>> = Mutex::new(Vec::new());
+
+/// Queue the `Grant` of `scope` for the next ship round. The answer is `true`
+/// when every member of the ensemble confirmed it, `false` when the round
+/// failed.
+pub(crate) fn enqueue_mark(scope: &str, counter: u64) -> tokio::sync::oneshot::Receiver<bool> {
+    let (done, wait) = tokio::sync::oneshot::channel();
+    MARKS.lock().expect("marks poisoned").push(PendingMark {
+        scope: scope.to_string(),
+        counter,
+        done,
+    });
+    wait
+}
+
+pub(crate) fn take_marks() -> Vec<PendingMark> {
+    std::mem::take(&mut *MARKS.lock().expect("marks poisoned"))
+}
+
+pub(crate) fn marks_pending() -> bool {
+    !MARKS.lock().expect("marks poisoned").is_empty()
+}
+
+/// Whether the bit of every counter is in a chunk in the bucket. A follower
+/// may truncate a batch with marks only then.
+pub(crate) fn marks_checkpointed(counters: &[u64]) -> bool {
+    counters.is_empty()
+        || current().is_none_or(|session| {
+            let written = session.checkpointed.lock().expect("checkpointed poisoned");
+            counters.iter().all(|counter| written.contains(counter))
+        })
+}
+
+/// How often the session writes the chunks that changed.
+pub fn checkpoint_interval() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("CELLD_LAZY_BIRTH_CHECKPOINT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(30_000),
+    )
+}
+
+impl Session {
+    /// The start order from the header on: create the header (create-only),
+    /// create chunk 0 and count it in the header by compare-and-swap, and only
+    /// then establish the session, so no id is minted before its chunk is
+    /// counted. The caller has recovered and sealed the predecessor, and
+    /// installs the lease after this returns. An answer that is an error is
+    /// settled by a read; the tag cannot change once the lease carries it, and
+    /// a collision of 8 random bytes is not an event to plan for.
+    pub async fn open(&self, bucket: &Bucket, node: &str, generation: &str) -> anyhow::Result<()> {
+        let tag = self.tag();
+        let mut header = Header {
+            node: node.to_string(),
+            generation: generation.to_string(),
+            mode: self.mode,
+            state: store::State::Open,
+            chunks: 0,
+            rev: 0,
+            key: hex(&self.counter_key),
+            lost: false,
+        };
+        let token = store::create_header(bucket, &tag, &header).await?;
+        let (chunk, chunk_token) = store::create_chunk(bucket, &tag, 0).await?;
+        header.chunks = 1;
+        header.rev = 1;
+        let token = store::swap_header(bucket, &tag, &header, &token)
+            .await?
+            .context("the session header changed before chunk 0 was counted")?;
+        {
+            let mut held = self.held.lock().await;
+            held.header = Some((header, token));
+            held.chunks.insert(0, (chunk, chunk_token));
+        }
+        self.counted.store(1, Ordering::SeqCst);
+        self.established.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Count the next chunk once the counters run within half a chunk of the
+    /// last counted one. Minting returns random ids, as a process without a
+    /// session does, until the header write applied.
+    pub async fn ensure_chunk_ahead(&self, bucket: &Bucket) -> anyhow::Result<()> {
+        let counted = self.counted.load(Ordering::SeqCst);
+        if counted == u64::MAX || self.is_closed() {
+            return Ok(());
+        }
+        if self.issued.load(Ordering::SeqCst) + CHUNK / 2 < counted * CHUNK {
+            return Ok(());
+        }
+        let tag = self.tag();
+        let (chunk, chunk_token) = store::create_chunk(bucket, &tag, counted).await?;
+        let mut held = self.held.lock().await;
+        let (mut header, token) = held.header.clone().context("the session is not open")?;
+        header.chunks = counted + 1;
+        header.rev += 1;
+        let Some(token) = store::swap_header(bucket, &tag, &header, &token).await? else {
+            self.closed.store(true, Ordering::SeqCst);
+            anyhow::bail!("the session header changed: the session stops granting");
+        };
+        held.header = Some((header, token));
+        held.chunks.insert(counted, (chunk, chunk_token));
+        self.counted.store(counted + 1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Record that the create-only record of the cell `scope` applied: the id's
+    /// counter is *granted*. The bit is set after the write returned, never
+    /// before. Idempotent, and a no-op for any id that this session did not
+    /// mint.
+    pub fn grant_scope(&self, scope: &str) {
+        if self.is_closed() {
+            return;
+        }
+        let Some(counter) = self.own_counter_of_scope(scope) else {
+            return;
+        };
+        self.granted_scopes
+            .lock()
+            .expect("granted scopes poisoned")
+            .insert(counter, scope.to_string());
+        if self
+            .granted
+            .lock()
+            .expect("granted poisoned")
+            .insert(counter)
+        {
+            self.dirty
+                .lock()
+                .expect("dirty poisoned")
+                .insert(counter / CHUNK);
+        }
+    }
+
+    /// The counter of a scope `Class:<64 hex digits>` whose id carries this
+    /// session's tag.
+    pub fn own_counter_of_scope(&self, scope: &str) -> Option<u64> {
+        let (_, id) = scope.rsplit_once(':')?;
+        let id = crate::engine_api::decode_durable_object_id(id)?;
+        if id[..8] != self.tag {
+            return None;
+        }
+        Some(decrypt_counter(
+            &self.counter_key,
+            id[8..16].try_into().ok()?,
+        ))
+    }
+
+    /// The cells whose `Grant` no chunk holds yet. A bundle carries them with
+    /// its rows, so a recoverer that finds the bundle finds the mark.
+    pub fn unchecked_mark_scopes(&self) -> Vec<(u64, String)> {
+        let written = self.checkpointed.lock().expect("checkpointed poisoned");
+        self.granted_scopes
+            .lock()
+            .expect("granted scopes poisoned")
+            .iter()
+            .filter(|(counter, _)| !written.contains(counter))
+            .map(|(counter, scope)| (*counter, scope.clone()))
+            .collect()
+    }
+
+    /// This session wrote the standard-path record of the waived id.
+    pub fn note_claimed(&self, counter: u64) {
+        self.claimed
+            .lock()
+            .expect("claimed poisoned")
+            .insert(counter);
+    }
+
+    /// Whether `scope` is an id of this session for which it wrote a record
+    /// (granted, or waived and claimed) and that record is expected to exist.
+    pub fn expects_record(&self, scope: &str) -> bool {
+        self.own_counter_of_scope(scope).is_some_and(|counter| {
+            self.is_granted(counter)
+                || self
+                    .claimed
+                    .lock()
+                    .expect("claimed poisoned")
+                    .contains(&counter)
+        })
+    }
+
+    pub fn is_claimed_scope(&self, scope: &str) -> bool {
+        self.own_counter_of_scope(scope).is_some_and(|counter| {
+            self.claimed
+                .lock()
+                .expect("claimed poisoned")
+                .contains(&counter)
+        })
+    }
+
+    /// The trace that a cell had a record, in a chunk in the bucket: a left
+    /// entry confirmed under a nonce of its own, by compare-and-swap. A left
+    /// entry implies the granted bit. It is written before every release of
+    /// the cell and before a preserved restart hands the cell on.
+    pub async fn confirm_left(&self, bucket: &Bucket, scope: &str) -> anyhow::Result<()> {
+        let Some(counter) = self.own_counter_of_scope(scope) else {
+            return Ok(());
+        };
+        if self.left.lock().expect("left poisoned").contains(&counter) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !self.is_closed() || self.sealing.load(Ordering::SeqCst),
+            "the session closed before the leave of {scope} was in a chunk"
+        );
+        let chunk = counter / CHUNK;
+        let tag = self.tag();
+        let mut nonce = [0_u8; 8];
+        getrandom::fill(&mut nonce).map_err(|error| anyhow::anyhow!("nonce: {error}"))?;
+        let nonce = hex(&nonce);
+        for _ in 0..6 {
+            let mut held = self.held.lock().await;
+            let (current, token) = held
+                .chunks
+                .get(&chunk)
+                .cloned()
+                .context("the session holds no such chunk")?;
+            let mut next = current.clone();
+            next.granted.insert(counter);
+            next.left.insert(
+                counter,
+                store::Left {
+                    epoch: 1,
+                    nonces: vec![nonce.clone()],
+                    done: Some(nonce.clone()),
+                },
+            );
+            next.rev += 1;
+            match store::swap_chunk(bucket, &tag, chunk, &next, &token).await? {
+                Some(token) => {
+                    self.checkpointed
+                        .lock()
+                        .expect("checkpointed poisoned")
+                        .extend(next.granted.iter().copied());
+                    self.granted
+                        .lock()
+                        .expect("granted poisoned")
+                        .insert(counter);
+                    held.chunks.insert(chunk, (next, token));
+                    self.left.lock().expect("left poisoned").insert(counter);
+                    return Ok(());
+                }
+                None => match store::read_chunk(bucket, &tag, chunk).await? {
+                    store::Read::Found(found, token) if found.state == store::State::Open => {
+                        held.chunks.insert(chunk, (found, token));
+                    }
+                    _ => {
+                        self.closed.store(true, Ordering::SeqCst);
+                        anyhow::bail!("chunk {chunk} is sealed or lost: the session stops");
+                    }
+                },
+            }
+        }
+        anyhow::bail!("the leave of {scope} lost every race")
+    }
+
+    pub fn mark_pending(&self, counter: u64) {
+        self.pending
+            .lock()
+            .expect("pending poisoned")
+            .insert(counter);
+    }
+
+    /// Whether `scope` is an id of this session whose grant is pending.
+    pub fn is_pending_scope(&self, scope: &str) -> bool {
+        self.own_counter_of_scope(scope).is_some_and(|counter| {
+            self.pending
+                .lock()
+                .expect("pending poisoned")
+                .contains(&counter)
+        })
+    }
+
+    /// Resolves when a write asked for a checkpoint.
+    pub async fn nudged(&self) {
+        self.nudge.notified().await;
+    }
+
+    /// Whether the counter's bit is in a chunk in the bucket.
+    pub fn is_checkpointed(&self, counter: u64) -> bool {
+        self.checkpointed
+            .lock()
+            .expect("checkpointed poisoned")
+            .contains(&counter)
+    }
+
+    /// Whether the counter's grant is recorded in memory.
+    pub fn is_granted(&self, counter: u64) -> bool {
+        self.granted
+            .lock()
+            .expect("granted poisoned")
+            .contains(&counter)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Write the chunks whose bits changed, each by a compare-and-swap on the
+    /// token of this session's last write of it. A lost write reads the chunk:
+    /// a sealed one ends the session's grants, an open one replaces what the
+    /// session holds and is written again at the next checkpoint.
+    pub async fn checkpoint(&self, bucket: &Bucket) -> anyhow::Result<()> {
+        let tag = self.tag();
+        let dirty: Vec<u64> = self
+            .dirty
+            .lock()
+            .expect("dirty poisoned")
+            .iter()
+            .copied()
+            .collect();
+        for chunk in dirty {
+            let granted = self.granted.lock().expect("granted poisoned").clone();
+            let mut held = self.held.lock().await;
+            let Some((current, token)) = held.chunks.get(&chunk).cloned() else {
+                continue;
+            };
+            let mut next = current.clone();
+            next.granted
+                .extend(granted.range(chunk * CHUNK..(chunk + 1) * CHUNK));
+            if next == current {
+                self.dirty.lock().expect("dirty poisoned").remove(&chunk);
+                continue;
+            }
+            next.rev += 1;
+            match store::swap_chunk(bucket, &tag, chunk, &next, &token).await? {
+                Some(token) => {
+                    self.checkpointed
+                        .lock()
+                        .expect("checkpointed poisoned")
+                        .extend(next.granted.iter().copied());
+                    held.chunks.insert(chunk, (next, token));
+                    self.dirty.lock().expect("dirty poisoned").remove(&chunk);
+                }
+                None => match store::read_chunk(bucket, &tag, chunk).await? {
+                    store::Read::Found(found, token) if found.state == store::State::Open => {
+                        held.chunks.insert(chunk, (found, token));
+                    }
+                    _ => {
+                        self.closed.store(true, Ordering::SeqCst);
+                        anyhow::bail!(
+                            "chunk {chunk} is sealed or lost: the session stops granting"
+                        );
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
+
+    /// The graceful close: stop granting, then seal this session's header and
+    /// chunks with the grants that no chunk holds yet.
+    pub async fn seal(&self, bucket: &Bucket) -> anyhow::Result<()> {
+        self.sealing.store(true, Ordering::SeqCst);
+        self.closed.store(true, Ordering::SeqCst);
+        let gather = self.granted.lock().expect("granted poisoned").clone();
+        let tag = self.tag();
+        store::seal_session(bucket, &tag, &gather, &BTreeSet::new()).await?;
+        // A chunk that a rival sealed first keeps its own content: only when
+        // every bit this session holds is in a sealed chunk may a held write
+        // go on.
+        let chunks: BTreeSet<u64> = gather.iter().map(|counter| counter / CHUNK).collect();
+        for chunk in chunks {
+            let Some(found) = (match store::read_chunk(bucket, &tag, chunk).await? {
+                store::Read::Found(found, _) => Some(found),
+                _ => None,
+            }) else {
+                return Ok(());
+            };
+            if gather
+                .range(chunk * CHUNK..(chunk + 1) * CHUNK)
+                .any(|counter| !found.granted.contains(counter))
+            {
+                return Ok(());
+            }
+        }
+        self.sealed_with_bits.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Seal the session whose tag the lease being replaced carries, before this
+/// process installs its own lease (the start order), also when that session
+/// never opened a log. A predecessor that sealed itself leaves nothing to do.
+/// This build records a grant in the chunk only, so the gather is empty.
+pub async fn seal_predecessor(bucket: &Bucket, node: &str, generation: &str) -> anyhow::Result<()> {
+    let key = format!("nodes/{node}.json");
+    let Some((bytes, _)) = bucket.get(&key).await? else {
+        return Ok(());
     };
-    match bucket.put_cas(&key, body, None).await {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => {
-            let found = bucket.get(&key).await?;
-            anyhow::ensure!(
-                found.is_some_and(|(bytes, _)| ours(&bytes)),
-                "the session header {key} already exists and is not this process's"
-            );
-            Ok(())
+    let lease: crate::ownership_store::NodeLeaseWire = serde_json::from_slice(&bytes)?;
+    match lease.session {
+        Some(session) if lease.generation != generation => {
+            store::seal_session(bucket, &session.tag, &BTreeSet::new(), &BTreeSet::new()).await
         }
-        Err(error) => {
-            let found = bucket
-                .get(&key)
-                .await
-                .with_context(|| format!("read back {key} after: {error:#}"))?;
-            anyhow::ensure!(
-                found.is_some_and(|(bytes, _)| ours(&bytes)),
-                "could not create the session header {key}: {error:#}"
-            );
-            Ok(())
-        }
+        _ => Ok(()),
     }
 }
 
@@ -524,6 +959,21 @@ pub async fn prepare_reload(
     cells: &[celld_logic::PresenceCell],
 ) -> anyhow::Result<crate::clean_reload::ReloadSession> {
     use celld_logic::session::{retag_needed, CARRIED_BOUND};
+    // Step 1 of the order, for the cells that this process wrote a record for: a
+    // trace in the bucket before the cell is handed on. A granted cell needs its
+    // bit in a chunk, a waived cell that it claimed needs a confirmed left entry.
+    // Any failure leaves no certificate.
+    let bucket = ownership.bucket_client();
+    for cell in cells {
+        let Some(counter) = session.own_counter_of_scope(&cell.id) else {
+            continue;
+        };
+        if session.is_claimed_scope(&cell.id) {
+            session.confirm_left(&bucket, &cell.id).await?;
+        } else if session.is_granted(counter) {
+            wait_until_checkpointed(&cell.id).await?;
+        }
+    }
     use futures_util::StreamExt as _;
     const READS: usize = 32;
     let all = session.tags().all();
@@ -1131,6 +1581,120 @@ mod tests {
         assert!(refuse_knob(false, Some(String::new())).is_err());
         assert!(refuse_knob(false, None).is_ok());
         assert!(refuse_knob(true, Some("1".into())).is_ok());
+    }
+
+    #[test]
+    fn no_id_is_minted_for_a_chunk_that_is_not_counted() {
+        let session = Session::with_tag(Mode::Shadow, [2; 8], &[]);
+        session.counted.store(1, Ordering::SeqCst);
+        session.established.store(true, Ordering::SeqCst);
+        for _ in 0..CHUNK {
+            assert!(session.mint(&key()).is_some());
+        }
+        assert!(session.mint(&key()).is_none(), "chunk 1 is not counted");
+        session.counted.store(2, Ordering::SeqCst);
+        assert!(session.mint(&key()).is_some());
+        session.closed.store(true, Ordering::SeqCst);
+        assert!(
+            session.mint(&key()).is_none(),
+            "a closed session mints nothing"
+        );
+    }
+
+    #[test]
+    fn a_grant_is_recorded_once_for_an_id_of_this_session_only() {
+        let session = established([2; 8]);
+        let own = durable_object_id_hex(&session.mint(&key()).expect("established"));
+        let other = durable_object_id_hex(&tagged_object_id(&key(), [3; 8], [1; 8]));
+        let named = durable_object_id_hex(&durable_object_id_for_name(
+            &namespace_key(SCRIPT, CLASS),
+            "alpha",
+        ));
+        session.grant_scope(&format!("{CLASS}:{own}"));
+        session.grant_scope(&format!("{CLASS}:{other}"));
+        session.grant_scope(&format!("{CLASS}:{named}"));
+        session.grant_scope("not-a-scope");
+        assert!(session.is_granted(0));
+        assert_eq!(session.granted.lock().unwrap().len(), 1);
+        assert_eq!(session.dirty.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn a_write_waits_for_the_bit_of_a_grant_only() {
+        crate::asyncrt::install_test_host_runtime();
+        let session = std::sync::Arc::new(established([9; 8]));
+        let own = durable_object_id_hex(&session.mint(&key()).expect("established"));
+        let scope = format!("{CLASS}:{own}");
+        let other = format!(
+            "{CLASS}:{}",
+            durable_object_id_hex(&tagged_object_id(&key(), [1; 8], [2; 8]))
+        );
+        // Not granted yet, and not this session's: nothing is held.
+        wait_with(&session, &scope).await.unwrap();
+        wait_with(&session, &other).await.unwrap();
+        session.grant_scope(&scope);
+        let waiting = {
+            let session = session.clone();
+            let scope = scope.clone();
+            tokio::spawn(async move { wait_with(&session, &scope).await })
+        };
+        // The write asks for a checkpoint and keeps waiting until the bit is in a chunk.
+        tokio::time::timeout(std::time::Duration::from_secs(5), session.nudged())
+            .await
+            .expect("the write asks for a checkpoint");
+        assert!(!waiting.is_finished());
+        session.checkpointed.lock().unwrap().insert(0);
+        waiting.await.unwrap().unwrap();
+        // A session that closed because its chunk or header was lost under it
+        // never lets the object through.
+        let lost = established([9; 8]);
+        let id = durable_object_id_hex(&lost.mint(&key()).expect("established"));
+        let lost_scope = format!("{CLASS}:{id}");
+        lost.grant_scope(&lost_scope);
+        lost.closed.store(true, Ordering::SeqCst);
+        assert!(wait_with(&lost, &lost_scope).await.is_err());
+        // A session whose own seal is running waits for it, and goes on only when
+        // the seal finished with the bits.
+        lost.sealing.store(true, Ordering::SeqCst);
+        let finish = {
+            let lost = std::sync::Arc::new(lost);
+            let waiter = lost.clone();
+            let scope = lost_scope.clone();
+            let task = tokio::spawn(async move { wait_with(&waiter, &scope).await });
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(!task.is_finished(), "the seal has not finished");
+            lost.sealed_with_bits.store(true, Ordering::SeqCst);
+            task
+        };
+        finish.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_session_expects_the_record_of_an_id_it_granted_or_claimed() {
+        let session = established([6; 8]);
+        let first = durable_object_id_hex(&session.mint(&key()).expect("established"));
+        let second = durable_object_id_hex(&session.mint(&key()).expect("established"));
+        let third = durable_object_id_hex(&session.mint(&key()).expect("established"));
+        let scope = |id: &String| format!("{CLASS}:{id}");
+        assert!(!session.expects_record(&scope(&first)));
+        session.grant_scope(&scope(&first));
+        session.note_claimed(1);
+        assert!(session.expects_record(&scope(&first)), "granted");
+        assert!(session.expects_record(&scope(&second)), "claimed");
+        assert!(session.is_claimed_scope(&scope(&second)));
+        assert!(
+            !session.expects_record(&scope(&third)),
+            "minted and never used"
+        );
+        let other = format!(
+            "{CLASS}:{}",
+            durable_object_id_hex(&tagged_object_id(&key(), [1; 8], [2; 8]))
+        );
+        assert!(!session.expects_record(&other), "another session");
+        assert!(!session.is_pending_scope(&scope(&first)));
+        session.mark_pending(0);
+        assert!(session.is_pending_scope(&scope(&first)));
     }
 
     #[test]

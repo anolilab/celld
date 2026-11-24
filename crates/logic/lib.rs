@@ -37,6 +37,7 @@ pub mod restore;
 pub mod routing;
 pub mod schedule;
 pub mod session;
+pub mod session_take;
 pub mod sqlite;
 pub mod sweep;
 pub mod wake;
@@ -7733,6 +7734,8 @@ mod reset_tests;
 mod scripted;
 #[cfg(test)]
 mod second_release_tests;
+#[cfg(test)]
+mod session_take_tests;
 #[cfg(test)]
 mod session_tests;
 #[cfg(test)]

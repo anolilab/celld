@@ -74,6 +74,17 @@ export default {
         empty: throws(() => ns.idFromString("")),
       });
     }
+    if (url.pathname === "/spawn") {
+      // New agents, each called in the request that creates its id.
+      const n = Number(url.searchParams.get("n") ?? 1);
+      const ids = [];
+      for (let i = 0; i < n; i++) {
+        const id = ns.newUniqueId();
+        await ns.get(id).fetch("http://object/bump");
+        ids.push(id.toString());
+      }
+      return Response.json({ ids });
+    }
     if (url.pathname === "/mint") {
       const ids = Array.from({ length: 3 }, () => ns.newUniqueId().toString());
       return Response.json({ ids });

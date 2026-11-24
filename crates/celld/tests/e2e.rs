@@ -35,6 +35,7 @@ mod e2e {
     pub mod invoke;
     pub mod isolates;
     pub mod lazy_birth;
+    pub mod lazy_birth_fleet;
     pub mod loader_defects;
     pub mod loader_isolation;
     pub mod node_compat;
