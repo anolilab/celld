@@ -331,6 +331,21 @@ pub(crate) async fn merge_to_run(
 // Jobs
 // ---------------------------------------------------------------------------
 
+/// Outputs a failed job wrote and could not delete: carried in the error, so the
+/// holder deletes them later.
+#[derive(Debug)]
+pub(crate) struct Stranded(pub Vec<String>);
+
+impl std::fmt::Display for Stranded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} written objects could not be deleted",
+            self.0.len()
+        )
+    }
+}
+
 /// A job prepared against one root and map, with what its commit retires.
 #[derive(Debug)]
 pub(crate) struct Prepared {
@@ -464,8 +479,21 @@ pub(crate) async fn prepare_spill(
         }
     }
     if let Some(error) = failure {
-        objects::delete_many(store.as_ref(), &outputs).await;
-        return Err(error);
+        // Outputs that cannot be deleted now are handed back, so the holder
+        // keeps them in its retired list and deletes them after the grace.
+        let gone: HashSet<String> = objects::delete_many(store.as_ref(), &outputs)
+            .await
+            .into_iter()
+            .collect();
+        let stranded: Vec<String> = outputs
+            .into_iter()
+            .filter(|key| !gone.contains(key))
+            .collect();
+        return Err(if stranded.is_empty() {
+            error
+        } else {
+            error.context(Stranded(stranded))
+        });
     }
     // A spill lists every partition: one that no consumed record falls in keeps
     // its level 1, and the commit still checks that it did not move.
@@ -578,6 +606,7 @@ pub(crate) async fn base_merge_with(
 
 /// Apply a prepared job to the root and map and write the new map. The caller
 /// writes the returned root.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_job(
     store: &dyn ObjectStore,
     prefix: &str,
@@ -586,20 +615,21 @@ pub(crate) async fn commit_job(
     root: &Root,
     map: &Map,
     prepared: &Prepared,
+    stray: &mut Option<String>,
 ) -> Result<(Root, Map), reg::Discard> {
     let (mut root, map) = reg::apply_job(root, map, &prepared.job)?;
     // A map key is never reused: a write that landed but returned an error
     // would otherwise make every later commit find the key taken and discard.
     let number = *next_map;
     *next_map += 1;
-    if objects::put_create(
-        store,
-        &objects::map_key(prefix, epoch, number),
-        reg::encode_map(&map),
-    )
-    .await
-    .is_err()
+    let key = objects::map_key(prefix, epoch, number);
+    if objects::put_create(store, &key, reg::encode_map(&map))
+        .await
+        .is_err()
     {
+        // The create may have landed. No root will name this key, so it is kept
+        // to be deleted after the grace.
+        *stray = Some(key);
         return Err(reg::Discard::InputChanged);
     }
     root.map = Some((epoch, number));
@@ -646,10 +676,15 @@ struct Holding {
     /// often: they go to the back of the next listing, so the ones behind them
     /// get fetch slots, and stay eligible.
     stalled: HashMap<String, u32>,
+    /// Folded segments whose delta no durable root names yet: deleted, and their
+    /// cells covered, once one does, whichever pass writes it.
+    pending_delete: Vec<String>,
     /// Folded segments whose delete is confirmed, to leave `seen`.
     deleted: Arc<Mutex<Vec<String>>>,
     /// Retired objects whose delete is confirmed, to leave `retired`.
     retired_gone: Arc<Mutex<Vec<String>>>,
+    /// Outputs of failed jobs that could not be deleted, to join `retired`.
+    stranded: Arc<Mutex<Vec<String>>>,
     /// Objects a committed job stopped naming, until the root write that says
     /// so is durable: their grace starts there.
     retire_next: Vec<String>,
@@ -893,8 +928,10 @@ impl Registry {
             next_run: 0,
             seen: HashSet::new(),
             stalled: HashMap::new(),
+            pending_delete: Vec::new(),
             deleted: Arc::default(),
             retired_gone: Arc::default(),
+            stranded: Arc::default(),
             retire_next: Vec::new(),
             counts,
             retired: Vec::new(),
@@ -1089,7 +1126,10 @@ impl Registry {
             folded = self.fold_segments(holding).await?;
         }
         holding.last_folded = folded.len() as u64;
-        if !folded.is_empty() {
+        // Segments of a delta that an earlier, failed root write left unnamed wait
+        // here, and this pass writes the root for them even if it folded nothing.
+        holding.pending_delete.extend(folded);
+        if !holding.pending_delete.is_empty() {
             changed = true;
         }
         let beat_due =
@@ -1106,19 +1146,18 @@ impl Registry {
                 .retired
                 .extend(next.into_iter().map(|key| (key, now)));
         }
-        if wrote && !folded.is_empty() {
+        if wrote && !holding.pending_delete.is_empty() {
             // The conditional write succeeded, so the root names the delta that
-            // folds these segments: the holder's own cells in them are covered.
+            // folds these segments: the holder's own cells in them are covered, and
+            // the segments can go. Coverage does not wait for the deletes, and
+            // neither does the next pass.
+            let folded = std::mem::take(&mut holding.pending_delete);
             self.observe_coverage(&folded.iter().collect());
             self.observed.notify_waiters();
             if let Some((id, loaded)) = holding.fresh_delta.take() {
                 self.seed_delta(id, loaded);
             }
             self.push_root(holding);
-        }
-        // The root already names the delta, so coverage does not wait for the
-        // deletes, and neither does the next pass.
-        if !folded.is_empty() {
             let (registry, deleted) = (self.clone(), holding.deleted.clone());
             crate::asyncrt::spawn(async move {
                 let gone = objects::delete_many(registry.store.as_ref(), &folded).await;
@@ -1281,6 +1320,7 @@ impl Registry {
             if job.epoch != holding.epoch {
                 continue;
             }
+            let mut stray = None;
             match commit_job(
                 self.store.as_ref(),
                 &self.prefix,
@@ -1289,6 +1329,7 @@ impl Registry {
                 &holding.root,
                 &holding.map,
                 &job,
+                &mut stray,
             )
             .await
             {
@@ -1319,6 +1360,9 @@ impl Registry {
                     changed = true;
                 }
                 Err(why) => {
+                    if let Some(key) = stray {
+                        holding.retired.push((key, crate::asyncrt::mono_ms()));
+                    }
                     self.counters.jobs_discarded.fetch_add(1, Ordering::Relaxed);
                     tracing::info!(event = "registry_job_discarded", kind = job.kind, ?why);
                     objects::delete_many(self.store.as_ref(), &job.outputs).await;
@@ -1413,6 +1457,7 @@ impl Registry {
         );
         let spill_root = (kind == "spill").then(|| Arc::new(holding.root.clone()));
         let advanced = holding.advanced.clone();
+        let stranded = holding.stranded.clone();
         running.fetch_add(1, Ordering::SeqCst);
         let registry = self.clone();
         crate::asyncrt::spawn(async move {
@@ -1462,6 +1507,9 @@ impl Registry {
                 }
                 Ok(None) => advanced.lock().unwrap().push((kind, partition)),
                 Err(error) => {
+                    if let Some(Stranded(keys)) = error.downcast_ref::<Stranded>() {
+                        stranded.lock().unwrap().extend(keys.iter().cloned());
+                    }
                     if format!("{error:#}").contains("self-check") {
                         registry
                             .counters
@@ -1486,6 +1534,10 @@ impl Registry {
         let now = crate::asyncrt::mono_ms();
         // A key leaves the list when its delete is confirmed, not when it is
         // asked for, so a delete that failed is tried again.
+        let stranded = std::mem::take(&mut *holding.stranded.lock().unwrap());
+        holding
+            .retired
+            .extend(stranded.into_iter().map(|key| (key, now)));
         let gone: HashSet<String> = std::mem::take(&mut *holding.retired_gone.lock().unwrap())
             .into_iter()
             .collect();

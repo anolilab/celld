@@ -38,6 +38,8 @@ const RETRY_AFTER: Duration = Duration::from_secs(1);
 const FINAL_FLUSH: Duration = Duration::from_secs(2);
 /// Cells whose coverage a node waits on at once; more are queued but not tracked.
 pub(crate) const CREATED_CAP: usize = 200_000;
+/// Cells queued for the next segment at once.
+pub(crate) const WAITING_CAP: usize = 1_000_000;
 /// How often a waiting write reads the root.
 const POLL: Duration = Duration::from_millis(250);
 /// Pass requests from one node are at least this far apart.
@@ -57,11 +59,9 @@ impl Registry {
                 return;
             }
             let record = Record::birth(key, epoch.min(u64::from(u32::MAX)) as u32);
-            queue
-                .waiting
-                .entry(key)
-                .and_modify(|held| *held = reg::merge(*held, record))
-                .or_insert(record);
+            if !self.enqueue(&mut queue, key, record) {
+                return;
+            }
             if queue.created.len() < self.cfg.created_cap {
                 queue.created.entry(key).or_insert(Created {
                     created_here: epoch == 1,
@@ -70,6 +70,41 @@ impl Registry {
             }
         }
         self.queued.notify_one();
+    }
+
+    /// Queue `record` for the next segment: merged into the cell's entry when it
+    /// has one, added when there is room, and otherwise dropped and counted. A
+    /// dropped cell is queued again by the wait of its first per-cell write.
+    pub(crate) fn enqueue(
+        &self,
+        queue: &mut crate::registry::Queue,
+        key: Key,
+        record: Record,
+    ) -> bool {
+        if let Some(held) = queue.waiting.get_mut(&key) {
+            *held = reg::merge(*held, record);
+            return true;
+        }
+        if queue.waiting.len() >= self.cfg.waiting_cap {
+            self.counters.queue_dropped.fetch_add(1, Ordering::Relaxed);
+            let now = crate::asyncrt::mono_ms();
+            let last = self.last_drop_log_ms.load(Ordering::Relaxed);
+            if (last == 0 || now.saturating_sub(last) >= 60_000)
+                && self
+                    .last_drop_log_ms
+                    .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                tracing::warn!(
+                    event = "registry_queue_dropped",
+                    cap = self.cfg.waiting_cap,
+                    "the registry queue is full: a cell was not queued and is queued again by its first write"
+                );
+            }
+            return false;
+        }
+        queue.waiting.insert(key, record);
+        true
     }
 
     /// Whether this process holds evidence that the registry covers `key`.
@@ -149,11 +184,7 @@ impl Registry {
             }
             Err(error) => {
                 for (cell, record) in batch {
-                    queue
-                        .waiting
-                        .entry(cell)
-                        .and_modify(|held| *held = reg::merge(*held, record))
-                        .or_insert(record);
+                    self.enqueue(&mut queue, cell, record);
                 }
                 drop(queue);
                 self.queued.notify_one();
@@ -320,9 +351,9 @@ impl Registry {
     }
 
     /// Queue a cell that was not queued at its claim (or whose entry is gone).
-    fn queue_for_coverage(&self, key: &Key) {
+    pub(crate) fn queue_for_coverage(&self, key: &Key) {
         let mut queue = self.queue.lock().unwrap();
-        queue.waiting.entry(*key).or_insert(Record::birth(*key, 0));
+        self.enqueue(&mut queue, *key, Record::birth(*key, 0));
         if queue.created.len() < self.cfg.created_cap {
             queue.created.entry(*key).or_insert(Created {
                 created_here: false,
@@ -422,11 +453,7 @@ impl Drop for Requeue<'_> {
         };
         let mut queue = self.registry.queue.lock().unwrap();
         for (cell, record) in batch {
-            queue
-                .waiting
-                .entry(cell)
-                .and_modify(|held| *held = reg::merge(*held, record))
-                .or_insert(record);
+            self.registry.enqueue(&mut queue, cell, record);
         }
         drop(queue);
         self.registry.queued.notify_one();

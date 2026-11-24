@@ -52,6 +52,9 @@ impl<K: std::hash::Hash + Eq> RecentSet<K> {
     }
 }
 
+/// Shadow lookups beside claims that run at once; a claim over the limit is not
+/// looked up, so shadow never competes without bound with the compactor's passes.
+pub(crate) const SHADOW_LOOKUPS: usize = 16;
 /// A lookup that outlives this answers `Unknown`.
 pub(crate) const LOOKUP_DEADLINE: Duration = Duration::from_secs(2);
 /// Cells whose coverage this process has observed.
@@ -81,6 +84,9 @@ pub(crate) struct Config {
     /// Cells whose own segment a node tracks at once; more are queued but found
     /// by a lookup during the wait.
     pub created_cap: usize,
+    /// Cells queued for the next segment at once; a cell over it is dropped and
+    /// counted, and its first per-cell write queues it again.
+    pub waiting_cap: usize,
     /// How long after a miss the sampler looks again.
     pub sampler_recheck_ms: u64,
     /// `CELLD_REGISTRY_JOB_PACING`: limit the requests and bytes per second of
@@ -149,6 +155,7 @@ impl Config {
             enforce: false,
             grace_ms: crate::registry_compactor::GRACE_MS,
             created_cap: crate::registry_writer::CREATED_CAP,
+            waiting_cap: crate::registry_writer::WAITING_CAP,
             sampler_recheck_ms: 20_000,
             job_pacing,
             pass_read: Duration::from_millis(pass_read_ms),
@@ -242,6 +249,10 @@ pub(crate) struct Counters {
     pub cap_pauses: AtomicU64,
     pub sampler_cells: AtomicU64,
     pub sampler_misses: AtomicU64,
+    /// Shadow lookups beside claims that were not started because too many ran.
+    pub shadow_skipped: AtomicU64,
+    /// Cells that were not queued because the queue was full.
+    pub queue_dropped: AtomicU64,
     /// Rechecks that could not tell (a failed read, a closed gate).
     pub sampler_unknown: AtomicU64,
     pub mismatches: AtomicU64,
@@ -311,6 +322,10 @@ pub struct Registry {
     /// Live nodes and their addresses, for the holder's root push.
     pub(crate) fleet: Mutex<Vec<(String, String)>>,
     pub(crate) last_pass_request_ms: AtomicU64,
+    /// When a dropped cell was last logged, so the log is once a minute.
+    pub(crate) last_drop_log_ms: AtomicU64,
+    /// Shadow lookups beside claims in flight at once.
+    shadow_slots: Arc<tokio::sync::Semaphore>,
     /// Holders (node and session) whose node log this process recovered, and
     /// when: such a holder is dead, so the role can be taken at once. A later
     /// session of the same node is not one of them.
@@ -378,6 +393,8 @@ impl Registry {
             peer_addr: Mutex::new(HashMap::new()),
             fleet: Mutex::new(Vec::new()),
             last_pass_request_ms: AtomicU64::new(0),
+            last_drop_log_ms: AtomicU64::new(0),
+            shadow_slots: Arc::new(tokio::sync::Semaphore::new(SHADOW_LOOKUPS)),
             recovered: Mutex::new(HashMap::new()),
         })
     }
@@ -385,6 +402,16 @@ impl Registry {
     /// Make this registry the one the routes serve.
     pub(crate) fn install(self: &Arc<Self>) {
         let _ = GLOBAL.set(self.clone());
+    }
+
+    /// A slot for one shadow lookup beside a claim, or `None` (counted) when the
+    /// limit is reached.
+    pub(crate) fn shadow_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let slot = self.shadow_slots.clone().try_acquire_owned().ok();
+        if slot.is_none() {
+            self.counters.shadow_skipped.fetch_add(1, Ordering::Relaxed);
+        }
+        slot
     }
 
     /// This process recovered the node log of `node`, which is dead: if it holds
@@ -912,6 +939,8 @@ impl Registry {
             ("cap_pauses", &counters.cap_pauses),
             ("sampler_cells", &counters.sampler_cells),
             ("sampler_misses", &counters.sampler_misses),
+            ("shadow_skipped", &counters.shadow_skipped),
+            ("queue_dropped", &counters.queue_dropped),
             ("sampler_unknown", &counters.sampler_unknown),
             ("mismatches", &counters.mismatches),
             ("bytes_written", &counters.bytes_written),

@@ -772,9 +772,11 @@ impl BucketOwnership {
         cell: &str,
     ) -> Option<tokio::sync::oneshot::Sender<ShadowVerdict>> {
         let registry = self.registry.clone()?;
+        let slot = registry.shadow_slot()?;
         let (verdict, arrived) = tokio::sync::oneshot::channel::<ShadowVerdict>();
         let (this, cell) = (self.clone(), cell.to_owned());
         crate::asyncrt::spawn(async move {
+            let _slot = slot;
             let result = registry
                 .lookup(&crate::registry_objects::key_of(&cell))
                 .await;

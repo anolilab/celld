@@ -20,6 +20,7 @@ fn config() -> Config {
         enforce: true,
         grace_ms: crate::registry_compactor::GRACE_MS,
         created_cap: crate::registry_writer::CREATED_CAP,
+        waiting_cap: crate::registry_writer::WAITING_CAP,
         sampler_recheck_ms: 20_000,
         job_pacing: false,
         pass_read: Duration::ZERO,
@@ -738,6 +739,8 @@ mod store {
         /// Writes of keys that contain a pattern are applied once and then
         /// answer an error, as a write whose answer was lost does.
         ambiguous: Mutex<Vec<String>>,
+        /// Writes of keys that contain a pattern are refused, once per entry.
+        refused: Mutex<Vec<String>>,
         failing: Mutex<Vec<String>>,
         held: Mutex<Vec<(String, Arc<Semaphore>)>>,
         seen: Notify,
@@ -759,6 +762,7 @@ mod store {
                 ops: Mutex::new(Vec::new()),
                 failing_deletes: std::sync::atomic::AtomicBool::new(false),
                 ambiguous: Mutex::new(Vec::new()),
+                refused: Mutex::new(Vec::new()),
                 failing: Mutex::new(Vec::new()),
                 held: Mutex::new(Vec::new()),
                 seen: Notify::new(),
@@ -766,6 +770,12 @@ mod store {
                 widest: AtomicU64::new(0),
                 range_cap: AtomicU64::new(u64::MAX),
             })
+        }
+
+        /// The next `times` writes of a key containing `pattern` fail and write nothing.
+        pub(super) fn refuse_puts(&self, pattern: &str, times: usize) {
+            let mut refused = self.refused.lock().unwrap();
+            refused.extend(std::iter::repeat_n(pattern.to_owned(), times));
         }
 
         pub(super) fn fail_deletes(&self, on: bool) {
@@ -927,6 +937,20 @@ mod store {
             }
             self.pause().await;
             self.ops.lock().unwrap().push(format!("put {key}"));
+            let refuse = {
+                let mut refused = self.refused.lock().unwrap();
+                refused
+                    .iter()
+                    .position(|pattern| key.contains(pattern.as_str()))
+                    .map(|at| refused.remove(at))
+                    .is_some()
+            };
+            if refuse {
+                return Err(object_store::Error::Generic {
+                    store: "scripted",
+                    source: "the write was refused".into(),
+                });
+            }
             let lose = {
                 let mut ambiguous = self.ambiguous.lock().unwrap();
                 ambiguous
@@ -2841,4 +2865,261 @@ async fn job_requests_never_exceed_the_limit_including_complete_abort_and_delete
         "{widest} requests were in flight against a limit of 2"
     );
     assert!(widest >= 1);
+}
+
+#[tokio::test]
+async fn segments_folded_before_a_failed_root_write_are_deleted_once_a_root_names_them() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    let writer = registry_on(&plain, "node-b");
+    writer.register_at_claim(&cell(1), 1);
+    writer.flush_now().await.unwrap();
+    // The root cannot be written for a while.
+    scripted.refuse_puts("/root", 3);
+    assert!(node.pass(&mut holding).await.is_err());
+    assert_eq!(
+        holding.pending_delete.len(),
+        1,
+        "the segment waits for a durable root"
+    );
+    assert_eq!(
+        keys_under(&plain, &objects::segments_root(PREFIX))
+            .await
+            .len(),
+        1
+    );
+    // A later pass folds nothing new and still writes the root, then deletes.
+    let mut passes = 0;
+    while node.pass(&mut holding).await.is_err() {
+        passes += 1;
+        assert!(passes < 5, "the root write never succeeded");
+        assert_eq!(holding.pending_delete.len(), 1);
+    }
+    assert!(holding.pending_delete.is_empty());
+    crate::asyncrt::timeout(Duration::from_secs(2), async {
+        while !keys_under(&plain, &objects::segments_root(PREFIX))
+            .await
+            .is_empty()
+        {
+            crate::asyncrt::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the folded segment was deleted");
+    assert_eq!(holding.root.deltas.len(), 1);
+}
+
+#[tokio::test]
+async fn a_map_a_failed_commit_may_have_written_is_deleted_after_the_grace() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            grace_ms: 0,
+            ..config()
+        },
+    );
+    let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &(0..20).map(cell).collect::<Vec<_>>()).await;
+    scripted.lose_next_answer("/map/");
+    let spill = spill_now(&node, &mut holding).await;
+    run_job(&node, &mut holding, spill).await;
+    assert_eq!(node.counters.jobs_discarded.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        keys_under(&plain, &objects::maps_root(PREFIX)).await.len(),
+        1,
+        "it landed"
+    );
+    assert!(
+        holding.retired.iter().any(|(key, _)| key.contains("/map/")),
+        "and it is kept to be deleted"
+    );
+    node.housekeeping(&mut holding);
+    wait_housekeeping(&holding).await;
+    assert!(keys_under(&plain, &objects::maps_root(PREFIX))
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_full_queue_drops_new_cells_counts_them_and_a_write_queues_one_again() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            waiting_cap: 2,
+            ..config()
+        },
+    );
+    for index in 1..=3 {
+        node.register_at_claim(&cell(index), 1);
+    }
+    assert_eq!(node.queue.lock().unwrap().waiting.len(), 2);
+    assert_eq!(node.counters.queue_dropped.load(Ordering::Relaxed), 1);
+    // A cell already queued is never dropped: its record is merged.
+    node.register_at_claim(&cell(1), 2);
+    assert_eq!(node.counters.queue_dropped.load(Ordering::Relaxed), 1);
+    // The queue drains, and the dropped cell's write queues it again.
+    node.flush_now().await.unwrap();
+    node.queue_for_coverage(&objects::key_of(&cell(3)));
+    assert!(node
+        .queue
+        .lock()
+        .unwrap()
+        .waiting
+        .contains_key(&objects::key_of(&cell(3))));
+    assert_eq!(
+        keys_under(&plain, &objects::segments_root(PREFIX))
+            .await
+            .len(),
+        1
+    );
+
+    // A batch that comes back after a failed write is held to the cap as well.
+    node.flush_now().await.unwrap();
+    for index in 10..12 {
+        node.register_at_claim(&cell(index), 1);
+    }
+    scripted.hold("/seg/");
+    scripted.lose_next_answer("/seg/");
+    let flushing = {
+        let node = node.clone();
+        crate::asyncrt::spawn(async move { node.flush_now().await })
+    };
+    // The flush has taken the batch and its write is held.
+    crate::asyncrt::timeout(Duration::from_secs(5), async {
+        while !node.queue.lock().unwrap().waiting.is_empty() {
+            crate::asyncrt::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the flush took the batch");
+    for index in 20..22 {
+        node.register_at_claim(&cell(index), 1);
+    }
+    let dropped_before = node.counters.queue_dropped.load(Ordering::Relaxed);
+    scripted.release("/seg/");
+    assert!(flushing.await.unwrap().is_err());
+    assert_eq!(
+        node.queue.lock().unwrap().waiting.len(),
+        2,
+        "still at the cap"
+    );
+    assert_eq!(
+        node.counters.queue_dropped.load(Ordering::Relaxed),
+        dropped_before + 2,
+        "the batch that came back found no room"
+    );
+}
+
+#[tokio::test]
+async fn shadow_lookups_beside_claims_are_limited_and_the_skipped_are_counted() {
+    let store = memory();
+    let node = registry_on(&store, "node-a");
+    let held: Vec<_> = (0..crate::registry::SHADOW_LOOKUPS)
+        .map(|_| node.shadow_slot().expect("a slot"))
+        .collect();
+    assert!(node.shadow_slot().is_none());
+    assert!(node.shadow_slot().is_none());
+    assert_eq!(node.counters.shadow_skipped.load(Ordering::Relaxed), 2);
+    drop(held);
+    assert!(node.shadow_slot().is_some(), "slots come back");
+}
+
+#[tokio::test]
+async fn a_failed_spill_hands_back_the_run_outputs_it_could_not_delete() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            grace_ms: 0,
+            ..config()
+        },
+    );
+    let mut holding = holder_of(&node).await;
+    // A level 1 in the partitions the first cells fall in.
+    register_and_fold(&node, &mut holding, &(0..3).map(cell).collect::<Vec<_>>()).await;
+    let spill = spill_now(&node, &mut holding).await;
+    run_job(&node, &mut holding, spill).await;
+    let with_l1: Vec<usize> = holding
+        .map
+        .partitions
+        .iter()
+        .enumerate()
+        .filter(|(_, partition)| partition.l1 != Level::Empty)
+        .map(|(index, _)| index)
+        .collect();
+    let without = holding
+        .map
+        .partitions
+        .iter()
+        .position(|partition| partition.l1 == Level::Empty);
+    let without = without.expect("three cells leave some of eight partitions empty");
+    let in_partition = |wanted: usize| {
+        (1_000..)
+            .map(cell)
+            .find(|name| holding.map.partition_for(&objects::key_of(name)) == wanted)
+            .unwrap()
+    };
+    // One new cell lands in a partition that has a level 1 (its read will fail),
+    // another in one that has none (its run is written).
+    let (failing, succeeding) = (in_partition(with_l1[0]), in_partition(without));
+    register_and_fold(&node, &mut holding, &[failing, succeeding]).await;
+    let snapshot = node
+        .load(Arc::new(holding.root.clone()), &Io::default())
+        .await;
+    let consumed: HashMap<DeltaId, Arc<crate::registry::Loaded>> = holding
+        .root
+        .deltas
+        .iter()
+        .copied()
+        .zip(snapshot.deltas)
+        .collect();
+    scripted.fail("/run/", true);
+    scripted.fail_deletes(true);
+    let before = keys_under(&plain, &objects::runs_root(PREFIX)).await;
+    let error = prepare_spill(
+        &node.job_store,
+        PREFIX,
+        holding.epoch,
+        &holding.map,
+        &consumed,
+        &mut holding.next_run,
+        1,
+    )
+    .await
+    .expect_err("one partition cannot be read");
+    let Some(Stranded(keys)) = error.downcast_ref::<Stranded>() else {
+        panic!("the written outputs are handed back: {error:#}");
+    };
+    let after = keys_under(&plain, &objects::runs_root(PREFIX)).await;
+    let written: Vec<&String> = after.iter().filter(|key| !before.contains(key)).collect();
+    assert!(!written.is_empty(), "a run was written before the failure");
+    assert_eq!(
+        keys.iter().collect::<Vec<_>>(),
+        written,
+        "and its key comes back, since it could not be deleted"
+    );
+    // The holder keeps them and deletes them after the grace.
+    holding
+        .stranded
+        .lock()
+        .unwrap()
+        .extend(keys.iter().cloned());
+    scripted.fail("/run/", false);
+    scripted.fail_deletes(false);
+    node.housekeeping(&mut holding);
+    wait_housekeeping(&holding).await;
+    assert_eq!(
+        keys_under(&plain, &objects::runs_root(PREFIX)).await,
+        before
+    );
 }
