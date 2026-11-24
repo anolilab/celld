@@ -24,12 +24,15 @@ pub mod isolate;
 pub mod kv;
 pub mod log_evict;
 pub mod log_tier;
+pub mod lost_record;
 mod output_gate;
 pub mod peer;
 pub mod pressure;
 pub mod queue;
 pub mod ratelimit;
 pub mod rebalance;
+pub mod registry;
+pub mod registry_gate;
 pub mod restore;
 pub mod routing;
 pub mod schedule;
@@ -1373,8 +1376,10 @@ impl State {
     /// running it after each event made a burst of N cells cost O(N^2) on the
     /// core thread, which starved the lease timer it also runs. It runs every
     /// event while the state is small, so a small test still fails at the
-    /// event that broke the invariant, and every `cells / 64` events beyond
-    /// that, which keeps the cost per event bounded.
+    /// event that broke the invariant, and every `cells / 64` calls beyond
+    /// that, which keeps the cost per event bounded. The actor and the event
+    /// loop both call it for one event, so a full check comes about every
+    /// `cells / 128` events.
     pub fn validate_amortized(&mut self) -> Result<(), String> {
         self.events_since_validate += 1;
         if self.events_since_validate < self.cells.len() / 64 {

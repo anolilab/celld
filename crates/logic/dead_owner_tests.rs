@@ -53,6 +53,7 @@ fn peer(node: &str, expires_ms: u64) -> CapacityPeer {
         rebalance_paused: false,
         draining: false,
         ingress_only: false,
+        generation: String::new(),
     }
 }
 

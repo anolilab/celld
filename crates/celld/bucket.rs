@@ -576,6 +576,25 @@ impl Bucket {
         )
     }
 
+    /// A bucket over given stores, for tests that count or shape what a listing
+    /// sees.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        store: Arc<dyn ObjectStore>,
+        paginated: Arc<dyn PaginatedListStore>,
+        prefix: &str,
+        backend: StorageBackend,
+    ) -> Bucket {
+        Bucket {
+            store: store.clone(),
+            paginated,
+            cas_store: store,
+            backend,
+            name: "test".to_owned(),
+            prefix: prefix.to_owned(),
+        }
+    }
+
     /// Open the machine-local development store. Only the `celld dev`
     /// supervisor and its child node receive this constructor; fleet flags
     /// continue to resolve exclusively through the cloud backend parser.

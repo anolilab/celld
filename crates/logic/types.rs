@@ -266,6 +266,9 @@ pub struct CapacityPeer {
     pub draining: bool,
     /// This node hosts no cells (`max_resident = 0`), so it can adopt none.
     pub ingress_only: bool,
+    /// The process generation that published this lease. A restarted node
+    /// keeps its name and publishes a new one.
+    pub generation: String,
 }
 
 impl CapacityPeer {

@@ -487,6 +487,18 @@ pub(crate) enum RecoverMode {
     /// until the log is sealed, so it waits behind the claimant and takes
     /// the claim over only once its heartbeat is stale.
     Boot,
+    /// A boot recovering this node's own predecessor session, before the
+    /// node's lease exists: the registry's gate cannot close until it is done,
+    /// so its uploads pass the gate. A boot recovering another node's log, and
+    /// a sweep, stay behind the gate.
+    Predecessor,
+}
+
+impl RecoverMode {
+    /// Whether this recovery's per-cell uploads pass a closed registry gate.
+    pub(crate) fn passes_gate(self) -> bool {
+        self == Self::Predecessor
+    }
 }
 
 /// The claimant's heartbeat while it gathers, beaten cooperatively at each
@@ -2612,6 +2624,231 @@ impl std::fmt::Display for PeerHttpError {
 
 impl std::error::Error for PeerHttpError {}
 
+/// Which live peers recruitment takes, and how many it passed over by reason.
+/// Returns the members, the removed counts, and the number of live peers.
+fn select_members(
+    health: &celld_logic::log_evict::FollowerHealth,
+    self_node: &str,
+    peers: Vec<celld_logic::CapacityPeer>,
+    now: u64,
+    mono: u64,
+    lease_ttl_ms: u64,
+) -> (Vec<Member>, Removed, usize) {
+    let mut removed = Removed::default();
+    let mut members: Vec<Member> = Vec::new();
+    let mut live_peers = 0;
+    for peer in peers
+        .into_iter()
+        .filter(|peer| peer.node != self_node && peer.expires_ms > now)
+    {
+        live_peers += 1;
+        // A peer that is draining is giving its work away and stops serving
+        // soon, and a peer whose connection just failed is most likely
+        // restarting with its old lease still live: recruiting either opens
+        // an ensemble that fails its first append. A failed peer is
+        // recruitable again once its lease belongs to a new process, or when
+        // its sit-out has passed.
+        if peer.draining {
+            removed.draining += 1;
+        } else if health.failed_recently(&peer.node, &peer.generation, now) {
+            removed.sitting_out += 1;
+        } else if health.quarantined(&peer.node, mono) {
+            // Only a follower that cannot serve appends at all sits out a
+            // term. A gray one is recruitable again at once, because the
+            // latency rule can judge it again and the swap rate cap is what
+            // bounds flapping.
+            removed.quarantined += 1;
+        } else if members.len() < RECRUIT_FOLLOWERS {
+            // Replication factor and the in-sync floor are separate numbers:
+            // recruit to the target, serve on one.
+            members.push(Member {
+                node: peer.node,
+                addr: peer.addr,
+                generation: peer.generation,
+                lease_expires_ms: peer.expires_ms,
+                lease_ttl_ms,
+            });
+        }
+    }
+    (members, removed, live_peers)
+}
+
+/// Is a selected member still the same live process, and not draining? Read
+/// from a fresh capacity listing, which is a store read and so happens outside
+/// the transition guard.
+fn member_still_published_eligible(
+    member: &Member,
+    fresh: &[celld_logic::CapacityPeer],
+    now: u64,
+) -> bool {
+    fresh.iter().any(|peer| {
+        peer.node == member.node
+            && peer.generation == member.generation
+            && !peer.draining
+            && peer.expires_ms > now
+    })
+}
+
+/// Does the local ledger still allow this member: its process has not failed
+/// an append that is still sitting out, and it is not quarantined? Local state
+/// only, so it can run under the transition guard.
+fn member_locally_eligible(
+    health: &celld_logic::log_evict::FollowerHealth,
+    member: &Member,
+    now: u64,
+    mono: u64,
+) -> bool {
+    !health.failed_recently(&member.node, &member.generation, now)
+        && !health.quarantined(&member.node, mono)
+}
+
+/// The boot ladder's wait between recovery attempts. A refusal because the
+/// predecessor's lease is live waits out what is left of that lease once,
+/// without counting against the attempt limit. A second such refusal means the
+/// predecessor keeps renewing, and from then on, like every other failure, the
+/// ladder waits a full lease term times the attempt, so a live predecessor
+/// still gets the whole old ladder.
+pub struct RecoveryLadder {
+    ttl_backoff: std::time::Duration,
+    attempts: u32,
+    live_seen: bool,
+}
+
+impl RecoveryLadder {
+    const MAX_ATTEMPTS: u32 = 4;
+
+    pub fn new(ttl_backoff: std::time::Duration) -> Self {
+        Self {
+            ttl_backoff,
+            attempts: 0,
+            live_seen: false,
+        }
+    }
+
+    /// The wait before the next attempt after `error`, or `None` when the
+    /// attempts are used up.
+    pub fn next(&mut self, error: &anyhow::Error) -> Option<std::time::Duration> {
+        if let Some(live) = error.downcast_ref::<LeaseLive>() {
+            if !self.live_seen {
+                self.live_seen = true;
+                return Some(
+                    (std::time::Duration::from_millis(live.remaining_ms)
+                        + std::time::Duration::from_millis(250))
+                    .min(self.ttl_backoff),
+                );
+            }
+        }
+        self.attempts += 1;
+        (self.attempts < Self::MAX_ATTEMPTS).then(|| self.ttl_backoff.saturating_mul(self.attempts))
+    }
+}
+
+/// How many live peers recruitment passed over, by reason.
+#[derive(Clone, Copy, Default)]
+struct Removed {
+    draining: usize,
+    sitting_out: usize,
+    quarantined: usize,
+}
+
+/// Record a failed append, or a failed probe, against the member's process:
+/// when the connection failed outright the peer is restarting or gone, and the
+/// process that failed sits out until its lease lapses, or one lease lifetime
+/// from now if that is later (a lease it renews). A timeout is not this: a
+/// slow member stays on the gray path and recruitable at once. Returns whether
+/// the member was sat out.
+fn note_failed_append(
+    health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
+    member: &Member,
+    error: &anyhow::Error,
+) -> bool {
+    if !is_connection_failure(error) {
+        return false;
+    }
+    let now = crate::ownership_store::now_ms();
+    warn!(
+        member = member.node,
+        generation = member.generation,
+        %error,
+        "follower append failed; sitting out of recruitment while its lease lasts"
+    );
+    health.lock().unwrap().append_failed(
+        &member.node,
+        &member.generation,
+        now,
+        member
+            .lease_expires_ms
+            .max(now.saturating_add(member.lease_ttl_ms)),
+    );
+    true
+}
+
+/// A peer connection that failed outright, as opposed to one that was slow.
+#[derive(Debug)]
+struct ConnectionLost(&'static str);
+
+impl std::fmt::Display for ConnectionLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ConnectionLost {}
+
+/// Did this transport error come from the connection failing outright
+/// (refused, reset, dial failed, closed before a response)? That is what a
+/// restarting peer produces. A timeout is not: it is what a slow but live
+/// follower produces, and the latency rule judges that one.
+fn is_connection_failure(error: &anyhow::Error) -> bool {
+    if error.downcast_ref::<ConnectionLost>().is_some() {
+        return true;
+    }
+    for cause in error.chain() {
+        if let Some(reqwest_error) = cause.downcast_ref::<reqwest::Error>() {
+            if reqwest_error.is_timeout() {
+                return false;
+            }
+            if reqwest_error.is_connect() {
+                return true;
+            }
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Recovery refused to fence a session whose lease is still live. A caller
+/// that retries may wait exactly `remaining_ms`.
+#[derive(Debug)]
+pub struct LeaseLive {
+    pub dead: String,
+    pub remaining_ms: u64,
+}
+
+impl std::fmt::Display for LeaseLive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to fence {}: its lease is live again (expires in {}ms)",
+            self.dead, self.remaining_ms
+        )
+    }
+}
+
+impl std::error::Error for LeaseLive {}
+
 // ── The leader side ─────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -2619,6 +2856,12 @@ impl std::error::Error for PeerHttpError {}
 pub struct Member {
     pub node: String,
     pub addr: String,
+    /// The process generation whose lease named this member when it was
+    /// recruited. A failure of this lane is a failure of that process only.
+    pub generation: String,
+    /// That lease's expiry, wall clock, and the lease lifetime.
+    pub lease_expires_ms: u64,
+    pub lease_ttl_ms: u64,
 }
 
 /// One round's work for one member lane: the shared request and the slot
@@ -3010,7 +3253,11 @@ fn resolve_append(
                 .append_incapable(policy, &member.node, done);
             None
         }
-        AppendSend::Answered(_) | AppendSend::Failed(_) => None,
+        AppendSend::Failed(error) => {
+            note_failed_append(health, member, &error);
+            None
+        }
+        AppendSend::Answered(_) => None,
     };
     // The window accounting settles BEFORE the round future can
     // resolve: by the time the ship loop sees a completed round, every
@@ -3346,12 +3593,18 @@ async fn stream_lane(
 
     /// Fail every unanswered frame; the round futures then fail and the
     /// shipper degrades through the existing path.
+    ///
+    /// `connection_lost` says the stream failed at the connection (the
+    /// follower closed it, a write failed, a redial was refused), which sits
+    /// the follower's process out of recruitment. A stop or a stalled stream's
+    /// deadline is not that.
     fn fail_all(
         member: &Member,
         policy: &celld_logic::log_evict::EvictionPolicy,
         health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
         tuning: &LaneTuning,
         inflight: &mut std::collections::VecDeque<StreamInFlight>,
+        connection_lost: bool,
     ) {
         for entry in inflight.drain(..) {
             if let Some(job) = entry.job {
@@ -3363,7 +3616,11 @@ async fn stream_lane(
                     job,
                     entry.started,
                     entry.write_ms,
-                    AppendSend::Failed(anyhow::anyhow!("append stream failed")),
+                    AppendSend::Failed(if connection_lost {
+                        anyhow::Error::new(ConnectionLost("append stream closed"))
+                    } else {
+                        anyhow::anyhow!("append stream failed")
+                    }),
                 );
             }
         }
@@ -3428,7 +3685,9 @@ async fn stream_lane(
                     job,
                     started,
                     mono_ms().saturating_sub(started),
-                    AppendSend::Failed(anyhow::anyhow!("append stream write failed")),
+                    AppendSend::Failed(anyhow::Error::new(ConnectionLost(
+                        "append stream write failed",
+                    ))),
                 );
                 continue;
             }
@@ -3546,7 +3805,7 @@ async fn stream_lane(
 
         match event {
             LaneEvent::Stopped => {
-                fail_all(member, policy, health, tuning, &mut inflight);
+                fail_all(member, policy, health, tuning, &mut inflight, false);
                 retire_connection(&mut conn).await;
                 return;
             }
@@ -3591,6 +3850,7 @@ async fn stream_lane(
                             health,
                             tuning,
                             &mut inflight,
+                            true,
                         )
                         .await;
                     }
@@ -3608,6 +3868,7 @@ async fn stream_lane(
                         health,
                         tuning,
                         &mut inflight,
+                        false,
                     )
                     .await;
                     continue;
@@ -3653,6 +3914,7 @@ async fn stream_lane(
                             health,
                             tuning,
                             &mut inflight,
+                            false,
                         )
                         .await;
                     }
@@ -3667,6 +3929,7 @@ async fn stream_lane(
                     health,
                     tuning,
                     &mut inflight,
+                    true,
                 )
                 .await;
             }
@@ -3752,6 +4015,7 @@ async fn stream_lane(
                         health,
                         tuning,
                         &mut inflight,
+                        false,
                     )
                     .await;
                 } else {
@@ -3766,6 +4030,7 @@ async fn stream_lane(
     /// a persisted range refuses with a covering end, which reads as the
     /// ack. A break with no answer since the last dial fails everything
     /// instead of looping.
+    #[allow(clippy::too_many_arguments)]
     async fn reconnect(
         established: StreamConnection,
         member: &Member,
@@ -3774,11 +4039,16 @@ async fn stream_lane(
         health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
         tuning: &LaneTuning,
         inflight: &mut std::collections::VecDeque<StreamInFlight>,
+        closed: bool,
     ) -> Option<StreamConnection> {
         let retired = established.retire().await;
-        redial_after_retire(retired, member, transport, policy, health, tuning, inflight).await
+        redial_after_retire(
+            retired, member, transport, policy, health, tuning, inflight, closed,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn redial_after_retire(
         retired: RetiredStream,
         member: &Member,
@@ -3787,9 +4057,10 @@ async fn stream_lane(
         health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
         tuning: &LaneTuning,
         inflight: &mut std::collections::VecDeque<StreamInFlight>,
+        closed: bool,
     ) -> Option<StreamConnection> {
         if !retired.permits_replay() {
-            fail_all(member, policy, health, tuning, inflight);
+            fail_all(member, policy, health, tuning, inflight, closed);
             return None;
         }
         // Hedge-resolved slots have no response coming on the new stream.
@@ -3804,15 +4075,22 @@ async fn stream_lane(
                 for entry in inflight.iter() {
                     if write_frame(&mut conn.write, &entry.frame).await.is_err() {
                         conn.retire().await;
-                        fail_all(member, policy, health, tuning, inflight);
+                        fail_all(member, policy, health, tuning, inflight, true);
                         return None;
                     }
                 }
                 arm_head(member, health, inflight);
                 Some(conn)
             }
-            Err(_) => {
-                fail_all(member, policy, health, tuning, inflight);
+            Err(error) => {
+                fail_all(
+                    member,
+                    policy,
+                    health,
+                    tuning,
+                    inflight,
+                    is_connection_failure(&error),
+                );
                 None
             }
         }
@@ -4485,7 +4763,7 @@ impl NodeLogManager {
                     == log_tier::TakeoverGate::RecoverFirst
             {
                 info!(session, "recovering a predecessor session's node log");
-                self.recover_as(&session, RecoverMode::Boot).await?;
+                self.recover_as(&session, RecoverMode::Predecessor).await?;
             }
         }
         // The install about to follow erases the record's only pointer to
@@ -4684,7 +4962,11 @@ impl NodeLogManager {
                                 .unwrap()
                                 .append_incapable(&shipper.policy, &node, done);
                         }
-                        AppendSend::Failed(_) => {}
+                        // A probe that cannot connect sits the process out like
+                        // a failed batch; a timeout stays on the latency path.
+                        AppendSend::Failed(error) => {
+                            note_failed_append(&health, member, &error);
+                        }
                     }
                 });
         }
@@ -4850,7 +5132,7 @@ impl NodeLogManager {
         // for a boot or a cold route, has nothing to add; waiting here held
         // the maintenance ticker for the length of the recovery.
         let _single_flight = match mode {
-            RecoverMode::Boot => recovery_lock.lock().await,
+            RecoverMode::Boot | RecoverMode::Predecessor => recovery_lock.lock().await,
             RecoverMode::Sweep => match recovery_lock.try_lock() {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -4859,7 +5141,12 @@ impl NodeLogManager {
                 }
             },
         };
-        self.recover_serial(dead, mode).await
+        let recovery = self.recover_serial(dead, mode);
+        if mode.passes_gate() {
+            crate::registry_seed::repairing_predecessor(recovery).await
+        } else {
+            recovery.await
+        }
     }
 
     /// Refresh the claim's heartbeat once `RECOVERY_HEARTBEAT` has passed.
@@ -4910,11 +5197,13 @@ impl NodeLogManager {
             // AT the step. A live lease is an error, not a skip: the
             // caller's claim must refuse and re-resolve to routing.
             let now = crate::ownership_store::now_ms();
-            anyhow::ensure!(
-                wire.expires_ms <= now,
-                "refusing to fence {dead}: its lease is live again (expires in {}ms)",
-                wire.expires_ms.saturating_sub(now)
-            );
+            if wire.expires_ms > now {
+                return Err(LeaseLive {
+                    dead: dead.to_string(),
+                    remaining_ms: wire.expires_ms - now,
+                }
+                .into());
+            }
             // No justification pin: the record is keyed by session, so a
             // revived process writes a NEW key and can never step this one.
             // The only concurrent writer is a rival recoverer, and every
@@ -5660,7 +5949,7 @@ impl NodeLogManager {
     /// the message is an invitation: a second node acknowledges from a
     /// follower's disk instead of a storage round trip. Live peers that are
     /// all ineligible is a fault the operator can act on.
-    fn report_fleet_shortfall(&self, live_peers: usize, now_ms: u64) {
+    fn report_fleet_shortfall(&self, live_peers: usize, removed: Removed, now_ms: u64) {
         const REPORT_INTERVAL_MS: u64 = 300_000;
         let last = match self.shortfall_logged_ms.load(Ordering::SeqCst) {
             0 => None,
@@ -5681,9 +5970,13 @@ impl NodeLogManager {
             ),
             log_tier::Shortfall::NoEligiblePeer => warn!(
                 live_peers,
+                draining = removed.draining,
+                sitting_out_after_failed_append = removed.sitting_out,
+                quarantined_for_incapability = removed.quarantined,
                 "fleet durability requested and no peer is eligible; writes \
-                 wait for the bucket. Every live peer is quarantined for \
-                 incapability or has not been recruited yet"
+                 wait for the bucket. Every live peer is draining, sitting \
+                 out after a failed append, or quarantined for incapability, \
+                 as counted here"
             ),
         }
     }
@@ -5758,31 +6051,38 @@ impl NodeLogManager {
             return Ok(());
         }
         let peers = self.ownership.read_capacity_peers().await?;
-        let now = crate::ownership_store::now_ms();
-        let mono = mono_ms();
-        // Kept before the filters consume the vector: a fleet with no peer at
+        let lease_ttl_ms = self.ownership.lease_ttl_ms();
+        // `live_peers` is kept apart from the filters: a fleet with no peer at
         // all is a different message from a fleet whose peers are all
         // ineligible, and an operator needs to be told which one they have.
-        let live_peers = peers
-            .iter()
-            .filter(|peer| peer.node != self.node && peer.expires_ms > now)
-            .count();
-        let members: Vec<Member> = peers
-            .into_iter()
-            .filter(|peer| peer.node != self.node && peer.expires_ms > now)
-            // Only a follower that cannot serve appends at all sits out a
-            // term. A gray one is recruitable again at once, because the
-            // latency rule can judge it again and the swap rate cap is what
-            // bounds flapping.
-            .filter(|peer| !self.health.lock().unwrap().quarantined(&peer.node, mono))
-            // Replication factor and the in-sync floor are separate numbers:
-            // recruit to the target, serve on one.
-            .take(RECRUIT_FOLLOWERS)
-            .map(|peer| Member {
-                node: peer.node,
-                addr: peer.addr,
-            })
-            .collect();
+        let (members, removed, live_peers) = select_members(
+            &self.health.lock().unwrap(),
+            &self.node,
+            peers,
+            crate::ownership_store::now_ms(),
+            mono_ms(),
+            lease_ttl_ms,
+        );
+        let mono = mono_ms();
+        // The peers were read before this pass waits for the transition and
+        // the drain barrier. Read them again here, outside the guard (the
+        // guard is what a graceful close needs, and a store read can be slow),
+        // and end the pass if a selected member started draining or its lease
+        // lapsed. Each selected member is checked on its own: another peer
+        // recovering or a different read order does not matter, because the
+        // pass publishes the members it selected.
+        if !members.is_empty() {
+            let fresh = self.ownership.read_capacity_peers().await?;
+            let now = crate::ownership_store::now_ms();
+            let health = self.health.lock().unwrap();
+            if !members.iter().all(|member| {
+                member_still_published_eligible(member, &fresh, now)
+                    && member_locally_eligible(&health, member, now, mono_ms())
+            }) {
+                info!("a recruited peer became ineligible; selecting again");
+                return Ok(());
+            }
+        }
         // Peer discovery is intentionally outside the transition guard.
         // Recheck the lifecycle after that await, then keep the snapshot,
         // publication, and successor installation in one critical section.
@@ -5814,7 +6114,7 @@ impl NodeLogManager {
             }
         }
         if members.is_empty() {
-            self.report_fleet_shortfall(live_peers, mono);
+            self.report_fleet_shortfall(live_peers, removed, mono);
             return Ok(());
         }
         if !self.ltx.all_fragment_rows_tiered() {
@@ -5864,10 +6164,28 @@ impl NodeLogManager {
         if self.task_stop.is_stopped() {
             return Ok(());
         }
+        // Under the guard only local state is consulted: a member whose
+        // process failed an append while this pass waited must not be
+        // published. The next tick selects again.
+        {
+            let health = self.health.lock().unwrap();
+            let now = crate::ownership_store::now_ms();
+            if !members
+                .iter()
+                .all(|member| member_locally_eligible(&health, member, now, mono_ms()))
+            {
+                info!("a recruited peer became ineligible before the ensemble was published; selecting again");
+                return Ok(());
+            }
+        }
         transition.write(Some(log_to_wire(&record, false))).await?;
         info!(
             epoch = record.epoch,
             members = ?record.ensemble,
+            generations = ?members
+                .iter()
+                .map(|member| (member.node.as_str(), member.generation.as_str()))
+                .collect::<Vec<_>>(),
             "log ensemble open; fleet acks enabled"
         );
         self.health.lock().unwrap().reset();
@@ -6521,6 +6839,7 @@ impl NodeLogManager {
                 warn!(session, %error, "eager node-log recovery failed");
             }
         }
+        info!("dead-leader sweep complete");
         Ok(())
     }
 
@@ -7185,6 +7504,383 @@ mod seal_absent_log_tests {
         });
     }
 
+    /// The error of one POST to `url` with a request timeout.
+    async fn post_error(url: String, timeout: std::time::Duration) -> anyhow::Error {
+        let error = reqwest::Client::new()
+            .post(url)
+            .timeout(timeout)
+            .body("x")
+            .send()
+            .await
+            .expect_err("the post fails");
+        error.into()
+    }
+
+    #[test]
+    fn a_refused_connection_is_a_connection_failure() {
+        run(async {
+            let port = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            let error = post_error(
+                format!("http://127.0.0.1:{port}/"),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            assert!(is_connection_failure(&error), "{error:#}");
+        });
+    }
+
+    #[test]
+    fn a_timeout_is_not_a_connection_failure() {
+        run(async {
+            // A follower that takes the connection and never answers: the
+            // kernel completes the handshake, and nothing reads the request.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let error = post_error(
+                format!("http://127.0.0.1:{port}/"),
+                std::time::Duration::from_millis(150),
+            )
+            .await;
+            drop(listener);
+            assert!(!is_connection_failure(&error), "{error:#}");
+            // Nor is an answer, a stalled stream's deadline, or a hedge.
+            assert!(!is_connection_failure(&anyhow::anyhow!(
+                "append stream failed"
+            )));
+            assert!(is_connection_failure(&anyhow::Error::new(ConnectionLost(
+                "append stream write failed"
+            ))));
+        });
+    }
+
+    /// A transport whose one stream is the near end of a duplex the test
+    /// holds the far end of.
+    struct OneStream(Mutex<Option<LogStreamIo>>);
+
+    impl LogTransport for OneStream {
+        fn post<'a>(
+            &'a self,
+            _node: &'a str,
+            _addr: &'a str,
+            _path: &'a str,
+            _body: Vec<u8>,
+            _deadline: Option<std::time::Duration>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<bytes::Bytes>> + Send + 'a>,
+        > {
+            Box::pin(async { anyhow::bail!("no one-shot posts in this twin") })
+        }
+
+        fn open_stream<'a>(
+            &'a self,
+            _node: &'a str,
+            _addr: &'a str,
+            _path: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<LogStreamIo>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("the twin has one stream"))
+            })
+        }
+    }
+
+    /// One append goes out on a stream, and then `end` ends the exchange
+    /// before any response. Reports whether the follower's process now sits
+    /// out of recruitment.
+    async fn sits_out_after(
+        end: impl FnOnce(tokio::io::DuplexStream, crate::ltx_repl::StopToken),
+    ) -> bool {
+        use tokio::io::AsyncReadExt as _;
+        let (near, mut far) = tokio::io::duplex(1 << 16);
+        let transport = Arc::new(OneStream(Mutex::new(Some(Box::new(near)))));
+        let now = crate::ownership_store::now_ms();
+        let member = Member {
+            node: "peer".into(),
+            addr: "peer:1".into(),
+            generation: "g1".into(),
+            lease_expires_ms: now + 60_000,
+            lease_ttl_ms: 10_000,
+        };
+        let health = Arc::new(Mutex::new(celld_logic::log_evict::FollowerHealth::default()));
+        let (jobs, receive) = tokio::sync::mpsc::unbounded_channel();
+        let (resp, answer) = tokio::sync::oneshot::channel();
+        jobs.send(LaneJob {
+            req: Arc::new(AppendReq {
+                leader: "a/b".into(),
+                epoch: 1,
+                truncate_to: 0,
+                entries: vec![Entry {
+                    seq: 1,
+                    cell: "c".into(),
+                    cell_epoch: 1,
+                    txid: 1,
+                    bytes: vec![0; 8],
+                }],
+            }),
+            enqueued: 0,
+            bytes: 8,
+            resp,
+        })
+        .unwrap();
+        let stop = crate::ltx_repl::StopToken::new();
+        let lane = member_lane(
+            member.clone(),
+            transport,
+            Arc::new(celld_logic::log_evict::EvictionPolicy::default()),
+            health.clone(),
+            LaneTuning {
+                hedge: HedgeMode::Fixed(0),
+                stream: None,
+                stream_transport: true,
+            },
+            receive,
+            stop.clone(),
+        );
+        let exchange = async {
+            let mut frame = [0_u8; 64];
+            assert!(far.read(&mut frame).await.unwrap() > 0, "a frame went out");
+            end(far, stop);
+            answer.await
+        };
+        futures_util::pin_mut!(lane, exchange);
+        let answered = match futures_util::future::select(lane, exchange).await {
+            futures_util::future::Either::Right((answered, _)) => answered,
+            // A stopped lane ends once it has failed what was in flight.
+            futures_util::future::Either::Left((_, exchange)) => exchange.await,
+        };
+        assert!(matches!(answered, Ok(None)), "the append fails");
+        let sits_out =
+            health
+                .lock()
+                .unwrap()
+                .failed_recently("peer", "g1", crate::ownership_store::now_ms());
+        sits_out
+    }
+
+    #[test]
+    fn a_stream_the_follower_closes_before_a_response_sits_it_out() {
+        run(async {
+            assert!(sits_out_after(|far, _stop| drop(far)).await);
+        });
+    }
+
+    #[test]
+    fn a_stream_failed_by_a_stop_does_not_sit_the_follower_out() {
+        run(async {
+            // The far end stays open, so only the stop ends the exchange.
+            let held = std::sync::Mutex::new(None);
+            let sits_out = sits_out_after(|far, stop| {
+                *held.lock().unwrap() = Some(far);
+                stop.request_stop();
+            })
+            .await;
+            assert!(!sits_out);
+        });
+    }
+
+    #[test]
+    fn a_reset_or_incomplete_message_is_judged_by_its_cause_not_its_shape() {
+        run(async {
+            // A server that reads the request and closes without answering:
+            // hyper reports an incomplete message, which it also reports when
+            // a pooled keep-alive connection closes as it is reused. That
+            // alone must not bench a live follower.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                use std::io::Read as _;
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 1024];
+                let _ = socket.read(&mut buffer);
+            });
+            let error = post_error(
+                format!("http://127.0.0.1:{port}/"),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            server.join().unwrap();
+            assert!(!is_connection_failure(&error), "{error:#}");
+        });
+    }
+
+    #[test]
+    fn a_failed_probe_sits_out_only_for_a_connection_failure() {
+        run(async {
+            let now = crate::ownership_store::now_ms();
+            let member = Member {
+                node: "peer".into(),
+                addr: "peer:1".into(),
+                generation: "g1".into(),
+                lease_expires_ms: now + 60_000,
+                lease_ttl_ms: 10_000,
+            };
+            let health = Arc::new(Mutex::new(celld_logic::log_evict::FollowerHealth::default()));
+            let sat_out = |health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>| {
+                health.lock().unwrap().failed_recently(
+                    "peer",
+                    "g1",
+                    crate::ownership_store::now_ms(),
+                )
+            };
+            // A probe that timed out is the latency path's business.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let timeout = post_error(
+                format!("http://127.0.0.1:{port}/"),
+                std::time::Duration::from_millis(150),
+            )
+            .await;
+            assert!(!note_failed_append(&health, &member, &timeout));
+            assert!(!sat_out(&health));
+            // A probe that is refused sits the process out until its lease.
+            drop(listener);
+            let refused = post_error(
+                format!("http://127.0.0.1:{port}/"),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            assert!(note_failed_append(&health, &member, &refused));
+            assert!(sat_out(&health));
+        });
+    }
+
+    #[test]
+    fn a_predecessor_that_keeps_renewing_gets_at_least_the_old_ladder() {
+        let ttl = std::time::Duration::from_secs(10);
+        let live = || {
+            anyhow::Error::new(LeaseLive {
+                dead: "n/g".into(),
+                remaining_ms: 3_000,
+            })
+        };
+        let mut ladder = RecoveryLadder::new(ttl);
+        let mut total = std::time::Duration::ZERO;
+        let mut failures = 0;
+        while let Some(wait) = ladder.next(&live()) {
+            total += wait;
+            failures += 1;
+            assert!(failures < 10, "the ladder ends");
+        }
+        // The old ladder: one, two and three lease terms between four tries.
+        assert!(total >= ttl * 6, "{total:?}");
+        // The first refusal waited only for what the lease had left.
+        let mut first = RecoveryLadder::new(ttl);
+        assert_eq!(
+            first.next(&live()),
+            Some(std::time::Duration::from_millis(3_250))
+        );
+        // Another kind of failure is on the old ladder from the start.
+        let other = anyhow::anyhow!("boom");
+        let mut ladder = RecoveryLadder::new(ttl);
+        assert_eq!(ladder.next(&other), Some(ttl));
+        assert_eq!(ladder.next(&other), Some(ttl * 2));
+        assert_eq!(ladder.next(&other), Some(ttl * 3));
+        assert_eq!(ladder.next(&other), None);
+    }
+
+    fn peer(node: &str, generation: &str, draining: bool) -> celld_logic::CapacityPeer {
+        celld_logic::CapacityPeer {
+            node: node.into(),
+            addr: format!("{node}:1"),
+            expires_ms: 0,
+            peer_protocol: 0,
+            sampled_ms: 0,
+            owned_cells: Some(0),
+            placement_weight: None,
+            bucket_format: None,
+            resident_cells: 0,
+            host_websockets: 0,
+            rss_bytes: 0,
+            in_use_bytes: None,
+            pressured: false,
+            memory_headroom: None,
+            restoring: 0,
+            paced_handoff: true,
+            rebalance_paused: false,
+            draining,
+            ingress_only: false,
+            generation: generation.into(),
+        }
+    }
+
+    #[test]
+    fn each_selected_member_is_checked_on_its_own() {
+        let now = crate::ownership_store::now_ms();
+        let live = |node: &str, generation: &str, draining: bool| {
+            let mut peer = peer(node, generation, draining);
+            peer.expires_ms = now + 10_000;
+            peer
+        };
+        let health = celld_logic::log_evict::FollowerHealth::default();
+        let selected = select_members(
+            &health,
+            "me",
+            vec![live("a", "ga", false), live("b", "gb", false)],
+            now,
+            0,
+            10_000,
+        )
+        .0;
+        assert_eq!(selected.len(), 2);
+        // More peers are eligible than slots, and the read order changed: a
+        // recovered earlier peer comes first. The selected members are still
+        // eligible, so nothing aborts.
+        let reordered = vec![
+            live("c", "gc", false),
+            live("b", "gb", false),
+            live("a", "ga", false),
+        ];
+        assert!(selected
+            .iter()
+            .all(|member| member_still_published_eligible(member, &reordered, now)));
+        // One started draining, one restarted as another process, one lapsed.
+        assert!(!member_still_published_eligible(
+            &selected[0],
+            &[live("a", "ga", true)],
+            now
+        ));
+        assert!(!member_still_published_eligible(
+            &selected[0],
+            &[live("a", "ga2", false)],
+            now
+        ));
+        let mut lapsed = live("a", "ga", false);
+        lapsed.expires_ms = now - 1;
+        assert!(!member_still_published_eligible(
+            &selected[0],
+            &[lapsed],
+            now
+        ));
+    }
+
+    #[test]
+    fn a_member_that_recovered_from_its_sit_out_does_not_abort_the_publish() {
+        let now = crate::ownership_store::now_ms();
+        let member = Member {
+            node: "a".into(),
+            addr: "a:1".into(),
+            generation: "ga".into(),
+            lease_expires_ms: now + 10_000,
+            lease_ttl_ms: 10_000,
+        };
+        let mut health = celld_logic::log_evict::FollowerHealth::default();
+        health.append_failed("a", "ga", now, now + 1_000);
+        // Still sitting out: the publish aborts.
+        assert!(!member_locally_eligible(&health, &member, now, 0));
+        // Its sit-out has passed (or it is another process): it publishes.
+        assert!(member_locally_eligible(&health, &member, now + 1_000, 0));
+        health.append_failed("a", "ga-old", now, now + 60_000);
+        assert!(member_locally_eligible(&health, &member, now + 1_000, 0));
+    }
+
     #[test]
     fn a_live_lease_is_not_sealed() {
         run(async {
@@ -7312,4 +8008,22 @@ fn note_gathered_mark(
             .push(LeftMark::Left { nonce }),
     }
     granted.insert(cell);
+}
+
+#[cfg(test)]
+mod recover_mode_tests {
+    use super::RecoverMode;
+
+    #[test]
+    fn only_a_boots_own_predecessor_recovery_passes_the_registry_gate() {
+        assert!(RecoverMode::Predecessor.passes_gate());
+        assert!(
+            !RecoverMode::Sweep.passes_gate(),
+            "a sweep stays behind the gate"
+        );
+        assert!(
+            !RecoverMode::Boot.passes_gate(),
+            "another node's log recovered on a cold route stays behind the gate"
+        );
+    }
 }

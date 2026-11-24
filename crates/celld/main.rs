@@ -2753,6 +2753,148 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
     }
 }
 
+/// The birth registry's holder is asked for a pass now. Fleet-HMAC verified
+/// like every internal peer surface.
+async fn internal_registry_pass(request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    let (parts, body) = request.into_parts();
+    let body = match collect_limited_body(body, MAX_PEER_CONTROL_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(error) => return peer_response(body_read_error("registry pass", error)),
+    };
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| parts.uri.path().to_string(), ToString::to_string);
+    if let Err(error) = app.peer_auth.verify(
+        &parts.method,
+        &path_and_query,
+        &parts.headers,
+        &body,
+        app.peer_auth.source(),
+    ) {
+        return peer_response(response(error.status(), error.message()));
+    }
+    if parts.method != hyper::Method::POST {
+        return peer_response(response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+        ));
+    }
+    let Some(registry) = celld::registry::global() else {
+        return peer_response(response(StatusCode::NOT_FOUND, "no registry"));
+    };
+    registry.request_pass_here();
+    peer_response(response(StatusCode::OK, "{\"ok\":true}"))
+}
+
+/// The registry's holder says it wrote a root that names new deltas. A hint
+/// that makes this node load them early; fleet-HMAC verified like every
+/// internal peer surface.
+async fn internal_registry_root(request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    let (parts, body) = request.into_parts();
+    let body = match collect_limited_body(body, MAX_PEER_CONTROL_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(error) => return peer_response(body_read_error("registry root", error)),
+    };
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| parts.uri.path().to_string(), ToString::to_string);
+    if let Err(error) = app.peer_auth.verify(
+        &parts.method,
+        &path_and_query,
+        &parts.headers,
+        &body,
+        app.peer_auth.source(),
+    ) {
+        return peer_response(response(error.status(), error.message()));
+    }
+    if parts.method != hyper::Method::POST {
+        return peer_response(response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+        ));
+    }
+    let Some(registry) = celld::registry::global() else {
+        return peer_response(response(StatusCode::NOT_FOUND, "no registry"));
+    };
+    if !registry.on_push(&body) {
+        return peer_response(response(StatusCode::BAD_REQUEST, "not a root push"));
+    }
+    peer_response(response(StatusCode::OK, "{\"ok\":true}"))
+}
+
+/// A node outside the birth registry's writer rule (the flag is off, or it has bucket
+/// durability) raises the registry's gate number, when the bucket has a registry root,
+/// before it does any per-cell work, once its own lease, matched by generation, says
+/// it is outside the rule: a seed that started before the lease cannot then open the
+/// gate over this node's writes. Claims, own-record writes and per-cell object
+/// writes wait for it (`registry_seed::hold`) from the start; every failure is
+/// retried with a growing pause and nothing falls through. The root is read after the
+/// lease is visible, since a registry node may have created one meanwhile; with none
+/// nothing is written and the hold is released.
+///
+/// A lapsed lease fences the process (it halts), so the lease is never taken again
+/// within one process and the gate needs closing only here.
+async fn close_registry_gate(ownership: &Arc<celld::ownership_store::BucketOwnership>, node: &str) {
+    let hold = celld::registry_seed::hold();
+    if !hold.is_pending() {
+        return;
+    }
+    let bucket = ownership.bucket_client();
+    let Some(generation) = ownership.process_generation().map(str::to_owned) else {
+        eprintln!("celld: the node lease has no generation; the registry gate stays closed");
+        return;
+    };
+    let lease_key = format!("nodes/{node}.json");
+    let gate = celld::registry_seed::close_until_done(
+        hold,
+        {
+            let (bucket, key, generation) = (bucket.clone(), lease_key, generation);
+            move || {
+                let (bucket, key, generation) = (bucket.clone(), key.clone(), generation.clone());
+                Box::pin(async move {
+                    match bucket.get(&key).await {
+                        Ok(Some((body, _))) => celld::registry_seed::lease_shows_gate_closed(
+                            &body,
+                            &generation,
+                            celld::ownership_store::now_ms(),
+                        ),
+                        _ => false,
+                    }
+                })
+            }
+        },
+        {
+            let bucket = bucket.clone();
+            move || {
+                let bucket = bucket.clone();
+                Box::pin(async move {
+                    celld::registry_seed::close_gate(bucket.store.as_ref(), &bucket.prefix).await
+                })
+            }
+        },
+        std::time::Duration::from_millis(200),
+    )
+    .await;
+    let gate = match gate {
+        Ok(gate) => gate,
+        // Not a failure to retry: the node is outside the rule and the registry
+        // says no. Exit so the supervisor sees the misconfiguration.
+        Err(refused) => {
+            eprintln!("celld: {refused}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(gate) = gate {
+        tracing::info!(
+            event = "registry_gate_closed",
+            gate,
+            "this node is outside the birth registry's writer rule: the gate is closed"
+        );
+    }
+}
+
 async fn internal_probe(request: Request<Incoming>, app: AppHandle) -> HttpReply {
     let (parts, body) = request.into_parts();
     // The probe skips the operator-token gate, so an unsigned caller reaches
@@ -3105,6 +3247,12 @@ async fn handle_internal(
     let result = match path.as_str() {
         "/peer/probe" => internal_probe(request, app).await,
         "/peer/handoff" => internal_handoff(request, app).await,
+        "/peer/registry/pass" if celld::registry::global().is_some() => {
+            internal_registry_pass(request, app).await
+        }
+        "/peer/registry/root" if celld::registry::global().is_some() => {
+            internal_registry_root(request, app).await
+        }
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),
         "/metrics" => metrics_reply(app.counts().await),
@@ -4020,6 +4168,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 fleet::validate_bucket(&client).await?;
             }
             celld::wake_format::ensure_ready(&client).await?;
+            celld::registry_seed::hold_until_gate_closed();
             // The list above proves the bucket answers; it does not prove the
             // store enforces the conditional writes or ranged reads that a
             // cell needs. Test both contracts here before the node serves.
@@ -4060,6 +4209,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 &node,
             )?;
             let cell_directory = replication.cell_directory();
+            let registry = replication.registry();
             let replication = Some(replication);
             // The same two calls a reload makes: there is no boot-only way from
             // a deployment to a serving generation.
@@ -4093,7 +4243,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 )
                 .with_lease_ttl_ms(lease_ttl_ms_from_environment())
                 .with_fleet_sample_ms(fleet_sample_ms)
-                .with_cell_directory(cell_directory),
+                .with_cell_directory(cell_directory)
+                .with_registry(registry),
             );
             let wake_scan = Some((client, bucket_ownership.clone()));
             let ownership = Ownership::Bucket(bucket_ownership);
@@ -4229,6 +4380,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             let (ownership, peer_key, wake, wake_scan) = if settings.bucket.is_some() {
                 let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
                 celld::wake_format::ensure_ready(&client).await?;
+                celld::registry_seed::hold_until_gate_closed();
                 let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
                 let peer_key = peer_auth::load_or_create(&client).await?;
                 let wake = Arc::new(celld::wake::WakeFlusher::new());
@@ -4321,6 +4473,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             let (ownership, peer_key) = if settings.bucket.is_some() {
                 let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
                 celld::wake_format::ensure_ready(&client).await?;
+                celld::registry_seed::hold_until_gate_closed();
                 let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
                 let peer_key = peer_auth::load_or_create(&client).await?;
                 (
@@ -4373,6 +4526,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let peer_auth = Arc::new(
         PeerAuth::new(peer_key, node.clone())?.with_operator_token(Some(operator_token.clone())),
     );
+    if let Some(registry) = celld::registry::global() {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(1))
+            .build()?;
+        registry.set_peer(peer_auth.clone(), client);
+    }
     // Connect-only timeout: a peer request may legitimately run through a
     // restore, but a handshake that never completes provably ran nothing.
     let peer_http = reqwest::Client::builder()
@@ -4540,12 +4699,15 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             recover_with_follower_listener(&internal_listener, app.clone(), async {
                 let ttl_backoff =
                     std::time::Duration::from_millis(actor.lease_spec.ttl_ms.max(1_000));
-                let mut recovered = Ok(());
+                let mut recovered: anyhow::Result<()>;
                 // A boot waits behind a peer's live recovery claim and takes
                 // it over only once its heartbeat is stale, so one attempt
                 // can legitimately last as long as the peer's gather. The
                 // bound is a backstop against a wedge, not a pace.
-                for attempt in 1..=4u32 {
+                let mut ladder = celld::node_log::RecoveryLadder::new(ttl_backoff);
+                let mut attempt = 0_u32;
+                loop {
+                    attempt += 1;
                     recovered = match tokio::time::timeout(
                         std::time::Duration::from_secs(15 * 60),
                         manager.recover_self(),
@@ -4555,16 +4717,17 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         Ok(result) => result,
                         Err(_) => Err(anyhow::anyhow!("predecessor recovery timed out")),
                     };
-                    if recovered.is_ok() || attempt == 4 {
+                    let Err(error) = recovered.as_ref() else {
                         break;
-                    }
-                    if let Err(error) = recovered.as_ref() {
-                        eprintln!("celld predecessor recovery attempt {attempt} failed: {error:#}");
-                    }
-                    // At least one full TTL between attempts, so a
-                    // refused-because-live predecessor lease has expired
-                    // by the retry.
-                    tokio::time::sleep(ttl_backoff.saturating_mul(attempt)).await;
+                    };
+                    eprintln!("celld predecessor recovery attempt {attempt} failed: {error:#}");
+                    // A live predecessor lease is waited out once to its
+                    // expiry; every other failure, and a predecessor that
+                    // keeps renewing, backs off a full TTL times the attempt.
+                    let Some(wait) = ladder.next(error) else {
+                        break;
+                    };
+                    tokio::time::sleep(wait).await;
                 }
                 recovered.map_err(|error| {
                     anyhow::anyhow!(
@@ -4737,6 +4900,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             let gate_flag = app.fleet_ready.clone();
             let max_restoring = max_activations as u64;
             tokio::spawn(async move {
+                close_registry_gate(&ownership, &gate_node).await;
                 let started = std::time::Instant::now();
                 let mut deadline_reported = false;
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -4802,6 +4966,14 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 }
             });
         }
+        (Some(ownership), _) if celld::registry_seed::hold().is_pending() => {
+            let (ownership, node, ready) =
+                (ownership.clone(), node.clone(), app.fleet_ready.clone());
+            tokio::spawn(async move {
+                close_registry_gate(&ownership, &node).await;
+                ready.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
         _ => app
             .fleet_ready
             .store(true, std::sync::atomic::Ordering::SeqCst),
@@ -4852,6 +5024,15 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         (now_ms, Vec::new())
                     }
                 };
+                if let Some(registry) = celld::registry::global() {
+                    registry.set_fleet(
+                        peers
+                            .iter()
+                            .filter(|peer| peer.expires_ms > view_ms && !peer.addr.is_empty())
+                            .map(|peer| (peer.node.clone(), peer.addr.clone()))
+                            .collect(),
+                    );
+                }
                 if let Some(replication) = &replication {
                     let format = celld_logic::format::BUCKET_FORMAT;
                     let open = celld_logic::format::fleet_reads(&peers, view_ms, format);

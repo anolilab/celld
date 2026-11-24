@@ -217,6 +217,7 @@ impl NodeLeaseWire {
             rebalance_paused: self.load.rebalance_paused.unwrap_or(false),
             draining: self.load.draining.unwrap_or(false),
             ingress_only: self.load.ingress_only.unwrap_or(false),
+            generation: self.generation,
         }
     }
 }
@@ -323,6 +324,13 @@ pub struct NodeLoadWire {
     /// cell an old node cannot restore.
     #[serde(default)]
     pub bucket_format: Option<u16>,
+    /// The node follows the registry's writer rule: this process installed a
+    /// registry and attached it to its ownership store. Always written, so a lease without the key
+    /// is told from a node that is outside the rule: the first is a binary from
+    /// before the registry, and neither may write per-cell objects while the
+    /// registry's gate is open.
+    #[serde(default)]
+    pub registry: bool,
     pub resident_cells: usize,
     pub host_websockets: usize,
     pub rss_bytes: u64,
@@ -506,6 +514,12 @@ pub struct BucketOwnership {
     /// The same for the capability of every live lease, for the records that an
     /// older build would misread.
     records_gate: std::sync::Mutex<(u64, bool)>,
+    /// The birth registry, which only shadows the lost-record listing.
+    registry: Option<Arc<crate::registry::Registry>>,
+    registry_answers: RegistryAnswers,
+    /// Claims and own-record writes wait on this until the registry's gate is
+    /// closed, on a node outside its writer rule.
+    gate_hold: &'static crate::registry_seed::GateHold,
 }
 
 /// How often the fleet directory answered a claim guard, by its answer and by
@@ -539,6 +553,117 @@ impl DirectoryAnswers {
             "new": pair(&self.counts[0]),
             "exists": pair(&self.counts[1]),
             "unknown": pair(&self.counts[2]),
+        })
+    }
+}
+
+/// What the claim guard found beside the registry's lookup of the same cell.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShadowVerdict {
+    /// The listing found LTX.
+    pub listed: bool,
+    pub list_us: u64,
+    /// The record was still absent after the listing found LTX.
+    pub lost: bool,
+}
+
+/// How often the birth registry answered a claim guard, by its answer and by
+/// whether the listing beside it found LTX, with the latencies of both.
+#[derive(Debug, Default)]
+pub(crate) struct RegistryAnswers {
+    counts: [[AtomicU64; 2]; 3],
+    mismatches: AtomicU64,
+    lookup_us: LatencyHistogram,
+    list_us: LatencyHistogram,
+}
+
+/// Latencies in microseconds by power-of-two bucket: bucket `i` holds values
+/// below `2^i`, the last one everything above. Fixed size, no lock.
+#[derive(Debug)]
+struct LatencyHistogram {
+    buckets: [AtomicU64; 32],
+}
+
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl LatencyHistogram {
+    fn record(&self, micros: u64) {
+        let at = (u64::BITS - micros.leading_zeros()).min(31) as usize;
+        self.buckets[at].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The upper bound, in microseconds, of the bucket the `p`th percentile
+    /// falls in, or `None` with no samples.
+    fn percentile(counts: &[u64], p: f64) -> Option<u64> {
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        let rank = ((total as f64) * p / 100.0).ceil().max(1.0) as u64;
+        let mut seen = 0;
+        for (at, count) in counts.iter().enumerate() {
+            seen += count;
+            if seen >= rank {
+                return Some(1_u64 << at);
+            }
+        }
+        None
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let counts: Vec<u64> = self
+            .buckets
+            .iter()
+            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .collect();
+        serde_json::json!({
+            "count": counts.iter().sum::<u64>(),
+            "p50_us": Self::percentile(&counts, 50.0),
+            "p99_us": Self::percentile(&counts, 99.0),
+            "buckets_log2_us": counts,
+        })
+    }
+}
+
+impl RegistryAnswers {
+    fn record(
+        &self,
+        answer: celld_logic::lost_record::Answer,
+        ltx_found: bool,
+        lookup_us: u64,
+        list_us: u64,
+    ) {
+        use celld_logic::lost_record::Answer;
+        let row = match answer {
+            Answer::New => 0,
+            Answer::Exists(_) => 1,
+            Answer::Unknown(_) => 2,
+        };
+        self.counts[row][usize::from(ltx_found)].fetch_add(1, Ordering::Relaxed);
+        self.lookup_us.record(lookup_us);
+        self.list_us.record(list_us);
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let pair = |row: &[AtomicU64; 2]| {
+            serde_json::json!({
+                "no_ltx": row[0].load(Ordering::Relaxed),
+                "ltx": row[1].load(Ordering::Relaxed),
+            })
+        };
+        serde_json::json!({
+            "new": pair(&self.counts[0]),
+            "exists": pair(&self.counts[1]),
+            "unknown": pair(&self.counts[2]),
+            "mismatches": self.mismatches.load(Ordering::Relaxed),
+            "lookup_us": self.lookup_us.to_json(),
+            "list_us": self.list_us.to_json(),
         })
     }
 }
@@ -645,7 +770,23 @@ impl BucketOwnership {
             marks_gate: std::sync::Mutex::new((0, false, Vec::new())),
             ensemble_live: std::sync::OnceLock::new(),
             records_gate: std::sync::Mutex::new((0, false)),
+            registry: None,
+            registry_answers: RegistryAnswers::default(),
+            gate_hold: crate::registry_seed::hold(),
         }
+    }
+
+    /// Use another hold than the process's, for a test that must not hold every
+    /// other claim in the process.
+    #[cfg(test)]
+    pub(crate) fn with_gate_hold(mut self, hold: &'static crate::registry_seed::GateHold) -> Self {
+        self.gate_hold = hold;
+        self
+    }
+
+    pub fn with_registry(mut self, registry: Option<Arc<crate::registry::Registry>>) -> Self {
+        self.registry = registry;
+        self
     }
 
     pub fn with_cell_directory(
@@ -742,6 +883,107 @@ impl BucketOwnership {
     ) -> Option<celld_logic::cell_directory::DirectoryAnswer> {
         let directory = self.cell_directory.as_ref()?;
         Some(directory.lookup(cell, crate::asyncrt::mono_ms()).await)
+    }
+
+    /// Start the birth registry's lookup of `cell` beside the claim's listing, or
+    /// `None` on a node without one. The lookup runs detached, so the claim never
+    /// waits for it; the claim sends its [`ShadowVerdict`] when it knows what the
+    /// listing found, and the answer is counted then.
+    pub(crate) fn start_registry_shadow(
+        self: &Arc<Self>,
+        cell: &str,
+    ) -> Option<tokio::sync::oneshot::Sender<ShadowVerdict>> {
+        let registry = self.registry.clone()?;
+        let slot = registry.shadow_slot()?;
+        let (verdict, arrived) = tokio::sync::oneshot::channel::<ShadowVerdict>();
+        let (this, cell) = (self.clone(), cell.to_owned());
+        crate::asyncrt::spawn(async move {
+            let _slot = slot;
+            let result = registry
+                .lookup(&crate::registry_objects::key_of(&cell))
+                .await;
+            tracing::debug!(
+                gets = result.gets,
+                bytes = result.bytes,
+                micros = result.micros,
+                "birth registry lookup"
+            );
+            // A claim that failed before it knew drops the sender: nothing to compare.
+            let Ok(verdict) = arrived.await else {
+                return;
+            };
+            this.record_registry_answer(
+                result.answer,
+                verdict.listed,
+                result.micros,
+                verdict.list_us,
+            );
+            let decision = celld_logic::lost_record::decide(
+                false,
+                Some(result.answer),
+                celld_logic::lost_record::Packs::Absent,
+                0,
+            );
+            if verdict.listed && decision == celld_logic::lost_record::Decision::ClaimNew {
+                // `lost`: the record is still absent after the listing found LTX,
+                // which is the gap that matters. Without it a first claim on
+                // another node can have written the record in between.
+                if verdict.lost {
+                    this.record_registry_mismatch();
+                }
+                tracing::error!(
+                    event = "registry_mismatch",
+                    cell,
+                    lost = verdict.lost,
+                    "the birth registry called a cell new while its LTX exists"
+                );
+            }
+        });
+        Some(verdict)
+    }
+
+    /// Count one answer of the registry beside the listing of the same claim.
+    pub(crate) fn record_registry_answer(
+        &self,
+        answer: celld_logic::lost_record::Answer,
+        ltx_found: bool,
+        lookup_us: u64,
+        list_us: u64,
+    ) {
+        self.registry_answers
+            .record(answer, ltx_found, lookup_us, list_us);
+    }
+
+    /// The registry called a cell new while its LTX exists and its record is
+    /// still absent after a re-read: a record lost beside LTX that the registry
+    /// did not know.
+    pub(crate) fn record_registry_mismatch(&self) {
+        self.registry_answers
+            .mismatches
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(registry) = &self.registry {
+            registry.counters.mismatches.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// This node recovered the node log of `node`: the registry may take the
+    /// compactor role from it at once.
+    pub(crate) fn note_node_recovered(&self, node: &str) {
+        if let Some(registry) = &self.registry {
+            registry.note_recovered(node);
+        }
+    }
+
+    /// The registry's role, queue and counters, or `None` on a node without one.
+    pub(crate) fn registry_state(&self) -> Option<serde_json::Value> {
+        self.registry.as_ref().map(|registry| registry.state())
+    }
+
+    /// The registry answers counted so far, or `None` on a node without one.
+    pub(crate) fn registry_answers(&self) -> Option<serde_json::Value> {
+        self.registry
+            .is_some()
+            .then(|| self.registry_answers.to_json())
     }
 
     /// Count one answer of the directory beside the listing of the same claim.
@@ -1091,6 +1333,7 @@ impl BucketOwnership {
     /// claim. Rejection is an ordinary outcome, not an error -- the record
     /// keeps naming whoever it names, and nothing was lost.
     pub async fn release_owner(&self, cell: &str, epoch: u64) -> anyhow::Result<CasOutcome> {
+        self.gate_hold.wait().await;
         // A lazy cell has no record to release: it gets one first, and its leave
         // is confirmed in the chunk before the release starts.
         if let Some(session) = crate::session::current().filter(|s| s.is_lazy_scope(cell)) {
@@ -1376,6 +1619,8 @@ impl BucketOwnership {
         guard: CasGuard,
         epoch: u64,
     ) -> anyhow::Result<CasOutcome> {
+        // A node outside the writer rule claims nothing before the gate is closed.
+        self.gate_hold.wait().await;
         // A claim over the record that the reader rules made up (B3: no record
         // yet, the minting node decides) is over nothing: it writes nothing and
         // is lost, so the cell is read and judged again.
@@ -1498,6 +1743,11 @@ impl BucketOwnership {
                     if let Some(directory) = &self.cell_directory {
                         directory.register_at_claim(cell);
                     }
+                }
+                // Every applied claim queues the cell in the registry: a create,
+                // a wake and a takeover alike.
+                if let Some(registry) = &self.registry {
+                    registry.register_at_claim(cell, epoch);
                 }
                 Ok(CasOutcome::Applied)
             }
@@ -1786,6 +2036,7 @@ pub(crate) fn process_load(live: &LiveLoad) -> NodeLoadWire {
         owned_cells: owned_cells(live),
         placement_weight: placement_weight(live),
         bucket_format: Some(celld_logic::format::BUCKET_FORMAT),
+        registry: crate::registry_seed::follows_rule(),
         rss_bytes,
         in_use_bytes: Some(in_use_bytes),
         cgroup_working_set_bytes: sample.cgroup_working_set_bytes,
@@ -1877,5 +2128,33 @@ mod session_wire_tests {
         assert_eq!(again.session, lease.session);
         let owner: OwnerWireOwned = serde_json::from_str(r#"{"node":"n","epoch":1}"#).unwrap();
         assert_eq!(owner.by, None);
+    }
+}
+
+#[cfg(test)]
+mod registry_answer_tests {
+    use super::*;
+    use celld_logic::lost_record::Answer;
+
+    #[test]
+    fn latencies_fill_a_fixed_histogram_and_report_counts_and_percentiles() {
+        let answers = RegistryAnswers::default();
+        for micros in 0..10_000_u64 {
+            answers.record(Answer::New, false, 100 + micros % 50, 3_000);
+        }
+        answers.record(Answer::New, false, u64::MAX, 3_000);
+        let json = answers.to_json();
+        assert_eq!(json["lookup_us"]["count"], 10_001);
+        assert_eq!(json["lookup_us"]["p50_us"], 128, "below 2^7 microseconds");
+        assert_eq!(json["list_us"]["p99_us"], 4_096);
+        assert_eq!(json["new"]["no_ltx"], 10_001);
+        assert!(
+            json["lookup_us"]["buckets_log2_us"]
+                .as_array()
+                .unwrap()
+                .len()
+                == 32
+        );
+        assert!(RegistryAnswers::default().to_json()["lookup_us"]["p50_us"].is_null());
     }
 }

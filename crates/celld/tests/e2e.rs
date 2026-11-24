@@ -4,6 +4,7 @@ mod e2e {
     pub mod ai;
     pub mod alarms;
     pub mod body_clone;
+    pub mod boot_recovery_kill;
     pub mod burst_lease;
     pub mod claim_provenance;
     pub mod client_streams;
@@ -39,6 +40,7 @@ mod e2e {
     pub mod loader_isolation;
     pub mod node_compat;
     pub mod node_crypto;
+    pub mod node_log_fleet;
     pub mod operator_branches;
     pub mod operator_token;
     pub mod ownership;

@@ -12,6 +12,59 @@ struct FormatRecord {
     format: u8,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     migrating: bool,
+    /// The birth registry's seed has started in this fleet. A binary from
+    /// before the registry does not know the field, and this record refuses
+    /// unknown fields, so it cannot read the marker and does not start.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    registry: u8,
+}
+
+fn is_zero(value: &u8) -> bool {
+    *value == 0
+}
+
+/// Write the registry's format marker into the format record, once. It is a
+/// conditional write of the record that every starting node reads, so an older
+/// binary that restarts after it fails to decode the record and refuses to
+/// start. Returns `false` when the record is absent (the fleet is not
+/// initialised) and an error for any record this binary cannot read.
+pub(crate) async fn mark_registry(
+    store: &dyn object_store::ObjectStore,
+    prefix: &str,
+) -> anyhow::Result<bool> {
+    use object_store::{ObjectStoreExt as _, PutMode, PutOptions, PutPayload, UpdateVersion};
+    let path = object_store::path::Path::from(format!("{prefix}{KEY}"));
+    // A conditional write that another node won is read back: the record is
+    // marked only when what is there says so.
+    for _ in 0..8 {
+        let read = match store.get(&path).await {
+            Ok(read) => read,
+            Err(object_store::Error::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let version = UpdateVersion {
+            e_tag: read.meta.e_tag.clone(),
+            version: read.meta.version.clone(),
+        };
+        let mut record = decode(&read.bytes().await?)?;
+        if record.registry != 0 {
+            return Ok(true);
+        }
+        record.registry = 1;
+        match store
+            .put_opts(
+                &path,
+                PutPayload::from_bytes(serde_json::to_vec(&record)?.into()),
+                PutOptions::from(PutMode::Update(version)),
+            )
+            .await
+        {
+            Ok(_) => return Ok(true),
+            Err(error) if crate::bucket::is_clean_cas_rejection(&error) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::bail!("the format record keeps changing: the registry marker is not confirmed")
 }
 
 fn decode(bytes: &[u8]) -> anyhow::Result<FormatRecord> {
@@ -96,6 +149,7 @@ async fn initialize(bucket: &Bucket) -> anyhow::Result<()> {
                     serde_json::to_vec(&FormatRecord {
                         format: 2,
                         migrating: true,
+                        registry: 0,
                     })?,
                     None,
                 )
@@ -149,6 +203,7 @@ async fn initialize(bucket: &Bucket) -> anyhow::Result<()> {
             serde_json::to_vec(&FormatRecord {
                 format: 2,
                 migrating: false,
+                registry: 0,
             })?,
             Some(&token),
         )
@@ -191,4 +246,51 @@ async fn ensure_legacy_layout(bucket: &Bucket) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::ObjectStoreExt as _;
+
+    #[tokio::test]
+    async fn the_registry_marker_is_written_once_and_this_binary_still_reads_the_record() {
+        let store = InMemory::new();
+        assert!(
+            !mark_registry(&store, "fleet/").await.unwrap(),
+            "no record yet"
+        );
+        store
+            .put(
+                &Path::from("fleet/wake/format.json"),
+                br#"{"format":2}"#.to_vec().into(),
+            )
+            .await
+            .unwrap();
+        assert!(mark_registry(&store, "fleet/").await.unwrap());
+        let body = store
+            .get(&Path::from("fleet/wake/format.json"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let record = decode(&body).unwrap();
+        assert_eq!(record.registry, 1);
+        assert!(!record.migrating);
+        assert!(
+            mark_registry(&store, "fleet/").await.unwrap(),
+            "a second call changes nothing"
+        );
+        let again = store
+            .get(&Path::from("fleet/wake/format.json"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(body, again);
+    }
 }
