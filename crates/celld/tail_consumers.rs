@@ -944,8 +944,15 @@ mod tests {
         // Another producer still buffers.
         other.submit("b".repeat(60));
         assert_eq!(other.lanes[0].dropped.load(Ordering::Relaxed), 0);
-        // The running call's batch of 62, and the 40 and 60 waiting.
-        assert_eq!(node.used.load(Ordering::Relaxed), 162);
+        // Its own lane takes the 60 and starts a call of its own, which waits
+        // at the gate; wait for that, so the count does not depend on whether
+        // the lane got to run yet.
+        seen.until("the other call to start", |seen| {
+            seen.entered.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        // The two running calls' encoded batches of 62 each, and the 40 waiting.
+        assert_eq!(node.used.load(Ordering::Relaxed), 164);
         gate.add_permits(10);
         seen.until("the budget to be released", |_| {
             node.used.load(Ordering::Relaxed) == 0
