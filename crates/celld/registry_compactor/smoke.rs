@@ -101,6 +101,8 @@ async fn lookup_against_list_smoke() {
             waiting_cap: crate::registry_writer::WAITING_CAP,
             seed_page: 1_000,
             sampler_recheck_ms: 20_000,
+            seed_check_ms: 10_000,
+            background_delete_ms: 60_000,
             job_pacing: true,
             lease_ttl_ms: crate::machine::lease_ttl_ms_from_environment(),
             pass_read: Duration::from_secs(1),
