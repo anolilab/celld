@@ -3367,3 +3367,180 @@ async fn the_sampler_starts_over_when_nothing_lies_after_its_cursor() {
         "the same sample began again at the start and found the cell"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The role watch, the partition cap and the delete retry
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_holder_that_changes_inside_the_lease_cache_window_gets_its_own_lease_read() {
+    let store = memory();
+    let node = registry_on(&store, "node-w");
+    lease(&store, "node-a", "{}", far()).await;
+    // node-b has no lease at all.
+    let holder = |name: &str| reg::Holder {
+        node: name.to_owned(),
+        session: format!("session-{name}"),
+    };
+    let mut cache = None;
+    assert_eq!(
+        node.lease_state(&holder("node-a"), 1_000, &mut cache).await,
+        Some(false)
+    );
+    // The root changed hands 10 ms later: node-b's lease is gone, and the cached
+    // answer for node-a says nothing about it.
+    assert_eq!(
+        node.lease_state(&holder("node-b"), 1_010, &mut cache).await,
+        Some(true)
+    );
+    assert_eq!(
+        node.lease_state(&holder("node-a"), 1_020, &mut cache).await,
+        Some(false)
+    );
+    // The same holder inside the window reuses the read.
+    objects::delete(store.as_ref(), &format!("{PREFIX}nodes/node-a.json")).await;
+    assert_eq!(
+        node.lease_state(&holder("node-a"), 1_030, &mut cache).await,
+        Some(false)
+    );
+    assert_eq!(
+        node.lease_state(&holder("node-a"), 3_100, &mut cache).await,
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn a_live_holder_whose_pass_outlasts_six_short_intervals_is_not_taken_for_stuck() {
+    let store = memory();
+    // A pass interval of 50 ms: six of them are 300 ms.
+    let node = registry_on(&store, "node-w");
+    let _holding = holder_of(&registry_on(&store, "node-h")).await;
+    let (root, _) = node.read_root(&Io::default()).await.unwrap().unwrap();
+    let decide = |unchanged: u64, lease: Option<bool>| {
+        reg::role(&node.watch_for(&root, unchanged, lease, 0))
+    };
+    assert_eq!(
+        decide(400, Some(false)),
+        reg::Role::Watch,
+        "slow, not stuck"
+    );
+    assert_eq!(decide(29_000, Some(false)), reg::Role::Watch);
+    assert_eq!(
+        decide(31_000, Some(false)),
+        reg::Role::Take { by_stuck: true }
+    );
+    // A holder whose lease is gone is still taken after three intervals of the floor.
+    assert_eq!(
+        decide(16_000, Some(true)),
+        reg::Role::Take { by_stuck: false }
+    );
+}
+
+#[tokio::test]
+async fn a_root_that_names_an_unsupported_number_of_partitions_is_unreadable() {
+    let store = memory();
+    let node = registry_on(&store, "node-a");
+    for k in [0, crate::registry::MAX_PARTITIONS + 1, u32::MAX] {
+        let mut root = Root::new(1);
+        root.k = k;
+        root.seed_gate = root.gate;
+        objects::delete(store.as_ref(), &objects::root_key(PREFIX)).await;
+        objects::write_root_versioned(store.as_ref(), PREFIX, &root, None)
+            .await
+            .unwrap();
+        let reader = registry_on(&store, "node-b");
+        assert!(
+            matches!(answer(&reader, "Agent:x").await, Answer::Unknown(_)),
+            "k = {k}"
+        );
+    }
+    let _ = node;
+}
+
+#[tokio::test]
+async fn a_folded_segment_whose_delete_failed_is_deleted_at_the_next_pass_without_refolding() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    let writer = registry_on(&plain, "node-b");
+    writer.register_at_claim(&cell(1), 1);
+    writer.flush_now().await.unwrap();
+    scripted.fail_deletes(true);
+    assert!(node.pass(&mut holding).await.unwrap());
+    crate::asyncrt::timeout(Duration::from_secs(2), async {
+        while holding.retry_delete.lock().unwrap().is_empty() {
+            crate::asyncrt::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the failed delete was kept for a retry");
+    assert_eq!(
+        keys_under(&plain, &objects::segments_root(PREFIX))
+            .await
+            .len(),
+        1
+    );
+    scripted.fail_deletes(false);
+    assert!(node.pass(&mut holding).await.unwrap());
+    crate::asyncrt::timeout(Duration::from_secs(2), async {
+        while !keys_under(&plain, &objects::segments_root(PREFIX))
+            .await
+            .is_empty()
+        {
+            crate::asyncrt::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the retry deleted the segment");
+    assert_eq!(
+        holding.root.deltas.len(),
+        1,
+        "it was not folded a second time"
+    );
+}
+
+#[tokio::test]
+async fn a_new_holder_does_not_fold_again_what_the_roots_deltas_already_folded() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let old = registry_on(&store, "node-a");
+    let mut old_holding = holder_of(&old).await;
+    let writer = registry_on(&plain, "node-c");
+    writer.register_at_claim(&cell(1), 1);
+    writer.flush_now().await.unwrap();
+    scripted.fail_deletes(true);
+    assert!(old.pass(&mut old_holding).await.unwrap());
+    crate::asyncrt::timeout(Duration::from_secs(2), async {
+        while old_holding.retry_delete.lock().unwrap().is_empty() {
+            crate::asyncrt::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    scripted.fail_deletes(false);
+    // The old holder dies with the segment still in the bucket.
+    let new = registry_on(&plain, "node-b");
+    let mut holding = take_over(&new).await;
+    assert_eq!(
+        holding.seen.len(),
+        1,
+        "seeded from the delta the root names"
+    );
+    assert!(new.pass(&mut holding).await.unwrap());
+    assert_eq!(
+        holding.root.deltas.len(),
+        1,
+        "no second delta for the same segment"
+    );
+    crate::asyncrt::timeout(Duration::from_secs(2), async {
+        while !keys_under(&plain, &objects::segments_root(PREFIX))
+            .await
+            .is_empty()
+        {
+            crate::asyncrt::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("and the leftover segment is deleted");
+}

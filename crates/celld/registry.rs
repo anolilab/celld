@@ -52,6 +52,9 @@ impl<K: std::hash::Hash + Eq> RecentSet<K> {
     }
 }
 
+/// The most partitions a registry may be configured with, and the most a root
+/// may name before it is refused: a map has an entry for each.
+pub(crate) const MAX_PARTITIONS: u32 = 65_536;
 /// Shadow lookups beside claims that run at once; a claim over the limit is not
 /// looked up, so shadow never competes without bound with the compactor's passes.
 pub(crate) const SHADOW_LOOKUPS: usize = 16;
@@ -138,8 +141,8 @@ impl Config {
         let pass_read_ms: u64 = with_default("CELLD_REGISTRY_PASS_READ_MS", 1_000)?;
         let bound = Self::bound_with(durability_ms, extra_wait)?;
         anyhow::ensure!(
-            partitions >= 1 && pass_ms >= 1 && batch_ms >= 1 && spill_ms >= 1 && base_days >= 1,
-            "the registry's partitions, pass, batch and spill windows and base days must be positive"
+            (1..=MAX_PARTITIONS).contains(&partitions) && pass_ms >= 1 && batch_ms >= 1 && spill_ms >= 1 && base_days >= 1,
+            "the registry's partitions (at most 65,536), pass, batch and spill windows and base days must be positive"
         );
         let base_ms = base_days
             .checked_mul(86_400_000)
@@ -557,7 +560,11 @@ impl Registry {
             .await;
         deltas_ok &= loaded.iter().all(Option::is_some);
         let deltas: Vec<Arc<Loaded>> = loaded.into_iter().flatten().collect();
+        // A root names how many partitions its map has. One that names none or
+        // more than a registry supports is unreadable: its empty map is never built.
+        let partitions_ok = (1..=MAX_PARTITIONS).contains(&root.k);
         let (map, map_ok) = match root.map {
+            _ if !partitions_ok => (Arc::new(Map::empty(1)), false),
             None => (Arc::new(Map::empty(root.k)), true),
             Some(named) => {
                 let cached = self

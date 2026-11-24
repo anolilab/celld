@@ -779,6 +779,9 @@ struct Holding {
     pending_delete: Vec<String>,
     /// Folded segments whose delete is confirmed, to leave `seen`.
     deleted: Arc<Mutex<Vec<String>>>,
+    /// Folded segments whose delete failed: deleted again at the next pass, with
+    /// no refolding, since they stay in `seen`.
+    retry_delete: Arc<Mutex<Vec<String>>>,
     /// Retired objects whose delete is confirmed, to leave `retired`.
     retired_gone: Arc<Mutex<Vec<String>>>,
     /// Outputs of failed jobs that could not be deleted, to join `retired`.
@@ -846,6 +849,19 @@ async fn lease_gone(registry: &Registry, node: &str) -> Option<bool> {
     Some(expires <= crate::ownership_store::now_ms())
 }
 
+/// What the watcher last learned about the holder's lease, and whose.
+struct LeaseCheck {
+    at: u64,
+    node: String,
+    session: String,
+    gone: Option<bool>,
+}
+
+/// The shortest pass interval the role rules are judged by: a pass and its store
+/// operations can outlast a very short configured one, and a holder that is only
+/// slow must not be taken for stuck. Six of these are the stuck floor, 30 s.
+const WATCH_PASS_FLOOR_MS: u64 = 5_000;
+
 /// How long a recovery of a node log counts as proof that the node is dead.
 const RECOVERY_VALID_MS: u64 = 60_000;
 
@@ -858,9 +874,54 @@ impl Registry {
             .is_some_and(|at| now.saturating_sub(*at) < RECOVERY_VALID_MS)
     }
 
+    /// Whether the holder's lease is gone, from a read at most two seconds old
+    /// that was made for this holder: a root that changed its holder inside the
+    /// window is a different node's lease to read.
+    async fn lease_state(
+        &self,
+        holder: &reg::Holder,
+        now: u64,
+        cache: &mut Option<LeaseCheck>,
+    ) -> Option<bool> {
+        if let Some(check) = cache.as_ref().filter(|check| {
+            now.saturating_sub(check.at) < 2_000
+                && check.node == holder.node
+                && check.session == holder.session
+        }) {
+            return check.gone;
+        }
+        let gone = lease_gone(self, &holder.node).await;
+        *cache = Some(LeaseCheck {
+            at: now,
+            node: holder.node.clone(),
+            session: holder.session.clone(),
+            gone,
+        });
+        gone
+    }
+
+    /// What the role rules see of a root this node has watched for `unchanged`.
+    fn watch_for(&self, root: &Root, unchanged: u64, lease: Option<bool>, now: u64) -> reg::Watch {
+        let own = root
+            .holder
+            .as_ref()
+            .is_some_and(|holder| holder.session == self.session);
+        reg::Watch {
+            holder: root.holder.is_some(),
+            own,
+            unchanged_ms: unchanged,
+            lease_gone: lease,
+            recovered_holder: root.holder.as_ref().is_some_and(|holder| {
+                !own && self.recovered_recently(&holder.node, &holder.session, now)
+            }),
+            stuck: root.stuck,
+            pass_ms: self.cfg.pass_ms.max(WATCH_PASS_FLOOR_MS),
+        }
+    }
+
     /// Watch the root and hold the role when the rules say so, until `stop`.
     pub(crate) async fn run_compactor(self: Arc<Self>, stop: crate::ltx_repl::StopToken) {
-        let mut checked_lease: Option<(u64, Option<bool>)> = None;
+        let mut checked_lease: Option<LeaseCheck> = None;
         let mut first = true;
         loop {
             // The first look is at once, so a node that starts into an empty
@@ -890,28 +951,11 @@ impl Registry {
                     let mut lease = None;
                     if let Some(holder) = root.holder.as_ref().filter(|_| !own) {
                         if unchanged >= self.cfg.pass_ms * reg::LEASE_TAKEOVER_PASSES {
-                            lease = match checked_lease {
-                                Some((at, value)) if now.saturating_sub(at) < 2_000 => value,
-                                _ => {
-                                    let value = lease_gone(&self, &holder.node).await;
-                                    checked_lease = Some((now, value));
-                                    value
-                                }
-                            };
+                            lease = self.lease_state(holder, now, &mut checked_lease).await;
                         }
                     }
                     (
-                        reg::role(&reg::Watch {
-                            holder: root.holder.is_some(),
-                            own,
-                            unchanged_ms: unchanged,
-                            lease_gone: lease,
-                            recovered_holder: root.holder.as_ref().is_some_and(|holder| {
-                                !own && self.recovered_recently(&holder.node, &holder.session, now)
-                            }),
-                            stuck: root.stuck,
-                            pass_ms: self.cfg.pass_ms,
-                        }),
+                        reg::role(&self.watch_for(root, unchanged, lease, now)),
                         Some(root.clone()),
                     )
                 }
@@ -1019,6 +1063,14 @@ impl Registry {
             .zip(root.deltas.iter())
             .map(|(delta, id)| (*id, delta.records.len() as u64))
             .collect();
+        // The segments the deltas the root names folded were deleted by the holder
+        // before, or are still there because a delete failed: either way they are
+        // not folded again, and any that remain are deleted.
+        let folded_before: Vec<String> = snapshot
+            .deltas
+            .iter()
+            .flat_map(|delta| delta.segments.iter().cloned())
+            .collect();
         let now = crate::asyncrt::mono_ms();
         Ok(Some(Holding {
             epoch: root.epoch,
@@ -1028,10 +1080,11 @@ impl Registry {
             next_delta: 0,
             next_map: 0,
             next_run: 0,
-            seen: HashSet::new(),
+            seen: folded_before.iter().cloned().collect(),
             stalled: HashMap::new(),
             pending_delete: Vec::new(),
             deleted: Arc::default(),
+            retry_delete: Arc::new(Mutex::new(folded_before)),
             retired_gone: Arc::default(),
             stranded: Arc::default(),
             retire_next: Vec::new(),
@@ -1226,6 +1279,8 @@ impl Registry {
     async fn pass(self: &Arc<Self>, holding: &mut Holding) -> anyhow::Result<bool> {
         self.counters.passes.fetch_add(1, Ordering::Relaxed);
         holding.deferred = false;
+        let retry = std::mem::take(&mut *holding.retry_delete.lock().unwrap());
+        self.delete_segments(holding, retry);
         let mut changed = self.commit_prepared(holding).await?;
         let live: u64 = holding.counts.values().sum();
         let capped = reg::at_cap(holding.root.deltas.len(), live);
@@ -1274,16 +1329,36 @@ impl Registry {
                 self.seed_delta(id, loaded);
             }
             self.push_root(holding);
-            let (registry, deleted) = (self.clone(), holding.deleted.clone());
-            crate::asyncrt::spawn(async move {
-                let gone = objects::delete_many(registry.store.as_ref(), &folded).await;
-                deleted.lock().unwrap().extend(gone);
-            });
+            self.delete_segments(holding, folded);
         }
         holding.last_pass_ms = crate::asyncrt::mono_ms();
         self.schedule(holding);
         self.housekeeping(holding);
         Ok(true)
+    }
+
+    /// Delete folded segments in the background. Those whose delete fails go to the
+    /// retry list, so the next pass deletes them again and never folds them twice.
+    fn delete_segments(self: &Arc<Self>, holding: &Holding, keys: Vec<String>) {
+        if keys.is_empty() {
+            return;
+        }
+        let (registry, deleted, retry) = (
+            self.clone(),
+            holding.deleted.clone(),
+            holding.retry_delete.clone(),
+        );
+        crate::asyncrt::spawn(async move {
+            let gone = objects::delete_many(registry.store.as_ref(), &keys).await;
+            let gone_set: HashSet<&String> = gone.iter().collect();
+            let failed: Vec<String> = keys
+                .iter()
+                .filter(|key| !gone_set.contains(key))
+                .cloned()
+                .collect();
+            deleted.lock().unwrap().extend(gone);
+            retry.lock().unwrap().extend(failed);
+        });
     }
 
     /// List the unfolded segments, fold them into one delta and add it to the

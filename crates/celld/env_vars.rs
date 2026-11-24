@@ -367,7 +367,11 @@ pub fn validate() -> anyhow::Result<()> {
             for name in ["CELLD_REGISTRY_JOB_PACING", "CELLD_REGISTRY_WAIT"] {
                 flag(name, false)?;
             }
-            positive::<u32>("CELLD_REGISTRY_PARTITIONS")?;
+            if let Some(partitions) = positive::<u32>("CELLD_REGISTRY_PARTITIONS")? {
+                if partitions > 65_536 {
+                    bail!("CELLD_REGISTRY_PARTITIONS must be at most 65536, not {partitions}");
+                }
+            }
             for name in [
                 "CELLD_REGISTRY_BASE_DAYS",
                 "CELLD_REGISTRY_BATCH_MS",
