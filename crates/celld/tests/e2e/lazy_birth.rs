@@ -259,19 +259,17 @@ fn tag_of_key(key: &str) -> String {
         .to_string()
 }
 
-/// In `shadow`, the sealed chunk of a session holds exactly the ids whose
-/// create-only record applied, once the next process started; the header of an
-/// ended session is sealed and only the current one is open.
+/// With no ensemble no `Grant` can be appended: every id is waived, the chunk of
+/// the session holds no bit once it is sealed, and the ended session's header is
+/// sealed while only the current one is open. (The fleet tests cover the bits.)
 #[tokio::test]
-async fn a_sealed_chunk_holds_exactly_the_ids_that_got_a_record() {
+async fn without_an_ensemble_every_id_is_waived_and_the_sealed_chunk_holds_no_bit() {
     let mut server = Server::start("do-ids", SHADOW).await;
     let ids = minted(&server).await;
     let (tag, header) = header_tag(server.project());
     assert_eq!(header["chunks"], 1);
     assert_eq!(bump(&server, &ids[0]).await, 1);
     assert_eq!(bump(&server, &ids[2]).await, 1);
-    // A second use of an id adds nothing.
-    assert_eq!(bump(&server, &ids[2]).await, 2);
     server.restart().await;
     let sealed = headers(server.project());
     assert_eq!(sealed.len(), 2, "{sealed:?}");
@@ -283,19 +281,9 @@ async fn a_sealed_chunk_holds_exactly_the_ids_that_got_a_record() {
         };
         assert_eq!(body["state"], state, "{key}: {body}");
     }
-    let chunks = bodies(server.project(), &format!("%fleet/sessions/{tag}/c/%"));
-    assert_eq!(chunks.len(), 1);
-    let chunk = &chunks[0].1;
+    let chunk = chunk_of(server.project(), &tag);
     assert_eq!(chunk["state"], "sealed", "{chunk}");
-    let granted: Vec<u64> = chunk["granted"]
-        .as_array()
-        .expect("granted")
-        .iter()
-        .map(|counter| counter.as_u64().expect("a counter"))
-        .collect();
-    let expected = vec![counter_of(&header, &ids[0]), counter_of(&header, &ids[2])];
-    assert_eq!(granted, expected, "{chunk}");
-    assert!(chunk.get("unknown").is_none());
+    assert_eq!(chunk["granted"], serde_json::json!([]), "{chunk}");
 }
 
 /// A header that is missing is created again as sealed and lost, a counted
@@ -455,10 +443,16 @@ async fn a_new_tagged_cell_is_claimed_by_a_first_form_record_and_a_mark() {
 async fn a_granted_tagged_cell_without_a_record_is_refused() {
     let mut server = Server::start("do-ids", SHADOW).await;
     let ids = minted(&server).await;
+    let (tag, header) = header_tag(server.project());
+    let counter = counter_of(&header, &ids[0]);
     assert_eq!(bump(&server, &ids[0]).await, 1);
     server
         .restart_after(|project| {
             drop_certificate(project);
+            // The bit that a proven mark would have set.
+            edit_chunk(project, &tag, |chunk| {
+                chunk["granted"] = serde_json::json!([counter]);
+            });
             store(project)
                 .execute("DELETE FROM objects WHERE key LIKE '%cells/%/own.json'", [])
                 .expect("lose the record");
@@ -615,44 +609,6 @@ async fn the_ids_of_a_lost_header_are_refused_and_no_chunk_is_marked() {
         count(server.project(), "%cells/%/own.json"),
         1,
         "nothing was claimed"
-    );
-}
-
-/// The first per-cell object of a granted cell waits for the bit of its grant to
-/// be in a chunk: with no checkpoint due for an hour, the write itself asks for
-/// one, and the chunk holds the bit by the time the object exists.
-#[tokio::test]
-async fn the_first_object_of_a_granted_cell_follows_its_bit_in_the_chunk() {
-    let server = Server::start(
-        "do-ids",
-        &[
-            ("CELLD_LAZY_BIRTH", "shadow"),
-            ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "3600000"),
-        ],
-    )
-    .await;
-    let ids = minted(&server).await;
-    let (tag, header) = header_tag(server.project());
-    assert_eq!(bump(&server, &ids[0]).await, 1);
-    let counter = counter_of(&header, &ids[0]);
-    let project = server.project().to_owned();
-    wait_until(
-        "the first object of the cell",
-        Duration::from_secs(60),
-        || {
-            let project = project.clone();
-            async move { (count(&project, "%/ltx/e1/%") > 0).then_some(()) }
-        },
-    )
-    .await;
-    let chunk = chunk_of(server.project(), &tag);
-    assert!(
-        chunk["granted"]
-            .as_array()
-            .expect("granted")
-            .iter()
-            .any(|granted| granted.as_u64() == Some(counter)),
-        "the object exists and the chunk does not hold its bit: {chunk}"
     );
 }
 

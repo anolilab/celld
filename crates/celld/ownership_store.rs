@@ -679,14 +679,6 @@ impl BucketOwnership {
         let Some((owner, etag)) = load_json::<OwnerWireOwned>(&self.bucket, &key).await? else {
             return Ok(None);
         };
-        // A record of epoch 1 that this session wrote proves that its
-        // create-only write applied, also when the answer to the write was an
-        // error: the id is granted.
-        if let (Some(session), Some(by)) = (crate::session::current(), owner.by.as_deref()) {
-            if owner.epoch == 1 && by == session.tag() && owner.node == self.node {
-                session.grant_scope(cell);
-            }
-        }
         let form = OwnerForm {
             nonce: owner.nonce,
             over: owner.over,
@@ -1155,13 +1147,16 @@ impl BucketOwnership {
         allowed
     }
 
-    /// Append the `Grant` of `cell` to the followers' log and wait for the
-    /// fleet proof of it, so the cell's first response follows a record that
-    /// survives the loss of this node. Without a fleet proof the evidence is a
-    /// read of the session's own header that says `open`, started after the
-    /// write of the record returned; without either the cell is not activated
-    /// by this write.
-    async fn grant_mark(
+    /// What happens to the id of `cell` after its create-only record applied.
+    /// The session appends a `Grant` to the followers' log, only while a capable
+    /// ensemble exists, and waits (bounded) for the fleet proof of it: with the
+    /// proof the id is granted and its bit is set, and its first response may
+    /// go on. Without a mark or without the proof the id is waived: it takes
+    /// the standard path with no bit, and the session acts on its record only
+    /// with evidence that it was not sealed when the write applied, a read of
+    /// its own header that says `open`, started after the write returned.
+    /// Without that evidence the cell is not activated by this write.
+    async fn after_first_record(
         &self,
         session: &crate::session::Session,
         cell: &str,
@@ -1169,12 +1164,12 @@ impl BucketOwnership {
         let Some(counter) = session.own_counter_of_scope(cell) else {
             return Ok(());
         };
-        if !self.marks_allowed().await {
-            return Ok(());
-        }
-        let proof = crate::session::enqueue_mark(cell, counter);
-        if let Ok(Ok(true)) = crate::asyncrt::timeout(MARK_PROOF_WAIT, proof).await {
-            return Ok(());
+        if self.marks_allowed().await {
+            let proof = crate::session::enqueue_mark(cell, counter);
+            if let Ok(Ok(true)) = crate::asyncrt::timeout(MARK_PROOF_WAIT, proof).await {
+                session.grant_scope(cell);
+                return Ok(());
+            }
         }
         match crate::session_store::read_header(&self.bucket, &session.tag()).await? {
             crate::session_store::Read::Found(header, _)
@@ -1258,8 +1253,7 @@ impl BucketOwnership {
                 // that reaches LTX another way, registers when it writes.
                 if matches!(guard, CasGuard::Absent) && epoch == 1 {
                     if let Some(session) = session {
-                        session.grant_scope(cell);
-                        self.grant_mark(session, cell).await?;
+                        self.after_first_record(session, cell).await?;
                     }
                 }
                 if matches!(guard, CasGuard::Absent) {
