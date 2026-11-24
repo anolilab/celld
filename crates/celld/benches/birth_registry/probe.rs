@@ -199,7 +199,12 @@ pub async fn lookup(
     .await?;
     Some((
         value["answer"].as_str()?.to_owned(),
-        value["record"].clone(),
+        // An unknown answer carries its doubt where a known one carries its record.
+        if value["answer"] == "unknown" {
+            json!({ "doubt": value["doubt"] })
+        } else {
+            value["record"].clone()
+        },
         value["gets"].as_u64()?,
         value["bytes"].as_u64()?,
         value["micros"].as_u64()?,
@@ -315,6 +320,9 @@ pub struct Check {
     pub misses: u64,
     pub first_misses: Vec<String>,
     pub bases: u64,
+    /// The unknown answers by the doubt the node gave; `no_answer` when the
+    /// debug request itself failed or ran out of time.
+    pub doubts: std::collections::BTreeMap<String, u64>,
 }
 
 impl Check {
@@ -322,6 +330,7 @@ impl Check {
         json!({
             "total": self.total, "exists": self.exists, "new": self.new, "unknown": self.unknown,
             "misses": self.misses, "first_misses": self.first_misses, "bases": self.bases,
+            "doubts": self.doubts,
         })
     }
 }
@@ -391,6 +400,7 @@ where
         misses: 0,
         first_misses: Vec::new(),
         bases: 0,
+        doubts: std::collections::BTreeMap::new(),
     }));
     let mut tasks = Vec::new();
     for worker in 0..parallel {
@@ -438,7 +448,16 @@ where
                 match got.as_ref().map(|(answer, ..)| answer.as_str()) {
                     Some("exists") => check.exists += 1,
                     Some("new") => check.new += 1,
-                    _ => check.unknown += 1,
+                    other => {
+                        check.unknown += 1;
+                        let doubt = match (other, &got) {
+                            (Some(_), Some((_, record, ..))) => {
+                                record["doubt"].as_str().unwrap_or("unnamed").to_owned()
+                            }
+                            _ => "no_answer".to_owned(),
+                        };
+                        *check.doubts.entry(doubt).or_default() += 1;
+                    }
                 }
                 if got
                     .as_ref()
@@ -470,6 +489,7 @@ where
         );
         check.unknown += left;
         check.misses += left;
+        *check.doubts.entry("not_looked_up".to_owned()).or_default() += left;
     }
     check
 }

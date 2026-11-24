@@ -37,6 +37,16 @@ fn record_json(record: &reg::Record) -> serde_json::Value {
     })
 }
 
+/// The answer's name, its record and, for `Unknown`, the doubt that kept the
+/// lookup from a conclusion.
+fn answer_parts(answer: &Answer) -> (&'static str, Option<serde_json::Value>, Option<String>) {
+    match answer {
+        Answer::New => ("new", None, None),
+        Answer::Exists(record) => ("exists", Some(record_json(record)), None),
+        Answer::Unknown(doubt) => ("unknown", None, Some(format!("{doubt:?}"))),
+    }
+}
+
 /// Serve one debug request. `None` for a path that is not a registry route.
 pub async fn serve(
     registry: &Arc<Registry>,
@@ -57,15 +67,11 @@ pub async fn serve(
                 return reply(400, serde_json::json!({ "error": "scope or key" }));
             };
             let result = registry.lookup(&key).await;
-            let (answer, record) = match result.answer {
-                Answer::New => ("new", None),
-                Answer::Exists(record) => ("exists", Some(record_json(&record))),
-                Answer::Unknown(_) => ("unknown", None),
-            };
+            let (answer, record, doubt) = answer_parts(&result.answer);
             reply(
                 200,
                 serde_json::json!({
-                    "answer": answer, "record": record, "gets": result.gets,
+                    "answer": answer, "record": record, "doubt": doubt, "gets": result.gets,
                     "bytes": result.bytes, "micros": result.micros,
                 }),
             )
@@ -181,5 +187,27 @@ pub async fn serve(
             reply(200, serde_json::json!({ "ok": true }))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use celld_logic::lost_record::Doubt;
+
+    #[test]
+    fn an_unknown_answer_names_its_doubt_and_the_others_have_none() {
+        assert_eq!(
+            answer_parts(&Answer::Unknown(Doubt::Late)),
+            ("unknown", None, Some("Late".to_owned()))
+        );
+        assert_eq!(
+            answer_parts(&Answer::Unknown(Doubt::LevelUnreadable(2))).2,
+            Some("LevelUnreadable(2)".to_owned())
+        );
+        assert_eq!(answer_parts(&Answer::New), ("new", None, None));
+        let (name, record, doubt) = answer_parts(&Answer::Exists(reg::Record::birth([7; 16], 1)));
+        assert_eq!((name, doubt), ("exists", None));
+        assert_eq!(record.expect("a record")["epoch"], 1);
     }
 }
