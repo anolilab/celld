@@ -684,7 +684,7 @@ async fn a_grant_without_a_timely_proof_is_pending_and_never_waived() {
     let env: &[(&str, &str)] = &[
         ("CELLD_LAZY_BIRTH", "shadow"),
         ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "500"),
-        ("CELLD_LAZY_BIRTH_PROOF_WAIT_MS", "1"),
+        ("CELLD_LAZY_BIRTH_PROOF_WAIT_MS", "0"),
     ];
     let Some(fleet) = Fleet::start("do-ids", 3, env).await else {
         return;
@@ -1073,7 +1073,7 @@ async fn a_pending_grant_of_a_lazy_cell_wakes_at_epoch_two() {
     let env: &[(&str, &str)] = &[
         ("CELLD_LAZY_BIRTH", "on"),
         ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "500"),
-        ("CELLD_LAZY_BIRTH_PROOF_WAIT_MS", "1"),
+        ("CELLD_LAZY_BIRTH_PROOF_WAIT_MS", "0"),
     ];
     let Some(fleet) = Fleet::start("do-ids", 3, env).await else {
         return;
@@ -1178,7 +1178,7 @@ async fn a_leave_that_only_the_followers_hold_is_sealed_into_the_chunk() {
     let env: &[(&str, &str)] = &[
         ("CELLD_LAZY_BIRTH", "on"),
         ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "600000"),
-        ("CELLD_LAZY_BIRTH_PROOF_WAIT_MS", "1"),
+        ("CELLD_LAZY_BIRTH_PROOF_WAIT_MS", "0"),
     ];
     let Some(fleet) = Fleet::start("do-ids", 3, env).await else {
         return;
@@ -1345,7 +1345,7 @@ async fn peer_answers(fleet: &Fleet, id: &str) -> Vec<u64> {
 const PENDING: &[(&str, &str)] = &[
     ("CELLD_LAZY_BIRTH", "on"),
     ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "500"),
-    ("CELLD_LAZY_BIRTH_PROOF_WAIT_MS", "1"),
+    ("CELLD_LAZY_BIRTH_PROOF_WAIT_MS", "0"),
 ];
 
 /// S7. Delete `own.json` in each window of the record-loss table: after a
@@ -1360,28 +1360,43 @@ async fn s7_record_loss_in_each_window_refuses_or_keeps_one_writer() {
     with_fleet(fleet, |mut fleet| async move {
         wait_for_ensemble(&fleet).await;
         let n = cells();
-        let ids = mint(&fleet, 4 * n).await;
-        let tag = ids[0][..16].to_string();
+        // One chunk holds 1,024 counters: a drill of 4n cells and a little slack
+        // stays in the first.
+        assert!(4 * n + 32 <= 1024, "at most 248 cells per window in one chunk");
+        let minted = mint(&fleet, 4 * n + 32).await;
+        let tag = minted[0][..16].to_string();
         let header = fleet
             .object(&format!("fleet/sessions/{tag}.json"))
             .await
             .expect("the header");
         let counter = |id: &String| counter_of(&header, id);
+        // The grants are pending: the first call of a cell fails (a call that
+        // succeeds anyway raced the proof and is left out). A: the second call
+        // wakes the cell at epoch 2 by the leave. The others stay lazy.
+        let mut a = Vec::new();
+        let mut lazy = Vec::new();
+        for id in &minted {
+            if a.len() == n && lazy.len() == 3 * n {
+                break;
+            }
+            if fleet.get_json(0, &format!("/bump?id={id}")).await.is_some() {
+                continue;
+            }
+            if a.len() < n {
+                wait_until("the cell to wake", Duration::from_secs(30), || async {
+                    fleet.get_json(0, &format!("/bump?id={id}")).await
+                })
+                .await;
+                a.push(id.clone());
+            } else {
+                lazy.push(id.clone());
+            }
+        }
+        assert_eq!((a.len(), lazy.len()), (n, 3 * n), "enough cells were pending");
+        let ids: Vec<String> = a.iter().chain(&lazy).cloned().collect();
         let (a, rest) = ids.split_at(n);
         let (b, rest) = rest.split_at(n);
         let (c, d) = rest.split_at(n);
-        // The grants are pending. A: the cell wakes at epoch 2 by the leave.
-        for id in a {
-            assert!(fleet.get_json(0, &format!("/bump?id={id}")).await.is_none());
-            wait_until("the cell to wake", Duration::from_secs(30), || async {
-                fleet.get_json(0, &format!("/bump?id={id}")).await
-            })
-            .await;
-        }
-        // The other groups stay lazy; ask for them once so that they are granted.
-        for id in b.iter().chain(c).chain(d) {
-            assert!(fleet.get_json(0, &format!("/bump?id={id}")).await.is_none());
-        }
         let everything: Vec<u64> = ids.iter().map(counter).collect();
         wait_until("the checkpoint", Duration::from_secs(60), || async {
             let chunk = fleet.object(&format!("fleet/sessions/{tag}/c/0")).await?;
@@ -1798,7 +1813,7 @@ async fn s15_mixed_modes_refuse_handed_off_cells_and_take_only_lazy_ones() {
                 vec![
                     ("CELLD_LAZY_BIRTH", "on"),
                     ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "500"),
-                    ("CELLD_LAZY_BIRTH_PROOF_WAIT_MS", "1"),
+                    ("CELLD_LAZY_BIRTH_PROOF_WAIT_MS", "0"),
                 ]
             } else {
                 with_mode(mode).to_vec()
