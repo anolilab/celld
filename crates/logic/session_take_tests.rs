@@ -221,3 +221,139 @@ fn a_birth_form_record_over_a_cell_with_ltx_is_refused_and_nothing_else_changes(
         "a granted cell"
     );
 }
+
+/// The seal's merge of marks into a left entry against the model's seal of a
+/// chunk, over every set of marks of a small pool and every starting entry.
+#[test]
+fn the_seal_of_left_marks_matches_the_model_over_the_whole_domain() {
+    use crate::lazy_birth::{Chunk, Entry, Gather, Left};
+    use crate::session::{apply_left_marks, LeftEntry, LeftMark};
+    let design = Design::rev4();
+    let pool = [
+        Entry::Leaving(0, 1, 1),
+        Entry::Leaving(0, 1, 2),
+        Entry::Leaving(0, 2, 3),
+        Entry::Left(0, 1),
+        Entry::Left(0, 3),
+    ];
+    let starts: [LeftCase; 4] = [
+        None,
+        Some((1, vec![1], None)),
+        Some((1, vec![1], Some(1))),
+        Some((2, vec![1, 2, 3, 4], None)),
+    ];
+    let mut cases = 0;
+    for start in &starts {
+        for subset in 0..(1_u32 << pool.len()) {
+            let entries: Vec<Entry> = (0..pool.len())
+                .filter(|i| subset >> i & 1 == 1)
+                .map(|i| pool[i])
+                .collect();
+            let mut chunk = Chunk::open();
+            if let Some((epoch, nonces, done)) = start {
+                chunk.left[0] = Some(Left {
+                    epoch: *epoch,
+                    nonces: nonces.clone(),
+                    done: *done,
+                });
+            }
+            let sealed = model::seal_chunk(
+                &design,
+                &chunk,
+                &Gather {
+                    entries: entries.iter().copied().collect(),
+                },
+            );
+            let marks: Vec<LeftMark> = entries
+                .iter()
+                .map(|entry| match *entry {
+                    Entry::Leaving(_, epoch, nonce) => LeftMark::Leaving {
+                        epoch: u64::from(epoch),
+                        nonce: name(nonce),
+                    },
+                    Entry::Left(_, nonce) => LeftMark::Left { nonce: name(nonce) },
+                    _ => unreachable!(),
+                })
+                .collect();
+            let have = start.as_ref().map(|(epoch, nonces, done)| LeftEntry {
+                epoch: u64::from(*epoch),
+                nonces: nonces.iter().copied().map(name).collect(),
+                done: done.map(name),
+            });
+            let got = apply_left_marks(have, &marks);
+            let expected = sealed.left[0].as_ref().map(|left| LeftEntry {
+                epoch: u64::from(left.epoch),
+                nonces: left.nonces.iter().copied().map(name).collect(),
+                done: left.done.map(name),
+            });
+            assert_eq!(got, expected, "start {start:?} marks {entries:?}");
+            cases += 1;
+        }
+    }
+    assert_eq!(cases, 4 * 32);
+}
+
+#[test]
+fn the_release_and_marker_rules_match_the_model() {
+    use crate::lazy_birth::Release;
+    use crate::session::{marker_allowed, release_allowed};
+    let design = Design::rev4();
+    for path in [
+        Release::LiveGc,
+        Release::BootGc,
+        Release::SweepGc,
+        Release::FollowerTruncate,
+    ] {
+        for in_chunk in [false, true] {
+            assert_eq!(
+                release_allowed(in_chunk),
+                model::release_ok(&design, path, in_chunk)
+            );
+        }
+    }
+    for granted in [false, true] {
+        for confirmed in [false, true] {
+            for carried in [false, true] {
+                assert_eq!(
+                    marker_allowed(granted, confirmed, carried),
+                    model::marker_allowed(&design, granted, confirmed, false, carried),
+                    "granted {granted} confirmed {confirmed} carried {carried}"
+                );
+            }
+        }
+    }
+}
+
+/// The guard on a birth-form record only ever makes a decision stricter: it keeps
+/// the decision or refuses a replacement, and never turns a refusal into a claim.
+#[test]
+fn the_birth_guard_only_refuses_what_the_rules_would_replace() {
+    use prod::{birth_guard, Take};
+    let takes = [
+        Take::Refuse("x"),
+        Take::Standard { epoch: 2 },
+        Take::FirstFromNothing { epoch: 2 },
+        Take::FirstNew { epoch: 2 },
+        Take::FirstOverRecord { epoch: 2 },
+        Take::Plain { epoch: 2 },
+        Take::Forward,
+        Take::ReplaceFirst { epoch: 2 },
+        Take::ValidTakeover { epoch: 2 },
+    ];
+    for take in takes {
+        for birth in [false, true] {
+            for ltx in [false, true] {
+                let got = birth_guard(take.clone(), birth, ltx);
+                let changed = got != take;
+                assert_eq!(
+                    changed,
+                    matches!(take, Take::FirstOverRecord { .. }) && birth && ltx,
+                    "{take:?} birth {birth} ltx {ltx}"
+                );
+                if changed {
+                    assert!(matches!(got, Take::Refuse(_)));
+                }
+            }
+        }
+    }
+}

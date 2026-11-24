@@ -17,6 +17,7 @@
 use crate::bucket::Bucket;
 use crate::session::Mode;
 use anyhow::Context;
+use celld_logic::session::{apply_left_marks, LeftMark};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -74,6 +75,22 @@ pub struct Left {
     pub nonces: Vec<String>,
     #[serde(default)]
     pub done: Option<String>,
+}
+
+fn to_entry(left: &Left) -> celld_logic::session::LeftEntry {
+    celld_logic::session::LeftEntry {
+        epoch: left.epoch,
+        nonces: left.nonces.clone(),
+        done: left.done.clone(),
+    }
+}
+
+fn from_entry(entry: celld_logic::session::LeftEntry) -> Left {
+    Left {
+        epoch: entry.epoch,
+        nonces: entry.nonces,
+        done: entry.done,
+    }
 }
 
 /// Add what the session knows of a leave to the left entry that a chunk holds. A
@@ -290,7 +307,7 @@ async fn seal_chunk(
     tag: &str,
     chunk: u64,
     gather: &BTreeSet<u64>,
-    lefts: &BTreeMap<u64, Left>,
+    lefts: &BTreeMap<u64, Vec<LeftMark>>,
 ) -> anyhow::Result<()> {
     for _ in 0..6 {
         match read_chunk(bucket, tag, chunk).await? {
@@ -302,9 +319,12 @@ async fn seal_chunk(
                     .granted
                     .extend(gather.range(chunk * CHUNK..(chunk + 1) * CHUNK));
                 // A left entry implies the granted bit.
-                for (counter, left) in lefts.range(chunk * CHUNK..(chunk + 1) * CHUNK) {
+                for (counter, marks) in lefts.range(chunk * CHUNK..(chunk + 1) * CHUNK) {
                     sealed.granted.insert(*counter);
-                    merge_left(&mut sealed.left, *counter, left);
+                    let have = sealed.left.get(counter).map(to_entry);
+                    if let Some(entry) = apply_left_marks(have, marks) {
+                        sealed.left.insert(*counter, from_entry(entry));
+                    }
                 }
                 sealed.rev += 1;
                 if swap_chunk(bucket, tag, chunk, &sealed, &token)
@@ -423,8 +443,8 @@ pub async fn seal_session(
     tag: &str,
     gather: &BTreeSet<u64>,
     marks: &BTreeSet<String>,
-    lefts: &BTreeMap<u64, Left>,
-    left_marks: &BTreeMap<String, Left>,
+    lefts: &BTreeMap<u64, Vec<LeftMark>>,
+    left_marks: &BTreeMap<String, Vec<LeftMark>>,
 ) -> anyhow::Result<()> {
     let mut closed: Option<Header> = None;
     for _ in 0..6 {
@@ -471,10 +491,13 @@ pub async fn seal_session(
     gather.extend(counters_of_marks(&header, tag, marks));
     // The left entries that the sealer found as marks, by counter.
     let mut lefts = lefts.clone();
-    for (scope, left) in left_marks {
+    for (scope, marks) in left_marks {
         let scopes = BTreeSet::from([scope.clone()]);
         for counter in counters_of_marks(&header, tag, &scopes) {
-            merge_left(&mut lefts, counter, left);
+            lefts
+                .entry(counter)
+                .or_default()
+                .extend(marks.iter().cloned());
         }
     }
     for chunk in 0..header.chunks {

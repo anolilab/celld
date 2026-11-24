@@ -1094,6 +1094,10 @@ impl BucketOwnership {
         // release starts.
         if let Some(session) = crate::session::current() {
             session.write_left_trace(&self.bucket, cell).await?;
+            anyhow::ensure!(
+                celld_logic::session::release_allowed(session.left_trace_in_chunk(cell)),
+                "the chunk does not hold the left entry of {cell} yet"
+            );
         }
         let Some((current, form)) = self.read_owner_form(cell).await? else {
             return Ok(CasOutcome::Rejected);

@@ -883,6 +883,23 @@ impl Session {
         }
     }
 
+    /// Whether the chunk in the bucket holds what the session knows of the leave
+    /// of `scope`: true for a cell that never announced one.
+    pub(crate) fn left_trace_in_chunk(&self, scope: &str) -> bool {
+        let Some(counter) = self.own_counter_of_scope(scope) else {
+            return true;
+        };
+        let memory = self.left_memory.lock().expect("left memory poisoned");
+        let Some(left) = memory.get(&counter) else {
+            return true;
+        };
+        self.left_written
+            .lock()
+            .expect("left written poisoned")
+            .get(&counter)
+            .is_some_and(|written| written.done == left.done && written.nonces == left.nonces)
+    }
+
     /// A mark that a fleet proof covers says this about the cell: the session
     /// holds it, and a checkpoint writes it into the chunk.
     pub(crate) fn note_mark(&self, counter: u64, kind: &MarkKind) {
@@ -952,12 +969,28 @@ impl Session {
         out
     }
 
-    /// The left entries of the session, for its seal.
-    pub(crate) fn left_entries(&self) -> BTreeMap<u64, store::Left> {
+    /// The leaves of the session as marks, for its seal.
+    pub(crate) fn left_entries(&self) -> BTreeMap<u64, Vec<celld_logic::session::LeftMark>> {
+        use celld_logic::session::LeftMark;
         self.left_memory
             .lock()
             .expect("left memory poisoned")
-            .clone()
+            .iter()
+            .map(|(counter, left)| {
+                let mut marks: Vec<LeftMark> = left
+                    .nonces
+                    .iter()
+                    .map(|nonce| LeftMark::Leaving {
+                        epoch: left.epoch,
+                        nonce: nonce.clone(),
+                    })
+                    .collect();
+                marks.extend(left.done.iter().map(|nonce| LeftMark::Left {
+                    nonce: nonce.clone(),
+                }));
+                (*counter, marks)
+            })
+            .collect()
     }
 
     pub(crate) fn has_left(&self, counter: u64) -> bool {
@@ -1050,8 +1083,12 @@ impl Session {
                 .extend(granted.range(chunk * CHUNK..(chunk + 1) * CHUNK));
             // The left entries that the marks made: the chunk holds them, so the
             // bundles and the followers' batches that carry the marks may go.
-            let lefts = self.left_entries();
-            for (counter, left) in lefts.range(chunk * CHUNK..(chunk + 1) * CHUNK) {
+            let memory = self
+                .left_memory
+                .lock()
+                .expect("left memory poisoned")
+                .clone();
+            for (counter, left) in memory.range(chunk * CHUNK..(chunk + 1) * CHUNK) {
                 next.granted.insert(*counter);
                 store::merge_left(&mut next.left, *counter, left);
             }
@@ -1185,10 +1222,21 @@ pub async fn prepare_reload(
         }
     }
     // The capture fails for a cell of this session that is still lazy.
-    anyhow::ensure!(
-        cells.iter().all(|cell| !session.is_lazy_scope(&cell.id)),
-        "a resident cell of this session has no record and no confirmed leave"
-    );
+    // A cell that this process granted and has not left with a confirmed leave
+    // keeps the marker from being written.
+    for cell in cells {
+        let granted_here = session
+            .own_counter_of_scope(&cell.id)
+            .is_some_and(|counter| session.is_granted(counter));
+        anyhow::ensure!(
+            celld_logic::session::marker_allowed(
+                granted_here,
+                !session.is_lazy_scope(&cell.id),
+                true
+            ),
+            "a resident cell of this session has no record and no confirmed leave"
+        );
+    }
     let all = session.tags().all();
     let mut tags: BTreeMap<String, String> = cells
         .iter()

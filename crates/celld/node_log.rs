@@ -5032,7 +5032,8 @@ impl NodeLogManager {
             // The cells whose `Grant` the followers hold.
             let mut granted_marks: BTreeSet<String> = BTreeSet::new();
             // The leaves that the followers and the bundles announced or confirmed.
-            let mut left_marks: BTreeMap<String, crate::session_store::Left> = BTreeMap::new();
+            let mut left_marks: BTreeMap<String, Vec<celld_logic::session::LeftMark>> =
+                BTreeMap::new();
             // "A blink is not death" applies to loss declaration too: a
             // member whose lease merely lapsed (a restart, a fleet-wide
             // power cycle) is NOT conclusively gone — its fsync'd fragments
@@ -7270,53 +7271,26 @@ mod mark_wire_tests {
     }
 }
 
-/// Sort a mark that a recoverer found into the grants and the left entries it
-/// seals. A leave is announced before it is confirmed, so a confirmation counts
-/// only for a nonce that was announced, in the seal's merge.
+/// Sort a mark that a recoverer found into the grants and the leave marks it
+/// seals. The seal applies the marks of a cell together, announcements first.
 fn note_gathered_mark(
     granted: &mut BTreeSet<String>,
-    lefts: &mut BTreeMap<String, crate::session_store::Left>,
+    lefts: &mut BTreeMap<String, Vec<celld_logic::session::LeftMark>>,
     cell: String,
     epoch: u64,
     bytes: &[u8],
 ) {
-    use crate::session::MarkKind;
-    match MarkKind::decode(epoch, bytes) {
-        Some(MarkKind::Grant) | None => {
-            granted.insert(cell);
-        }
-        Some(MarkKind::Leaving { epoch, nonce }) => {
-            let entry = lefts
-                .entry(cell.clone())
-                .or_insert_with(|| crate::session_store::Left {
-                    epoch,
-                    nonces: Vec::new(),
-                    done: None,
-                });
-            if !entry.nonces.contains(&nonce) && entry.nonces.len() < 4 {
-                entry.nonces.push(nonce);
-            }
-            entry.epoch = epoch;
-            granted.insert(cell);
-        }
-        Some(MarkKind::Left { nonce }) => {
-            if let Some(entry) = lefts.get_mut(&cell) {
-                if entry.nonces.contains(&nonce) {
-                    entry.done = Some(nonce);
-                }
-            } else {
-                // Its announcement is in another tail: keep the confirmation
-                // until the nonces are united.
-                lefts.insert(
-                    cell.clone(),
-                    crate::session_store::Left {
-                        epoch: 0,
-                        nonces: vec![nonce.clone()],
-                        done: Some(nonce),
-                    },
-                );
-            }
-            granted.insert(cell);
-        }
+    use celld_logic::session::LeftMark;
+    match crate::session::MarkKind::decode(epoch, bytes) {
+        Some(crate::session::MarkKind::Grant) | None => {}
+        Some(crate::session::MarkKind::Leaving { epoch, nonce }) => lefts
+            .entry(cell.clone())
+            .or_default()
+            .push(LeftMark::Leaving { epoch, nonce }),
+        Some(crate::session::MarkKind::Left { nonce }) => lefts
+            .entry(cell.clone())
+            .or_default()
+            .push(LeftMark::Left { nonce }),
     }
+    granted.insert(cell);
 }

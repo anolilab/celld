@@ -115,3 +115,68 @@ pub struct LeftEntry {
     pub nonces: Vec<String>,
     pub done: Option<String>,
 }
+
+/// A mark about a leave that a sealer found in the followers' tails, in the
+/// retained bundles or in the session's own memory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeftMark {
+    Leaving { epoch: u64, nonce: String },
+    Left { nonce: String },
+}
+
+/// The left entry of a chunk after a seal has added the marks it found. Every
+/// `Leaving` is applied before any `Left`, in the order of its epoch and nonce, so
+/// two sealers with the same marks build the same entry whatever order they found
+/// them in: an announcement creates the entry or adds a nonce (at most four) and
+/// raises the epoch, a confirmation sets `done` on an entry that exists.
+pub fn apply_left_marks(have: Option<LeftEntry>, marks: &[LeftMark]) -> Option<LeftEntry> {
+    let mut entry = have;
+    let mut leaving: Vec<(u64, &String)> = marks
+        .iter()
+        .filter_map(|mark| match mark {
+            LeftMark::Leaving { epoch, nonce } => Some((*epoch, nonce)),
+            LeftMark::Left { .. } => None,
+        })
+        .collect();
+    leaving.sort();
+    for (epoch, nonce) in leaving {
+        let left = entry.get_or_insert_with(|| LeftEntry {
+            epoch,
+            nonces: Vec::new(),
+            done: None,
+        });
+        if epoch > left.epoch {
+            left.epoch = epoch;
+        }
+        if !left.nonces.contains(nonce) && left.nonces.len() < 4 {
+            left.nonces.push(nonce.clone());
+        }
+    }
+    let mut confirmed: Vec<&String> = marks
+        .iter()
+        .filter_map(|mark| match mark {
+            LeftMark::Left { nonce } => Some(nonce),
+            LeftMark::Leaving { .. } => None,
+        })
+        .collect();
+    confirmed.sort();
+    for nonce in confirmed {
+        if let Some(left) = entry.as_mut() {
+            left.done = Some(nonce.clone());
+        }
+    }
+    entry
+}
+
+/// Whether a bundle, a batch of a follower or a release may go ahead: the marks it
+/// holds are in a chunk in the bucket.
+pub fn release_allowed(marks_in_chunk: bool) -> bool {
+    marks_in_chunk
+}
+
+/// Whether the reload marker of a preserved restart may name a cell: a tag that
+/// the successor carries, and, for a cell that this process granted, a confirmed
+/// leave.
+pub fn marker_allowed(granted_here: bool, confirmed_leave: bool, tag_carried: bool) -> bool {
+    tag_carried && (!granted_here || confirmed_leave)
+}
