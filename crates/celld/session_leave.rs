@@ -39,13 +39,13 @@ pub(crate) struct Edits {
 const ANNOUNCEMENTS: usize = 4;
 
 /// How long a leave waits for the fleet proof of one of its marks
-/// (`CELLD_LAZY_BIRTH_LEAVE_WAIT_MS`, 10 s by default).
+/// (`CELLD_LAZY_BIRTH_LEAVE_WAIT_MS`, 2 s by default).
 fn leave_proof_wait() -> std::time::Duration {
     std::time::Duration::from_millis(
         std::env::var("CELLD_LAZY_BIRTH_LEAVE_WAIT_MS")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(10_000),
+            .unwrap_or(2_000),
     )
 }
 
@@ -157,9 +157,11 @@ impl Session {
     ) -> anyhow::Result<()> {
         if via_marks {
             let proof = crate::session::enqueue_mark(scope, counter, kind.clone());
-            match crate::asyncrt::timeout(leave_proof_wait(), proof).await {
-                Ok(Ok(true)) => return Ok(()),
-                _ => anyhow::bail!("no fleet proof of the leave of {scope}: it is tried again"),
+            // A proof that does not come (the ensemble lost its followers, or its
+            // shipper stopped) is no reason to wait: the chunk is the proof when
+            // there is no ensemble, and it is stronger.
+            if let Ok(Ok(true)) = crate::asyncrt::timeout(leave_proof_wait(), proof).await {
+                return Ok(());
             }
         }
         let chunk = counter / CHUNK;

@@ -40,6 +40,7 @@ fn region() -> String {
 pub struct Node {
     child: Option<Child>,
     pub public: String,
+    internal: String,
     home: PathBuf,
 }
 
@@ -82,6 +83,7 @@ impl Node {
         Node {
             child: Some(child),
             public: format!("http://127.0.0.1:{public}"),
+            internal: format!("http://127.0.0.1:{internal}"),
             home,
         }
     }
@@ -117,6 +119,24 @@ impl Node {
 }
 
 impl Node {
+    /// A preserved restart: ask the node to stop and keep its cells for the
+    /// next process of this directory, then wait for it to exit.
+    pub async fn preserve(&mut self, client: &reqwest::Client) {
+        let response = client
+            .post(format!("{}/shutdown?handoff=preserve", self.internal))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .expect("ask for a preserved stop");
+        assert!(response.status().is_success(), "{}", response.status());
+        let mut child = self.child.take().expect("a running node");
+        wait_until("the node to exit", Duration::from_secs(90), || {
+            let exited = matches!(child.try_wait(), Ok(Some(_)));
+            async move { exited.then_some(()) }
+        })
+        .await;
+    }
+
     /// Stop the node as an orchestrator does: TERM, then wait for its drain.
     pub fn stop(&mut self) {
         drop_child(self.child.take());
@@ -826,7 +846,7 @@ fn agents() -> usize {
     std::env::var("LAZY_FLEET_AGENTS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(200)
+        .unwrap_or(600)
 }
 
 /// The sum of the requests of each class in a tally, and the requests of the
@@ -894,7 +914,7 @@ async fn requests_per_minted_agent(mode: &'static str) -> (f64, f64, u64, u64) {
         // The idle window: the same time without agents.
         let idle_from = proxy.take();
         let idle_started = Instant::now();
-        tokio::time::sleep(Duration::from_secs(20)).await;
+        tokio::time::sleep(Duration::from_secs(40)).await;
         let idle = support::diff(&proxy.take(), &idle_from).expect("diff");
         let idle_secs = idle_started.elapsed().as_secs_f64();
         let before = proxy.take();
@@ -1246,4 +1266,628 @@ async fn an_alarm_on_a_lazy_cell_fires() {
         fleet
     })
     .await;
+}
+
+/// How many cells a drill covers in each window (`LAZY_FLEET_CELLS`).
+fn cells() -> usize {
+    std::env::var("LAZY_FLEET_CELLS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(12)
+}
+
+/// Ids from `/mint`, which makes three at a time and calls none of them.
+async fn mint(fleet: &Fleet, count: usize) -> Vec<String> {
+    let mut ids = Vec::new();
+    while ids.len() < count {
+        let minted = fleet.get_json(0, "/mint").await.expect("mint");
+        ids.extend(
+            minted["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_str().unwrap().to_string()),
+        );
+    }
+    ids.truncate(count);
+    ids
+}
+
+/// Change the chunk of a session in the bucket by a compare-and-swap, the way
+/// a fault would.
+async fn edit_chunk(fleet: &Fleet, tag: &str, edit: impl Fn(&mut Value)) {
+    let key = format!("fleet/sessions/{tag}/c/0");
+    for _ in 0..20 {
+        let (bytes, token) = fleet
+            .bucket
+            .get(&key)
+            .await
+            .expect("read the chunk")
+            .expect("a chunk");
+        let mut chunk: Value = serde_json::from_slice(&bytes).expect("a chunk");
+        edit(&mut chunk);
+        chunk["rev"] = (chunk["rev"].as_u64().unwrap() + 1).into();
+        let body = serde_json::to_vec(&chunk).unwrap();
+        if fleet
+            .bucket
+            .put_cas(&key, body, Some(&token))
+            .await
+            .expect("write the chunk")
+            .is_some()
+        {
+            return;
+        }
+    }
+    panic!("the chunk kept changing under the edit");
+}
+
+async fn delete_records(fleet: &Fleet, ids: &[String]) {
+    let keys: Vec<String> = ids
+        .iter()
+        .map(|id| format!("cells/Cell:{id}/own.json"))
+        .collect();
+    let deleted = fleet.bucket.delete_many(&keys).await;
+    assert_eq!(deleted.len(), keys.len());
+}
+
+/// The answers of the peers (nodes 1 and 2) to a call of the cell: how many
+/// answered, and their counters.
+async fn peer_answers(fleet: &Fleet, id: &str) -> Vec<u64> {
+    let mut answers = Vec::new();
+    for node in [1, 2] {
+        if let Some(out) = fleet.get_json(node, &format!("/bump?id={id}")).await {
+            answers.push(out["n"].as_u64().unwrap());
+        }
+    }
+    answers
+}
+
+const PENDING: &[(&str, &str)] = &[
+    ("CELLD_LAZY_BIRTH", "on"),
+    ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "500"),
+    ("CELLD_LAZY_BIRTH_PROOF_WAIT_MS", "1"),
+];
+
+/// S7. Delete `own.json` in each window of the record-loss table: after a
+/// confirmed leave, over an announced leave whose record was never written, over a
+/// cell that a taker marked, and under a leave that lands late. Every cell is
+/// refused or has one acting writer; none has two.
+#[tokio::test]
+async fn s7_record_loss_in_each_window_refuses_or_keeps_one_writer() {
+    let Some(fleet) = Fleet::start("do-ids", 3, PENDING).await else {
+        return;
+    };
+    with_fleet(fleet, |mut fleet| async move {
+        wait_for_ensemble(&fleet).await;
+        let n = cells();
+        let ids = mint(&fleet, 4 * n).await;
+        let tag = ids[0][..16].to_string();
+        let header = fleet
+            .object(&format!("fleet/sessions/{tag}.json"))
+            .await
+            .expect("the header");
+        let counter = |id: &String| counter_of(&header, id);
+        let (a, rest) = ids.split_at(n);
+        let (b, rest) = rest.split_at(n);
+        let (c, d) = rest.split_at(n);
+        // The grants are pending. A: the cell wakes at epoch 2 by the leave.
+        for id in a {
+            assert!(fleet.get_json(0, &format!("/bump?id={id}")).await.is_none());
+            wait_until("the cell to wake", Duration::from_secs(30), || async {
+                fleet.get_json(0, &format!("/bump?id={id}")).await
+            })
+            .await;
+        }
+        // The other groups stay lazy; ask for them once so that they are granted.
+        for id in b.iter().chain(c).chain(d) {
+            assert!(fleet.get_json(0, &format!("/bump?id={id}")).await.is_none());
+        }
+        let everything: Vec<u64> = ids.iter().map(counter).collect();
+        wait_until("the checkpoint", Duration::from_secs(60), || async {
+            let chunk = fleet.object(&format!("fleet/sessions/{tag}/c/0")).await?;
+            let granted: Vec<u64> = chunk["granted"]
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_u64)
+                .collect();
+            let left_done = a.iter().all(|id| {
+                chunk["left"][counter(id).to_string()]["done"].is_string()
+            });
+            (everything.iter().all(|c| granted.contains(c)) && left_done).then_some(())
+        })
+        .await;
+        // C and D: a leave was announced and its record never written.
+        let planted: Vec<(u64, String)> = c
+            .iter()
+            .chain(d)
+            .enumerate()
+            .map(|(i, id)| (counter(id), format!("{:016x}", i + 1)))
+            .collect();
+        edit_chunk(&fleet, &tag, |chunk| {
+            for (counter, nonce) in &planted {
+                chunk["left"][counter.to_string()] =
+                    serde_json::json!({"epoch": 1, "nonces": [nonce], "done": null});
+            }
+        })
+        .await;
+        // A: the record is lost after the leave was confirmed.
+        delete_records(&fleet, a).await;
+        fleet.nodes[0].kill();
+        // The seal and the first takers: B has no left entry (K5 from nothing at
+        // epoch 2), C and D an open one (K5 at epoch 2).
+        // A call goes through the peer that acts, or is forwarded to it, so a
+        // writer answers with the next counter every time.
+        let mut last = std::collections::BTreeMap::new();
+        for id in b.iter().chain(c).chain(d) {
+            let answers = wait_until("a peer to take the cell", Duration::from_secs(180), || async {
+                let answers = peer_answers(&fleet, id).await;
+                (!answers.is_empty()).then_some(answers)
+            })
+            .await;
+            assert_eq!(answers[0], 1, "no write was acknowledged before, and none is lost");
+            last.insert(id.clone(), *answers.last().unwrap());
+        }
+        let mut refused = 0;
+        let mut one_writer = 0;
+        // A: confirmed leave, no record: refused everywhere.
+        for id in a {
+            assert!(peer_answers(&fleet, id).await.is_empty(), "{id}");
+            refused += 1;
+        }
+        // B and C: the taker's record is lost.
+        delete_records(&fleet, b).await;
+        delete_records(&fleet, c).await;
+        // D: the taker's record is lost and the stalled leave lands over it.
+        delete_records(&fleet, d).await;
+        for (id, (_, nonce)) in d.iter().zip(&planted[n..]) {
+            let body = serde_json::json!({
+                "node": "lazy-0", "epoch": 1, "by": tag, "leave": nonce
+            });
+            let key = format!("cells/Cell:{id}/own.json");
+            let written = fleet
+                .bucket
+                .put_cas(&key, serde_json::to_vec(&body).unwrap(), None)
+                .await
+                .expect("the late leave");
+            assert!(written.is_some());
+        }
+        for id in b.iter().chain(c).chain(d) {
+            let answers = peer_answers(&fleet, id).await;
+            if answers.is_empty() {
+                refused += 1;
+                continue;
+            }
+            // One acting writer: its counter goes on from where it was. A second
+            // writer would start again from its own state.
+            for (next, answer) in (last[id] + 1..).zip(&answers) {
+                assert_eq!(*answer, next, "two acting writers for {id}: {answers:?}");
+            }
+            one_writer += 1;
+        }
+        // A fresh reader judges each record by itself: a new process of node 0
+        // refuses every cell whose taker's record is lost, and writes nothing.
+        fleet.respawn(0, PENDING).await;
+        for id in b.iter().chain(c).chain(d) {
+            assert!(
+                fleet.get_json(0, &format!("/bump?id={id}")).await.is_none(),
+                "a fresh reader must refuse {id}"
+            );
+        }
+        let keys = fleet.keys("cells/").await;
+        for id in b.iter().chain(c) {
+            assert!(
+                !keys.contains(&format!("cells/Cell:{id}/own.json")),
+                "the refusal wrote no record"
+            );
+        }
+        for id in d {
+            let record = fleet.object(&format!("cells/Cell:{id}/own.json")).await.unwrap();
+            assert!(record["leave"].is_string(), "still the late leave: {record}");
+        }
+        eprintln!("S7 cells per window {n}: refused {refused}, one acting writer {one_writer}, two writers 0");
+        fleet
+    })
+    .await;
+}
+
+/// S12. A node with live lazy cells loses its followers. Each cell's next write
+/// is acknowledged on a bucket proof, which leaves the cell first: one
+/// create-only write of its record, and the left entries of all the cells in a few
+/// chunk writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s12_a_node_that_loses_its_followers_leaves_each_lazy_cell_once() {
+    let count: usize = std::env::var("LAZY_FLEET_S12_CELLS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100);
+    let Some(fleet) = Fleet::start_counted("do-ids", 3, ON).await else {
+        return;
+    };
+    with_fleet(fleet, |mut fleet| async move {
+        wait_for_ensemble(&fleet).await;
+        let ids = spawn_agents(&fleet, count).await;
+        let tag = ids[0][..16].to_string();
+        // Every grant is in a chunk before the followers go.
+        wait_until("the checkpoint", Duration::from_secs(60), || async {
+            let chunk = fleet.object(&format!("fleet/sessions/{tag}/c/0")).await?;
+            (chunk["granted"].as_array()?.len() >= count).then_some(())
+        })
+        .await;
+        let proxy = fleet.proxy.as_ref().expect("a counted fleet");
+        let before = proxy.take();
+        fleet.nodes[1].kill();
+        fleet.nodes[2].kill();
+        let started = Instant::now();
+        let calls = ids.iter().map(|id| {
+            let url = format!("{}/bump?id={id}", fleet.nodes[0].public);
+            let client = fleet.client.clone();
+            async move {
+                loop {
+                    if let Ok(response) = client.get(&url).send().await {
+                        if response.status().is_success() {
+                            return started.elapsed();
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        });
+        let Ok(times) =
+            tokio::time::timeout(Duration::from_secs(60), futures_util::future::join_all(calls)).await
+        else {
+            let log = fleet.nodes[0].log();
+            let tail: Vec<&str> = log.lines().rev().take(40).collect();
+            panic!("a cell did not acknowledge; the node log ends:\n{}", tail.join("\n"));
+        };
+        let slowest = times.iter().max().copied().unwrap();
+        let load = support::diff(&proxy.take(), &before).expect("diff");
+        let records = requests_on(&load, "PUT", "/own.json");
+        let chunks = requests_on(&load, "PUT", "fleet/sessions/*/c/#");
+        eprintln!(
+            "S12 cells {count}: slowest acknowledgement {:.1}s after the followers were killed; own.json PUTs {records}; chunk PUTs {chunks}",
+            slowest.as_secs_f64()
+        );
+        assert!(
+            slowest < Duration::from_secs(5),
+            "every cell acknowledges within 5 s"
+        );
+        assert_eq!(records as usize, count, "one create-only write for each cell");
+        assert!(chunks <= 20, "{chunks} chunk writes");
+        // The bucket-proof acknowledgement left each cell: a leave-form record and
+        // a confirmed left entry.
+        let sample = &ids[0];
+        let record = fleet
+            .object(&format!("cells/Cell:{sample}/own.json"))
+            .await
+            .expect("a record");
+        assert!(record["leave"].is_string(), "{record}");
+        let chunk = fleet.object(&format!("fleet/sessions/{tag}/c/0")).await.unwrap();
+        let left = chunk["left"].as_object().map_or(0, |left| left.len());
+        assert_eq!(left, count, "a left entry for each cell");
+        fleet
+    })
+    .await;
+}
+
+fn with_mode(mode: &'static str) -> [(&'static str, &'static str); 2] {
+    [
+        ("CELLD_LAZY_BIRTH", mode),
+        ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "500"),
+    ]
+}
+
+/// S14. Roll the flag back from `on` to `read` to `shadow`, restarting the nodes
+/// one by one while lazy cells exist. Every lazy cell is still served, whatever
+/// the flag of the node that asks, and a new session writes the record again.
+#[tokio::test]
+async fn s14_a_rollback_from_on_to_read_to_shadow_keeps_every_lazy_cell() {
+    let on = with_mode("on");
+    let Some(mut fleet) = Fleet::start("do-ids", 3, &on).await else {
+        return;
+    };
+    let count = cells();
+    let body = async {
+        wait_for_ensemble(&fleet).await;
+        let spawned = spawn_agents(&fleet, count).await;
+        let tag = spawned[0][..16].to_string();
+        assert!(
+            fleet
+                .keys("cells/")
+                .await
+                .iter()
+                .all(|key| !key.ends_with("/own.json")),
+            "the cells are lazy"
+        );
+        // The followers go down in the flag first: node 1 to `read`, node 2 to
+        // `shadow`. The lazy cells are still served by their session on node 0
+        // (a read of the state writes nothing and moves no counter), whatever
+        // node asks.
+        for (index, mode) in [(1_usize, "read"), (2, "shadow")] {
+            fleet.respawn(index, &with_mode(mode)).await;
+            wait_for_ensemble(&fleet).await;
+            for node in 0..3 {
+                for id in &spawned {
+                    let state = wait_until(
+                        "the cell to be served",
+                        Duration::from_secs(120),
+                        || async { fleet.get_json(node, &format!("/state?id={id}")).await },
+                    )
+                    .await;
+                    assert_eq!(state["n"], 1, "served by its session through node {node}");
+                }
+            }
+        }
+        assert!(
+            fleet
+                .keys("cells/")
+                .await
+                .iter()
+                .all(|key| !key.ends_with("/own.json")),
+            "no cell left the lazy state"
+        );
+        // The minting node goes down and comes back in `read`. The `shadow` node is
+        // asked first: the header of the dead session says `on`, so it takes each
+        // lazy cell by a first-form claim and restores the acknowledged write.
+        fleet.respawn(0, &with_mode("read")).await;
+        let mut expected = vec![1_u64; count];
+        for (slot, id) in spawned.iter().enumerate() {
+            let out = wait_until(
+                "the shadow node to take the cell",
+                Duration::from_secs(180),
+                || async { fleet.get_json(2, &format!("/bump?id={id}")).await },
+            )
+            .await;
+            expected[slot] += 1;
+            assert_eq!(out["n"].as_u64().unwrap(), expected[slot], "a lost write");
+            let record = fleet
+                .object(&format!("cells/Cell:{id}/own.json"))
+                .await
+                .expect("the taker's record");
+            assert!(record["nonce"].is_string(), "a first-form claim: {record}");
+        }
+        let chunk = fleet
+            .object(&format!("fleet/sessions/{tag}/c/0"))
+            .await
+            .unwrap();
+        assert_eq!(
+            chunk["taken"].as_object().map_or(0, |t| t.len()),
+            count,
+            "{chunk}"
+        );
+        for node in 0..3 {
+            for (slot, id) in spawned.iter().enumerate() {
+                let out = wait_until(
+                    "the cell to be served",
+                    Duration::from_secs(120),
+                    || async { fleet.get_json(node, &format!("/bump?id={id}")).await },
+                )
+                .await;
+                expected[slot] += 1;
+                assert_eq!(out["n"].as_u64().unwrap(), expected[slot], "node {node}");
+            }
+        }
+        // A new session of the flag in force writes its record again: node 0 now
+        // runs `read`, node 2 `shadow`.
+        let fresh_read = fleet.get_json(0, "/spawn?n=1").await.expect("spawn");
+        let id = fresh_read["ids"][0].as_str().unwrap();
+        let record = fleet
+            .object(&format!("cells/Cell:{id}/own.json"))
+            .await
+            .expect("a read session writes the record");
+        assert_eq!(record["birth"], true, "{record}");
+        let fresh_shadow = fleet.get_json(2, "/spawn?n=1").await.expect("spawn");
+        let id = fresh_shadow["ids"][0].as_str().unwrap();
+        let record = fleet
+            .object(&format!("cells/Cell:{id}/own.json"))
+            .await
+            .expect("a shadow session writes the record");
+        assert!(record["birth"].is_null(), "{record}");
+    };
+    let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+    fleet.nodes.clear();
+    fleet.clean().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// S15. Sessions in `shadow`, then `read`, then `on` hand their cells to peers in
+/// a drain. Delete `own.json` of every handed-off cell: each is refused, and no
+/// granted id of a `shadow` or `read` session is taken by a first-form claim over
+/// nothing, while a lazy cell of the `on` session still is.
+#[tokio::test]
+async fn s15_mixed_modes_refuse_handed_off_cells_and_take_only_lazy_ones() {
+    let shadow = with_mode("shadow");
+    let peers = with_mode("on");
+    let Some(mut fleet) = Fleet::start_each("do-ids", &[&shadow, &peers, &peers]).await else {
+        return;
+    };
+    let count = cells();
+    let body = async {
+        wait_for_ensemble(&fleet).await;
+        let mut handed: Vec<(&str, String, Vec<String>)> = Vec::new();
+        let mut lazy: Vec<String> = Vec::new();
+        for mode in ["shadow", "read", "on"] {
+            let env: Vec<(&str, &str)> = if mode == "on" {
+                vec![
+                    ("CELLD_LAZY_BIRTH", "on"),
+                    ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "500"),
+                    ("CELLD_LAZY_BIRTH_PROOF_WAIT_MS", "1"),
+                ]
+            } else {
+                with_mode(mode).to_vec()
+            };
+            if mode != "shadow" {
+                fleet.respawn(0, &env).await;
+                wait_for_ensemble(&fleet).await;
+            }
+            let ids = if mode == "on" {
+                // The grants are pending; the second request wakes each cell by the
+                // leave, so the cells that the drain hands on are not lazy.
+                let ids = mint(&fleet, count + count).await;
+                for id in &ids[..count] {
+                    assert!(fleet.get_json(0, &format!("/bump?id={id}")).await.is_none());
+                    wait_until("the cell to wake", Duration::from_secs(30), || async {
+                        fleet.get_json(0, &format!("/bump?id={id}")).await
+                    })
+                    .await;
+                }
+                // The rest stay lazy; ask once so that they are granted.
+                for id in &ids[count..] {
+                    assert!(fleet.get_json(0, &format!("/bump?id={id}")).await.is_none());
+                }
+                lazy = ids[count..].to_vec();
+                ids[..count].to_vec()
+            } else {
+                spawn_agents(&fleet, count).await
+            };
+            let tag = ids[0][..16].to_string();
+            let header = wait_until("the header", Duration::from_secs(30), || async {
+                fleet.object(&format!("fleet/sessions/{tag}.json")).await
+            })
+            .await;
+            let _ = header;
+            fleet.nodes[0].stop();
+            // The drain handed every cell to a peer: each has a record again.
+            wait_until("the handoff", Duration::from_secs(120), || async {
+                for id in &ids {
+                    let record = fleet.object(&format!("cells/Cell:{id}/own.json")).await?;
+                    // Adopted by a peer: its record names a later session.
+                    (record["by"] != tag.as_str() && record["epoch"].as_u64()? >= 2)
+                        .then_some(())?;
+                }
+                Some(())
+            })
+            .await;
+            handed.push((mode, tag, ids));
+        }
+        for (mode, _, ids) in &handed {
+            delete_records(&fleet, ids).await;
+            for id in ids {
+                assert!(
+                    peer_answers(&fleet, id).await.is_empty(),
+                    "a handed-off cell of a {mode} session must be refused"
+                );
+            }
+        }
+        // No granted id of `shadow` or `read` was taken over nothing.
+        for (mode, tag, ids) in &handed {
+            let header = fleet
+                .object(&format!("fleet/sessions/{tag}.json"))
+                .await
+                .unwrap();
+            let chunk = fleet
+                .object(&format!("fleet/sessions/{tag}/c/0"))
+                .await
+                .unwrap();
+            let taken = chunk["taken"].as_object().cloned().unwrap_or_default();
+            for id in ids {
+                let counter = counter_of(&header, id).to_string();
+                assert!(
+                    !taken.contains_key(&counter),
+                    "{mode}: a takeover of a granted id"
+                );
+            }
+        }
+        // A lazy cell of the `on` session is still taken.
+        for id in &lazy {
+            let answers = wait_until(
+                "a peer to take the lazy cell",
+                Duration::from_secs(120),
+                || async {
+                    let answers = peer_answers(&fleet, id).await;
+                    (!answers.is_empty()).then_some(answers)
+                },
+            )
+            .await;
+            assert_eq!(answers[0], 1);
+        }
+        let (_, tag, _) = handed.last().unwrap();
+        let header = fleet
+            .object(&format!("fleet/sessions/{tag}.json"))
+            .await
+            .unwrap();
+        let chunk = fleet
+            .object(&format!("fleet/sessions/{tag}/c/0"))
+            .await
+            .unwrap();
+        for id in &lazy {
+            let counter = counter_of(&header, id).to_string();
+            assert!(chunk["taken"][&counter].is_string(), "{chunk}");
+        }
+    };
+    let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+    fleet.nodes.clear();
+    fleet.clean().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// B5. A preserved restart with a resident lazy cell: before the log is sealed
+/// the cell leaves at epoch 1 (a leave-form record that names the first session
+/// and a confirmed left entry), the successor resumes it without a claim and
+/// answers with the acknowledged write, and a peer finds the record.
+#[tokio::test]
+async fn a_preserved_restart_leaves_each_resident_lazy_cell_first() {
+    let Some(mut fleet) = Fleet::start("do-ids", 3, ON).await else {
+        return;
+    };
+    let body = async {
+        wait_for_ensemble(&fleet).await;
+        let spawned = fleet.get_json(0, "/spawn?n=2").await.expect("spawn");
+        let ids: Vec<String> = spawned["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap().to_string())
+            .collect();
+        let tag = ids[0][..16].to_string();
+        let header = fleet
+            .object(&format!("fleet/sessions/{tag}.json"))
+            .await
+            .unwrap();
+        assert!(fleet
+            .object(&format!("cells/Cell:{}/own.json", ids[0]))
+            .await
+            .is_none());
+        let client = fleet.client.clone();
+        fleet.nodes[0].preserve(&client).await;
+        for id in &ids {
+            let record = fleet
+                .object(&format!("cells/Cell:{id}/own.json"))
+                .await
+                .expect("the leave wrote a record before the restart");
+            assert_eq!(record["epoch"], 1, "{record}");
+            assert_eq!(record["by"], tag, "{record}");
+            assert!(record["leave"].is_string(), "{record}");
+            let chunk = fleet
+                .object(&format!("fleet/sessions/{tag}/c/0"))
+                .await
+                .unwrap();
+            let left = &chunk["left"][counter_of(&header, id).to_string()];
+            assert_eq!(left["done"], record["leave"], "{chunk}");
+        }
+        fleet.respawn(0, ON).await;
+        for id in &ids {
+            let out = wait_until(
+                "the successor to answer",
+                Duration::from_secs(120),
+                || async { fleet.get_json(0, &format!("/bump?id={id}")).await },
+            )
+            .await;
+            assert_eq!(out["n"], 2, "the acknowledged write survived");
+            let record = fleet
+                .object(&format!("cells/Cell:{id}/own.json"))
+                .await
+                .unwrap();
+            assert_eq!(record["epoch"], 1, "resumed without a claim: {record}");
+        }
+    };
+    let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+    fleet.nodes.clear();
+    fleet.clean().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
 }
