@@ -327,6 +327,9 @@ pub struct Registry {
     pub(crate) waiters: AtomicUsize,
     pub(crate) role: Role,
     pub(crate) peer: OnceLock<PeerCall>,
+    /// The fleet bucket with its paginated delimiter listing, which the seed lists
+    /// cells with: one request per thousand cells. Without it the seed lists objects.
+    pub(crate) lister: OnceLock<crate::bucket::Bucket>,
     pub(crate) peer_addr: Mutex<HashMap<String, (u64, String)>>,
     /// Live nodes and their addresses, for the holder's root push.
     pub(crate) fleet: Mutex<Vec<(String, String)>>,
@@ -407,6 +410,7 @@ impl Registry {
             waiters: AtomicUsize::new(0),
             role: Role::default(),
             peer: OnceLock::new(),
+            lister: OnceLock::new(),
             peer_addr: Mutex::new(HashMap::new()),
             fleet: Mutex::new(Vec::new()),
             last_pass_request_ms: AtomicU64::new(0),
@@ -447,6 +451,14 @@ impl Registry {
             (holder.node.clone(), holder.session.clone()),
             crate::asyncrt::mono_ms(),
         );
+    }
+
+    /// The bucket handle the seed lists cells through, when it scopes the same
+    /// prefix as the registry's store.
+    pub(crate) fn set_lister(&self, bucket: crate::bucket::Bucket) {
+        if bucket.prefix == self.prefix {
+            let _ = self.lister.set(bucket);
+        }
     }
 
     /// Give the registry what it needs to ask the holder for a pass.

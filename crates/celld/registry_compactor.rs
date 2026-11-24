@@ -1799,7 +1799,8 @@ impl Registry {
                 tracing::info!(
                     event = "registry_seed_listed",
                     gate = root.gate,
-                    cells = seed.cells
+                    cells = seed.cells,
+                    delimiter_listing = self.lister.get().is_some()
                 );
                 let spill_partitions = if self.cfg.job_pacing {
                     crate::registry_pace::PACED_SPILL_PARTITIONS

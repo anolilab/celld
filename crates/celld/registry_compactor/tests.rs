@@ -3544,3 +3544,105 @@ async fn a_new_holder_does_not_fold_again_what_the_roots_deltas_already_folded()
     .await
     .expect("and the leftover segment is deleted");
 }
+
+// ---------------------------------------------------------------------------
+// The seed lists cells by delimiter, a request per thousand cells
+// ---------------------------------------------------------------------------
+
+/// A paginated listing that counts the requests it answers.
+struct CountingPages {
+    inner: Arc<crate::local_store::LocalStore>,
+    requests: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl object_store::list::PaginatedListStore for CountingPages {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: object_store::list::PaginatedListOptions,
+    ) -> object_store::Result<object_store::list::PaginatedListResult> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        self.inner.list_paginated(prefix, options).await
+    }
+}
+
+fn hashed(class: &str, index: usize) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(format!("{class}{index}").as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{class}:{hex}")
+}
+
+#[tokio::test]
+async fn the_seed_lists_cells_by_delimiter_in_about_a_request_per_thousand_cells() {
+    let dir = tempfile::tempdir().unwrap();
+    let local =
+        Arc::new(crate::local_store::LocalStore::open(dir.path().join("db.sqlite")).unwrap());
+    let store: Arc<dyn ObjectStore> = local.clone();
+    let pages = Arc::new(CountingPages {
+        inner: local.clone(),
+        requests: std::sync::atomic::AtomicUsize::new(0),
+    });
+    // Three classes of different sizes, names that are not hex, a name with no
+    // class, and a class of one: every one of them must be seeded exactly once.
+    let mut names: Vec<String> = Vec::new();
+    names.extend((0..2_100).map(|index| hashed("Agent", index)));
+    names.extend((0..300).map(|index| hashed("Counter", index)));
+    names.extend((0..120).map(|index| hashed("__KvNamespace", index)));
+    names.extend(
+        [
+            "Agent:Zed",
+            "Agent:ABC",
+            "Agent:-dash",
+            "Agent:g1",
+            "Agent:zz",
+            "Counter:Q",
+            "Solo:1",
+            "plain-name",
+        ]
+        .map(str::to_owned),
+    );
+    for name in &names {
+        put_object(&store, &format!("{PREFIX}cells/{name}/own.json"), "{}").await;
+        put_object(
+            &store,
+            &format!("{PREFIX}cells/{name}/ltx/e1/0/1-1.ltx"),
+            "x",
+        )
+        .await;
+    }
+    let node = registry_on(&store, "node-a");
+    node.set_lister(crate::bucket::Bucket::for_test(
+        store.clone(),
+        pages.clone(),
+        PREFIX,
+    ));
+    assert!(node.lister.get().is_some());
+    let mut holding = closed_holder(&node).await;
+    let reader = registry_on(&store, "node-b");
+    pass_until_open(&node, &mut holding).await;
+    assert_eq!(
+        node.counters.seed_cells.load(Ordering::Relaxed),
+        names.len() as u64,
+        "every cell once"
+    );
+    for name in &names {
+        assert!(
+            matches!(answer(&reader, name).await, Answer::Exists(_)),
+            "{name}"
+        );
+    }
+    // About a request per thousand cells, one per class to find it, and one per
+    // range: a flat listing of the objects would have taken twice the pages of
+    // the cells alone before any split.
+    let classes = 4;
+    let ranges = 19;
+    let requests = pages.requests.load(Ordering::SeqCst);
+    let bound = names.len() / 1_000 + classes + 1 + classes * ranges + classes * 2;
+    assert!(
+        requests <= bound,
+        "{requests} listing requests for {} cells, at most {bound}",
+        names.len()
+    );
+}

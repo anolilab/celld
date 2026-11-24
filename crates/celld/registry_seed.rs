@@ -11,6 +11,7 @@
 //! merge code as a spill. The commit that names the merged runs also sets the
 //! root's seed number to the gate number the seed was made for.
 
+use crate::bucket::Bucket;
 use crate::registry::Registry;
 use crate::registry_objects as objects;
 use anyhow::Context as _;
@@ -24,6 +25,10 @@ use std::sync::atomic::Ordering;
 
 /// Key ranges the listing of `cells/` is split into, in parallel.
 const RANGE_CONCURRENCY: usize = 16;
+/// Common prefixes one listing request asks for.
+const PAGE_SIZE: usize = 1_000;
+/// The characters after a class's colon that start the sixteen hex ranges.
+const HEX: &str = "0123456789abcdef";
 /// Attempts at raising the gate number before a node gives up starting.
 const CLOSE_ATTEMPTS: usize = 100;
 
@@ -131,6 +136,22 @@ fn seed_key(prefix: &str, gate: u64, partition: usize, range: usize) -> String {
 }
 
 impl Registry {
+    /// Every cell by a flat listing of the objects under `cells/`, split by the
+    /// first character of the name: for a store without a delimiter listing.
+    async fn list_cells_flat(&self) -> anyhow::Result<Vec<Vec<Record>>> {
+        let bounds = range_bounds();
+        let ranges = bounds.len() + 1;
+        let results: Vec<anyhow::Result<Vec<Record>>> = futures_util::stream::iter(0..ranges)
+            .map(|index| {
+                let bounds = &bounds;
+                async move { self.list_range(index, bounds).await }
+            })
+            .buffer_unordered(RANGE_CONCURRENCY)
+            .collect()
+            .await;
+        results.into_iter().collect()
+    }
+
     /// The cells whose names fall in range `index`, as births with their keys,
     /// sorted. One listing of the range, ended at the first name above it.
     async fn list_range(&self, index: usize, bounds: &[String]) -> anyhow::Result<Vec<Record>> {
@@ -167,25 +188,138 @@ impl Registry {
         Ok(reg::sorted(records))
     }
 
-    /// List every cell, split by name range and run in parallel, and write the
-    /// cells as sorted seed objects, one per partition and range. The seed is
-    /// made for `gate`, the gate number the root had when the seed started.
+    /// The names of the cells under `prefix` (a name prefix such as `cells/Agent:0`),
+    /// one request per page, from after `start_after` until a name reaches
+    /// `stop_at`. Each common prefix of the delimiter listing is one cell.
+    async fn list_names(
+        &self,
+        bucket: &Bucket,
+        prefix: &str,
+        start_after: Option<&str>,
+        stop_at: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut names = Vec::new();
+        let mut token = None;
+        loop {
+            self.counters.list_requests.fetch_add(1, Ordering::Relaxed);
+            let page = bucket
+                .common_prefixes_page(prefix, start_after, token, PAGE_SIZE)
+                .await?;
+            for child in page.prefixes {
+                let name = child
+                    .strip_prefix("cells/")
+                    .unwrap_or(&child)
+                    .trim_end_matches('/')
+                    .to_owned();
+                if stop_at.is_some_and(|stop| name.as_str() >= stop) {
+                    return Ok(names);
+                }
+                if celld_logic::cell::valid_cell_scope(&name) {
+                    names.push(name);
+                }
+            }
+            token = page.page_token;
+            if token.is_none() {
+                return Ok(names);
+            }
+        }
+    }
+
+    /// Every cell, as lists to write as seed objects, by delimiter listings: the
+    /// classes (`<Class>:`) are found by a walk that jumps past each class after
+    /// its first name, one request per class, and each class is then split into
+    /// nineteen ranges listed in parallel: one per first character of the hex
+    /// part, and three for what lies between and beyond them, so every name is in
+    /// exactly one.
+    async fn list_cells_paged(&self, bucket: &Bucket) -> anyhow::Result<Vec<Vec<Record>>> {
+        let mut classes: Vec<String> = Vec::new();
+        let mut loose: Vec<String> = Vec::new();
+        let mut after: Option<String> = None;
+        'walk: loop {
+            let mut token = None;
+            loop {
+                self.counters.list_requests.fetch_add(1, Ordering::Relaxed);
+                let page = bucket
+                    .common_prefixes_page("cells/", after.as_deref(), token, PAGE_SIZE)
+                    .await?;
+                for child in page.prefixes {
+                    let name = child
+                        .strip_prefix("cells/")
+                        .unwrap_or(&child)
+                        .trim_end_matches('/')
+                        .to_owned();
+                    match name.find(':') {
+                        // The first name of a class: its range listings take
+                        // the class, and the walk goes on after it (`;` is the
+                        // character after `:`).
+                        Some(colon) => {
+                            let class = &name[..=colon];
+                            classes.push(class.to_owned());
+                            after = Some(format!("cells/{};", &class[..colon]));
+                            continue 'walk;
+                        }
+                        None if celld_logic::cell::valid_cell_scope(&name) => loose.push(name),
+                        None => {}
+                    }
+                }
+                token = page.page_token;
+                if token.is_none() {
+                    break 'walk;
+                }
+            }
+        }
+        let mut jobs: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+        for class in &classes {
+            let all = format!("cells/{class}");
+            for digit in HEX.chars() {
+                jobs.push((format!("{all}{digit}"), None, None));
+            }
+            // Below `0`, between `9` and `a` (the rest of ASCII up to `` ` ``, which
+            // holds capitals), and beyond `f`: an offset just past a group's
+            // names, and the name that ends the range.
+            jobs.push((all.clone(), None, Some(format!("{class}0"))));
+            jobs.push((
+                all.clone(),
+                Some(format!("{all}9\u{ff}")),
+                Some(format!("{class}a")),
+            ));
+            jobs.push((all.clone(), Some(format!("{all}f\u{ff}")), None));
+        }
+        let listed: Vec<anyhow::Result<Vec<String>>> = futures_util::stream::iter(jobs)
+            .map(|(prefix, start, stop)| async move {
+                self.list_names(bucket, &prefix, start.as_deref(), stop.as_deref())
+                    .await
+            })
+            .buffer_unordered(RANGE_CONCURRENCY)
+            .collect()
+            .await;
+        let mut ranges: Vec<Vec<Record>> = Vec::new();
+        let records = |names: Vec<String>| {
+            reg::sorted(
+                names
+                    .into_iter()
+                    .map(|name| Record::birth(objects::key_of(&name), 0))
+                    .collect(),
+            )
+        };
+        ranges.push(records(loose));
+        for names in listed {
+            ranges.push(records(names?));
+        }
+        Ok(ranges)
+    }
+
+    /// List every cell, split into ranges, and write the cells as sorted seed
+    /// objects, one per partition and range. The seed is made for `gate`, the
+    /// gate number the root had when the seed started.
     pub(crate) async fn write_seed(&self, gate: u64, map: &Map) -> anyhow::Result<SeedObjects> {
-        let bounds = range_bounds();
-        let ranges = bounds.len() + 1;
-        let results: Vec<anyhow::Result<(usize, Vec<Record>)>> =
-            futures_util::stream::iter(0..ranges)
-                .map(|index| {
-                    let bounds = &bounds;
-                    async move { Ok((index, self.list_range(index, bounds).await?)) }
-                })
-                .buffer_unordered(RANGE_CONCURRENCY)
-                .collect()
-                .await;
+        let ranges = match self.lister.get() {
+            Some(bucket) => self.list_cells_paged(bucket).await?,
+            None => self.list_cells_flat().await?,
+        };
         let mut seed = SeedObjects::default();
         let mut writes: Vec<(String, Vec<u8>)> = Vec::new();
-        for result in results {
-            let (range, records) = result?;
+        for (range, records) in ranges.into_iter().enumerate() {
             seed.cells += records.len() as u64;
             let mut grouped: BTreeMap<usize, Vec<Record>> = BTreeMap::new();
             for record in records {
