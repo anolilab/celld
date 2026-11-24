@@ -2824,14 +2824,15 @@ async fn internal_registry_root(request: Request<Incoming>, app: AppHandle) -> H
     peer_response(response(StatusCode::OK, "{\"ok\":true}"))
 }
 
-/// A node outside the birth registry's writer rule (the flag is `shadow` and it has
-/// bucket durability) raises the registry's gate number before it does any
+/// A node outside the birth registry's writer rule (the flag is off, or it has bucket
+/// durability) raises the registry's gate number, when the bucket has a registry root,
+/// before it does any
 /// per-cell work, once its own lease, matched by generation, says it is outside
 /// the rule: a seed that started before the lease cannot then open the gate over
 /// this node's writes. Claims, own-record writes and per-cell object writes wait
 /// for it (`registry_seed::hold`); every failure is retried with a growing pause
-/// and nothing falls through. With no root nothing is written. A node with the
-/// flag off does none of this and reads and writes no registry object.
+/// and nothing falls through. With no root (the one read at start) nothing is held
+/// and nothing is written.
 ///
 /// A lapsed lease fences the process (it halts), so the lease is never taken again
 /// within one process and the gate needs closing only here.
@@ -3822,11 +3823,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let action = action_from_process()?;
     let host_runtime = tokio::runtime::Handle::current();
     celld::asyncrt::set_host_handle(host_runtime.clone());
-    // Outside the birth registry's writer rule (flag `shadow`, bucket durability):
-    // per-cell work waits until the gate is closed. Nothing changes with the flag off.
-    if celld::registry_seed::needs_gate_close() {
-        celld::registry_seed::hold().require();
-    }
     // Docker and journald can stop consuming the process pipe during a log
     // burst. Logging must lose diagnostics under that backpressure rather
     // than block the Tokio workers that route requests and renew authority.
@@ -4163,6 +4159,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 fleet::validate_bucket(&client).await?;
             }
             celld::wake_format::ensure_ready(&client).await?;
+            celld::registry_seed::hold_if_registry_exists(&client).await;
             // The list above proves the bucket answers; it does not prove the
             // store enforces the conditional writes or ranged reads that a
             // cell needs. Test both contracts here before the node serves.
@@ -4374,6 +4371,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             let (ownership, peer_key, wake, wake_scan) = if settings.bucket.is_some() {
                 let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
                 celld::wake_format::ensure_ready(&client).await?;
+                celld::registry_seed::hold_if_registry_exists(&client).await;
                 let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
                 let peer_key = peer_auth::load_or_create(&client).await?;
                 let wake = Arc::new(celld::wake::WakeFlusher::new());
@@ -4466,6 +4464,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             let (ownership, peer_key) = if settings.bucket.is_some() {
                 let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
                 celld::wake_format::ensure_ready(&client).await?;
+                celld::registry_seed::hold_if_registry_exists(&client).await;
                 let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
                 let peer_key = peer_auth::load_or_create(&client).await?;
                 (

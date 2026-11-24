@@ -4144,3 +4144,155 @@ async fn the_sweep_removes_seed_objects_of_earlier_epochs_and_keeps_its_own() {
         "an earlier holder's attempt goes, this one's stays"
     );
 }
+
+fn leaked_hold() -> &'static crate::registry_seed::GateHold {
+    Box::leak(Box::new(crate::registry_seed::GateHold::new()))
+}
+
+#[tokio::test]
+async fn a_node_outside_the_rule_in_a_bucket_without_a_registry_reads_one_object_and_holds_nothing()
+{
+    let (scripted, _) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let local =
+        Arc::new(crate::local_store::LocalStore::open(dir.path().join("db.sqlite")).unwrap());
+    let bucket = crate::bucket::Bucket::for_test(
+        store.clone(),
+        local,
+        PREFIX,
+        crate::bucket::StorageBackend::Local,
+    );
+    let hold = leaked_hold();
+    crate::registry_seed::require_if_root_exists(hold, &bucket).await;
+    assert!(!hold.is_pending(), "no root, so no hold");
+    assert_eq!(
+        scripted.ops(),
+        vec![format!("get {PREFIX}fleet/reg/v1/root")],
+        "one read and nothing else"
+    );
+    hold.wait().await;
+}
+
+#[tokio::test]
+async fn a_node_outside_the_rule_raises_an_open_gate_before_its_first_per_cell_write() {
+    let (scripted, _) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    // A fleet whose registry is seeded: the gate is open.
+    let seeded = registry_on(&store, "node-w");
+    let _holding = holder_of(&seeded).await;
+    let dir = tempfile::tempdir().unwrap();
+    let local =
+        Arc::new(crate::local_store::LocalStore::open(dir.path().join("db.sqlite")).unwrap());
+    let bucket = crate::bucket::Bucket::for_test(
+        store.clone(),
+        local,
+        PREFIX,
+        crate::bucket::StorageBackend::Local,
+    );
+    let hold = leaked_hold();
+    crate::registry_seed::require_if_root_exists(hold, &bucket).await;
+    assert!(hold.is_pending(), "a root exists, so per-cell work is held");
+    // The node's first per-cell write, as the replicator would make it.
+    let gated: Arc<dyn ObjectStore> = Arc::new(crate::registry_seed::GatedStore::new(
+        store.clone(),
+        PREFIX.to_owned(),
+        hold,
+    ));
+    let write = {
+        let gated = gated.clone();
+        crate::asyncrt::spawn(async move {
+            gated
+                .put(
+                    &Path::from(format!("{PREFIX}cells/Agent:x/ltx/e1/0/1-1.ltx")),
+                    vec![1_u8].into(),
+                )
+                .await
+        })
+    };
+    crate::asyncrt::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !scripted.ops().iter().any(|op| op.contains("/ltx/")),
+        "the write has not reached the store"
+    );
+    // Its lease shows it is outside the rule; the gate is raised; then it goes on.
+    let gate = crate::registry_seed::close_until_done(
+        hold,
+        || Box::pin(async { true }),
+        {
+            let bucket = bucket.clone();
+            move || {
+                let bucket = bucket.clone();
+                Box::pin(async move {
+                    crate::registry_seed::close_gate(bucket.store.as_ref(), &bucket.prefix).await
+                })
+            }
+        },
+        Duration::from_millis(1),
+    )
+    .await;
+    assert_eq!(gate, Some(2));
+    write.await.unwrap().unwrap();
+    let ops = scripted.ops();
+    let raised = ops
+        .iter()
+        .rposition(|op| op.starts_with("put ") && op.ends_with("fleet/reg/v1/root"))
+        .unwrap();
+    let first_write = ops.iter().position(|op| op.contains("/ltx/")).unwrap();
+    assert!(raised < first_write, "the gate was raised first: {ops:?}");
+    let reader = registry_on(&store, "node-r");
+    assert!(matches!(
+        answer(&reader, "Agent:fresh").await,
+        Answer::Unknown(celld_logic::lost_record::Doubt::GateClosed)
+    ));
+}
+
+#[tokio::test]
+async fn a_claim_through_the_bucket_ownership_waits_for_the_hold() {
+    use celld_logic::{CasGuard, CasOutcome};
+    crate::asyncrt::install_test_host_runtime();
+    let dir = tempfile::tempdir().unwrap();
+    let bucket = crate::bucket::Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+    let hold = leaked_hold();
+    hold.require();
+    let ownership = Arc::new(
+        crate::ownership_store::BucketOwnership::new(
+            bucket.clone(),
+            bucket.clone(),
+            "node-a".to_owned(),
+            "key".to_owned(),
+        )
+        .with_gate_hold(hold),
+    );
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let claim = {
+        let (ownership, done) = (ownership.clone(), done.clone());
+        crate::asyncrt::spawn(async move {
+            let claimed = ownership.cas_owner("Agent:c", CasGuard::Absent, 1).await;
+            done.store(true, Ordering::SeqCst);
+            claimed
+        })
+    };
+    crate::asyncrt::sleep(Duration::from_millis(100)).await;
+    assert!(!done.load(Ordering::SeqCst), "the claim waits");
+    assert!(
+        bucket
+            .get("cells/Agent:c/own.json")
+            .await
+            .unwrap()
+            .is_none(),
+        "and no record was written"
+    );
+    hold.release();
+    let outcome = crate::asyncrt::timeout(Duration::from_secs(2), claim)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(outcome, CasOutcome::Applied));
+    assert!(bucket
+        .get("cells/Agent:c/own.json")
+        .await
+        .unwrap()
+        .is_some());
+}

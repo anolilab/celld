@@ -432,6 +432,9 @@ pub struct BucketOwnership {
     /// The birth registry, which only shadows the lost-record listing.
     registry: Option<Arc<crate::registry::Registry>>,
     registry_answers: RegistryAnswers,
+    /// Claims and own-record writes wait on this until the registry's gate is
+    /// closed, on a node outside its writer rule.
+    gate_hold: &'static crate::registry_seed::GateHold,
 }
 
 /// How often the fleet directory answered a claim guard, by its answer and by
@@ -680,7 +683,16 @@ impl BucketOwnership {
             directory_answers: DirectoryAnswers::default(),
             registry: None,
             registry_answers: RegistryAnswers::default(),
+            gate_hold: crate::registry_seed::hold(),
         }
+    }
+
+    /// Use another hold than the process's, for a test that must not hold every
+    /// other claim in the process.
+    #[cfg(test)]
+    pub(crate) fn with_gate_hold(mut self, hold: &'static crate::registry_seed::GateHold) -> Self {
+        self.gate_hold = hold;
+        self
     }
 
     pub fn with_registry(mut self, registry: Option<Arc<crate::registry::Registry>>) -> Self {
@@ -1218,7 +1230,7 @@ impl BucketOwnership {
     /// claim. Rejection is an ordinary outcome, not an error -- the record
     /// keeps naming whoever it names, and nothing was lost.
     pub async fn release_owner(&self, cell: &str, epoch: u64) -> anyhow::Result<CasOutcome> {
-        crate::registry_seed::hold().wait().await;
+        self.gate_hold.wait().await;
         let Some(current) = self.read_owner(cell).await? else {
             return Ok(CasOutcome::Rejected);
         };
@@ -1240,7 +1252,7 @@ impl BucketOwnership {
         epoch: u64,
     ) -> anyhow::Result<CasOutcome> {
         // A node outside the writer rule claims nothing before the gate is closed.
-        crate::registry_seed::hold().wait().await;
+        self.gate_hold.wait().await;
         let key = format!("cells/{cell}/own.json");
         let body = serde_json::to_vec(&OwnerWire {
             node: &self.node,

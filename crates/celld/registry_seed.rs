@@ -81,15 +81,36 @@ pub fn hold() -> &'static GateHold {
     &HOLD
 }
 
-/// Whether this process is outside the writer rule while the registry is on:
-/// `CELLD_BIRTH_REGISTRY=shadow` with a durability other than fleet. A node with
-/// the flag off does none of this and reads and writes no registry object.
+/// Whether this process is outside the registry's writer rule: it follows the rule
+/// only with `CELLD_BIRTH_REGISTRY=shadow` and fleet durability (the default). A
+/// node with the flag off, or with bucket durability, can write per-cell objects
+/// that the registry does not cover, so it closes the gate before it does.
 pub fn needs_gate_close() -> bool {
-    crate::env_vars::value("CELLD_BIRTH_REGISTRY")
+    let shadow = crate::env_vars::value("CELLD_BIRTH_REGISTRY")
         .ok()
         .flatten()
-        .is_some_and(|mode| mode == "shadow")
-        && std::env::var("CELLD_DURABILITY").is_ok_and(|durability| durability != "fleet")
+        .is_some_and(|mode| mode == "shadow");
+    let fleet = std::env::var("CELLD_DURABILITY").map_or(true, |durability| durability == "fleet");
+    !(shadow && fleet)
+}
+
+/// One read of the registry's root at start, for a node outside the writer rule:
+/// when a root exists, per-cell work is held until the gate is closed; when none
+/// does (a bucket that has never run the registry) nothing is held and nothing
+/// else is read or written. A read that fails is treated as a root that may
+/// exist, which the closing then settles with its own retries.
+pub async fn hold_if_registry_exists(bucket: &Bucket) {
+    if needs_gate_close() {
+        require_if_root_exists(hold(), bucket).await;
+    }
+}
+
+/// [`hold_if_registry_exists`] for a given hold: one read of the root.
+pub(crate) async fn require_if_root_exists(hold: &GateHold, bucket: &Bucket) {
+    match objects::read_root(bucket.store.as_ref(), &bucket.prefix).await {
+        Ok(None) => {}
+        Ok(Some(_)) | Err(_) => hold.require(),
+    }
 }
 
 /// Whether the lease object `body` is this process's (by generation, not by node
