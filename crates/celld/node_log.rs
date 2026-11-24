@@ -5875,11 +5875,23 @@ impl NodeLogManager {
         // hour sealed 1,300 acked rows into orphanhood behind epoch 156.
         // An Open record is always safe: the next incarnation's recovery
         // drains the bundles.
-        let per_cell_complete = self.ltx.all_tails_tiered()
-            && match self.uncovered_bundle_rows().await {
-                Ok(uncovered) => uncovered.is_empty(),
-                Err(_) => false,
-            };
+        let tails_tiered = self.ltx.all_tails_tiered();
+        let uncovered_rows = match self.uncovered_bundle_rows().await {
+            Ok(uncovered) => {
+                for (cell, epoch, txid) in uncovered.keys().take(3) {
+                    let facts = crate::session::current().and_then(|session| {
+                        let counter = session.own_counter_of_scope(cell)?;
+                        Some((session.is_granted(counter), session.is_checkpointed(counter)))
+                    });
+                    eprintln!(
+                        "node-log close: uncovered row {cell} epoch {epoch} txid {txid}, (granted, checkpointed) {facts:?}"
+                    );
+                }
+                Some(uncovered.len())
+            }
+            Err(_) => None,
+        };
+        let per_cell_complete = tails_tiered && uncovered_rows == Some(0);
         if !log_tier::graceful_seal_allowed(
             &record,
             shipper.epoch,
@@ -5887,8 +5899,11 @@ impl NodeLogManager {
             per_cell_complete,
         ) {
             eprintln!(
-                "node-log close: not sealable (record epoch {} state {:?}, shipper epoch {}); record left open",
-                record.epoch, record.state, shipper.epoch
+                "node-log close: not sealable (record epoch {} state {:?}, shipper epoch {}, batch in flight {}, per-cell layout complete {per_cell_complete}: tails tiered {tails_tiered}, uncovered bundle rows {uncovered_rows:?}); record left open",
+                record.epoch,
+                record.state,
+                shipper.epoch,
+                Self::shipper_batch_in_flight(&shipper)
             );
             return;
         }
