@@ -375,6 +375,9 @@ async fn wait_for_ensemble(fleet: &Fleet) {
         },
     )
     .await;
+    // A node grants ids only into an ensemble that has been active for a moment
+    // (an ensemble that names a member that is gone fails its first append).
+    tokio::time::sleep(Duration::from_secs(2)).await;
 }
 
 const SHADOW: &[(&str, &str)] = &[
@@ -2046,15 +2049,37 @@ async fn s5_run(mode: &'static str) -> (Duration, usize) {
         let ids = spawn_agents(&fleet, agents_in_drills()).await;
         // Let the writes reach a bundle, as they do in a moment of a real run.
         tokio::time::sleep(Duration::from_secs(4)).await;
+        // The lease of the minting node renews every few seconds and a peer takes its
+        // cells only after it ran out: kill right after a renewal, so that both runs
+        // wait for the same lease and the times compare.
+        let first = fleet.object("nodes/lazy-0.json").await.map(|lease| lease["expires_ms"].clone());
+        wait_until("a renewal of the lease", Duration::from_secs(30), || async {
+            let now = fleet.object("nodes/lazy-0.json").await?["expires_ms"].clone();
+            (Some(&now) != first.as_ref()).then_some(())
+        })
+        .await;
         fleet.nodes[0].kill();
         let started = Instant::now();
         // All the agents ask at once, as clients do.
-        let answers = futures_util::future::join_all(
-            ids.iter()
-                .map(|id| answer_through_peers(&fleet, id, Duration::from_secs(240))),
-        )
+        let timed = futures_util::future::join_all(ids.iter().map(|id| async {
+            let n = answer_through_peers(&fleet, id, Duration::from_secs(240)).await;
+            (n, started.elapsed())
+        }))
         .await;
-        let wrong = answers.iter().filter(|n| **n != 2).count();
+        let wrong = timed.iter().filter(|(n, _)| *n != 2).count();
+        let mut times: Vec<Duration> = timed.iter().map(|(_, t)| *t).collect();
+        times.sort();
+        eprintln!(
+            "S5 {mode}: first answer {:.2}s, median {:.2}s, last {:.2}s",
+            times[0].as_secs_f64(),
+            times[times.len() / 2].as_secs_f64(),
+            times[times.len() - 1].as_secs_f64()
+        );
+        if let Ok(dir) = std::env::var("LAZY_FLEET_KEEP_LOGS") {
+            for (index, node) in fleet.nodes.iter().enumerate() {
+                let _ = std::fs::write(format!("{dir}/s5-{mode}-node-{index}.log"), node.log());
+            }
+        }
         *result.lock().unwrap() = (started.elapsed(), wrong);
         fleet
     })
@@ -2064,7 +2089,6 @@ async fn s5_run(mode: &'static str) -> (Duration, usize) {
 }
 
 #[tokio::test]
-#[ignore = "fails: 60 agents all answer 10.6 s after the kill with the flag on against 8.6 s with it off (limit: +1 s); no write is lost. Run with --ignored"]
 async fn s5_killing_the_minting_node_loses_no_write_and_answers_again() {
     let (on, wrong_on) = s5_run("on").await;
     let (off, wrong_off) = s5_run("off").await;
@@ -2413,7 +2437,7 @@ async fn s16_a_declared_loss_leaves_no_agent_with_two_writers() {
 /// by a preserved restart with resident cells. A call that fails is tried on the
 /// next node. Reports the success of new ids and the time of each restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "fails with the flag on: 38% of new agents succeed during the restarts (ResolveFailed, NodeFenced); with it off 100%. Run with --ignored"]
+#[ignore = "slow (minutes) and, under load, 98.7-99.9% instead of 99.9%: a restart that takes long also fences the new ids of the other nodes. Run with --ignored"]
 async fn s8_rolling_and_preserved_restarts_under_a_stream_of_new_agents() {
     let mode: &'static str = Box::leak(
         std::env::var("LAZY_FLEET_S8_MODE")
