@@ -1556,7 +1556,7 @@ pub(crate) fn process_load(live: &LiveLoad) -> NodeLoadWire {
         owned_cells: owned_cells(live),
         placement_weight: placement_weight(live),
         bucket_format: Some(celld_logic::format::BUCKET_FORMAT),
-        registry: crate::registry::is_w1(),
+        registry: !crate::registry_seed::needs_gate_close(),
         rss_bytes,
         in_use_bytes: Some(in_use_bytes),
         cgroup_working_set_bytes: sample.cgroup_working_set_bytes,

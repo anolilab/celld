@@ -1404,8 +1404,9 @@ impl LtxRepl {
                 );
                 (wrapped, Some(registry))
             }
-            // Outside the writer rule with the registry on: per-cell writes wait for
-            // the gate to be closed. With the flag off nothing changes.
+            // Outside the writer rule (the flag is off, or the node has bucket
+            // durability): per-cell LTX writes wait until this node has closed the
+            // registry's gate or found that the bucket has no registry root.
             None if crate::registry_seed::needs_gate_close() => (
                 Arc::new(crate::registry_seed::GatedStore::new(
                     store,

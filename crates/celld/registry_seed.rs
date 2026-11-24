@@ -59,7 +59,11 @@ impl GateHold {
     /// Return at once when nothing is required, otherwise when released.
     pub async fn wait(&self) {
         loop {
+            // Registered before `pending` is read, so a release between the two
+            // wakes this wait instead of being missed.
             let released = self.released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
             if !self.is_pending() {
                 return;
             }
@@ -86,12 +90,21 @@ pub fn hold() -> &'static GateHold {
 /// node with the flag off, or with bucket durability, can write per-cell objects
 /// that the registry does not cover, so it closes the gate before it does.
 pub fn needs_gate_close() -> bool {
-    let shadow = crate::env_vars::value("CELLD_BIRTH_REGISTRY")
-        .ok()
-        .flatten()
-        .is_some_and(|mode| mode == "shadow");
-    let fleet = std::env::var("CELLD_DURABILITY").map_or(true, |durability| durability == "fleet");
-    !(shadow && fleet)
+    needs_gate_close_for(
+        crate::env_vars::value("CELLD_BIRTH_REGISTRY")
+            .ok()
+            .flatten()
+            .as_deref(),
+        std::env::var("CELLD_DURABILITY").ok().as_deref(),
+    )
+}
+
+/// [`needs_gate_close`] for given settings: `mode` is `CELLD_BIRTH_REGISTRY` and
+/// `durability` is `CELLD_DURABILITY`, absent meaning unset (fleet). The node's
+/// lease says `registry: true` exactly when this is false, so what a lease
+/// advertises and whether the node holds per-cell work are one decision.
+pub fn needs_gate_close_for(mode: Option<&str>, durability: Option<&str>) -> bool {
+    !(mode == Some("shadow") && durability.is_none_or(|durability| durability == "fleet"))
 }
 
 /// At start, a node outside the writer rule holds per-cell work until it has

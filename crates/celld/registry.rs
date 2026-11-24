@@ -367,11 +367,6 @@ pub fn global() -> Option<Arc<Registry>> {
     GLOBAL.get().cloned()
 }
 
-/// Whether this process follows the writer rule: it runs a registry.
-pub fn is_w1() -> bool {
-    GLOBAL.get().is_some()
-}
-
 impl Registry {
     pub(crate) fn new(
         store: Arc<dyn ObjectStore>,

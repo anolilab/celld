@@ -4309,3 +4309,45 @@ async fn a_claim_through_the_bucket_ownership_waits_for_the_hold() {
         .unwrap()
         .is_some());
 }
+
+#[tokio::test]
+async fn a_release_in_the_window_before_a_wait_registers_never_leaves_it_asleep() {
+    for round in 0..500 {
+        let hold: Arc<crate::registry_seed::GateHold> = Arc::default();
+        hold.require();
+        let waiter = {
+            let hold = hold.clone();
+            crate::asyncrt::spawn(async move { hold.wait().await })
+        };
+        // The release races the wait's first look; a yield now and then moves it
+        // into the window between reading `pending` and being registered.
+        if round % 3 == 0 {
+            tokio::task::yield_now().await;
+        }
+        hold.release();
+        crate::asyncrt::timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: the wait slept through the release"))
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_lease_says_it_follows_the_rule_exactly_when_the_node_holds_nothing() {
+    use crate::registry_seed::needs_gate_close_for as holds;
+    // (mode, durability, holds per-cell work)
+    for (mode, durability, expected) in [
+        (Some("shadow"), None, false),
+        (Some("shadow"), Some("fleet"), false),
+        (Some("shadow"), Some("bucket"), true),
+        (None, None, true),
+        (Some("off"), None, true),
+        (Some("off"), Some("fleet"), true),
+    ] {
+        assert_eq!(holds(mode, durability), expected, "{mode:?} {durability:?}");
+    }
+    // The lease a node publishes is the same decision, whichever branch of start-up
+    // built it: one that never starts a replication included.
+    let load = crate::ownership_store::process_load(&crate::ownership_store::LiveLoad::default());
+    assert_eq!(load.registry, !crate::registry_seed::needs_gate_close());
+}
