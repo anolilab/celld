@@ -804,6 +804,9 @@ struct Holding {
     seed_slot: Arc<Mutex<Option<crate::registry_seed::SeedObjects>>>,
     /// The lease check of the listed seed, which runs outside the pass.
     seed_check: Arc<Mutex<SeedCheck>>,
+    /// A prepared seed that waits for its lease verdict. It is not in `prepared`, so
+    /// it does not keep other jobs from starting.
+    seed_waiting: Option<Prepared>,
     base_next: usize,
     /// Jobs that ended with nothing to do (an empty partition, no delta): the
     /// scheduling state moves past them at the next pass.
@@ -1134,6 +1137,7 @@ impl Registry {
             seeding: Arc::new(AtomicBool::new(false)),
             seed_slot: Arc::default(),
             seed_check: Arc::default(),
+            seed_waiting: None,
             base_next: 0,
             advanced: Arc::default(),
             last_sweep_ms: now,
@@ -1543,10 +1547,12 @@ impl Registry {
     /// inputs changed is discarded and its objects deleted.
     async fn commit_prepared(self: &Arc<Self>, holding: &mut Holding) -> anyhow::Result<bool> {
         let mut prepared: Vec<Prepared> = std::mem::take(&mut *holding.prepared.lock().unwrap());
+        // A seed that waits for its lease verdict is looked at again at every pass.
+        if let Some(job) = holding.seed_waiting.take() {
+            prepared.push(job);
+        }
         prepared.sort_by_key(|job| job.kind != "spill");
         let mut changed = false;
-        // A seed whose lease check is still running waits for the next pass.
-        let mut waiting: Vec<Prepared> = Vec::new();
         for job in prepared {
             if job.epoch != holding.epoch {
                 continue;
@@ -1562,8 +1568,10 @@ impl Registry {
                 }
                 match self.seed_step(holding, &job) {
                     SeedStep::Commit => {}
+                    // Held outside `prepared` until the verdict is back, so a lease read
+                    // that is slow does not keep a spill from starting.
                     SeedStep::Wait => {
-                        waiting.push(job);
+                        holding.seed_waiting = Some(job);
                         continue;
                     }
                     SeedStep::Rejected => continue,
@@ -1626,7 +1634,6 @@ impl Registry {
                 }
             }
         }
-        holding.prepared.lock().unwrap().extend(waiting);
         Ok(changed)
     }
 
@@ -1703,15 +1710,20 @@ impl Registry {
         );
         crate::asyncrt::spawn(async move {
             use celld_logic::registry_gate::{seed_decision, SeedDecision};
-            let leases = crate::registry_seed::live_leases(
-                registry.store.as_ref(),
-                &registry.prefix,
-                crate::ownership_store::now_ms(),
+            // A read that does not come back is an unreadable lease: the listing is
+            // kept and the merge tried again later.
+            let leases = crate::asyncrt::timeout(
+                Duration::from_millis(registry.cfg.seed_check_ms),
+                crate::registry_seed::live_leases(
+                    registry.store.as_ref(),
+                    &registry.prefix,
+                    crate::ownership_store::now_ms(),
+                ),
             )
             .await;
             let verdict = match leases {
-                Err(_) => SeedVerdict::Unreadable,
-                Ok(leases) => match seed_decision(&root, &leases) {
+                Err(_) | Ok(Err(_)) => SeedVerdict::Unreadable,
+                Ok(Ok(leases)) => match seed_decision(&root, &leases) {
                     SeedDecision::Start => SeedVerdict::Clean,
                     SeedDecision::OlderBinaryLive => SeedVerdict::OlderBinary,
                     SeedDecision::WaitForNonW1 | SeedDecision::NotNeeded => SeedVerdict::NonW1,
@@ -1795,7 +1807,7 @@ impl Registry {
             if let Some(passed) = listed {
                 // Listed and written: the merge that commits it is a job, and runs
                 // when no other does, once the cutover window has passed.
-                if !busy && passed {
+                if !busy && passed && holding.seed_waiting.is_none() {
                     self.start_seed_merge(holding);
                     return;
                 }

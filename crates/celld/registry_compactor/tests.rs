@@ -23,6 +23,7 @@ fn config() -> Config {
         waiting_cap: crate::registry_writer::WAITING_CAP,
         seed_page: 1_000,
         lease_ttl_ms: 20,
+        seed_check_ms: 10_000,
         sampler_recheck_ms: 20_000,
         job_pacing: false,
         pass_read: Duration::ZERO,
@@ -4714,4 +4715,95 @@ async fn a_seed_whose_gate_was_raised_during_the_cutover_window_is_dropped_and_m
         leftover.iter().all(|key| !first_objects.contains(key)),
         "the first seed's objects are gone"
     );
+}
+
+#[tokio::test]
+async fn a_lease_read_that_never_returns_does_not_stop_a_spill_from_committing() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    ensure_format_record(&plain).await;
+    bucket_with_cells(&plain, &["Agent:00aa".to_owned(), "Agent:00bb".to_owned()]).await;
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            lease_ttl_ms: 20,
+            ..config()
+        },
+    );
+    let mut holding = closed_holder(&node).await;
+    pass_until_listed(&node, &mut holding).await;
+    lease(&plain, "node-x", r#"{"registry":true}"#, far()).await;
+    scripted.hold("/nodes/");
+    // Passes until the seed is prepared and waits for its verdict, which hangs.
+    crate::asyncrt::timeout(Duration::from_secs(5), async {
+        while holding.seed_waiting.is_none() {
+            holding.last_seed_ms = Some(crate::asyncrt::mono_ms());
+            node.pass(&mut holding).await.unwrap();
+            crate::asyncrt::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the seed waits for its lease check");
+    assert!(
+        holding.prepared.lock().unwrap().is_empty(),
+        "the waiting seed is not in the prepared jobs"
+    );
+    // Births arrive and a spill is due: it starts and commits beside the stalled read.
+    register_and_fold(&node, &mut holding, &(0..20).map(cell).collect::<Vec<_>>()).await;
+    holding.last_spill_ms = None;
+    crate::asyncrt::timeout(Duration::from_secs(5), async {
+        while node.counters.spills.load(Ordering::Relaxed) == 0 {
+            holding.last_seed_ms = Some(crate::asyncrt::mono_ms());
+            node.pass(&mut holding).await.unwrap();
+            crate::asyncrt::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a spill committed while the lease read hung");
+    assert!(!holding.root.gate_open(), "the seed is still waiting");
+    scripted.release("/nodes/");
+    pass_until_open(&node, &mut holding).await;
+}
+
+#[tokio::test]
+async fn a_lease_read_that_takes_too_long_counts_as_unreadable_and_is_tried_again() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    ensure_format_record(&plain).await;
+    bucket_with_cells(&plain, &["Agent:00aa".to_owned()]).await;
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            lease_ttl_ms: 20,
+            seed_check_ms: 150,
+            ..config()
+        },
+    );
+    let mut holding = closed_holder(&node).await;
+    pass_until_listed(&node, &mut holding).await;
+    lease(&plain, "node-x", r#"{"registry":true}"#, far()).await;
+    scripted.hold("/nodes/");
+    let began = crate::asyncrt::mono_ms();
+    crate::asyncrt::timeout(Duration::from_secs(5), async {
+        while scripted.reads("/nodes/") < 2 {
+            holding.last_seed_ms = Some(crate::asyncrt::mono_ms());
+            node.pass(&mut holding).await.unwrap();
+            crate::asyncrt::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the check was started again after its bound");
+    assert!(
+        crate::asyncrt::mono_ms() - began >= 150,
+        "not before the bound"
+    );
+    assert!(
+        holding.seed_slot.lock().unwrap().is_some(),
+        "the listing is kept"
+    );
+    assert!(!holding.root.gate_open());
+    scripted.release("/nodes/");
+    pass_until_open(&node, &mut holding).await;
 }
