@@ -3228,6 +3228,34 @@ async fn a_map_a_failed_commit_may_have_written_is_deleted_after_the_grace() {
 }
 
 #[tokio::test]
+async fn a_map_a_commit_replaced_is_deleted_after_the_grace() {
+    let store = memory();
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            grace_ms: 0,
+            ..config()
+        },
+    );
+    let mut holding = holder_of(&node).await;
+    for round in 0..3_u32 {
+        let cells: Vec<String> = (0..10).map(|index| cell(round * 10 + index)).collect();
+        register_and_fold(&node, &mut holding, &cells).await;
+        let spill = spill_now(&node, &mut holding).await;
+        run_job(&node, &mut holding, spill).await;
+    }
+    assert_eq!(node.counters.spills.load(Ordering::Relaxed), 3);
+    node.housekeeping(&mut holding);
+    wait_housekeeping(&holding).await;
+    assert_eq!(
+        keys_under(&store, &objects::maps_root(PREFIX)).await.len(),
+        1,
+        "only the map the root names stays"
+    );
+}
+
+#[tokio::test]
 async fn a_full_queue_drops_new_cells_counts_them_and_a_write_queues_one_again() {
     let (scripted, plain) = scripted();
     let store: Arc<dyn ObjectStore> = scripted.clone();
