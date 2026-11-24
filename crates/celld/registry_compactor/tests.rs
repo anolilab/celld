@@ -19,6 +19,7 @@ fn config() -> Config {
         bound: Duration::from_millis(600),
         enforce: true,
         grace_ms: crate::registry_compactor::GRACE_MS,
+        created_cap: crate::registry_writer::CREATED_CAP,
         job_pacing: false,
         pass_read: Duration::ZERO,
     }
@@ -731,6 +732,8 @@ mod store {
         yielding: std::sync::atomic::AtomicBool,
         /// Every read and write in the order it ran, after any pause.
         ops: Mutex<Vec<String>>,
+        /// Deletes answer an error for every key while set.
+        failing_deletes: std::sync::atomic::AtomicBool,
         /// Writes of keys that contain a pattern are applied once and then
         /// answer an error, as a write whose answer was lost does.
         ambiguous: Mutex<Vec<String>>,
@@ -753,6 +756,7 @@ mod store {
                 lists: Mutex::new(Vec::new()),
                 yielding: std::sync::atomic::AtomicBool::new(false),
                 ops: Mutex::new(Vec::new()),
+                failing_deletes: std::sync::atomic::AtomicBool::new(false),
                 ambiguous: Mutex::new(Vec::new()),
                 failing: Mutex::new(Vec::new()),
                 held: Mutex::new(Vec::new()),
@@ -761,6 +765,10 @@ mod store {
                 widest: AtomicU64::new(0),
                 range_cap: AtomicU64::new(u64::MAX),
             })
+        }
+
+        pub(super) fn fail_deletes(&self, on: bool) {
+            self.failing_deletes.store(on, Ordering::SeqCst);
         }
 
         pub(super) fn yield_each_request(&self, on: bool) {
@@ -1012,6 +1020,18 @@ mod store {
         ) -> BoxStream<'static, object_store::Result<Path>> {
             use futures_util::StreamExt as _;
             // One call is one request: it carries every key it is given.
+            if self.failing_deletes.load(Ordering::SeqCst) {
+                return locations
+                    .map(|location| {
+                        location.and_then(|_| {
+                            Err(object_store::Error::Generic {
+                                store: "scripted",
+                                source: "a delete failed".into(),
+                            })
+                        })
+                    })
+                    .boxed();
+            }
             let keys = Arc::new(AtomicUsize::new(0));
             self.batches.lock().unwrap().push(keys.clone());
             let counted = locations
@@ -2207,4 +2227,92 @@ async fn a_folded_segment_leaves_the_seen_set_only_when_its_delete_is_confirmed(
     .expect("the delete was confirmed");
     assert!(node.pass(&mut holding).await.unwrap());
     assert!(holding.seen.is_empty());
+}
+
+#[tokio::test]
+async fn a_retired_object_stays_listed_until_its_delete_is_confirmed() {
+    let (scripted, _) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            grace_ms: 0,
+            ..config()
+        },
+    );
+    let mut holding = holder_of(&node).await;
+    let stale = objects::delta_key(PREFIX, DeltaId { epoch: 1, n: 77 });
+    objects::put_create(store.as_ref(), &stale, b"x".to_vec())
+        .await
+        .unwrap();
+    holding.retired.push((stale.clone(), 0));
+    scripted.fail_deletes(true);
+    node.housekeeping(&mut holding);
+    wait_housekeeping(&holding).await;
+    assert!(
+        keys_under(&store, &objects::deltas_root(PREFIX))
+            .await
+            .contains(&stale),
+        "the delete failed, so the object is still there"
+    );
+    node.housekeeping(&mut holding);
+    assert!(
+        holding.retired.iter().any(|(key, _)| *key == stale),
+        "and still listed, to be tried again"
+    );
+    wait_housekeeping(&holding).await;
+    scripted.fail_deletes(false);
+    node.housekeeping(&mut holding);
+    wait_housekeeping(&holding).await;
+    assert!(!keys_under(&store, &objects::deltas_root(PREFIX))
+        .await
+        .contains(&stale));
+    node.housekeeping(&mut holding);
+    assert!(
+        holding.retired.is_empty(),
+        "confirmed, so it leaves the list"
+    );
+}
+
+async fn wait_housekeeping(holding: &Holding) {
+    crate::asyncrt::timeout(Duration::from_secs(2), async {
+        while holding.housekeeping.load(Ordering::SeqCst) {
+            crate::asyncrt::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("housekeeping finished");
+}
+
+#[tokio::test]
+async fn a_cell_the_full_table_does_not_track_is_found_by_a_lookup_during_the_wait() {
+    let store = memory();
+    let holder = registry_on(&store, "node-a");
+    let mut holding = holder_of(&holder).await;
+    let writer = registry_with(
+        &store,
+        "node-b",
+        Config {
+            created_cap: 1,
+            ..config()
+        },
+    );
+    writer.register_at_claim(&cell(1), 1);
+    writer.register_at_claim(&cell(2), 1);
+    writer.flush_now().await.unwrap();
+    assert_eq!(
+        writer.queue.lock().unwrap().created.len(),
+        1,
+        "the table is full"
+    );
+    let name = cell(2);
+    let wait = writer.ensure_covered(&name);
+    let fold = async {
+        crate::asyncrt::sleep(Duration::from_millis(100)).await;
+        assert!(holder.pass(&mut holding).await.unwrap());
+    };
+    let (covered, ()) = futures_util::join!(wait, fold);
+    covered.unwrap();
+    assert_eq!(writer.counters.bound_hits.load(Ordering::Relaxed), 0);
 }

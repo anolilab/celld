@@ -800,11 +800,17 @@ impl BucketOwnership {
                 celld_logic::lost_record::Packs::Absent,
                 0,
             );
-            if verdict.lost && decision == celld_logic::lost_record::Decision::ClaimNew {
-                this.record_registry_mismatch();
+            if verdict.listed && decision == celld_logic::lost_record::Decision::ClaimNew {
+                // `lost`: the record is still absent after the listing found LTX,
+                // which is the gap that matters. Without it a first claim on
+                // another node can have written the record in between.
+                if verdict.lost {
+                    this.record_registry_mismatch();
+                }
                 tracing::error!(
                     event = "registry_mismatch",
                     cell,
+                    lost = verdict.lost,
                     "the birth registry called a cell new while its LTX exists"
                 );
             }

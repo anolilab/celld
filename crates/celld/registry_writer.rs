@@ -62,7 +62,7 @@ impl Registry {
                 .entry(key)
                 .and_modify(|held| *held = reg::merge(*held, record))
                 .or_insert(record);
-            if queue.created.len() < CREATED_CAP {
+            if queue.created.len() < self.cfg.created_cap {
                 queue.created.entry(key).or_insert(Created {
                     created_here: epoch == 1,
                     seg: None,
@@ -323,7 +323,7 @@ impl Registry {
     fn queue_for_coverage(&self, key: &Key) {
         let mut queue = self.queue.lock().unwrap();
         queue.waiting.entry(*key).or_insert(Record::birth(*key, 0));
-        if queue.created.len() < CREATED_CAP {
+        if queue.created.len() < self.cfg.created_cap {
             queue.created.entry(*key).or_insert(Created {
                 created_here: false,
                 seg: None,
@@ -374,15 +374,17 @@ impl Registry {
                 let created = queue.created.get(key);
                 (
                     created.is_some_and(|created| created.seg.is_none()),
-                    created.is_some_and(|created| created.seg.is_some()),
+                    // A cell that is not tracked (the table is full) cannot see its
+                    // own segment folded either, so it looks up too.
+                    created.is_none_or(|created| created.seg.is_some()),
                 )
             };
             if flushed {
                 let _ = self.flush_now().await;
             }
-            // Its segment is written but no delta the root names lists it: the
-            // delta may have been spilled into a run before this node saw it,
-            // so only a lookup can still show the cell.
+            // Its segment is written but no delta the root names lists it (the
+            // delta may have been spilled into a run before this node saw it), or
+            // the cell is not tracked: only a lookup can still show the cell.
             if folded_away && matches!(self.lookup(key).await.answer, Answer::Exists(_)) {
                 self.add_evidence(key);
                 return;
@@ -558,10 +560,17 @@ mod tests {
 
     #[test]
     fn the_wait_bound_is_four_seconds_against_the_default_budget_and_stays_under_half() {
-        assert_eq!(Config::bound_for(10_000), Duration::from_secs(4));
-        check_bound(Config::bound_for(10_000), 10_000).unwrap();
-        for budget in [1_500, 3_000, 5_000, 9_000, 10_000, 60_000] {
-            check_bound(Config::bound_for(budget), budget).unwrap();
+        // One second under half the budget, at most four seconds.
+        for (budget_ms, bound_ms) in [
+            (10_000, 4_000),
+            (5_000, 1_500),
+            (2_000, 0),
+            (1_000, 0),
+            (60_000, 4_000),
+        ] {
+            let bound = Config::bound_for(budget_ms);
+            assert_eq!(bound, Duration::from_millis(bound_ms), "budget {budget_ms}");
+            check_bound(bound, budget_ms).unwrap();
         }
     }
 

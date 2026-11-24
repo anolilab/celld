@@ -78,6 +78,9 @@ pub(crate) struct Config {
     /// How long an object that no root names stays before it is deleted: far
     /// longer than the 2 s a lookup lasts.
     pub grace_ms: u64,
+    /// Cells whose own segment a node tracks at once; more are queued but found
+    /// by a lookup during the wait.
+    pub created_cap: usize,
     /// `CELLD_REGISTRY_JOB_PACING`: limit the requests and bytes per second of
     /// spills and base merges, so they do not stall the store the lookups read.
     pub job_pacing: bool,
@@ -88,11 +91,12 @@ pub(crate) struct Config {
 }
 
 impl Config {
-    /// The longest a first write waits for coverage: 4 s, or 1 s under half
-    /// the durability budget when that is less, so the write keeps the rest of
-    /// the budget for its own upload.
+    /// The longest a first write waits for coverage: 4 s, or 1 s under half the
+    /// durability budget when that is less, so the write keeps the rest of the
+    /// budget for its own upload. At the default budget of 10 s that is 4 s
+    /// against a half of 5 s.
     pub(crate) fn bound_for(durability_ms: u64) -> Duration {
-        Duration::from_millis(4_000.min(durability_ms.saturating_sub(1_000) / 2))
+        Duration::from_millis((durability_ms / 2).saturating_sub(1_000).min(4_000))
     }
 
     pub(crate) fn from_env(durability_ms: u64) -> anyhow::Result<Self> {
@@ -127,6 +131,7 @@ impl Config {
             bound,
             enforce: false,
             grace_ms: crate::registry_compactor::GRACE_MS,
+            created_cap: crate::registry_writer::CREATED_CAP,
             job_pacing,
             pass_read: Duration::from_millis(pass_read_ms),
         })

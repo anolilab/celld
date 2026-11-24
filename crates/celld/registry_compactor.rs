@@ -640,6 +640,8 @@ struct Holding {
     seen: HashSet<String>,
     /// Folded segments whose delete is confirmed, to leave `seen`.
     deleted: Arc<Mutex<Vec<String>>>,
+    /// Retired objects whose delete is confirmed, to leave `retired`.
+    retired_gone: Arc<Mutex<Vec<String>>>,
     /// Objects a committed job stopped naming, until the root write that says
     /// so is durable: their grace starts there.
     retire_next: Vec<String>,
@@ -877,6 +879,7 @@ impl Registry {
             next_run: 0,
             seen: HashSet::new(),
             deleted: Arc::default(),
+            retired_gone: Arc::default(),
             retire_next: Vec::new(),
             counts,
             retired: Vec::new(),
@@ -1424,6 +1427,12 @@ impl Registry {
             return;
         }
         let now = crate::asyncrt::mono_ms();
+        // A key leaves the list when its delete is confirmed, not when it is
+        // asked for, so a delete that failed is tried again.
+        let gone: HashSet<String> = std::mem::take(&mut *holding.retired_gone.lock().unwrap())
+            .into_iter()
+            .collect();
+        holding.retired.retain(|(key, _)| !gone.contains(key));
         let due: Vec<String> = holding
             .retired
             .iter()
@@ -1436,7 +1445,6 @@ impl Registry {
         if due.is_empty() && !sweep && !sample {
             return;
         }
-        holding.retired.retain(|(key, _)| !due.contains(key));
         if sweep {
             holding.last_sweep_ms = now;
         }
@@ -1444,10 +1452,11 @@ impl Registry {
             holding.last_sample_ms = now;
         }
         holding.housekeeping.store(true, Ordering::SeqCst);
-        let (this, flag, sampler) = (
+        let (this, flag, sampler, retired_gone) = (
             self.clone(),
             holding.housekeeping.clone(),
             holding.sampler.clone(),
+            holding.retired_gone.clone(),
         );
         let retired: HashSet<String> = holding
             .retired
@@ -1456,7 +1465,8 @@ impl Registry {
             .chain(holding.retire_next.iter().cloned())
             .collect();
         crate::asyncrt::spawn(async move {
-            objects::delete_many(this.store.as_ref(), &due).await;
+            let gone = objects::delete_many(this.store.as_ref(), &due).await;
+            retired_gone.lock().unwrap().extend(gone);
             if sweep {
                 this.sweep(&retired).await;
             }
