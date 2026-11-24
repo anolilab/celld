@@ -4533,6 +4533,36 @@ fn a_seed_job(outputs: Vec<String>) -> Prepared {
     }
 }
 
+/// Ask for the step until the lease check has answered, as passes would.
+async fn seed_step_decided(node: &Arc<Registry>, holding: &mut Holding, job: &Prepared) -> bool {
+    crate::asyncrt::timeout(Duration::from_secs(5), async {
+        loop {
+            match node.seed_step(holding, job) {
+                SeedStep::Commit => return true,
+                SeedStep::Rejected => return false,
+                SeedStep::Wait => crate::asyncrt::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("the lease check answered")
+}
+
+async fn wait_stranded(holding: &Holding, expected: &[String]) {
+    crate::asyncrt::timeout(Duration::from_secs(5), async {
+        while holding.stranded.lock().unwrap().len() < expected.len() {
+            crate::asyncrt::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the unconfirmed deletes were kept");
+    let mut kept = holding.stranded.lock().unwrap().clone();
+    kept.sort();
+    let mut expected = expected.to_vec();
+    expected.sort();
+    assert_eq!(kept, expected);
+}
+
 #[tokio::test]
 async fn every_rejection_of_a_seed_commit_keeps_the_outputs_it_could_not_delete() {
     let (scripted, plain) = scripted();
@@ -4553,28 +4583,71 @@ async fn every_rejection_of_a_seed_commit_keeps_the_outputs_it_could_not_delete(
             by_partition: Default::default(),
         })
     };
-    let stranded = |holding: &Holding| holding.stranded.lock().unwrap().clone();
     scripted.fail_deletes(true);
 
     // 1. The cutover window has not passed.
     *holding.seed_slot.lock().unwrap() = slot(crate::asyncrt::mono_ms());
-    assert!(!node.seed_may_commit(&mut holding, &job).await);
-    assert_eq!(stranded(&holding), vec![output.clone()], "window");
+    assert!(!seed_step_decided(&node, &mut holding, &job).await);
+    wait_stranded(&holding, &[output.clone()]).await;
     holding.stranded.lock().unwrap().clear();
 
     // 2. A lease cannot be read.
     *holding.seed_slot.lock().unwrap() = slot(0);
     lease(&plain, "node-x", r#"{"registry":true}"#, far()).await;
     scripted.fail("/nodes/", true);
-    assert!(!node.seed_may_commit(&mut holding, &job).await);
-    assert_eq!(stranded(&holding), vec![output.clone()], "unreadable lease");
+    assert!(!seed_step_decided(&node, &mut holding, &job).await);
+    wait_stranded(&holding, &[output.clone()]).await;
     scripted.fail("/nodes/", false);
     holding.stranded.lock().unwrap().clear();
 
     // 3. A lease without the field is live.
     lease(&plain, "node-old", "{}", far()).await;
-    assert!(!node.seed_may_commit(&mut holding, &job).await);
-    assert_eq!(stranded(&holding), vec![output], "blocking lease");
+    assert!(!seed_step_decided(&node, &mut holding, &job).await);
+    wait_stranded(&holding, &[output]).await;
+    assert!(
+        holding.seed_slot.lock().unwrap().is_none(),
+        "the listing is dropped"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_lease_listing_for_a_seed_does_not_delay_the_next_pass() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    ensure_format_record(&plain).await;
+    bucket_with_cells(&plain, &["Agent:00aa".to_owned(), "Agent:00bb".to_owned()]).await;
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            lease_ttl_ms: 20,
+            ..config()
+        },
+    );
+    let mut holding = closed_holder(&node).await;
+    // The seed is listed and merged with the leases readable; only then do they
+    // stall, so the check that precedes the commit is the one that hangs.
+    pass_until_listed(&node, &mut holding).await;
+    lease(&plain, "node-x", r#"{"registry":true}"#, far()).await;
+    scripted.hold("/nodes/");
+    let mut slowest = 0;
+    for _ in 0..12 {
+        holding.last_seed_ms = Some(crate::asyncrt::mono_ms());
+        let began = crate::asyncrt::mono_ms();
+        node.pass(&mut holding).await.unwrap();
+        slowest = slowest.max(crate::asyncrt::mono_ms() - began);
+        crate::asyncrt::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(
+        slowest < 300,
+        "a pass took {slowest} ms while the lease listing was stalled"
+    );
+    assert!(
+        !holding.root.gate_open(),
+        "and the seed waits for its check"
+    );
+    scripted.release("/nodes/");
+    pass_until_open(&node, &mut holding).await;
 }
 
 #[test]
