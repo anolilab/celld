@@ -2622,14 +2622,33 @@ fn select_members(
     (members, removed, live_peers)
 }
 
-/// Is every selected member still among the members a fresh selection takes,
-/// as the same process?
-fn selection_still_holds(selected: &[Member], fresh: &[Member]) -> bool {
-    selected.iter().all(|member| {
-        fresh
-            .iter()
-            .any(|now| now.node == member.node && now.generation == member.generation)
+/// Is a selected member still the same live process, and not draining? Read
+/// from a fresh capacity listing, which is a store read and so happens outside
+/// the transition guard.
+fn member_still_published_eligible(
+    member: &Member,
+    fresh: &[celld_logic::CapacityPeer],
+    now: u64,
+) -> bool {
+    fresh.iter().any(|peer| {
+        peer.node == member.node
+            && peer.generation == member.generation
+            && !peer.draining
+            && peer.expires_ms > now
     })
+}
+
+/// Does the local ledger still allow this member: its process has not failed
+/// an append that is still sitting out, and it is not quarantined? Local state
+/// only, so it can run under the transition guard.
+fn member_locally_eligible(
+    health: &celld_logic::log_evict::FollowerHealth,
+    member: &Member,
+    now: u64,
+    mono: u64,
+) -> bool {
+    !health.failed_recently(&member.node, &member.generation, now)
+        && !health.quarantined(&member.node, mono)
 }
 
 /// The boot ladder's wait between recovery attempts. A refusal because the
@@ -5899,6 +5918,25 @@ impl NodeLogManager {
             lease_ttl_ms,
         );
         let mono = mono_ms();
+        // The peers were read before this pass waits for the transition and
+        // the drain barrier. Read them again here, outside the guard (the
+        // guard is what a graceful close needs, and a store read can be slow),
+        // and end the pass if a selected member started draining or its lease
+        // lapsed. Each selected member is checked on its own: another peer
+        // recovering or a different read order does not matter, because the
+        // pass publishes the members it selected.
+        if !members.is_empty() {
+            let fresh = self.ownership.read_capacity_peers().await?;
+            let now = crate::ownership_store::now_ms();
+            let health = self.health.lock().unwrap();
+            if !members.iter().all(|member| {
+                member_still_published_eligible(member, &fresh, now)
+                    && member_locally_eligible(&health, member, now, mono_ms())
+            }) {
+                info!("a recruited peer became ineligible; selecting again");
+                return Ok(());
+            }
+        }
         // Peer discovery is intentionally outside the transition guard.
         // Recheck the lifecycle after that await, then keep the snapshot,
         // publication, and successor installation in one critical section.
@@ -5980,22 +6018,19 @@ impl NodeLogManager {
         if self.task_stop.is_stopped() {
             return Ok(());
         }
-        // The peers were read before this pass waited for the transition and
-        // for the drain barrier. A member that has since started draining, or
-        // whose connection failed meanwhile, must not be published: the pass
-        // ends and the next tick selects again.
-        let fresh = self.ownership.read_capacity_peers().await?;
-        let (fresh_members, _, _) = select_members(
-            &self.health.lock().unwrap(),
-            &self.node,
-            fresh,
-            crate::ownership_store::now_ms(),
-            mono_ms(),
-            lease_ttl_ms,
-        );
-        if !selection_still_holds(&members, &fresh_members) {
-            info!("a recruited peer became ineligible before the ensemble was published; selecting again");
-            return Ok(());
+        // Under the guard only local state is consulted: a member whose
+        // process failed an append while this pass waited must not be
+        // published. The next tick selects again.
+        {
+            let health = self.health.lock().unwrap();
+            let now = crate::ownership_store::now_ms();
+            if !members
+                .iter()
+                .all(|member| member_locally_eligible(&health, member, now, mono_ms()))
+            {
+                info!("a recruited peer became ineligible before the ensemble was published; selecting again");
+                return Ok(());
+            }
         }
         transition.write(Some(log_to_wire(&record, false))).await?;
         info!(
@@ -7572,25 +7607,73 @@ mod seal_absent_log_tests {
     }
 
     #[test]
-    fn a_selected_member_that_became_ineligible_aborts_the_publish() {
+    fn each_selected_member_is_checked_on_its_own() {
         let now = crate::ownership_store::now_ms();
-        let health = celld_logic::log_evict::FollowerHealth::default();
-        let take = |health: &celld_logic::log_evict::FollowerHealth, draining_b: bool| {
-            let mut a = peer("a", "ga", false);
-            let mut b = peer("b", "gb", draining_b);
-            a.expires_ms = now + 10_000;
-            b.expires_ms = now + 10_000;
-            select_members(health, "me", vec![a, b], now, 0, 10_000).0
+        let live = |node: &str, generation: &str, draining: bool| {
+            let mut peer = peer(node, generation, draining);
+            peer.expires_ms = now + 10_000;
+            peer
         };
-        let selected = take(&health, false);
+        let health = celld_logic::log_evict::FollowerHealth::default();
+        let selected = select_members(
+            &health,
+            "me",
+            vec![live("a", "ga", false), live("b", "gb", false)],
+            now,
+            0,
+            10_000,
+        )
+        .0;
         assert_eq!(selected.len(), 2);
-        assert!(selection_still_holds(&selected, &take(&health, false)));
-        // One member started draining after it was selected.
-        assert!(!selection_still_holds(&selected, &take(&health, true)));
-        // Or its process failed an append meanwhile.
-        let mut failed = health.clone();
-        failed.append_failed("a", "ga", now, now + 10_000);
-        assert!(!selection_still_holds(&selected, &take(&failed, false)));
+        // More peers are eligible than slots, and the read order changed: a
+        // recovered earlier peer comes first. The selected members are still
+        // eligible, so nothing aborts.
+        let reordered = vec![
+            live("c", "gc", false),
+            live("b", "gb", false),
+            live("a", "ga", false),
+        ];
+        assert!(selected
+            .iter()
+            .all(|member| member_still_published_eligible(member, &reordered, now)));
+        // One started draining, one restarted as another process, one lapsed.
+        assert!(!member_still_published_eligible(
+            &selected[0],
+            &[live("a", "ga", true)],
+            now
+        ));
+        assert!(!member_still_published_eligible(
+            &selected[0],
+            &[live("a", "ga2", false)],
+            now
+        ));
+        let mut lapsed = live("a", "ga", false);
+        lapsed.expires_ms = now - 1;
+        assert!(!member_still_published_eligible(
+            &selected[0],
+            &[lapsed],
+            now
+        ));
+    }
+
+    #[test]
+    fn a_member_that_recovered_from_its_sit_out_does_not_abort_the_publish() {
+        let now = crate::ownership_store::now_ms();
+        let member = Member {
+            node: "a".into(),
+            addr: "a:1".into(),
+            generation: "ga".into(),
+            lease_expires_ms: now + 10_000,
+            lease_ttl_ms: 10_000,
+        };
+        let mut health = celld_logic::log_evict::FollowerHealth::default();
+        health.append_failed("a", "ga", now, now + 1_000);
+        // Still sitting out: the publish aborts.
+        assert!(!member_locally_eligible(&health, &member, now, 0));
+        // Its sit-out has passed (or it is another process): it publishes.
+        assert!(member_locally_eligible(&health, &member, now + 1_000, 0));
+        health.append_failed("a", "ga-old", now, now + 60_000);
+        assert!(member_locally_eligible(&health, &member, now + 1_000, 0));
     }
 
     #[test]

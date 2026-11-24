@@ -180,7 +180,9 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 fn recruited_after_failing(log: &str) -> Vec<(String, String, f64)> {
     // Half a second short of the lifetime, for the clocks of two log lines.
     let within_s = TTL_MS as f64 / 1000.0 - 0.5;
-    let mut failed: std::collections::BTreeMap<String, (String, f64)> = Default::default();
+    // Per node and generation: a late failure of an old process must not hide
+    // the failure of the current one.
+    let mut failed: std::collections::BTreeMap<(String, String), f64> = Default::default();
     let mut recruited = Vec::new();
     for line in log.lines() {
         let Some(at) = seconds_of(line) else {
@@ -190,7 +192,7 @@ fn recruited_after_failing(log: &str) -> Vec<(String, String, f64)> {
             if let (Some(node), Some(generation)) =
                 (field(line, "member"), field(line, "generation"))
             {
-                failed.insert(node.to_string(), (generation.to_string(), at));
+                failed.insert((node.to_string(), generation.to_string()), at);
             }
         } else if line.contains("log ensemble open") {
             let Some(listed) = line.split("generations=[").nth(1) else {
@@ -208,8 +210,8 @@ fn recruited_after_failing(log: &str) -> Vec<(String, String, f64)> {
                 let [node, generation] = pair else {
                     continue;
                 };
-                if let Some((held, since)) = failed.get(*node) {
-                    if held == generation && at - since < within_s {
+                if let Some(since) = failed.get(&(node.to_string(), generation.to_string())) {
+                    if at - since < within_s {
                         recruited.push((node.to_string(), generation.to_string(), at - since));
                     }
                 }
