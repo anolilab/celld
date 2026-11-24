@@ -108,7 +108,20 @@ impl Fleet {
             Classifier::from_env(),
         )
         .await;
-        let dir = tempfile::TempDir::new().expect("create temp dir");
+        // `CELLD_REG_LOGS` names a directory to keep the nodes' directories and
+        // logs in; without it they go to a temporary one that is removed at the end.
+        let dir = match env_text("CELLD_REG_LOGS") {
+            Some(base) => {
+                std::fs::create_dir_all(&base).expect("create the log directory");
+                let mut dir = tempfile::Builder::new()
+                    .prefix(&format!("{run}-"))
+                    .tempdir_in(base)
+                    .expect("create the node directory");
+                dir.disable_cleanup(true);
+                dir
+            }
+            None => tempfile::TempDir::new().expect("create temp dir"),
+        };
         // The internal routes ask for the operator token; the public ones ignore it.
         let mut token =
             reqwest::header::HeaderValue::from_str(&format!("Bearer {}", support::OPERATOR_TOKEN))
