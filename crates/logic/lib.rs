@@ -726,6 +726,9 @@ pub struct State {
     confirming_cells: BTreeSet<CellId>,
     next_op: OpId,
     next_timer_generation: u64,
+    /// Events applied since the last full invariant check; see
+    /// `validate_amortized`.
+    events_since_validate: usize,
     cells: BTreeMap<CellId, Cell>,
     request_cells: BTreeMap<RequestId, CellId>,
     /// Local routes handed to the executor but not yet reported complete.
@@ -913,6 +916,7 @@ impl State {
             confirming_cells: BTreeSet::new(),
             next_op: 1,
             next_timer_generation: 1,
+            events_since_validate: 0,
             cells: BTreeMap::new(),
             request_cells: BTreeMap::new(),
             active_requests: BTreeMap::new(),
@@ -1307,6 +1311,21 @@ impl State {
             ));
         }
         Ok(())
+    }
+
+    /// The invariant check for debug builds. `validate` walks every cell, so
+    /// running it after each event made a burst of N cells cost O(N^2) on the
+    /// core thread, which starved the lease timer it also runs. It runs every
+    /// event while the state is small, so a small test still fails at the
+    /// event that broke the invariant, and every `cells / 64` events beyond
+    /// that, which keeps the cost per event bounded.
+    pub fn validate_amortized(&mut self) -> Result<(), String> {
+        self.events_since_validate += 1;
+        if self.events_since_validate < self.cells.len() / 64 {
+            return Ok(());
+        }
+        self.events_since_validate = 0;
+        self.validate()
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -7352,7 +7371,7 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
     state.pump_release(&mut effects);
     state.pump_swap(&mut effects);
     if cfg!(debug_assertions) {
-        state.validate().expect("state invariant");
+        state.validate_amortized().expect("state invariant");
     }
     state.arm_operation_deadlines(&mut effects);
     effects

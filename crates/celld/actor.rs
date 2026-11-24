@@ -3157,7 +3157,9 @@ impl Actor {
             }
             self.settle_handoff_accepts();
             if self.validate_invariants {
-                self.state.validate().expect("celld core invariant");
+                self.state
+                    .validate_amortized()
+                    .expect("celld core invariant");
             }
         }
     }
