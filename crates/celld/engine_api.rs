@@ -574,6 +574,60 @@ pub(crate) fn durable_object_id_hmac(key: &[u8; 32], input: &[u8]) -> hmac::Hmac
     mac
 }
 
+/// The MAC domain of an id that a session minted: its input is this byte and
+/// then the payload, so no name id and no older random id verifies under it,
+/// and a build that knows only the plain domain rejects a tagged id.
+const TAGGED_DOMAIN: u8 = b't';
+
+/// What an id's MAC says about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdKind {
+    /// A name id, or an older random id: the plain domain.
+    Plain,
+    /// An id minted by a session: 8 bytes of session tag, then the session's
+    /// counter encrypted under the session's key (see `session::encrypt_counter`).
+    Tagged { tag: [u8; 8], block: [u8; 8] },
+}
+
+fn tagged_mac(key: &[u8; 32], payload: &[u8]) -> hmac::Hmac<sha2::Sha256> {
+    let mut input = Vec::with_capacity(1 + payload.len());
+    input.push(TAGGED_DOMAIN);
+    input.extend_from_slice(payload);
+    durable_object_id_hmac(key, &input)
+}
+
+/// The id a session mints: the 8-byte session tag, the 8-byte encrypted
+/// counter `block`, then the 16-byte MAC of the tagged domain.
+pub(crate) fn tagged_object_id(key: &[u8; 32], tag: [u8; 8], block: [u8; 8]) -> [u8; 32] {
+    use hmac::Mac;
+    let mut id = [0_u8; 32];
+    id[..8].copy_from_slice(&tag);
+    id[8..16].copy_from_slice(&block);
+    let digest = tagged_mac(key, &id[..16]).finalize().into_bytes();
+    id[16..].copy_from_slice(&digest[..16]);
+    id
+}
+
+/// The domain under which `id` verifies, or `None` when it verifies under
+/// neither. Every entry point that turns an id into a scope accepts both
+/// domains.
+pub(crate) fn verify_object_id(key: &[u8; 32], id: &[u8; 32]) -> Option<IdKind> {
+    use hmac::Mac;
+    if durable_object_id_hmac(key, &id[..16])
+        .verify_truncated_left(&id[16..])
+        .is_ok()
+    {
+        return Some(IdKind::Plain);
+    }
+    tagged_mac(key, &id[..16])
+        .verify_truncated_left(&id[16..])
+        .ok()?;
+    Some(IdKind::Tagged {
+        tag: id[..8].try_into().expect("8 bytes"),
+        block: id[8..16].try_into().expect("8 bytes"),
+    })
+}
+
 /// Ids already derived on this thread, keyed by namespace and name.
 ///
 /// `getByName` costs two HMAC-SHA256 rounds, and a profile of `/c/hello`

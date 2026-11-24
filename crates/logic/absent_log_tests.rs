@@ -14,6 +14,7 @@ fn lease(expires_ms: u64, log_state: Option<LogState>) -> NodeLeaseRecord {
         peer_protocol: 1,
         generation: "g".into(),
         log_state,
+        tags: Vec::new(),
         etag: "lease-etag".into(),
     }
 }
@@ -39,6 +40,7 @@ fn takeover(lease: NodeLeaseRecord) -> Vec<Effect> {
         result: Ok(Some(OwnerRecord {
             node: Some("dead".into()),
             epoch: 7,
+            by: None,
             etag: "owner-etag".into(),
         })),
     });
@@ -101,6 +103,7 @@ fn an_absent_lease_is_still_proof_that_nothing_was_acknowledged() {
         result: Ok(Some(OwnerRecord {
             node: Some("dead".into()),
             epoch: 7,
+            by: None,
             etag: "owner-etag".into(),
         })),
     });
@@ -157,6 +160,7 @@ fn a_session_whose_lease_was_sealed_under_it_fences_itself() {
             peer_protocol: 1,
             generation: "g".into(),
             log_state: Some(LogState::Sealed),
+            tags: Vec::new(),
             etag: "sealed-etag".into(),
         })),
     });

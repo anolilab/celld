@@ -1662,6 +1662,36 @@ impl Bucket {
         }
     }
 
+    /// Whether the store hands the same token for the same bytes written
+    /// twice: create X, replace it by Y, then replace Y by X, and compare the
+    /// first token with the last. A store whose token is a hash of the body
+    /// does, and a repeated body then gives a stale writer a token that holds
+    /// again. celld never writes one body twice, so this is a report, not a
+    /// violation.
+    pub async fn probe_token_repeats(&self) -> anyhow::Result<bool> {
+        let key = Self::probe_key("token");
+        let result = async {
+            let first = self
+                .put_cas(&key, b"probe-x".to_vec(), None)
+                .await?
+                .context("the token probe could not create its object")?;
+            let second = self
+                .put_cas(&key, b"probe-y".to_vec(), Some(&first))
+                .await?
+                .context("the token probe could not replace its object")?;
+            let third = self
+                .put_cas(&key, b"probe-x".to_vec(), Some(&second))
+                .await?
+                .context("the token probe could not replace its object again")?;
+            anyhow::Ok(first == third)
+        }
+        .await;
+        if let Err(error) = self.delete(&key).await {
+            tracing::warn!(%error, "the token probe could not delete its object");
+        }
+        result
+    }
+
     /// The four steps, against one key. Steps 2 and 4 must be rejected;
     /// a store that applies either one cannot fence.
     async fn cas_contract(&self, key: &str) -> anyhow::Result<StorageProbeVerdict> {

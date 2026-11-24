@@ -4542,7 +4542,26 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         .tcp_nodelay(true)
         .build()
         .unwrap();
-    let resume_generation = celld::runtime::take_clean_reload_generation(&data_dir, &node);
+    // An unsupported value fails before the certificate of a preserved
+    // restart is consumed.
+    let lazy_birth = celld::session::Mode::from_env()?;
+    celld::session::refuse_test_knobs()?;
+    let clean_reload = celld::runtime::take_clean_reload(&data_dir, &node);
+    let resume_generation = clean_reload
+        .as_ref()
+        .map(|reload| reload.generation.clone());
+    if lazy_birth != celld::session::Mode::Off {
+        let reloaded = clean_reload
+            .as_ref()
+            .and_then(|reload| reload.session.clone())
+            .unwrap_or_default();
+        let session =
+            celld::session::install(celld::session::Session::new(lazy_birth, &reloaded.tags)?);
+        for (cell, tag) in &reloaded.cells {
+            let epoch = reloaded.epochs.get(cell).copied().unwrap_or(0);
+            session.note_resumed(cell, tag, epoch);
+        }
+    }
     let clean_reload_candidate = resume_generation.is_some();
     let drain_pins = DrainPinRegistry::default();
     let actor = Actor::from_environment_with_services(
@@ -4721,6 +4740,20 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             owner.start_background(follower.clone());
             durability_owner.install_runtime(owner);
         }
+    }
+    // The session header is created after the predecessor is recovered and
+    // before the lease that carries its tag is installed.
+    if let Some(session) = celld::session::current() {
+        if let Ownership::Bucket(bucket_ownership) = &actor.ownership {
+            celld::session::create_header(
+                &bucket_ownership.bucket_client(),
+                session,
+                &node,
+                &process_generation,
+            )
+            .await?;
+        }
+        session.establish();
     }
     let mut durability_owner = durability_owner.select();
     let (do_call_tx, mut do_call_rx) = mpsc::unbounded_channel();
@@ -5885,6 +5918,49 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         flush_connections,
     )
     .await;
+    // A preserved restart under records that name a session: before the log is
+    // sealed, replace the oldest carried tag in the records of the cells that
+    // still have it, so the successor's set holds every tag in use. A failure
+    // leaves no marker, and the next process starts by the normal path.
+    let mut reload_session: Option<celld::runtime::ReloadSession> = None;
+    let mut reload_session_ok = true;
+    if shutdown_mode == ShutdownMode::Preserve && drained {
+        if let (Some(session), Some(bucket_ownership)) =
+            (celld::session::current(), ready_ownership.as_ref())
+        {
+            let prepared = match before_process_deadline(process_deadline, app.presence()).await {
+                Some(Some(presence)) => {
+                    let prepared = before_process_deadline(
+                        process_deadline,
+                        celld::session::prepare_reload(session, bucket_ownership, &presence.cells),
+                    )
+                    .await;
+                    prepared.ok_or("timeout while naming the session in the cell records")
+                }
+                Some(None) => Err("no snapshot of the resident cells"),
+                None => Err("timeout while reading the resident cells"),
+            };
+            match prepared {
+                Ok(Ok(prepared)) => reload_session = Some(prepared),
+                Ok(Err(error)) => {
+                    reload_session_ok = false;
+                    tracing::warn!(
+                        event = "clean_reload_abandoned",
+                        %error,
+                        "could not name the session in the records of the resident cells"
+                    );
+                }
+                Err(reason) => {
+                    reload_session_ok = false;
+                    tracing::warn!(
+                        event = "clean_reload_abandoned",
+                        reason,
+                        "could not name the session in the records of the resident cells"
+                    );
+                }
+            }
+        }
+    }
     // The graceful-shutdown drain point: seal our node-log record so the
     // next incarnation starts with no gather. Guarded inside — it seals
     // only when every shipped frame is bucket-covered.
@@ -5906,7 +5982,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // Preparation captures and uploads each stopped cell's exact database
     // position. A failed proof abandons the marker and leaves normal startup
     // to reconcile the preserved files against bucket coverage.
-    if clean_reload_is_eligible(durability_quiesced, drained, shutdown_mode) {
+    if reload_session_ok && clean_reload_is_eligible(durability_quiesced, drained, shutdown_mode) {
         let presence = before_process_deadline(process_deadline, app.presence()).await;
         let prepared = match (&app.runtime, presence) {
             (Some(runtime), Some(Some(presence))) => {
@@ -5928,6 +6004,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         &data_dir,
                         &clean_reload_node,
                         &process_generation,
+                        reload_session.as_ref(),
                     ) {
                         Ok(()) => tracing::info!(
                             event = "clean_reload_prepared",

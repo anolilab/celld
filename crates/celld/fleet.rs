@@ -357,6 +357,15 @@ async fn diagnose_checks(
     // A store that cannot fence makes every peer result moot, so the
     // storage verdict comes before the fleet walk.
     probe_storage(out, bucket, read_only).await?;
+    if !read_only {
+        out.row(&match bucket.probe_token_repeats().await {
+            Ok(repeats) => Check::ok(
+                "cas token repeats for equal bytes",
+                if repeats { "yes" } else { "no" },
+            ),
+            Err(error) => Check::skip("cas token repeats for equal bytes", format!("{error:#}")),
+        })?;
+    }
 
     let enumerated = peers.is_empty();
     let peers = if enumerated {

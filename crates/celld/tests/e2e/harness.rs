@@ -354,6 +354,15 @@ impl Server {
             .unwrap_or_else(|reason| panic!("{reason}"));
     }
 
+    /// Set (or, with `None`, remove) an environment variable of the next
+    /// start.
+    pub fn set_env(&mut self, key: &str, value: Option<&str>) {
+        self.env.retain(|(name, _)| name != key);
+        if let Some(value) = value {
+            self.env.push((key.to_string(), value.to_string()));
+        }
+    }
+
     /// A GET whose status the test checks itself.
     pub async fn get_status(&self, path: &str) -> reqwest::StatusCode {
         self.client

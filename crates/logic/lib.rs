@@ -36,6 +36,7 @@ pub mod registry_gate;
 pub mod restore;
 pub mod routing;
 pub mod schedule;
+pub mod session;
 pub mod sqlite;
 pub mod sweep;
 pub mod wake;
@@ -887,6 +888,20 @@ pub struct State {
     memory_headroom: bool,
     /// Which resource is holding the latch, for the effect the shell logs.
     shed_reason: Option<&'static str>,
+    /// The session tags of this process and the reader of the tag in an id.
+    /// `None` is a process that writes no session: every record is compared
+    /// by node name, as an older binary does.
+    session: Option<session::SessionTags>,
+    /// Reads the tag in the id of a cell. Set on every node that verifies
+    /// tagged ids, with or without a session of its own: a tagged id belongs
+    /// to the session that minted it at epoch 1, whoever else claims it.
+    id_tag: Option<session::IdTagOf>,
+    /// Whether the id of a cell is this process's own and names a counter it
+    /// never issued: such a cell is never claimed.
+    id_unissued: Option<fn(&str) -> bool>,
+    /// The tag and epoch of the record of each cell this process resumed in a
+    /// preserved restart. A predecessor's tag names this process only here.
+    resumed: BTreeMap<CellId, (String, Epoch)>,
 }
 
 impl State {
@@ -953,7 +968,68 @@ impl State {
             shedding: false,
             memory_headroom: false,
             shed_reason: None,
+            session: None,
+            id_tag: None,
+            id_unissued: None,
+            resumed: BTreeMap::new(),
         }
+    }
+
+    /// The cells a preserved restart resumed, with the tag and epoch of each
+    /// cell's record.
+    pub fn set_resumed(&mut self, resumed: BTreeMap<CellId, (String, Epoch)>) {
+        self.resumed = resumed;
+    }
+
+    /// Run as a session: `tags` are written in this process's records and
+    /// carried in its lease, and `id_tag` reads the tag of a cell's id.
+    pub fn set_session(&mut self, tags: session::SessionTags) {
+        self.session = Some(tags);
+    }
+
+    /// Read the tag of a cell's id with `id_tag`, so the first record of a
+    /// tagged id starts at the epoch its minting session does not share.
+    pub fn set_id_tag(&mut self, id_tag: session::IdTagOf) {
+        self.id_tag = Some(id_tag);
+    }
+
+    /// Refuse to claim a cell for which `unissued` answers true.
+    pub fn set_id_unissued(&mut self, unissued: fn(&str) -> bool) {
+        self.id_unissued = Some(unissued);
+    }
+
+    /// Whether `record` names this process, or a predecessor whose cell this
+    /// process resumed in a preserved restart.
+    fn names_this_process(&self, cell: &str, record: &OwnerRecord) -> bool {
+        record.node.as_deref() == Some(self.node.as_str())
+            && self.session.as_ref().is_none_or(|tags| {
+                record.by.as_deref().is_none_or(|by| {
+                    tags.is_own(Some(by))
+                        || self
+                            .resumed
+                            .get(cell)
+                            .is_some_and(|(tag, epoch)| tag == by && *epoch == record.epoch)
+                })
+            })
+    }
+
+    /// Whether `record` is a write of this very process. A second process of
+    /// one node never counts its predecessor's write as its own, and under a
+    /// session every write carries `by`, so a record without it is a delayed
+    /// write of an older binary or of a process that ran without a session.
+    fn written_by_this_process(&self, record: &OwnerRecord) -> bool {
+        record.node.as_deref() == Some(self.node.as_str())
+            && self
+                .session
+                .as_ref()
+                .is_none_or(|tags| record.by.as_deref() == Some(tags.own()))
+    }
+
+    /// The epoch of the first record of `cell`.
+    fn first_record_epoch(&self, cell: &str) -> Epoch {
+        let id_tag = self.id_tag.and_then(|id_tag| id_tag(cell));
+        let own = self.session.as_ref().map(session::SessionTags::own);
+        session::first_record_epoch(own, id_tag.as_deref())
     }
 
     pub fn node(&self) -> &str {
@@ -2137,6 +2213,7 @@ impl State {
         effects: &mut Vec<Effect>,
     ) {
         if self.confirming {
+            self.resumed.clear();
             self.confirm_local_cells(result, effects);
             return;
         }
@@ -2145,16 +2222,31 @@ impl State {
         }
         let Ok(mut cells) = result else {
             self.resuming = false;
+            self.resumed.clear();
             return;
         };
         // A preserved eviction copy is not a resumable epoch.
         cells.retain(|cell| cell.live);
+        // A process that runs as a session resumes a cell only at the epoch
+        // its predecessor's certificate named, so that it knows the tag of the
+        // record it serves under and carries it in its lease. Any other cell
+        // takes the normal claim path.
+        if self.session.is_some() {
+            cells.retain(|cell| {
+                self.resumed
+                    .get(&cell.id)
+                    .is_some_and(|(_, epoch)| *epoch == cell.epoch)
+            });
+        }
         cells.sort();
         cells.dedup();
         if cells.len() > self.config.max_resident || !self.cells.is_empty() {
             self.resuming = false;
+            self.resumed.clear();
             return;
         }
+        let resumed: BTreeSet<&CellId> = cells.iter().map(|cell| &cell.id).collect();
+        self.resumed.retain(|id, _| resumed.contains(id));
         for local in cells {
             let mut cell = Cell {
                 resume_demand: true,
@@ -2439,6 +2531,12 @@ impl State {
             // state was recovered before this install (the engine's
             // startup order), so None is the truth, not a reset.
             log_state: None,
+            // The tags this process answers for: its own and, until the
+            // resume is decided, the ones its predecessor's certificate named.
+            tags: self
+                .session
+                .as_ref()
+                .map_or_else(Vec::new, session::SessionTags::all),
             etag: String::new(),
         };
         let pending = PendingNodeLease {
@@ -2800,9 +2898,21 @@ impl State {
                     && record.expires_ms > now_ms
                     && pending.spec.resume_generation.as_deref()
                         == Some(record.generation.as_str());
+                if !pending.resume_local {
+                    // A rejected resume (a stale certificate, another
+                    // generation) carries no predecessor's tag and resumes no
+                    // cell, before any lease says otherwise.
+                    pending.desired.tags.truncate(1);
+                    self.resumed.clear();
+                }
                 self.begin_node_lease_write(pending, CasGuard::Match(record.etag), effects);
             }
-            Ok(None) => self.begin_node_lease_write(pending, CasGuard::Absent, effects),
+            Ok(None) => {
+                let mut pending = pending;
+                pending.desired.tags.truncate(1);
+                self.resumed.clear();
+                self.begin_node_lease_write(pending, CasGuard::Absent, effects);
+            }
         }
     }
 
@@ -3142,6 +3252,7 @@ impl State {
                     // renewal carries the folded log state through
                     // unchanged.
                     log_state: prior.record.log_state,
+                    tags: prior.record.tags.clone(),
                     etag: String::new(),
                 };
                 let guard = CasGuard::Match(prior.record.etag.clone());
@@ -4274,11 +4385,9 @@ impl State {
                 // dormant at that epoch, exactly as an idle eviction does,
                 // and the next request wakes it through the usual claim.
                 let phase = match result {
-                    Ok(Some(record)) if record.node.as_deref() == Some(self.node.as_str()) => {
-                        Phase::Dormant {
-                            epoch: record.epoch,
-                        }
-                    }
+                    Ok(Some(record)) if self.names_this_process(&id, &record) => Phase::Dormant {
+                        epoch: record.epoch,
+                    },
                     _ => Phase::Inactive,
                 };
                 set_phase(&mut self.occupied, &mut cell, phase);
@@ -4299,8 +4408,7 @@ impl State {
         match result {
             Ok(Some(record))
                 if reconciling_claim.as_ref().is_some_and(|claim| {
-                    record.node.as_deref() == Some(self.node.as_str())
-                        && record.epoch == claim.epoch
+                    self.written_by_this_process(&record) && record.epoch == claim.epoch
                 }) =>
             {
                 let spec = RestoreSpec {
@@ -4389,6 +4497,10 @@ impl State {
                     .node_lease_cache
                     .get(&owner)
                     .filter(|lease| lease.deadline.live(self.now_ms, self.now_mono_ms))
+                    // A cached lease that does not carry the record's author
+                    // may predate that author's start. "The author is not
+                    // live" is decided only on a lease read after the record.
+                    .filter(|lease| session::author_live(record.by.as_deref(), &lease.record.tags))
                     .cloned();
                 if let Some(lease) = cached {
                     self.apply_node_lease_result(
@@ -4419,13 +4531,17 @@ impl State {
                     });
                 }
             }
+            Ok(None) if self.id_unissued.is_some_and(|unissued| unissued(&id)) => {
+                set_phase(&mut self.occupied, &mut cell, Phase::Inactive);
+                self.finish_requests(&id, &mut cell, Err(RequestError::ResolveFailed), effects);
+            }
             Ok(None) => {
                 self.place_unowned(
                     &id,
                     &mut cell,
                     Claim {
                         guard: CasGuard::Absent,
-                        epoch: 1,
+                        epoch: self.first_record_epoch(&id),
                         takeover: false,
                         prior: None,
                         reconciles,
@@ -4648,6 +4764,7 @@ impl State {
                 if lease.expires_ms > issued_ms
                     && !lease.addr.is_empty()
                     && record.node.as_deref() == Some(lease.node.as_str())
+                    && session::author_live(record.by.as_deref(), &lease.tags)
                     && lease.peer_protocol != self.config.peer_protocol =>
             {
                 set_phase(&mut self.occupied, cell, Phase::Inactive);
@@ -4659,6 +4776,7 @@ impl State {
             })) if lease.expires_ms > issued_ms
                 && !lease.addr.is_empty()
                 && record.node.as_deref() == Some(lease.node.as_str())
+                && session::author_live(record.by.as_deref(), &lease.tags)
                 && lease.peer_protocol == self.config.peer_protocol =>
             {
                 let node = lease.node;
@@ -4703,8 +4821,13 @@ impl State {
                 // could open a log and acknowledge into the epoch this claim
                 // supersedes. Recovery seals the absent log by compare-and-
                 // set, which fails that renewal, so the claim waits for it.
+                // A record whose author is no process that this node's lease
+                // carries was written by a predecessor of that node, which the
+                // node recovered before its own install.
                 let unrecovered = lease.as_ref().is_some_and(|lease| {
                     lease.record.log_state != Some(crate::log_tier::LogState::Sealed)
+                        && (record.node.as_deref() != Some(lease.record.node.as_str())
+                            || session::author_live(record.by.as_deref(), &lease.record.tags))
                 });
                 // An ingress-only node leaves the dead owner's log to the
                 // peer that takes the cell.
@@ -7610,6 +7733,8 @@ mod reset_tests;
 mod scripted;
 #[cfg(test)]
 mod second_release_tests;
+#[cfg(test)]
+mod session_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]

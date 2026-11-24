@@ -9,8 +9,11 @@
 //! Nothing here reads a counter to decide anything, makes a bucket request or
 //! changes a record, a lease or an id.
 //!
-//! The key of an id is the first 8 bytes of its 16-byte payload, as a number
-//! and written as 16 hex digits. Ordinary ids, D1 and KV scopes and facet
+//! The key of an id is its first 8 bytes of payload XORed with the next 8, as
+//! a number and written as 16 hex digits. (The ids of one session share their
+//! first 8 bytes, so the first half alone would give them all one key.) A
+//! binary from before this change keyed an id by its first 8 bytes alone, so
+//! samples from a rollout that mixes the two do not line up. Ordinary ids, D1 and KV scopes and facet
 //! scopes all end in `:` and 64 hex digits, so all of them have a key; only an
 //! id that this process minted can be in the minted set, and the other kinds
 //! show up in the rings only.
@@ -47,9 +50,12 @@ pub(crate) struct Claimed<'a> {
     pub ensemble: bool,
 }
 
-/// The key of an id: the first 8 bytes of its payload.
+/// The key of an id: its first 8 bytes of payload folded with the next 8. The
+/// ids of one session share their first 8 bytes (the tag), so the first half
+/// alone would give every one of them the same key.
 pub(crate) fn key_of_id(id: &[u8; 32]) -> u64 {
-    u64::from_be_bytes(id[..8].try_into().expect("a slice of 8 bytes"))
+    let word = |bytes: &[u8]| u64::from_be_bytes(bytes.try_into().expect("a slice of 8 bytes"));
+    word(&id[..8]) ^ word(&id[8..16])
 }
 
 /// The key of the id at the end of a cell scope: the text after the last `:`

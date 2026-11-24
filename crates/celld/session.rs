@@ -1,0 +1,1109 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
+//! The session of a process that runs with `CELLD_LAZY_BIRTH` other than
+//! `off`.
+//!
+//! A session is one process of one node. Its *tag* is 8 random bytes. The tag
+//! names the process in every `own.json` it writes, rides in its node lease
+//! beside the tags of a preserved restart, and starts the id of every Durable
+//! Object it mints, so an id says which session minted it. Its *header*,
+//! `fleet/sessions/<tag>.json`, is created with a create-only write before the
+//! lease is installed; the create fixes the tag as unique.
+//!
+//! With the flag `off` nothing here is installed, nothing is written, and an
+//! id is minted from random bytes as before.
+
+use crate::bucket::Bucket;
+use crate::engine_api::{
+    durable_object_id_key, namespace_key, tagged_object_id, verify_object_id, IdKind,
+};
+use anyhow::Context;
+use celld_logic::session::SessionTags;
+use celld_logic::OwnerRecord;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
+
+pub const ENV: &str = "CELLD_LAZY_BIRTH";
+
+/// Turns tagged minting on in a debug build, for tests only.
+const TEST_TAGGED_IDS: &str = "CELLD_TEST_TAGGED_IDS";
+
+/// A release build refuses to start with the test knob set, so that no
+/// deployment mints tagged ids by accident.
+pub fn refuse_test_knobs() -> anyhow::Result<()> {
+    refuse_knob(cfg!(debug_assertions), std::env::var(TEST_TAGGED_IDS).ok())
+}
+
+fn refuse_knob(debug_build: bool, value: Option<String>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        debug_build || value.is_none(),
+        "{TEST_TAGGED_IDS} is for tests of a debug build and is refused here"
+    );
+    Ok(())
+}
+
+/// How far a process takes part in session-granted births.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    Off,
+    Shadow,
+    Read,
+    On,
+}
+
+impl Mode {
+    pub fn parse(value: Option<&str>) -> anyhow::Result<Self> {
+        match value.map(str::trim) {
+            None | Some("" | "off") => Ok(Self::Off),
+            Some("shadow") => Ok(Self::Shadow),
+            Some("read") => Ok(Self::Read),
+            Some("on") => Ok(Self::On),
+            Some(other) => {
+                anyhow::bail!("{ENV} must be `off`, `shadow`, `read` or `on`, not `{other}`")
+            }
+        }
+    }
+
+    /// The mode this process runs in. Only `off` and `shadow` are available
+    /// yet: a process must not run in a mode whose rules it does not have.
+    pub fn from_env() -> anyhow::Result<Self> {
+        match Self::parse(std::env::var(ENV).ok().as_deref())? {
+            mode @ (Self::Off | Self::Shadow) => Ok(mode),
+            mode => anyhow::bail!("{ENV}={mode:?} is not supported by this build; use `shadow`"),
+        }
+    }
+}
+
+/// An id that a check refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdRefusal {
+    /// The MAC verifies under neither domain.
+    Forged,
+    /// The id names this live session and a counter it never issued.
+    Unissued,
+}
+
+pub struct Session {
+    tag: [u8; 8],
+    mode: Mode,
+    tags: SessionTags,
+    /// The key that encrypts the counter in an id. It is stored in the session
+    /// header, which nodes read and clients never see, so an id minted by this
+    /// session cannot be guessed from another id.
+    counter_key: [u8; 32],
+    /// The next counter to issue: every counter below it was issued.
+    issued: AtomicU64,
+    /// The header is written and the lease can carry the tag; minting waits
+    /// for it, so an id never names a session that no record knows.
+    established: AtomicBool,
+    /// The tag of the record of each cell this process resumed in a preserved
+    /// restart. A cell absent here is served under the process's own tag.
+    resumed: Mutex<BTreeMap<String, (String, u64)>>,
+}
+
+pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
+}
+
+impl Session {
+    /// A session with a fresh tag, after a preserved restart whose reload
+    /// marker listed `marker`.
+    pub fn new(mode: Mode, marker: &[String]) -> anyhow::Result<Self> {
+        let mut tag = [0_u8; 8];
+        getrandom::fill(&mut tag).map_err(|error| anyhow::anyhow!("session tag: {error}"))?;
+        let mut counter_key = [0_u8; 32];
+        getrandom::fill(&mut counter_key)
+            .map_err(|error| anyhow::anyhow!("session key: {error}"))?;
+        Ok(Self::with_keys(mode, tag, counter_key, marker))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_tag(mode: Mode, tag: [u8; 8], marker: &[String]) -> Self {
+        let mut counter_key = [0_u8; 32];
+        getrandom::fill(&mut counter_key).expect("secure random generation");
+        Self::with_keys(mode, tag, counter_key, marker)
+    }
+
+    fn with_keys(mode: Mode, tag: [u8; 8], counter_key: [u8; 32], marker: &[String]) -> Self {
+        Self {
+            tag,
+            mode,
+            counter_key,
+            tags: SessionTags::new(&hex(&tag), marker),
+            issued: AtomicU64::new(0),
+            established: AtomicBool::new(false),
+            resumed: Mutex::default(),
+        }
+    }
+
+    pub fn tag(&self) -> String {
+        hex(&self.tag)
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// The tags this process answers for, its own first.
+    pub fn tags(&self) -> &SessionTags {
+        &self.tags
+    }
+
+    pub fn establish(&self) {
+        self.established.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_established(&self) -> bool {
+        self.established.load(Ordering::SeqCst)
+    }
+
+    /// Whether `newUniqueId` mints tagged ids. It does not in a production
+    /// process: an older node of the same fleet rejects a tagged id, so
+    /// minting waits for a later change that starts it once every node
+    /// verifies them. Tests of the id layout turn it on with
+    /// `CELLD_TEST_TAGGED_IDS=1`.
+    pub(crate) fn minting_enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            cfg!(debug_assertions) && std::env::var(TEST_TAGGED_IDS).is_ok_and(|value| value == "1")
+        })
+    }
+
+    /// The next id of this session, or `None` before the session is
+    /// established.
+    pub(crate) fn mint(&self, key: &[u8; 32]) -> Option<[u8; 32]> {
+        if !self.is_established() {
+            return None;
+        }
+        let counter = self.issued.fetch_add(1, Ordering::SeqCst);
+        let block = encrypt_counter(&self.counter_key, counter);
+        Some(tagged_object_id(key, self.tag, block))
+    }
+
+    /// Offer the tag of the record of a cell that the predecessor's
+    /// certificate named. `tag` is empty for a record without `by`. A tag this
+    /// process does not carry is refused, so the cell is not resumed and takes
+    /// the normal claim path. The core settles which of the offered cells it
+    /// resumes in the end (see [`Self::settle_resumed`]).
+    pub fn note_resumed(&self, cell: &str, tag: &str, epoch: u64) {
+        let carried = tag.is_empty() || self.tags.all().iter().any(|carried| carried == tag);
+        if carried && tag != self.tags.own() {
+            self.resumed
+                .lock()
+                .expect("resumed cells poisoned")
+                .insert(cell.to_string(), (tag.to_string(), epoch));
+        }
+    }
+
+    /// Every cell this process resumed under a predecessor's tag, with the
+    /// tag and epoch of its record.
+    pub fn resumed_snapshot(&self) -> BTreeMap<String, (String, u64)> {
+        self.resumed.lock().expect("resumed cells poisoned").clone()
+    }
+
+    /// Keep the offered cells that the local scan found live at the offered
+    /// epoch, and none at all if the scan failed (`None`). The core resumes
+    /// no cell beyond these.
+    pub fn settle_resumed(&self, local: Option<&[celld_logic::LocalCell]>) {
+        let mut resumed = self.resumed.lock().expect("resumed cells poisoned");
+        match local {
+            Some(local) => resumed.retain(|cell, (_, epoch)| {
+                local
+                    .iter()
+                    .any(|found| found.live && found.id == *cell && found.epoch == *epoch)
+            }),
+            None => resumed.clear(),
+        }
+    }
+
+    /// Whether this process resumed `cell` under `tag` at `epoch`, and still
+    /// carries `tag`.
+    pub(crate) fn resumed_at(&self, cell: &str, tag: &str, epoch: u64) -> bool {
+        self.tags.all().iter().any(|carried| carried == tag)
+            && self
+                .resumed
+                .lock()
+                .expect("resumed cells poisoned")
+                .get(cell)
+                .is_some_and(|(resumed, at)| resumed == tag && *at == epoch)
+    }
+
+    /// A claim of `cell` wrote this process's own tag.
+    pub fn forget_resumed(&self, cell: &str) {
+        self.resumed
+            .lock()
+            .expect("resumed cells poisoned")
+            .remove(cell);
+    }
+}
+
+const FEISTEL_ROUNDS: u8 = 6;
+
+fn round(key: &[u8; 32], round: u8, half: u32) -> u32 {
+    use hmac::Mac;
+    let mut input = [0_u8; 5];
+    input[0] = round;
+    input[1..].copy_from_slice(&half.to_be_bytes());
+    let digest = crate::engine_api::durable_object_id_hmac(key, &input)
+        .finalize()
+        .into_bytes();
+    u32::from_be_bytes(digest[..4].try_into().expect("4 bytes"))
+}
+
+/// Encrypt a counter into 8 bytes with a balanced Feistel network over 32-bit
+/// halves, whose round function is HMAC-SHA-256 under `key`. It is a
+/// permutation of the 64-bit values, so distinct counters give distinct ids.
+pub fn encrypt_counter(key: &[u8; 32], counter: u64) -> [u8; 8] {
+    let (mut left, mut right) = ((counter >> 32) as u32, counter as u32);
+    for index in 0..FEISTEL_ROUNDS {
+        (left, right) = (right, left ^ round(key, index, right));
+    }
+    ((u64::from(left) << 32) | u64::from(right)).to_be_bytes()
+}
+
+/// The counter that [`encrypt_counter`] hid in `block`.
+pub fn decrypt_counter(key: &[u8; 32], block: [u8; 8]) -> u64 {
+    let value = u64::from_be_bytes(block);
+    let (mut left, mut right) = ((value >> 32) as u32, value as u32);
+    for index in (0..FEISTEL_ROUNDS).rev() {
+        (left, right) = (right ^ round(key, index, left), left);
+    }
+    (u64::from(left) << 32) | u64::from(right)
+}
+
+static SESSION: OnceLock<Session> = OnceLock::new();
+
+/// Install the session of this process. A second install is a bug.
+pub fn install(session: Session) -> &'static Session {
+    assert!(SESSION.set(session).is_ok(), "a session is installed once");
+    SESSION.get().expect("installed above")
+}
+
+pub fn current() -> Option<&'static Session> {
+    SESSION.get()
+}
+
+/// Whether `record` names this process, or a predecessor whose cell this
+/// process resumed. Without a session a record is compared by node name.
+pub(crate) fn names_this_process(node: &str, cell: &str, record: &OwnerRecord) -> bool {
+    names_with(current(), node, record, cell)
+}
+
+/// [`names_this_process`] for a given session. A predecessor's tag counts only
+/// for a cell this process resumed, and only at the epoch it resumed it at:
+/// `epoch` is the record's epoch.
+pub(crate) fn names_with(
+    session: Option<&Session>,
+    node: &str,
+    record: &OwnerRecord,
+    cell: &str,
+) -> bool {
+    if record.node.as_deref() != Some(node) {
+        return false;
+    }
+    let Some(session) = session else { return true };
+    match record.by.as_deref() {
+        None => true,
+        Some(tag) => tag == session.tags.own() || session.resumed_at(cell, tag, record.epoch),
+    }
+}
+
+static CARRIED_VERIFIED: AtomicU64 = AtomicU64::new(0);
+
+/// A read after a bucket proof found a record that names a predecessor's tag
+/// that this process carries. Counted, so a test and an operator can see that
+/// the carried set is what let the write pass.
+pub(crate) fn note_verified(record: &OwnerRecord) {
+    if let Some(session) = current() {
+        if record
+            .by
+            .as_deref()
+            .is_some_and(|by| by != session.tags.own())
+        {
+            CARRIED_VERIFIED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The counters of a session, for `/state`; none without a session.
+pub(crate) fn counters_json() -> Option<serde_json::Value> {
+    let session = current()?;
+    Some(serde_json::json!({
+        "tag": session.tag(),
+        "verified_under_carried_tag": CARRIED_VERIFIED.load(Ordering::Relaxed),
+    }))
+}
+
+/// Whether `record` names this process at `epoch`: the owner check of epoch
+/// GC, which may delete only as the owner.
+pub(crate) fn owns_epoch(
+    session: Option<&Session>,
+    node: &str,
+    cell: &str,
+    epoch: u64,
+    record: Option<&OwnerRecord>,
+) -> bool {
+    record.is_some_and(|record| names_with(session, node, record, cell) && record.epoch == epoch)
+}
+
+/// What a session makes of an id that verified as `kind`.
+pub(crate) fn check_issued(session: Option<&Session>, kind: IdKind) -> Result<IdKind, IdRefusal> {
+    // Only an id of this session's own tag is judged here. An id of another
+    // session's tag needs that session's header key to read its counter, and
+    // what to do with one is decided on the standard path, not at an entry
+    // point: it is accepted as it was before.
+    if let (Some(session), IdKind::Tagged { tag, block }) = (session, kind) {
+        let counter = decrypt_counter(&session.counter_key, block);
+        if tag == session.tag && counter >= session.issued.load(Ordering::SeqCst) {
+            return Err(IdRefusal::Unissued);
+        }
+    }
+    Ok(kind)
+}
+
+/// Check an id as an entry point that turns an id into a scope must: it
+/// verifies under the plain or the tagged domain, and an id with this
+/// session's tag names a counter that the session issued.
+pub(crate) fn check_id(
+    session: Option<&Session>,
+    key: &[u8; 32],
+    id: &[u8; 32],
+) -> Result<IdKind, IdRefusal> {
+    let kind = verify_object_id(key, id).ok_or(IdRefusal::Forged)?;
+    check_issued(session, kind)
+}
+
+static NAMESPACES: RwLock<Option<HashMap<String, BTreeSet<[u8; 32]>>>> = RwLock::new(None);
+
+/// Let the claim path read the MAC domain of an id of `class`, which the
+/// script `script` declares.
+pub(crate) fn register_class(script: &str, class: &str) {
+    let key = durable_object_id_key(&namespace_key(script, class));
+    NAMESPACES
+        .write()
+        .expect("namespaces poisoned")
+        .get_or_insert_default()
+        .entry(class.to_string())
+        .or_default()
+        .insert(key);
+}
+
+/// The tag in the id of a cell scope `Class:<64 hex digits>`, for the claim
+/// path. `None` when the class is not declared here or the id verifies in
+/// the plain domain only. A process without a session reads it too, so it
+/// never claims a tagged id at epoch 1. The class
+/// in the scope gives the key, so no header is read to decide.
+pub(crate) fn id_tag_of_scope(scope: &str) -> Option<String> {
+    tag_of_scope(scope)
+}
+
+/// Whether `scope` is the id of this process's own session with a counter that
+/// the session never issued. A ready-made scope that a peer placed here must
+/// not create the first record of such a cell. An id of another session's tag
+/// needs that session's key to be judged, which the chunk rules do later.
+pub(crate) fn scope_unissued(scope: &str) -> bool {
+    scope_unissued_by(current(), scope)
+}
+
+fn scope_unissued_by(session: Option<&Session>, scope: &str) -> bool {
+    let Some(session) = session else {
+        return false;
+    };
+    match kind_of_scope(scope) {
+        Some(IdKind::Tagged { tag, block }) => {
+            tag == session.tag
+                && decrypt_counter(&session.counter_key, block)
+                    >= session.issued.load(Ordering::SeqCst)
+        }
+        _ => false,
+    }
+}
+
+fn tag_of_scope(scope: &str) -> Option<String> {
+    match kind_of_scope(scope)? {
+        IdKind::Tagged { tag, .. } => Some(hex(&tag)),
+        IdKind::Plain => None,
+    }
+}
+
+fn kind_of_scope(scope: &str) -> Option<IdKind> {
+    let (class, id) = scope.split_once(':')?;
+    let id = crate::engine_api::decode_durable_object_id(id)?;
+    let namespaces = NAMESPACES.read().expect("namespaces poisoned");
+    let keys = namespaces.as_ref()?.get(class)?;
+    keys.iter().find_map(|key| verify_object_id(key, &id))
+}
+
+#[derive(Serialize, Deserialize)]
+struct HeaderWire {
+    node: String,
+    generation: String,
+    mode: Mode,
+    state: String,
+    chunks: u64,
+    rev: u64,
+    /// The key that encrypts the counters of this session's ids, as hex.
+    key: String,
+}
+
+pub(crate) fn header_key(tag: &str) -> String {
+    format!("fleet/sessions/{tag}.json")
+}
+
+/// Create the header of `session` with a create-only write. An answer that is
+/// an error is settled by a read: the header must name this node and
+/// generation, or the process does not start. The tag cannot change after the
+/// lease carries it, and a collision of 8 random bytes is not an event to plan
+/// for.
+pub async fn create_header(
+    bucket: &Bucket,
+    session: &Session,
+    node: &str,
+    generation: &str,
+) -> anyhow::Result<()> {
+    let key = header_key(&session.tag());
+    let wire = HeaderWire {
+        node: node.to_string(),
+        generation: generation.to_string(),
+        mode: session.mode,
+        state: "open".to_string(),
+        chunks: 0,
+        rev: 0,
+        key: hex(&session.counter_key),
+    };
+    let body = serde_json::to_vec(&wire)?;
+    let ours = |bytes: &[u8]| {
+        serde_json::from_slice::<HeaderWire>(bytes)
+            .is_ok_and(|found| found.node == node && found.generation == generation)
+    };
+    match bucket.put_cas(&key, body, None).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => {
+            let found = bucket.get(&key).await?;
+            anyhow::ensure!(
+                found.is_some_and(|(bytes, _)| ours(&bytes)),
+                "the session header {key} already exists and is not this process's"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let found = bucket
+                .get(&key)
+                .await
+                .with_context(|| format!("read back {key} after: {error:#}"))?;
+            anyhow::ensure!(
+                found.is_some_and(|(bytes, _)| ours(&bytes)),
+                "could not create the session header {key}: {error:#}"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Name the session in the records of a preserved restart's cells, before the
+/// log is sealed.
+///
+/// The record of every resident cell is read, and the certificate lists the
+/// tag that record really carries (empty for a record without `by`). The
+/// successor carries those tags, at most [`celld_logic::session::CARRIED_BOUND`]
+/// with its own. When this process's set is full, every cell whose record has
+/// the oldest tag is re-tagged to this process's own tag, by one conditional
+/// write that changes `by` and nothing else. Any failure is an error and no
+/// certificate is written.
+pub async fn prepare_reload(
+    session: &Session,
+    ownership: &crate::ownership_store::BucketOwnership,
+    cells: &[celld_logic::PresenceCell],
+) -> anyhow::Result<crate::clean_reload::ReloadSession> {
+    use celld_logic::session::{retag_needed, CARRIED_BOUND};
+    use futures_util::StreamExt as _;
+    const READS: usize = 32;
+    let all = session.tags().all();
+    let mut tags: BTreeMap<String, String> = BTreeMap::new();
+    let mut reads = futures_util::stream::iter(cells)
+        .map(|cell| async move { (cell, ownership.read_owner(&cell.id).await) })
+        .buffer_unordered(READS);
+    while let Some((cell, record)) = reads.next().await {
+        let record = record?;
+        anyhow::ensure!(
+            record
+                .as_ref()
+                .is_some_and(|record| ownership.serves(record, cell.epoch)),
+            "the record of {} does not name this node at epoch {}",
+            cell.id,
+            cell.epoch
+        );
+        let by = record.and_then(|record| record.by).unwrap_or_default();
+        tags.insert(cell.id.clone(), by);
+    }
+    drop(reads);
+    let in_use = |tags: &BTreeMap<String, String>| -> BTreeSet<String> {
+        tags.values()
+            .filter(|tag| !tag.is_empty())
+            .cloned()
+            .collect()
+    };
+    if let Some(oldest) = retag_needed(&all, &in_use(&tags), CARRIED_BOUND) {
+        let own = session.tags().own().to_string();
+        let stale: Vec<_> = cells
+            .iter()
+            .filter(|cell| tags[&cell.id] == oldest)
+            .collect();
+        for cell in stale {
+            anyhow::ensure!(
+                ownership
+                    .retag_owner(&cell.id, cell.epoch, &oldest, &own)
+                    .await?,
+                "the record of {} no longer names {oldest} at epoch {}",
+                cell.id,
+                cell.epoch
+            );
+            session.forget_resumed(&cell.id);
+            tags.insert(cell.id.clone(), own.clone());
+        }
+    }
+    let in_use = in_use(&tags);
+    let carried: Vec<String> = all
+        .iter()
+        .filter(|tag| in_use.contains(*tag))
+        .cloned()
+        .collect();
+    anyhow::ensure!(
+        in_use.len() == carried.len() && carried.len() <= CARRIED_BOUND,
+        "the successor cannot carry the tags of the resident cells"
+    );
+    Ok(crate::clean_reload::ReloadSession {
+        tags: carried,
+        cells: tags,
+        epochs: cells
+            .iter()
+            .map(|cell| (cell.id.clone(), cell.epoch))
+            .collect(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine_api::{
+        durable_object_id_for_name, durable_object_id_hex, durable_object_id_hmac,
+        durable_object_id_key, namespace_key,
+    };
+
+    const SCRIPT: &str = "script";
+    const CLASS: &str = "Agent";
+
+    fn key() -> [u8; 32] {
+        durable_object_id_key(&namespace_key(SCRIPT, CLASS))
+    }
+
+    fn established(tag: [u8; 8]) -> Session {
+        let session = Session::with_tag(Mode::Shadow, tag, &[]);
+        session.establish();
+        session
+    }
+
+    /// An id from random bytes, as `newUniqueId` minted before tagged ids.
+    fn random_id(key: &[u8; 32]) -> [u8; 32] {
+        use hmac::Mac;
+        let mut id = [7_u8; 32];
+        id[..16].copy_from_slice(&[0xAB; 16]);
+        let digest = durable_object_id_hmac(key, &id[..16])
+            .finalize()
+            .into_bytes();
+        id[16..].copy_from_slice(&digest[..16]);
+        id
+    }
+
+    #[test]
+    fn a_tagged_id_round_trips() {
+        let session = established([1, 2, 3, 4, 5, 6, 7, 8]);
+        let first = session.mint(&key()).expect("established");
+        let second = session.mint(&key()).expect("established");
+        assert_ne!(first, second);
+        let Some(IdKind::Tagged { tag, block }) = verify_object_id(&key(), &second) else {
+            panic!("a minted id verifies as tagged");
+        };
+        assert_eq!(tag, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(decrypt_counter(&session.counter_key, block), 1);
+        let Some(IdKind::Tagged { block, .. }) = verify_object_id(&key(), &first) else {
+            panic!("tagged");
+        };
+        assert_eq!(decrypt_counter(&session.counter_key, block), 0);
+        assert!(check_id(Some(&session), &key(), &second).is_ok());
+        // The hex form is what a Worker sees and hands back.
+        assert_eq!(durable_object_id_hex(&second).len(), 64);
+    }
+
+    #[test]
+    fn consecutive_ids_do_not_reveal_their_counters() {
+        let session = established([8; 8]);
+        let blocks: Vec<[u8; 8]> = (0..64)
+            .map(|_| session.mint(&key()).expect("established"))
+            .map(|id| id[8..16].try_into().unwrap())
+            .collect();
+        for (counter, block) in blocks.iter().enumerate() {
+            assert_ne!(
+                *block,
+                (counter as u64).to_be_bytes(),
+                "counter in the clear"
+            );
+            assert_eq!(
+                decrypt_counter(&session.counter_key, *block),
+                counter as u64
+            );
+        }
+        for pair in blocks.windows(2) {
+            let (a, b) = (u64::from_be_bytes(pair[0]), u64::from_be_bytes(pair[1]));
+            assert_ne!(b, a.wrapping_add(1), "sequential");
+            let differing = pair[0].iter().zip(&pair[1]).filter(|(x, y)| x != y).count();
+            assert!(differing >= 4, "{pair:?} differ in only {differing} bytes");
+        }
+        // Another session's key gives other blocks for the same counters.
+        let other = established([8; 8]);
+        assert_ne!(
+            encrypt_counter(&session.counter_key, 0),
+            encrypt_counter(&other.counter_key, 0)
+        );
+    }
+
+    #[test]
+    fn the_counter_cipher_is_a_permutation() {
+        let key = [42_u8; 32];
+        let mut seen = std::collections::HashSet::new();
+        let samples =
+            (0..20_000_u64).chain([u64::MAX, u64::MAX - 1, 1 << 32, (1 << 32) - 1, 1 << 63]);
+        for counter in samples {
+            let block = encrypt_counter(&key, counter);
+            assert!(seen.insert(block), "two counters share a block");
+            assert_eq!(decrypt_counter(&key, block), counter);
+        }
+    }
+
+    #[test]
+    fn nothing_is_minted_before_the_session_is_established() {
+        let session = Session::with_tag(Mode::Shadow, [9; 8], &[]);
+        assert!(session.mint(&key()).is_none());
+    }
+
+    #[test]
+    fn a_name_id_and_an_old_random_id_never_verify_as_tagged() {
+        let named = durable_object_id_for_name(&namespace_key(SCRIPT, CLASS), "alpha");
+        assert_eq!(verify_object_id(&key(), &named), Some(IdKind::Plain));
+        let random = random_id(&key());
+        assert_eq!(verify_object_id(&key(), &random), Some(IdKind::Plain));
+    }
+
+    #[test]
+    fn a_build_that_knows_only_the_plain_domain_rejects_a_tagged_id() {
+        use hmac::Mac;
+        let session = established([3; 8]);
+        let id = session.mint(&key()).expect("established");
+        assert!(durable_object_id_hmac(&key(), &id[..16])
+            .verify_truncated_left(&id[16..])
+            .is_err());
+    }
+
+    #[test]
+    fn an_id_with_a_live_tag_and_an_unissued_counter_is_rejected() {
+        let session = established([4; 8]);
+        session.mint(&key()).expect("counter 0");
+        session.mint(&key()).expect("counter 1");
+        let at = |counter| {
+            tagged_object_id(
+                &key(),
+                [4; 8],
+                encrypt_counter(&session.counter_key, counter),
+            )
+        };
+        let (issued, unissued, far) = (at(1), at(2), at(u64::MAX));
+        let other_session = tagged_object_id(&key(), [5; 8], [9; 8]);
+        assert!(check_id(Some(&session), &key(), &issued).is_ok());
+        assert_eq!(
+            check_id(Some(&session), &key(), &unissued),
+            Err(IdRefusal::Unissued)
+        );
+        assert_eq!(
+            check_id(Some(&session), &key(), &far),
+            Err(IdRefusal::Unissued)
+        );
+        // Another session's tag is not live here, and a process without a
+        // session accepts both domains.
+        assert!(check_id(Some(&session), &key(), &other_session).is_ok());
+        assert!(check_id(None, &key(), &unissued).is_ok());
+        let mut forged = issued;
+        forged[31] ^= 1;
+        assert_eq!(
+            check_id(Some(&session), &key(), &forged),
+            Err(IdRefusal::Forged)
+        );
+    }
+
+    /// The claim path reads the tag of an id from its class and its MAC
+    /// alone, for a scope that arrived as a ready string, with no header read.
+    #[test]
+    fn the_claim_path_reads_the_tag_from_the_class_and_the_mac() {
+        register_class(SCRIPT, CLASS);
+        let tagged = durable_object_id_hex(&tagged_object_id(&key(), [6; 8], [3; 8]));
+        assert_eq!(
+            tag_of_scope(&format!("{CLASS}:{tagged}")),
+            Some(hex(&[6; 8]))
+        );
+        let named = durable_object_id_hex(&durable_object_id_for_name(
+            &namespace_key(SCRIPT, CLASS),
+            "alpha",
+        ));
+        assert_eq!(tag_of_scope(&format!("{CLASS}:{named}")), None);
+        let random = durable_object_id_hex(&random_id(&key()));
+        assert_eq!(tag_of_scope(&format!("{CLASS}:{random}")), None);
+        // Another class's key does not verify it, and a scope that is not an
+        // id reads as none.
+        assert_eq!(tag_of_scope(&format!("Other:{tagged}")), None);
+        assert_eq!(tag_of_scope("Agent:nothex"), None);
+        assert_eq!(tag_of_scope("no-colon"), None);
+    }
+
+    fn record(node: &str, epoch: u64, by: Option<&str>) -> OwnerRecord {
+        OwnerRecord {
+            node: Some(node.into()),
+            epoch,
+            by: by.map(str::to_string),
+            etag: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_carried_tag_counts_only_for_a_cell_resumed_at_its_epoch() {
+        let own = hex(&[1; 8]);
+        let session = Session::with_tag(Mode::Shadow, [1; 8], &["old".to_string()]);
+        session.note_resumed("c", "old", 4);
+        let names =
+            |cell, epoch, by| names_with(Some(&session), "n", &record("n", epoch, by), cell);
+        assert!(names("c", 4, Some("old")));
+        assert!(!names("c", 5, Some("old")), "another epoch");
+        assert!(!names("d", 4, Some("old")), "a cell it did not resume");
+        assert!(!names("c", 4, Some("other")), "a tag it does not carry");
+        assert!(names("d", 4, Some(&own)));
+        assert!(names("d", 4, None), "a record of an older binary");
+        assert!(!names_with(Some(&session), "m", &record("n", 4, None), "c"));
+        assert!(names_with(None, "n", &record("n", 4, Some("any")), "c"));
+        // Its own claim ends the resumption.
+        session.forget_resumed("c");
+        assert!(!names("c", 4, Some("old")));
+    }
+
+    #[test]
+    fn a_tag_the_process_does_not_carry_is_not_resumed() {
+        let session = Session::with_tag(Mode::Shadow, [1; 8], &["old".to_string()]);
+        session.note_resumed("kept", "old", 4);
+        session.note_resumed("older", "dropped", 4);
+        session.note_resumed("plain", "", 4);
+        let cells: Vec<_> = session.resumed_snapshot().into_keys().collect();
+        assert_eq!(cells, ["kept", "plain"]);
+        // The scan found `kept` at another epoch and never saw `plain`.
+        session.settle_resumed(Some(&[celld_logic::LocalCell {
+            id: "kept".into(),
+            epoch: 5,
+            live: true,
+        }]));
+        assert!(session.resumed_snapshot().is_empty());
+        session.note_resumed("kept", "old", 4);
+        session.settle_resumed(None);
+        assert!(session.resumed_snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_resumed_cell_is_counted_only_under_a_tag_the_set_still_carries() {
+        let session = Session::with_tag(Mode::Shadow, [1; 8], &["old".to_string()]);
+        session
+            .resumed
+            .lock()
+            .unwrap()
+            .insert("c".into(), ("gone".into(), 4));
+        assert!(!session.resumed_at("c", "gone", 4));
+        session.note_resumed("c", "old", 4);
+        assert!(session.resumed_at("c", "old", 4));
+    }
+
+    #[test]
+    fn a_claim_of_an_unissued_counter_of_the_own_session_is_refused() {
+        register_class(SCRIPT, CLASS);
+        let session = established([7; 8]);
+        let scope_unissued = |scope: &str| scope_unissued_by(Some(&session), scope);
+        let at = |counter| {
+            let block = encrypt_counter(&session.counter_key, counter);
+            let id = tagged_object_id(&key(), [7; 8], block);
+            format!("{CLASS}:{}", durable_object_id_hex(&id))
+        };
+        session.mint(&key()).expect("counter 0");
+        assert!(!scope_unissued(&at(0)));
+        assert!(!scope_unissued_by(None, &at(1)));
+        assert!(scope_unissued(&at(1)));
+        let other = tagged_object_id(&key(), [8; 8], [3; 8]);
+        assert!(!scope_unissued(&format!(
+            "{CLASS}:{}",
+            durable_object_id_hex(&other)
+        )));
+        assert!(!scope_unissued("Agent:plain"));
+    }
+
+    mod preserved_restart {
+        use super::*;
+        use crate::bucket::Bucket;
+        use crate::ownership_store::BucketOwnership;
+
+        const NODE: &str = "node-a";
+
+        fn tag(n: u8) -> String {
+            hex(&[n; 8])
+        }
+
+        struct World {
+            _dir: tempfile::TempDir,
+            bucket: Bucket,
+            ownership: BucketOwnership,
+        }
+
+        fn world() -> World {
+            crate::asyncrt::install_test_host_runtime();
+            let dir = tempfile::tempdir().unwrap();
+            let bucket = Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+            let ownership = BucketOwnership::new(
+                bucket.clone(),
+                bucket.clone(),
+                NODE.to_owned(),
+                "key".to_owned(),
+            );
+            World {
+                _dir: dir,
+                bucket,
+                ownership,
+            }
+        }
+
+        async fn put(world: &World, cell: &str, node: &str, epoch: u64, by: Option<&str>) {
+            let mut record = serde_json::json!({"node": node, "epoch": epoch});
+            if let Some(by) = by {
+                record["by"] = by.into();
+            }
+            world
+                .bucket
+                .put_cas(
+                    &format!("cells/{cell}/own.json"),
+                    serde_json::to_vec(&record).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap()
+                .expect("a new record");
+        }
+
+        fn cell(id: &str, epoch: u64) -> celld_logic::PresenceCell {
+            celld_logic::PresenceCell {
+                id: id.into(),
+                epoch,
+            }
+        }
+
+        #[tokio::test]
+        async fn retag_owner_changes_by_and_nothing_else() {
+            let world = world();
+            put(&world, "c", NODE, 5, Some("old")).await;
+            let retag = |from: &'static str| world.ownership.retag_owner("c", 5, from, "new");
+            assert!(!retag("other").await.unwrap(), "another tag");
+            assert!(!world
+                .ownership
+                .retag_owner("c", 6, "old", "new")
+                .await
+                .unwrap());
+            assert!(retag("old").await.unwrap());
+            let record = world.ownership.read_owner("c").await.unwrap().unwrap();
+            assert_eq!(record.by.as_deref(), Some("new"));
+            assert_eq!(record.node.as_deref(), Some(NODE));
+            assert_eq!(record.epoch, 5);
+            assert!(!retag("old").await.unwrap(), "no longer names the old tag");
+            put(&world, "d", "node-b", 5, Some("old")).await;
+            assert!(!world
+                .ownership
+                .retag_owner("d", 5, "old", "new")
+                .await
+                .unwrap());
+        }
+
+        #[tokio::test]
+        async fn retag_owner_waits_for_the_gate_hold() {
+            crate::asyncrt::install_test_host_runtime();
+            let hold: &'static crate::registry_seed::GateHold =
+                Box::leak(Box::new(crate::registry_seed::GateHold::new()));
+            let dir = tempfile::tempdir().unwrap();
+            let bucket = Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+            let ownership = std::sync::Arc::new(
+                BucketOwnership::new(
+                    bucket.clone(),
+                    bucket.clone(),
+                    NODE.to_owned(),
+                    "key".to_owned(),
+                )
+                .with_gate_hold(hold),
+            );
+            let record = serde_json::json!({"node": NODE, "epoch": 5, "by": "old"});
+            bucket
+                .put_cas(
+                    "cells/c/own.json",
+                    serde_json::to_vec(&record).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap()
+                .expect("a new record");
+            hold.require();
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let retag = {
+                let (ownership, done) = (ownership.clone(), done.clone());
+                crate::asyncrt::spawn(async move {
+                    let applied = ownership.retag_owner("c", 5, "old", "new").await;
+                    done.store(true, std::sync::atomic::Ordering::SeqCst);
+                    applied
+                })
+            };
+            crate::asyncrt::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(!done.load(std::sync::atomic::Ordering::SeqCst), "it waits");
+            let held = ownership.read_owner("c").await.unwrap().unwrap();
+            assert_eq!(held.by.as_deref(), Some("old"), "nothing was written");
+            hold.release();
+            assert!(retag.await.unwrap().unwrap());
+            let record = ownership.read_owner("c").await.unwrap().unwrap();
+            assert_eq!(record.by.as_deref(), Some("new"));
+        }
+
+        #[tokio::test]
+        async fn the_certificate_lists_the_tags_the_records_really_carry() {
+            let world = world();
+            let session = Session::with_tag(Mode::Shadow, [1; 8], &[tag(2)]);
+            put(&world, "a", NODE, 3, Some(&tag(2))).await;
+            put(&world, "b", NODE, 4, Some(&tag(1))).await;
+            put(&world, "plain", NODE, 1, None).await;
+            // The process believes nothing about `a`: the record decides.
+            let reload = prepare_reload(
+                &session,
+                &world.ownership,
+                &[cell("a", 3), cell("b", 4), cell("plain", 1)],
+            )
+            .await
+            .unwrap();
+            assert_eq!(reload.tags, [tag(1), tag(2)]);
+            assert_eq!(reload.cells["a"], tag(2));
+            assert_eq!(reload.cells["b"], tag(1));
+            assert_eq!(reload.cells["plain"], "");
+            assert_eq!(reload.epochs["a"], 3);
+        }
+
+        #[tokio::test]
+        async fn a_record_that_does_not_name_this_node_refuses_the_certificate() {
+            let world = world();
+            let session = Session::with_tag(Mode::Shadow, [1; 8], &[]);
+            put(&world, "a", "node-b", 3, Some(&tag(1))).await;
+            assert!(prepare_reload(&session, &world.ownership, &[cell("a", 3)])
+                .await
+                .is_err());
+            assert!(
+                prepare_reload(&session, &world.ownership, &[cell("missing", 1)])
+                    .await
+                    .is_err()
+            );
+            put(&world, "b", NODE, 3, Some("stranger")).await;
+            assert!(prepare_reload(&session, &world.ownership, &[cell("b", 3)])
+                .await
+                .is_err());
+        }
+
+        /// The set is full after three preserved restarts: the oldest tag is
+        /// written into the records that still carry it, and the certificate
+        /// lists the rest.
+        #[tokio::test]
+        async fn a_full_set_retags_the_cells_of_its_oldest_tag() {
+            let world = world();
+            let marker = [tag(2), tag(3), tag(4)];
+            let session = Session::with_tag(Mode::Shadow, [1; 8], &marker);
+            assert_eq!(session.tags().all().len(), 4);
+            put(&world, "oldest", NODE, 5, Some(&tag(4))).await;
+            put(&world, "middle", NODE, 5, Some(&tag(3))).await;
+            put(&world, "own", NODE, 5, Some(&tag(1))).await;
+            session.note_resumed("oldest", &tag(4), 5);
+            let reload = prepare_reload(
+                &session,
+                &world.ownership,
+                &[cell("oldest", 5), cell("middle", 5), cell("own", 5)],
+            )
+            .await
+            .unwrap();
+            assert_eq!(reload.tags, [tag(1), tag(3)]);
+            assert_eq!(reload.cells["oldest"], tag(1));
+            let record = world.ownership.read_owner("oldest").await.unwrap().unwrap();
+            assert_eq!(record.by.as_deref(), Some(tag(1).as_str()));
+            assert_eq!(record.epoch, 5);
+            assert!(session.resumed_snapshot().is_empty());
+            // The successor of that certificate carries its own tag and these.
+            let next = Session::with_tag(Mode::Shadow, [9; 8], &reload.tags);
+            assert_eq!(next.tags().all(), [hex(&[9; 8]), tag(1), tag(3)]);
+        }
+
+        #[tokio::test]
+        async fn a_set_that_is_not_full_rewrites_nothing() {
+            let world = world();
+            let session = Session::with_tag(Mode::Shadow, [1; 8], &[tag(2)]);
+            put(&world, "a", NODE, 5, Some(&tag(2))).await;
+            let before = world.ownership.read_owner("a").await.unwrap().unwrap();
+            let reload = prepare_reload(&session, &world.ownership, &[cell("a", 5)])
+                .await
+                .unwrap();
+            assert_eq!(reload.tags, [tag(2)]);
+            let after = world.ownership.read_owner("a").await.unwrap().unwrap();
+            assert_eq!(before.etag, after.etag);
+        }
+    }
+
+    #[test]
+    fn the_owner_check_of_epoch_gc_accepts_a_resumed_cell_under_a_carried_tag() {
+        let session = Session::with_tag(Mode::Shadow, [1; 8], &["old".to_string()]);
+        session.note_resumed("c", "old", 3);
+        let owns = |epoch, record: Option<&OwnerRecord>| {
+            owns_epoch(Some(&session), "n", "c", epoch, record)
+        };
+        assert!(owns(3, Some(&record("n", 3, Some("old")))));
+        assert!(
+            !owns(3, Some(&record("n", 4, Some("old")))),
+            "another epoch"
+        );
+        assert!(!owns(4, Some(&record("n", 3, Some("old")))));
+        assert!(!owns(3, Some(&record("n", 3, Some("stranger")))));
+        assert!(!owns(3, Some(&record("m", 3, Some("old")))), "another node");
+        assert!(!owns(3, None));
+        assert!(owns(3, Some(&record("n", 3, Some(&hex(&[1; 8]))))));
+    }
+
+    #[test]
+    fn the_test_knob_is_refused_in_a_release_build() {
+        assert!(refuse_knob(false, Some("1".into())).is_err());
+        assert!(refuse_knob(false, Some(String::new())).is_err());
+        assert!(refuse_knob(false, None).is_ok());
+        assert!(refuse_knob(true, Some("1".into())).is_ok());
+    }
+
+    #[test]
+    fn the_mode_comes_from_the_flag() {
+        assert_eq!(Mode::parse(None).unwrap(), Mode::Off);
+        assert_eq!(Mode::parse(Some("off")).unwrap(), Mode::Off);
+        assert_eq!(Mode::parse(Some("shadow")).unwrap(), Mode::Shadow);
+        assert_eq!(Mode::parse(Some("read")).unwrap(), Mode::Read);
+        assert_eq!(Mode::parse(Some("on")).unwrap(), Mode::On);
+        assert!(Mode::parse(Some("yes")).is_err());
+    }
+}

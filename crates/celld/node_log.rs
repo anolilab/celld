@@ -6488,10 +6488,12 @@ impl NodeLogManager {
     /// [`crate::ltx_repl::LtxRepl::gc_superseded_epochs`] for why that order
     /// is the fence.
     async fn owns_epoch(&self, cell: &str, epoch: u64) -> anyhow::Result<bool> {
-        Ok(matches!(
-            self.ownership.read_owner(cell).await?,
-            Some(record)
-                if record.node.as_deref() == Some(self.node.as_str()) && record.epoch == epoch
+        Ok(crate::session::owns_epoch(
+            crate::session::current(),
+            &self.node,
+            cell,
+            epoch,
+            self.ownership.read_owner(cell).await?.as_ref(),
         ))
     }
 

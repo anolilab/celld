@@ -754,6 +754,7 @@ impl Generation {
                 return Err(anyhow!("duplicate co-hosted Worker script {script}"));
             }
             for class in classes {
+                crate::session::register_class(&script, &class);
                 register_cell_class(&mut cell_configs, class, config.clone(), &|class| {
                     if is_primary {
                         anyhow!("duplicate Durable Object class {class}")
