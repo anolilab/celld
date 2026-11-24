@@ -171,11 +171,22 @@ impl Fleet {
 
     /// One environment per node.
     pub async fn start_each(fixture: &str, envs: &[&[(&str, &str)]]) -> Option<Fleet> {
+        Fleet::start_each_at(fixture, envs, None).await
+    }
+
+    /// [`Self::start_each`] with the nodes reaching the store at `node_endpoint`
+    /// (a proxy), while the test itself reads and cleans through the store.
+    pub async fn start_each_at(
+        fixture: &str,
+        envs: &[&[(&str, &str)]],
+        node_endpoint: Option<String>,
+    ) -> Option<Fleet> {
         let Ok(bucket) = std::env::var("CELLD_STORE_CONTRACT_BUCKET") else {
             eprintln!("skipped: CELLD_STORE_CONTRACT_BUCKET is not set");
             return None;
         };
-        let endpoint = std::env::var("AWS_ENDPOINT_URL").expect("AWS_ENDPOINT_URL names the store");
+        let store = std::env::var("AWS_ENDPOINT_URL").expect("AWS_ENDPOINT_URL names the store");
+        let endpoint = node_endpoint.unwrap_or_else(|| store.clone());
         let run = format!(
             "lazy-{}",
             std::time::SystemTime::now()
@@ -188,7 +199,7 @@ impl Fleet {
         let deployed = Command::new(CELLD)
             .arg("deploy")
             .arg(fixture_dir(fixture))
-            .args(["--bucket", &spec, "--endpoint", &endpoint])
+            .args(["--bucket", &spec, "--endpoint", &store])
             .args(["--region", &region()])
             .env("CELLD_CONFIG_DIR", home.path().join("deploy"))
             .current_dir(home.path())
@@ -208,7 +219,7 @@ impl Fleet {
         for node in &nodes {
             node.wait_ready(&client).await;
         }
-        let bucket = Bucket::open(&spec, Some(&endpoint), &region(), None, Some("lazy-fleet"))
+        let bucket = Bucket::open(&spec, Some(&store), &region(), None, Some("lazy-fleet"))
             .unwrap_or_else(|error| panic!("open {spec}: {error:#}"));
         Some(Fleet {
             spec,
@@ -945,4 +956,161 @@ async fn s16_a_declared_loss_leaves_no_agent_with_two_writers() {
         "S16 agents {}: flag on kept {kept}, rows lost {lost}, refused {refused}; flag off kept {kept_off}, rows lost {lost_off}, refused {refused_off}",
         agents_in_drills()
     );
+}
+
+/// A proxy to the store that can refuse: while it refuses, every open
+/// connection is cut and every new one is closed at once.
+struct Refusing {
+    refusing: tokio::sync::watch::Sender<bool>,
+    url: String,
+}
+
+impl Refusing {
+    async fn start(upstream: &str) -> Refusing {
+        let upstream = upstream
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the proxy");
+        let url = format!("http://{}", listener.local_addr().expect("proxy address"));
+        let (refusing, watch) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else {
+                    return;
+                };
+                if *watch.borrow() {
+                    continue;
+                }
+                let upstream = upstream.clone();
+                let mut watch = watch.clone();
+                tokio::spawn(async move {
+                    let Ok(mut outbound) = tokio::net::TcpStream::connect(&upstream).await else {
+                        return;
+                    };
+                    celld::asyncrt::select! {
+                        _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                        _ = watch.wait_for(|refusing| *refusing) => {}
+                    }
+                });
+            }
+        });
+        Refusing { refusing, url }
+    }
+
+    fn refuse(&self, on: bool) {
+        self.refusing.send_replace(on);
+    }
+}
+
+/// The bundles of the node logs that the bucket holds.
+async fn bundles(fleet: &Fleet) -> usize {
+    fleet
+        .keys("log/")
+        .await
+        .iter()
+        .filter(|key| key.contains("/bundle/"))
+        .count()
+}
+
+/// S10. The bucket refuses every request for 60 s while a node grants ids; then
+/// the node is killed. Meanwhile no object of a cell and no release is written
+/// (so the bundles that carry the marks stay), and afterwards every id that was
+/// acknowledged is in the sealed chunk of its session, and the retained bundles
+/// are back to the count of an idle fleet within two minutes.
+#[tokio::test]
+async fn s10_a_bucket_that_refuses_for_a_minute_loses_no_acknowledged_grant() {
+    let Ok(upstream) = std::env::var("AWS_ENDPOINT_URL") else {
+        eprintln!("skipped: AWS_ENDPOINT_URL is not set");
+        return;
+    };
+    let proxy = Refusing::start(&upstream).await;
+    let Some(mut fleet) =
+        Fleet::start_each_at("do-ids", &[SHADOW; 3], Some(proxy.url.clone())).await
+    else {
+        return;
+    };
+    let body = async {
+        wait_for_ensemble(&fleet).await;
+        // Agents are made until the cut, and the cut falls in the middle of the
+        // stream.
+        let mut acknowledged: Vec<String> = Vec::new();
+        let began = Instant::now();
+        let mut refusing = false;
+        let mut cut_at = None;
+        while cut_at.is_none_or(|at: Instant| at.elapsed() < Duration::from_secs(60)) {
+            if !refusing && began.elapsed() > Duration::from_secs(8) {
+                proxy.refuse(true);
+                refusing = true;
+                cut_at = Some(Instant::now());
+            }
+            if let Some(out) = fleet.get_json(0, "/spawn?n=1").await {
+                acknowledged.extend(
+                    out["ids"]
+                        .as_array()
+                        .expect("ids")
+                        .iter()
+                        .map(|id| id.as_str().expect("an id").to_string()),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert!(!acknowledged.is_empty(), "an agent was acknowledged");
+        let cells = fleet.keys("cells/").await;
+        // A per-cell object is written only for what the bucket accepted before
+        // the cut, and nothing is released while it refuses: no record names no
+        // node.
+        for key in cells.iter().filter(|key| key.ends_with("/own.json")) {
+            let record = fleet.object(key).await.expect("a record");
+            assert_ne!(
+                record["node"], "",
+                "released while the bucket refused: {key}"
+            );
+        }
+        assert!(
+            bundles(&fleet).await >= 1,
+            "the bundles that carry the marks are kept"
+        );
+        fleet.nodes[0].kill();
+        proxy.refuse(false);
+        let tag = acknowledged[0][..16].to_string();
+        let header = wait_until("the seal", Duration::from_secs(120), || async {
+            let header = fleet.object(&format!("fleet/sessions/{tag}.json")).await?;
+            (header["state"] == "sealed").then_some(header)
+        })
+        .await;
+        let chunk = fleet
+            .object(&format!("fleet/sessions/{tag}/c/0"))
+            .await
+            .expect("the chunk");
+        assert_eq!(chunk["state"], "sealed", "{chunk}");
+        let granted: Vec<u64> = chunk["granted"]
+            .as_array()
+            .expect("granted")
+            .iter()
+            .map(|counter| counter.as_u64().expect("a counter"))
+            .collect();
+        for id in &acknowledged {
+            assert!(
+                granted.contains(&counter_of(&header, id)),
+                "an acknowledged grant is not in the sealed chunk: {id}"
+            );
+        }
+        // The count of an idle fleet (the retained bundles of a quiet run).
+        wait_until(
+            "the retained bundles to return to an idle count",
+            Duration::from_secs(120),
+            || async { (bundles(&fleet).await <= 10).then_some(()) },
+        )
+        .await;
+    };
+    let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+    proxy.refuse(false);
+    fleet.nodes.clear();
+    fleet.clean().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
 }
