@@ -598,3 +598,54 @@ async fn the_bundle_of_a_granted_cell_carries_its_mark() {
     })
     .await;
 }
+
+/// A request that gives up before the fleet proof of its `Grant` fails with an
+/// error that may be retried, the cell does not activate, and the grant is
+/// pending: the id is granted (its bit is set at the append), it never takes the
+/// standard path in its session, and every later request for it fails the same
+/// way, also when the proof comes late.
+#[tokio::test]
+async fn a_grant_without_a_timely_proof_is_pending_and_never_waived() {
+    let env: &[(&str, &str)] = &[
+        ("CELLD_LAZY_BIRTH", "shadow"),
+        ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "500"),
+        ("CELLD_LAZY_BIRTH_PROOF_WAIT_MS", "1"),
+    ];
+    let Some(fleet) = Fleet::start("do-ids", 3, env).await else {
+        return;
+    };
+    with_fleet(fleet, |fleet| async move {
+        wait_for_ensemble(&fleet).await;
+        let minted = fleet.get_json(0, "/mint").await.expect("mint");
+        let id = minted["ids"][0].as_str().unwrap().to_string();
+        let tag = id[..16].to_string();
+        let header = fleet
+            .object(&format!("fleet/sessions/{tag}.json"))
+            .await
+            .expect("the header");
+        let counter = counter_of(&header, &id);
+        assert!(
+            fleet.get_json(0, &format!("/bump?id={id}")).await.is_none(),
+            "the request gave up before a proof"
+        );
+        // The proof comes late and changes nothing: the cell stays refused.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(fleet.get_json(0, &format!("/bump?id={id}")).await.is_none());
+        assert!(fleet.nodes[0].log().contains("pending_grant"));
+        // The record exists and the id is granted in the chunk.
+        let records: Vec<_> = fleet
+            .keys("cells/")
+            .await
+            .into_iter()
+            .filter(|key| key.ends_with("/own.json"))
+            .collect();
+        assert_eq!(records.len(), 1, "{records:?}");
+        wait_until("the bit in the chunk", Duration::from_secs(30), || async {
+            let chunk = fleet.object(&format!("fleet/sessions/{tag}/c/0")).await?;
+            (chunk["granted"] == serde_json::json!([counter])).then_some(())
+        })
+        .await;
+        fleet
+    })
+    .await;
+}

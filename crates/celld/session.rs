@@ -82,6 +82,10 @@ pub struct Session {
     dirty: Mutex<BTreeSet<u64>>,
     /// The counters whose bit a chunk in the bucket holds.
     checkpointed: Mutex<BTreeSet<u64>>,
+    /// The grants whose request gave up before a fleet proof. A proof that
+    /// comes later does not end this: the cell is served again only by the
+    /// wake at a new epoch, which is not built.
+    pending: Mutex<BTreeSet<u64>>,
     /// The cell of each granted counter, for the marks that ride a bundle.
     granted_scopes: Mutex<BTreeMap<u64, String>>,
     /// A write that waits for a bit asks for a checkpoint now.
@@ -134,6 +138,7 @@ impl Session {
             dirty: Mutex::default(),
             checkpointed: Mutex::default(),
             granted_scopes: Mutex::default(),
+            pending: Mutex::default(),
             nudge: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
             sealing: AtomicBool::new(false),
@@ -570,6 +575,23 @@ impl Session {
             .filter(|(counter, _)| !written.contains(counter))
             .map(|(counter, scope)| (*counter, scope.clone()))
             .collect()
+    }
+
+    pub fn mark_pending(&self, counter: u64) {
+        self.pending
+            .lock()
+            .expect("pending poisoned")
+            .insert(counter);
+    }
+
+    /// Whether `scope` is an id of this session whose grant is pending.
+    pub fn is_pending_scope(&self, scope: &str) -> bool {
+        self.own_counter_of_scope(scope).is_some_and(|counter| {
+            self.pending
+                .lock()
+                .expect("pending poisoned")
+                .contains(&counter)
+        })
     }
 
     /// Resolves when a write asked for a checkpoint.

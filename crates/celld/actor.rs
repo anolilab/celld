@@ -261,6 +261,17 @@ impl Ownership {
         if bucket.lost_record_held(cell, crate::asyncrt::mono_ms()) {
             return Err(Failure::Definite);
         }
+        // A grant whose request gave up before its fleet proof is pending: the
+        // cell does not activate, and every request for it fails the same way
+        // and may be retried.
+        if crate::session::current().is_some_and(|session| session.is_pending_scope(cell)) {
+            tracing::warn!(
+                event = "pending_grant",
+                cell,
+                "the grant of the cell is pending"
+            );
+            return Err(Failure::Definite);
+        }
         let (record, form) = bucket
             .read_owner_form(cell)
             .await

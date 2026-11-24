@@ -435,8 +435,16 @@ pub(crate) const LOST_RECORD_RECHECK_MS: u64 = 10_000;
 /// How long the answer to "may a `Grant` be appended" holds.
 const MARKS_GATE_MS: u64 = 5_000;
 
-/// How long a record waits for the fleet proof of its `Grant`.
-const MARK_PROOF_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a record waits for the fleet proof of its `Grant`
+/// (`CELLD_LAZY_BIRTH_PROOF_WAIT_MS`, 10 s by default).
+fn mark_proof_wait() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("CELLD_LAZY_BIRTH_PROOF_WAIT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10_000),
+    )
+}
 
 /// The production-compatible conditional object store used by ownership
 /// effects. A failed write is reported to the core as ambiguous unless the
@@ -1148,14 +1156,22 @@ impl BucketOwnership {
     }
 
     /// What happens to the id of `cell` after its create-only record applied.
-    /// The session appends a `Grant` to the followers' log, only while a capable
-    /// ensemble exists, and waits (bounded) for the fleet proof of it: with the
-    /// proof the id is granted and its bit is set, and its first response may
-    /// go on. Without a mark or without the proof the id is waived: it takes
-    /// the standard path with no bit, and the session acts on its record only
-    /// with evidence that it was not sealed when the write applied, a read of
-    /// its own header that says `open`, started after the write returned.
-    /// Without that evidence the cell is not activated by this write.
+    ///
+    /// The waive is decided before the append. While no capable ensemble
+    /// exists the id is waived in memory and takes the standard path with no
+    /// bit; the session then acts on its record only with evidence that it was
+    /// not sealed when the write applied, a read of its own header that says
+    /// `open`, started after the write returned, and without that evidence the
+    /// cell is not activated by this write.
+    ///
+    /// Otherwise the session appends the `Grant`, and from the append the id is
+    /// granted: its bit is set, and it never takes the standard path in this
+    /// session, whatever becomes of the proof. The request waits (bounded) for
+    /// the fleet proof. If it gives up first, it fails with an error that the
+    /// caller may retry, the cell does not activate, and the grant is pending:
+    /// a proof that comes later changes nothing, and later requests for the
+    /// cell fail the same way (the wake of a pending grant at a new epoch is
+    /// not built).
     async fn after_first_record(
         &self,
         session: &crate::session::Session,
@@ -1165,11 +1181,18 @@ impl BucketOwnership {
             return Ok(());
         };
         if self.marks_allowed().await {
+            session.grant_scope(cell);
             let proof = crate::session::enqueue_mark(cell, counter);
-            if let Ok(Ok(true)) = crate::asyncrt::timeout(MARK_PROOF_WAIT, proof).await {
-                session.grant_scope(cell);
+            if let Ok(Ok(true)) = crate::asyncrt::timeout(mark_proof_wait(), proof).await {
                 return Ok(());
             }
+            session.mark_pending(counter);
+            tracing::warn!(
+                event = "pending_grant",
+                cell,
+                "no fleet proof of the grant in time"
+            );
+            anyhow::bail!("no fleet proof of the grant of {cell}: the grant is pending");
         }
         match crate::session_store::read_header(&self.bucket, &session.tag()).await? {
             crate::session_store::Read::Found(header, _)
