@@ -27,6 +27,23 @@ use std::sync::{Mutex, OnceLock, RwLock};
 
 pub const ENV: &str = "CELLD_LAZY_BIRTH";
 
+/// Turns tagged minting on in a debug build, for tests only.
+const TEST_TAGGED_IDS: &str = "CELLD_TEST_TAGGED_IDS";
+
+/// A release build refuses to start with the test knob set, so that no
+/// deployment mints tagged ids by accident.
+pub fn refuse_test_knobs() -> anyhow::Result<()> {
+    refuse_knob(cfg!(debug_assertions), std::env::var(TEST_TAGGED_IDS).ok())
+}
+
+fn refuse_knob(debug_build: bool, value: Option<String>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        debug_build || value.is_none(),
+        "{TEST_TAGGED_IDS} is for tests of a debug build and is refused here"
+    );
+    Ok(())
+}
+
 /// How far a process takes part in session-granted births.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,7 +171,9 @@ impl Session {
     /// `CELLD_TEST_TAGGED_IDS=1`.
     pub(crate) fn minting_enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var("CELLD_TEST_TAGGED_IDS").is_ok_and(|value| value == "1"))
+        *ON.get_or_init(|| {
+            cfg!(debug_assertions) && std::env::var(TEST_TAGGED_IDS).is_ok_and(|value| value == "1")
+        })
     }
 
     /// The next id of this session, or `None` before the session is
@@ -1068,6 +1087,14 @@ mod tests {
         assert!(!owns(3, Some(&record("m", 3, Some("old")))), "another node");
         assert!(!owns(3, None));
         assert!(owns(3, Some(&record("n", 3, Some(&hex(&[1; 8]))))));
+    }
+
+    #[test]
+    fn the_test_knob_is_refused_in_a_release_build() {
+        assert!(refuse_knob(false, Some("1".into())).is_err());
+        assert!(refuse_knob(false, Some(String::new())).is_err());
+        assert!(refuse_knob(false, None).is_ok());
+        assert!(refuse_knob(true, Some("1".into())).is_ok());
     }
 
     #[test]

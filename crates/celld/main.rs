@@ -4545,6 +4545,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // An unsupported value fails before the certificate of a preserved
     // restart is consumed.
     let lazy_birth = celld::session::Mode::from_env()?;
+    celld::session::refuse_test_knobs()?;
     let clean_reload = celld::runtime::take_clean_reload(&data_dir, &node);
     let resume_generation = clean_reload
         .as_ref()

@@ -9,8 +9,11 @@
 //! Nothing here reads a counter to decide anything, makes a bucket request or
 //! changes a record, a lease or an id.
 //!
-//! The key of an id is the first 8 bytes of its 16-byte payload, as a number
-//! and written as 16 hex digits. Ordinary ids, D1 and KV scopes and facet
+//! The key of an id is its first 8 bytes of payload XORed with the next 8, as
+//! a number and written as 16 hex digits. (The ids of one session share their
+//! first 8 bytes, so the first half alone would give them all one key.) A
+//! binary from before this change keyed an id by its first 8 bytes alone, so
+//! samples from a rollout that mixes the two do not line up. Ordinary ids, D1 and KV scopes and facet
 //! scopes all end in `:` and 64 hex digits, so all of them have a key; only an
 //! id that this process minted can be in the minted set, and the other kinds
 //! show up in the rings only.

@@ -463,3 +463,29 @@ fn started_state_for_lease() -> State {
     state.set_session(SessionTags::new(OWN, &tags(&[OLD])));
     state
 }
+
+/// A successor lease carries its predecessor's tag for every record under it,
+/// so a peer forwards a request for a cell whose record names that tag to the
+/// successor, also when the successor did not resume the cell (it was dormant,
+/// or the scan did not find it). The successor then decides as any node does
+/// for a record that names its own node: it claims the next epoch on the
+/// record's tag, by one conditional write, with no recovery of its own log to
+/// wait for, because it recovered its predecessor before it installed. The
+/// write is conditional on the record's etag, so a peer that claims the same
+/// epoch at the same time loses or wins, and the cell has one owner.
+#[test]
+fn a_cell_the_successor_did_not_resume_is_claimed_once_when_it_is_forwarded_there() {
+    let mut state = session_node(&[OLD]);
+    assert!(state.resumed.is_empty(), "nothing was resumed");
+    let op = request(&mut state, 1, "cell");
+    let effects = owner_read(&mut state, op, Some(("ingress", 3, Some(OLD))));
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RecoverNodeLog { .. })),
+        "{effects:?}"
+    );
+    let (guard, epoch, _) = cas_owner(&effects).expect("one claim");
+    assert!(matches!(guard, CasGuard::Match(ref etag) if etag == "owner-etag"));
+    assert_eq!(epoch, 4, "the next epoch, beside no other owner");
+}
