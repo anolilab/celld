@@ -95,36 +95,43 @@ pub fn hold() -> &'static GateHold {
     &HOLD
 }
 
-/// Whether this process is outside the registry's writer rule: it follows the rule
-/// only with `CELLD_BIRTH_REGISTRY=shadow` and fleet durability (the default). A
-/// node with the flag off, or with bucket durability, can write per-cell objects
-/// that the registry does not cover, so it closes the gate before it does.
+static FOLLOWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process follows the registry's writer rule: it has a registry
+/// installed and attached to its ownership store. Nothing else counts, whatever
+/// the settings say: a start-up branch that never starts a replication, a node with
+/// the flag off and a node with bucket durability all advertise `registry: false`
+/// and close the gate before they do per-cell work.
+pub fn follows_rule() -> bool {
+    FOLLOWS.load(Ordering::SeqCst)
+}
+
+/// The registry is installed: this process follows the rule, so it has nothing to
+/// close and the hold taken at start is released.
+pub fn mark_follows_rule() {
+    FOLLOWS.store(true, Ordering::SeqCst);
+    hold().release();
+}
+
+/// Whether this process is outside the writer rule, and so must close the gate.
 pub fn needs_gate_close() -> bool {
-    needs_gate_close_for(
-        crate::env_vars::value("CELLD_BIRTH_REGISTRY")
-            .ok()
-            .flatten()
-            .as_deref(),
-        std::env::var("CELLD_DURABILITY").ok().as_deref(),
-    )
+    !follows_rule()
 }
 
-/// [`needs_gate_close`] for given settings: `mode` is `CELLD_BIRTH_REGISTRY` and
-/// `durability` is `CELLD_DURABILITY`, absent meaning unset (fleet). The node's
-/// lease says `registry: true` exactly when this is false, so what a lease
-/// advertises and whether the node holds per-cell work are one decision.
-pub fn needs_gate_close_for(mode: Option<&str>, durability: Option<&str>) -> bool {
-    !(mode == Some("shadow") && durability.is_none_or(|durability| durability == "fleet"))
-}
-
-/// At start, a node outside the writer rule holds per-cell work until it has
-/// closed the gate. It does not decide from a root read now that there is none: a
-/// registry node can create a root and seed before this node's lease, which says
-/// it is outside the rule, is visible. The hold is kept until that lease is
-/// visible; the root is read after that, and with none nothing is written.
+/// At start, every node holds per-cell work until it has closed the gate, or
+/// installs a registry and so follows the rule. It does not decide from a root
+/// read now that there is none: a registry node can create a root and seed before
+/// this node's lease, which says it is outside the rule, is visible. The hold is
+/// kept until that lease is visible; the root is read after that, and with none
+/// nothing is written.
 pub fn hold_until_gate_closed() {
+    hold_until_gate_closed_in(hold());
+}
+
+/// [`hold_until_gate_closed`] for a given hold.
+pub(crate) fn hold_until_gate_closed_in(hold: &GateHold) {
     if needs_gate_close() {
-        hold().require();
+        hold.require();
     }
 }
 
@@ -441,14 +448,14 @@ impl SeedObjects {
     }
 }
 
-/// The key of the seed object of one partition from one range.
+/// The key of the seed object of one partition.
 ///
 /// `attempt` is unique to one seed attempt of one holder (its epoch and the
 /// run-number base it reserved), so two attempts never write the same key, and a
 /// range is numbered by what it covers, not by when its listing finished.
-fn seed_key(prefix: &str, gate: u64, attempt: &str, partition: usize, range: usize) -> String {
+fn seed_key(prefix: &str, gate: u64, attempt: &str, partition: usize) -> String {
     format!(
-        "{}/seed/{gate:012}/{attempt}/{partition:05}/{range:03}",
+        "{}/seed/{gate:012}/{attempt}/{partition:05}",
         objects::root_dir(prefix)
     )
 }
@@ -633,7 +640,7 @@ impl Registry {
     }
 
     /// List every cell, split into ranges, and write the cells as sorted seed
-    /// objects, one per partition and range. The seed is made for `gate`, the
+    /// objects, one per partition. The seed is made for `gate`, the
     /// gate number the root had when the seed started.
     pub(crate) async fn write_seed(
         &self,
@@ -650,24 +657,23 @@ impl Registry {
             gate,
             ..SeedObjects::default()
         };
-        let mut writes: Vec<(String, Vec<u8>)> = Vec::new();
-        for (range, records) in ranges {
+        // The ranges are in memory already: all of a partition's cells, from every
+        // range, are one sorted object.
+        let mut grouped: BTreeMap<usize, Vec<Record>> = BTreeMap::new();
+        for (_, records) in ranges {
             seed.cells += records.len() as u64;
-            let mut grouped: BTreeMap<usize, Vec<Record>> = BTreeMap::new();
             for record in records {
                 grouped
                     .entry(map.partition_for(&record.key))
                     .or_default()
                     .push(record);
             }
-            for (partition, records) in grouped {
-                let key = seed_key(&self.prefix, gate, attempt, partition, range);
-                writes.push((key.clone(), reg::encode_segment(&records)));
-                seed.by_partition.entry(partition).or_default().push(key);
-            }
         }
-        for keys in seed.by_partition.values_mut() {
-            keys.sort();
+        let mut writes: Vec<(String, Vec<u8>)> = Vec::new();
+        for (partition, records) in grouped {
+            let key = seed_key(&self.prefix, gate, attempt, partition);
+            writes.push((key.clone(), reg::encode_segment(&reg::sorted(records))));
+            seed.by_partition.entry(partition).or_default().push(key);
         }
         let store = self.store.clone();
         let wrote: Vec<anyhow::Result<()>> = futures_util::stream::iter(writes)

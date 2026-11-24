@@ -3795,7 +3795,7 @@ async fn a_failed_seed_attempt_leaves_nothing_the_next_one_can_use() {
 }
 
 #[tokio::test]
-async fn a_seed_attempt_never_overwrites_an_object_and_numbers_ranges_by_what_they_cover() {
+async fn a_seed_attempt_never_overwrites_an_object_and_writes_the_same_partitions() {
     let store = memory();
     ensure_format_record(&store).await;
     bucket_with_cells(&store, &seeded_names()).await;
@@ -3814,7 +3814,7 @@ async fn a_seed_attempt_never_overwrites_an_object_and_numbers_ranges_by_what_th
             .iter()
             .map(|key| key.rsplit('/').next().unwrap().to_owned())
             .collect::<Vec<_>>(),
-        "the same cells fall in the same ranges, whatever order the listings finish in"
+        "the same cells fall in the same partitions, whatever order the listings finish in"
     );
 }
 
@@ -4342,23 +4342,19 @@ async fn a_release_in_the_window_before_a_wait_registers_never_leaves_it_asleep(
 }
 
 #[test]
-fn a_lease_says_it_follows_the_rule_exactly_when_the_node_holds_nothing() {
-    use crate::registry_seed::needs_gate_close_for as holds;
-    // (mode, durability, holds per-cell work)
-    for (mode, durability, expected) in [
-        (Some("shadow"), None, false),
-        (Some("shadow"), Some("fleet"), false),
-        (Some("shadow"), Some("bucket"), true),
-        (None, None, true),
-        (Some("off"), None, true),
-        (Some("off"), Some("fleet"), true),
-    ] {
-        assert_eq!(holds(mode, durability), expected, "{mode:?} {durability:?}");
-    }
-    // The lease a node publishes is the same decision, whichever branch of start-up
-    // built it: one that never starts a replication included.
+fn a_node_that_never_installs_a_registry_advertises_false_and_takes_the_hold() {
+    // A start-up branch that never starts a replication (a local script, no
+    // deployment) installs no registry, whatever the settings say.
+    assert!(!crate::registry_seed::follows_rule());
     let load = crate::ownership_store::process_load(&crate::ownership_store::LiveLoad::default());
-    assert_eq!(load.registry, !crate::registry_seed::needs_gate_close());
+    assert!(!load.registry, "the lease says it is outside the rule");
+    let hold = crate::registry_seed::GateHold::new();
+    crate::registry_seed::hold_until_gate_closed_in(&hold);
+    assert!(
+        hold.is_pending(),
+        "and per-cell work is held until the gate is closed"
+    );
+    assert!(crate::registry_seed::needs_gate_close());
 }
 
 #[tokio::test]
@@ -4480,4 +4476,103 @@ async fn close_when_visible_result(
         Duration::from_millis(1),
     )
     .await
+}
+
+#[tokio::test]
+async fn a_seed_over_several_classes_writes_one_object_per_partition() {
+    let store = memory();
+    ensure_format_record(&store).await;
+    let mut names = seeded_names();
+    names.extend((0..40).map(|index| format!("Counter:{index:04x}")));
+    names.extend((0..40).map(|index| format!("Session:{index:04x}")));
+    bucket_with_cells(&store, &names).await;
+    let node = registry_on(&store, "node-a");
+    let mut holding = closed_holder(&node).await;
+    let reader = registry_on(&store, "node-b");
+    let seed = node
+        .write_seed(1, "1-0", &holding.map)
+        .await
+        .expect("a seed");
+    let written = keys_under(&store, &objects::seed_root(PREFIX)).await;
+    let partitions: HashSet<&str> = written
+        .iter()
+        .map(|key| key.rsplit('/').next().unwrap())
+        .collect();
+    assert_eq!(
+        written.len(),
+        partitions.len(),
+        "no partition has more than one seed object: {written:?}"
+    );
+    assert!(written.len() <= holding.map.partitions.len());
+    assert_eq!(seed.cells as usize, names.len());
+    *holding.seed_slot.lock().unwrap() = Some(seed);
+    holding.last_seed_ms = Some(crate::asyncrt::mono_ms());
+    pass_until_open(&node, &mut holding).await;
+    for name in &names {
+        assert!(
+            matches!(answer(&reader, name).await, Answer::Exists(_)),
+            "{name}"
+        );
+    }
+}
+
+fn a_seed_job(outputs: Vec<String>) -> Prepared {
+    Prepared {
+        epoch: 1,
+        job: Job::Spill {
+            consumed: Default::default(),
+            partitions: Vec::new(),
+        },
+        kind: "seed",
+        outputs,
+        retire: Vec::new(),
+        stats: MergeStats::default(),
+        partitions: 0,
+        ms: 0,
+        seed_gate: Some(1),
+    }
+}
+
+#[tokio::test]
+async fn every_rejection_of_a_seed_commit_keeps_the_outputs_it_could_not_delete() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    ensure_format_record(&plain).await;
+    let node = registry_on(&store, "node-a");
+    let mut holding = closed_holder(&node).await;
+    let output = format!("{PREFIX}fleet/reg/v1/run/0000000000000000/1-1-1");
+    objects::put_create(plain.as_ref(), &output, b"x".to_vec())
+        .await
+        .unwrap();
+    let job = a_seed_job(vec![output.clone()]);
+    let slot = |marker_ms: u64| {
+        Some(crate::registry_seed::SeedObjects {
+            gate: 1,
+            marker_ms,
+            cells: 0,
+            by_partition: Default::default(),
+        })
+    };
+    let stranded = |holding: &Holding| holding.stranded.lock().unwrap().clone();
+    scripted.fail_deletes(true);
+
+    // 1. The cutover window has not passed.
+    *holding.seed_slot.lock().unwrap() = slot(crate::asyncrt::mono_ms());
+    assert!(!node.seed_may_commit(&mut holding, &job).await);
+    assert_eq!(stranded(&holding), vec![output.clone()], "window");
+    holding.stranded.lock().unwrap().clear();
+
+    // 2. A lease cannot be read.
+    *holding.seed_slot.lock().unwrap() = slot(0);
+    lease(&plain, "node-x", r#"{"registry":true}"#, far()).await;
+    scripted.fail("/nodes/", true);
+    assert!(!node.seed_may_commit(&mut holding, &job).await);
+    assert_eq!(stranded(&holding), vec![output.clone()], "unreadable lease");
+    scripted.fail("/nodes/", false);
+    holding.stranded.lock().unwrap().clear();
+
+    // 3. A lease without the field is live.
+    lease(&plain, "node-old", "{}", far()).await;
+    assert!(!node.seed_may_commit(&mut holding, &job).await);
+    assert_eq!(stranded(&holding), vec![output], "blocking lease");
 }

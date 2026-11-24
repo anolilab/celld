@@ -1398,6 +1398,7 @@ impl LtxRepl {
                     config,
                 );
                 registry.install();
+                crate::registry_seed::mark_follows_rule();
                 registry.set_lister(lease.clone());
                 let wrapped: Arc<dyn ObjectStore> = Arc::new(
                     crate::registry_writer::RegistryStore::new(store, registry.clone()),

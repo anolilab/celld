@@ -1600,13 +1600,13 @@ impl Registry {
             .as_ref()
             .is_some_and(|seed| self.cutover_passed(seed));
         if !waited_out {
-            objects::delete_many(self.store.as_ref(), &job.outputs).await;
+            self.delete_or_strand(holding, job.outputs.clone()).await;
             return false;
         }
         let decision = match &leases {
             Ok(leases) => seed_decision(&holding.root, leases),
             Err(_) => {
-                objects::delete_many(self.store.as_ref(), &job.outputs).await;
+                self.delete_or_strand(holding, job.outputs.clone()).await;
                 return false;
             }
         };
@@ -1623,21 +1623,26 @@ impl Registry {
         } else {
             self.counters.seed_waits.fetch_add(1, Ordering::Relaxed);
         }
-        objects::delete_many(self.store.as_ref(), &job.outputs).await;
+        self.delete_or_strand(holding, job.outputs.clone()).await;
         let dropped = holding.seed_slot.lock().unwrap().take();
         if let Some(seed) = dropped {
-            let keys = seed.keys();
-            let gone: HashSet<String> = objects::delete_many(self.store.as_ref(), &keys)
-                .await
-                .into_iter()
-                .collect();
-            holding
-                .stranded
-                .lock()
-                .unwrap()
-                .extend(keys.into_iter().filter(|key| !gone.contains(key)));
+            self.delete_or_strand(holding, seed.keys()).await;
         }
         false
+    }
+
+    /// Delete `keys`; those whose delete is not confirmed go to the retired list's
+    /// intake, so they are deleted after the grace.
+    async fn delete_or_strand(&self, holding: &Holding, keys: Vec<String>) {
+        let gone: HashSet<String> = objects::delete_many(self.store.as_ref(), &keys)
+            .await
+            .into_iter()
+            .collect();
+        holding
+            .stranded
+            .lock()
+            .unwrap()
+            .extend(keys.into_iter().filter(|key| !gone.contains(key)));
     }
 
     fn record_job(&self, job: &Prepared, outcome: &str) {
