@@ -91,10 +91,7 @@ pub(crate) async fn live_leases(
 /// closed, and the compactor does not seed while this node's lease is live.
 /// Returns the gate number written, or `None` when there is no root. Refuses
 /// when shared packs exist.
-pub async fn close_gate(
-    store: &dyn ObjectStore,
-    prefix: &str,
-) -> anyhow::Result<Option<u64>> {
+pub async fn close_gate(store: &dyn ObjectStore, prefix: &str) -> anyhow::Result<Option<u64>> {
     for _ in 0..CLOSE_ATTEMPTS {
         let Some((read, _)) = objects::read_root(store, prefix).await? else {
             return Ok(None);

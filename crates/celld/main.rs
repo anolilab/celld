@@ -4874,7 +4874,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             });
         }
         (Some(ownership), _) if !celld::registry::is_w1() => {
-            let (ownership, node, ready) = (ownership.clone(), node.clone(), app.fleet_ready.clone());
+            let (ownership, node, ready) =
+                (ownership.clone(), node.clone(), app.fleet_ready.clone());
             tokio::spawn(async move {
                 close_registry_gate(&ownership, &node).await;
                 ready.store(true, std::sync::atomic::Ordering::SeqCst);

@@ -116,7 +116,10 @@ mod tests {
 
     #[test]
     fn a_live_node_outside_the_rule_makes_the_seed_wait() {
-        let leases = [LeaseRegistry::Declared(true), LeaseRegistry::Declared(false)];
+        let leases = [
+            LeaseRegistry::Declared(true),
+            LeaseRegistry::Declared(false),
+        ];
         assert_eq!(
             seed_decision(&closed_root(), &leases),
             SeedDecision::WaitForNonW1
