@@ -1945,6 +1945,7 @@ impl Registry {
                 break;
             }
         }
+        let sampled = cells.len();
         for cell in cells {
             self.counters.sampler_cells.fetch_add(1, Ordering::Relaxed);
             let key = objects::key_of(&cell);
@@ -1956,6 +1957,12 @@ impl Registry {
                 misses.push((cell, crate::asyncrt::mono_ms(), 0));
             }
         }
+        tracing::info!(
+            event = "registry_sample",
+            cells = sampled,
+            to_recheck = misses.len(),
+            "the sampler looked up cells that hold LTX"
+        );
         let mut state = state.lock().unwrap();
         state.after = if seen == 0 { None } else { last };
         state.misses.extend(misses);

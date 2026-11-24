@@ -2423,6 +2423,7 @@ fn the_registry_bound_shrinks_by_the_directory_wait_and_the_sum_stays_under_half
     assert!(wait(10_000, 6_000).is_err());
     assert_eq!(wait(5_000, 1_000).unwrap(), Duration::from_millis(500));
     assert!(wait(5_000, 2_500).is_err());
+}
 
 // ---------------------------------------------------------------------------
 // The gate, the seed and the format marker
