@@ -4588,7 +4588,7 @@ async fn every_rejection_of_a_seed_commit_keeps_the_outputs_it_could_not_delete(
     // 1. The cutover window has not passed.
     *holding.seed_slot.lock().unwrap() = slot(crate::asyncrt::mono_ms());
     assert!(!seed_step_decided(&node, &mut holding, &job).await);
-    wait_stranded(&holding, &[output.clone()]).await;
+    wait_stranded(&holding, std::slice::from_ref(&output)).await;
     holding.stranded.lock().unwrap().clear();
 
     // 2. A lease cannot be read.
@@ -4596,7 +4596,7 @@ async fn every_rejection_of_a_seed_commit_keeps_the_outputs_it_could_not_delete(
     lease(&plain, "node-x", r#"{"registry":true}"#, far()).await;
     scripted.fail("/nodes/", true);
     assert!(!seed_step_decided(&node, &mut holding, &job).await);
-    wait_stranded(&holding, &[output.clone()]).await;
+    wait_stranded(&holding, std::slice::from_ref(&output)).await;
     scripted.fail("/nodes/", false);
     holding.stranded.lock().unwrap().clear();
 
