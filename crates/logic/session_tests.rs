@@ -18,7 +18,8 @@ fn id_tag(cell: &str) -> Option<String> {
 
 fn session_node(marker: &[&str]) -> State {
     let mut state = started(8);
-    state.set_session(SessionTags::new(OWN, &tags(marker)), id_tag);
+    state.set_session(SessionTags::new(OWN, &tags(marker)));
+    state.set_id_tag(id_tag);
     state
 }
 
@@ -59,12 +60,15 @@ fn the_first_record_of_a_tagged_id_is_epoch_two_for_every_other_session() {
         ("tagged-foreign-tag", true, 2),
         ("tagged-own-tag", true, 1),
         ("plain", true, 1),
-        ("tagged-foreign-tag", false, 1),
+        ("tagged-foreign-tag", false, 2),
+        ("plain", false, 1),
     ] {
         let mut state = if session {
             session_node(&[])
         } else {
-            started(8)
+            let mut state = started(8);
+            state.set_id_tag(id_tag);
+            state
         };
         let op = request(&mut state, 1, cell);
         let effects = owner_read(&mut state, op, None);
@@ -249,4 +253,59 @@ fn a_predecessors_tag_names_this_process_only_for_a_resumed_cell_at_its_epoch() 
     assert!(!state.names_this_process("d", &record(4, Some("old".into()))));
     assert!(state.names_this_process("d", &record(4, Some(OWN.into()))));
     assert!(state.names_this_process("d", &record(4, None)));
+}
+
+/// A cached lease that predates the owner's restart does not carry the tag of
+/// the record's author. The core must not call that author dead from it: it
+/// reads the lease again, and decides on that read.
+#[test]
+fn a_cached_lease_from_before_a_restart_never_takes_over_the_restarted_cell() {
+    let mut state = started(8);
+    let lease_of = |carried: &[&str]| {
+        let mut lease = lease_record("peer", NOW_MS + 30_000, Some(LogState::Open));
+        lease.tags = tags(carried);
+        lease
+    };
+    // The first cell fills the cache with the lease of the old process.
+    let op = request(&mut state, 1, "first");
+    let effects = owner_read(&mut state, op, Some(("peer", 3, Some(OLD))));
+    let [Effect::ReadNodeLease { op, .. }] = work(&effects)[..] else {
+        panic!("expected a lease read, got {effects:?}");
+    };
+    on_event(
+        &mut state,
+        Event::NodeLeaseRead {
+            op: *op,
+            now_ms: NOW_MS,
+            result: Ok(Some(lease_of(&[OLD]))),
+        },
+    );
+    // The peer restarted under a new tag and claimed another cell.
+    let op = request(&mut state, 2, "second");
+    let effects = owner_read(&mut state, op, Some(("peer", 5, Some(FOREIGN))));
+    assert!(cas_owner(&effects).is_none(), "taken over: {effects:?}");
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RecoverNodeLog { .. })),
+        "{effects:?}"
+    );
+    let [Effect::ReadNodeLease { op, .. }] = work(&effects)[..] else {
+        panic!("expected a fresh lease read, got {effects:?}");
+    };
+    let effects = on_event(
+        &mut state,
+        Event::NodeLeaseRead {
+            op: *op,
+            now_ms: NOW_MS,
+            result: Ok(Some(lease_of(&[FOREIGN]))),
+        },
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Complete { result: Ok(Route::Remote { node, epoch: 5, .. }), .. } if node == "peer"
+        )),
+        "{effects:?}"
+    );
 }

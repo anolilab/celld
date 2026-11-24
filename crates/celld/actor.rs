@@ -48,8 +48,9 @@ const MAX_ALARM_HANDLER_BUDGET_MS: u64 = 365 * 24 * 60 * 60 * 1000;
 /// A core that runs as a session compares records by session, and reads the
 /// tag of an id from its class and its MAC.
 fn with_session(mut state: State) -> State {
+    state.set_id_tag(crate::session::id_tag_of_scope);
     if let Some(session) = crate::session::current() {
-        state.set_session(session.tags().clone(), crate::session::id_tag_of_scope);
+        state.set_session(session.tags().clone());
         state.set_resumed(session.resumed_snapshot());
     }
     state

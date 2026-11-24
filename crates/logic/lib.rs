@@ -891,7 +891,11 @@ pub struct State {
     /// The session tags of this process and the reader of the tag in an id.
     /// `None` is a process that writes no session: every record is compared
     /// by node name, as an older binary does.
-    session: Option<(session::SessionTags, session::IdTagOf)>,
+    session: Option<session::SessionTags>,
+    /// Reads the tag in the id of a cell. Set on every node that verifies
+    /// tagged ids, with or without a session of its own: a tagged id belongs
+    /// to the session that minted it at epoch 1, whoever else claims it.
+    id_tag: Option<session::IdTagOf>,
     /// The tag and epoch of the record of each cell this process resumed in a
     /// preserved restart. A predecessor's tag names this process only here.
     resumed: BTreeMap<CellId, (String, Epoch)>,
@@ -962,6 +966,7 @@ impl State {
             memory_headroom: false,
             shed_reason: None,
             session: None,
+            id_tag: None,
             resumed: BTreeMap::new(),
         }
     }
@@ -974,15 +979,21 @@ impl State {
 
     /// Run as a session: `tags` are written in this process's records and
     /// carried in its lease, and `id_tag` reads the tag of a cell's id.
-    pub fn set_session(&mut self, tags: session::SessionTags, id_tag: session::IdTagOf) {
-        self.session = Some((tags, id_tag));
+    pub fn set_session(&mut self, tags: session::SessionTags) {
+        self.session = Some(tags);
+    }
+
+    /// Read the tag of a cell's id with `id_tag`, so the first record of a
+    /// tagged id starts at the epoch its minting session does not share.
+    pub fn set_id_tag(&mut self, id_tag: session::IdTagOf) {
+        self.id_tag = Some(id_tag);
     }
 
     /// Whether `record` names this process, or a predecessor whose cell this
     /// process resumed in a preserved restart.
     fn names_this_process(&self, cell: &str, record: &OwnerRecord) -> bool {
         record.node.as_deref() == Some(self.node.as_str())
-            && self.session.as_ref().is_none_or(|(tags, _)| {
+            && self.session.as_ref().is_none_or(|tags| {
                 record.by.as_deref().is_none_or(|by| {
                     tags.is_own(Some(by))
                         || self
@@ -1000,17 +1011,14 @@ impl State {
             && self
                 .session
                 .as_ref()
-                .is_none_or(|(tags, _)| tags.is_own(record.by.as_deref()))
+                .is_none_or(|tags| tags.is_own(record.by.as_deref()))
     }
 
     /// The epoch of the first record of `cell`.
     fn first_record_epoch(&self, cell: &str) -> Epoch {
-        match &self.session {
-            Some((tags, id_tag)) => {
-                session::first_record_epoch(Some(tags.own()), id_tag(cell).as_deref())
-            }
-            None => 1,
-        }
+        let id_tag = self.id_tag.and_then(|id_tag| id_tag(cell));
+        let own = self.session.as_ref().map(session::SessionTags::own);
+        session::first_record_epoch(own, id_tag.as_deref())
     }
 
     pub fn node(&self) -> &str {
@@ -4445,6 +4453,10 @@ impl State {
                     .node_lease_cache
                     .get(&owner)
                     .filter(|lease| lease.deadline.live(self.now_ms, self.now_mono_ms))
+                    // A cached lease that does not carry the record's author
+                    // may predate that author's start. "The author is not
+                    // live" is decided only on a lease read after the record.
+                    .filter(|lease| session::author_live(record.by.as_deref(), &lease.record.tags))
                     .cloned();
                 if let Some(lease) = cached {
                     self.apply_node_lease_result(

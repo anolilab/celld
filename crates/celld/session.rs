@@ -325,11 +325,11 @@ pub(crate) fn register_class(script: &str, class: &str) {
 }
 
 /// The tag in the id of a cell scope `Class:<64 hex digits>`, for the claim
-/// path. `None` when the process has no session, the class is not declared
-/// here, or the id verifies in the plain domain only. The class
+/// path. `None` when the class is not declared here or the id verifies in
+/// the plain domain only. A process without a session reads it too, so it
+/// never claims a tagged id at epoch 1. The class
 /// in the scope gives the key, so no header is read to decide.
 pub(crate) fn id_tag_of_scope(scope: &str) -> Option<String> {
-    current()?;
     tag_of_scope(scope)
 }
 

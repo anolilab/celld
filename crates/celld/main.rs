@@ -5945,7 +5945,14 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         "could not name the session in the records of the resident cells"
                     );
                 }
-                None => reload_session_ok = false,
+                None => {
+                    reload_session_ok = false;
+                    tracing::warn!(
+                        event = "clean_reload_abandoned",
+                        reason = "timeout",
+                        "the process deadline passed before the resident cells were named in the session"
+                    );
+                }
             }
         }
     }
