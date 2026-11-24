@@ -133,12 +133,29 @@ fn free_port() -> u16 {
 
 /// The seconds into the day of a log line, from its RFC 3339 prefix.
 fn seconds_of(line: &str) -> Option<f64> {
-    let time = line.split('T').nth(1)?;
+    let (date, time) = line.split_once('T')?;
+    let date = date.get(date.len().checked_sub(10)?..)?;
+    let mut ymd = date.split('-');
+    let year: i64 = ymd.next()?.parse().ok()?;
+    let month: i64 = ymd.next()?.parse().ok()?;
+    let day: i64 = ymd.next()?.parse().ok()?;
+    // Days since 1970-01-01 (the civil-from-days inverse), so a run that
+    // crosses midnight or a month still orders its lines.
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 9)
+    } else {
+        (year, month - 3)
+    };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
     let mut parts = time.split([':', 'Z', ' ']);
     let hours: f64 = parts.next()?.parse().ok()?;
     let minutes: f64 = parts.next()?.parse().ok()?;
     let seconds: f64 = parts.next()?.parse().ok()?;
-    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+    Some(days as f64 * 86_400.0 + hours * 3600.0 + minutes * 60.0 + seconds)
 }
 
 /// The text between `key"` and the next `"` on `line`, for `key="value"`.
