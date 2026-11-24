@@ -3186,10 +3186,12 @@ fn resolve_append(
     resp: AppendSend,
 ) {
     let done = mono_ms();
-    health
-        .lock()
-        .unwrap()
-        .append_completed(&member.node, done, done.saturating_sub(started));
+    health.lock().unwrap().append_completed(
+        &member.node,
+        &member.generation,
+        done,
+        done.saturating_sub(started),
+    );
     info!(
         event = "log_append_rtt",
         member = member.node,
@@ -3256,7 +3258,10 @@ async fn http_append_job(
     job: LaneJob,
 ) {
     let started = mono_ms();
-    health.lock().unwrap().append_started(&member.node, started);
+    health
+        .lock()
+        .unwrap()
+        .append_started(&member.node, &member.generation, started);
     let last = job.req.entries.last().map_or(0, |entry| entry.seq);
     // The hedge: appends are idempotent per sequence — a duplicate of a
     // persisted range refuses with an end that covers it, which
@@ -3480,7 +3485,10 @@ fn arm_head(
         if head.head_started.is_none() {
             let now = mono_ms();
             head.head_started = Some(now);
-            health.lock().unwrap().append_started(&member.node, now);
+            health
+                .lock()
+                .unwrap()
+                .append_started(&member.node, &member.generation, now);
         }
     }
 }
@@ -3623,7 +3631,11 @@ async fn stream_lane(
                         return;
                     }
                     let started = mono_ms();
-                    health.lock().unwrap().append_started(&member.node, started);
+                    health.lock().unwrap().append_started(
+                        &member.node,
+                        &member.generation,
+                        started,
+                    );
                     resolve_append(
                         member,
                         policy,
@@ -3643,7 +3655,10 @@ async fn stream_lane(
             let started = mono_ms();
             if write_frame(write, &frame).await.is_err() {
                 retire_connection(&mut conn).await;
-                health.lock().unwrap().append_started(&member.node, started);
+                health
+                    .lock()
+                    .unwrap()
+                    .append_started(&member.node, &member.generation, started);
                 resolve_append(
                     member,
                     policy,
@@ -4895,7 +4910,10 @@ impl NodeLogManager {
                         entries: Vec::new(),
                     };
                     let started = mono_ms();
-                    health.lock().unwrap().append_started(&node, started);
+                    health
+                        .lock()
+                        .unwrap()
+                        .append_started(&node, &member.generation, started);
                     let outcome = crate::asyncrt::select_biased! {
                         "a stop signal that ties a probe response prevents recording stale health";
                         _ = stop.stopped() => return,
@@ -4904,6 +4922,7 @@ impl NodeLogManager {
                     let done = mono_ms();
                     health.lock().unwrap().append_completed(
                         &node,
+                        &member.generation,
                         done,
                         done.saturating_sub(started),
                     );
@@ -5961,7 +5980,19 @@ impl NodeLogManager {
                 current.is_active() && members.len() <= current.members.len()
             });
         if cannot_publish {
-            return Ok(());
+            // The unguarded look can be stale: a degrade in between must
+            // still reach the repair below. Confirm under the guard, which
+            // the repair check also takes, and take the shortcut only if the
+            // ensemble is still active and no narrower than the selection.
+            let transition = self.live_log.lock().await;
+            let still = !transition.is_running()
+                || self.inner.lock().unwrap().as_ref().is_some_and(|current| {
+                    current.is_active() && members.len() <= current.members.len()
+                });
+            drop(transition);
+            if still {
+                return Ok(());
+            }
         }
         if !members.is_empty() {
             let fresh = self.ownership.read_capacity_peers().await?;
