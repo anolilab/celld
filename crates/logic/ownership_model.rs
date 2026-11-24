@@ -630,6 +630,7 @@ impl Ownership {
                 LogSt::Open => Some(log_tier::LogState::Open),
                 LogSt::Sealed => Some(log_tier::LogState::Sealed),
             },
+            tags: Vec::new(),
             etag: format!("l{}", lease.generation),
         }
     }
@@ -668,6 +669,7 @@ impl Ownership {
             log_state: world.procs[node]
                 .as_ref()
                 .and_then(|p| p.pred_log_sealed.then_some(log_tier::LogState::Sealed)),
+            tags: Vec::new(),
             etag: "previous".into(),
         }
     }
@@ -728,6 +730,7 @@ impl Ownership {
                     Some(record) => Ok(Some(OwnerRecord {
                         node: record.node.map(name),
                         epoch: record.epoch,
+                        by: None,
                         etag: Self::etag(record.token),
                     })),
                     None if Self::has_data(world)

@@ -36,6 +36,7 @@ pub mod registry_gate;
 pub mod restore;
 pub mod routing;
 pub mod schedule;
+pub mod session;
 pub mod sqlite;
 pub mod sweep;
 pub mod wake;
@@ -887,6 +888,13 @@ pub struct State {
     memory_headroom: bool,
     /// Which resource is holding the latch, for the effect the shell logs.
     shed_reason: Option<&'static str>,
+    /// The session tags of this process and the reader of the tag in an id.
+    /// `None` is a process that writes no session: every record is compared
+    /// by node name, as an older binary does.
+    session: Option<(session::SessionTags, session::IdTagOf)>,
+    /// The tag and epoch of the record of each cell this process resumed in a
+    /// preserved restart. A predecessor's tag names this process only here.
+    resumed: BTreeMap<CellId, (String, Epoch)>,
 }
 
 impl State {
@@ -953,6 +961,55 @@ impl State {
             shedding: false,
             memory_headroom: false,
             shed_reason: None,
+            session: None,
+            resumed: BTreeMap::new(),
+        }
+    }
+
+    /// The cells a preserved restart resumed, with the tag and epoch of each
+    /// cell's record.
+    pub fn set_resumed(&mut self, resumed: BTreeMap<CellId, (String, Epoch)>) {
+        self.resumed = resumed;
+    }
+
+    /// Run as a session: `tags` are written in this process's records and
+    /// carried in its lease, and `id_tag` reads the tag of a cell's id.
+    pub fn set_session(&mut self, tags: session::SessionTags, id_tag: session::IdTagOf) {
+        self.session = Some((tags, id_tag));
+    }
+
+    /// Whether `record` names this process, or a predecessor whose cell this
+    /// process resumed in a preserved restart.
+    fn names_this_process(&self, cell: &str, record: &OwnerRecord) -> bool {
+        record.node.as_deref() == Some(self.node.as_str())
+            && self.session.as_ref().is_none_or(|(tags, _)| {
+                record.by.as_deref().is_none_or(|by| {
+                    tags.is_own(Some(by))
+                        || self
+                            .resumed
+                            .get(cell)
+                            .is_some_and(|(tag, epoch)| tag == by && *epoch == record.epoch)
+                })
+            })
+    }
+
+    /// Whether `record` is a write of this very process. A second process of
+    /// one node never counts its predecessor's write as its own.
+    fn written_by_this_process(&self, record: &OwnerRecord) -> bool {
+        record.node.as_deref() == Some(self.node.as_str())
+            && self
+                .session
+                .as_ref()
+                .is_none_or(|(tags, _)| tags.is_own(record.by.as_deref()))
+    }
+
+    /// The epoch of the first record of `cell`.
+    fn first_record_epoch(&self, cell: &str) -> Epoch {
+        match &self.session {
+            Some((tags, id_tag)) => {
+                session::first_record_epoch(Some(tags.own()), id_tag(cell).as_deref())
+            }
+            None => 1,
         }
     }
 
@@ -2439,6 +2496,7 @@ impl State {
             // state was recovered before this install (the engine's
             // startup order), so None is the truth, not a reset.
             log_state: None,
+            tags: Vec::new(),
             etag: String::new(),
         };
         let pending = PendingNodeLease {
@@ -3142,6 +3200,7 @@ impl State {
                     // renewal carries the folded log state through
                     // unchanged.
                     log_state: prior.record.log_state,
+                    tags: Vec::new(),
                     etag: String::new(),
                 };
                 let guard = CasGuard::Match(prior.record.etag.clone());
@@ -4274,11 +4333,9 @@ impl State {
                 // dormant at that epoch, exactly as an idle eviction does,
                 // and the next request wakes it through the usual claim.
                 let phase = match result {
-                    Ok(Some(record)) if record.node.as_deref() == Some(self.node.as_str()) => {
-                        Phase::Dormant {
-                            epoch: record.epoch,
-                        }
-                    }
+                    Ok(Some(record)) if self.names_this_process(&id, &record) => Phase::Dormant {
+                        epoch: record.epoch,
+                    },
                     _ => Phase::Inactive,
                 };
                 set_phase(&mut self.occupied, &mut cell, phase);
@@ -4299,8 +4356,7 @@ impl State {
         match result {
             Ok(Some(record))
                 if reconciling_claim.as_ref().is_some_and(|claim| {
-                    record.node.as_deref() == Some(self.node.as_str())
-                        && record.epoch == claim.epoch
+                    self.written_by_this_process(&record) && record.epoch == claim.epoch
                 }) =>
             {
                 let spec = RestoreSpec {
@@ -4425,7 +4481,7 @@ impl State {
                     &mut cell,
                     Claim {
                         guard: CasGuard::Absent,
-                        epoch: 1,
+                        epoch: self.first_record_epoch(&id),
                         takeover: false,
                         prior: None,
                         reconciles,
@@ -4648,6 +4704,7 @@ impl State {
                 if lease.expires_ms > issued_ms
                     && !lease.addr.is_empty()
                     && record.node.as_deref() == Some(lease.node.as_str())
+                    && session::author_live(record.by.as_deref(), &lease.tags)
                     && lease.peer_protocol != self.config.peer_protocol =>
             {
                 set_phase(&mut self.occupied, cell, Phase::Inactive);
@@ -4659,6 +4716,7 @@ impl State {
             })) if lease.expires_ms > issued_ms
                 && !lease.addr.is_empty()
                 && record.node.as_deref() == Some(lease.node.as_str())
+                && session::author_live(record.by.as_deref(), &lease.tags)
                 && lease.peer_protocol == self.config.peer_protocol =>
             {
                 let node = lease.node;
@@ -4703,8 +4761,13 @@ impl State {
                 // could open a log and acknowledge into the epoch this claim
                 // supersedes. Recovery seals the absent log by compare-and-
                 // set, which fails that renewal, so the claim waits for it.
+                // A record whose author is no process that this node's lease
+                // carries was written by a predecessor of that node, which the
+                // node recovered before its own install.
                 let unrecovered = lease.as_ref().is_some_and(|lease| {
                     lease.record.log_state != Some(crate::log_tier::LogState::Sealed)
+                        && (record.node.as_deref() != Some(lease.record.node.as_str())
+                            || session::author_live(record.by.as_deref(), &lease.record.tags))
                 });
                 // An ingress-only node leaves the dead owner's log to the
                 // peer that takes the cell.
@@ -7610,6 +7673,8 @@ mod reset_tests;
 mod scripted;
 #[cfg(test)]
 mod second_release_tests;
+#[cfg(test)]
+mod session_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]

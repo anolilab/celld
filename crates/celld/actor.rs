@@ -45,6 +45,16 @@ const HANDOFF_ALARM_COVERAGE_MS: u64 = 5_000;
 
 const MAX_ALARM_HANDLER_BUDGET_MS: u64 = 365 * 24 * 60 * 60 * 1000;
 
+/// A core that runs as a session compares records by session, and reads the
+/// tag of an id from its class and its MAC.
+fn with_session(mut state: State) -> State {
+    if let Some(session) = crate::session::current() {
+        state.set_session(session.tags().clone(), crate::session::id_tag_of_scope);
+        state.set_resumed(session.resumed_snapshot());
+    }
+    state
+}
+
 /// The shell's deadline for one actor operation. Queue leases include this
 /// exact budget for their settlement call, so the actor and broker must read
 /// one accessor rather than duplicate the environment default.
@@ -383,6 +393,7 @@ impl Ownership {
                         OwnerRecord {
                             node: Some(node),
                             epoch,
+                            by: None,
                             etag,
                         },
                     );
@@ -419,6 +430,7 @@ impl Ownership {
                         OwnerRecord {
                             node: None,
                             epoch,
+                            by: None,
                             etag,
                         },
                     );
@@ -2453,7 +2465,7 @@ impl Actor {
         };
         Ok(Self {
             node_log: Arc::new(std::sync::Mutex::new(None)),
-            state: ActorState::from(State::new(
+            state: ActorState::from(with_session(State::new(
                 node,
                 Config {
                     max_resident: limits.resident,
@@ -2496,7 +2508,7 @@ impl Actor {
                         Ownership::Bucket(_) => ownership_on_evict_from_environment()?,
                     },
                 },
-            )),
+            ))),
             ownership,
             peer_http,
             peer_auth,
@@ -3922,7 +3934,7 @@ impl Actor {
                 out.spawn_scoped(async move {
                     let result = match ownership.read_owner(&cell).await {
                         Ok(Some(record))
-                            if record.node.as_deref() == Some(node.as_str())
+                            if crate::session::names_this_process(&node, &cell, &record)
                                 && record.epoch == epoch =>
                         {
                             Ok(())

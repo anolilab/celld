@@ -3,7 +3,7 @@
 use crate::log_tier::LogState;
 use crate::*;
 
-const NOW_MS: u64 = 1_000_000;
+pub(crate) const NOW_MS: u64 = 1_000_000;
 const PEER_PROTOCOL: u16 = 1;
 
 fn config(max_resident: usize) -> Config {
@@ -15,7 +15,11 @@ fn config(max_resident: usize) -> Config {
     }
 }
 
-fn lease_record(node: &str, expires_ms: u64, log_state: Option<LogState>) -> NodeLeaseRecord {
+pub(crate) fn lease_record(
+    node: &str,
+    expires_ms: u64,
+    log_state: Option<LogState>,
+) -> NodeLeaseRecord {
     NodeLeaseRecord {
         node: node.into(),
         addr: format!("{node}:8081"),
@@ -23,6 +27,7 @@ fn lease_record(node: &str, expires_ms: u64, log_state: Option<LogState>) -> Nod
         peer_protocol: PEER_PROTOCOL,
         generation: "g".into(),
         log_state,
+        tags: Vec::new(),
         etag: "lease-etag".into(),
     }
 }
@@ -53,7 +58,7 @@ fn peer(node: &str, expires_ms: u64) -> CapacityPeer {
 }
 
 /// A node that holds a live lease of its own.
-fn started(max_resident: usize) -> State {
+pub(crate) fn started(max_resident: usize) -> State {
     let mut state = State::new("ingress", config(max_resident));
     let effects = on_event(
         &mut state,
@@ -102,14 +107,14 @@ fn started(max_resident: usize) -> State {
 }
 
 /// The effects other than the deadline timers armed beside them.
-fn work(effects: &[Effect]) -> Vec<&Effect> {
+pub(crate) fn work(effects: &[Effect]) -> Vec<&Effect> {
     effects
         .iter()
         .filter(|effect| !matches!(effect, Effect::ScheduleTimer { .. }))
         .collect()
 }
 
-fn request(state: &mut State, request: RequestId, cell: &str) -> OpId {
+pub(crate) fn request(state: &mut State, request: RequestId, cell: &str) -> OpId {
     let effects = on_event(
         state,
         Event::RequestAt {
@@ -136,6 +141,7 @@ fn owner_read(state: &mut State, op: OpId, node: Option<&str>) -> Vec<Effect> {
             result: Ok(node.map(|node| OwnerRecord {
                 node: Some(node.into()),
                 epoch: 7,
+                by: None,
                 etag: "owner-etag".into(),
             })),
         },
@@ -343,6 +349,7 @@ fn claim_after_read(state: &mut State, cell: &str, record: Option<&str>) -> Effe
             result: Ok(Some(OwnerRecord {
                 node: record.map(Into::into),
                 epoch: 1,
+                by: None,
                 etag: "owner-etag".into(),
             })),
         },

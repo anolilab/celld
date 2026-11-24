@@ -90,11 +90,8 @@ impl Declared {
         let Some(id) = decode_durable_object_id(instance) else {
             return false;
         };
-        use hmac::Mac;
         let key = durable_object_id_key(&crate::engine_api::namespace_key(&self.script, class));
-        durable_object_id_hmac(&key, &id[..16])
-            .verify_truncated_left(&id[16..])
-            .is_ok()
+        crate::session::check_id(crate::session::current(), &key, &id).is_ok()
     }
 }
 
