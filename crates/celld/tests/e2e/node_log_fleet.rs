@@ -193,6 +193,22 @@ fn recruited_after_failing(log: &str) -> Vec<(String, String, f64)> {
     recruited
 }
 
+/// The ensemble-open lines of the other nodes that name `name`.
+fn opens_naming(nodes: &[Node], except: usize, name: &str) -> usize {
+    let quoted = format!("\"{name}\"");
+    nodes
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != except)
+        .map(|(_, node)| {
+            node.log()
+                .lines()
+                .filter(|line| line.contains("log ensemble open") && line.contains(&quoted))
+                .count()
+        })
+        .sum()
+}
+
 /// Lines of `log` that contain `needle`.
 fn count(log: &str, needle: &str) -> usize {
     log.lines().filter(|line| line.contains(needle)).count()
@@ -247,7 +263,17 @@ async fn a_rolling_restart_does_not_recruit_the_restarting_peer() {
     let body = async {
         // The followers form their ensembles a few seconds after they are
         // ready.
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        wait_until(
+            "every node to open a log ensemble",
+            Duration::from_secs(90),
+            || {
+                let all = nodes
+                    .iter()
+                    .all(|node| count(&node.log(), "log ensemble open") >= 1);
+                async move { all.then_some(()) }
+            },
+        )
+        .await;
         let addresses = Arc::new(Mutex::new(
             nodes
                 .iter()
@@ -305,14 +331,28 @@ async fn a_rolling_restart_does_not_recruit_the_restarting_peer() {
         let mut restarts = Vec::new();
         for index in 0..3 {
             let t = Instant::now();
+            let name = format!("nodelog-{index}");
             nodes[index].stop();
             let node = Node::spawn(home.path(), index, &spec, &endpoint);
+            // What the peers had opened with this node before it came back.
+            let named_before = opens_naming(&nodes, index, &name);
+            let own_before = count(&node.log(), "log ensemble open");
             node.wait_ready(&client).await;
             nodes[index] = node;
             *addresses.lock().unwrap() = nodes.iter().map(|node| node.public.clone()).collect();
             restarts.push(t.elapsed());
-            // Let the ensembles settle before the next node goes.
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // The ensembles settle before the next node goes: the restarted
+            // node has opened its own, and a peer has recruited it again.
+            wait_until(
+                &format!("{name} to be in the ensembles again"),
+                Duration::from_secs(60),
+                || {
+                    let settled = count(&nodes[index].log(), "log ensemble open") > own_before
+                        && opens_naming(&nodes, index, &name) > named_before;
+                    async move { settled.then_some(()) }
+                },
+            )
+            .await;
         }
         stop.store(true, Ordering::SeqCst);
         let _ = driver.await;
@@ -376,8 +416,15 @@ async fn a_rolling_restart_does_not_recruit_the_restarting_peer() {
         .into_iter()
         .map(|meta| meta.location.to_string())
         .collect();
-    store.delete_many(&keys).await;
+    let deleted: std::collections::BTreeSet<String> =
+        store.delete_many(&keys).await.into_iter().collect();
+    let leftovers: Vec<&String> = keys.iter().filter(|key| !deleted.contains(*key)).collect();
+    // An earlier failure is reported first; the cleanup follows it.
     if let Err(panic) = outcome {
+        if !leftovers.is_empty() {
+            eprintln!("cleanup left {} objects: {leftovers:?}", leftovers.len());
+        }
         std::panic::resume_unwind(panic);
     }
+    assert!(leftovers.is_empty(), "cleanup left objects: {leftovers:?}");
 }

@@ -2573,6 +2573,68 @@ impl std::fmt::Display for PeerHttpError {
 
 impl std::error::Error for PeerHttpError {}
 
+/// How many live peers recruitment passed over, by reason.
+#[derive(Clone, Copy, Default)]
+struct Removed {
+    draining: usize,
+    sitting_out: usize,
+    quarantined: usize,
+}
+
+/// A peer connection that failed outright, as opposed to one that was slow.
+#[derive(Debug)]
+struct ConnectionLost(&'static str);
+
+impl std::fmt::Display for ConnectionLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ConnectionLost {}
+
+/// Did this transport error come from the connection failing outright
+/// (refused, reset, dial failed, closed before a response)? That is what a
+/// restarting peer produces. A timeout is not: it is what a slow but live
+/// follower produces, and the latency rule judges that one.
+fn is_connection_failure(error: &anyhow::Error) -> bool {
+    if error.downcast_ref::<ConnectionLost>().is_some() {
+        return true;
+    }
+    for cause in error.chain() {
+        if let Some(reqwest_error) = cause.downcast_ref::<reqwest::Error>() {
+            if reqwest_error.is_timeout() {
+                return false;
+            }
+            if reqwest_error.is_connect() {
+                return true;
+            }
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+            ) {
+                return true;
+            }
+        }
+        if let Some(hyper_error) = cause.downcast_ref::<hyper::Error>() {
+            if hyper_error.is_closed()
+                || hyper_error.is_canceled()
+                || hyper_error.is_incomplete_message()
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Recovery refused to fence a session whose lease is still live. A caller
 /// that retries may wait exactly `remaining_ms`.
 #[derive(Debug)]
@@ -2992,25 +3054,30 @@ fn resolve_append(
                 .append_incapable(policy, &member.node, done);
             None
         }
-        AppendSend::Failed(_) => {
-            // The process that failed sits out until its lease lapses, or one
-            // lease lifetime from now if that is later (a lease it renews).
+        AppendSend::Failed(error) if is_connection_failure(&error) => {
+            // The peer's connection failed outright: it is restarting or
+            // gone. The process that failed sits out until its lease lapses,
+            // or one lease lifetime from now if that is later (a lease it
+            // renews). A timeout is not this: a slow member stays on the
+            // gray path and recruitable at once.
             let now = crate::ownership_store::now_ms();
             warn!(
                 member = member.node,
                 generation = member.generation,
+                %error,
                 "follower append failed; sitting out of recruitment while its lease lasts"
             );
             health.lock().unwrap().append_failed(
                 &member.node,
                 &member.generation,
+                now,
                 member
                     .lease_expires_ms
                     .max(now.saturating_add(member.lease_ttl_ms)),
             );
             None
         }
-        AppendSend::Answered(_) => None,
+        AppendSend::Answered(_) | AppendSend::Failed(_) => None,
     };
     // The window accounting settles BEFORE the round future can
     // resolve: by the time the ship loop sees a completed round, every
@@ -3428,7 +3495,9 @@ async fn stream_lane(
                     job,
                     started,
                     mono_ms().saturating_sub(started),
-                    AppendSend::Failed(anyhow::anyhow!("append stream write failed")),
+                    AppendSend::Failed(anyhow::Error::new(ConnectionLost(
+                        "append stream write failed",
+                    ))),
                 );
                 continue;
             }
@@ -5590,7 +5659,7 @@ impl NodeLogManager {
     /// the message is an invitation: a second node acknowledges from a
     /// follower's disk instead of a storage round trip. Live peers that are
     /// all ineligible is a fault the operator can act on.
-    fn report_fleet_shortfall(&self, live_peers: usize, now_ms: u64) {
+    fn report_fleet_shortfall(&self, live_peers: usize, removed: Removed, now_ms: u64) {
         const REPORT_INTERVAL_MS: u64 = 300_000;
         let last = match self.shortfall_logged_ms.load(Ordering::SeqCst) {
             0 => None,
@@ -5611,9 +5680,13 @@ impl NodeLogManager {
             ),
             log_tier::Shortfall::NoEligiblePeer => warn!(
                 live_peers,
+                draining = removed.draining,
+                sitting_out_after_failed_append = removed.sitting_out,
+                quarantined_for_incapability = removed.quarantined,
                 "fleet durability requested and no peer is eligible; writes \
-                 wait for the bucket. Every live peer is quarantined for \
-                 incapability or has not been recruited yet"
+                 wait for the bucket. Every live peer is draining, sitting \
+                 out after a failed append, or quarantined for incapability, \
+                 as counted here"
             ),
         }
     }
@@ -5685,39 +5758,41 @@ impl NodeLogManager {
             .filter(|peer| peer.node != self.node && peer.expires_ms > now)
             .count();
         let lease_ttl_ms = self.ownership.lease_ttl_ms();
-        let members: Vec<Member> = peers
+        let mut removed = Removed::default();
+        let mut members: Vec<Member> = Vec::new();
+        for peer in peers
             .into_iter()
             .filter(|peer| peer.node != self.node && peer.expires_ms > now)
+        {
+            let health = self.health.lock().unwrap();
             // A peer that is draining is giving its work away and stops
-            // serving soon, and a peer whose append just failed is most likely
-            // restarting with its old lease still live: recruiting either opens
-            // an ensemble that fails its first append. A failed peer is
-            // recruitable again once its lease belongs to a new process, or
-            // when the backoff has passed.
-            .filter(|peer| !peer.draining)
-            .filter(|peer| {
-                !self
-                    .health
-                    .lock()
-                    .unwrap()
-                    .failed_recently(&peer.node, &peer.generation, now)
-            })
-            // Only a follower that cannot serve appends at all sits out a
-            // term. A gray one is recruitable again at once, because the
-            // latency rule can judge it again and the swap rate cap is what
-            // bounds flapping.
-            .filter(|peer| !self.health.lock().unwrap().quarantined(&peer.node, mono))
-            // Replication factor and the in-sync floor are separate numbers:
-            // recruit to the target, serve on one.
-            .take(RECRUIT_FOLLOWERS)
-            .map(|peer| Member {
-                node: peer.node,
-                addr: peer.addr,
-                generation: peer.generation,
-                lease_expires_ms: peer.expires_ms,
-                lease_ttl_ms,
-            })
-            .collect();
+            // serving soon, and a peer whose connection just failed is most
+            // likely restarting with its old lease still live: recruiting
+            // either opens an ensemble that fails its first append. A failed
+            // peer is recruitable again once its lease belongs to a new
+            // process, or when its sit-out has passed.
+            if peer.draining {
+                removed.draining += 1;
+            } else if health.failed_recently(&peer.node, &peer.generation, now) {
+                removed.sitting_out += 1;
+            } else if health.quarantined(&peer.node, mono) {
+                // Only a follower that cannot serve appends at all sits out a
+                // term. A gray one is recruitable again at once, because the
+                // latency rule can judge it again and the swap rate cap is
+                // what bounds flapping.
+                removed.quarantined += 1;
+            } else if members.len() < RECRUIT_FOLLOWERS {
+                // Replication factor and the in-sync floor are separate
+                // numbers: recruit to the target, serve on one.
+                members.push(Member {
+                    node: peer.node,
+                    addr: peer.addr,
+                    generation: peer.generation,
+                    lease_expires_ms: peer.expires_ms,
+                    lease_ttl_ms,
+                });
+            }
+        }
         // Peer discovery is intentionally outside the transition guard.
         // Recheck the lifecycle after that await, then keep the snapshot,
         // publication, and successor installation in one critical section.
@@ -5749,7 +5824,7 @@ impl NodeLogManager {
             }
         }
         if members.is_empty() {
-            self.report_fleet_shortfall(live_peers, mono);
+            self.report_fleet_shortfall(live_peers, removed, mono);
             return Ok(());
         }
         if !self.ltx.all_fragment_rows_tiered() {
@@ -7063,6 +7138,58 @@ mod seal_absent_log_tests {
                 !matches!(renewed, Ok(Some(_))),
                 "a renewal on the pre-seal token must not apply"
             );
+        });
+    }
+
+    /// The error of one POST to `url` with a request timeout.
+    async fn post_error(url: String, timeout: std::time::Duration) -> anyhow::Error {
+        let error = reqwest::Client::new()
+            .post(url)
+            .timeout(timeout)
+            .body("x")
+            .send()
+            .await
+            .expect_err("the post fails");
+        error.into()
+    }
+
+    #[test]
+    fn a_refused_connection_is_a_connection_failure() {
+        run(async {
+            let port = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            let error = post_error(
+                format!("http://127.0.0.1:{port}/"),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            assert!(is_connection_failure(&error), "{error:#}");
+        });
+    }
+
+    #[test]
+    fn a_timeout_is_not_a_connection_failure() {
+        run(async {
+            // A follower that takes the connection and never answers: the
+            // kernel completes the handshake, and nothing reads the request.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let error = post_error(
+                format!("http://127.0.0.1:{port}/"),
+                std::time::Duration::from_millis(150),
+            )
+            .await;
+            drop(listener);
+            assert!(!is_connection_failure(&error), "{error:#}");
+            // Nor is an answer, a stalled stream's deadline, or a hedge.
+            assert!(!is_connection_failure(&anyhow::anyhow!(
+                "append stream failed"
+            )));
+            assert!(is_connection_failure(&anyhow::Error::new(ConnectionLost(
+                "append stream write failed"
+            ))));
         });
     }
 

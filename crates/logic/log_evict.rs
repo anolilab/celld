@@ -160,10 +160,12 @@ impl MemberHealth {
 pub struct FollowerHealth {
     members: BTreeMap<NodeId, MemberHealth>,
     quarantined_until: BTreeMap<NodeId, u64>,
-    /// Followers whose append failed in transport: the process generation
-    /// that failed and the wall-clock time until which it sits out. Unlike the
-    /// quarantine, it never holds back a different process of the same node.
-    failed: BTreeMap<NodeId, (String, u64)>,
+    /// Followers whose append failed at the connection, by node and process
+    /// generation, and the wall-clock time until which each sits out. Unlike
+    /// the quarantine, it never holds back a different process of the same
+    /// node, and a late failure of an old process never erases the sit-out of
+    /// the current one.
+    failed: BTreeMap<(NodeId, String), u64>,
     last_swap_ms: Option<u64>,
 }
 
@@ -320,21 +322,22 @@ impl FollowerHealth {
         self.members.remove(member);
     }
 
-    /// The member's append failed in transport (refused, reset, timed out, a
-    /// 5xx). A peer that is restarting keeps its node lease live until the
-    /// lease lapses or its successor replaces it, so the next rebuild must not
-    /// recruit it again at once: that ensemble fails its first append and
-    /// degrades. `generation` is the process generation of the lane that
-    /// failed, and the member sits out until `until_ms` (wall clock) for that
-    /// generation only; a later failure of the same generation never shortens
-    /// the sit-out, and a failure of another one replaces it.
-    pub fn append_failed(&mut self, member: &str, generation: &str, until_ms: u64) {
-        let until_ms = match self.failed.get(member) {
-            Some((held, held_until)) if held == generation => until_ms.max(*held_until),
-            _ => until_ms,
-        };
-        self.failed
-            .insert(member.to_string(), (generation.to_string(), until_ms));
+    /// The member's append failed at the connection (refused, reset, dial
+    /// failed, closed before a response): the signature of a peer that is
+    /// restarting. Its lease stays live until it lapses or its successor
+    /// replaces it, so the next rebuild must not recruit it again at once: that
+    /// ensemble fails its first append and degrades. `generation` is the
+    /// process generation of the lane that failed, and that process sits out
+    /// until `until_ms` (wall clock). A later failure of the same process never
+    /// shortens the sit-out. A timeout is not recorded here: a slow member is
+    /// judged by the latency rule and stays recruitable.
+    pub fn append_failed(&mut self, member: &str, generation: &str, now_ms: u64, until_ms: u64) {
+        self.failed.retain(|_, until| *until > now_ms);
+        let entry = self
+            .failed
+            .entry((member.to_string(), generation.to_string()))
+            .or_insert(0);
+        *entry = (*entry).max(until_ms);
         self.members.remove(member);
     }
 
@@ -342,8 +345,8 @@ impl FollowerHealth {
     /// process failed an append and its sit-out has not passed?
     pub fn failed_recently(&self, candidate: &str, generation: &str, now_ms: u64) -> bool {
         self.failed
-            .get(candidate)
-            .is_some_and(|(held, until)| held == generation && *until > now_ms)
+            .get(&(candidate.to_string(), generation.to_string()))
+            .is_some_and(|until| *until > now_ms)
     }
 
     /// May an eviction-driven swap happen now? A failed follower (a hard
@@ -434,20 +437,27 @@ mod tests {
     fn a_failed_append_sits_out_that_process_until_its_lease_lapses() {
         let mut health = FollowerHealth::default();
         assert!(!health.failed_recently("b", "g1", 1_000));
-        health.append_failed("b", "g1", 11_000);
+        health.append_failed("b", "g1", 1_000, 11_000);
         assert!(health.failed_recently("b", "g1", 10_999));
         assert!(!health.failed_recently("b", "g1", 11_000));
         // A successor process of the same node is eligible at once.
         assert!(!health.failed_recently("b", "g2", 1_000));
         assert!(!health.failed_recently("c", "g1", 1_000));
         // A later failure of the same process never shortens the sit-out.
-        health.append_failed("b", "g1", 2_000);
+        health.append_failed("b", "g1", 2_000, 3_000);
         assert!(health.failed_recently("b", "g1", 10_999));
-        // A failure of another process replaces it; the first is forgotten.
-        health.append_failed("b", "g2", 5_000);
-        assert!(health.failed_recently("b", "g2", 4_999));
-        assert!(!health.failed_recently("b", "g1", 4_999));
         // And it is not a quarantine: the incapability ledger is untouched.
         assert!(!health.quarantined("b", 1_000));
+    }
+
+    #[test]
+    fn a_late_failure_of_an_old_process_leaves_the_current_sit_out() {
+        let mut health = FollowerHealth::default();
+        health.append_failed("b", "current", 1_000, 11_000);
+        health.append_failed("b", "old", 1_500, 5_000);
+        assert!(health.failed_recently("b", "current", 4_000));
+        assert!(health.failed_recently("b", "old", 4_000));
+        assert!(!health.failed_recently("b", "old", 5_000));
+        assert!(health.failed_recently("b", "current", 10_999));
     }
 }
