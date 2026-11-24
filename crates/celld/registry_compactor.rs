@@ -1690,26 +1690,35 @@ impl Registry {
             }
         }
         let cells_prefix = Path::from(format!("{}cells", self.prefix));
-        let mut listing = match &after {
-            Some(after) => self
-                .store
-                .list_with_offset(Some(&cells_prefix), &Path::from(after.as_str())),
-            None => self.store.list(Some(&cells_prefix)),
-        };
-        self.counters.list_requests.fetch_add(1, Ordering::Relaxed);
         let mut cells: Vec<String> = Vec::new();
         let mut seen = 0;
         let mut last = None;
-        while let Some(Ok(meta)) = listing.next().await {
-            seen += 1;
-            let key = meta.location.to_string();
-            last = Some(key.clone());
-            if let Some(cell) = objects::cell_of_ltx_key(&self.prefix, &key) {
-                if !cells.iter().any(|held| held == cell) {
-                    cells.push(cell.to_owned());
+        // From where the last page ended; when nothing lies after that, the page
+        // is the start of `cells/` again in the same sample, so a bucket that has
+        // grown only before the cursor is still looked at.
+        let starts = after.clone().into_iter().map(Some).chain([None]);
+        for start in starts {
+            let mut listing = match &start {
+                Some(after) => self
+                    .store
+                    .list_with_offset(Some(&cells_prefix), &Path::from(after.as_str())),
+                None => self.store.list(Some(&cells_prefix)),
+            };
+            self.counters.list_requests.fetch_add(1, Ordering::Relaxed);
+            while let Some(Ok(meta)) = listing.next().await {
+                seen += 1;
+                let key = meta.location.to_string();
+                last = Some(key.clone());
+                if let Some(cell) = objects::cell_of_ltx_key(&self.prefix, &key) {
+                    if !cells.iter().any(|held| held == cell) {
+                        cells.push(cell.to_owned());
+                    }
+                }
+                if cells.len() >= SAMPLER_CELLS || seen >= 400 {
+                    break;
                 }
             }
-            if cells.len() >= SAMPLER_CELLS || seen >= 400 {
+            if seen > 0 {
                 break;
             }
         }

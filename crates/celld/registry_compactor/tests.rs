@@ -3123,3 +3123,28 @@ async fn a_failed_spill_hands_back_the_run_outputs_it_could_not_delete() {
         before
     );
 }
+
+#[tokio::test]
+async fn the_sampler_starts_over_when_nothing_lies_after_its_cursor() {
+    let store = memory();
+    let node = registry_on(&store, "node-a");
+    let _holding = holder_of(&node).await;
+    objects::put_create(
+        store.as_ref(),
+        &format!("{PREFIX}cells/Agent:late/ltx/e1/0/1-1.ltx"),
+        b"x".to_vec(),
+    )
+    .await
+    .unwrap();
+    // The cursor is past every object, as after a page that ended the bucket.
+    let state = Mutex::new(SamplerState {
+        after: Some(format!("{PREFIX}cells/zzz/own.json")),
+        misses: Vec::new(),
+    });
+    node.sample(&state).await;
+    assert_eq!(
+        node.counters.sampler_cells.load(Ordering::Relaxed),
+        1,
+        "the same sample began again at the start and found the cell"
+    );
+}
