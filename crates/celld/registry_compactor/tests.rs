@@ -4576,3 +4576,69 @@ async fn every_rejection_of_a_seed_commit_keeps_the_outputs_it_could_not_delete(
     assert!(!node.seed_may_commit(&mut holding, &job).await);
     assert_eq!(stranded(&holding), vec![output], "blocking lease");
 }
+
+#[test]
+fn the_cutover_window_does_not_overflow_for_a_huge_lease_lifetime() {
+    let store = memory();
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            lease_ttl_ms: u64::MAX,
+            ..config()
+        },
+    );
+    let seed = crate::registry_seed::SeedObjects {
+        gate: 1,
+        marker_ms: 0,
+        cells: 0,
+        by_partition: Default::default(),
+    };
+    // Saturated, so the window is never passed: no panic, no wrapped small number.
+    assert!(!node.cutover_passed(&seed));
+}
+
+#[tokio::test]
+async fn a_seed_whose_gate_was_raised_during_the_cutover_window_is_dropped_and_made_again() {
+    let (scripted, plain) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    ensure_format_record(&plain).await;
+    bucket_with_cells(&plain, &["Agent:00aa".to_owned(), "Agent:00bb".to_owned()]).await;
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            lease_ttl_ms: 100,
+            ..config()
+        },
+    );
+    let mut holding = closed_holder(&node).await;
+    pass_until_listed(&node, &mut holding).await;
+    let first_objects = keys_under(&plain, &objects::seed_root(PREFIX)).await;
+    assert!(!first_objects.is_empty());
+    // A node outside the rule starts inside the window and raises the gate. The
+    // holder meets the new number at its next root write.
+    crate::registry_seed::close_gate(plain.as_ref(), PREFIX)
+        .await
+        .unwrap();
+    node.register_at_claim(&cell(1), 1);
+    node.flush_now().await.unwrap();
+    node.pass(&mut holding).await.unwrap();
+    assert_eq!(holding.root.gate, 2);
+    // The window passes; the old seed (for gate 1) is rejected, not committed.
+    crate::asyncrt::sleep(Duration::from_millis(250)).await;
+    let discards = node.counters.jobs_discarded.load(Ordering::Relaxed);
+    pass_until_open(&node, &mut holding).await;
+    assert!(node.counters.jobs_discarded.load(Ordering::Relaxed) > discards);
+    assert_eq!(
+        node.counters.seed_commits.load(Ordering::Relaxed),
+        1,
+        "only the seed made for gate 2 committed"
+    );
+    assert_eq!(holding.root.seed_gate, 2);
+    let leftover = keys_under(&plain, &objects::seed_root(PREFIX)).await;
+    assert!(
+        leftover.iter().all(|key| !first_objects.contains(key)),
+        "the first seed's objects are gone"
+    );
+}

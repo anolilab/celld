@@ -275,7 +275,7 @@ pub(crate) fn epoch_of(prefix: &str, key: &str) -> Option<u64> {
             let (_, name) = tail.split_once('/')?;
             name.split('-').nth(1)?.parse().ok()
         }
-        // `seed/<gate>/<epoch>-<base>/<partition>/<range>`
+        // `seed/<gate>/<epoch>-<base>/<partition>`
         "seed" => {
             let (_, rest) = tail.split_once('/')?;
             rest.split('/').next()?.split('-').next()?.parse().ok()

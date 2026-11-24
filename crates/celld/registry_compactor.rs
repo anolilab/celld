@@ -1516,8 +1516,18 @@ impl Registry {
             if job.epoch != holding.epoch {
                 continue;
             }
-            if job.seed_gate.is_some() && !self.seed_may_commit(holding, &job).await {
-                continue;
+            if let Some(gate) = job.seed_gate {
+                // A seed is made for one gate number. If the gate was raised since
+                // (a node outside the rule started), what it listed is stale: it is
+                // dropped and a new one is made for the new number.
+                if gate != holding.root.gate {
+                    self.counters.jobs_discarded.fetch_add(1, Ordering::Relaxed);
+                    self.drop_seed(holding, &job).await;
+                    continue;
+                }
+                if !self.seed_may_commit(holding, &job).await {
+                    continue;
+                }
             }
             let mut stray = None;
             match commit_job(
@@ -1623,12 +1633,18 @@ impl Registry {
         } else {
             self.counters.seed_waits.fetch_add(1, Ordering::Relaxed);
         }
+        self.drop_seed(holding, job).await;
+        false
+    }
+
+    /// Drop a rejected seed: its merge outputs and its listing, with what cannot be
+    /// deleted now kept for later, and the slot cleared so a new seed is made.
+    async fn drop_seed(&self, holding: &mut Holding, job: &Prepared) {
         self.delete_or_strand(holding, job.outputs.clone()).await;
         let dropped = holding.seed_slot.lock().unwrap().take();
         if let Some(seed) = dropped {
             self.delete_or_strand(holding, seed.keys()).await;
         }
-        false
     }
 
     /// Delete `keys`; those whose delete is not confirmed go to the retired list's
@@ -1944,7 +1960,8 @@ impl Registry {
     /// Whether a listed seed has waited out the cutover window: two lease
     /// lifetimes since its marker was confirmed.
     fn cutover_passed(&self, seed: &crate::registry_seed::SeedObjects) -> bool {
-        crate::asyncrt::mono_ms().saturating_sub(seed.marker_ms) >= 2 * self.cfg.lease_ttl_ms
+        crate::asyncrt::mono_ms().saturating_sub(seed.marker_ms)
+            >= self.cfg.lease_ttl_ms.saturating_mul(2)
     }
 
     /// Start the job that merges a listed seed into level 1. A merge that is

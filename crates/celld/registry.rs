@@ -143,6 +143,11 @@ impl Config {
         let wait = flag("CELLD_REGISTRY_WAIT", true)?;
         let job_pacing = flag("CELLD_REGISTRY_JOB_PACING", true)?;
         let pass_read_ms: u64 = with_default("CELLD_REGISTRY_PASS_READ_MS", 1_000)?;
+        let lease_ttl_ms = crate::machine::lease_ttl_ms_from_environment();
+        anyhow::ensure!(
+            lease_ttl_ms.checked_mul(2).is_some(),
+            "CELLD_TTL_MS={lease_ttl_ms} is too large for the registry's cutover window"
+        );
         let bound = Self::bound_with(durability_ms, extra_wait)?;
         anyhow::ensure!(
             (1..=MAX_PARTITIONS).contains(&partitions) && pass_ms >= 1 && batch_ms >= 1 && spill_ms >= 1 && base_days >= 1,
@@ -164,7 +169,7 @@ impl Config {
             created_cap: crate::registry_writer::CREATED_CAP,
             waiting_cap: crate::registry_writer::WAITING_CAP,
             seed_page: 1_000,
-            lease_ttl_ms: crate::machine::lease_ttl_ms_from_environment(),
+            lease_ttl_ms,
             sampler_recheck_ms: 20_000,
             job_pacing,
             pass_read: Duration::from_millis(pass_read_ms),

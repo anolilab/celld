@@ -272,6 +272,13 @@ pub fn validate() -> anyhow::Result<()> {
     ] {
         positive::<u64>(name)?;
     }
+    // Lifetimes are multiplied (the registry's seed waits two of them), so one that
+    // cannot be is not accepted.
+    if let Some(ttl) = positive::<u64>("CELLD_TTL_MS")? {
+        if ttl > u64::MAX / 4 {
+            bail!("CELLD_TTL_MS={ttl} is too large");
+        }
+    }
 
     for name in [
         "CELLD_ADMISSION_WAIT_MS",
