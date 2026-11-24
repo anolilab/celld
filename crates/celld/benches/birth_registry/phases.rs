@@ -200,13 +200,15 @@ impl Rig {
 
 /// `cp -a` of the aged bucket's directory inside the store's container.
 pub fn copy_aged(template: &str, run: &str) {
+    let bucket = env_text("CELLD_BENCH_BUCKET").unwrap_or_else(|| "s3://bench".into());
+    let bucket = bucket.trim_start_matches("s3://").trim_end_matches('/');
     let status = std::process::Command::new("docker")
         .args([
             "exec",
-            "rustfs-reg",
+            &super::store_container(),
             "sh",
             "-c",
-            &format!("cp -a /data/reg/{template} /data/reg/{run}"),
+            &format!("cp -a /data/{bucket}/{template} /data/{bucket}/{run}"),
         ])
         .status()
         .expect("docker exec");
