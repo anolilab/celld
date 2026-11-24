@@ -2623,14 +2623,6 @@ fn is_connection_failure(error: &anyhow::Error) -> bool {
                 return true;
             }
         }
-        if let Some(hyper_error) = cause.downcast_ref::<hyper::Error>() {
-            if hyper_error.is_closed()
-                || hyper_error.is_canceled()
-                || hyper_error.is_incomplete_message()
-            {
-                return true;
-            }
-        }
     }
     false
 }
@@ -3413,12 +3405,18 @@ async fn stream_lane(
 
     /// Fail every unanswered frame; the round futures then fail and the
     /// shipper degrades through the existing path.
+    ///
+    /// `connection_lost` says the stream failed at the connection (the
+    /// follower closed it, a write failed, a redial was refused), which sits
+    /// the follower's process out of recruitment. A stop or a stalled stream's
+    /// deadline is not that.
     fn fail_all(
         member: &Member,
         policy: &celld_logic::log_evict::EvictionPolicy,
         health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
         tuning: &LaneTuning,
         inflight: &mut std::collections::VecDeque<StreamInFlight>,
+        connection_lost: bool,
     ) {
         for entry in inflight.drain(..) {
             if let Some(job) = entry.job {
@@ -3430,7 +3428,11 @@ async fn stream_lane(
                     job,
                     entry.started,
                     entry.write_ms,
-                    AppendSend::Failed(anyhow::anyhow!("append stream failed")),
+                    AppendSend::Failed(if connection_lost {
+                        anyhow::Error::new(ConnectionLost("append stream closed"))
+                    } else {
+                        anyhow::anyhow!("append stream failed")
+                    }),
                 );
             }
         }
@@ -3615,7 +3617,7 @@ async fn stream_lane(
 
         match event {
             LaneEvent::Stopped => {
-                fail_all(member, policy, health, tuning, &mut inflight);
+                fail_all(member, policy, health, tuning, &mut inflight, false);
                 retire_connection(&mut conn).await;
                 return;
             }
@@ -3660,6 +3662,7 @@ async fn stream_lane(
                             health,
                             tuning,
                             &mut inflight,
+                            true,
                         )
                         .await;
                     }
@@ -3677,6 +3680,7 @@ async fn stream_lane(
                         health,
                         tuning,
                         &mut inflight,
+                        false,
                     )
                     .await;
                     continue;
@@ -3722,6 +3726,7 @@ async fn stream_lane(
                             health,
                             tuning,
                             &mut inflight,
+                            false,
                         )
                         .await;
                     }
@@ -3736,6 +3741,7 @@ async fn stream_lane(
                     health,
                     tuning,
                     &mut inflight,
+                    true,
                 )
                 .await;
             }
@@ -3821,6 +3827,7 @@ async fn stream_lane(
                         health,
                         tuning,
                         &mut inflight,
+                        false,
                     )
                     .await;
                 } else {
@@ -3835,6 +3842,7 @@ async fn stream_lane(
     /// a persisted range refuses with a covering end, which reads as the
     /// ack. A break with no answer since the last dial fails everything
     /// instead of looping.
+    #[allow(clippy::too_many_arguments)]
     async fn reconnect(
         established: StreamConnection,
         member: &Member,
@@ -3843,11 +3851,16 @@ async fn stream_lane(
         health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
         tuning: &LaneTuning,
         inflight: &mut std::collections::VecDeque<StreamInFlight>,
+        closed: bool,
     ) -> Option<StreamConnection> {
         let retired = established.retire().await;
-        redial_after_retire(retired, member, transport, policy, health, tuning, inflight).await
+        redial_after_retire(
+            retired, member, transport, policy, health, tuning, inflight, closed,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn redial_after_retire(
         retired: RetiredStream,
         member: &Member,
@@ -3856,9 +3869,10 @@ async fn stream_lane(
         health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
         tuning: &LaneTuning,
         inflight: &mut std::collections::VecDeque<StreamInFlight>,
+        closed: bool,
     ) -> Option<StreamConnection> {
         if !retired.permits_replay() {
-            fail_all(member, policy, health, tuning, inflight);
+            fail_all(member, policy, health, tuning, inflight, closed);
             return None;
         }
         // Hedge-resolved slots have no response coming on the new stream.
@@ -3873,15 +3887,22 @@ async fn stream_lane(
                 for entry in inflight.iter() {
                     if write_frame(&mut conn.write, &entry.frame).await.is_err() {
                         conn.retire().await;
-                        fail_all(member, policy, health, tuning, inflight);
+                        fail_all(member, policy, health, tuning, inflight, true);
                         return None;
                     }
                 }
                 arm_head(member, health, inflight);
                 Some(conn)
             }
-            Err(_) => {
-                fail_all(member, policy, health, tuning, inflight);
+            Err(error) => {
+                fail_all(
+                    member,
+                    policy,
+                    health,
+                    tuning,
+                    inflight,
+                    is_connection_failure(&error),
+                );
                 None
             }
         }
@@ -7190,6 +7211,161 @@ mod seal_absent_log_tests {
             assert!(is_connection_failure(&anyhow::Error::new(ConnectionLost(
                 "append stream write failed"
             ))));
+        });
+    }
+
+    /// A transport whose one stream is the near end of a duplex the test
+    /// holds the far end of.
+    struct OneStream(Mutex<Option<LogStreamIo>>);
+
+    impl LogTransport for OneStream {
+        fn post<'a>(
+            &'a self,
+            _node: &'a str,
+            _addr: &'a str,
+            _path: &'a str,
+            _body: Vec<u8>,
+            _deadline: Option<std::time::Duration>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<bytes::Bytes>> + Send + 'a>,
+        > {
+            Box::pin(async { anyhow::bail!("no one-shot posts in this twin") })
+        }
+
+        fn open_stream<'a>(
+            &'a self,
+            _node: &'a str,
+            _addr: &'a str,
+            _path: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<LogStreamIo>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("the twin has one stream"))
+            })
+        }
+    }
+
+    /// One append goes out on a stream, and then `end` ends the exchange
+    /// before any response. Reports whether the follower's process now sits
+    /// out of recruitment.
+    async fn sits_out_after(
+        end: impl FnOnce(tokio::io::DuplexStream, crate::ltx_repl::StopToken),
+    ) -> bool {
+        use tokio::io::AsyncReadExt as _;
+        let (near, mut far) = tokio::io::duplex(1 << 16);
+        let transport = Arc::new(OneStream(Mutex::new(Some(Box::new(near)))));
+        let now = crate::ownership_store::now_ms();
+        let member = Member {
+            node: "peer".into(),
+            addr: "peer:1".into(),
+            generation: "g1".into(),
+            lease_expires_ms: now + 60_000,
+            lease_ttl_ms: 10_000,
+        };
+        let health = Arc::new(Mutex::new(celld_logic::log_evict::FollowerHealth::default()));
+        let (jobs, receive) = tokio::sync::mpsc::unbounded_channel();
+        let (resp, answer) = tokio::sync::oneshot::channel();
+        jobs.send(LaneJob {
+            req: Arc::new(AppendReq {
+                leader: "a/b".into(),
+                epoch: 1,
+                truncate_to: 0,
+                entries: vec![Entry {
+                    seq: 1,
+                    cell: "c".into(),
+                    cell_epoch: 1,
+                    txid: 1,
+                    bytes: vec![0; 8],
+                }],
+            }),
+            enqueued: 0,
+            bytes: 8,
+            resp,
+        })
+        .unwrap();
+        let stop = crate::ltx_repl::StopToken::new();
+        let lane = member_lane(
+            member.clone(),
+            transport,
+            Arc::new(celld_logic::log_evict::EvictionPolicy::default()),
+            health.clone(),
+            LaneTuning {
+                hedge: HedgeMode::Fixed(0),
+                stream: None,
+                stream_transport: true,
+            },
+            receive,
+            stop.clone(),
+        );
+        let exchange = async {
+            let mut frame = [0_u8; 64];
+            assert!(far.read(&mut frame).await.unwrap() > 0, "a frame went out");
+            end(far, stop);
+            answer.await
+        };
+        futures_util::pin_mut!(lane, exchange);
+        let answered = match futures_util::future::select(lane, exchange).await {
+            futures_util::future::Either::Right((answered, _)) => answered,
+            // A stopped lane ends once it has failed what was in flight.
+            futures_util::future::Either::Left((_, exchange)) => exchange.await,
+        };
+        assert!(matches!(answered, Ok(None)), "the append fails");
+        let sits_out =
+            health
+                .lock()
+                .unwrap()
+                .failed_recently("peer", "g1", crate::ownership_store::now_ms());
+        sits_out
+    }
+
+    #[test]
+    fn a_stream_the_follower_closes_before_a_response_sits_it_out() {
+        run(async {
+            assert!(sits_out_after(|far, _stop| drop(far)).await);
+        });
+    }
+
+    #[test]
+    fn a_stream_failed_by_a_stop_does_not_sit_the_follower_out() {
+        run(async {
+            // The far end stays open, so only the stop ends the exchange.
+            let held = std::sync::Mutex::new(None);
+            let sits_out = sits_out_after(|far, stop| {
+                *held.lock().unwrap() = Some(far);
+                stop.request_stop();
+            })
+            .await;
+            assert!(!sits_out);
+        });
+    }
+
+    #[test]
+    fn a_reset_or_incomplete_message_is_judged_by_its_cause_not_its_shape() {
+        run(async {
+            // A server that reads the request and closes without answering:
+            // hyper reports an incomplete message, which it also reports when
+            // a pooled keep-alive connection closes as it is reused. That
+            // alone must not bench a live follower.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                use std::io::Read as _;
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 1024];
+                let _ = socket.read(&mut buffer);
+            });
+            let error = post_error(
+                format!("http://127.0.0.1:{port}/"),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            server.join().unwrap();
+            assert!(!is_connection_failure(&error), "{error:#}");
         });
     }
 
