@@ -1369,6 +1369,17 @@ impl LtxRepl {
         } else {
             (store, None)
         };
+        // A process that runs as a session holds the first per-cell object of a
+        // cell it granted until the grant is in a chunk.
+        let store: Arc<dyn ObjectStore> =
+            if crate::session::Mode::from_env()? != crate::session::Mode::Off {
+                Arc::new(crate::grant_wait_store::GrantWaitStore::new(
+                    store,
+                    prefix.clone(),
+                ))
+            } else {
+                store
+            };
         // Azure blob metadata names must be C# identifiers, so the standard
         // Litestream key cannot carry its hyphen there. External Litestream
         // tooling reads that key, therefore an az:// replica gives up

@@ -4587,11 +4587,14 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 let interval = celld::session::checkpoint_interval();
                 let mut last = tokio::time::Instant::now();
                 while !session.is_closed() {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let asked = celld::asyncrt::select! {
+                        () = session.nudged() => true,
+                        () = tokio::time::sleep(std::time::Duration::from_millis(500)) => false,
+                    };
                     if let Err(error) = session.ensure_chunk_ahead(&bucket).await {
                         tracing::warn!(%error, "session chunk");
                     }
-                    if last.elapsed() >= interval {
+                    if asked || last.elapsed() >= interval {
                         last = tokio::time::Instant::now();
                         if let Err(error) = session.checkpoint(&bucket).await {
                             tracing::warn!(%error, "session checkpoint");

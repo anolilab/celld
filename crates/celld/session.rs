@@ -82,6 +82,8 @@ pub struct Session {
     dirty: Mutex<BTreeSet<u64>>,
     /// The counters whose bit a chunk in the bucket holds.
     checkpointed: Mutex<BTreeSet<u64>>,
+    /// A write that waits for a bit asks for a checkpoint now.
+    nudge: tokio::sync::Notify,
     /// The session stopped granting: its header closed, or its seal began.
     closed: AtomicBool,
     held: tokio::sync::Mutex<Held>,
@@ -125,6 +127,7 @@ impl Session {
             granted: Mutex::default(),
             dirty: Mutex::default(),
             checkpointed: Mutex::default(),
+            nudge: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
             held: tokio::sync::Mutex::default(),
             established: AtomicBool::new(false),
@@ -353,6 +356,36 @@ pub(crate) struct Held {
     chunks: BTreeMap<u64, (Chunk, String)>,
 }
 
+/// Hold a write under `e1/` of the cell `scope` until the bit of its grant is in
+/// a chunk, when the cell is one that this session granted. Any other cell
+/// passes at once. A session that began its seal passes too: the seal writes
+/// the bits.
+pub(crate) async fn wait_until_checkpointed(scope: &str) -> anyhow::Result<()> {
+    match current() {
+        Some(session) => wait_with(session, scope).await,
+        None => Ok(()),
+    }
+}
+
+async fn wait_with(session: &Session, scope: &str) -> anyhow::Result<()> {
+    let Some(counter) = session.own_counter_of_scope(scope) else {
+        return Ok(());
+    };
+    if !session.is_granted(counter) || session.is_checkpointed(counter) {
+        return Ok(());
+    }
+    session.nudge.notify_one();
+    let deadline = crate::asyncrt::mono_ms() + 30_000;
+    while crate::asyncrt::mono_ms() < deadline {
+        if session.is_checkpointed(counter) || session.is_closed() {
+            return Ok(());
+        }
+        session.nudge.notify_one();
+        crate::asyncrt::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    anyhow::bail!("the grant of {scope} is not in a chunk")
+}
+
 /// A `Grant` that waits for its fleet proof: the cell, its counter, and the
 /// channel that the ship loop answers when the round that carried it completed.
 pub(crate) struct PendingMark {
@@ -504,6 +537,19 @@ impl Session {
             &self.counter_key,
             id[8..16].try_into().ok()?,
         ))
+    }
+
+    /// Resolves when a write asked for a checkpoint.
+    pub async fn nudged(&self) {
+        self.nudge.notified().await;
+    }
+
+    /// Whether the counter's bit is in a chunk in the bucket.
+    pub fn is_checkpointed(&self, counter: u64) -> bool {
+        self.checkpointed
+            .lock()
+            .expect("checkpointed poisoned")
+            .contains(&counter)
     }
 
     /// Whether the counter's grant is recorded in memory.
@@ -901,6 +947,38 @@ mod tests {
         assert!(session.is_granted(0));
         assert_eq!(session.granted.lock().unwrap().len(), 1);
         assert_eq!(session.dirty.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn a_write_waits_for_the_bit_of_a_grant_only() {
+        crate::asyncrt::install_test_host_runtime();
+        let session = std::sync::Arc::new(established([9; 8]));
+        let own = durable_object_id_hex(&session.mint(&key()).expect("established"));
+        let scope = format!("{CLASS}:{own}");
+        let other = format!(
+            "{CLASS}:{}",
+            durable_object_id_hex(&tagged_object_id(&key(), [1; 8], [2; 8]))
+        );
+        // Not granted yet, and not this session's: nothing is held.
+        wait_with(&session, &scope).await.unwrap();
+        wait_with(&session, &other).await.unwrap();
+        session.grant_scope(&scope);
+        let waiting = {
+            let session = session.clone();
+            let scope = scope.clone();
+            tokio::spawn(async move { wait_with(&session, &scope).await })
+        };
+        // The write asks for a checkpoint and keeps waiting until the bit is in a chunk.
+        tokio::time::timeout(std::time::Duration::from_secs(5), session.nudged())
+            .await
+            .expect("the write asks for a checkpoint");
+        assert!(!waiting.is_finished());
+        session.checkpointed.lock().unwrap().insert(0);
+        waiting.await.unwrap().unwrap();
+        // A session that began its seal passes: the seal writes the bits.
+        session.closed.store(true, Ordering::SeqCst);
+        wait_with(&session, &scope).await.unwrap();
     }
 
     #[test]

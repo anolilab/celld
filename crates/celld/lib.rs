@@ -49,6 +49,7 @@ pub mod env_vars;
 pub(crate) mod facet_streams;
 pub mod fleet;
 pub mod generation;
+pub(crate) mod grant_wait_store;
 pub mod host_channels;
 pub mod host_services;
 pub mod http_streams;

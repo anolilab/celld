@@ -618,6 +618,44 @@ async fn the_ids_of_a_lost_header_are_refused_and_no_chunk_is_marked() {
     );
 }
 
+/// The first per-cell object of a granted cell waits for the bit of its grant to
+/// be in a chunk: with no checkpoint due for an hour, the write itself asks for
+/// one, and the chunk holds the bit by the time the object exists.
+#[tokio::test]
+async fn the_first_object_of_a_granted_cell_follows_its_bit_in_the_chunk() {
+    let server = Server::start(
+        "do-ids",
+        &[
+            ("CELLD_LAZY_BIRTH", "shadow"),
+            ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "3600000"),
+        ],
+    )
+    .await;
+    let ids = minted(&server).await;
+    let (tag, header) = header_tag(server.project());
+    assert_eq!(bump(&server, &ids[0]).await, 1);
+    let counter = counter_of(&header, &ids[0]);
+    let project = server.project().to_owned();
+    wait_until(
+        "the first object of the cell",
+        Duration::from_secs(60),
+        || {
+            let project = project.clone();
+            async move { (count(&project, "%/ltx/e1/%") > 0).then_some(()) }
+        },
+    )
+    .await;
+    let chunk = chunk_of(server.project(), &tag);
+    assert!(
+        chunk["granted"]
+            .as_array()
+            .expect("granted")
+            .iter()
+            .any(|granted| granted.as_u64() == Some(counter)),
+        "the object exists and the chunk does not hold its bit: {chunk}"
+    );
+}
+
 /// An id whose counter no chunk of its session counts was never minted.
 #[tokio::test]
 async fn an_id_that_was_never_minted_is_refused() {
