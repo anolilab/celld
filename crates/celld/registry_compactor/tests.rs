@@ -4136,6 +4136,19 @@ async fn a_predecessor_repair_writes_through_a_closed_gate() {
     .expect("a repair of the predecessor's log does not wait for the gate")
     .unwrap();
     assert!(hold.is_pending(), "the gate itself is still closed");
+    // Outside the repair the same write still waits.
+    let waiting = crate::asyncrt::timeout(
+        Duration::from_millis(100),
+        store.put(
+            &Path::from(format!("{PREFIX}cells/Agent:y/ltx/e1/0/1-1.ltx")),
+            vec![1_u8].into(),
+        ),
+    )
+    .await;
+    assert!(
+        waiting.is_err(),
+        "a write outside the repair waits for the gate"
+    );
 }
 
 #[tokio::test]

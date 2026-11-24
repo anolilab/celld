@@ -51,7 +51,11 @@ struct Node {
 impl Node {
     /// Start node `index` in a directory that survives a respawn.
     fn spawn(home: &Path, index: usize, bucket: &str, endpoint: &str) -> Node {
-        let (public, internal) = (free_port(), free_port());
+        let public = free_port();
+        // Two free ports picked one after the other can be the same one.
+        let internal = std::iter::repeat_with(free_port)
+            .find(|port| *port != public)
+            .expect("a second free port");
         let home = home.join(format!("node-{index}"));
         std::fs::create_dir_all(&home).expect("create the node directory");
         let log = std::fs::OpenOptions::new()
@@ -344,8 +348,14 @@ async fn a_killed_node_finishes_its_boot_recovery() {
         .into_iter()
         .map(|meta| meta.location.to_string())
         .collect();
-    store.delete_many(&keys).await;
+    let deleted = store.delete_many(&keys).await;
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
+    let leftovers: Vec<&String> = keys.iter().filter(|key| !deleted.contains(key)).collect();
+    assert!(
+        leftovers.is_empty(),
+        "{} objects were not deleted: {leftovers:?}",
+        leftovers.len()
+    );
 }

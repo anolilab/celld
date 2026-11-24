@@ -94,7 +94,8 @@ tokio::task_local! {
     static PREDECESSOR_REPAIR: ();
 }
 
-/// Run `future` as a repair of a dead predecessor's log: its per-cell writes pass
+/// Run `future` as a boot's repair of its own dead predecessor's log
+/// (`RecoverMode::Predecessor`, nothing else): its per-cell writes pass
 /// [`GatedStore`] without waiting. A boot recovers its predecessor before it takes
 /// a lease, and the gate closes only once that lease is visible, so a recovery
 /// that waited for the gate would wait for itself. The objects are the ones the
