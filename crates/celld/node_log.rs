@@ -5875,22 +5875,64 @@ impl NodeLogManager {
         // hour sealed 1,300 acked rows into orphanhood behind epoch 156.
         // An Open record is always safe: the next incarnation's recovery
         // drains the bundles.
-        let tails_tiered = self.ltx.all_tails_tiered();
-        let uncovered_rows = match self.uncovered_bundle_rows().await {
-            Ok(uncovered) => {
-                for (cell, epoch, txid) in uncovered.keys().take(3) {
-                    let facts = crate::session::current().and_then(|session| {
-                        let counter = session.own_counter_of_scope(cell)?;
-                        Some((session.is_granted(counter), session.is_checkpointed(counter)))
-                    });
-                    eprintln!(
-                        "node-log close: uncovered row {cell} epoch {epoch} txid {txid}, (granted, checkpointed) {facts:?}"
-                    );
+        // The first per-cell object of a cell that the session granted is held until
+        // the grant is in a chunk: write the chunks first, which releases those
+        // uploads, and look again for as long as they are still on their way.
+        let mut tails_tiered = false;
+        let mut uncovered_rows = None;
+        let mut uncovered_cells: Option<Vec<(String, u64)>> = None;
+        for attempt in 0..20 {
+            if let Some(session) = crate::session::current() {
+                if let Err(error) = session.checkpoint(&self.bucket).await {
+                    eprintln!("node-log close: session checkpoint failed: {error:#}");
                 }
-                Some(uncovered.len())
             }
-            Err(_) => None,
-        };
+            tails_tiered = self.ltx.all_tails_tiered();
+            uncovered_rows = match self.uncovered_bundle_rows().await {
+                Ok(uncovered) => {
+                    if attempt == 19 || (tails_tiered && uncovered.is_empty()) {
+                        for (cell, epoch, txid) in uncovered.keys().take(3) {
+                            let facts = crate::session::current().and_then(|session| {
+                                let counter = session.own_counter_of_scope(cell)?;
+                                Some((session.is_granted(counter), session.is_checkpointed(counter)))
+                            });
+                            eprintln!(
+                                "node-log close: uncovered row {cell} epoch {epoch} txid {txid}, (granted, checkpointed) {facts:?}, (percell, durable, shipped) {:?}",
+                                self.ltx.watermarks(cell, *epoch)
+                            );
+                        }
+                    }
+                    uncovered_cells = Some(
+                        uncovered
+                            .keys()
+                            .map(|(cell, epoch, _)| (cell.clone(), *epoch))
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect(),
+                    );
+                    Some(uncovered.len())
+                }
+                Err(_) => None,
+            };
+            if let Some(cells) = &uncovered_cells {
+                // The rows of a cell that no per-cell object covers are put there by
+                // the direct pass that a handoff runs, with the grants in their chunks.
+                futures_util::stream::iter(cells.iter().cloned())
+                    .for_each_concurrent(16, |(cell, epoch)| async move {
+                        self.ltx
+                            .sync_wait(&cell, epoch, std::time::Duration::from_secs(10))
+                            .await;
+                    })
+                    .await;
+            }
+            if tails_tiered && uncovered_rows == Some(0) {
+                if attempt > 0 {
+                    eprintln!("node-log close: per-cell layout complete after {attempt} more looks");
+                }
+                break;
+            }
+            crate::asyncrt::sleep(std::time::Duration::from_millis(250)).await;
+        }
         let per_cell_complete = tails_tiered && uncovered_rows == Some(0);
         if !log_tier::graceful_seal_allowed(
             &record,

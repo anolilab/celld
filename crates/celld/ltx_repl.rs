@@ -1751,6 +1751,17 @@ impl LtxRepl {
     /// installs that fact in `dirty_tails` before it removes the active handle,
     /// and this method reads the same two stores in that order. Therefore, the
     /// final check observes either the undrained active handle or its marker.
+    /// The watermarks of a resident cell: per-cell coverage, durable and shipped.
+    pub(crate) fn watermarks(&self, cell: &str, epoch: u64) -> Option<(u64, u64, u64)> {
+        let cells = self.cells.lock().unwrap();
+        let handle = cells.get(&(cell.to_string(), epoch))?;
+        Some((
+            percell_coverage(handle),
+            handle.durable_txid.load(Ordering::SeqCst),
+            handle.shipped_txid.load(Ordering::SeqCst),
+        ))
+    }
+
     pub(crate) fn all_tails_tiered(&self) -> bool {
         let cells = self.cells.lock().unwrap();
         Self::all_cells_shipped_tiered(&cells) && self.dirty_tails.lock().unwrap().is_empty()
