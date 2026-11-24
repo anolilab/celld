@@ -3472,6 +3472,16 @@ impl Actor {
                 }
                 let ownership = self.ownership.clone();
                 out.spawn_scoped(async move {
+                    // A dormant lazy cell of a draining node is released by the
+                    // seal of its session: no request is made for it here.
+                    let lazy_in_drain = reason == celld_logic::ReleaseReason::Drain
+                        && crate::session::current().is_some_and(|s| s.is_lazy_scope(&cell));
+                    if lazy_in_drain {
+                        return CompletedEffect::plain(Event::OwnerReleased {
+                            op,
+                            result: Ok(CasOutcome::Applied),
+                        });
+                    }
                     let result = ownership.release_owner(&cell, epoch).await;
                     if matches!(result, Ok(CasOutcome::Applied)) {
                         crate::claim_provenance::release_applied(&cell, epoch, reason);
@@ -3488,6 +3498,15 @@ impl Actor {
                 // The in-memory adapter is one process, so it has no successor
                 // to acknowledge a handoff.
                 if matches!(&self.ownership, Ownership::Memory(_)) {
+                    immediate.push_back(Event::SuccessorAdopted {
+                        op,
+                        result: Err(Failure::Definite),
+                    });
+                    return;
+                }
+                // A lazy cell was not released: it has no record for a peer to
+                // claim, and the seal of the session hands it on.
+                if crate::session::current().is_some_and(|s| s.is_lazy_scope(&cell)) {
                     immediate.push_back(Event::SuccessorAdopted {
                         op,
                         result: Err(Failure::Definite),

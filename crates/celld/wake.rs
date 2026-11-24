@@ -146,7 +146,14 @@ pub(crate) async fn probe_entries(
                 elected.then_some((cell, entry_ms))
             }
             Ok(record) => {
-                let owner = record.as_ref().and_then(|record| record.node.as_deref());
+                // A lazy cell of this node has no record and is owned here.
+                let lazy_here = record.is_none()
+                    && crate::session::current().is_some_and(|s| s.is_lazy_scope(&cell));
+                let owner = if lazy_here {
+                    Some(node)
+                } else {
+                    record.as_ref().and_then(|record| record.node.as_deref())
+                };
                 let owner_live = owner.is_some_and(|owner| live.contains(owner));
                 (owner == Some(node) || (elected && elected_hint_needed(owner, node, owner_live)))
                     .then_some((cell, entry_ms))
@@ -546,6 +553,16 @@ impl WakeFlusher {
             .prove_alarm(cell, source.id.epoch, source.position)
             .await?;
         anyhow::ensure!(durable >= source.position, "wake retirement proof is short");
+        // A lazy cell gets its record before the retirement rests on it.
+        if let (crate::actor::Ownership::Bucket(bucket), Some(session)) = (
+            ownership,
+            crate::session::current().filter(|s| s.is_lazy_scope(cell)),
+        ) {
+            bucket
+                .leave_cell(session, cell, source.id.epoch)
+                .await
+                .map_err(|_| anyhow::anyhow!("wake retirement could not leave the lazy cell"))?;
+        }
         let owner = ownership
             .read_owner(cell)
             .await

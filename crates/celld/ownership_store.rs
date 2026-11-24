@@ -1289,7 +1289,10 @@ impl BucketOwnership {
         let Some(counter) = session.own_counter_of_scope(cell) else {
             return Ok(());
         };
-        if self.marks_allowed().await {
+        // A birth-form record exists only for an id that is granted: the `Grant`
+        // follows the write whatever the ensemble became, and a request that finds
+        // no proof leaves the grant pending and the cell inactive.
+        if session.is_birth_scope(cell) || self.marks_allowed().await {
             return self.append_grant(session, cell, counter).await;
         }
         match crate::session_store::read_header(&self.bucket, &session.tag()).await? {
@@ -1352,6 +1355,15 @@ impl BucketOwnership {
             // A session in mode `on` grants an id without a record: the cell is
             // lazy. Only while a `Grant` can still be appended; otherwise the id
             // is waived and takes the standard path.
+            // A birth-form record is written only while a `Grant` can be appended.
+            if matches!(guard, CasGuard::Absent)
+                && epoch == 1
+                && session.mode() == crate::session::Mode::Read
+                && session.is_birth_scope(cell)
+                && !self.marks_allowed().await
+            {
+                session.forget_birth(cell);
+            }
             if matches!(guard, CasGuard::Absent)
                 && epoch == 1
                 && session.mode() == crate::session::Mode::On

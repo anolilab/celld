@@ -12,11 +12,25 @@ const throws = (fn) => {
 const HEX64 = /^[0-9a-f]{64}$/;
 
 export class Cell extends DurableObject {
+  async alarm() {
+    await this.ctx.storage.put("alarmed", true);
+  }
+
   async fetch(request) {
     if (new URL(request.url).pathname === "/bump") {
       const n = ((await this.ctx.storage.get("n")) ?? 0) + 1;
       await this.ctx.storage.put("n", n);
       return Response.json({ n });
+    }
+    if (new URL(request.url).pathname === "/arm") {
+      await this.ctx.storage.setAlarm(Date.now() + 500);
+      return Response.json({ armed: true });
+    }
+    if (new URL(request.url).pathname === "/state") {
+      return Response.json({
+        n: (await this.ctx.storage.get("n")) ?? 0,
+        alarmed: (await this.ctx.storage.get("alarmed")) ?? false,
+      });
     }
     const id = this.ctx.id;
     return Response.json({ name: id.name ?? null, id: id.toString() });
@@ -88,6 +102,11 @@ export default {
         ids.push(id.toString());
       }
       return Response.json({ ids });
+    }
+    if (url.pathname === "/arm" || url.pathname === "/state") {
+      const id = ns.idFromString(url.searchParams.get("id"));
+      const out = await ns.get(id).fetch("http://object" + url.pathname);
+      return Response.json(await out.json());
     }
     if (url.pathname === "/bump") {
       const id = ns.idFromString(url.searchParams.get("id"));

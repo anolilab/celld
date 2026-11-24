@@ -877,10 +877,8 @@ async fn spawn_agents(fleet: &Fleet, count: usize) -> Vec<String> {
 /// length, divided by the agents. Prints the numbers; the assertions are the
 /// ones that need no baseline.
 async fn requests_per_minted_agent(mode: &'static str) -> (f64, f64, u64, u64) {
-    let env: &[(&str, &str)] = &[
-        ("CELLD_LAZY_BIRTH", mode),
-        ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "500"),
-    ];
+    // The checkpoint interval is the default of 30 s, as in production.
+    let env: &[(&str, &str)] = &[("CELLD_LAZY_BIRTH", mode)];
     let Some(fleet) = Fleet::start_counted("do-ids", 3, env).await else {
         return (0.0, 0.0, 0, 0);
     };
@@ -903,8 +901,8 @@ async fn requests_per_minted_agent(mode: &'static str) -> (f64, f64, u64, u64) {
         let started = Instant::now();
         let ids = spawn_agents(&fleet, n).await;
         assert_eq!(ids.len(), n);
-        // The run ends when the bucket has been quiet for the checkpoint.
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // The run ends after a checkpoint of the session has fallen in the window.
+        tokio::time::sleep(Duration::from_secs(35)).await;
         let after = proxy.take();
         let secs = started.elapsed().as_secs_f64();
         let load = support::diff(&after, &before).expect("diff");
@@ -925,9 +923,7 @@ async fn requests_per_minted_agent(mode: &'static str) -> (f64, f64, u64, u64) {
             net_b / n as f64,
         );
         for ((kind, shape, part), count) in &load {
-            if shape.starts_with("cells/") || shape.contains("fleet/sessions") {
-                eprintln!("  {kind} {shape} {part:?} {count}");
-            }
+            eprintln!("  {kind} {shape} {part:?} {count} (idle {})", idle.get(&(kind.clone(), shape.clone(), *part)).copied().unwrap_or(0));
         }
         *out.lock().unwrap() = (net_a / n as f64, net_b / n as f64, own_all, own_get);
         fleet
@@ -954,14 +950,11 @@ async fn s4_requests_per_minted_agent_in_read() {
         own_all, n,
         "one create-only write of own.json for each agent"
     );
-    // The plan's limit is 1.17 class A and 0.4 class B. The idle-window baseline
-    // moves a run by a few hundredths per agent, so the limit is reported, and
-    // the test asserts it with that margin.
     eprintln!(
         "S4 read within the limit 1.17/0.4: {}",
         a <= 1.17 && b <= 0.4
     );
-    assert!(a <= 1.25 && b <= 0.4, "per agent A {a:.3} B {b:.3}");
+    assert!(a <= 1.17 && b <= 0.4, "per agent A {a:.3} B {b:.3}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -975,7 +968,7 @@ async fn s4_requests_per_minted_agent_in_on() {
         "a lazy cell has no request on own.json (GET {own_get})"
     );
     eprintln!("S4 on within the limit 0.17/0.4: {}", a <= 0.17 && b <= 0.4);
-    assert!(a <= 0.25 && b <= 0.4, "per agent A {a:.3} B {b:.3}");
+    assert!(a <= 0.17 && b <= 0.4, "per agent A {a:.3} B {b:.3}");
 }
 
 const ON: &[(&str, &str)] = &[
@@ -1106,10 +1099,11 @@ async fn a_pending_grant_of_a_lazy_cell_wakes_at_epoch_two() {
     .await;
 }
 
-/// A drain hands a lazy cell on: the cell gets its record and a confirmed left
-/// entry before its release, and a peer serves it with the acknowledged write.
+/// A drain does not hand a dormant lazy cell on: nothing is written for it, and
+/// the seal of the session lets a peer take it by a first-form record at the
+/// next epoch, with the acknowledged write.
 #[tokio::test]
-async fn a_drain_gives_a_lazy_cell_its_record_before_the_release() {
+async fn a_drain_leaves_a_dormant_lazy_cell_to_the_seal() {
     let Some(fleet) = Fleet::start("do-ids", 3, ON).await else {
         return;
     };
@@ -1118,11 +1112,6 @@ async fn a_drain_gives_a_lazy_cell_its_record_before_the_release() {
         let spawned = fleet.get_json(0, "/spawn?n=1").await.expect("spawn");
         let id = spawned["ids"][0].as_str().unwrap().to_string();
         let tag = id[..16].to_string();
-        let header = fleet
-            .object(&format!("fleet/sessions/{tag}.json"))
-            .await
-            .expect("the header");
-        let counter = counter_of(&header, &id);
         fleet.nodes[0].stop();
         let out = wait_until(
             "a peer to serve the cell",
@@ -1142,13 +1131,19 @@ async fn a_drain_gives_a_lazy_cell_its_record_before_the_release() {
             .object(&format!("cells/Cell:{id}/own.json"))
             .await
             .expect("a record");
-        assert!(record["epoch"].as_u64().unwrap() >= 2, "{record}");
-        let chunk = fleet
-            .object(&format!("fleet/sessions/{tag}/c/0"))
+        assert!(
+            record["leave"].is_null(),
+            "the drain wrote no leave: {record}"
+        );
+        assert!(
+            record["nonce"].is_string(),
+            "a taker's first-form record: {record}"
+        );
+        let header = fleet
+            .object(&format!("fleet/sessions/{tag}.json"))
             .await
             .unwrap();
-        let left = &chunk["left"][counter.to_string()];
-        assert!(left["done"].is_string(), "the leave is confirmed: {chunk}");
+        assert_eq!(header["state"], "sealed");
         fleet
     })
     .await;
@@ -1218,6 +1213,36 @@ async fn a_leave_that_only_the_followers_hold_is_sealed_into_the_chunk() {
         let left = &chunk["left"][counter.to_string()];
         assert_eq!(left["done"], record["leave"], "{chunk}");
         assert_eq!(chunk["state"], "sealed");
+        fleet
+    })
+    .await;
+}
+
+/// An alarm on a lazy cell fires: the cell is found without a record and its
+/// retirement rests on a record that the leave wrote.
+#[tokio::test]
+async fn an_alarm_on_a_lazy_cell_fires() {
+    let Some(fleet) = Fleet::start("do-ids", 3, ON).await else {
+        return;
+    };
+    with_fleet(fleet, |fleet| async move {
+        wait_for_ensemble(&fleet).await;
+        let spawned = fleet.get_json(0, "/spawn?n=1").await.expect("spawn");
+        let id = spawned["ids"][0].as_str().unwrap().to_string();
+        fleet
+            .get_json(0, &format!("/arm?id={id}"))
+            .await
+            .expect("arm");
+        wait_until("the alarm to fire", Duration::from_secs(60), || async {
+            let state = fleet.get_json(0, &format!("/state?id={id}")).await?;
+            (state["alarmed"] == true).then_some(())
+        })
+        .await;
+        let record = fleet
+            .object(&format!("cells/Cell:{id}/own.json"))
+            .await
+            .expect("the retirement needed a record");
+        assert!(record["leave"].is_string(), "{record}");
         fleet
     })
     .await;
