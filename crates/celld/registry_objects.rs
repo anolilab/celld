@@ -41,6 +41,28 @@ pub(crate) fn key_of(cell: &str) -> reg::Key {
         .expect("16 bytes of a digest")
 }
 
+/// A key as 32 lowercase hex characters, for the debug routes and the bench.
+pub(crate) fn hex_key(key: &reg::Key) -> String {
+    use std::fmt::Write as _;
+    key.iter()
+        .fold(String::with_capacity(32), |mut text, byte| {
+            let _ = write!(text, "{byte:02x}");
+            text
+        })
+}
+
+/// The key of 32 hex characters, or `None`.
+pub(crate) fn parse_key(text: &str) -> Option<reg::Key> {
+    if text.len() != 32 || !text.is_ascii() {
+        return None;
+    }
+    let mut key = [0_u8; 16];
+    for (index, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(key)
+}
+
 pub(crate) fn root_dir(prefix: &str) -> String {
     format!("{prefix}{ROOT}")
 }
