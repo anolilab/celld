@@ -205,6 +205,7 @@ mod tests {
             rebalance_paused: false,
             draining: false,
             ingress_only,
+            generation: String::new(),
         }
     }
 

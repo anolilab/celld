@@ -23,6 +23,7 @@ fn peer(node: &str, ingress_only: bool) -> CapacityPeer {
         rebalance_paused: false,
         draining: false,
         ingress_only,
+        generation: String::new(),
     }
 }
 

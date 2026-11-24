@@ -4679,12 +4679,15 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             recover_with_follower_listener(&internal_listener, app.clone(), async {
                 let ttl_backoff =
                     std::time::Duration::from_millis(actor.lease_spec.ttl_ms.max(1_000));
-                let mut recovered = Ok(());
+                let mut recovered: anyhow::Result<()>;
                 // A boot waits behind a peer's live recovery claim and takes
                 // it over only once its heartbeat is stale, so one attempt
                 // can legitimately last as long as the peer's gather. The
                 // bound is a backstop against a wedge, not a pace.
-                for attempt in 1..=4u32 {
+                let mut ladder = celld::node_log::RecoveryLadder::new(ttl_backoff);
+                let mut attempt = 0_u32;
+                loop {
+                    attempt += 1;
                     recovered = match tokio::time::timeout(
                         std::time::Duration::from_secs(15 * 60),
                         manager.recover_self(),
@@ -4694,16 +4697,17 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         Ok(result) => result,
                         Err(_) => Err(anyhow::anyhow!("predecessor recovery timed out")),
                     };
-                    if recovered.is_ok() || attempt == 4 {
+                    let Err(error) = recovered.as_ref() else {
                         break;
-                    }
-                    if let Err(error) = recovered.as_ref() {
-                        eprintln!("celld predecessor recovery attempt {attempt} failed: {error:#}");
-                    }
-                    // At least one full TTL between attempts, so a
-                    // refused-because-live predecessor lease has expired
-                    // by the retry.
-                    tokio::time::sleep(ttl_backoff.saturating_mul(attempt)).await;
+                    };
+                    eprintln!("celld predecessor recovery attempt {attempt} failed: {error:#}");
+                    // A live predecessor lease is waited out once to its
+                    // expiry; every other failure, and a predecessor that
+                    // keeps renewing, backs off a full TTL times the attempt.
+                    let Some(wait) = ladder.next(error) else {
+                        break;
+                    };
+                    tokio::time::sleep(wait).await;
                 }
                 recovered.map_err(|error| {
                     anyhow::anyhow!(
