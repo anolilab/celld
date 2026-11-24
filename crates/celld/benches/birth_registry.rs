@@ -272,6 +272,12 @@ impl Fleet {
     }
 }
 
+/// The container that holds the store's data, which the bench copies the aged
+/// bucket inside of: `CELLD_REG_STORE_CONTAINER`.
+fn store_container() -> String {
+    env_text("CELLD_REG_STORE_CONTAINER").unwrap_or_else(|| "rustfs-reg".into())
+}
+
 /// The directory a phase writes its JSON to.
 fn out_dir() -> String {
     env_text("CELLD_REG_OUT").unwrap_or_else(|| {
@@ -465,7 +471,7 @@ async fn birth_load(
 /// The bytes the store holds, from inside its container.
 fn store_bytes() -> u64 {
     let output = std::process::Command::new("docker")
-        .args(["exec", "rustfs-reg", "du", "-sk", "/data"])
+        .args(["exec", &store_container(), "du", "-sk", "/data"])
         .output();
     output
         .ok()
@@ -482,7 +488,7 @@ fn store_inodes() -> u64 {
     let output = std::process::Command::new("docker")
         .args([
             "exec",
-            "rustfs-reg",
+            &store_container(),
             "sh",
             "-c",
             "find /data -type f | wc -l",
