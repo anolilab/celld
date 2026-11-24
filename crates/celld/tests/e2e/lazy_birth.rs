@@ -259,11 +259,12 @@ fn tag_of_key(key: &str) -> String {
         .to_string()
 }
 
-/// With no ensemble no `Grant` can be appended: every id is waived, the chunk of
-/// the session holds no bit once it is sealed, and the ended session's header is
-/// sealed while only the current one is open. (The fleet tests cover the bits.)
+/// With no ensemble no `Grant` can be appended: every id is waived and no mark
+/// sets a bit. The only bits in the sealed chunk are those that a left entry
+/// implies, for the cells that the preserved restart handed on; the ended
+/// session's header is sealed while only the current one is open.
 #[tokio::test]
-async fn without_an_ensemble_every_id_is_waived_and_the_sealed_chunk_holds_no_bit() {
+async fn without_an_ensemble_every_id_is_waived_and_only_a_left_entry_implies_a_bit() {
     let mut server = Server::start("do-ids", SHADOW).await;
     let ids = minted(&server).await;
     let (tag, header) = header_tag(server.project());
@@ -283,7 +284,13 @@ async fn without_an_ensemble_every_id_is_waived_and_the_sealed_chunk_holds_no_bi
     }
     let chunk = chunk_of(server.project(), &tag);
     assert_eq!(chunk["state"], "sealed", "{chunk}");
-    assert_eq!(chunk["granted"], serde_json::json!([]), "{chunk}");
+    let counters = [counter_of(&header, &ids[0]), counter_of(&header, &ids[2])];
+    assert_eq!(chunk["granted"], serde_json::json!(counters), "{chunk}");
+    assert_eq!(
+        chunk["left"].as_object().map(|left| left.len()),
+        Some(2),
+        "{chunk}"
+    );
 }
 
 /// A header that is missing is created again as sealed and lost, a counted
@@ -626,4 +633,63 @@ async fn an_id_that_was_never_minted_is_refused() {
         .get_status(&format!("/bump?id={forged}"))
         .await
         .is_success());
+}
+
+fn left_of(chunk: &Value, counter: u64) -> Value {
+    chunk["left"][counter.to_string()].clone()
+}
+
+/// K8 rule 7: a preserved restart hands a cell on only after a confirmed left
+/// entry for it is in the chunk, and the entry implies the granted bit.
+#[tokio::test]
+async fn a_preserved_restart_leaves_a_trace_for_the_cell_it_hands_on() {
+    let mut server = Server::start("do-ids", SHADOW).await;
+    let ids = minted(&server).await;
+    let (tag, header) = header_tag(server.project());
+    assert_eq!(bump(&server, &ids[0]).await, 1);
+    let counter = counter_of(&header, &ids[0]);
+    server.restart().await;
+    let chunk = chunk_of(server.project(), &tag);
+    let left = left_of(&chunk, counter);
+    assert_eq!(left["done"], left["nonces"][0], "{chunk}");
+    assert_eq!(left["epoch"], 1, "{chunk}");
+    assert_eq!(chunk["granted"], serde_json::json!([counter]), "{chunk}");
+    // The successor resumed the cell without a claim.
+    assert_eq!(bump(&server, &ids[0]).await, 2);
+    assert_eq!(own_record(server.project())["epoch"], 1);
+}
+
+/// K8 rule 7: a release leaves its trace first. After a drain released the
+/// cell, the chunk holds the confirmed left entry.
+#[tokio::test]
+async fn a_release_leaves_a_trace_in_the_chunk_first() {
+    let server = Server::start("do-ids", SHADOW).await;
+    let ids = minted(&server).await;
+    let (tag, header) = header_tag(server.project());
+    assert_eq!(bump(&server, &ids[0]).await, 1);
+    let counter = counter_of(&header, &ids[0]);
+    let url = server.internal_url("/shutdown").await;
+    let token = server.operator_token().await;
+    let response = reqwest::Client::new()
+        .post(url)
+        .header(reqwest::header::AUTHORIZATION, token.bearer())
+        .send()
+        .await
+        .expect("ask for a drain");
+    assert!(response.status().is_success());
+    let project = server.project().to_owned();
+    wait_until("the release", Duration::from_secs(60), || {
+        let project = project.clone();
+        async move {
+            let records = bodies(&project, "%cells/%/own.json");
+            records
+                .first()
+                .filter(|(_, record)| record["node"] == "")
+                .map(|_| ())
+        }
+    })
+    .await;
+    let chunk = chunk_of(server.project(), &tag);
+    let left = left_of(&chunk, counter);
+    assert_eq!(left["done"], left["nonces"][0], "{chunk}");
 }

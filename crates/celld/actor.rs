@@ -217,6 +217,17 @@ async fn judged_refusal(
     if crate::session::current().is_none() {
         return Ok(None);
     }
+    // The session wrote a record for this id and none exists: it is lost, and the
+    // session never writes a first record for the id again.
+    if record.is_none() && crate::session::current().is_some_and(|s| s.expects_record(cell)) {
+        eprintln!(
+            "celld ownership record lost: {cell}: the session wrote a record and it is lost; \
+             refusing the cell for {} s. See the ownership record repair in docs/guarantees.md.",
+            crate::ownership_store::LOST_RECORD_RECHECK_MS / 1_000
+        );
+        bucket.hold_lost_record(cell, crate::asyncrt::mono_ms());
+        return Ok(Some(Failure::Definite));
+    }
     let plain = crate::ownership_store::OwnerForm::default();
     let rec = record.map(|record| (record, form.unwrap_or(&plain)));
     match bucket

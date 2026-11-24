@@ -86,6 +86,11 @@ pub struct Session {
     /// comes later does not end this: the cell is served again only by the
     /// wake at a new epoch, which is not built.
     pending: Mutex<BTreeSet<u64>>,
+    /// The waived ids whose standard-path record this session wrote: it never
+    /// writes a first record for them again, and a missing record is lost.
+    claimed: Mutex<BTreeSet<u64>>,
+    /// The cells that left this session with a confirmed left entry in a chunk.
+    left: Mutex<BTreeSet<u64>>,
     /// The cell of each granted counter, for the marks that ride a bundle.
     granted_scopes: Mutex<BTreeMap<u64, String>>,
     /// A write that waits for a bit asks for a checkpoint now.
@@ -138,6 +143,8 @@ impl Session {
             dirty: Mutex::default(),
             checkpointed: Mutex::default(),
             granted_scopes: Mutex::default(),
+            claimed: Mutex::default(),
+            left: Mutex::default(),
             pending: Mutex::default(),
             nudge: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
@@ -577,6 +584,102 @@ impl Session {
             .collect()
     }
 
+    /// This session wrote the standard-path record of the waived id.
+    pub fn note_claimed(&self, counter: u64) {
+        self.claimed
+            .lock()
+            .expect("claimed poisoned")
+            .insert(counter);
+    }
+
+    /// Whether `scope` is an id of this session for which it wrote a record
+    /// (granted, or waived and claimed) and that record is expected to exist.
+    pub fn expects_record(&self, scope: &str) -> bool {
+        self.own_counter_of_scope(scope).is_some_and(|counter| {
+            self.is_granted(counter)
+                || self
+                    .claimed
+                    .lock()
+                    .expect("claimed poisoned")
+                    .contains(&counter)
+        })
+    }
+
+    pub fn is_claimed_scope(&self, scope: &str) -> bool {
+        self.own_counter_of_scope(scope).is_some_and(|counter| {
+            self.claimed
+                .lock()
+                .expect("claimed poisoned")
+                .contains(&counter)
+        })
+    }
+
+    /// The trace that a cell had a record, in a chunk in the bucket: a left
+    /// entry confirmed under a nonce of its own, by compare-and-swap. A left
+    /// entry implies the granted bit. It is written before every release of
+    /// the cell and before a preserved restart hands the cell on.
+    pub async fn confirm_left(&self, bucket: &Bucket, scope: &str) -> anyhow::Result<()> {
+        let Some(counter) = self.own_counter_of_scope(scope) else {
+            return Ok(());
+        };
+        if self.left.lock().expect("left poisoned").contains(&counter) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !self.is_closed() || self.sealing.load(Ordering::SeqCst),
+            "the session closed before the leave of {scope} was in a chunk"
+        );
+        let chunk = counter / CHUNK;
+        let tag = self.tag();
+        let mut nonce = [0_u8; 8];
+        getrandom::fill(&mut nonce).map_err(|error| anyhow::anyhow!("nonce: {error}"))?;
+        let nonce = hex(&nonce);
+        for _ in 0..6 {
+            let mut held = self.held.lock().await;
+            let (current, token) = held
+                .chunks
+                .get(&chunk)
+                .cloned()
+                .context("the session holds no such chunk")?;
+            let mut next = current.clone();
+            next.granted.insert(counter);
+            next.left.insert(
+                counter,
+                store::Left {
+                    epoch: 1,
+                    nonces: vec![nonce.clone()],
+                    done: Some(nonce.clone()),
+                },
+            );
+            next.rev += 1;
+            match store::swap_chunk(bucket, &tag, chunk, &next, &token).await? {
+                Some(token) => {
+                    self.checkpointed
+                        .lock()
+                        .expect("checkpointed poisoned")
+                        .extend(next.granted.iter().copied());
+                    self.granted
+                        .lock()
+                        .expect("granted poisoned")
+                        .insert(counter);
+                    held.chunks.insert(chunk, (next, token));
+                    self.left.lock().expect("left poisoned").insert(counter);
+                    return Ok(());
+                }
+                None => match store::read_chunk(bucket, &tag, chunk).await? {
+                    store::Read::Found(found, token) if found.state == store::State::Open => {
+                        held.chunks.insert(chunk, (found, token));
+                    }
+                    _ => {
+                        self.closed.store(true, Ordering::SeqCst);
+                        anyhow::bail!("chunk {chunk} is sealed or lost: the session stops");
+                    }
+                },
+            }
+        }
+        anyhow::bail!("the leave of {scope} lost every race")
+    }
+
     pub fn mark_pending(&self, counter: u64) {
         self.pending
             .lock()
@@ -735,6 +838,21 @@ pub async fn prepare_reload(
     cells: &[celld_logic::PresenceCell],
 ) -> anyhow::Result<crate::clean_reload::ReloadSession> {
     use celld_logic::session::{retag_needed, CARRIED_BOUND};
+    // Step 1 of the order, for the cells that this process wrote a record for: a
+    // trace in the bucket before the cell is handed on. A granted cell needs its
+    // bit in a chunk, a waived cell that it claimed needs a confirmed left entry.
+    // Any failure leaves no certificate.
+    let bucket = ownership.bucket_client();
+    for cell in cells {
+        let Some(counter) = session.own_counter_of_scope(&cell.id) else {
+            continue;
+        };
+        if session.is_claimed_scope(&cell.id) {
+            session.confirm_left(&bucket, &cell.id).await?;
+        } else if session.is_granted(counter) {
+            wait_until_checkpointed(&cell.id).await?;
+        }
+    }
     let all = session.tags().all();
     let mut tags: BTreeMap<String, String> = cells
         .iter()
@@ -1075,6 +1193,33 @@ mod tests {
             task
         };
         finish.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_session_expects_the_record_of_an_id_it_granted_or_claimed() {
+        let session = established([6; 8]);
+        let first = durable_object_id_hex(&session.mint(&key()).expect("established"));
+        let second = durable_object_id_hex(&session.mint(&key()).expect("established"));
+        let third = durable_object_id_hex(&session.mint(&key()).expect("established"));
+        let scope = |id: &String| format!("{CLASS}:{id}");
+        assert!(!session.expects_record(&scope(&first)));
+        session.grant_scope(&scope(&first));
+        session.note_claimed(1);
+        assert!(session.expects_record(&scope(&first)), "granted");
+        assert!(session.expects_record(&scope(&second)), "claimed");
+        assert!(session.is_claimed_scope(&scope(&second)));
+        assert!(
+            !session.expects_record(&scope(&third)),
+            "minted and never used"
+        );
+        let other = format!(
+            "{CLASS}:{}",
+            durable_object_id_hex(&tagged_object_id(&key(), [1; 8], [2; 8]))
+        );
+        assert!(!session.expects_record(&other), "another session");
+        assert!(!session.is_pending_scope(&scope(&first)));
+        session.mark_pending(0);
+        assert!(session.is_pending_scope(&scope(&first)));
     }
 
     #[test]

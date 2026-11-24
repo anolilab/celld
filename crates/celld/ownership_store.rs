@@ -1075,6 +1075,15 @@ impl BucketOwnership {
         {
             return Ok(CasOutcome::Rejected);
         }
+        // A release lets another node claim the cell, and that claim must rest
+        // on a trace in the bucket that the cell had a record.
+        if let Some(session) = crate::session::current() {
+            if session.is_claimed_scope(cell) {
+                session.confirm_left(&self.bucket, cell).await?;
+            } else if session.expects_record(cell) {
+                crate::session::wait_until_checkpointed(cell).await?;
+            }
+        }
         let key = format!("cells/{cell}/own.json");
         let by = crate::session::current().map(|session| session.tag());
         let body = serde_json::to_vec(&OwnerWire {
@@ -1198,6 +1207,9 @@ impl BucketOwnership {
             crate::session_store::Read::Found(header, _)
                 if header.state == crate::session_store::State::Open =>
             {
+                // The session wrote the standard-path record of this waived id,
+                // once.
+                session.note_claimed(counter);
                 Ok(())
             }
             _ => anyhow::bail!("no evidence that the record of {cell} was written before a seal"),
