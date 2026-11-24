@@ -18,6 +18,31 @@ use serde_json::value::RawValue;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Who reads the ownership record, and for what. The reader is an input of
+/// [`BucketOwnership::resolve_owner`]; the epoch is the one the reader expects
+/// the record to name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordReader {
+    /// The claim path: the first read of a cell that is asked for.
+    Claim,
+    /// The read after a listing found LTX and the first read found no record.
+    ClaimReread,
+    /// The read after a bucket proof, before a write is acknowledged.
+    BucketProof { epoch: u64 },
+    /// The probe of a cell's owner while electing a wake or alarm node.
+    WakeDiscovery,
+    /// The check that a wake entry may be retired.
+    WakeRetirement { epoch: u64 },
+    /// The owner check of epoch GC.
+    EpochGc { epoch: u64 },
+    /// A release of the record.
+    Release { epoch: u64 },
+    /// A re-tag before a preserved restart.
+    Retag { epoch: u64 },
+    /// The naming of a resident cell in the certificate of a preserved restart.
+    Reload { epoch: u64 },
+}
+
 #[derive(Serialize)]
 struct OwnerWire<'a> {
     node: &'a str,
@@ -774,7 +799,20 @@ impl BucketOwnership {
         (!self.probe_public_key.is_empty()).then_some(self.probe_public_key.as_str())
     }
 
-    pub async fn read_owner(&self, cell: &str) -> anyhow::Result<Option<OwnerRecord>> {
+    /// The one way to read the ownership record of a cell. Every reader goes
+    /// through here and says which reader it is, so a rule about what a record
+    /// means for that reader has one place to live.
+    pub async fn resolve_owner(
+        &self,
+        cell: &str,
+        reader: RecordReader,
+    ) -> anyhow::Result<Option<OwnerRecord>> {
+        // Nothing depends on the reader yet.
+        let _ = reader;
+        self.fetch_owner(cell).await
+    }
+
+    async fn fetch_owner(&self, cell: &str) -> anyhow::Result<Option<OwnerRecord>> {
         let key = format!("cells/{cell}/own.json");
         let Some((owner, etag)) = load_json::<OwnerWireOwned>(&self.bucket, &key).await? else {
             return Ok(None);
@@ -1257,7 +1295,10 @@ impl BucketOwnership {
     /// keeps naming whoever it names, and nothing was lost.
     pub async fn release_owner(&self, cell: &str, epoch: u64) -> anyhow::Result<CasOutcome> {
         self.gate_hold.wait().await;
-        let Some(current) = self.read_owner(cell).await? else {
+        let Some(current) = self
+            .resolve_owner(cell, RecordReader::Release { epoch })
+            .await?
+        else {
             return Ok(CasOutcome::Rejected);
         };
         if !crate::session::names_this_process(&self.node, cell, &current) || current.epoch != epoch
@@ -1301,7 +1342,8 @@ impl BucketOwnership {
                 && record.epoch == epoch
                 && record.by.as_deref() == Some(by)
         };
-        let Some(current) = self.read_owner(cell).await? else {
+        let reader = RecordReader::Retag { epoch };
+        let Some(current) = self.resolve_owner(cell, reader).await? else {
             return Ok(false);
         };
         if !names(&current, from) {
@@ -1315,7 +1357,7 @@ impl BucketOwnership {
         match self.bucket.put_cas(&key, body, Some(&current.etag)).await {
             Ok(applied) => Ok(applied.is_some()),
             Err(_) => Ok(self
-                .read_owner(cell)
+                .resolve_owner(cell, reader)
                 .await?
                 .is_some_and(|record| names(&record, to))),
         }

@@ -36,7 +36,11 @@ async fn a_lost_record_without_ltx_does_not_admit_a_second_first_claim() {
 
     let first = a.cas_owner("c", CasGuard::Absent, 1).await.unwrap();
     assert!(matches!(first, CasOutcome::Applied));
-    assert!(a.read_owner("c").await.unwrap().is_some());
+    assert!(a
+        .read_owner("c", crate::ownership_store::RecordReader::Claim)
+        .await
+        .unwrap()
+        .is_some());
 
     bucket.delete("cells/c/own.json").await.unwrap();
     assert!(!bucket.list_any("cells/c/ltx").await.unwrap());

@@ -9,6 +9,7 @@ use crate::machine::{
     random_process_generation, DEFAULT_MAX_OUTBOUND_WEBSOCKETS,
     DEFAULT_OWNER_LOG_RECOVERY_ATTEMPTS, DEFAULT_OWNER_LOG_RECOVERY_BACKOFF_MS,
 };
+use crate::ownership_store::RecordReader;
 use crate::ownership_store::{now_ms, BucketOwnership, LeaseCasError};
 use crate::peer_auth::{self, PeerAuth};
 use crate::runtime::RuntimeManager;
@@ -211,10 +212,17 @@ impl Ownership {
     /// Read the record as it is stored. A missing record here means only that
     /// no record exists now, so this read must not decide a claim; the core
     /// reads through [`Self::read_owner_for_claim`].
-    pub(crate) async fn read_owner(&self, cell: &str) -> Result<Option<OwnerRecord>, Failure> {
+    pub(crate) async fn read_owner(
+        &self,
+        cell: &str,
+        reader: RecordReader,
+    ) -> Result<Option<OwnerRecord>, Failure> {
         match self {
             Self::Memory(memory) => Ok(memory.lock().await.owners.get(cell).cloned()),
-            Self::Bucket(bucket) => bucket.read_owner(cell).await.map_err(ownership_read_failed),
+            Self::Bucket(bucket) => bucket
+                .resolve_owner(cell, reader)
+                .await
+                .map_err(ownership_read_failed),
         }
     }
 
@@ -226,12 +234,12 @@ impl Ownership {
     ) -> Result<Option<OwnerRecord>, Failure> {
         // Memory ownership runs without replication, so it never has LTX.
         let Self::Bucket(bucket) = self else {
-            return self.read_owner(cell).await;
+            return self.read_owner(cell, RecordReader::Claim).await;
         };
         if bucket.lost_record_held(cell, crate::asyncrt::mono_ms()) {
             return Err(Failure::Definite);
         }
-        let record = self.read_owner(cell).await?;
+        let record = self.read_owner(cell, RecordReader::Claim).await?;
         if record.is_some() {
             return Ok(record);
         }
@@ -273,7 +281,7 @@ impl Ownership {
         // read. Only a read after the listing that finds no record proves a
         // loss; without it, this node fails a request that it can forward and
         // reports a record that exists.
-        let reread = self.read_owner(cell).await?;
+        let reread = self.read_owner(cell, RecordReader::ClaimReread).await?;
         // The registry's answer is compared once the loss is proven: only a
         // `ClaimNew` here is wrong, since the cell has LTX and the record is
         // still absent. Nothing is decided from the registry in `shadow`.
@@ -3937,7 +3945,8 @@ impl Actor {
                 let ownership = self.ownership.clone();
                 let node = self.state.node().to_string();
                 out.spawn_scoped(async move {
-                    let result = match ownership.read_owner(&cell).await {
+                    let reader = RecordReader::BucketProof { epoch };
+                    let result = match ownership.read_owner(&cell, reader).await {
                         Ok(Some(record))
                             if crate::session::names_this_process(&node, &cell, &record)
                                 && record.epoch == epoch =>

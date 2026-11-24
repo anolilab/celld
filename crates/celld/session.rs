@@ -17,6 +17,7 @@ use crate::bucket::Bucket;
 use crate::engine_api::{
     durable_object_id_key, namespace_key, tagged_object_id, verify_object_id, IdKind,
 };
+use crate::ownership_store::RecordReader;
 use anyhow::Context;
 use celld_logic::session::SessionTags;
 use celld_logic::OwnerRecord;
@@ -528,7 +529,14 @@ pub async fn prepare_reload(
     let all = session.tags().all();
     let mut tags: BTreeMap<String, String> = BTreeMap::new();
     let mut reads = futures_util::stream::iter(cells)
-        .map(|cell| async move { (cell, ownership.read_owner(&cell.id).await) })
+        .map(|cell| async move {
+            (
+                cell,
+                ownership
+                    .resolve_owner(&cell.id, RecordReader::Reload { epoch: cell.epoch })
+                    .await,
+            )
+        })
         .buffer_unordered(READS);
     while let Some((cell, record)) = reads.next().await {
         let record = record?;
@@ -924,7 +932,12 @@ mod tests {
                 .await
                 .unwrap());
             assert!(retag("old").await.unwrap());
-            let record = world.ownership.read_owner("c").await.unwrap().unwrap();
+            let record = world
+                .ownership
+                .resolve_owner("c", RecordReader::Claim)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(record.by.as_deref(), Some("new"));
             assert_eq!(record.node.as_deref(), Some(NODE));
             assert_eq!(record.epoch, 5);
@@ -975,11 +988,19 @@ mod tests {
             };
             crate::asyncrt::sleep(std::time::Duration::from_millis(100)).await;
             assert!(!done.load(std::sync::atomic::Ordering::SeqCst), "it waits");
-            let held = ownership.read_owner("c").await.unwrap().unwrap();
+            let held = ownership
+                .resolve_owner("c", RecordReader::Claim)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(held.by.as_deref(), Some("old"), "nothing was written");
             hold.release();
             assert!(retag.await.unwrap().unwrap());
-            let record = ownership.read_owner("c").await.unwrap().unwrap();
+            let record = ownership
+                .resolve_owner("c", RecordReader::Claim)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(record.by.as_deref(), Some("new"));
         }
 
@@ -1046,7 +1067,12 @@ mod tests {
             .unwrap();
             assert_eq!(reload.tags, [tag(1), tag(3)]);
             assert_eq!(reload.cells["oldest"], tag(1));
-            let record = world.ownership.read_owner("oldest").await.unwrap().unwrap();
+            let record = world
+                .ownership
+                .resolve_owner("oldest", RecordReader::Claim)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(record.by.as_deref(), Some(tag(1).as_str()));
             assert_eq!(record.epoch, 5);
             assert!(session.resumed_snapshot().is_empty());
@@ -1060,12 +1086,22 @@ mod tests {
             let world = world();
             let session = Session::with_tag(Mode::Shadow, [1; 8], &[tag(2)]);
             put(&world, "a", NODE, 5, Some(&tag(2))).await;
-            let before = world.ownership.read_owner("a").await.unwrap().unwrap();
+            let before = world
+                .ownership
+                .resolve_owner("a", RecordReader::Claim)
+                .await
+                .unwrap()
+                .unwrap();
             let reload = prepare_reload(&session, &world.ownership, &[cell("a", 5)])
                 .await
                 .unwrap();
             assert_eq!(reload.tags, [tag(2)]);
-            let after = world.ownership.read_owner("a").await.unwrap().unwrap();
+            let after = world
+                .ownership
+                .resolve_owner("a", RecordReader::Claim)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(before.etag, after.etag);
         }
     }
