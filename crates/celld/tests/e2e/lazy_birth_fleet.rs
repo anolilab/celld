@@ -1544,7 +1544,6 @@ async fn s12_a_node_that_loses_its_followers_leaves_each_lazy_cell_once() {
         let before = fleet.proxy.as_ref().map(|proxy| proxy.take());
         fleet.nodes[1].kill();
         fleet.nodes[2].kill();
-        let started = Instant::now();
         // A probe that writes a small object to the store every 100 ms, from the
         // test's own client: if the store is slow, it is slow for the probe too.
         let probe_bucket = fleet.bucket.clone();
