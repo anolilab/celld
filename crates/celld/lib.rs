@@ -84,6 +84,7 @@ pub mod registry;
 pub(crate) mod registry_compactor;
 pub(crate) mod registry_objects;
 pub(crate) mod registry_pace;
+pub mod registry_seed;
 pub(crate) mod registry_writer;
 pub mod replication;
 pub(crate) mod response_encoding;

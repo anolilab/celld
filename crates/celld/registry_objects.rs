@@ -41,6 +41,10 @@ pub(crate) fn key_of(cell: &str) -> reg::Key {
         .expect("16 bytes of a digest")
 }
 
+pub(crate) fn root_dir(prefix: &str) -> String {
+    format!("{prefix}{ROOT}")
+}
+
 pub(crate) fn root_key(prefix: &str) -> String {
     format!("{prefix}{ROOT}/root")
 }
@@ -55,6 +59,10 @@ pub(crate) fn deltas_root(prefix: &str) -> String {
 
 pub(crate) fn maps_root(prefix: &str) -> String {
     format!("{prefix}{ROOT}/map")
+}
+
+pub(crate) fn seed_root(prefix: &str) -> String {
+    format!("{prefix}{ROOT}/seed")
 }
 
 pub(crate) fn runs_root(prefix: &str) -> String {
@@ -239,7 +247,15 @@ pub(crate) async fn delete_many(store: &dyn ObjectStore, keys: &[String]) -> Vec
     .boxed();
     store
         .delete_stream(locations)
-        .filter_map(|deleted| async move { deleted.ok().map(|path| path.to_string()) })
+        .filter_map(|deleted| async move {
+            match deleted {
+                Ok(path) => Some(path.to_string()),
+                // A stored object that is not there is as gone as one deleted: GCS
+                // and Azure answer so for a retry of a delete that landed.
+                Err(object_store::Error::NotFound { path, .. }) => Some(path),
+                Err(_) => None,
+            }
+        })
         .collect()
         .await
 }
@@ -258,6 +274,11 @@ pub(crate) fn epoch_of(prefix: &str, key: &str) -> Option<u64> {
         "run" => {
             let (_, name) = tail.split_once('/')?;
             name.split('-').nth(1)?.parse().ok()
+        }
+        // `seed/<gate>/<epoch>-<base>/<partition>`
+        "seed" => {
+            let (_, rest) = tail.split_once('/')?;
+            rest.split('/').next()?.split('-').next()?.parse().ok()
         }
         _ => None,
     }

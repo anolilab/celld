@@ -266,6 +266,13 @@ pub struct NodeLoadWire {
     /// cell an old node cannot restore.
     #[serde(default)]
     pub bucket_format: Option<u16>,
+    /// The node follows the registry's writer rule: this process installed a
+    /// registry and attached it to its ownership store. Always written, so a lease without the key
+    /// is told from a node that is outside the rule: the first is a binary from
+    /// before the registry, and neither may write per-cell objects while the
+    /// registry's gate is open.
+    #[serde(default)]
+    pub registry: bool,
     pub resident_cells: usize,
     pub host_websockets: usize,
     pub rss_bytes: u64,
@@ -425,6 +432,9 @@ pub struct BucketOwnership {
     /// The birth registry, which only shadows the lost-record listing.
     registry: Option<Arc<crate::registry::Registry>>,
     registry_answers: RegistryAnswers,
+    /// Claims and own-record writes wait on this until the registry's gate is
+    /// closed, on a node outside its writer rule.
+    gate_hold: &'static crate::registry_seed::GateHold,
 }
 
 /// How often the fleet directory answered a claim guard, by its answer and by
@@ -673,7 +683,16 @@ impl BucketOwnership {
             directory_answers: DirectoryAnswers::default(),
             registry: None,
             registry_answers: RegistryAnswers::default(),
+            gate_hold: crate::registry_seed::hold(),
         }
+    }
+
+    /// Use another hold than the process's, for a test that must not hold every
+    /// other claim in the process.
+    #[cfg(test)]
+    pub(crate) fn with_gate_hold(mut self, hold: &'static crate::registry_seed::GateHold) -> Self {
+        self.gate_hold = hold;
+        self
     }
 
     pub fn with_registry(mut self, registry: Option<Arc<crate::registry::Registry>>) -> Self {
@@ -1211,6 +1230,7 @@ impl BucketOwnership {
     /// claim. Rejection is an ordinary outcome, not an error -- the record
     /// keeps naming whoever it names, and nothing was lost.
     pub async fn release_owner(&self, cell: &str, epoch: u64) -> anyhow::Result<CasOutcome> {
+        self.gate_hold.wait().await;
         let Some(current) = self.read_owner(cell).await? else {
             return Ok(CasOutcome::Rejected);
         };
@@ -1231,6 +1251,8 @@ impl BucketOwnership {
         guard: CasGuard,
         epoch: u64,
     ) -> anyhow::Result<CasOutcome> {
+        // A node outside the writer rule claims nothing before the gate is closed.
+        self.gate_hold.wait().await;
         let key = format!("cells/{cell}/own.json");
         let body = serde_json::to_vec(&OwnerWire {
             node: &self.node,
@@ -1534,6 +1556,7 @@ pub(crate) fn process_load(live: &LiveLoad) -> NodeLoadWire {
         owned_cells: owned_cells(live),
         placement_weight: placement_weight(live),
         bucket_format: Some(celld_logic::format::BUCKET_FORMAT),
+        registry: crate::registry_seed::follows_rule(),
         rss_bytes,
         in_use_bytes: Some(in_use_bytes),
         cgroup_working_set_bytes: sample.cgroup_working_set_bytes,

@@ -272,6 +272,13 @@ pub fn validate() -> anyhow::Result<()> {
     ] {
         positive::<u64>(name)?;
     }
+    // Lifetimes are multiplied (the registry's seed waits two of them), so one that
+    // cannot be is not accepted.
+    if let Some(ttl) = positive::<u64>("CELLD_TTL_MS")? {
+        if ttl > u64::MAX / 4 {
+            bail!("CELLD_TTL_MS={ttl} is too large");
+        }
+    }
 
     for name in [
         "CELLD_ADMISSION_WAIT_MS",
@@ -367,7 +374,11 @@ pub fn validate() -> anyhow::Result<()> {
             for name in ["CELLD_REGISTRY_JOB_PACING", "CELLD_REGISTRY_WAIT"] {
                 flag(name, false)?;
             }
-            positive::<u32>("CELLD_REGISTRY_PARTITIONS")?;
+            if let Some(partitions) = positive::<u32>("CELLD_REGISTRY_PARTITIONS")? {
+                if partitions > 65_536 {
+                    bail!("CELLD_REGISTRY_PARTITIONS must be at most 65536, not {partitions}");
+                }
+            }
             for name in [
                 "CELLD_REGISTRY_BASE_DAYS",
                 "CELLD_REGISTRY_BATCH_MS",

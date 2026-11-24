@@ -1398,11 +1398,24 @@ impl LtxRepl {
                     config,
                 );
                 registry.install();
+                crate::registry_seed::mark_follows_rule();
+                registry.set_lister(lease.clone());
                 let wrapped: Arc<dyn ObjectStore> = Arc::new(
                     crate::registry_writer::RegistryStore::new(store, registry.clone()),
                 );
                 (wrapped, Some(registry))
             }
+            // Outside the writer rule (the flag is off, or the node has bucket
+            // durability): per-cell LTX writes wait until this node has closed the
+            // registry's gate or found that the bucket has no registry root.
+            None if crate::registry_seed::needs_gate_close() => (
+                Arc::new(crate::registry_seed::GatedStore::new(
+                    store,
+                    prefix.clone(),
+                    crate::registry_seed::hold(),
+                )) as Arc<dyn ObjectStore>,
+                None,
+            ),
             None => (store, None),
         };
         // The tiering flush interval: with a healthy shipper, at most one

@@ -2824,6 +2824,77 @@ async fn internal_registry_root(request: Request<Incoming>, app: AppHandle) -> H
     peer_response(response(StatusCode::OK, "{\"ok\":true}"))
 }
 
+/// A node outside the birth registry's writer rule (the flag is off, or it has bucket
+/// durability) raises the registry's gate number, when the bucket has a registry root,
+/// before it does any per-cell work, once its own lease, matched by generation, says
+/// it is outside the rule: a seed that started before the lease cannot then open the
+/// gate over this node's writes. Claims, own-record writes and per-cell object
+/// writes wait for it (`registry_seed::hold`) from the start; every failure is
+/// retried with a growing pause and nothing falls through. The root is read after the
+/// lease is visible, since a registry node may have created one meanwhile; with none
+/// nothing is written and the hold is released.
+///
+/// A lapsed lease fences the process (it halts), so the lease is never taken again
+/// within one process and the gate needs closing only here.
+async fn close_registry_gate(ownership: &Arc<celld::ownership_store::BucketOwnership>, node: &str) {
+    let hold = celld::registry_seed::hold();
+    if !hold.is_pending() {
+        return;
+    }
+    let bucket = ownership.bucket_client();
+    let Some(generation) = ownership.process_generation().map(str::to_owned) else {
+        eprintln!("celld: the node lease has no generation; the registry gate stays closed");
+        return;
+    };
+    let lease_key = format!("nodes/{node}.json");
+    let gate = celld::registry_seed::close_until_done(
+        hold,
+        {
+            let (bucket, key, generation) = (bucket.clone(), lease_key, generation);
+            move || {
+                let (bucket, key, generation) = (bucket.clone(), key.clone(), generation.clone());
+                Box::pin(async move {
+                    match bucket.get(&key).await {
+                        Ok(Some((body, _))) => celld::registry_seed::lease_shows_gate_closed(
+                            &body,
+                            &generation,
+                            celld::ownership_store::now_ms(),
+                        ),
+                        _ => false,
+                    }
+                })
+            }
+        },
+        {
+            let bucket = bucket.clone();
+            move || {
+                let bucket = bucket.clone();
+                Box::pin(async move {
+                    celld::registry_seed::close_gate(bucket.store.as_ref(), &bucket.prefix).await
+                })
+            }
+        },
+        std::time::Duration::from_millis(200),
+    )
+    .await;
+    let gate = match gate {
+        Ok(gate) => gate,
+        // Not a failure to retry: the node is outside the rule and the registry
+        // says no. Exit so the supervisor sees the misconfiguration.
+        Err(refused) => {
+            eprintln!("celld: {refused}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(gate) = gate {
+        tracing::info!(
+            event = "registry_gate_closed",
+            gate,
+            "this node is outside the birth registry's writer rule: the gate is closed"
+        );
+    }
+}
+
 async fn internal_probe(request: Request<Incoming>, app: AppHandle) -> HttpReply {
     let (parts, body) = request.into_parts();
     // The probe skips the operator-token gate, so an unsigned caller reaches
@@ -4097,6 +4168,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 fleet::validate_bucket(&client).await?;
             }
             celld::wake_format::ensure_ready(&client).await?;
+            celld::registry_seed::hold_until_gate_closed();
             // The list above proves the bucket answers; it does not prove the
             // store enforces the conditional writes or ranged reads that a
             // cell needs. Test both contracts here before the node serves.
@@ -4308,6 +4380,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             let (ownership, peer_key, wake, wake_scan) = if settings.bucket.is_some() {
                 let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
                 celld::wake_format::ensure_ready(&client).await?;
+                celld::registry_seed::hold_until_gate_closed();
                 let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
                 let peer_key = peer_auth::load_or_create(&client).await?;
                 let wake = Arc::new(celld::wake::WakeFlusher::new());
@@ -4400,6 +4473,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             let (ownership, peer_key) = if settings.bucket.is_some() {
                 let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
                 celld::wake_format::ensure_ready(&client).await?;
+                celld::registry_seed::hold_until_gate_closed();
                 let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
                 let peer_key = peer_auth::load_or_create(&client).await?;
                 (
@@ -4771,6 +4845,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             let gate_flag = app.fleet_ready.clone();
             let max_restoring = max_activations as u64;
             tokio::spawn(async move {
+                close_registry_gate(&ownership, &gate_node).await;
                 let started = std::time::Instant::now();
                 let mut deadline_reported = false;
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -4834,6 +4909,14 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         );
                     }
                 }
+            });
+        }
+        (Some(ownership), _) if celld::registry_seed::hold().is_pending() => {
+            let (ownership, node, ready) =
+                (ownership.clone(), node.clone(), app.fleet_ready.clone());
+            tokio::spawn(async move {
+                close_registry_gate(&ownership, &node).await;
+                ready.store(true, std::sync::atomic::Ordering::SeqCst);
             });
         }
         _ => app

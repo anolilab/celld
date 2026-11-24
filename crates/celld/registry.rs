@@ -52,6 +52,9 @@ impl<K: std::hash::Hash + Eq> RecentSet<K> {
     }
 }
 
+/// The most partitions a registry may be configured with, and the most a root
+/// may name before it is refused: a map has an entry for each.
+pub(crate) const MAX_PARTITIONS: u32 = 65_536;
 /// Shadow lookups beside claims that run at once; a claim over the limit is not
 /// looked up, so shadow never competes without bound with the compactor's passes.
 pub(crate) const SHADOW_LOOKUPS: usize = 16;
@@ -87,6 +90,10 @@ pub(crate) struct Config {
     /// Cells queued for the next segment at once; a cell over it is dropped and
     /// counted, and its first per-cell write queues it again.
     pub waiting_cap: usize,
+    /// Common prefixes one listing request of the seed asks for.
+    pub seed_page: usize,
+    /// The node-lease lifetime, which the seed's cutover window is two of.
+    pub lease_ttl_ms: u64,
     /// How long after a miss the sampler looks again.
     pub sampler_recheck_ms: u64,
     /// `CELLD_REGISTRY_JOB_PACING`: limit the requests and bytes per second of
@@ -136,10 +143,15 @@ impl Config {
         let wait = flag("CELLD_REGISTRY_WAIT", true)?;
         let job_pacing = flag("CELLD_REGISTRY_JOB_PACING", true)?;
         let pass_read_ms: u64 = with_default("CELLD_REGISTRY_PASS_READ_MS", 1_000)?;
+        let lease_ttl_ms = crate::machine::lease_ttl_ms_from_environment();
+        anyhow::ensure!(
+            lease_ttl_ms.checked_mul(2).is_some(),
+            "CELLD_TTL_MS={lease_ttl_ms} is too large for the registry's cutover window"
+        );
         let bound = Self::bound_with(durability_ms, extra_wait)?;
         anyhow::ensure!(
-            partitions >= 1 && pass_ms >= 1 && batch_ms >= 1 && spill_ms >= 1 && base_days >= 1,
-            "the registry's partitions, pass, batch and spill windows and base days must be positive"
+            (1..=MAX_PARTITIONS).contains(&partitions) && pass_ms >= 1 && batch_ms >= 1 && spill_ms >= 1 && base_days >= 1,
+            "the registry's partitions (at most 65,536), pass, batch and spill windows and base days must be positive"
         );
         let base_ms = base_days
             .checked_mul(86_400_000)
@@ -156,6 +168,8 @@ impl Config {
             grace_ms: crate::registry_compactor::GRACE_MS,
             created_cap: crate::registry_writer::CREATED_CAP,
             waiting_cap: crate::registry_writer::WAITING_CAP,
+            seed_page: 1_000,
+            lease_ttl_ms,
             sampler_recheck_ms: 20_000,
             job_pacing,
             pass_read: Duration::from_millis(pass_read_ms),
@@ -269,6 +283,14 @@ pub(crate) struct Counters {
     pub prefetch_skipped: AtomicU64,
     /// Deltas fetched because of a push; `delta_loads` counts the others.
     pub prefetch_loads: AtomicU64,
+    /// Seeds started, the cells they listed, and the ones that waited for a node
+    /// outside the writer rule or stopped for a binary without the lease field.
+    pub seeds: AtomicU64,
+    /// Seeds that committed and opened the gate for their number.
+    pub seed_commits: AtomicU64,
+    pub seed_cells: AtomicU64,
+    pub seed_waits: AtomicU64,
+    pub seed_blocked: AtomicU64,
 }
 
 /// A cell this process queued at a claim, until its coverage is observed.
@@ -318,6 +340,9 @@ pub struct Registry {
     pub(crate) waiters: AtomicUsize,
     pub(crate) role: Role,
     pub(crate) peer: OnceLock<PeerCall>,
+    /// The fleet bucket with its paginated delimiter listing, which the seed lists
+    /// cells with: one request per thousand cells. Without it the seed lists objects.
+    pub(crate) lister: OnceLock<crate::bucket::Bucket>,
     pub(crate) peer_addr: Mutex<HashMap<String, (u64, String)>>,
     /// Live nodes and their addresses, for the holder's root push.
     pub(crate) fleet: Mutex<Vec<(String, String)>>,
@@ -393,6 +418,7 @@ impl Registry {
             waiters: AtomicUsize::new(0),
             role: Role::default(),
             peer: OnceLock::new(),
+            lister: OnceLock::new(),
             peer_addr: Mutex::new(HashMap::new()),
             fleet: Mutex::new(Vec::new()),
             last_pass_request_ms: AtomicU64::new(0),
@@ -433,6 +459,17 @@ impl Registry {
             (holder.node.clone(), holder.session.clone()),
             crate::asyncrt::mono_ms(),
         );
+    }
+
+    /// The bucket handle the seed lists cells through, when it scopes the same
+    /// prefix as the registry's store.
+    pub(crate) fn set_lister(&self, bucket: crate::bucket::Bucket) {
+        // A backend that cannot resume a listing by name (Azure) keeps the flat
+        // listing, which the seed resumes by name too: only stores whose paginated
+        // listing takes a start-after are used.
+        if bucket.prefix == self.prefix && bucket.backend != crate::bucket::StorageBackend::Azure {
+            let _ = self.lister.set(bucket);
+        }
     }
 
     /// Give the registry what it needs to ask the holder for a pass.
@@ -546,7 +583,11 @@ impl Registry {
             .await;
         deltas_ok &= loaded.iter().all(Option::is_some);
         let deltas: Vec<Arc<Loaded>> = loaded.into_iter().flatten().collect();
+        // A root names how many partitions its map has. One that names none or
+        // more than a registry supports is unreadable: its empty map is never built.
+        let partitions_ok = (1..=MAX_PARTITIONS).contains(&root.k);
         let (map, map_ok) = match root.map {
+            _ if !partitions_ok => (Arc::new(Map::empty(1)), false),
             None => (Arc::new(Map::empty(root.k)), true),
             Some(named) => {
                 let cached = self
@@ -957,6 +998,11 @@ impl Registry {
             ("pushes_received", &counters.pushes_received),
             ("prefetch_skipped", &counters.prefetch_skipped),
             ("prefetch_loads", &counters.prefetch_loads),
+            ("seeds", &counters.seeds),
+            ("seed_commits", &counters.seed_commits),
+            ("seed_cells", &counters.seed_cells),
+            ("seed_waits", &counters.seed_waits),
+            ("seed_blocked", &counters.seed_blocked),
         ]
         .into_iter()
         .map(|(name, value)| (name.to_owned(), load(value).into()))
