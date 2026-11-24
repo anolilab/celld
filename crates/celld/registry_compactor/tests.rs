@@ -2487,6 +2487,9 @@ async fn a_failed_base_merge_keeps_its_partition_and_is_tried_again_at_once() {
     register_and_fold(&node, &mut holding, &(0..40).map(cell).collect::<Vec<_>>()).await;
     let spill = spill_now(&node, &mut holding).await;
     run_job(&node, &mut holding, spill).await;
+    // Whatever the passes above started on their own has ended.
+    wait_jobs_idle(&holding).await;
+    holding.prepared.lock().unwrap().clear();
     let index = holding
         .map
         .partitions
