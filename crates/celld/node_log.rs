@@ -323,6 +323,9 @@ struct BundleIndex {
     /// cell needs its evicted bundles only until its per-cell coverage passes
     /// this cut, so a covered cell costs no bundle read.
     evicted: BTreeMap<(String, u64), u64>,
+    /// The counters of the `Grant` marks that each bundle carries. Bundle GC
+    /// keeps a bundle until every one of them is in a chunk.
+    marks: HashMap<String, Vec<u64>>,
 }
 
 /// One cell epoch's view of the index. The rows, the evicted bundles, and
@@ -428,9 +431,20 @@ impl BundleIndex {
         }
     }
 
+    fn set_marks(&mut self, key: &str, counters: Vec<u64>) {
+        if !counters.is_empty() {
+            self.marks.insert(key.to_string(), counters);
+        }
+    }
+
+    fn marks_of(&self, key: &str) -> Vec<u64> {
+        self.marks.get(key).cloned().unwrap_or_default()
+    }
+
     fn remove(&mut self, keys: &[String]) {
         let removed: BTreeSet<&str> = keys.iter().map(String::as_str).collect();
         for key in &removed {
+            self.marks.remove(*key);
             let Some(bundle) = self.bundles.remove(*key) else {
                 continue;
             };
@@ -5282,6 +5296,12 @@ impl NodeLogManager {
             let mut bundles_ms = 0_u64;
             let mut upload_ms = 0_u64;
             let mut gathered_bytes = 0_u64;
+            // The bits of the marks that only the followers held go into the
+            // chunks before any row from their tails becomes a per-cell object.
+            if let Some(session) = wire.session.as_ref() {
+                crate::session_store::add_granted_bits(&self.bucket, &session.tag, &granted_marks)
+                    .await?;
+            }
             let mut tail = Some(std::mem::take(&mut gathered));
             for (index, window) in windows.into_iter().enumerate() {
                 let fetch_started = mono_ms();
@@ -5304,6 +5324,10 @@ impl NodeLogManager {
                     let (key, bytes) = fetched?;
                     let rows = celld_ltx::bundle::decode_rows(&bytes)
                         .with_context(|| format!("decode retained recovery bundle {key}"))?;
+                    granted_marks.extend(
+                        celld_ltx::bundle::decode_marks(&bytes)
+                            .with_context(|| format!("decode the marks of bundle {key}"))?,
+                    );
                     for row in rows {
                         let payload = celld_ltx::bundle::slice(&bytes, &row)
                             .with_context(|| format!("read a row from recovery bundle {key}"))?;
@@ -6299,9 +6323,9 @@ impl NodeLogManager {
             }
             let key = meta.key;
             *cursor = Some(key.clone());
-            let indexed = {
+            let (indexed, mut marks) = {
                 let index = self.bundle_index.lock().unwrap();
-                index.rows(&key)
+                (index.rows(&key), index.marks_of(&key))
             };
             let rows = match indexed {
                 Some(rows) => rows,
@@ -6309,12 +6333,30 @@ impl NodeLogManager {
                     let Ok(Some((bytes, _))) = self.bucket.get(&key).await else {
                         continue;
                     };
+                    // A bundle that this process did not index: its marks are
+                    // in its footer.
+                    if let (Some(session), Ok(cells)) = (
+                        crate::session::current(),
+                        celld_ltx::bundle::decode_marks(&bytes),
+                    ) {
+                        marks.extend(
+                            cells
+                                .iter()
+                                .filter_map(|cell| session.own_counter_of_scope(cell)),
+                        );
+                    }
                     match celld_ltx::bundle::decode_rows(&bytes) {
                         Ok(rows) => rows,
                         Err(_) => continue,
                     }
                 }
             };
+            // A bundle that carries a `Grant` is kept until its bit is in a
+            // chunk: a `Grant` of a cell that never committed leaves no other
+            // trace in the bucket.
+            if !crate::session::marks_checkpointed(&marks) {
+                continue;
+            }
             let mut paired = Vec::with_capacity(rows.len());
             for row in &rows {
                 let cache_key = (row.cell.clone(), row.cell_epoch);
@@ -6674,6 +6716,24 @@ impl NodeLogManager {
             }
         };
         let seq = self.bundle_seq.fetch_add(1, Ordering::SeqCst);
+        // The `Grant` marks that no chunk holds yet ride the bundle with its
+        // rows, as entries with no bytes.
+        let mut entries = entries;
+        let mark_counters: Vec<u64> = match crate::session::current() {
+            Some(session) => {
+                let marks = session.unchecked_mark_scopes();
+                for (_, scope) in &marks {
+                    entries.push(celld_ltx::bundle::BundleEntry {
+                        cell: scope.clone(),
+                        cell_epoch: 1,
+                        txid: celld_ltx::bundle::MARK_TXID,
+                        bytes: Vec::new(),
+                    });
+                }
+                marks.into_iter().map(|(counter, _)| counter).collect()
+            }
+            None => Vec::new(),
+        };
         let body = match celld_ltx::bundle::encode(&entries) {
             Ok(body) => body,
             Err(error) => {
@@ -6727,7 +6787,11 @@ impl NodeLogManager {
                     warn!(key, "bundle flush not credited: record moved");
                     return false;
                 }
-                self.bundle_index.lock().unwrap().insert(key, rows);
+                {
+                    let mut index = self.bundle_index.lock().unwrap();
+                    index.set_marks(&key, mark_counters);
+                    index.insert(key, rows);
+                }
                 true
             }
             Err(error) => {

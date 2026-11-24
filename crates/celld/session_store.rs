@@ -333,6 +333,49 @@ fn counters_of_marks(header: &Header, tag: &str, marks: &BTreeSet<String>) -> BT
         .collect()
 }
 
+/// Write the granted bits of the marks that a recoverer found on the followers
+/// into the open chunks of a dead session, before it uploads any row that it
+/// holds only from those tails: no object in the bucket may depend on a grant
+/// that no chunk holds. A sealed chunk is kept as it is.
+pub async fn add_granted_bits(
+    bucket: &Bucket,
+    tag: &str,
+    marks: &BTreeSet<String>,
+) -> anyhow::Result<()> {
+    if marks.is_empty() {
+        return Ok(());
+    }
+    let Read::Found(header, _) = read_header(bucket, tag).await? else {
+        return Ok(());
+    };
+    let counters = counters_of_marks(&header, tag, marks);
+    let chunks: BTreeSet<u64> = counters.iter().map(|counter| counter / CHUNK).collect();
+    for chunk in chunks {
+        for _ in 0..6 {
+            let Read::Found(found, token) = read_chunk(bucket, tag, chunk).await? else {
+                break;
+            };
+            if found.state == State::Sealed {
+                break;
+            }
+            let mut next = found.clone();
+            next.granted
+                .extend(counters.range(chunk * CHUNK..(chunk + 1) * CHUNK));
+            if next == found {
+                break;
+            }
+            next.rev += 1;
+            if swap_chunk(bucket, tag, chunk, &next, &token)
+                .await?
+                .is_some()
+            {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The seal of a session, in the order that fixes what the gather found
 /// (steps 2, 4 and 5 of the seal): close the header, seal each counted chunk,
 /// seal the header. Any node may continue a seal that another began. A missing

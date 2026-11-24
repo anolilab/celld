@@ -149,6 +149,11 @@ pub struct Fleet {
 impl Fleet {
     /// `None` when no store is configured.
     pub async fn start(fixture: &str, nodes: usize, env: &[(&str, &str)]) -> Option<Fleet> {
+        Fleet::start_each(fixture, &vec![env; nodes]).await
+    }
+
+    /// One environment per node.
+    pub async fn start_each(fixture: &str, envs: &[&[(&str, &str)]]) -> Option<Fleet> {
         let Ok(bucket) = std::env::var("CELLD_STORE_CONTRACT_BUCKET") else {
             eprintln!("skipped: CELLD_STORE_CONTRACT_BUCKET is not set");
             return None;
@@ -178,8 +183,10 @@ impl Fleet {
             String::from_utf8_lossy(&deployed.stderr)
         );
         let client = client();
-        let nodes: Vec<Node> = (0..nodes)
-            .map(|index| Node::spawn(home.path(), index, &spec, &endpoint, env))
+        let nodes: Vec<Node> = envs
+            .iter()
+            .enumerate()
+            .map(|(index, env)| Node::spawn(home.path(), index, &spec, &endpoint, env))
             .collect();
         for node in &nodes {
             node.wait_ready(&client).await;
@@ -271,6 +278,23 @@ fn counter_of(header: &Value, id: &str) -> u64 {
     celld::session::decrypt_counter(&key, unhex(&id[16..32]).try_into().expect("8 bytes"))
 }
 
+/// The ensemble of node 0 forms by maintenance, a few seconds after it is
+/// ready; a grant before that is waived.
+async fn wait_for_ensemble(fleet: &Fleet) {
+    wait_until(
+        "node 0 to have an ensemble",
+        Duration::from_secs(90),
+        || async {
+            let lease = fleet.object("nodes/lazy-0.json").await?;
+            (lease["log"]["state"] == "open"
+                && !lease["log"]["ensemble"].as_array()?.is_empty()
+                && !lease["session"].is_null())
+            .then_some(())
+        },
+    )
+    .await;
+}
+
 const SHADOW: &[(&str, &str)] = &[
     ("CELLD_LAZY_BIRTH", "shadow"),
     ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "500"),
@@ -285,6 +309,7 @@ async fn killing_the_minting_node_seals_its_session_with_its_grants() {
         return;
     };
     with_fleet(fleet, |mut fleet| async move {
+        wait_for_ensemble(&fleet).await;
         let minted = fleet.get_json(0, "/mint").await.expect("mint");
         let ids: Vec<String> = minted["ids"]
             .as_array()
@@ -293,7 +318,12 @@ async fn killing_the_minting_node_seals_its_session_with_its_grants() {
             .map(|id| id.as_str().unwrap().to_string())
             .collect();
         let tag = ids[0][..16].to_string();
-        // Two of the three ids get a record, through node 0 and through node 1.
+        // Two of the three ids get a record; the middle one never does.
+        let third = fleet
+            .get_json(0, &format!("/bump?id={}", ids[2]))
+            .await
+            .expect("bump");
+        assert_eq!(third["n"], 1);
         let first = fleet
             .get_json(0, &format!("/bump?id={}", ids[0]))
             .await
@@ -304,14 +334,10 @@ async fn killing_the_minting_node_seals_its_session_with_its_grants() {
             .object(&format!("fleet/sessions/{tag}.json"))
             .await
             .expect("the session header");
-        let granted = counter_of(&header, &ids[0]);
+        let granted = [counter_of(&header, &ids[0]), counter_of(&header, &ids[2])];
         wait_until("the checkpoint", Duration::from_secs(30), || async {
             let chunk = fleet.object(&format!("fleet/sessions/{tag}/c/0")).await?;
-            chunk["granted"]
-                .as_array()?
-                .iter()
-                .any(|counter| counter.as_u64() == Some(granted))
-                .then_some(())
+            (chunk["granted"] == serde_json::json!(granted)).then_some(())
         })
         .await;
         fleet.nodes[0].kill();
@@ -339,7 +365,7 @@ async fn killing_the_minting_node_seals_its_session_with_its_grants() {
             .await
             .expect("the chunk");
         assert_eq!(chunk["state"], "sealed", "{chunk}");
-        assert_eq!(chunk["granted"], serde_json::json!([granted]), "{chunk}");
+        assert_eq!(chunk["granted"], serde_json::json!(granted), "{chunk}");
         // Nobody wrote epoch 1 for the ids of the dead session but itself.
         for node in [1, 2] {
             let log = fleet.nodes[node].log();
@@ -371,20 +397,7 @@ async fn a_grant_that_no_checkpoint_wrote_survives_the_loss_of_the_minting_node(
         return;
     };
     with_fleet(fleet, |mut fleet| async move {
-        // The ensemble of node 0 forms by maintenance, a few seconds after it
-        // is ready.
-        wait_until(
-            "node 0 to have an ensemble",
-            Duration::from_secs(90),
-            || async {
-                let lease = fleet.object("nodes/lazy-0.json").await?;
-                (lease["log"]["state"] == "open"
-                    && !lease["log"]["ensemble"].as_array()?.is_empty()
-                    && !lease["session"].is_null())
-                .then_some(())
-            },
-        )
-        .await;
+        wait_for_ensemble(&fleet).await;
         let minted = fleet.get_json(0, "/mint").await.expect("mint");
         let ids: Vec<String> = minted["ids"]
             .as_array()
@@ -432,6 +445,155 @@ async fn a_grant_that_no_checkpoint_wrote_survives_the_loss_of_the_minting_node(
             .expect("the chunk");
         assert_eq!(chunk["state"], "sealed", "{chunk}");
         assert_eq!(chunk["granted"], serde_json::json!([counter]), "{chunk}");
+        fleet
+    })
+    .await;
+}
+
+/// A node without the flag in the ensemble means no `Grant` can be appended:
+/// the id is waived, takes the standard path with no bit, and the recoverer of
+/// the dead session finds no mark, so the sealed chunk holds no bit.
+#[tokio::test]
+async fn an_ensemble_member_without_the_capability_waives_the_id() {
+    let off: &[(&str, &str)] = &[];
+    let Some(fleet) = Fleet::start_each("do-ids", &[SHADOW, off]).await else {
+        return;
+    };
+    with_fleet(fleet, |mut fleet| async move {
+        wait_until(
+            "node 0 to have an ensemble",
+            Duration::from_secs(90),
+            || async {
+                let lease = fleet.object("nodes/lazy-0.json").await?;
+                (lease["log"]["state"] == "open"
+                    && !lease["log"]["ensemble"].as_array()?.is_empty())
+                .then_some(())
+            },
+        )
+        .await;
+        let minted = fleet.get_json(0, "/mint").await.expect("mint");
+        let id = minted["ids"][0].as_str().unwrap().to_string();
+        let tag = id[..16].to_string();
+        let out = fleet
+            .get_json(0, &format!("/bump?id={id}"))
+            .await
+            .expect("bump");
+        assert_eq!(out["n"], 1, "the waived id is served on the standard path");
+        fleet.nodes[0].kill();
+        wait_until(
+            "the other node to serve the id",
+            Duration::from_secs(180),
+            || async { fleet.get_json(1, &format!("/bump?id={id}")).await },
+        )
+        .await;
+        let chunk = fleet
+            .object(&format!("fleet/sessions/{tag}/c/0"))
+            .await
+            .expect("the chunk");
+        assert_eq!(chunk["state"], "sealed", "{chunk}");
+        assert!(
+            chunk["granted"]
+                .as_array()
+                .is_none_or(|bits| bits.is_empty()),
+            "a waived id has no bit: {chunk}"
+        );
+        fleet
+    })
+    .await;
+}
+
+/// The first per-cell object of a granted cell waits for its bit to be in a
+/// chunk: with no checkpoint due for an hour, the held write asks for one, and
+/// the chunk holds the bit by the time the object exists.
+#[tokio::test]
+async fn the_first_object_of_a_granted_cell_follows_its_bit_in_the_chunk() {
+    let env: &[(&str, &str)] = &[
+        ("CELLD_LAZY_BIRTH", "shadow"),
+        ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "3600000"),
+        ("CELLD_IDLE_EVICT_S", "2"),
+    ];
+    let Some(fleet) = Fleet::start("do-ids", 3, env).await else {
+        return;
+    };
+    with_fleet(fleet, |fleet| async move {
+        wait_for_ensemble(&fleet).await;
+        let minted = fleet.get_json(0, "/mint").await.expect("mint");
+        let id = minted["ids"][0].as_str().unwrap().to_string();
+        let tag = id[..16].to_string();
+        let header = fleet
+            .object(&format!("fleet/sessions/{tag}.json"))
+            .await
+            .expect("the header");
+        let counter = counter_of(&header, &id);
+        let out = fleet
+            .get_json(0, &format!("/bump?id={id}"))
+            .await
+            .expect("bump");
+        assert_eq!(out["n"], 1);
+        wait_until(
+            "the first object of the cell",
+            Duration::from_secs(60),
+            || async {
+                let keys = fleet.keys("").await;
+                keys.iter()
+                    .any(|key| key.contains("/ltx/e1/"))
+                    .then_some(())
+            },
+        )
+        .await;
+        let chunk = fleet
+            .object(&format!("fleet/sessions/{tag}/c/0"))
+            .await
+            .expect("the chunk");
+        assert_eq!(
+            chunk["granted"],
+            serde_json::json!([counter]),
+            "the object exists and the chunk does not hold its bit: {chunk}"
+        );
+        fleet
+    })
+    .await;
+}
+
+/// The `Grant` of a granted cell rides the bundle that carries the cell's
+/// rows, so a recoverer that finds the bundle finds the mark even when the
+/// followers' tails are gone.
+#[tokio::test]
+async fn the_bundle_of_a_granted_cell_carries_its_mark() {
+    let env: &[(&str, &str)] = &[
+        ("CELLD_LAZY_BIRTH", "shadow"),
+        ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "3600000"),
+    ];
+    let Some(fleet) = Fleet::start("do-ids", 3, env).await else {
+        return;
+    };
+    with_fleet(fleet, |fleet| async move {
+        wait_for_ensemble(&fleet).await;
+        let minted = fleet.get_json(0, "/mint").await.expect("mint");
+        let id = minted["ids"][0].as_str().unwrap().to_string();
+        let out = fleet
+            .get_json(0, &format!("/bump?id={id}"))
+            .await
+            .expect("bump");
+        assert_eq!(out["n"], 1);
+        wait_until(
+            "a bundle with the mark",
+            Duration::from_secs(60),
+            || async {
+                for key in fleet.keys("log/").await {
+                    if !key.ends_with(".ltxb") {
+                        continue;
+                    }
+                    let (bytes, _) = fleet.bucket.get(&key).await.ok()??;
+                    let marks = celld_ltx::bundle::decode_marks(&bytes).ok()?;
+                    if marks.iter().any(|cell| cell.ends_with(&id)) {
+                        return Some(());
+                    }
+                }
+                None
+            },
+        )
+        .await;
         fleet
     })
     .await;

@@ -82,10 +82,16 @@ pub struct Session {
     dirty: Mutex<BTreeSet<u64>>,
     /// The counters whose bit a chunk in the bucket holds.
     checkpointed: Mutex<BTreeSet<u64>>,
+    /// The cell of each granted counter, for the marks that ride a bundle.
+    granted_scopes: Mutex<BTreeMap<u64, String>>,
     /// A write that waits for a bit asks for a checkpoint now.
     nudge: tokio::sync::Notify,
     /// The session stopped granting: its header closed, or its seal began.
     closed: AtomicBool,
+    /// The close is the session's own graceful seal, which is running.
+    sealing: AtomicBool,
+    /// The session's seal finished and every bit it holds is in a sealed chunk.
+    sealed_with_bits: AtomicBool,
     held: tokio::sync::Mutex<Held>,
     /// The next counter to issue: every counter below it was issued.
     issued: AtomicU64,
@@ -127,8 +133,11 @@ impl Session {
             granted: Mutex::default(),
             dirty: Mutex::default(),
             checkpointed: Mutex::default(),
+            granted_scopes: Mutex::default(),
             nudge: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
+            sealing: AtomicBool::new(false),
+            sealed_with_bits: AtomicBool::new(false),
             held: tokio::sync::Mutex::default(),
             established: AtomicBool::new(false),
             resumed: Mutex::default(),
@@ -377,8 +386,15 @@ async fn wait_with(session: &Session, scope: &str) -> anyhow::Result<()> {
     session.nudge.notify_one();
     let deadline = crate::asyncrt::mono_ms() + 30_000;
     while crate::asyncrt::mono_ms() < deadline {
-        if session.is_checkpointed(counter) || session.is_closed() {
+        // The seal of this session writes the bits: a write goes on once the
+        // seal finished with them. A session that closed for any other reason
+        // (a chunk or a header that was lost or changed under it) never writes
+        // the object.
+        if session.is_checkpointed(counter) || session.sealed_with_bits.load(Ordering::SeqCst) {
             return Ok(());
+        }
+        if session.is_closed() && !session.sealing.load(Ordering::SeqCst) {
+            anyhow::bail!("the session closed before the grant of {scope} was in a chunk");
         }
         session.nudge.notify_one();
         crate::asyncrt::sleep(std::time::Duration::from_millis(20)).await;
@@ -512,6 +528,10 @@ impl Session {
         let Some(counter) = self.own_counter_of_scope(scope) else {
             return;
         };
+        self.granted_scopes
+            .lock()
+            .expect("granted scopes poisoned")
+            .insert(counter, scope.to_string());
         if self
             .granted
             .lock()
@@ -537,6 +557,19 @@ impl Session {
             &self.counter_key,
             id[8..16].try_into().ok()?,
         ))
+    }
+
+    /// The cells whose `Grant` no chunk holds yet. A bundle carries them with
+    /// its rows, so a recoverer that finds the bundle finds the mark.
+    pub fn unchecked_mark_scopes(&self) -> Vec<(u64, String)> {
+        let written = self.checkpointed.lock().expect("checkpointed poisoned");
+        self.granted_scopes
+            .lock()
+            .expect("granted scopes poisoned")
+            .iter()
+            .filter(|(counter, _)| !written.contains(counter))
+            .map(|(counter, scope)| (*counter, scope.clone()))
+            .collect()
     }
 
     /// Resolves when a write asked for a checkpoint.
@@ -619,9 +652,31 @@ impl Session {
     /// The graceful close: stop granting, then seal this session's header and
     /// chunks with the grants that no chunk holds yet.
     pub async fn seal(&self, bucket: &Bucket) -> anyhow::Result<()> {
+        self.sealing.store(true, Ordering::SeqCst);
         self.closed.store(true, Ordering::SeqCst);
         let gather = self.granted.lock().expect("granted poisoned").clone();
-        store::seal_session(bucket, &self.tag(), &gather, &BTreeSet::new()).await
+        let tag = self.tag();
+        store::seal_session(bucket, &tag, &gather, &BTreeSet::new()).await?;
+        // A chunk that a rival sealed first keeps its own content: only when
+        // every bit this session holds is in a sealed chunk may a held write
+        // go on.
+        let chunks: BTreeSet<u64> = gather.iter().map(|counter| counter / CHUNK).collect();
+        for chunk in chunks {
+            let Some(found) = (match store::read_chunk(bucket, &tag, chunk).await? {
+                store::Read::Found(found, _) => Some(found),
+                _ => None,
+            }) else {
+                return Ok(());
+            };
+            if gather
+                .range(chunk * CHUNK..(chunk + 1) * CHUNK)
+                .any(|counter| !found.granted.contains(counter))
+            {
+                return Ok(());
+            }
+        }
+        self.sealed_with_bits.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -976,9 +1031,28 @@ mod tests {
         assert!(!waiting.is_finished());
         session.checkpointed.lock().unwrap().insert(0);
         waiting.await.unwrap().unwrap();
-        // A session that began its seal passes: the seal writes the bits.
-        session.closed.store(true, Ordering::SeqCst);
-        wait_with(&session, &scope).await.unwrap();
+        // A session that closed because its chunk or header was lost under it
+        // never lets the object through.
+        let lost = established([9; 8]);
+        let id = durable_object_id_hex(&lost.mint(&key()).expect("established"));
+        let lost_scope = format!("{CLASS}:{id}");
+        lost.grant_scope(&lost_scope);
+        lost.closed.store(true, Ordering::SeqCst);
+        assert!(wait_with(&lost, &lost_scope).await.is_err());
+        // A session whose own seal is running waits for it, and goes on only when
+        // the seal finished with the bits.
+        lost.sealing.store(true, Ordering::SeqCst);
+        let finish = {
+            let lost = std::sync::Arc::new(lost);
+            let waiter = lost.clone();
+            let scope = lost_scope.clone();
+            let task = tokio::spawn(async move { wait_with(&waiter, &scope).await });
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(!task.is_finished(), "the seal has not finished");
+            lost.sealed_with_bits.store(true, Ordering::SeqCst);
+            task
+        };
+        finish.await.unwrap().unwrap();
     }
 
     #[test]

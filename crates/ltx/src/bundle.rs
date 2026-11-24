@@ -16,6 +16,12 @@ use crate::TXID;
 
 const MAGIC: &[u8; 4] = b"CLB1";
 
+/// The `txid` of a mark: a row of the footer that names a cell and carries no
+/// bytes. A mark is a fact about the session that wrote the bundle (the
+/// `Grant` of a cell), not a transaction; [`decode_rows`] does not return it,
+/// so a reader that knows only rows sees the bundle as it always was.
+pub const MARK_TXID: u64 = u64::MAX;
+
 fn malformed(what: &str) -> Error {
     Error::Other(format!("bundle: {what}").into())
 }
@@ -90,8 +96,24 @@ pub fn encode(entries: &[BundleEntry]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// The rows, from a complete bundle object.
+/// The rows, from a complete bundle object. Marks are left out.
 pub fn decode_rows(bundle: &[u8]) -> Result<Vec<BundleRow>> {
+    Ok(decode_footer(bundle)?
+        .into_iter()
+        .filter(|row| row.txid != MARK_TXID)
+        .collect())
+}
+
+/// The cells whose mark a bundle carries.
+pub fn decode_marks(bundle: &[u8]) -> Result<Vec<String>> {
+    Ok(decode_footer(bundle)?
+        .into_iter()
+        .filter(|row| row.txid == MARK_TXID)
+        .map(|row| row.cell)
+        .collect())
+}
+
+fn decode_footer(bundle: &[u8]) -> Result<Vec<BundleRow>> {
     let (_, mut footer) = split_data_and_footer(bundle)?;
     let mut rows = Vec::new();
     while !footer.is_empty() {
@@ -135,4 +157,51 @@ pub fn slice<'a>(bundle: &'a [u8], row: &BundleRow) -> Result<&'a [u8]> {
         return Err(malformed("row overruns the data section"));
     }
     Ok(&data[start..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(cell: &str, txid: u64, bytes: &[u8]) -> BundleEntry {
+        BundleEntry {
+            cell: cell.into(),
+            cell_epoch: 1,
+            txid,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_bundle_without_marks_keeps_its_bytes() {
+        let body = encode(&[entry("c", 1, b"abc")]).unwrap();
+        let mut expected = b"abc".to_vec();
+        let mut footer = Vec::new();
+        footer.extend_from_slice(&1_u16.to_le_bytes());
+        footer.extend_from_slice(b"c");
+        for value in [1_u64, 1, 0, 3] {
+            footer.extend_from_slice(&value.to_le_bytes());
+        }
+        expected.extend_from_slice(&footer);
+        expected.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+        expected.extend_from_slice(b"CLB1");
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn a_mark_is_not_a_row_and_is_read_apart() {
+        let body = encode(&[
+            entry("c", 1, b"abc"),
+            entry("d", MARK_TXID, b""),
+            entry("e", 2, b"xy"),
+        ])
+        .unwrap();
+        let rows = decode_rows(&body).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.cell.as_str()).collect::<Vec<_>>(),
+            ["c", "e"]
+        );
+        assert_eq!(slice(&body, &rows[1]).unwrap(), b"xy");
+        assert_eq!(decode_marks(&body).unwrap(), ["d"]);
+    }
 }
