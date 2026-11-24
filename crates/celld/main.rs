@@ -2753,6 +2753,77 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
     }
 }
 
+/// The birth registry's holder is asked for a pass now. Fleet-HMAC verified
+/// like every internal peer surface.
+async fn internal_registry_pass(request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    let (parts, body) = request.into_parts();
+    let body = match collect_limited_body(body, MAX_PEER_CONTROL_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(error) => return peer_response(body_read_error("registry pass", error)),
+    };
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| parts.uri.path().to_string(), ToString::to_string);
+    if let Err(error) = app.peer_auth.verify(
+        &parts.method,
+        &path_and_query,
+        &parts.headers,
+        &body,
+        app.peer_auth.source(),
+    ) {
+        return peer_response(response(error.status(), error.message()));
+    }
+    if parts.method != hyper::Method::POST {
+        return peer_response(response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+        ));
+    }
+    let Some(registry) = celld::registry::global() else {
+        return peer_response(response(StatusCode::NOT_FOUND, "no registry"));
+    };
+    registry.request_pass_here();
+    peer_response(response(StatusCode::OK, "{\"ok\":true}"))
+}
+
+/// The registry's holder says it wrote a root that names new deltas. A hint
+/// that makes this node load them early; fleet-HMAC verified like every
+/// internal peer surface.
+async fn internal_registry_root(request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    let (parts, body) = request.into_parts();
+    let body = match collect_limited_body(body, MAX_PEER_CONTROL_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(error) => return peer_response(body_read_error("registry root", error)),
+    };
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| parts.uri.path().to_string(), ToString::to_string);
+    if let Err(error) = app.peer_auth.verify(
+        &parts.method,
+        &path_and_query,
+        &parts.headers,
+        &body,
+        app.peer_auth.source(),
+    ) {
+        return peer_response(response(error.status(), error.message()));
+    }
+    if parts.method != hyper::Method::POST {
+        return peer_response(response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+        ));
+    }
+    let Some(registry) = celld::registry::global() else {
+        return peer_response(response(StatusCode::NOT_FOUND, "no registry"));
+    };
+    if !registry.on_push(&body) {
+        return peer_response(response(StatusCode::BAD_REQUEST, "not a root push"));
+    }
+    peer_response(response(StatusCode::OK, "{\"ok\":true}"))
+}
+
 async fn internal_probe(request: Request<Incoming>, app: AppHandle) -> HttpReply {
     let (parts, body) = request.into_parts();
     // The probe skips the operator-token gate, so an unsigned caller reaches
@@ -3105,6 +3176,12 @@ async fn handle_internal(
     let result = match path.as_str() {
         "/peer/probe" => internal_probe(request, app).await,
         "/peer/handoff" => internal_handoff(request, app).await,
+        "/peer/registry/pass" if celld::registry::global().is_some() => {
+            internal_registry_pass(request, app).await
+        }
+        "/peer/registry/root" if celld::registry::global().is_some() => {
+            internal_registry_root(request, app).await
+        }
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),
         "/metrics" => metrics_reply(app.counts().await),
@@ -4060,6 +4137,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 &node,
             )?;
             let cell_directory = replication.cell_directory();
+            let registry = replication.registry();
             let replication = Some(replication);
             // The same two calls a reload makes: there is no boot-only way from
             // a deployment to a serving generation.
@@ -4093,7 +4171,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 )
                 .with_lease_ttl_ms(lease_ttl_ms_from_environment())
                 .with_fleet_sample_ms(fleet_sample_ms)
-                .with_cell_directory(cell_directory),
+                .with_cell_directory(cell_directory)
+                .with_registry(registry),
             );
             let wake_scan = Some((client, bucket_ownership.clone()));
             let ownership = Ownership::Bucket(bucket_ownership);
@@ -4373,6 +4452,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let peer_auth = Arc::new(
         PeerAuth::new(peer_key, node.clone())?.with_operator_token(Some(operator_token.clone())),
     );
+    if let Some(registry) = celld::registry::global() {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(1))
+            .build()?;
+        registry.set_peer(peer_auth.clone(), client);
+    }
     // Connect-only timeout: a peer request may legitimately run through a
     // restore, but a handshake that never completes provably ran nothing.
     let peer_http = reqwest::Client::builder()
@@ -4801,6 +4886,15 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         (now_ms, Vec::new())
                     }
                 };
+                if let Some(registry) = celld::registry::global() {
+                    registry.set_fleet(
+                        peers
+                            .iter()
+                            .filter(|peer| peer.expires_ms > view_ms && !peer.addr.is_empty())
+                            .map(|peer| (peer.node.clone(), peer.addr.clone()))
+                            .collect(),
+                    );
+                }
                 if let Some(replication) = &replication {
                     let format = celld_logic::format::BUCKET_FORMAT;
                     let open = celld_logic::format::fleet_reads(&peers, view_ms, format);

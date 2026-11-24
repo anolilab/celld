@@ -53,6 +53,11 @@ impl Replication {
         })
     }
 
+    /// The node's birth registry, when it runs one.
+    pub fn registry(&self) -> Option<Arc<crate::registry::Registry>> {
+        self.ltx.registry()
+    }
+
     /// The node's view of the fleet directory of cells with LTX.
     pub fn cell_directory(&self) -> Option<Arc<crate::cell_directory::CellDirectory>> {
         self.ltx.cell_directory()
