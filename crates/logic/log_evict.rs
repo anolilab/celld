@@ -160,6 +160,9 @@ impl MemberHealth {
 pub struct FollowerHealth {
     members: BTreeMap<NodeId, MemberHealth>,
     quarantined_until: BTreeMap<NodeId, u64>,
+    /// Followers whose append failed in transport, and until when. Unlike the
+    /// quarantine, a recruiter lifts it for a peer that is a new process.
+    failed_until: BTreeMap<NodeId, u64>,
     last_swap_ms: Option<u64>,
 }
 
@@ -316,6 +319,26 @@ impl FollowerHealth {
         self.members.remove(member);
     }
 
+    /// The member's append failed in transport (refused, reset, timed out, a
+    /// 5xx). A peer that is restarting keeps its node lease live until the
+    /// lease lapses or its successor replaces it, so the next rebuild must not
+    /// recruit it again at once: that ensemble fails its first append and
+    /// degrades. Recruitment skips the member until `backoff_ms` has passed or
+    /// it is a different process (see `failed_recently`).
+    pub fn append_failed(&mut self, member: &str, backoff_ms: u64, now_ms: u64) {
+        let until = now_ms.saturating_add(backoff_ms);
+        let entry = self.failed_until.entry(member.to_string()).or_insert(0);
+        *entry = (*entry).max(until);
+        self.members.remove(member);
+    }
+
+    /// Did this candidate's append fail within the backoff?
+    pub fn failed_recently(&self, candidate: &str, now_ms: u64) -> bool {
+        self.failed_until
+            .get(candidate)
+            .is_some_and(|until| *until > now_ms)
+    }
+
     /// May an eviction-driven swap happen now? A failed follower (a hard
     /// error, not a gray tail) bypasses this — that swap is v0's existing
     /// degrade path and correctness needs it regardless of cadence.
@@ -393,5 +416,25 @@ impl FollowerHealth {
             .samples
             .back()
             .is_none_or(|(at, _)| at.saturating_add(quiet_ms) < now_ms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_append_sits_out_for_the_backoff_only() {
+        let mut health = FollowerHealth::default();
+        assert!(!health.failed_recently("b", 1_000));
+        health.append_failed("b", 10_000, 1_000);
+        assert!(health.failed_recently("b", 10_999));
+        assert!(!health.failed_recently("b", 11_000));
+        assert!(!health.failed_recently("c", 1_000));
+        // A shorter failure never shortens a sit-out already running.
+        health.append_failed("b", 100, 2_000);
+        assert!(health.failed_recently("b", 10_999));
+        // And it is not a quarantine: the incapability ledger is untouched.
+        assert!(!health.quarantined("b", 1_000));
     }
 }

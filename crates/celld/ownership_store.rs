@@ -163,6 +163,7 @@ impl NodeLeaseWire {
             rebalance_paused: self.load.rebalance_paused.unwrap_or(false),
             draining: self.load.draining.unwrap_or(false),
             ingress_only: self.load.ingress_only.unwrap_or(false),
+            generation: self.generation,
         }
     }
 }
