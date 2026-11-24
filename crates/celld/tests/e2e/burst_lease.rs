@@ -129,6 +129,10 @@ async fn a_burst_of_cell_wakes_does_not_fence_the_node() {
             "burst of {count} cells acknowledged in {:.1}s",
             took.as_secs_f64()
         );
+        // A burst that ends quickly may end before a lease renewal fell due:
+        // keep the node up for longer than one lease lifetime (10 s by
+        // default) after it, so a renewal the burst starved would show.
+        tokio::time::sleep(Duration::from_secs(12)).await;
         results.iter().filter(|ok| !**ok).count()
     })
     .catch_unwind()
