@@ -128,10 +128,34 @@ pub enum Marked {
     Foreign(String),
 }
 
+type MarkWaiter = (
+    u64,
+    String,
+    tokio::sync::oneshot::Sender<Result<Marked, String>>,
+);
+
+/// The marks that wait for the next write of a chunk, by session and chunk, and
+/// the lock of the writer that takes them.
+type WriterLocks = std::sync::Mutex<
+    std::collections::HashMap<(String, u64), std::sync::Arc<tokio::sync::Mutex<()>>>,
+>;
+
+#[derive(Default)]
+struct MarkQueues {
+    waiting: std::sync::Mutex<std::collections::HashMap<(String, u64), Vec<MarkWaiter>>>,
+    writers: WriterLocks,
+}
+
+fn mark_queues() -> &'static MarkQueues {
+    static QUEUES: std::sync::OnceLock<MarkQueues> = std::sync::OnceLock::new();
+    QUEUES.get_or_init(MarkQueues::default)
+}
+
 /// Put `nonce` in the taken table of the cell with `counter`, by a
 /// compare-and-swap on the token of a read of the chunk. A lost write reads the
 /// chunk again: no entry for the cell means another cell changed the chunk, so
-/// the write is tried again; this nonce means the write had applied.
+/// the write is tried again; this nonce means the write had applied. The marks of
+/// the cells of one chunk that this process takes together share one write.
 pub async fn mark_taken(
     bucket: &Bucket,
     tag: &str,
@@ -139,30 +163,98 @@ pub async fn mark_taken(
     nonce: &str,
 ) -> anyhow::Result<Marked> {
     let chunk = counter / CHUNK;
+    let key = (tag.to_string(), chunk);
+    let queues = mark_queues();
+    let (done, mut result) = tokio::sync::oneshot::channel();
+    queues
+        .waiting
+        .lock()
+        .expect("mark queue poisoned")
+        .entry(key.clone())
+        .or_default()
+        .push((counter, nonce.to_string(), done));
+    let writer = queues
+        .writers
+        .lock()
+        .expect("mark writers poisoned")
+        .entry(key.clone())
+        .or_default()
+        .clone();
+    let _turn = writer.lock().await;
+    if let Ok(outcome) = result.try_recv() {
+        return outcome.map_err(|error| anyhow::anyhow!(error));
+    }
+    let batch: Vec<MarkWaiter> = queues
+        .waiting
+        .lock()
+        .expect("mark queue poisoned")
+        .remove(&key)
+        .unwrap_or_default();
+    let outcomes = write_marks(bucket, tag, chunk, &batch).await;
+    for ((_, _, done), outcome) in batch.into_iter().zip(outcomes) {
+        let _ = done.send(outcome.map_err(|error| format!("{error:#}")));
+    }
+    match result.try_recv() {
+        Ok(outcome) => outcome.map_err(|error| anyhow::anyhow!(error)),
+        Err(_) => anyhow::bail!("a mark of {} was lost", chunk_key(tag, chunk)),
+    }
+}
+
+async fn write_marks(
+    bucket: &Bucket,
+    tag: &str,
+    chunk: u64,
+    batch: &[MarkWaiter],
+) -> Vec<anyhow::Result<Marked>> {
     for _ in 0..8 {
-        match read_chunk(bucket, tag, chunk).await? {
-            Read::Found(found, token) => {
-                if let Some(taken) = found.taken.get(&counter) {
-                    return Ok(if taken == nonce {
-                        Marked::Ours
-                    } else {
-                        Marked::Foreign(taken.clone())
-                    });
+        let Ok(Read::Found(found, token)) = read_chunk(bucket, tag, chunk).await else {
+            return batch
+                .iter()
+                .map(|_| {
+                    Err(anyhow::anyhow!(
+                        "{} is missing or unreadable",
+                        chunk_key(tag, chunk)
+                    ))
+                })
+                .collect();
+        };
+        let mut next = found.clone();
+        let mut outcomes: Vec<Marked> = Vec::new();
+        for (counter, nonce, _) in batch {
+            outcomes.push(match next.taken.get(counter) {
+                Some(taken) if taken == nonce => Marked::Ours,
+                Some(taken) => Marked::Foreign(taken.clone()),
+                None => {
+                    next.taken.insert(*counter, nonce.clone());
+                    Marked::Ours
                 }
-                let mut next = found.clone();
-                next.taken.insert(counter, nonce.to_string());
-                next.rev += 1;
-                if swap_chunk(bucket, tag, chunk, &next, &token)
-                    .await?
-                    .is_some()
-                {
-                    return Ok(Marked::Ours);
-                }
+            });
+        }
+        if next == found {
+            return outcomes.into_iter().map(Ok).collect();
+        }
+        next.rev += 1;
+        match swap_chunk(bucket, tag, chunk, &next, &token).await {
+            Ok(Some(_)) => return outcomes.into_iter().map(Ok).collect(),
+            Ok(None) => {}
+            Err(error) => {
+                let message = format!("{error:#}");
+                return batch
+                    .iter()
+                    .map(|_| Err(anyhow::anyhow!(message.clone())))
+                    .collect();
             }
-            _ => anyhow::bail!("{} is missing or unreadable", chunk_key(tag, chunk)),
         }
     }
-    anyhow::bail!("marking {} lost every race", chunk_key(tag, chunk))
+    batch
+        .iter()
+        .map(|_| {
+            Err(anyhow::anyhow!(
+                "marking {} lost every race",
+                chunk_key(tag, chunk)
+            ))
+        })
+        .collect()
 }
 
 pub fn header_key(tag: &str) -> String {
@@ -189,6 +281,29 @@ async fn read<T: for<'de> Deserialize<'de>>(bucket: &Bucket, key: &str) -> anyho
             Err(_) => Read::Unreadable(token),
         },
     })
+}
+
+/// The header of a session as `read_header` reads it, except that a sealed header
+/// is final and is kept: a reader that judges many cells of one session reads it
+/// once.
+pub async fn read_header_cached(bucket: &Bucket, tag: &str) -> anyhow::Result<Read<Header>> {
+    static SEALED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Header>>,
+    > = std::sync::OnceLock::new();
+    let cache = SEALED.get_or_init(Default::default);
+    if let Some(header) = cache.lock().expect("header cache poisoned").get(tag) {
+        return Ok(Read::Found(header.clone(), String::new()));
+    }
+    let read = read_header(bucket, tag).await?;
+    if let Read::Found(header, _) = &read {
+        if header.state == State::Sealed && !header.lost {
+            cache
+                .lock()
+                .expect("header cache poisoned")
+                .insert(tag.to_string(), header.clone());
+        }
+    }
+    Ok(read)
 }
 
 pub async fn read_header(bucket: &Bucket, tag: &str) -> anyhow::Result<Read<Header>> {

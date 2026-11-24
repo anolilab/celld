@@ -129,7 +129,7 @@ impl BucketOwnership {
             return Ok(Verdict::Proceed);
         }
         let bucket = self.bucket_client();
-        let header = match store::read_header(&bucket, &tag).await? {
+        let header = match store::read_header_cached(&bucket, &tag).await? {
             Read::Found(header, _) if header.state != store::State::Sealed => {
                 if record.is_none() && header.node != self.node_name() {
                     tracing::info!(
