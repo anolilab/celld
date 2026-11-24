@@ -246,3 +246,62 @@ async fn round(rig: &Rig, epoch: u64) {
         "the round {outcome:?}"
     );
 }
+
+#[test]
+fn raw_l0_upload_passes_a_closed_gate_only_inside_a_predecessor_repair() {
+    run(async {
+        let hold: &'static crate::registry_seed::GateHold =
+            Box::leak(Box::new(crate::registry_seed::GateHold::new()));
+        hold.require();
+        let gated: Arc<dyn celld_ltx::object_store::ObjectStore> =
+            Arc::new(crate::registry_seed::GatedStore::new(
+                Arc::new(celld_ltx::object_store::memory::InMemory::new()),
+                PREFIX.to_owned(),
+                hold,
+            ));
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let ltx = LtxRepl::assemble(
+            directory.path(),
+            gated,
+            TimestampMetadataKey::Litestream,
+            "bucket".to_string(),
+            PREFIX.to_string(),
+            None,
+            "us-east-1".to_string(),
+            None,
+            None,
+            3_600_000,
+            production_ltx_host(),
+            5_000,
+            LtxConfig::from_lookup(|_| Ok(None)),
+            None,
+            None,
+        );
+        let header = celld_ltx::ltx::Header {
+            min_txid: TXID(1),
+            max_txid: TXID(1),
+            ..Default::default()
+        };
+        let bytes = header.marshal();
+
+        // A sweep or cold-route recovery is not the boot's predecessor repair.
+        let swept = crate::asyncrt::timeout(
+            Duration::from_millis(150),
+            ltx.upload_raw_l0(CELL, 1, 1, 1, &bytes),
+        )
+        .await;
+        assert!(
+            swept.is_err(),
+            "a raw L0 upload outside a repair waits for the gate"
+        );
+
+        crate::asyncrt::timeout(
+            Duration::from_secs(2),
+            crate::registry_seed::repairing_predecessor(ltx.upload_raw_l0(CELL, 1, 2, 2, &bytes)),
+        )
+        .await
+        .expect("a predecessor repair does not wait for the gate")
+        .unwrap();
+        assert!(hold.is_pending(), "the gate itself is still closed");
+    });
+}
