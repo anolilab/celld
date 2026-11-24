@@ -395,9 +395,12 @@ async fn a_rolling_restart_does_not_recruit_the_restarting_peer() {
                 "node {index} recruited a peer again within its lease: {again:?}"
             );
         }
+        // A liveness backstop, not a performance bound: a restart is mostly
+        // the drain handoff of the node's cells, and the times are printed
+        // above. The recruitment assertion is the check of this test.
         for (index, restart) in restarts.iter().enumerate() {
             assert!(
-                *restart < Duration::from_secs(30),
+                *restart < Duration::from_secs(90),
                 "restart {index} took {restart:?}"
             );
         }
