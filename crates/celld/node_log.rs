@@ -2727,13 +2727,7 @@ fn note_failed_append(
         return false;
     }
     let now = crate::ownership_store::now_ms();
-    warn!(
-        member = member.node,
-        generation = member.generation,
-        %error,
-        "follower append failed; sitting out of recruitment while its lease lasts"
-    );
-    health.lock().unwrap().append_failed(
+    let newly = health.lock().unwrap().append_failed(
         &member.node,
         &member.generation,
         now,
@@ -2741,6 +2735,23 @@ fn note_failed_append(
             .lease_expires_ms
             .max(now.saturating_add(member.lease_ttl_ms)),
     );
+    // Once per sit-out: every unanswered frame of a stream and every repeated
+    // probe reports the same failure.
+    if newly {
+        warn!(
+            member = member.node,
+            generation = member.generation,
+            %error,
+            "follower append failed; sitting out of recruitment while its lease lasts"
+        );
+    } else {
+        tracing::debug!(
+            member = member.node,
+            generation = member.generation,
+            %error,
+            "follower append failed again; still sitting out"
+        );
+    }
     true
 }
 
@@ -5942,6 +5953,16 @@ impl NodeLogManager {
         // lapsed. Each selected member is checked on its own: another peer
         // recovering or a different read order does not matter, because the
         // pass publishes the members it selected.
+        // A pass that cannot publish skips the read: the current ensemble is
+        // active and the selection is no larger than it, which the guarded
+        // check below would end anyway.
+        let cannot_publish =
+            self.inner.lock().unwrap().as_ref().is_some_and(|current| {
+                current.is_active() && members.len() <= current.members.len()
+            });
+        if cannot_publish {
+            return Ok(());
+        }
         if !members.is_empty() {
             let fresh = self.ownership.read_capacity_peers().await?;
             let now = crate::ownership_store::now_ms();
@@ -6059,7 +6080,13 @@ impl NodeLogManager {
                 .collect::<Vec<_>>(),
             "log ensemble open; fleet acks enabled"
         );
-        self.health.lock().unwrap().reset();
+        {
+            let mut health = self.health.lock().unwrap();
+            health.reset();
+            for member in &members {
+                health.activate(&member.node, &member.generation);
+            }
+        }
         // An unset override selects the adaptive deadline; a set value is
         // the lab's fixed override, and 0 disables hedging entirely.
         let hedge = match crate::env_vars::optional::<u64>("CELLD_LOG_HEDGE_MS")

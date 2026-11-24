@@ -166,6 +166,10 @@ pub struct FollowerHealth {
     /// node, and a late failure of an old process never erases the sit-out of
     /// the current one.
     failed: BTreeMap<(NodeId, String), u64>,
+    /// The process generation of each member of the current ensemble, so a
+    /// late failure of an old process cannot clear the health of the
+    /// replacement lane that took its place.
+    active_generation: BTreeMap<NodeId, String>,
     last_swap_ms: Option<u64>,
 }
 
@@ -174,6 +178,12 @@ impl FollowerHealth {
     /// ledger — it is exactly the memory that stops flapping.
     pub fn reset(&mut self) {
         self.members.clear();
+    }
+
+    /// The ensemble that just opened recruited `member` as `generation`.
+    pub fn activate(&mut self, member: &str, generation: &str) {
+        self.active_generation
+            .insert(member.to_string(), generation.to_string());
     }
 
     /// An append POST went out to `member`.
@@ -331,14 +341,32 @@ impl FollowerHealth {
     /// until `until_ms` (wall clock). A later failure of the same process never
     /// shortens the sit-out. A timeout is not recorded here: a slow member is
     /// judged by the latency rule and stays recruitable.
-    pub fn append_failed(&mut self, member: &str, generation: &str, now_ms: u64, until_ms: u64) {
+    ///
+    /// Returns whether this process was newly sat out, so a caller can log the
+    /// sit-out once and its repeats quietly. The member's health is cleared
+    /// only when the failing process is the one the current ensemble
+    /// recruited (or none is recorded): the failure of an old process says
+    /// nothing about a replacement lane.
+    pub fn append_failed(
+        &mut self,
+        member: &str,
+        generation: &str,
+        now_ms: u64,
+        until_ms: u64,
+    ) -> bool {
         self.failed.retain(|_, until| *until > now_ms);
-        let entry = self
-            .failed
-            .entry((member.to_string(), generation.to_string()))
-            .or_insert(0);
+        let key = (member.to_string(), generation.to_string());
+        let newly = !self.failed.contains_key(&key);
+        let entry = self.failed.entry(key).or_insert(0);
         *entry = (*entry).max(until_ms);
-        self.members.remove(member);
+        if self
+            .active_generation
+            .get(member)
+            .is_none_or(|active| active == generation)
+        {
+            self.members.remove(member);
+        }
+        newly
     }
 
     /// Must a candidate that publishes `generation` sit out because that very
@@ -448,6 +476,22 @@ mod tests {
         assert!(health.failed_recently("b", "g1", 10_999));
         // And it is not a quarantine: the incapability ledger is untouched.
         assert!(!health.quarantined("b", 1_000));
+    }
+
+    #[test]
+    fn a_failure_of_an_old_process_leaves_the_replacement_lanes_health() {
+        let mut health = FollowerHealth::default();
+        health.activate("b", "new");
+        health.append_started("b", 1_000);
+        health.append_completed("b", 1_010, 10);
+        // The old process's lane fails late.
+        assert!(health.append_failed("b", "old", 1_020, 11_000));
+        assert!(health.members.contains_key("b"));
+        // The recruited process failing clears it.
+        assert!(health.append_failed("b", "new", 1_030, 11_000));
+        assert!(!health.members.contains_key("b"));
+        // A repeat of the same failure is not new.
+        assert!(!health.append_failed("b", "new", 1_040, 11_000));
     }
 
     #[test]
