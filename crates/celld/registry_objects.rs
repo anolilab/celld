@@ -41,6 +41,10 @@ pub(crate) fn key_of(cell: &str) -> reg::Key {
         .expect("16 bytes of a digest")
 }
 
+pub(crate) fn root_dir(prefix: &str) -> String {
+    format!("{prefix}{ROOT}")
+}
+
 pub(crate) fn root_key(prefix: &str) -> String {
     format!("{prefix}{ROOT}/root")
 }

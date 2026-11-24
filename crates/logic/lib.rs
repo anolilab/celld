@@ -32,6 +32,7 @@ pub mod queue;
 pub mod ratelimit;
 pub mod rebalance;
 pub mod registry;
+pub mod registry_gate;
 pub mod restore;
 pub mod routing;
 pub mod schedule;

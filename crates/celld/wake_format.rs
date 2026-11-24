@@ -12,6 +12,55 @@ struct FormatRecord {
     format: u8,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     migrating: bool,
+    /// The birth registry's seed has started in this fleet. A binary from
+    /// before the registry does not know the field, and this record refuses
+    /// unknown fields, so it cannot read the marker and does not start.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    registry: u8,
+}
+
+fn is_zero(value: &u8) -> bool {
+    *value == 0
+}
+
+/// Write the registry's format marker into the format record, once. It is a
+/// conditional write of the record that every starting node reads, so an older
+/// binary that restarts after it fails to decode the record and refuses to
+/// start. Returns `false` when the record is absent (the fleet is not
+/// initialised) and an error for any record this binary cannot read.
+pub(crate) async fn mark_registry(
+    store: &dyn object_store::ObjectStore,
+    prefix: &str,
+) -> anyhow::Result<bool> {
+    use object_store::{ObjectStoreExt as _, PutMode, PutOptions, PutPayload, UpdateVersion};
+    let path = object_store::path::Path::from(format!("{prefix}{KEY}"));
+    let read = match store.get(&path).await {
+        Ok(read) => read,
+        Err(object_store::Error::NotFound { .. }) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let version = UpdateVersion {
+        e_tag: read.meta.e_tag.clone(),
+        version: read.meta.version.clone(),
+    };
+    let mut record = decode(&read.bytes().await?)?;
+    if record.registry != 0 {
+        return Ok(true);
+    }
+    record.registry = 1;
+    match store
+        .put_opts(
+            &path,
+            PutPayload::from_bytes(serde_json::to_vec(&record)?.into()),
+            PutOptions::from(PutMode::Update(version)),
+        )
+        .await
+    {
+        Ok(_) => Ok(true),
+        // Another node wrote it first: whatever it wrote is read next time.
+        Err(error) if crate::bucket::is_clean_cas_rejection(&error) => Ok(true),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn decode(bytes: &[u8]) -> anyhow::Result<FormatRecord> {
@@ -96,6 +145,7 @@ async fn initialize(bucket: &Bucket) -> anyhow::Result<()> {
                     serde_json::to_vec(&FormatRecord {
                         format: 2,
                         migrating: true,
+                        registry: 0,
                     })?,
                     None,
                 )
@@ -149,6 +199,7 @@ async fn initialize(bucket: &Bucket) -> anyhow::Result<()> {
             serde_json::to_vec(&FormatRecord {
                 format: 2,
                 migrating: false,
+                registry: 0,
             })?,
             Some(&token),
         )

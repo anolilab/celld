@@ -26,6 +26,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt as _;
 
+/// How long the holder waits before it looks at a closed gate again.
+const SEED_RETRY_MS: u64 = 10_000;
 /// How long an object that no root names stays before the sweep deletes it,
 /// which is far longer than the 2 s a lookup lasts.
 pub(crate) const GRACE_MS: u64 = 300_000;
@@ -357,6 +359,9 @@ pub(crate) struct Prepared {
     pub stats: MergeStats,
     pub partitions: usize,
     pub ms: u64,
+    /// The gate number a seed was made for: the commit sets the root's seed
+    /// number to it.
+    pub seed_gate: Option<u64>,
 }
 
 fn level_run(level: &Level) -> Option<RunRef> {
@@ -384,6 +389,13 @@ async fn source_of(
     }
 }
 
+/// What a partition's level 1 is merged with.
+pub(crate) enum Fold {
+    Records(Vec<Record>),
+    /// Seed objects of the partition, read when its merge starts.
+    Seed(Vec<String>),
+}
+
 /// Prepare a spill: fold `deltas` into level 1 of every partition they touch.
 pub(crate) async fn prepare_spill(
     store: &Arc<dyn ObjectStore>,
@@ -394,34 +406,115 @@ pub(crate) async fn prepare_spill(
     next_run: &mut u64,
     partitions_at_a_time: usize,
 ) -> anyhow::Result<Prepared> {
-    let started = crate::asyncrt::mono_ms();
     let all: Vec<Record> = consumed
         .values()
         .flat_map(|delta| delta.records.iter().copied())
         .collect();
     let all = reg::sorted(all);
-    let mut groups: Vec<(usize, Vec<Record>)> = Vec::new();
+    let mut groups: Vec<(usize, Fold)> = Vec::new();
+    let mut last = None;
     for record in all {
         let index = map.partition_for(&record.key);
         match groups.last_mut() {
-            Some((last, records)) if *last == index => records.push(record),
-            _ => groups.push((index, vec![record])),
+            Some((_, Fold::Records(records))) if last == Some(index) => records.push(record),
+            _ => {
+                groups.push((index, Fold::Records(vec![record])));
+                last = Some(index);
+            }
         }
     }
+    let mut retire: Vec<String> = consumed
+        .keys()
+        .map(|id| objects::delta_key(prefix, *id))
+        .collect();
+    let mut prepared = prepare_fold(
+        store,
+        prefix,
+        epoch,
+        map,
+        groups,
+        consumed.keys().copied().collect(),
+        "spill",
+        next_run,
+        partitions_at_a_time,
+    )
+    .await?;
+    retire.append(&mut prepared.retire);
+    prepared.retire = retire;
+    Ok(prepared)
+}
+
+/// Prepare the seed: every partition's seed objects folded into its level 1.
+/// Consumes no delta, and the commit sets the root's seed number to `gate`.
+pub(crate) async fn prepare_seed(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+    epoch: u64,
+    map: &Map,
+    seed: &crate::registry_seed::SeedObjects,
+    gate: u64,
+    next_run: &mut u64,
+    partitions_at_a_time: usize,
+) -> anyhow::Result<Prepared> {
+    let groups: Vec<(usize, Fold)> = seed
+        .by_partition
+        .iter()
+        .map(|(index, keys)| (*index, Fold::Seed(keys.clone())))
+        .collect();
+    let mut prepared = prepare_fold(
+        store,
+        prefix,
+        epoch,
+        map,
+        groups,
+        std::collections::BTreeSet::new(),
+        "seed",
+        next_run,
+        partitions_at_a_time,
+    )
+    .await?;
+    let objects: Vec<String> = seed.by_partition.values().flatten().cloned().collect();
+    prepared.outputs.extend(objects.iter().cloned());
+    prepared.retire.extend(objects);
+    prepared.seed_gate = Some(gate);
+    Ok(prepared)
+}
+
+/// Fold each group into level 1 of its partition, one merge per partition, and
+/// list every partition of the map in the job, as a spill must.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_fold(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+    epoch: u64,
+    map: &Map,
+    groups: Vec<(usize, Fold)>,
+    consumed: std::collections::BTreeSet<DeltaId>,
+    kind: &'static str,
+    next_run: &mut u64,
+    partitions_at_a_time: usize,
+) -> anyhow::Result<Prepared> {
+    let started = crate::asyncrt::mono_ms();
     let work: Vec<_> = groups
         .into_iter()
-        .map(|(index, records)| {
+        .map(|(index, fold)| {
             *next_run += 1;
-            (index, records, *next_run)
+            (index, fold, *next_run)
         })
         .collect();
     let results: Vec<anyhow::Result<(usize, Level, RunRef, MergeStats)>> =
         futures_util::stream::iter(work)
-            .map(|(index, records, id)| {
+            .map(|(index, fold, id)| {
                 let store = store.clone();
                 let partition = map.partitions[index];
                 let hi = map.hi(index);
                 async move {
+                    let records = match fold {
+                        Fold::Records(records) => records,
+                        Fold::Seed(keys) => {
+                            crate::registry_seed::read_seed(store.as_ref(), &keys).await?
+                        }
+                    };
                     let (older, declared) =
                         source_of(&store, prefix, partition.lo, 1, &partition.l1).await?;
                     let total = declared + records.len() as u64;
@@ -508,19 +601,19 @@ pub(crate) async fn prepare_spill(
     }
     let touched = outputs.len();
     partitions.sort_by_key(|spilled| spilled.index);
-    retire.extend(consumed.keys().map(|id| objects::delta_key(prefix, *id)));
     Ok(Prepared {
         epoch,
-        kind: "spill",
+        kind,
         partitions: touched,
         job: Job::Spill {
-            consumed: consumed.keys().copied().collect(),
+            consumed,
             partitions,
         },
         outputs,
         retire,
         stats,
         ms: crate::asyncrt::mono_ms().saturating_sub(started),
+        seed_gate: None,
     })
 }
 
@@ -601,6 +694,7 @@ pub(crate) async fn base_merge_with(
         retire,
         stats,
         ms: crate::asyncrt::mono_ms().saturating_sub(started),
+        seed_gate: None,
     }))
 }
 
@@ -618,6 +712,9 @@ pub(crate) async fn commit_job(
     stray: &mut Option<String>,
 ) -> Result<(Root, Map), reg::Discard> {
     let (mut root, map) = reg::apply_job(root, map, &prepared.job)?;
+    if let Some(gate) = prepared.seed_gate {
+        root = celld_logic::registry_gate::seeded(&root, gate);
+    }
     // A map key is never reused: a write that landed but returned an error
     // would otherwise make every later commit find the key taken and discard.
     let number = *next_map;
@@ -696,6 +793,8 @@ struct Holding {
     last_spill_ms: Option<u64>,
     last_folded: u64,
     last_base_ms: u64,
+    /// When a seed was last started (`None` until one was).
+    last_seed_ms: Option<u64>,
     base_next: usize,
     /// Jobs that ended with nothing to do (an empty partition, no delta): the
     /// scheduling state moves past them at the next pass.
@@ -717,8 +816,10 @@ struct Holding {
 enum Reconciled {
     /// It is the root the failed write carried: the write landed.
     Landed(UpdateVersion),
-    /// It names this holder but is an older root.
-    Holds(UpdateVersion),
+    /// It names this holder but is another root: a node outside the writer rule
+    /// raised the gate number, or an earlier write of this holder landed. Carries
+    /// the version and the gate number it holds.
+    Holds(UpdateVersion, u64),
     /// It names someone else, or no one.
     Lost,
 }
@@ -940,6 +1041,7 @@ impl Registry {
             last_spill_ms: None,
             last_folded: 0,
             last_base_ms: now,
+            last_seed_ms: None,
             base_next: 0,
             advanced: Arc::default(),
             last_sweep_ms: now,
@@ -961,34 +1063,47 @@ impl Registry {
         let (streak, stuck) = reg::after_write(holding.root.streak, holding.root.stuck);
         holding.root.streak = streak;
         holding.root.stuck = stuck;
-        self.counters.put_requests.fetch_add(1, Ordering::Relaxed);
-        let attempt = objects::write_root_versioned(
-            self.store.as_ref(),
-            &self.prefix,
-            &holding.root,
-            Some(holding.version.clone()),
-        )
-        .await;
-        if let Ok(Some(version)) = attempt {
-            holding.version = version;
-            holding.last_root_ms = crate::asyncrt::mono_ms();
-            return Ok(true);
-        }
-        // An error may be a write that landed, and a refusal may be the retry
-        // of one: read the root before standing down from a role it still names.
-        match self.reconcile_root(&holding.root).await {
-            Some(Reconciled::Landed(version)) => {
+        // A node outside the writer rule raises the gate number with its own
+        // conditional write of the root, which makes this holder's next write
+        // fail. The gate number is the one field others write: adopt it and
+        // write again, so the holder never lowers it.
+        for attempt in 0..3 {
+            self.counters.put_requests.fetch_add(1, Ordering::Relaxed);
+            let attempted = objects::write_root_versioned(
+                self.store.as_ref(),
+                &self.prefix,
+                &holding.root,
+                Some(holding.version.clone()),
+            )
+            .await;
+            if let Ok(Some(version)) = attempted {
                 holding.version = version;
                 holding.last_root_ms = crate::asyncrt::mono_ms();
-                Ok(true)
+                return Ok(true);
             }
-            Some(Reconciled::Holds(version)) => {
-                holding.version = version;
-                anyhow::bail!("the root moved under this holder; the next pass writes again")
+            // An error may be a write that landed, and a refusal may be the
+            // retry of one or a raised gate: read the root before standing down
+            // from a role it still names.
+            match self.reconcile_root(&holding.root).await {
+                Some(Reconciled::Landed(version)) => {
+                    holding.version = version;
+                    holding.last_root_ms = crate::asyncrt::mono_ms();
+                    return Ok(true);
+                }
+                Some(Reconciled::Holds(version, gate)) => {
+                    holding.version = version;
+                    holding.root.gate = holding.root.gate.max(gate);
+                    if attempt == 2 {
+                        anyhow::bail!(
+                            "the root moved under this holder; the next pass writes again"
+                        );
+                    }
+                }
+                Some(Reconciled::Lost) => return Ok(false),
+                None => return attempted.map(|_| false),
             }
-            Some(Reconciled::Lost) => Ok(false),
-            None => attempt.map(|_| false),
         }
+        Ok(false)
     }
 
     /// Read the root after a write that failed or was refused, and say whether
@@ -999,7 +1114,7 @@ impl Registry {
         Some(if *root == *intended {
             Reconciled::Landed(version)
         } else if root.held_by(&self.session, intended.epoch) {
-            Reconciled::Holds(version)
+            Reconciled::Holds(version, root.gate)
         } else {
             Reconciled::Lost
         })
@@ -1408,6 +1523,17 @@ impl Registry {
                 _ => {}
             }
         }
+        // A closed gate needs a seed. It waits for nodes outside the writer rule
+        // to leave, so it is tried again every few seconds, and the other jobs go
+        // on meanwhile.
+        if !holding.root.gate_open()
+            && holding
+                .last_seed_ms
+                .is_none_or(|at| now.saturating_sub(at) >= SEED_RETRY_MS)
+        {
+            self.start_seed(holding, now);
+            return;
+        }
         let live: u64 = holding.counts.values().sum();
         let spill = reg::spill_due(
             holding.root.deltas.len(),
@@ -1523,6 +1649,102 @@ impl Registry {
             }
             running.fetch_sub(1, Ordering::SeqCst);
         });
+    }
+
+    /// Start the seed job: look at the leases, and if the gate may reopen write
+    /// the format marker, list the cells and prepare the merge that sets the
+    /// root's seed number. Nothing is prepared while a node outside the writer
+    /// rule is live.
+    fn start_seed(self: &Arc<Self>, holding: &mut Holding, now: u64) {
+        holding.last_seed_ms = Some(now);
+        let root = holding.root.clone();
+        let (epoch, map) = (holding.epoch, holding.map.clone());
+        let mut next_run = holding.next_run;
+        holding.next_run += 1_000_000;
+        let (running, prepared, abandon) = (
+            holding.running.clone(),
+            holding.prepared.clone(),
+            holding.abandon.clone(),
+        );
+        running.fetch_add(1, Ordering::SeqCst);
+        let registry = self.clone();
+        crate::asyncrt::spawn(async move {
+            match registry.seed_job(&root, epoch, &map, &mut next_run).await {
+                Ok(Some(job)) if !abandon.load(Ordering::SeqCst) => {
+                    prepared.lock().unwrap().push(job)
+                }
+                Ok(Some(job)) => {
+                    objects::delete_many(registry.store.as_ref(), &job.outputs).await;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "registry seed failed");
+                }
+            }
+            running.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+
+    async fn seed_job(
+        &self,
+        root: &Root,
+        epoch: u64,
+        map: &Map,
+        next_run: &mut u64,
+    ) -> anyhow::Result<Option<Prepared>> {
+        use celld_logic::registry_gate::{seed_decision, SeedDecision};
+        let leases = crate::registry_seed::live_leases(
+            self.store.as_ref(),
+            &self.prefix,
+            crate::ownership_store::now_ms(),
+        )
+        .await?;
+        match seed_decision(root, &leases) {
+            SeedDecision::NotNeeded => Ok(None),
+            SeedDecision::OlderBinaryLive => {
+                self.counters.seed_blocked.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    event = "registry_seed_blocked",
+                    "a live node lease has no `registry` field: a binary from before the \
+                     registry runs, so the format marker and the seed wait for it to leave"
+                );
+                Ok(None)
+            }
+            SeedDecision::WaitForNonW1 => {
+                self.counters.seed_waits.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            }
+            SeedDecision::Start => {
+                // The marker comes first: from here a binary from before the
+                // registry that restarts reads it and does not start.
+                crate::wake_format::mark_registry(self.store.as_ref(), &self.prefix).await?;
+                self.counters.seeds.fetch_add(1, Ordering::Relaxed);
+                let seed = self.write_seed(root.gate, map).await?;
+                tracing::info!(
+                    event = "registry_seed_listed",
+                    gate = root.gate,
+                    cells = seed.cells
+                );
+                let spill_partitions = if self.cfg.job_pacing {
+                    crate::registry_pace::PACED_SPILL_PARTITIONS
+                } else {
+                    SPILL_CONCURRENCY
+                };
+                Ok(Some(
+                    prepare_seed(
+                        &self.job_store,
+                        &self.prefix,
+                        epoch,
+                        map,
+                        &seed,
+                        root.gate,
+                        next_run,
+                        spill_partitions,
+                    )
+                    .await?,
+                ))
+            }
+        }
     }
 
     /// Delete what is due, sweep and sample, in a task of its own: none of it

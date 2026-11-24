@@ -269,6 +269,12 @@ pub(crate) struct Counters {
     pub prefetch_skipped: AtomicU64,
     /// Deltas fetched because of a push; `delta_loads` counts the others.
     pub prefetch_loads: AtomicU64,
+    /// Seeds started, the cells they listed, and the ones that waited for a node
+    /// outside the writer rule or stopped for a binary without the lease field.
+    pub seeds: AtomicU64,
+    pub seed_cells: AtomicU64,
+    pub seed_waits: AtomicU64,
+    pub seed_blocked: AtomicU64,
 }
 
 /// A cell this process queued at a claim, until its coverage is observed.
@@ -350,6 +356,11 @@ static GLOBAL: OnceLock<Arc<Registry>> = OnceLock::new();
 /// The registry this process runs, for the peer routes.
 pub fn global() -> Option<Arc<Registry>> {
     GLOBAL.get().cloned()
+}
+
+/// Whether this process follows the writer rule: it runs a registry.
+pub fn is_w1() -> bool {
+    GLOBAL.get().is_some()
 }
 
 impl Registry {
@@ -957,6 +968,10 @@ impl Registry {
             ("pushes_received", &counters.pushes_received),
             ("prefetch_skipped", &counters.prefetch_skipped),
             ("prefetch_loads", &counters.prefetch_loads),
+            ("seeds", &counters.seeds),
+            ("seed_cells", &counters.seed_cells),
+            ("seed_waits", &counters.seed_waits),
+            ("seed_blocked", &counters.seed_blocked),
         ]
         .into_iter()
         .map(|(name, value)| (name.to_owned(), load(value).into()))

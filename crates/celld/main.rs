@@ -2824,6 +2824,42 @@ async fn internal_registry_root(request: Request<Incoming>, app: AppHandle) -> H
     peer_response(response(StatusCode::OK, "{\"ok\":true}"))
 }
 
+/// A node outside the birth registry's writer rule (the flag is off, or it has
+/// bucket durability) raises the registry's gate number before it serves, once
+/// its own lease says it is outside the rule: a seed that started before the
+/// lease cannot then open the gate over this node's writes. With no root it
+/// writes nothing. A node that finds shared packs refuses to start.
+async fn close_registry_gate(ownership: &Arc<celld::ownership_store::BucketOwnership>, node: &str) {
+    if celld::registry::is_w1() {
+        return;
+    }
+    let bucket = ownership.bucket_client();
+    for _ in 0..300 {
+        let live = match ownership.read_capacity_peers().await {
+            Ok(peers) => peers.iter().any(|peer| {
+                peer.node == node && peer.expires_ms > celld::ownership_store::now_ms()
+            }),
+            Err(_) => false,
+        };
+        if live {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    match celld::registry_seed::close_gate(bucket.store.as_ref(), &bucket.prefix).await {
+        Ok(Some(gate)) => tracing::info!(
+            event = "registry_gate_closed",
+            gate,
+            "this node is outside the birth registry's writer rule: the gate is closed"
+        ),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("celld: {error:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn internal_probe(request: Request<Incoming>, app: AppHandle) -> HttpReply {
     let (parts, body) = request.into_parts();
     // The probe skips the operator-token gate, so an unsigned caller reaches
@@ -4771,6 +4807,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             let gate_flag = app.fleet_ready.clone();
             let max_restoring = max_activations as u64;
             tokio::spawn(async move {
+                close_registry_gate(&ownership, &gate_node).await;
                 let started = std::time::Instant::now();
                 let mut deadline_reported = false;
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -4834,6 +4871,13 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         );
                     }
                 }
+            });
+        }
+        (Some(ownership), _) if !celld::registry::is_w1() => {
+            let (ownership, node, ready) = (ownership.clone(), node.clone(), app.fleet_ready.clone());
+            tokio::spawn(async move {
+                close_registry_gate(&ownership, &node).await;
+                ready.store(true, std::sync::atomic::Ordering::SeqCst);
             });
         }
         _ => app
