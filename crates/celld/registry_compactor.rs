@@ -1746,22 +1746,31 @@ impl Registry {
         self.strand_in_background(holding, keys);
     }
 
-    /// Delete `keys` in a task of its own; those whose delete is not confirmed go
-    /// to the retired list's intake, so they are deleted after the grace.
+    /// Delete `keys` in a task of its own. Every key is in `stranded` before the
+    /// delete starts and leaves it only once its delete is confirmed, so a delete
+    /// that stalls, or a holder that stops, leaves them for the sweep and the retired
+    /// list. The delete is bounded.
     fn strand_in_background(self: &Arc<Self>, holding: &Holding, keys: Vec<String>) {
         if keys.is_empty() {
             return;
         }
+        holding
+            .stranded
+            .lock()
+            .unwrap()
+            .extend(keys.iter().cloned());
         let (registry, stranded) = (self.clone(), holding.stranded.clone());
         crate::asyncrt::spawn(async move {
-            let gone: HashSet<String> = objects::delete_many(registry.store.as_ref(), &keys)
-                .await
-                .into_iter()
-                .collect();
-            stranded
-                .lock()
-                .unwrap()
-                .extend(keys.into_iter().filter(|key| !gone.contains(key)));
+            let deleted = crate::asyncrt::timeout(
+                Duration::from_millis(registry.cfg.background_delete_ms),
+                objects::delete_many(registry.store.as_ref(), &keys),
+            )
+            .await;
+            let Ok(gone) = deleted else {
+                return;
+            };
+            let gone: HashSet<String> = gone.into_iter().collect();
+            stranded.lock().unwrap().retain(|key| !gone.contains(key));
         });
     }
 
