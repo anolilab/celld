@@ -4700,13 +4700,19 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     if let Err(error) = recovered.as_ref() {
                         eprintln!("celld predecessor recovery attempt {attempt} failed: {error:#}");
                     }
-                    // A refused-because-live predecessor lease is waited
-                    // out to its expiry; any other failure backs off a full
-                    // TTL times the attempt.
-                    let backoff = match manager.predecessor_lease_remaining().await {
-                        Some(remaining) => (remaining + std::time::Duration::from_millis(250))
-                            .min(ttl_backoff.saturating_mul(attempt)),
-                        None => ttl_backoff.saturating_mul(attempt),
+                    // A refusal because the predecessor's lease is live waits
+                    // out what is left of that lease; any other failure backs
+                    // off a full TTL times the attempt.
+                    let full = ttl_backoff.saturating_mul(attempt);
+                    let backoff = match recovered
+                        .as_ref()
+                        .err()
+                        .and_then(|error| error.downcast_ref::<celld::node_log::LeaseLive>())
+                    {
+                        Some(live) => (std::time::Duration::from_millis(live.remaining_ms)
+                            + std::time::Duration::from_millis(250))
+                        .min(full),
+                        None => full,
                     };
                     tokio::time::sleep(backoff).await;
                 }

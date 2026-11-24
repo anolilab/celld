@@ -500,11 +500,6 @@ fn mono_us() -> u64 {
     crate::asyncrt::mono_us()
 }
 
-/// How long a follower whose append failed in transport sits out recruitment
-/// while its lease still belongs to the process that failed: one default lease
-/// lifetime, the longest a stopped peer can still look live.
-const FAILED_APPEND_BACKOFF_MS: u64 = 10_000;
-
 /// The eviction policy, defaults per the design doc, every constant an E8
 /// target the lab can override.
 pub fn eviction_policy_from_env() -> anyhow::Result<celld_logic::log_evict::EvictionPolicy> {
@@ -2578,6 +2573,26 @@ impl std::fmt::Display for PeerHttpError {
 
 impl std::error::Error for PeerHttpError {}
 
+/// Recovery refused to fence a session whose lease is still live. A caller
+/// that retries may wait exactly `remaining_ms`.
+#[derive(Debug)]
+pub struct LeaseLive {
+    pub dead: String,
+    pub remaining_ms: u64,
+}
+
+impl std::fmt::Display for LeaseLive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to fence {}: its lease is live again (expires in {}ms)",
+            self.dead, self.remaining_ms
+        )
+    }
+}
+
+impl std::error::Error for LeaseLive {}
+
 // ── The leader side ─────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -2585,6 +2600,12 @@ impl std::error::Error for PeerHttpError {}
 pub struct Member {
     pub node: String,
     pub addr: String,
+    /// The process generation whose lease named this member when it was
+    /// recruited. A failure of this lane is a failure of that process only.
+    pub generation: String,
+    /// That lease's expiry, wall clock, and the lease lifetime.
+    pub lease_expires_ms: u64,
+    pub lease_ttl_ms: u64,
 }
 
 /// One round's work for one member lane: the shared request and the slot
@@ -2972,10 +2993,21 @@ fn resolve_append(
             None
         }
         AppendSend::Failed(_) => {
-            health
-                .lock()
-                .unwrap()
-                .append_failed(&member.node, FAILED_APPEND_BACKOFF_MS, done);
+            // The process that failed sits out until its lease lapses, or one
+            // lease lifetime from now if that is later (a lease it renews).
+            let now = crate::ownership_store::now_ms();
+            warn!(
+                member = member.node,
+                generation = member.generation,
+                "follower append failed; sitting out of recruitment while its lease lasts"
+            );
+            health.lock().unwrap().append_failed(
+                &member.node,
+                &member.generation,
+                member
+                    .lease_expires_ms
+                    .max(now.saturating_add(member.lease_ttl_ms)),
+            );
             None
         }
         AppendSend::Answered(_) => None,
@@ -3994,8 +4026,6 @@ pub struct NodeLogManager {
     /// it did. A single node then paid the bucket for every write with no
     /// line anywhere saying why, or that a second node changes it.
     shortfall_logged_ms: Arc<std::sync::atomic::AtomicU64>,
-    /// The process generation each peer had when it was last recruited.
-    recruited_generation: Arc<Mutex<BTreeMap<String, String>>>,
     /// The shutdown latch: once set, the bundle sink refuses new flushes
     /// so the graceful seal's uncovered-scan cannot go stale between the
     /// LIST and the seal CAS.
@@ -4424,7 +4454,6 @@ impl NodeLogManager {
             policy: Arc::new(policy),
             suspect_self: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shortfall_logged_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            recruited_generation: Arc::new(Mutex::new(BTreeMap::new())),
             closing: std::sync::atomic::AtomicBool::new(false),
             flush_in_flight: std::sync::atomic::AtomicBool::new(false),
             predecessors_clean: std::sync::atomic::AtomicBool::new(false),
@@ -4881,11 +4910,13 @@ impl NodeLogManager {
             // AT the step. A live lease is an error, not a skip: the
             // caller's claim must refuse and re-resolve to routing.
             let now = crate::ownership_store::now_ms();
-            anyhow::ensure!(
-                wire.expires_ms <= now,
-                "refusing to fence {dead}: its lease is live again (expires in {}ms)",
-                wire.expires_ms.saturating_sub(now)
-            );
+            if wire.expires_ms > now {
+                return Err(LeaseLive {
+                    dead: dead.to_string(),
+                    remaining_ms: wire.expires_ms - now,
+                }
+                .into());
+            }
             // No justification pin: the record is keyed by session, so a
             // revived process writes a NEW key and can never step this one.
             // The only concurrent writer is a rival recoverer, and every
@@ -5532,20 +5563,6 @@ impl NodeLogManager {
         self.ensure_predecessors_recovered().await
     }
 
-    /// How long until the lease this node's predecessor published lapses, or
-    /// `None` when it is absent, lapsed, or unreadable. A boot whose recovery
-    /// refused to fence a live predecessor lease waits exactly this long
-    /// instead of a flat backoff: the lease is the only thing it is waiting
-    /// for, and a flat term after a refusal that had 4 s left cost a whole
-    /// extra TTL of the restart.
-    pub async fn predecessor_lease_remaining(&self) -> Option<std::time::Duration> {
-        let lease = self.ownership.read_node_lease(&self.node).await.ok()??;
-        let remaining = lease
-            .expires_ms
-            .checked_sub(crate::ownership_store::now_ms())?;
-        (remaining > 0).then(|| std::time::Duration::from_millis(remaining))
-    }
-
     /// Is the fleet tier serving acknowledgements?
     ///
     /// One follower is the floor, not two. Recruitment still takes two, so a
@@ -5667,8 +5684,8 @@ impl NodeLogManager {
             .iter()
             .filter(|peer| peer.node != self.node && peer.expires_ms > now)
             .count();
-        let recruited = self.recruited_generation.lock().unwrap().clone();
-        let candidates: Vec<(Member, String)> = peers
+        let lease_ttl_ms = self.ownership.lease_ttl_ms();
+        let members: Vec<Member> = peers
             .into_iter()
             .filter(|peer| peer.node != self.node && peer.expires_ms > now)
             // A peer that is draining is giving its work away and stops
@@ -5679,12 +5696,11 @@ impl NodeLogManager {
             // when the backoff has passed.
             .filter(|peer| !peer.draining)
             .filter(|peer| {
-                !(self
+                !self
                     .health
                     .lock()
                     .unwrap()
-                    .failed_recently(&peer.node, mono)
-                    && recruited.get(&peer.node) == Some(&peer.generation))
+                    .failed_recently(&peer.node, &peer.generation, now)
             })
             // Only a follower that cannot serve appends at all sits out a
             // term. A gray one is recruitable again at once, because the
@@ -5694,22 +5710,14 @@ impl NodeLogManager {
             // Replication factor and the in-sync floor are separate numbers:
             // recruit to the target, serve on one.
             .take(RECRUIT_FOLLOWERS)
-            .map(|peer| {
-                (
-                    Member {
-                        node: peer.node,
-                        addr: peer.addr,
-                    },
-                    peer.generation,
-                )
+            .map(|peer| Member {
+                node: peer.node,
+                addr: peer.addr,
+                generation: peer.generation,
+                lease_expires_ms: peer.expires_ms,
+                lease_ttl_ms,
             })
             .collect();
-        self.recruited_generation.lock().unwrap().extend(
-            candidates
-                .iter()
-                .map(|(member, generation)| (member.node.clone(), generation.clone())),
-        );
-        let members: Vec<Member> = candidates.into_iter().map(|(member, _)| member).collect();
         // Peer discovery is intentionally outside the transition guard.
         // Recheck the lifecycle after that await, then keep the snapshot,
         // publication, and successor installation in one critical section.
@@ -5795,6 +5803,10 @@ impl NodeLogManager {
         info!(
             epoch = record.epoch,
             members = ?record.ensemble,
+            generations = ?members
+                .iter()
+                .map(|member| (member.node.as_str(), member.generation.as_str()))
+                .collect::<Vec<_>>(),
             "log ensemble open; fleet acks enabled"
         );
         self.health.lock().unwrap().reset();

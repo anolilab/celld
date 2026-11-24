@@ -57,6 +57,7 @@ impl Node {
             .args(["--advertise", &format!("127.0.0.1:{internal}")])
             .env("CELLD_NODE", format!("nodelog-{index}"))
             .env("CELLD_WATCH", home.join("state"))
+            .env("CELLD_DURABILITY", "fleet")
             .env("CELLD_OPERATOR_TOKEN", TOKEN)
             .env("CELLD_CONFIG_DIR", home.join("config"))
             .current_dir(&home)
@@ -128,6 +129,68 @@ fn free_port() -> u16 {
         .local_addr()
         .expect("read the local address")
         .port()
+}
+
+/// The seconds into the day of a log line, from its RFC 3339 prefix.
+fn seconds_of(line: &str) -> Option<f64> {
+    let time = line.split('T').nth(1)?;
+    let mut parts = time.split([':', 'Z', ' ']);
+    let hours: f64 = parts.next()?.parse().ok()?;
+    let minutes: f64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
+/// The text between `key"` and the next `"` on `line`, for `key="value"`.
+fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let rest = line.split(&format!("{key}=\"")).nth(1)?;
+    rest.split('"').next()
+}
+
+/// The ensembles that opened with a member whose very process had failed an
+/// append a moment before: `(node, generation, seconds since the failure)`.
+/// A failed process sits out until its lease lapses, which is longer than
+/// `WITHIN_S`; a successor process has a new generation and may be recruited
+/// at once.
+fn recruited_after_failing(log: &str) -> Vec<(String, String, f64)> {
+    const WITHIN_S: f64 = 9.0;
+    let mut failed: std::collections::BTreeMap<String, (String, f64)> = Default::default();
+    let mut recruited = Vec::new();
+    for line in log.lines() {
+        let Some(at) = seconds_of(line) else {
+            continue;
+        };
+        if line.contains("follower append failed") {
+            if let (Some(node), Some(generation)) =
+                (field(line, "member"), field(line, "generation"))
+            {
+                failed.insert(node.to_string(), (generation.to_string(), at));
+            }
+        } else if line.contains("log ensemble open") {
+            let Some(listed) = line.split("generations=[").nth(1) else {
+                continue;
+            };
+            let quoted: Vec<&str> = listed
+                .split(']')
+                .next()
+                .unwrap_or_default()
+                .split('"')
+                .skip(1)
+                .step_by(2)
+                .collect();
+            for pair in quoted.chunks(2) {
+                let [node, generation] = pair else {
+                    continue;
+                };
+                if let Some((held, since)) = failed.get(*node) {
+                    if held == generation && at - since < WITHIN_S {
+                        recruited.push((node.to_string(), generation.to_string(), at - since));
+                    }
+                }
+            }
+        }
+    }
+    recruited
 }
 
 /// Lines of `log` that contain `needle`.
@@ -279,10 +342,17 @@ async fn a_rolling_restart_does_not_recruit_the_restarting_peer() {
             success >= 99.9,
             "new cells succeed at least 99.9% of the time"
         );
-        for (index, degraded) in degrades.iter().enumerate() {
+        // Fleet durability was on: every node opened ensembles.
+        for (index, opened) in reopened.iter().enumerate() {
+            assert!(*opened >= 1, "node {index} never opened a log ensemble");
+        }
+        // The defect: a peer that had just failed an append was recruited
+        // again at once, because its lease was still live.
+        for (index, node) in nodes.iter().enumerate() {
+            let again = recruited_after_failing(&node.log());
             assert!(
-                *degraded <= MAX_DEGRADES,
-                "node {index} degraded its ensemble {degraded} times in one rolling restart"
+                again.is_empty(),
+                "node {index} recruited a peer again within its lease: {again:?}"
             );
         }
         for (index, restart) in restarts.iter().enumerate() {
@@ -311,7 +381,3 @@ async fn a_rolling_restart_does_not_recruit_the_restarting_peer() {
         std::panic::resume_unwind(panic);
     }
 }
-
-/// The floor is three: the node's own drain and one for each of its peers that
-/// restarts. A peer that is recruited again at once costs several more.
-const MAX_DEGRADES: usize = 4;

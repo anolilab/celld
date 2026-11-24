@@ -160,9 +160,10 @@ impl MemberHealth {
 pub struct FollowerHealth {
     members: BTreeMap<NodeId, MemberHealth>,
     quarantined_until: BTreeMap<NodeId, u64>,
-    /// Followers whose append failed in transport, and until when. Unlike the
-    /// quarantine, a recruiter lifts it for a peer that is a new process.
-    failed_until: BTreeMap<NodeId, u64>,
+    /// Followers whose append failed in transport: the process generation
+    /// that failed and the wall-clock time until which it sits out. Unlike the
+    /// quarantine, it never holds back a different process of the same node.
+    failed: BTreeMap<NodeId, (String, u64)>,
     last_swap_ms: Option<u64>,
 }
 
@@ -323,20 +324,26 @@ impl FollowerHealth {
     /// 5xx). A peer that is restarting keeps its node lease live until the
     /// lease lapses or its successor replaces it, so the next rebuild must not
     /// recruit it again at once: that ensemble fails its first append and
-    /// degrades. Recruitment skips the member until `backoff_ms` has passed or
-    /// it is a different process (see `failed_recently`).
-    pub fn append_failed(&mut self, member: &str, backoff_ms: u64, now_ms: u64) {
-        let until = now_ms.saturating_add(backoff_ms);
-        let entry = self.failed_until.entry(member.to_string()).or_insert(0);
-        *entry = (*entry).max(until);
+    /// degrades. `generation` is the process generation of the lane that
+    /// failed, and the member sits out until `until_ms` (wall clock) for that
+    /// generation only; a later failure of the same generation never shortens
+    /// the sit-out, and a failure of another one replaces it.
+    pub fn append_failed(&mut self, member: &str, generation: &str, until_ms: u64) {
+        let until_ms = match self.failed.get(member) {
+            Some((held, held_until)) if held == generation => until_ms.max(*held_until),
+            _ => until_ms,
+        };
+        self.failed
+            .insert(member.to_string(), (generation.to_string(), until_ms));
         self.members.remove(member);
     }
 
-    /// Did this candidate's append fail within the backoff?
-    pub fn failed_recently(&self, candidate: &str, now_ms: u64) -> bool {
-        self.failed_until
+    /// Must a candidate that publishes `generation` sit out because that very
+    /// process failed an append and its sit-out has not passed?
+    pub fn failed_recently(&self, candidate: &str, generation: &str, now_ms: u64) -> bool {
+        self.failed
             .get(candidate)
-            .is_some_and(|until| *until > now_ms)
+            .is_some_and(|(held, until)| held == generation && *until > now_ms)
     }
 
     /// May an eviction-driven swap happen now? A failed follower (a hard
@@ -424,16 +431,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_failed_append_sits_out_for_the_backoff_only() {
+    fn a_failed_append_sits_out_that_process_until_its_lease_lapses() {
         let mut health = FollowerHealth::default();
-        assert!(!health.failed_recently("b", 1_000));
-        health.append_failed("b", 10_000, 1_000);
-        assert!(health.failed_recently("b", 10_999));
-        assert!(!health.failed_recently("b", 11_000));
-        assert!(!health.failed_recently("c", 1_000));
-        // A shorter failure never shortens a sit-out already running.
-        health.append_failed("b", 100, 2_000);
-        assert!(health.failed_recently("b", 10_999));
+        assert!(!health.failed_recently("b", "g1", 1_000));
+        health.append_failed("b", "g1", 11_000);
+        assert!(health.failed_recently("b", "g1", 10_999));
+        assert!(!health.failed_recently("b", "g1", 11_000));
+        // A successor process of the same node is eligible at once.
+        assert!(!health.failed_recently("b", "g2", 1_000));
+        assert!(!health.failed_recently("c", "g1", 1_000));
+        // A later failure of the same process never shortens the sit-out.
+        health.append_failed("b", "g1", 2_000);
+        assert!(health.failed_recently("b", "g1", 10_999));
+        // A failure of another process replaces it; the first is forgotten.
+        health.append_failed("b", "g2", 5_000);
+        assert!(health.failed_recently("b", "g2", 4_999));
+        assert!(!health.failed_recently("b", "g1", 4_999));
         // And it is not a quarantine: the incapability ledger is untouched.
         assert!(!health.quarantined("b", 1_000));
     }
