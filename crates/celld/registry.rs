@@ -99,34 +99,49 @@ impl Config {
         Duration::from_millis((durability_ms / 2).saturating_sub(1_000).min(4_000))
     }
 
-    pub(crate) fn from_env(durability_ms: u64) -> anyhow::Result<Self> {
-        let partitions = crate::env_vars::with_default("CELLD_REGISTRY_PARTITIONS", 1024)? as u32;
-        let pass_ms = crate::env_vars::with_default("CELLD_REGISTRY_PASS_MS", 5_000)? as u64;
-        let batch_ms = crate::env_vars::with_default("CELLD_REGISTRY_BATCH_MS", 10_000)? as u64;
-        let spill_ms = crate::env_vars::with_default("CELLD_REGISTRY_SPILL_MS", 900_000)? as u64;
-        let base_days = crate::env_vars::with_default("CELLD_REGISTRY_BASE_DAYS", 3)? as u64;
-        let wait = crate::env_vars::flag("CELLD_REGISTRY_WAIT", true)?;
-        let job_pacing = crate::env_vars::flag("CELLD_REGISTRY_JOB_PACING", true)?;
-        let pass_read_ms =
-            crate::env_vars::with_default("CELLD_REGISTRY_PASS_READ_MS", 1_000)? as u64;
-        let bound = Self::bound_for(durability_ms);
+    /// The wait bound once another first-write wait is already on the same
+    /// path (`extra`, the cell directory's), or an error when the two together
+    /// would reach half the durability budget.
+    pub(crate) fn bound_with(durability_ms: u64, extra: Duration) -> anyhow::Result<Duration> {
+        let bound = Self::bound_for(durability_ms).saturating_sub(extra);
         anyhow::ensure!(
-            partitions >= 1 && pass_ms >= 1 && batch_ms >= 1,
-            "the registry's partitions, pass and batch windows must be positive"
-        );
-        anyhow::ensure!(
-            bound.as_millis() as u64 * 2 < durability_ms,
-            "the registry's wait of {} ms must stay below half of CELLD_LTX_DURABILITY_TIMEOUT_SECS \
-             ({durability_ms} ms): a first write waits for coverage and then needs the rest of the \
+            (bound + extra).as_millis() as u64 * 2 < durability_ms,
+            "the registry's wait of {} ms and the cell directory's first-write wait of {} ms \
+             must together stay below half of CELLD_LTX_DURABILITY_TIMEOUT_SECS \
+             ({durability_ms} ms): a first write waits for both and then needs the rest of the \
              budget for its own upload",
-            bound.as_millis()
+            bound.as_millis(),
+            extra.as_millis()
         );
+        Ok(bound)
+    }
+
+    /// `extra_wait` is the first-write wait of the cell directory when it runs
+    /// beside the registry, which the registry's own bound shrinks by.
+    pub(crate) fn from_env(durability_ms: u64, extra_wait: Duration) -> anyhow::Result<Self> {
+        use crate::env_vars::{flag, with_default};
+        let partitions: u32 = with_default("CELLD_REGISTRY_PARTITIONS", 1024)?;
+        let pass_ms: u64 = with_default("CELLD_REGISTRY_PASS_MS", 5_000)?;
+        let batch_ms: u64 = with_default("CELLD_REGISTRY_BATCH_MS", 10_000)?;
+        let spill_ms: u64 = with_default("CELLD_REGISTRY_SPILL_MS", 900_000)?;
+        let base_days: u64 = with_default("CELLD_REGISTRY_BASE_DAYS", 3)?;
+        let wait = flag("CELLD_REGISTRY_WAIT", true)?;
+        let job_pacing = flag("CELLD_REGISTRY_JOB_PACING", true)?;
+        let pass_read_ms: u64 = with_default("CELLD_REGISTRY_PASS_READ_MS", 1_000)?;
+        let bound = Self::bound_with(durability_ms, extra_wait)?;
+        anyhow::ensure!(
+            partitions >= 1 && pass_ms >= 1 && batch_ms >= 1 && spill_ms >= 1 && base_days >= 1,
+            "the registry's partitions, pass, batch and spill windows and base days must be positive"
+        );
+        let base_ms = base_days
+            .checked_mul(86_400_000)
+            .ok_or_else(|| anyhow::anyhow!("CELLD_REGISTRY_BASE_DAYS={base_days} is too large"))?;
         Ok(Self {
             partitions,
             pass_ms,
             batch_ms,
             spill_ms,
-            base_ms: base_days * 86_400_000,
+            base_ms,
             wait,
             bound,
             enforce: false,

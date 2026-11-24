@@ -2316,3 +2316,86 @@ async fn a_cell_the_full_table_does_not_track_is_found_by_a_lookup_during_the_wa
     covered.unwrap();
     assert_eq!(writer.counters.bound_hits.load(Ordering::Relaxed), 0);
 }
+
+#[tokio::test]
+async fn segments_behind_stalled_reads_get_their_turn_in_a_later_pass() {
+    let (scripted, plain) = scripted();
+    let writer = registry_on(&plain, "node-a");
+    for index in 0..FETCH_CONCURRENCY + 2 {
+        writer.register_at_claim(&cell(index as u32), 1);
+        writer.flush_now().await.unwrap();
+    }
+    let other = registry_on(&plain, "node-b");
+    other.register_at_claim(&cell(900), 1);
+    other.flush_now().await.unwrap();
+    // Every read of node-a's segments stalls, and they list before node-b's.
+    scripted.hold("/seg/node-a/");
+    let view: Arc<dyn ObjectStore> = scripted.clone();
+    let holder = registry_with(
+        &view,
+        "node-h",
+        Config {
+            pass_read: Duration::from_millis(150),
+            ..config()
+        },
+    );
+    let mut holding = holder_of(&holder).await;
+    assert!(holder.pass(&mut holding).await.unwrap());
+    assert!(
+        holding.root.deltas.is_empty(),
+        "the stalled reads folded nothing"
+    );
+    assert!(holding.deferred);
+    assert!(holder.pass(&mut holding).await.unwrap());
+    assert_eq!(
+        holding.root.deltas.len(),
+        1,
+        "the segment behind the stalled ones was read in the second pass"
+    );
+    let folded = holding.root.deltas.iter().next().copied().unwrap();
+    let (delta, _) = objects::read_delta(plain.as_ref(), PREFIX, folded)
+        .await
+        .unwrap();
+    assert!(delta
+        .segments
+        .iter()
+        .all(|key| key.contains("/seg/node-b/")));
+    // The stalled ones stay eligible: once the store answers they fold.
+    scripted.release("/seg/node-a/");
+    for _ in 0..4 {
+        holder.pass(&mut holding).await.unwrap();
+    }
+    let all: usize = {
+        let mut total = 0;
+        for id in holding.root.deltas.iter() {
+            total += objects::read_delta(plain.as_ref(), PREFIX, *id)
+                .await
+                .unwrap()
+                .0
+                .segments
+                .len();
+        }
+        total
+    };
+    assert_eq!(
+        all,
+        FETCH_CONCURRENCY + 3,
+        "every segment folded in the end"
+    );
+}
+
+#[test]
+fn the_registry_bound_shrinks_by_the_directory_wait_and_the_sum_stays_under_half() {
+    let wait = |d: u64, extra_ms: u64| Config::bound_with(d, Duration::from_millis(extra_ms));
+    assert_eq!(wait(10_000, 0).unwrap(), Duration::from_secs(4));
+    assert_eq!(wait(10_000, 1_000).unwrap(), Duration::from_secs(3));
+    assert_eq!(wait(10_000, 3_000).unwrap(), Duration::from_secs(1));
+    assert_eq!(wait(10_000, 4_500).unwrap(), Duration::ZERO);
+    assert!(
+        wait(10_000, 5_000).is_err(),
+        "the directory alone reaches half"
+    );
+    assert!(wait(10_000, 6_000).is_err());
+    assert_eq!(wait(5_000, 1_000).unwrap(), Duration::from_millis(500));
+    assert!(wait(5_000, 2_500).is_err());
+}

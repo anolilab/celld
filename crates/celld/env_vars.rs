@@ -364,16 +364,17 @@ pub fn validate() -> anyhow::Result<()> {
             for name in ["CELLD_REGISTRY_JOB_PACING", "CELLD_REGISTRY_WAIT"] {
                 flag(name, false)?;
             }
+            positive::<u32>("CELLD_REGISTRY_PARTITIONS")?;
             for name in [
                 "CELLD_REGISTRY_BASE_DAYS",
                 "CELLD_REGISTRY_BATCH_MS",
-                "CELLD_REGISTRY_PARTITIONS",
                 "CELLD_REGISTRY_PASS_MS",
-                "CELLD_REGISTRY_PASS_READ_MS",
                 "CELLD_REGISTRY_SPILL_MS",
             ] {
-                optional::<u64>(name)?;
+                positive::<u64>(name)?;
             }
+            // Zero means no limit.
+            optional::<u64>("CELLD_REGISTRY_PASS_READ_MS")?;
         }
     }
 

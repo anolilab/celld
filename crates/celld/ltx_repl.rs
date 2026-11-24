@@ -1374,13 +1374,21 @@ impl LtxRepl {
         };
         let (store, registry) = match birth_registry_mode()? {
             Some(()) => {
-                if directory.is_some() {
+                // Beside the cell directory a first write can wait for both; the
+                // registry's bound shrinks by the directory's wait.
+                let directory_wait = if directory.is_some() {
                     tracing::warn!(
                         "CELLD_BIRTH_REGISTRY=shadow with CELLD_CELL_DIRECTORY_SHADOW=1: \
                          a first write can wait for both"
                     );
-                }
-                let config = crate::registry::Config::from_env(durability_timeout_ms)?;
+                    crate::cell_directory::first_write_wait(Duration::from_millis(
+                        crate::env_vars::with_default::<u64>("CELLD_CELL_DIRECTORY_BATCH_MS", 0)?,
+                    ))
+                } else {
+                    Duration::ZERO
+                };
+                let config =
+                    crate::registry::Config::from_env(durability_timeout_ms, directory_wait)?;
                 crate::registry_writer::check_bound(config.bound, durability_timeout_ms)?;
                 let registry = crate::registry::Registry::new(
                     store.clone(),

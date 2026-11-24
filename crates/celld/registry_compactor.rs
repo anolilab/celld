@@ -638,6 +638,10 @@ struct Holding {
     next_map: u64,
     next_run: u64,
     seen: HashSet<String>,
+    /// Segments whose read was under way when a pass ran out of time, and how
+    /// often: they go to the back of the next listing, so the ones behind them
+    /// get fetch slots, and stay eligible.
+    stalled: HashMap<String, u32>,
     /// Folded segments whose delete is confirmed, to leave `seen`.
     deleted: Arc<Mutex<Vec<String>>>,
     /// Retired objects whose delete is confirmed, to leave `retired`.
@@ -878,6 +882,7 @@ impl Registry {
             next_map: 0,
             next_run: 0,
             seen: HashSet::new(),
+            stalled: HashMap::new(),
             deleted: Arc::default(),
             retired_gone: Arc::default(),
             retire_next: Vec::new(),
@@ -1156,24 +1161,31 @@ impl Registry {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
+        // Segments that stalled before go last, the least stalled first.
+        keys.sort_by_key(|key| holding.stalled.get(key).copied().unwrap_or(0));
         let wanted = keys.len();
+        let started: Mutex<HashSet<String>> = Mutex::default();
         let mut reads = futures_util::stream::iter(keys)
-            .map(|key| async move {
-                self.counters.get_requests.fetch_add(1, Ordering::Relaxed);
-                let body = async {
-                    let bytes = self
-                        .store
-                        .get(&Path::from(key.as_str()))
-                        .await?
-                        .bytes()
-                        .await?;
-                    self.counters
-                        .bytes_read
-                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    reg::decode_segment(&bytes).context("decode a registry segment")
+            .map(|key| {
+                let started = &started;
+                async move {
+                    self.counters.get_requests.fetch_add(1, Ordering::Relaxed);
+                    started.lock().unwrap().insert(key.clone());
+                    let body = async {
+                        let bytes = self
+                            .store
+                            .get(&Path::from(key.as_str()))
+                            .await?
+                            .bytes()
+                            .await?;
+                        self.counters
+                            .bytes_read
+                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        reg::decode_segment(&bytes).context("decode a registry segment")
+                    }
+                    .await;
+                    (key, body)
                 }
-                .await;
-                (key, body)
             })
             .buffer_unordered(FETCH_CONCURRENCY);
         let mut fetched: Vec<(String, anyhow::Result<Vec<Record>>)> = Vec::new();
@@ -1181,6 +1193,20 @@ impl Registry {
             fetched.push(read);
         }
         drop(reads);
+        // A read that began and did not finish is stalled; one that never began
+        // only waited its turn.
+        let done: HashSet<&String> = fetched.iter().map(|(key, _)| key).collect();
+        for key in started
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|key| !done.contains(key))
+        {
+            *holding.stalled.entry(key.clone()).or_insert(0) += 1;
+        }
+        for (key, _) in &fetched {
+            holding.stalled.remove(key);
+        }
         if fetched.len() < wanted {
             holding.deferred = true;
             self.counters
