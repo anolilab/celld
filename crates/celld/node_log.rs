@@ -2573,6 +2573,106 @@ impl std::fmt::Display for PeerHttpError {
 
 impl std::error::Error for PeerHttpError {}
 
+/// Which live peers recruitment takes, and how many it passed over by reason.
+/// Returns the members, the removed counts, and the number of live peers.
+fn select_members(
+    health: &celld_logic::log_evict::FollowerHealth,
+    self_node: &str,
+    peers: Vec<celld_logic::CapacityPeer>,
+    now: u64,
+    mono: u64,
+    lease_ttl_ms: u64,
+) -> (Vec<Member>, Removed, usize) {
+    let mut removed = Removed::default();
+    let mut members: Vec<Member> = Vec::new();
+    let mut live_peers = 0;
+    for peer in peers
+        .into_iter()
+        .filter(|peer| peer.node != self_node && peer.expires_ms > now)
+    {
+        live_peers += 1;
+        // A peer that is draining is giving its work away and stops serving
+        // soon, and a peer whose connection just failed is most likely
+        // restarting with its old lease still live: recruiting either opens
+        // an ensemble that fails its first append. A failed peer is
+        // recruitable again once its lease belongs to a new process, or when
+        // its sit-out has passed.
+        if peer.draining {
+            removed.draining += 1;
+        } else if health.failed_recently(&peer.node, &peer.generation, now) {
+            removed.sitting_out += 1;
+        } else if health.quarantined(&peer.node, mono) {
+            // Only a follower that cannot serve appends at all sits out a
+            // term. A gray one is recruitable again at once, because the
+            // latency rule can judge it again and the swap rate cap is what
+            // bounds flapping.
+            removed.quarantined += 1;
+        } else if members.len() < RECRUIT_FOLLOWERS {
+            // Replication factor and the in-sync floor are separate numbers:
+            // recruit to the target, serve on one.
+            members.push(Member {
+                node: peer.node,
+                addr: peer.addr,
+                generation: peer.generation,
+                lease_expires_ms: peer.expires_ms,
+                lease_ttl_ms,
+            });
+        }
+    }
+    (members, removed, live_peers)
+}
+
+/// Is every selected member still among the members a fresh selection takes,
+/// as the same process?
+fn selection_still_holds(selected: &[Member], fresh: &[Member]) -> bool {
+    selected.iter().all(|member| {
+        fresh
+            .iter()
+            .any(|now| now.node == member.node && now.generation == member.generation)
+    })
+}
+
+/// The boot ladder's wait between recovery attempts. A refusal because the
+/// predecessor's lease is live waits out what is left of that lease once,
+/// without counting against the attempt limit. A second such refusal means the
+/// predecessor keeps renewing, and from then on, like every other failure, the
+/// ladder waits a full lease term times the attempt, so a live predecessor
+/// still gets the whole old ladder.
+pub struct RecoveryLadder {
+    ttl_backoff: std::time::Duration,
+    attempts: u32,
+    live_seen: bool,
+}
+
+impl RecoveryLadder {
+    const MAX_ATTEMPTS: u32 = 4;
+
+    pub fn new(ttl_backoff: std::time::Duration) -> Self {
+        Self {
+            ttl_backoff,
+            attempts: 0,
+            live_seen: false,
+        }
+    }
+
+    /// The wait before the next attempt after `error`, or `None` when the
+    /// attempts are used up.
+    pub fn next(&mut self, error: &anyhow::Error) -> Option<std::time::Duration> {
+        if let Some(live) = error.downcast_ref::<LeaseLive>() {
+            if !self.live_seen {
+                self.live_seen = true;
+                return Some(
+                    (std::time::Duration::from_millis(live.remaining_ms)
+                        + std::time::Duration::from_millis(250))
+                    .min(self.ttl_backoff),
+                );
+            }
+        }
+        self.attempts += 1;
+        (self.attempts < Self::MAX_ATTEMPTS).then(|| self.ttl_backoff.saturating_mul(self.attempts))
+    }
+}
+
 /// How many live peers recruitment passed over, by reason.
 #[derive(Clone, Copy, Default)]
 struct Removed {
@@ -5786,51 +5886,19 @@ impl NodeLogManager {
             return Ok(());
         }
         let peers = self.ownership.read_capacity_peers().await?;
-        let now = crate::ownership_store::now_ms();
-        let mono = mono_ms();
-        // Kept before the filters consume the vector: a fleet with no peer at
+        let lease_ttl_ms = self.ownership.lease_ttl_ms();
+        // `live_peers` is kept apart from the filters: a fleet with no peer at
         // all is a different message from a fleet whose peers are all
         // ineligible, and an operator needs to be told which one they have.
-        let live_peers = peers
-            .iter()
-            .filter(|peer| peer.node != self.node && peer.expires_ms > now)
-            .count();
-        let lease_ttl_ms = self.ownership.lease_ttl_ms();
-        let mut removed = Removed::default();
-        let mut members: Vec<Member> = Vec::new();
-        for peer in peers
-            .into_iter()
-            .filter(|peer| peer.node != self.node && peer.expires_ms > now)
-        {
-            let health = self.health.lock().unwrap();
-            // A peer that is draining is giving its work away and stops
-            // serving soon, and a peer whose connection just failed is most
-            // likely restarting with its old lease still live: recruiting
-            // either opens an ensemble that fails its first append. A failed
-            // peer is recruitable again once its lease belongs to a new
-            // process, or when its sit-out has passed.
-            if peer.draining {
-                removed.draining += 1;
-            } else if health.failed_recently(&peer.node, &peer.generation, now) {
-                removed.sitting_out += 1;
-            } else if health.quarantined(&peer.node, mono) {
-                // Only a follower that cannot serve appends at all sits out a
-                // term. A gray one is recruitable again at once, because the
-                // latency rule can judge it again and the swap rate cap is
-                // what bounds flapping.
-                removed.quarantined += 1;
-            } else if members.len() < RECRUIT_FOLLOWERS {
-                // Replication factor and the in-sync floor are separate
-                // numbers: recruit to the target, serve on one.
-                members.push(Member {
-                    node: peer.node,
-                    addr: peer.addr,
-                    generation: peer.generation,
-                    lease_expires_ms: peer.expires_ms,
-                    lease_ttl_ms,
-                });
-            }
-        }
+        let (members, removed, live_peers) = select_members(
+            &self.health.lock().unwrap(),
+            &self.node,
+            peers,
+            crate::ownership_store::now_ms(),
+            mono_ms(),
+            lease_ttl_ms,
+        );
+        let mono = mono_ms();
         // Peer discovery is intentionally outside the transition guard.
         // Recheck the lifecycle after that await, then keep the snapshot,
         // publication, and successor installation in one critical section.
@@ -5910,6 +5978,23 @@ impl NodeLogManager {
         // A write admitted here can finish after fallback, so dead-session
         // recovery remains responsible for that remote Open record.
         if self.task_stop.is_stopped() {
+            return Ok(());
+        }
+        // The peers were read before this pass waited for the transition and
+        // for the drain barrier. A member that has since started draining, or
+        // whose connection failed meanwhile, must not be published: the pass
+        // ends and the next tick selects again.
+        let fresh = self.ownership.read_capacity_peers().await?;
+        let (fresh_members, _, _) = select_members(
+            &self.health.lock().unwrap(),
+            &self.node,
+            fresh,
+            crate::ownership_store::now_ms(),
+            mono_ms(),
+            lease_ttl_ms,
+        );
+        if !selection_still_holds(&members, &fresh_members) {
+            info!("a recruited peer became ineligible before the ensemble was published; selecting again");
             return Ok(());
         }
         transition.write(Some(log_to_wire(&record, false))).await?;
@@ -7425,6 +7510,87 @@ mod seal_absent_log_tests {
             assert!(note_failed_append(&health, &member, &refused));
             assert!(sat_out(&health));
         });
+    }
+
+    #[test]
+    fn a_predecessor_that_keeps_renewing_gets_at_least_the_old_ladder() {
+        let ttl = std::time::Duration::from_secs(10);
+        let live = || {
+            anyhow::Error::new(LeaseLive {
+                dead: "n/g".into(),
+                remaining_ms: 3_000,
+            })
+        };
+        let mut ladder = RecoveryLadder::new(ttl);
+        let mut total = std::time::Duration::ZERO;
+        let mut failures = 0;
+        while let Some(wait) = ladder.next(&live()) {
+            total += wait;
+            failures += 1;
+            assert!(failures < 10, "the ladder ends");
+        }
+        // The old ladder: one, two and three lease terms between four tries.
+        assert!(total >= ttl * 6, "{total:?}");
+        // The first refusal waited only for what the lease had left.
+        let mut first = RecoveryLadder::new(ttl);
+        assert_eq!(
+            first.next(&live()),
+            Some(std::time::Duration::from_millis(3_250))
+        );
+        // Another kind of failure is on the old ladder from the start.
+        let other = anyhow::anyhow!("boom");
+        let mut ladder = RecoveryLadder::new(ttl);
+        assert_eq!(ladder.next(&other), Some(ttl));
+        assert_eq!(ladder.next(&other), Some(ttl * 2));
+        assert_eq!(ladder.next(&other), Some(ttl * 3));
+        assert_eq!(ladder.next(&other), None);
+    }
+
+    fn peer(node: &str, generation: &str, draining: bool) -> celld_logic::CapacityPeer {
+        celld_logic::CapacityPeer {
+            node: node.into(),
+            addr: format!("{node}:1"),
+            expires_ms: 0,
+            peer_protocol: 0,
+            sampled_ms: 0,
+            owned_cells: Some(0),
+            placement_weight: None,
+            bucket_format: None,
+            resident_cells: 0,
+            host_websockets: 0,
+            rss_bytes: 0,
+            in_use_bytes: None,
+            pressured: false,
+            memory_headroom: None,
+            restoring: 0,
+            paced_handoff: true,
+            rebalance_paused: false,
+            draining,
+            ingress_only: false,
+            generation: generation.into(),
+        }
+    }
+
+    #[test]
+    fn a_selected_member_that_became_ineligible_aborts_the_publish() {
+        let now = crate::ownership_store::now_ms();
+        let health = celld_logic::log_evict::FollowerHealth::default();
+        let take = |health: &celld_logic::log_evict::FollowerHealth, draining_b: bool| {
+            let mut a = peer("a", "ga", false);
+            let mut b = peer("b", "gb", draining_b);
+            a.expires_ms = now + 10_000;
+            b.expires_ms = now + 10_000;
+            select_members(health, "me", vec![a, b], now, 0, 10_000).0
+        };
+        let selected = take(&health, false);
+        assert_eq!(selected.len(), 2);
+        assert!(selection_still_holds(&selected, &take(&health, false)));
+        // One member started draining after it was selected.
+        assert!(!selection_still_holds(&selected, &take(&health, true)));
+        // Or its process failed an append meanwhile.
+        let mut failed = health.clone();
+        failed.append_failed("a", "ga", now, now + 10_000);
+        assert!(!selection_still_holds(&selected, &take(&failed, false)));
     }
 
     #[test]

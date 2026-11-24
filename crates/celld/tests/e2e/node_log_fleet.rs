@@ -45,7 +45,11 @@ struct Node {
 impl Node {
     /// Start node `index` in a directory that survives a respawn.
     fn spawn(home: &Path, index: usize, bucket: &str, endpoint: &str) -> Node {
-        let (public, internal) = (free_port(), free_port());
+        let public = free_port();
+        // Another port than the public one, as the other fleet tests pick it.
+        let internal = std::iter::repeat_with(free_port)
+            .find(|port| *port != public)
+            .expect("an endless iterator");
         let home = home.join(format!("node-{index}"));
         std::fs::create_dir_all(&home).expect("create the node directory");
         let log = std::fs::OpenOptions::new()
