@@ -29,10 +29,11 @@ const TOKEN: &str = "node-log-fleet-token";
 /// lease, one backoff, and the recovery itself.
 const READY_BOUND: Duration = Duration::from_secs(30);
 
-/// The peers' dead-leader sweep period, in seconds, and how long after one of
-/// their ticks the node is killed.
-const SWEEP_TICK: f64 = 30.0;
-const SWEEP_OFFSET: f64 = 3.0;
+/// The log line a node writes when it finishes a dead-leader sweep.
+const SWEEP_DONE: &str = "dead-leader sweep complete";
+
+/// The log line of a node that sealed a dead session's log.
+const RECOVERED: &str = "node log recovered and sealed";
 
 /// New cells per second, over all clients.
 const RATE_PER_SECOND: u64 = 100;
@@ -139,6 +140,11 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Lines of `log` that contain `needle`.
+fn count(log: &str, needle: &str) -> usize {
+    log.lines().filter(|line| line.contains(needle)).count()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_killed_node_finishes_its_boot_recovery() {
     let Ok(bucket) = std::env::var("CELLD_STORE_CONTRACT_BUCKET") else {
@@ -170,7 +176,6 @@ async fn a_killed_node_finishes_its_boot_recovery() {
         String::from_utf8_lossy(&deployed.stderr)
     );
     let client = client();
-    let fleet_started = Instant::now();
     let mut nodes: Vec<Node> = (0..3)
         .map(|index| Node::spawn(home.path(), index, &spec, &endpoint))
         .collect();
@@ -199,6 +204,8 @@ async fn a_killed_node_finishes_its_boot_recovery() {
         let stop = Arc::new(AtomicBool::new(false));
         let ok = Arc::new(AtomicU64::new(0));
         let bad = Arc::new(AtomicU64::new(0));
+        let ok_on_victim = Arc::new(AtomicU64::new(0));
+        let victim = nodes[0].public.clone();
         let driver = {
             let (addresses, stop, ok, bad, client) = (
                 addresses.clone(),
@@ -207,6 +214,7 @@ async fn a_killed_node_finishes_its_boot_recovery() {
                 bad.clone(),
                 client.clone(),
             );
+            let (ok_on_victim, victim) = (ok_on_victim.clone(), victim.clone());
             tokio::spawn(async move {
                 let mut turn = 0usize;
                 let mut tick = tokio::time::interval(Duration::from_millis(1000 / RATE_PER_SECOND));
@@ -217,6 +225,7 @@ async fn a_killed_node_finishes_its_boot_recovery() {
                     turn += 1;
                     let (addresses, ok, bad, client) =
                         (addresses.clone(), ok.clone(), bad.clone(), client.clone());
+                    let (ok_on_victim, victim) = (ok_on_victim.clone(), victim.clone());
                     calls.push(tokio::spawn(async move {
                         // A call that fails is tried on the next node.
                         for attempt in 0..3 {
@@ -231,6 +240,9 @@ async fn a_killed_node_finishes_its_boot_recovery() {
                                 .await;
                             if response.is_ok_and(|response| response.status().is_success()) {
                                 ok.fetch_add(1, Ordering::SeqCst);
+                                if url == victim {
+                                    ok_on_victim.fetch_add(1, Ordering::SeqCst);
+                                }
                                 return;
                             }
                         }
@@ -243,17 +255,40 @@ async fn a_killed_node_finishes_its_boot_recovery() {
             })
         };
 
-        // Let the node hold unreplicated work, then kill it without a drain
-        // and stop the traffic. A request routed to a cell the dead node owned
-        // would make a peer recover its log as soon as its lease lapses; with
-        // none, a peer's own sweep runs only every 30 s, so the restarted node
-        // wins the recovery claim and uploads the gathered tails itself. The
-        // peers sweep on a 30 s tick counted from their start: kill just after
-        // one, so the next falls long after the restarted node's second try.
-        let elapsed = fleet_started.elapsed().as_secs_f64();
-        let after_tick =
-            (((elapsed + 3.0 - SWEEP_OFFSET) / SWEEP_TICK).ceil() * SWEEP_TICK) + SWEEP_OFFSET;
-        tokio::time::sleep(Duration::from_secs_f64(after_tick - elapsed)).await;
+        // Kill the node, without a drain, right after both peers have finished
+        // a dead-leader sweep. A request routed to a cell the dead node owned
+        // would make a peer recover its log as soon as its lease lapses, and
+        // the peers' next sweep is 30 s away, so the restarted node wins the
+        // recovery claim and uploads the gathered tails itself. The traffic
+        // stops at the kill for the same reason.
+        let sweeps = |nodes: &[Node]| -> Vec<usize> {
+            nodes[1..]
+                .iter()
+                .map(|node| count(&node.log(), SWEEP_DONE))
+                .collect()
+        };
+        let before = sweeps(&nodes);
+        wait_until(
+            "both peers to finish a dead-leader sweep",
+            Duration::from_secs(60),
+            || async {
+                let now = sweeps(&nodes);
+                now.iter()
+                    .zip(&before)
+                    .all(|(now, before)| now > before)
+                    .then_some(())
+            },
+        )
+        .await;
+        let (served, served_by_victim) = (
+            ok.load(Ordering::SeqCst),
+            ok_on_victim.load(Ordering::SeqCst),
+        );
+        assert!(
+            served >= 100 && served_by_victim >= 30,
+            "{served} new cells served, {served_by_victim} of them by the node to be killed: \
+             too few to leave a tail to recover"
+        );
         let started = Instant::now();
         if let Some(mut child) = nodes[0].child.take() {
             signal_group(child.id(), "KILL");
@@ -264,6 +299,30 @@ async fn a_killed_node_finishes_its_boot_recovery() {
         let node = Node::spawn(home.path(), 0, &spec, &endpoint);
         node.wait_ready_within(&client, READY_BOUND).await;
         nodes[0] = node;
+        // The restarted node, not a peer, must have recovered its predecessor,
+        // and had rows to upload: a pass that skipped the fixed path proves
+        // nothing.
+        let recovered: Vec<String> = nodes
+            .iter()
+            .map(|node| {
+                node.log()
+                    .lines()
+                    .filter(|line| line.contains(RECOVERED))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect();
+        assert!(
+            recovered[1].is_empty() && recovered[2].is_empty(),
+            "a peer recovered the killed node's log: {recovered:?}"
+        );
+        let entries: u64 = recovered[0]
+            .split("entries=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|entries| entries.parse().ok())
+            .unwrap_or_else(|| panic!("the restarted node did not recover its log: {recovered:?}"));
+        assert!(entries > 0, "the recovery had nothing to upload");
         eprintln!(
             "kill -9 fleet: {} ok, {} failed; the killed node was ready again after {:.1}s",
             ok.load(Ordering::SeqCst),

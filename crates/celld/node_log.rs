@@ -6371,6 +6371,7 @@ impl NodeLogManager {
                 warn!(session, %error, "eager node-log recovery failed");
             }
         }
+        info!("dead-leader sweep complete");
         Ok(())
     }
 
