@@ -662,6 +662,9 @@ struct Holding {
     last_folded: u64,
     last_base_ms: u64,
     base_next: usize,
+    /// Jobs that ended with nothing to do (an empty partition, no delta): the
+    /// scheduling state moves past them at the next pass.
+    advanced: Arc<Mutex<Vec<Finished>>>,
     last_sweep_ms: u64,
     last_sample_ms: u64,
     sampler: Arc<Mutex<SamplerState>>,
@@ -684,6 +687,9 @@ enum Reconciled {
     /// It names someone else, or no one.
     Lost,
 }
+
+/// A job that ended with nothing to do: its kind and, for a base merge, its partition.
+type Finished = (&'static str, Option<usize>);
 
 enum Ended {
     Stopped,
@@ -898,6 +904,7 @@ impl Registry {
             last_folded: 0,
             last_base_ms: now,
             base_next: 0,
+            advanced: Arc::default(),
             last_sweep_ms: now,
             last_sample_ms: now,
             sampler: Arc::default(),
@@ -1291,6 +1298,19 @@ impl Registry {
                     holding.root = root;
                     holding.map = Arc::new(map);
                     holding.retire_next.extend(job.retire.iter().cloned());
+                    // Scheduling moves on only when a job committed, so a job that
+                    // failed or was discarded is tried again on a later pass.
+                    let committed_at = crate::asyncrt::mono_ms();
+                    match &job.job {
+                        Job::Spill { .. } if job.kind == "spill" => {
+                            holding.last_spill_ms = Some(committed_at);
+                        }
+                        Job::BaseMerge { partition, .. } => {
+                            holding.last_base_ms = committed_at;
+                            holding.base_next = partition + 1;
+                        }
+                        Job::Spill { .. } => {}
+                    }
                     match job.kind {
                         "spill" => self.counters.spills.fetch_add(1, Ordering::Relaxed),
                         _ => self.counters.base_merges.fetch_add(1, Ordering::Relaxed),
@@ -1334,6 +1354,16 @@ impl Registry {
             return;
         }
         let now = crate::asyncrt::mono_ms();
+        for (kind, partition) in std::mem::take(&mut *holding.advanced.lock().unwrap()) {
+            match (kind, partition) {
+                ("spill", _) => holding.last_spill_ms = Some(now),
+                (_, Some(index)) => {
+                    holding.last_base_ms = now;
+                    holding.base_next = index + 1;
+                }
+                _ => {}
+            }
+        }
         let live: u64 = holding.counts.values().sum();
         let spill = reg::spill_due(
             holding.root.deltas.len(),
@@ -1358,7 +1388,6 @@ impl Registry {
             let every = self.cfg.base_ms / u64::from(self.cfg.partitions.max(1));
             (now.saturating_sub(holding.last_base_ms) >= every).then(|| {
                 let index = holding.base_next % holding.map.partitions.len();
-                holding.base_next += 1;
                 ("base_merge", Some(index))
             })
         };
@@ -1383,11 +1412,7 @@ impl Registry {
             holding.abandon.clone(),
         );
         let spill_root = (kind == "spill").then(|| Arc::new(holding.root.clone()));
-        if spill_root.is_some() {
-            holding.last_spill_ms = Some(now);
-        } else {
-            holding.last_base_ms = now;
-        }
+        let advanced = holding.advanced.clone();
         running.fetch_add(1, Ordering::SeqCst);
         let registry = self.clone();
         crate::asyncrt::spawn(async move {
@@ -1396,7 +1421,11 @@ impl Registry {
                     let snapshot = registry
                         .load_with(root.clone(), &Io::default(), &store)
                         .await;
-                    if snapshot.deltas_ok {
+                    if !snapshot.deltas_ok {
+                        Err(anyhow::anyhow!(
+                            "a delta the spill consumes could not be loaded"
+                        ))
+                    } else {
                         let consumed: HashMap<DeltaId, Arc<crate::registry::Loaded>> =
                             root.deltas.iter().copied().zip(snapshot.deltas).collect();
                         prepare_spill(
@@ -1410,8 +1439,6 @@ impl Registry {
                         )
                         .await
                         .map(Some)
-                    } else {
-                        Ok(None)
                     }
                 }
                 _ => {
@@ -1433,7 +1460,7 @@ impl Registry {
                 Ok(Some(job)) => {
                     objects::delete_many(store.as_ref(), &job.outputs).await;
                 }
-                Ok(None) => {}
+                Ok(None) => advanced.lock().unwrap().push((kind, partition)),
                 Err(error) => {
                     if format!("{error:#}").contains("self-check") {
                         registry

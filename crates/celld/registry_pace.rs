@@ -122,10 +122,12 @@ impl MultipartUpload for PacedUpload {
     }
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
+        let _slot = self.pace.requests.acquire().await.expect("never closed");
         self.inner.complete().await
     }
 
     async fn abort(&mut self) -> object_store::Result<()> {
+        let _slot = self.pace.requests.acquire().await.expect("never closed");
         self.inner.abort().await
     }
 }
@@ -197,7 +199,16 @@ impl ObjectStore for PacedStore {
         &self,
         locations: BoxStream<'static, object_store::Result<Path>>,
     ) -> BoxStream<'static, object_store::Result<Path>> {
-        self.inner.delete_stream(locations)
+        // The store batches the keys into its own requests and answers each key; one
+        // permit covers the whole stream, so a deletion never adds to the requests
+        // the jobs have in flight beyond the limit. Errors stay per key.
+        let (inner, pace) = (self.inner.clone(), self.pace.clone());
+        futures_util::stream::once(async move {
+            let _slot = pace.requests.acquire().await.expect("never closed");
+            inner.delete_stream(locations).collect::<Vec<_>>().await
+        })
+        .flat_map(futures_util::stream::iter)
+        .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {

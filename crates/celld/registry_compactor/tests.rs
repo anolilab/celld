@@ -2455,3 +2455,387 @@ async fn the_sampler_reports_incomplete_only_on_a_definite_miss() {
         "only the cell the registry does not hold is incomplete"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scheduling moves on only when a job succeeded
+// ---------------------------------------------------------------------------
+
+async fn wait_jobs_idle(holding: &Holding) {
+    crate::asyncrt::timeout(Duration::from_secs(5), async {
+        while holding.running.load(Ordering::SeqCst) > 0 {
+            crate::asyncrt::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the job ended");
+}
+
+#[tokio::test]
+async fn a_failed_base_merge_keeps_its_partition_and_is_tried_again_at_once() {
+    let (scripted, _) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            // A partition is due every millisecond.
+            base_ms: 8,
+            ..config()
+        },
+    );
+    let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &(0..40).map(cell).collect::<Vec<_>>()).await;
+    let spill = spill_now(&node, &mut holding).await;
+    run_job(&node, &mut holding, spill).await;
+    let index = holding
+        .map
+        .partitions
+        .iter()
+        .position(|partition| partition.l1 != Level::Empty)
+        .expect("a partition holds a level 1");
+    holding.base_next = index;
+    holding.last_base_ms = 0;
+    scripted.fail("/run/", true);
+    node.schedule(&mut holding);
+    wait_jobs_idle(&holding).await;
+    assert!(
+        holding.prepared.lock().unwrap().is_empty(),
+        "the merge failed"
+    );
+    assert_eq!(
+        holding.base_next, index,
+        "the rotation did not move past it"
+    );
+    assert_eq!(holding.last_base_ms, 0, "and its interval did not restart");
+    scripted.fail("/run/", false);
+    // The next pass tries the same partition, with no interval to wait.
+    node.schedule(&mut holding);
+    wait_jobs_idle(&holding).await;
+    assert_eq!(holding.prepared.lock().unwrap().len(), 1);
+    assert!(node.pass(&mut holding).await.unwrap());
+    assert_eq!(
+        holding.base_next,
+        index + 1,
+        "committed: the rotation moves on"
+    );
+    assert!(holding.last_base_ms > 0);
+    assert_eq!(node.counters.base_merges.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn a_failed_spill_does_not_wait_a_whole_interval_to_be_tried_again() {
+    let (scripted, _) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &(0..40).map(cell).collect::<Vec<_>>()).await;
+    let spill = spill_now(&node, &mut holding).await;
+    run_job(&node, &mut holding, spill).await;
+    // More births, and a spill that is due but cannot read the level 1 it merges into.
+    register_and_fold(&node, &mut holding, &(40..80).map(cell).collect::<Vec<_>>()).await;
+    holding.last_spill_ms = None;
+    scripted.fail("/run/", true);
+    for attempt in 1..=2 {
+        node.schedule(&mut holding);
+        wait_jobs_idle(&holding).await;
+        assert!(holding.prepared.lock().unwrap().is_empty());
+        assert_eq!(
+            holding.last_spill_ms, None,
+            "attempt {attempt} did not count"
+        );
+    }
+    assert_eq!(
+        node.counters.spills_takeover.load(Ordering::Relaxed),
+        2,
+        "tried again at the next pass, not an interval later"
+    );
+    scripted.fail("/run/", false);
+    node.schedule(&mut holding);
+    wait_jobs_idle(&holding).await;
+    assert!(node.pass(&mut holding).await.unwrap());
+    assert!(
+        holding.last_spill_ms.is_some(),
+        "the commit moved the clock"
+    );
+    assert!(holding.root.deltas.is_empty());
+}
+
+#[tokio::test]
+async fn an_empty_partition_is_passed_over_and_the_rotation_moves_on() {
+    let store = memory();
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            base_ms: 8,
+            ..config()
+        },
+    );
+    let mut holding = holder_of(&node).await;
+    holding.last_base_ms = 0;
+    node.schedule(&mut holding);
+    wait_jobs_idle(&holding).await;
+    node.schedule(&mut holding);
+    assert_eq!(
+        holding.base_next, 1,
+        "nothing to merge is an end, not a failure"
+    );
+    wait_jobs_idle(&holding).await;
+}
+
+// ---------------------------------------------------------------------------
+// Every job request holds a permit
+// ---------------------------------------------------------------------------
+
+mod gauge {
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures_util::stream::{BoxStream, StreamExt as _};
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, UploadPart,
+    };
+    use std::fmt;
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A store that counts the requests it has in flight, at their widest.
+    #[derive(Default)]
+    pub(super) struct Gauge {
+        inner: InMemory,
+        now: AtomicUsize,
+        pub(super) widest: AtomicUsize,
+        pub(super) requests: AtomicUsize,
+    }
+
+    impl Gauge {
+        async fn busy<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+            let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+            self.widest.fetch_max(now, Ordering::SeqCst);
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            crate::asyncrt::sleep(Duration::from_millis(15)).await;
+            let out = work.await;
+            self.now.fetch_sub(1, Ordering::SeqCst);
+            out
+        }
+    }
+
+    impl fmt::Display for Gauge {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("Gauge")
+        }
+    }
+
+    impl fmt::Debug for Gauge {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("Gauge")
+        }
+    }
+
+    struct Upload {
+        inner: Box<dyn MultipartUpload>,
+        store: Arc<Gauge>,
+    }
+
+    impl fmt::Debug for Upload {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("Upload")
+        }
+    }
+
+    #[async_trait]
+    impl MultipartUpload for Upload {
+        fn put_part(&mut self, data: PutPayload) -> UploadPart {
+            let (part, store) = (self.inner.put_part(data), self.store.clone());
+            Box::pin(async move { store.busy(part).await })
+        }
+
+        async fn complete(&mut self) -> object_store::Result<PutResult> {
+            let store = self.store.clone();
+            store.busy(self.inner.complete()).await
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            let store = self.store.clone();
+            store.busy(self.inner.abort()).await
+        }
+    }
+
+    /// The gauge as a store, which hands out uploads that count too.
+    pub(super) struct Counted(pub(super) Arc<Gauge>);
+
+    impl fmt::Display for Counted {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("Counted")
+        }
+    }
+
+    impl fmt::Debug for Counted {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("Counted")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for Counted {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.0
+                .busy(self.0.inner.put_opts(location, payload, options))
+                .await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            let inner = self
+                .0
+                .busy(self.0.inner.put_multipart_opts(location, options))
+                .await?;
+            Ok(Box::new(Upload {
+                inner,
+                store: self.0.clone(),
+            }))
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.0.busy(self.0.inner.get_opts(location, options)).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[Range<u64>],
+        ) -> object_store::Result<Vec<Bytes>> {
+            self.0.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            let gauge = self.0.clone();
+            futures_util::stream::once(async move {
+                gauge
+                    .busy(async {
+                        gauge
+                            .inner
+                            .delete_stream(locations)
+                            .collect::<Vec<_>>()
+                            .await
+                    })
+                    .await
+            })
+            .flat_map(futures_util::stream::iter)
+            .boxed()
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.0.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.0.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.0.inner.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: RenameOptions,
+        ) -> object_store::Result<()> {
+            self.0.inner.rename_opts(from, to, options).await
+        }
+    }
+}
+
+#[tokio::test]
+async fn job_requests_never_exceed_the_limit_including_complete_abort_and_delete() {
+    use object_store::MultipartUpload as _;
+    crate::asyncrt::install_test_host_runtime();
+    let gauge = Arc::new(gauge::Gauge::default());
+    let counted: Arc<dyn ObjectStore> = Arc::new(gauge::Counted(gauge.clone()));
+    let paced = PacedStore::new(counted, Pace::new(2, 1 << 30));
+    let tasks: Vec<_> = (0..12)
+        .map(|index| {
+            let paced = paced.clone();
+            crate::asyncrt::spawn(async move {
+                let key = Path::from(format!("obj/{index}"));
+                match index % 3 {
+                    // A multipart upload that completes.
+                    0 => {
+                        let mut upload = paced
+                            .put_multipart_opts(&key, Default::default())
+                            .await
+                            .unwrap();
+                        upload.put_part(vec![1_u8; 8].into()).await.unwrap();
+                        upload.complete().await.unwrap();
+                    }
+                    // One that is abandoned.
+                    1 => {
+                        let mut upload = paced
+                            .put_multipart_opts(&key, Default::default())
+                            .await
+                            .unwrap();
+                        upload.put_part(vec![1_u8; 8].into()).await.unwrap();
+                        upload.abort().await.unwrap();
+                    }
+                    // A deletion of several keys, as the batch of a job.
+                    _ => {
+                        paced.put(&key, vec![2_u8; 8].into()).await.unwrap();
+                        let keys: Vec<_> = (0..3)
+                            .map(|n| Ok(Path::from(format!("gone/{index}/{n}"))))
+                            .collect();
+                        let deleted: Vec<_> = paced
+                            .delete_stream(futures_util::stream::iter(keys).boxed())
+                            .collect()
+                            .await;
+                        assert_eq!(deleted.len(), 3, "every key still gets its answer");
+                    }
+                }
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap();
+    }
+    let widest = gauge.widest.load(Ordering::SeqCst);
+    assert!(
+        gauge.requests.load(Ordering::SeqCst) >= 30,
+        "complete, abort and delete were counted"
+    );
+    assert!(
+        widest <= 2,
+        "{widest} requests were in flight against a limit of 2"
+    );
+    assert!(widest >= 1);
+}
