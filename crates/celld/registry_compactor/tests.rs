@@ -4149,11 +4149,7 @@ fn leaked_hold() -> &'static crate::registry_seed::GateHold {
     Box::leak(Box::new(crate::registry_seed::GateHold::new()))
 }
 
-#[tokio::test]
-async fn a_node_outside_the_rule_in_a_bucket_without_a_registry_reads_one_object_and_holds_nothing()
-{
-    let (scripted, _) = scripted();
-    let store: Arc<dyn ObjectStore> = scripted.clone();
+fn test_bucket(store: &Arc<dyn ObjectStore>) -> (crate::bucket::Bucket, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let local =
         Arc::new(crate::local_store::LocalStore::open(dir.path().join("db.sqlite")).unwrap());
@@ -4163,37 +4159,61 @@ async fn a_node_outside_the_rule_in_a_bucket_without_a_registry_reads_one_object
         PREFIX,
         crate::bucket::StorageBackend::Local,
     );
-    let hold = leaked_hold();
-    crate::registry_seed::require_if_root_exists(hold, &bucket).await;
-    assert!(!hold.is_pending(), "no root, so no hold");
-    assert_eq!(
-        scripted.ops(),
-        vec![format!("get {PREFIX}fleet/reg/v1/root")],
-        "one read and nothing else"
-    );
-    hold.wait().await;
+    (bucket, dir)
+}
+
+/// Close the gate as `close_registry_gate` does, once `lease_visible` says so.
+async fn close_when_visible(
+    hold: &'static crate::registry_seed::GateHold,
+    bucket: &crate::bucket::Bucket,
+    lease_visible: impl FnMut() -> futures_util::future::BoxFuture<'static, bool>,
+) -> Option<u64> {
+    let bucket = bucket.clone();
+    crate::registry_seed::close_until_done(
+        hold,
+        lease_visible,
+        move || {
+            let bucket = bucket.clone();
+            Box::pin(async move {
+                crate::registry_seed::close_gate(bucket.store.as_ref(), &bucket.prefix).await
+            })
+        },
+        Duration::from_millis(1),
+    )
+    .await
 }
 
 #[tokio::test]
-async fn a_node_outside_the_rule_raises_an_open_gate_before_its_first_per_cell_write() {
+async fn a_node_outside_the_rule_in_a_bucket_without_a_registry_writes_nothing_and_reads_the_root_once(
+) {
     let (scripted, _) = scripted();
     let store: Arc<dyn ObjectStore> = scripted.clone();
-    // A fleet whose registry is seeded: the gate is open.
-    let seeded = registry_on(&store, "node-w");
-    let _holding = holder_of(&seeded).await;
-    let dir = tempfile::tempdir().unwrap();
-    let local =
-        Arc::new(crate::local_store::LocalStore::open(dir.path().join("db.sqlite")).unwrap());
-    let bucket = crate::bucket::Bucket::for_test(
-        store.clone(),
-        local,
-        PREFIX,
-        crate::bucket::StorageBackend::Local,
-    );
+    let (bucket, _dir) = test_bucket(&store);
     let hold = leaked_hold();
-    crate::registry_seed::require_if_root_exists(hold, &bucket).await;
-    assert!(hold.is_pending(), "a root exists, so per-cell work is held");
-    // The node's first per-cell write, as the replicator would make it.
+    // From the start per-cell work waits, whatever the bucket holds.
+    hold.require();
+    assert!(scripted.ops().is_empty(), "nothing is read to decide that");
+    let gate = close_when_visible(hold, &bucket, || Box::pin(async { true })).await;
+    assert_eq!(gate, None, "no root, nothing raised");
+    assert!(!hold.is_pending());
+    assert_eq!(
+        scripted.ops(),
+        vec![format!("get {PREFIX}fleet/reg/v1/root")],
+        "one read after the lease is visible, and no write"
+    );
+}
+
+#[tokio::test]
+async fn a_root_that_appears_before_the_lease_is_visible_is_met_by_the_gate_raise() {
+    let (scripted, _) = scripted();
+    let store: Arc<dyn ObjectStore> = scripted.clone();
+    let (bucket, _dir) = test_bucket(&store);
+    let hold = leaked_hold();
+    hold.require();
+    // No root at start, so a read then would have released the hold. A registry
+    // node creates the root and seeds before this node's lease is visible.
+    let registry = registry_on(&store, "node-w");
+    let _holding = holder_of(&registry).await;
     let gated: Arc<dyn ObjectStore> = Arc::new(crate::registry_seed::GatedStore::new(
         store.clone(),
         PREFIX.to_owned(),
@@ -4215,23 +4235,16 @@ async fn a_node_outside_the_rule_raises_an_open_gate_before_its_first_per_cell_w
         !scripted.ops().iter().any(|op| op.contains("/ltx/")),
         "the write has not reached the store"
     );
-    // Its lease shows it is outside the rule; the gate is raised; then it goes on.
-    let gate = crate::registry_seed::close_until_done(
-        hold,
-        || Box::pin(async { true }),
-        {
-            let bucket = bucket.clone();
-            move || {
-                let bucket = bucket.clone();
-                Box::pin(async move {
-                    crate::registry_seed::close_gate(bucket.store.as_ref(), &bucket.prefix).await
-                })
-            }
-        },
-        Duration::from_millis(1),
-    )
+    let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = close_when_visible(hold, &bucket, {
+        let polls = polls.clone();
+        move || {
+            let seen = polls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { seen >= 2 })
+        }
+    })
     .await;
-    assert_eq!(gate, Some(2));
+    assert_eq!(gate, Some(2), "the open gate was raised");
     write.await.unwrap().unwrap();
     let ops = scripted.ops();
     let raised = ops

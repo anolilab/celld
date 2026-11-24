@@ -94,22 +94,14 @@ pub fn needs_gate_close() -> bool {
     !(shadow && fleet)
 }
 
-/// One read of the registry's root at start, for a node outside the writer rule:
-/// when a root exists, per-cell work is held until the gate is closed; when none
-/// does (a bucket that has never run the registry) nothing is held and nothing
-/// else is read or written. A read that fails is treated as a root that may
-/// exist, which the closing then settles with its own retries.
-pub async fn hold_if_registry_exists(bucket: &Bucket) {
+/// At start, a node outside the writer rule holds per-cell work until it has
+/// closed the gate. It does not decide from a root read now that there is none: a
+/// registry node can create a root and seed before this node's lease, which says
+/// it is outside the rule, is visible. The hold is kept until that lease is
+/// visible; the root is read after that, and with none nothing is written.
+pub fn hold_until_gate_closed() {
     if needs_gate_close() {
-        require_if_root_exists(hold(), bucket).await;
-    }
-}
-
-/// [`hold_if_registry_exists`] for a given hold: one read of the root.
-pub(crate) async fn require_if_root_exists(hold: &GateHold, bucket: &Bucket) {
-    match objects::read_root(bucket.store.as_ref(), &bucket.prefix).await {
-        Ok(None) => {}
-        Ok(Some(_)) | Err(_) => hold.require(),
+        hold().require();
     }
 }
 
