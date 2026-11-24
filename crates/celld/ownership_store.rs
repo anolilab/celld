@@ -432,6 +432,12 @@ impl std::fmt::Display for LeaseCasError {
 /// so a repair takes effect well within either.
 pub(crate) const LOST_RECORD_RECHECK_MS: u64 = 10_000;
 
+/// How long the answer to "may a `Grant` be appended" holds.
+const MARKS_GATE_MS: u64 = 5_000;
+
+/// How long a record waits for the fleet proof of its `Grant`.
+const MARK_PROOF_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The production-compatible conditional object store used by ownership
 /// effects. A failed write is reported to the core as ambiguous unless the
 /// store definitively returned HTTP 412, or the attempt provably wrote no
@@ -469,6 +475,9 @@ pub struct BucketOwnership {
     directory_answers: DirectoryAnswers,
     /// The first-form record that the next conditional write of a cell carries.
     pub(crate) k5: crate::session_reader::K5Plans,
+    /// Whether a `Grant` may be appended, and when that was decided: it is read
+    /// from the leases of the ensemble at most every [`MARKS_GATE_MS`].
+    marks_gate: std::sync::Mutex<(u64, bool)>,
 }
 
 /// How often the fleet directory answered a claim guard, by its answer and by
@@ -605,6 +614,7 @@ impl BucketOwnership {
             cell_directory: None,
             directory_answers: DirectoryAnswers::default(),
             k5: crate::session_reader::K5Plans::default(),
+            marks_gate: std::sync::Mutex::new((0, false)),
         }
     }
 
@@ -1119,6 +1129,63 @@ impl BucketOwnership {
         }
     }
 
+    /// Whether a `Grant` may be appended now: the node log is open with an
+    /// ensemble, and every member of the ensemble advertises the capability in
+    /// its lease. Without that the id is granted by the chunk alone.
+    async fn marks_allowed(&self) -> bool {
+        let now = crate::asyncrt::mono_ms();
+        {
+            let gate = self.marks_gate.lock().unwrap();
+            if gate.0 != 0 && now.saturating_sub(gate.0) < MARKS_GATE_MS {
+                return gate.1;
+            }
+        }
+        let ensemble = match &self.own_log.lock().unwrap().1 {
+            Some(log) if log.state == "open" && !log.ensemble.is_empty() => log.ensemble.clone(),
+            _ => Vec::new(),
+        };
+        let mut allowed = !ensemble.is_empty();
+        for member in &ensemble {
+            allowed &= matches!(
+                load_node_lease(&self.bucket, member).await,
+                Ok(Some(lease)) if !lease.tags.is_empty()
+            );
+        }
+        *self.marks_gate.lock().unwrap() = (now.max(1), allowed);
+        allowed
+    }
+
+    /// Append the `Grant` of `cell` to the followers' log and wait for the
+    /// fleet proof of it, so the cell's first response follows a record that
+    /// survives the loss of this node. Without a fleet proof the evidence is a
+    /// read of the session's own header that says `open`, started after the
+    /// write of the record returned; without either the cell is not activated
+    /// by this write.
+    async fn grant_mark(
+        &self,
+        session: &crate::session::Session,
+        cell: &str,
+    ) -> anyhow::Result<()> {
+        let Some(counter) = session.own_counter_of_scope(cell) else {
+            return Ok(());
+        };
+        if !self.marks_allowed().await {
+            return Ok(());
+        }
+        let proof = crate::session::enqueue_mark(cell, counter);
+        if let Ok(Ok(true)) = crate::asyncrt::timeout(MARK_PROOF_WAIT, proof).await {
+            return Ok(());
+        }
+        match crate::session_store::read_header(&self.bucket, &session.tag()).await? {
+            crate::session_store::Read::Found(header, _)
+                if header.state == crate::session_store::State::Open =>
+            {
+                Ok(())
+            }
+            _ => anyhow::bail!("no evidence that the record of {cell} was written before a seal"),
+        }
+    }
+
     pub async fn cas_owner(
         &self,
         cell: &str,
@@ -1192,6 +1259,7 @@ impl BucketOwnership {
                 if matches!(guard, CasGuard::Absent) && epoch == 1 {
                     if let Some(session) = session {
                         session.grant_scope(cell);
+                        self.grant_mark(session, cell).await?;
                     }
                 }
                 if matches!(guard, CasGuard::Absent) {

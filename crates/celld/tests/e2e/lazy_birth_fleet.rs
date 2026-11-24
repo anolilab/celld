@@ -357,3 +357,82 @@ async fn killing_the_minting_node_seals_its_session_with_its_grants() {
     })
     .await;
 }
+
+/// No checkpoint runs before the kill, so the only trace of the grant is the
+/// `Grant` mark on the followers: the recoverer reads it from their tails and
+/// the sealed chunk holds the counter.
+#[tokio::test]
+async fn a_grant_that_no_checkpoint_wrote_survives_the_loss_of_the_minting_node() {
+    let env: &[(&str, &str)] = &[
+        ("CELLD_LAZY_BIRTH", "shadow"),
+        ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "3600000"),
+    ];
+    let Some(fleet) = Fleet::start("do-ids", 3, env).await else {
+        return;
+    };
+    with_fleet(fleet, |mut fleet| async move {
+        // The ensemble of node 0 forms by maintenance, a few seconds after it
+        // is ready.
+        wait_until(
+            "node 0 to have an ensemble",
+            Duration::from_secs(90),
+            || async {
+                let lease = fleet.object("nodes/lazy-0.json").await?;
+                (lease["log"]["state"] == "open"
+                    && !lease["log"]["ensemble"].as_array()?.is_empty()
+                    && !lease["session"].is_null())
+                .then_some(())
+            },
+        )
+        .await;
+        let minted = fleet.get_json(0, "/mint").await.expect("mint");
+        let ids: Vec<String> = minted["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap().to_string())
+            .collect();
+        let tag = ids[0][..16].to_string();
+        let out = fleet
+            .get_json(0, &format!("/bump?id={}", ids[0]))
+            .await
+            .expect("bump");
+        assert_eq!(out["n"], 1);
+        let header = fleet
+            .object(&format!("fleet/sessions/{tag}.json"))
+            .await
+            .expect("the header");
+        let counter = counter_of(&header, &ids[0]);
+        let chunk = fleet
+            .object(&format!("fleet/sessions/{tag}/c/0"))
+            .await
+            .expect("the chunk");
+        assert_eq!(
+            chunk["granted"],
+            serde_json::json!([]),
+            "no checkpoint ran: {chunk}"
+        );
+        fleet.nodes[0].kill();
+        wait_until(
+            "another node to serve the id",
+            Duration::from_secs(180),
+            || async {
+                for node in [1, 2] {
+                    if let Some(out) = fleet.get_json(node, &format!("/bump?id={}", ids[0])).await {
+                        return Some(out);
+                    }
+                }
+                None
+            },
+        )
+        .await;
+        let chunk = fleet
+            .object(&format!("fleet/sessions/{tag}/c/0"))
+            .await
+            .expect("the chunk");
+        assert_eq!(chunk["state"], "sealed", "{chunk}");
+        assert_eq!(chunk["granted"], serde_json::json!([counter]), "{chunk}");
+        fleet
+    })
+    .await;
+}

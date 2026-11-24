@@ -935,6 +935,15 @@ fn credit_percell_upload(handle: &Cell, txid: u64) {
 /// stops, so every path that leaves rows only in the bucket, and every path
 /// that deletes them, must credit `durable_txid`, or this batch and every
 /// later batch stay on follower disks until the next epoch.
+/// What a shipped batch holds that must reach the bucket before the followers
+/// may truncate it: the top position of each cell, and the `Grant` marks, which
+/// reach the bucket as a bit in the session's chunk.
+#[derive(Default)]
+struct ShipBatch {
+    cells: Vec<(CellHandle, u64)>,
+    marks: Vec<u64>,
+}
+
 fn ship_batch_covered(cells: &[(CellHandle, u64)]) -> bool {
     cells
         .iter()
@@ -4760,7 +4769,7 @@ async fn ship_loop(
     // the followers' truncate_to. This is what bounds follower disks, and
     // the ledger's epoch reset is what keeps a stale watermark from
     // truncating a fresh fragment.
-    let mut ledger: celld_logic::log_tier::ShipLedger<Vec<(CellHandle, u64)>> =
+    let mut ledger: celld_logic::log_tier::ShipLedger<ShipBatch> =
         celld_logic::log_tier::ShipLedger::default();
     // Rounds in flight, completed strictly in submission order. A later
     // round's ack waits here until every earlier round has credited or
@@ -4939,7 +4948,7 @@ async fn ship_loop(
                 .collect()
         };
         scan_us += lap_us(&mut lap);
-        if work.is_empty() {
+        if work.is_empty() && !crate::session::marks_pending() {
             continue;
         }
         let round = asyncrt::mono_ms();
@@ -5126,10 +5135,25 @@ async fn ship_loop(
             read_bytes_total += chunk_read_bytes;
             probe_us_max = probe_us_max.max(chunk_probe_us);
         }
-        if credits.is_empty() {
+        // The `Grant` marks that wait for a fleet proof ride this round as
+        // entries of their own, after the rows.
+        let marks = crate::session::take_marks();
+        if credits.is_empty() && marks.is_empty() {
             continue;
         }
-        ledger.advance(|cells| ship_batch_covered(cells));
+        let mut mark_waiters: Vec<(u64, tokio::sync::oneshot::Sender<bool>)> = Vec::new();
+        for mark in marks {
+            entries.push(ShipEntry {
+                cell: mark.scope,
+                epoch: 1,
+                txid: crate::node_log::MARK_TXID,
+                bytes: vec![b'G'],
+            });
+            mark_waiters.push((mark.counter, mark.done));
+        }
+        ledger.advance(|batch| {
+            ship_batch_covered(&batch.cells) && crate::session::marks_checkpointed(&batch.marks)
+        });
         let covered_seq = ledger.covered_seq();
         let captured_ms = asyncrt::mono_ms().saturating_sub(round);
         capture_us += lap_us(&mut lap);
@@ -5156,6 +5180,7 @@ async fn ship_loop(
         let submitted = asyncrt::mono_ms();
         inflight.push_back(Box::pin(async move {
             ShipRound {
+                marks: mark_waiters,
                 completion: match append {
                     Some(append) => ShipRoundCompletion::Append(append.await),
                     None => ShipRoundCompletion::OrderedEmpty,
@@ -5193,6 +5218,8 @@ enum ShipRoundCompletion {
 
 /// One pipelined round's completion, applied strictly in submission order.
 struct ShipRound {
+    /// The marks of this round and who waits for their fleet proof.
+    marks: Vec<(u64, tokio::sync::oneshot::Sender<bool>)>,
     completion: ShipRoundCompletion,
     credits: Vec<(CellHandle, u64, u64)>,
     covered_seq: u64,
@@ -5224,23 +5251,34 @@ struct ShipRound {
 /// be durable on the followers, which is safe, but crediting them would
 /// release gates past an unresolved earlier round.
 fn apply_round(
-    ledger: &mut celld_logic::log_tier::ShipLedger<Vec<(CellHandle, u64)>>,
-    round: ShipRound,
+    ledger: &mut celld_logic::log_tier::ShipLedger<ShipBatch>,
+    mut round: ShipRound,
 ) -> bool {
+    let marks = std::mem::take(&mut round.marks);
     let proof_last_seq = match &round.completion {
         ShipRoundCompletion::Append(completion) => {
             let Some(last_seq) = completion.last_seq() else {
+                // No fleet proof: a waiter for a mark falls back to its header.
+                for (_, waiter) in marks {
+                    let _ = waiter.send(false);
+                }
                 return false;
             };
             if last_seq > round.covered_seq {
                 ledger.shipped(
                     last_seq,
-                    round
-                        .credits
-                        .iter()
-                        .map(|(handle, _, position)| (handle.clone(), *position))
-                        .collect(),
+                    ShipBatch {
+                        cells: round
+                            .credits
+                            .iter()
+                            .map(|(handle, _, position)| (handle.clone(), *position))
+                            .collect(),
+                        marks: marks.iter().map(|(counter, _)| *counter).collect(),
+                    },
                 );
+            }
+            for (_, waiter) in marks {
+                let _ = waiter.send(true);
             }
             Some(last_seq)
         }

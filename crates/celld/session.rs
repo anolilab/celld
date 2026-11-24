@@ -80,6 +80,8 @@ pub struct Session {
     /// a counter the bucket does not know yet.
     granted: Mutex<BTreeSet<u64>>,
     dirty: Mutex<BTreeSet<u64>>,
+    /// The counters whose bit a chunk in the bucket holds.
+    checkpointed: Mutex<BTreeSet<u64>>,
     /// The session stopped granting: its header closed, or its seal began.
     closed: AtomicBool,
     held: tokio::sync::Mutex<Held>,
@@ -122,6 +124,7 @@ impl Session {
             counted: AtomicU64::new(u64::MAX),
             granted: Mutex::default(),
             dirty: Mutex::default(),
+            checkpointed: Mutex::default(),
             closed: AtomicBool::new(false),
             held: tokio::sync::Mutex::default(),
             established: AtomicBool::new(false),
@@ -350,6 +353,47 @@ pub(crate) struct Held {
     chunks: BTreeMap<u64, (Chunk, String)>,
 }
 
+/// A `Grant` that waits for its fleet proof: the cell, its counter, and the
+/// channel that the ship loop answers when the round that carried it completed.
+pub(crate) struct PendingMark {
+    pub scope: String,
+    pub counter: u64,
+    pub done: tokio::sync::oneshot::Sender<bool>,
+}
+
+static MARKS: Mutex<Vec<PendingMark>> = Mutex::new(Vec::new());
+
+/// Queue the `Grant` of `scope` for the next ship round. The answer is `true`
+/// when every member of the ensemble confirmed it, `false` when the round
+/// failed.
+pub(crate) fn enqueue_mark(scope: &str, counter: u64) -> tokio::sync::oneshot::Receiver<bool> {
+    let (done, wait) = tokio::sync::oneshot::channel();
+    MARKS.lock().expect("marks poisoned").push(PendingMark {
+        scope: scope.to_string(),
+        counter,
+        done,
+    });
+    wait
+}
+
+pub(crate) fn take_marks() -> Vec<PendingMark> {
+    std::mem::take(&mut *MARKS.lock().expect("marks poisoned"))
+}
+
+pub(crate) fn marks_pending() -> bool {
+    !MARKS.lock().expect("marks poisoned").is_empty()
+}
+
+/// Whether the bit of every counter is in a chunk in the bucket. A follower
+/// may truncate a batch with marks only then.
+pub(crate) fn marks_checkpointed(counters: &[u64]) -> bool {
+    counters.is_empty()
+        || current().is_none_or(|session| {
+            let written = session.checkpointed.lock().expect("checkpointed poisoned");
+            counters.iter().all(|counter| written.contains(counter))
+        })
+}
+
 /// How often the session writes the chunks that changed.
 pub fn checkpoint_interval() -> std::time::Duration {
     std::time::Duration::from_millis(
@@ -503,6 +547,10 @@ impl Session {
             next.rev += 1;
             match store::swap_chunk(bucket, &tag, chunk, &next, &token).await? {
                 Some(token) => {
+                    self.checkpointed
+                        .lock()
+                        .expect("checkpointed poisoned")
+                        .extend(next.granted.iter().copied());
                     held.chunks.insert(chunk, (next, token));
                     self.dirty.lock().expect("dirty poisoned").remove(&chunk);
                 }
