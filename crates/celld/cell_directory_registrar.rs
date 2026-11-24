@@ -1029,7 +1029,11 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(outcome, CasOutcome::Rejected));
-        let record = ownership.read_owner("c1").await.unwrap().unwrap();
+        let record = ownership
+            .resolve_owner("c1", crate::ownership_store::RecordReader::Claim)
+            .await
+            .unwrap()
+            .unwrap();
         let outcome = ownership
             .cas_owner("c1", CasGuard::Match(record.etag), 2)
             .await
@@ -1046,7 +1050,11 @@ mod tests {
             .unwrap()
             .waiting
             .clear();
-        let record = ownership.read_owner("c2").await.unwrap().unwrap();
+        let record = ownership
+            .resolve_owner("c2", crate::ownership_store::RecordReader::Claim)
+            .await
+            .unwrap()
+            .unwrap();
         ownership
             .cas_owner("c2", CasGuard::Match(record.etag), 2)
             .await

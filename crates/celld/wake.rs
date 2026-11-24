@@ -9,6 +9,7 @@
 //! whose caller stopped waiting before their remote effect.
 use crate::bucket::Bucket;
 use crate::ownership_store::BucketOwnership;
+use crate::ownership_store::RecordReader;
 use celld_logic::wake::elected_hint_needed;
 use celld_logic::wake::parse_entry_key;
 use celld_logic::wake::WakeCore;
@@ -131,7 +132,9 @@ pub(crate) async fn probe_entries(
         anyhow::Result<Option<celld_logic::OwnerRecord>>,
     )> = stream::iter(entries)
         .map(|(cell, entry_ms)| async move {
-            let owner = ownership.read_owner(&cell).await;
+            let owner = ownership
+                .resolve_owner(&cell, RecordReader::WakeDiscovery)
+                .await;
             (cell, entry_ms, owner)
         })
         .buffer_unordered(ELECTED_PROBE_CONCURRENCY)
@@ -547,7 +550,12 @@ impl WakeFlusher {
             .await?;
         anyhow::ensure!(durable >= source.position, "wake retirement proof is short");
         let owner = ownership
-            .read_owner(cell)
+            .read_owner(
+                cell,
+                RecordReader::WakeRetirement {
+                    epoch: source.id.epoch,
+                },
+            )
             .await
             .map_err(|_| anyhow::anyhow!("wake retirement ownership read failed"))?;
         anyhow::ensure!(

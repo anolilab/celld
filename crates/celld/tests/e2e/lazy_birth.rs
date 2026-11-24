@@ -106,7 +106,7 @@ fn header_tag(project: &Path) -> (String, Value) {
 
 #[tokio::test]
 async fn with_the_flag_off_nothing_names_a_session() {
-    let server = Server::start("do-ids", &[]).await;
+    let server = Server::start("do-ids", &[("CELLD_LAZY_BIRTH", "off")]).await;
     let ids = minted(&server).await;
     assert_eq!(bump(&server, &ids[0]).await, 1);
     let project = server.project();
@@ -339,7 +339,7 @@ async fn a_cell_that_passed_through_a_process_without_a_session_is_claimed_not_r
     let (first_tag, _) = header_tag(server.project());
     assert_eq!(bump(&server, &ids[0]).await, 1);
 
-    server.set_env("CELLD_LAZY_BIRTH", None);
+    server.set_env("CELLD_LAZY_BIRTH", Some("off"));
     server.restart().await;
     assert_eq!(bump(&server, &ids[0]).await, 2);
     let record = own_record(server.project());

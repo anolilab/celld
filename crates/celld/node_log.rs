@@ -22,6 +22,7 @@
 //! re-recruit CASes a fresh ensemble; recovery gathers from every
 //! reachable sealed member and requires at least one.
 
+use crate::ownership_store::RecordReader;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -6493,7 +6494,10 @@ impl NodeLogManager {
             &self.node,
             cell,
             epoch,
-            self.ownership.read_owner(cell).await?.as_ref(),
+            self.ownership
+                .resolve_owner(cell, RecordReader::EpochGc { epoch })
+                .await?
+                .as_ref(),
         ))
     }
 
