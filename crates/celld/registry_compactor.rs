@@ -10,7 +10,7 @@
 //! and base merge are prepared beside the pass loop and commit through
 //! [`reg::apply_job`], which refuses a job whose inputs changed.
 
-use crate::registry::{Io, Registry};
+use crate::registry::{push_capped, Io, Registry};
 use crate::registry_objects as objects;
 use anyhow::Context as _;
 use celld_logic::registry::{
@@ -114,6 +114,11 @@ impl RunReader {
         })
     }
 
+    /// The records of the next buckets, or `None` at the end, for the debug route.
+    pub(crate) async fn next_chunk_public(&mut self) -> anyhow::Result<Option<Vec<Record>>> {
+        self.next_chunk().await
+    }
+
     /// The records of the next buckets, or `None` at the end.
     async fn next_chunk(&mut self) -> anyhow::Result<Option<Vec<Record>>> {
         if self.next >= self.buckets {
@@ -156,6 +161,9 @@ pub(crate) enum Source {
     Nothing,
     Records(Vec<Record>, usize),
     Run(Box<RunReader>),
+    /// Records from a closure, for the aging tool.
+    #[cfg(test)]
+    Generated(Box<dyn FnMut() -> Option<Vec<Record>> + Send>),
 }
 
 impl Source {
@@ -172,6 +180,8 @@ impl Source {
                 Ok(Some(chunk))
             }
             Self::Run(reader) => reader.next_chunk().await,
+            #[cfg(test)]
+            Self::Generated(generate) => Ok(generate()),
         }
     }
 
@@ -904,6 +914,13 @@ const WATCH_PASS_FLOOR_MS: u64 = 5_000;
 const RECOVERY_VALID_MS: u64 = 60_000;
 
 impl Registry {
+    /// The holder's last event of a kind, for the debug state route.
+    fn log_event(&self, key: &str, value: serde_json::Value) {
+        if crate::registry_api::enabled() {
+            self.debug.lock().unwrap().insert(key.to_owned(), value);
+        }
+    }
+
     fn recovered_recently(&self, node: &str, session: &str, now: u64) -> bool {
         self.recovered
             .lock()
@@ -1155,6 +1172,10 @@ impl Registry {
     /// Write the holder's root. `false` when the write lost: another node holds
     /// the role now.
     async fn write_root(&self, holding: &mut Holding) -> anyhow::Result<bool> {
+        let delay = self.holds.root_write_ms.load(Ordering::Relaxed);
+        if delay > 0 {
+            crate::asyncrt::sleep(Duration::from_millis(delay)).await;
+        }
         holding.root.heartbeat += 1;
         let (streak, stuck) = reg::after_write(holding.root.streak, holding.root.stuck);
         holding.root.streak = streak;
@@ -1221,6 +1242,7 @@ impl Registry {
         mut holding: Holding,
         stop: &crate::ltx_repl::StopToken,
     ) -> Ended {
+        let mut gap_from = crate::asyncrt::mono_ms();
         loop {
             // A pass that left segments unread is followed by another at once
             // (after a short gap), not a whole period later.
@@ -1240,7 +1262,25 @@ impl Registry {
                 _ = self.pass_now.notified() => {}
                 _ = crate::asyncrt::sleep(pass_ms) => {}
             }
+            let began = crate::asyncrt::mono_us();
+            let now = crate::asyncrt::mono_ms();
             let outcome = self.pass(&mut holding).await;
+            let elapsed = crate::asyncrt::mono_us().saturating_sub(began);
+            {
+                let mut samples = self.samples.lock().unwrap();
+                push_capped(&mut samples.pass_us, elapsed);
+                push_capped(&mut samples.pass_gap_ms, now.saturating_sub(gap_from));
+                push_capped(
+                    &mut samples.pass_log,
+                    (
+                        now,
+                        elapsed,
+                        holding.running.load(Ordering::SeqCst) as u64,
+                        holding.last_folded,
+                    ),
+                );
+            }
+            gap_from = now;
             match outcome {
                 Ok(true) => {}
                 Ok(false) => {
@@ -1546,6 +1586,17 @@ impl Registry {
     /// Apply the jobs prepared since the last pass, spills first. A job whose
     /// inputs changed is discarded and its objects deleted.
     async fn commit_prepared(self: &Arc<Self>, holding: &mut Holding) -> anyhow::Result<bool> {
+        self.log_event(
+            "jobs",
+            serde_json::json!({
+                "running": holding.running.load(Ordering::SeqCst),
+                "prepared": holding.prepared.lock().unwrap().len(),
+                "forced": self.forced.lock().unwrap().len(),
+            }),
+        );
+        if self.holds.commit.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
         let mut prepared: Vec<Prepared> = std::mem::take(&mut *holding.prepared.lock().unwrap());
         // A seed that waits for its lease verdict is looked at again at every pass.
         if let Some(job) = holding.seed_waiting.take() {
@@ -1775,6 +1826,18 @@ impl Registry {
     }
 
     fn record_job(&self, job: &Prepared, outcome: &str) {
+        push_capped(
+            &mut self.samples.lock().unwrap().job_ms,
+            (format!("{}:{outcome}", job.kind), job.ms),
+        );
+        self.log_event(
+            "last_job",
+            serde_json::json!({
+                "kind": job.kind, "outcome": outcome, "ms": job.ms, "partitions": job.partitions,
+                "records": job.stats.records, "bytes_read": job.stats.bytes_read,
+                "bytes_written": job.stats.bytes_written, "parts": job.stats.parts,
+            }),
+        );
         tracing::info!(
             event = "registry_job",
             kind = job.kind,
@@ -1793,8 +1856,11 @@ impl Registry {
 
     /// Start a spill or a base merge when one is due. One job runs at a time.
     fn schedule(self: &Arc<Self>, holding: &mut Holding) {
-        let busy = holding.running.load(Ordering::SeqCst) > 0
-            || !holding.prepared.lock().unwrap().is_empty();
+        // The schedule hold lets a second job prepare while one runs.
+        let serial = !self.holds.schedule.load(Ordering::Relaxed);
+        let busy = serial
+            && (holding.running.load(Ordering::SeqCst) > 0
+                || !holding.prepared.lock().unwrap().is_empty());
         let now = crate::asyncrt::mono_ms();
         for (kind, partition) in std::mem::take(&mut *holding.advanced.lock().unwrap()) {
             match (kind, partition) {
@@ -1842,7 +1908,13 @@ impl Registry {
                 .map_or(u64::MAX, |at| now.saturating_sub(at)),
             self.cfg.spill_ms,
         ) && !holding.root.deltas.is_empty();
-        let kind = if spill {
+        let forced = self.forced.lock().unwrap().pop_front();
+        let kind = if let Some((kind, partition)) = forced {
+            Some(match kind.as_str() {
+                "spill" => ("spill", None),
+                _ => ("base_merge", Some(partition)),
+            })
+        } else if spill {
             let reason = match holding.last_spill_ms {
                 None => &self.counters.spills_takeover,
                 Some(_) if live >= reg::SPILL_RECORDS => &self.counters.spills_records,
@@ -2358,6 +2430,33 @@ impl Registry {
     }
 }
 
+/// One partition's bounds and runs, for the debug route.
+pub(crate) fn partition_report(map: &Map, index: usize) -> serde_json::Value {
+    let partition = map.partitions[index];
+    serde_json::json!({
+        "partition": index, "lo": format!("{:016x}", partition.lo), "hi": format!("{:016x}", map.hi(index)),
+        "l1": level_json(&partition.l1), "l2": level_json(&partition.l2),
+    })
+}
+
+fn level_json(level: &Level) -> serde_json::Value {
+    match level {
+        Level::Empty => serde_json::json!("empty"),
+        Level::Run(run) => serde_json::json!({
+            "epoch": run.epoch, "id": run.id, "buckets": run.buckets,
+            "overflow": run.overflow, "records": run.records,
+        }),
+    }
+}
+
 #[cfg(test)]
 #[path = "registry_compactor/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "registry_compactor/synth.rs"]
+mod synth;
+
+#[cfg(test)]
+#[path = "registry_compactor/smoke.rs"]
+mod smoke;

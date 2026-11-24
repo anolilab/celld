@@ -82,6 +82,7 @@ pub mod queue_policy;
 pub mod r2_cli;
 pub(crate) mod r2_store;
 pub mod registry;
+pub mod registry_api;
 pub(crate) mod registry_compactor;
 pub(crate) mod registry_objects;
 pub(crate) mod registry_pace;
