@@ -102,6 +102,7 @@ async fn lookup_against_list_smoke() {
             seed_page: 1_000,
             sampler_recheck_ms: 20_000,
             job_pacing: true,
+            lease_ttl_ms: crate::machine::lease_ttl_ms_from_environment(),
             pass_read: Duration::from_secs(1),
         },
     );
