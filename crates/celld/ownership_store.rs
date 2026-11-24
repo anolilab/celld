@@ -266,8 +266,8 @@ pub struct NodeLoadWire {
     /// cell an old node cannot restore.
     #[serde(default)]
     pub bucket_format: Option<u16>,
-    /// The node follows the registry's writer rule (`CELLD_BIRTH_REGISTRY` not
-    /// `off`, with fleet durability). Always written, so a lease without the key
+    /// The node follows the registry's writer rule: this process installed a
+    /// registry and attached it to its ownership store. Always written, so a lease without the key
     /// is told from a node that is outside the rule: the first is a binary from
     /// before the registry, and neither may write per-cell objects while the
     /// registry's gate is open.
