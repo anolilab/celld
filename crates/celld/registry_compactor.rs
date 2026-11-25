@@ -915,9 +915,9 @@ const RECOVERY_VALID_MS: u64 = 60_000;
 
 impl Registry {
     /// The holder's last event of a kind, for the debug state route.
-    fn log_event(&self, key: &str, value: serde_json::Value) {
+    fn log_event(&self, key: &str, value: impl FnOnce() -> serde_json::Value) {
         if crate::registry_api::enabled() {
-            self.debug.lock().unwrap().insert(key.to_owned(), value);
+            self.debug.lock().unwrap().insert(key.to_owned(), value());
         }
     }
 
@@ -1266,7 +1266,7 @@ impl Registry {
             let now = crate::asyncrt::mono_ms();
             let outcome = self.pass(&mut holding).await;
             let elapsed = crate::asyncrt::mono_us().saturating_sub(began);
-            {
+            if crate::registry_api::enabled() {
                 let mut samples = self.samples.lock().unwrap();
                 push_capped(&mut samples.pass_us, elapsed);
                 push_capped(&mut samples.pass_gap_ms, now.saturating_sub(gap_from));
@@ -1586,14 +1586,13 @@ impl Registry {
     /// Apply the jobs prepared since the last pass, spills first. A job whose
     /// inputs changed is discarded and its objects deleted.
     async fn commit_prepared(self: &Arc<Self>, holding: &mut Holding) -> anyhow::Result<bool> {
-        self.log_event(
-            "jobs",
+        self.log_event("jobs", || {
             serde_json::json!({
                 "running": holding.running.load(Ordering::SeqCst),
                 "prepared": holding.prepared.lock().unwrap().len(),
                 "forced": self.forced.lock().unwrap().len(),
-            }),
-        );
+            })
+        });
         if self.holds.commit.load(Ordering::Relaxed) {
             return Ok(false);
         }
@@ -1834,18 +1833,19 @@ impl Registry {
     }
 
     fn record_job(&self, job: &Prepared, outcome: &str) {
-        push_capped(
-            &mut self.samples.lock().unwrap().job_ms,
-            (format!("{}:{outcome}", job.kind), job.ms),
-        );
-        self.log_event(
-            "last_job",
+        if crate::registry_api::enabled() {
+            push_capped(
+                &mut self.samples.lock().unwrap().job_ms,
+                (format!("{}:{outcome}", job.kind), job.ms),
+            );
+        }
+        self.log_event("last_job", || {
             serde_json::json!({
                 "kind": job.kind, "outcome": outcome, "ms": job.ms, "partitions": job.partitions,
                 "records": job.stats.records, "bytes_read": job.stats.bytes_read,
                 "bytes_written": job.stats.bytes_written, "parts": job.stats.parts,
-            }),
-        );
+            })
+        });
         tracing::info!(
             event = "registry_job",
             kind = job.kind,
@@ -1917,11 +1917,14 @@ impl Registry {
             self.cfg.spill_ms,
         ) && !holding.root.deltas.is_empty();
         let forced = self.forced.lock().unwrap().pop_front();
-        let kind = if let Some((kind, partition)) = forced {
-            Some(match kind.as_str() {
-                "spill" => ("spill", None),
-                _ => ("base_merge", Some(partition)),
-            })
+        let kind = if let Some((forced_kind, partition)) = forced {
+            // The debug route checks the name and the partition; anything else
+            // that reaches here is dropped, not run as a base merge.
+            match forced_kind.as_str() {
+                "spill" => Some(("spill", None)),
+                "base_merge" => Some(("base_merge", Some(partition))),
+                _ => None,
+            }
         } else if spill {
             let reason = match holding.last_spill_ms {
                 None => &self.counters.spills_takeover,

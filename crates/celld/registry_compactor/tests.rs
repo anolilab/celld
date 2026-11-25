@@ -3228,6 +3228,25 @@ async fn a_map_a_failed_commit_may_have_written_is_deleted_after_the_grace() {
 }
 
 #[tokio::test]
+async fn a_lookup_counts_only_the_deltas_it_read_itself() {
+    let store = memory();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    let reader = registry_on(&store, "reader");
+    register_and_fold(&node, &mut holding, &[cell(1)]).await;
+    // A refresh outside a lookup (the watch loop, the cover poll) loads the delta.
+    assert!(reader.refresh(&Io::default()).await.is_some());
+    let load = |value: &std::sync::atomic::AtomicU64| value.load(Ordering::Relaxed);
+    assert_eq!(load(&reader.counters.delta_loads), 1);
+    assert_eq!(load(&reader.counters.lookup_delta_loads), 0);
+    // The next delta is read by a lookup, and only that one is counted as its own.
+    register_and_fold(&node, &mut holding, &[cell(2)]).await;
+    assert!(matches!(answer(&reader, &cell(2)).await, Answer::Exists(_)));
+    assert_eq!(load(&reader.counters.delta_loads), 2);
+    assert_eq!(load(&reader.counters.lookup_delta_loads), 1);
+}
+
+#[tokio::test]
 async fn a_map_a_commit_replaced_is_deleted_after_the_grace() {
     let store = memory();
     let node = registry_with(

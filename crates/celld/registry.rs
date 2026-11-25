@@ -221,12 +221,20 @@ pub(crate) struct Snapshot {
 pub(crate) struct Io {
     pub gets: AtomicU64,
     pub bytes: AtomicU64,
+    /// Of `gets`, the delta reads this lookup made itself.
+    pub delta_gets: AtomicU64,
 }
 
 impl Io {
     pub(crate) fn get(&self, bytes: usize) {
         self.gets.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// A delta read, which is also a get.
+    pub(crate) fn delta_get(&self, bytes: usize) {
+        self.get(bytes);
+        self.delta_gets.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -248,6 +256,10 @@ pub(crate) struct Counters {
     pub bytes: AtomicU64,
     pub root_reads: AtomicU64,
     pub delta_loads: AtomicU64,
+    /// Of `delta_loads`, the deltas a lookup read itself, which are the ones in
+    /// its `gets`; the watch loop, the cover poll and the debug routes read the
+    /// others.
+    pub lookup_delta_loads: AtomicU64,
     pub segments_written: AtomicU64,
     pub backstop_lookups: AtomicU64,
     pub backstop_exists: AtomicU64,
@@ -695,7 +707,7 @@ impl Registry {
         let load = cell
             .get_or_try_init(|| async {
                 let (delta, size) = objects::read_delta(store.as_ref(), &self.prefix, id).await?;
-                io.get(size);
+                io.delta_get(size);
                 if pushed {
                     &self.counters.prefetch_loads
                 } else {
@@ -890,6 +902,9 @@ impl Registry {
         let counters = &self.counters;
         counters.lookups.fetch_add(1, Ordering::Relaxed);
         counters.gets.fetch_add(gets, Ordering::Relaxed);
+        counters
+            .lookup_delta_loads
+            .fetch_add(io.delta_gets.load(Ordering::Relaxed), Ordering::Relaxed);
         counters.bytes.fetch_add(bytes, Ordering::Relaxed);
         match answer {
             Answer::New => &counters.new,
@@ -897,7 +912,9 @@ impl Registry {
             Answer::Unknown(_) => &counters.unknown,
         }
         .fetch_add(1, Ordering::Relaxed);
-        push_capped(&mut self.samples.lock().unwrap().lookup_us, micros);
+        if crate::registry_api::enabled() {
+            push_capped(&mut self.samples.lock().unwrap().lookup_us, micros);
+        }
         LookupResult {
             answer,
             gets,
@@ -1018,6 +1035,7 @@ impl Registry {
             ("bytes", &counters.bytes),
             ("root_reads", &counters.root_reads),
             ("delta_loads", &counters.delta_loads),
+            ("lookup_delta_loads", &counters.lookup_delta_loads),
             ("segments_written", &counters.segments_written),
             ("backstop_lookups", &counters.backstop_lookups),
             ("backstop_exists", &counters.backstop_exists),
@@ -1082,8 +1100,20 @@ impl Registry {
 
     /// The raw samples for the bench, and a reset of them when `take`.
     pub(crate) fn samples_json(&self, take: bool) -> serde_json::Value {
+        // Cells claimed here that no root has named after 20 s: they leave no
+        // sample, so the gate reads them from the queue.
+        let now = crate::asyncrt::mono_ms();
+        let uncovered_over_20s = self
+            .queue
+            .lock()
+            .unwrap()
+            .created
+            .values()
+            .filter(|created| now.saturating_sub(created.claim_ms) > 20_000)
+            .count();
         let mut samples = self.samples.lock().unwrap();
         let value = serde_json::json!({
+            "uncovered_over_20s": uncovered_over_20s,
             "lookup_us": samples.lookup_us,
             "claim_to_covered_ms": samples.claim_to_covered_ms,
             "segment_to_covered_ms": samples.segment_to_covered_ms,
