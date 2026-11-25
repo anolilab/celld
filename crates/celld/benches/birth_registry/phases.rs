@@ -310,6 +310,10 @@ pub fn counters_without(
 }
 
 pub fn percentiles(values: &[u64]) -> Value {
+    if values.is_empty() {
+        // Nothing measured: a gate reads null and fails, not 0.
+        return json!({ "n": 0, "p50": null, "p99": null, "max": null });
+    }
     json!({
         "n": values.len(), "p50": ms_p(values, 50.0), "p99": ms_p(values, 99.0),
         "max": ms_p(values, 100.0),
@@ -360,7 +364,7 @@ pub async fn guard_answers(fleet: &Fleet, nodes: &[usize]) -> Value {
     })
 }
 
-const COUNTERS: [&str; 40] = [
+const COUNTERS: [&str; 41] = [
     "spills_takeover",
     "spills_records",
     "spills_deltas",
@@ -373,6 +377,7 @@ const COUNTERS: [&str; 40] = [
     "bytes",
     "root_reads",
     "delta_loads",
+    "lookup_delta_loads",
     "segments_written",
     "backstop_lookups",
     "backstop_exists",
@@ -693,6 +698,8 @@ async fn load_phase(cfg: Cfg) {
                 .collect::<Vec<_>>(),
             "jobs": samples.iter().flat_map(|node| node["job_ms"].as_array().cloned().unwrap_or_default()).collect::<Vec<_>>(),
             "waits": samples.iter().flat_map(|node| node["waits"].as_array().cloned().unwrap_or_default()).collect::<Vec<_>>(),
+            // Claimed cells no root named after 20 s, from the nodes' queues at read time.
+            "uncovered_over_20s": samples.iter().map(|node| node["uncovered_over_20s"].as_u64().unwrap_or(0)).sum::<u64>(),
         },
         "guard": guard,
         "counters": counters,
@@ -766,6 +773,9 @@ pub async fn check_each_node(rig: &Rig, keys: Vec<(String, Expect)>) -> probe::C
                 sum.misses += check.misses;
                 sum.bases += check.bases;
                 sum.first_misses.extend(check.first_misses);
+                for (doubt, count) in check.doubts {
+                    *sum.doubts.entry(doubt).or_default() += count;
+                }
                 sum
             }
         });
@@ -893,13 +903,14 @@ async fn deleted_records(rig: &Rig, cells: &[(String, String)]) -> Value {
                 };
                 at += 1;
                 let url = format!("{}/agent/{name}", ep.public(at % ep.count()));
-                if ep
-                    .client
-                    .post(url)
-                    .send()
-                    .await
-                    .is_ok_and(|r| r.status().is_success())
-                {
+                // Only the node's own refusal (503) counts as refused. A claim that
+                // was served, failed to connect or got another status is not a
+                // refusal and fails the check.
+                let refused = match ep.client.post(url).send().await {
+                    Ok(response) => response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    Err(_) => false,
+                };
+                if !refused {
                     served.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -1342,7 +1353,10 @@ fn gates_of(cfg: &Cfg, result: &Value, gates: &mut Gates) {
     if cfg.lookups > 0.0 {
         let list_p99 = result["guard"]["list_ms"]["p99"].as_f64();
         let p99 = n(&lookups["node_p99_ms"]);
-        let shape = n(&lookups["gets_mean"]) <= 3.05 && n(&lookups["bytes_mean"]) <= 16384.0;
+        // A lookup that failed, or no lookup at all, fails the gates that read them.
+        let answered = lookups["complete"] == true;
+        let shape =
+            answered && n(&lookups["gets_mean"]) <= 3.05 && n(&lookups["bytes_mean"]) <= 16384.0;
         if cfg.name == "real" {
             // G-t: the absolute latency is reported, not gated.
             let covered = &result["node_samples"]["pass_to_covered_ms"];
@@ -1363,14 +1377,23 @@ fn gates_of(cfg: &Cfg, result: &Value, gates: &mut Gates) {
                 hold(p99 <= 25.0 && shape),
             );
         }
-        gates.add("G-b", json!({ "unknown_pct": lookups["unknown_pct"], "unknown": lookups["unknown"], "of": lookups["total"] }), "< 0.5 %", hold(n(&lookups["unknown_pct"]) < 0.5));
+        gates.add("G-b", json!({ "unknown_pct": lookups["unknown_pct"], "unknown": lookups["unknown"], "of": lookups["answered"], "failed": lookups["failed"] }), "< 0.5 % of the answered lookups; no failed lookup; at least one answered", hold(answered && n(&lookups["unknown_pct"]) < 0.5));
     }
     let ns = &result["node_samples"];
     gates.add(
         "G-d",
-        json!({ "claim_to_covered_p99_ms": ns["claim_to_covered_ms"]["p99"], "segment_to_covered_p99_ms": ns["segment_to_covered_ms"]["p99"], "pass_to_covered_p99_ms": ns["pass_to_covered_ms"]["p99"], "claim_n": ns["claim_to_covered_ms"]["n"] }),
-        "<= 20 s; <= 8 s; <= 2 s",
-        hold(n(&ns["claim_to_covered_ms"]["p99"]) <= 20_000.0 && n(&ns["segment_to_covered_ms"]["p99"]) <= 8_000.0 && n(&ns["pass_to_covered_ms"]["p99"]).max(0.0) <= 2_000.0),
+        json!({ "claim_to_covered_p99_ms": ns["claim_to_covered_ms"]["p99"], "segment_to_covered_p99_ms": ns["segment_to_covered_ms"]["p99"], "pass_to_covered_p99_ms": ns["pass_to_covered_ms"]["p99"], "claim_n": ns["claim_to_covered_ms"]["n"], "pass_n": ns["pass_to_covered_ms"]["n"], "uncovered_over_20s": ns["uncovered_over_20s"] }),
+        "<= 20 s; <= 8 s; <= 2 s (when a write waited); samples present; no claimed cell uncovered after 20 s",
+        // A phase with no claims, or a claim that stayed uncovered, fails. The
+        // third clause is measured only when a first write waited for a pass.
+        hold(
+            ns["claim_to_covered_ms"]["n"].as_u64().unwrap_or(0) > 0
+                && ns["uncovered_over_20s"] == 0
+                && n(&ns["claim_to_covered_ms"]["p99"]) <= 20_000.0
+                && n(&ns["segment_to_covered_ms"]["p99"]) <= 8_000.0
+                && (ns["pass_to_covered_ms"]["n"].as_u64().unwrap_or(0) == 0
+                    || n(&ns["pass_to_covered_ms"]["p99"]) <= 2_000.0),
+        ),
     );
     gates.add(
         "G-m",

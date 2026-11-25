@@ -72,11 +72,16 @@ fn units(result: &Value) -> Option<Value> {
     let spills = c("spills");
     let merges = c("base_merges");
     let windows = window / 10.0;
-    let lookup_run_gets = c("gets") - c("delta_loads") - c("root_reads");
+    // A lookup's GETs are one root read, the run buckets and the deltas it read
+    // itself; the deltas the watch loop and the cover poll read are not in them.
+    let lookup_run_gets = c("gets") - c("lookup_delta_loads") - lookups;
+    // Root GETs beyond the one each lookup makes: the watch loop of every node.
+    let watch_root_gets = (get("GET root") - lookups).max(0.0);
     Some(json!({
         "nodes": nodes, "window_s": window, "passes": passes, "lookups": lookups, "spills": spills, "base_merges": merges,
         "tally": counts,
-        "lookup_gets_per_agent": (c("root_reads") + lookup_run_gets) / lookups.max(1.0),
+        "lookup_gets_per_agent": (lookups + lookup_run_gets) / lookups.max(1.0),
+        "watch_root_gets_per_node_per_s": watch_root_gets / (nodes * window).max(1.0),
         "segment_puts_per_node_per_window": get("PUT seg") / (nodes * windows).max(1.0),
         "segment_gets_per_segment": get("GET seg") / get("PUT seg").max(1.0),
         "lists_per_pass": get("LIST seg") / passes.max(1.0),
@@ -178,6 +183,7 @@ pub async fn report() {
         let run_puts = mean("run_puts_per_spill");
         let run_gets = mean("run_gets_per_spill");
         let passes_per_s = mean("passes_per_s");
+        let watch_root_gets = mean("watch_root_gets_per_node_per_s");
         let months_windows = MONTH_S / 10.0;
         let passes = passes_per_s * MONTH_S;
         let spills = MONTH_S / 900.0;
@@ -188,6 +194,8 @@ pub async fn report() {
             "passes": { "a": passes * a_per_pass },
             "node_delta_reads": { "b": (NODES - 1.0) * passes * delta_gets },
             // The holder's push: node-to-node HTTP, no bucket request, so no a or b.
+            // Root reads by the watch loop of each node, beyond the lookups' own.
+            "watch_root_reads": { "b": NODES * MONTH_S * watch_root_gets },
             "root_push": { "http_requests": (NODES - 1.0) * passes, "bucket_requests": 0.0 },
             "spills": { "a": spills * run_puts, "b": spills * run_gets },
             "base_merges": { "a": 0.5e6 },

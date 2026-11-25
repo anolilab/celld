@@ -385,8 +385,10 @@ pub async fn compactor_kill() {
         stats.stop.store(true, Ordering::Relaxed);
         let _ = task.await;
         let summary = stats.summary();
-        unknown_total +=
-            summary["unknown"].as_u64().unwrap_or(0) + summary["wrong"].as_u64().unwrap_or(0);
+        unknown_total += summary["unknown"].as_u64().unwrap_or(0)
+            + summary["wrong"].as_u64().unwrap_or(0)
+            + summary["failed"].as_u64().unwrap_or(0)
+            + u64::from(summary["answered"].as_u64().unwrap_or(0) == 0);
         rows.push(json!({ "case": case, "holder": holder, "handover_root_ms": handover, "next_holder_root_ms": next, "lookups": summary }));
         say!("{case}: {}", rows.last().unwrap());
         rig.fleet.restart(holder).await;
@@ -411,8 +413,10 @@ pub async fn compactor_kill() {
     stats.stop.store(true, Ordering::Relaxed);
     let _ = task.await;
     let summary = stats.summary();
-    unknown_total +=
-        summary["unknown"].as_u64().unwrap_or(0) + summary["wrong"].as_u64().unwrap_or(0);
+    unknown_total += summary["unknown"].as_u64().unwrap_or(0)
+        + summary["wrong"].as_u64().unwrap_or(0)
+        + summary["failed"].as_u64().unwrap_or(0)
+        + u64::from(summary["answered"].as_u64().unwrap_or(0) == 0);
     rows.push(json!({ "case": "kill_quiet", "holder": holder, "next_holder_root_ms": quiet, "lookups": summary }));
     let ms = |case: usize, key: &str| rows[case][key].as_u64();
     gates.add(
@@ -943,7 +947,7 @@ pub async fn flap() {
     stats.stop.store(true, Ordering::Relaxed);
     let _ = lookup_task.await;
     let summary = stats.summary();
-    gates.add("G-b", json!({ "unknown": summary["unknown"], "wrong": summary["wrong"], "of": summary["total"] }), "0 (the 35 s root hold runs with the default 2 s lookup deadline: only Unknown from a lookup counts)", Some(summary["wrong"] == 0 && summary["unknown"] == 0));
+    gates.add("G-b", json!({ "failed": summary["failed"], "answered": summary["answered"], "unknown": summary["unknown"], "wrong": summary["wrong"], "of": summary["total"] }), "0 (the 35 s root hold runs with the default 2 s lookup deadline: only Unknown from a lookup counts)", Some(summary["wrong"] == 0 && summary["unknown"] == 0 && summary["complete"] == true));
     let (births, generator) = load.stop().await;
     tokio::time::sleep(Duration::from_secs(60)).await;
     let check = full_aged_check(&rig, 10_000, 2_000).await;
