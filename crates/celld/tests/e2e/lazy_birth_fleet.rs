@@ -1015,8 +1015,8 @@ async fn bundles(fleet: &Fleet) -> usize {
         .count()
 }
 
-/// S10. The bucket refuses every request for 60 s while a node grants ids; then
-/// the node is killed. Meanwhile no object of a cell and no release is written
+/// S10. The bucket refuses every request for 60 s while a node grants ids (every
+/// node halts when its lease cannot be renewed); then the fleet is started again. Meanwhile no object of a cell and no release is written
 /// (so the bundles that carry the marks stay), and afterwards every id that was
 /// acknowledged is in the sealed chunk of its session, and the retained bundles
 /// are back to the count of an idle fleet within two minutes.
@@ -1073,8 +1073,16 @@ async fn s10_a_bucket_that_refuses_for_a_minute_loses_no_acknowledged_grant() {
             bundles(&fleet).await >= 1,
             "the bundles that carry the marks are kept"
         );
-        fleet.nodes[0].kill();
+        // A node that cannot renew its lease halts; an orchestrator starts the
+        // fleet again once the store is back, and each start seals the session
+        // of its predecessor.
+        for node in &mut fleet.nodes {
+            node.kill();
+        }
         proxy.refuse(false);
+        for index in 0..3 {
+            fleet.respawn(index, SHADOW).await;
+        }
         let tag = acknowledged[0][..16].to_string();
         let header = wait_until("the seal", Duration::from_secs(120), || async {
             let header = fleet.object(&format!("fleet/sessions/{tag}.json")).await?;
@@ -1107,6 +1115,23 @@ async fn s10_a_bucket_that_refuses_for_a_minute_loses_no_acknowledged_grant() {
         .await;
     };
     let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+    if outcome.is_err() {
+        for (index, node) in fleet.nodes.iter().enumerate() {
+            let log = node.log();
+            let tail: Vec<&str> = log
+                .lines()
+                .filter(|line| {
+                    ["FENCE", "seal", "recover", "session", "lease"]
+                        .iter()
+                        .any(|word| line.contains(word))
+                })
+                .collect();
+            eprintln!(
+                "node {index}:\n{}",
+                tail[tail.len().saturating_sub(25)..].join("\n")
+            );
+        }
+    }
     proxy.refuse(false);
     fleet.nodes.clear();
     fleet.clean().await;
