@@ -894,9 +894,12 @@ async fn deleted_records(rig: &Rig, cells: &[(String, String)]) -> Value {
     // What the claims after the record's loss got back: the count of each
     // status, and of connection errors.
     let statuses: Arc<Mutex<BTreeMap<String, u64>>> = Arc::default();
+    // The first bodies of each status, cut to 300 bytes, to tell what produced it.
+    let bodies: Arc<Mutex<BTreeMap<String, Vec<String>>>> = Arc::default();
     let mut tasks = Vec::new();
     for worker in 0..16 {
-        let (ep, queue, statuses) = (ep.clone(), queue.clone(), statuses.clone());
+        let (ep, queue, statuses, bodies) =
+            (ep.clone(), queue.clone(), statuses.clone(), bodies.clone());
         tasks.push(tokio::spawn(async move {
             let mut at = worker;
             loop {
@@ -905,10 +908,21 @@ async fn deleted_records(rig: &Rig, cells: &[(String, String)]) -> Value {
                 };
                 at += 1;
                 let url = format!("{}/agent/{name}", ep.public(at % ep.count()));
-                let seen = match ep.client.post(url).send().await {
-                    Ok(response) => response.status().as_u16().to_string(),
-                    Err(_) => "connection_error".to_owned(),
+                let (seen, body) = match ep.client.post(url).send().await {
+                    Ok(response) => {
+                        let status = response.status().as_u16().to_string();
+                        let text = response.text().await.unwrap_or_default();
+                        (status, text.chars().take(300).collect::<String>())
+                    }
+                    Err(error) => ("connection_error".to_owned(), error.to_string()),
                 };
+                {
+                    let mut bodies = bodies.lock().unwrap();
+                    let kept = bodies.entry(seen.clone()).or_default();
+                    if kept.len() < 3 {
+                        kept.push(body);
+                    }
+                }
                 *statuses.lock().unwrap().entry(seen).or_default() += 1;
             }
         }));
@@ -917,9 +931,10 @@ async fn deleted_records(rig: &Rig, cells: &[(String, String)]) -> Value {
         let _ = task.await;
     }
     let statuses = statuses.lock().unwrap().clone();
+    let bodies = bodies.lock().unwrap().clone();
     let unconfirmed = unconfirmed_refusals(&statuses);
     json!({ "cells": evicted.len(), "with_ltx": with_ltx, "deleted": deleted, "registry": check.json(),
-            "statuses": statuses, "unconfirmed_refusals": unconfirmed, "served_after_loss": unconfirmed })
+            "statuses": statuses, "bodies": bodies, "unconfirmed_refusals": unconfirmed, "served_after_loss": unconfirmed })
 }
 
 /// The answers that are not a refusal until one is confirmed: every status but
