@@ -50,6 +50,16 @@ pub fn us_to_ms_p(values: &[u64], percent: f64) -> f64 {
     ms_p(values, percent) / 1000.0
 }
 
+/// A percentile in milliseconds of microsecond samples, or null with none: a
+/// gate that reads null fails instead of reading a percentile of nothing as 0.
+pub fn us_to_ms_p_json(values: &[u64], percent: f64) -> Value {
+    if values.is_empty() {
+        Value::Null
+    } else {
+        json!(us_to_ms_p(values, percent))
+    }
+}
+
 /// What the aging tool left for the bench: keys that exist and keys that do not.
 #[derive(Default, Clone)]
 pub struct Samples {
@@ -145,6 +155,10 @@ impl Lookups {
             self.bytes.lock().unwrap().clone(),
         );
         let total = self.total.load(Ordering::Relaxed);
+        let failed = self.failed.load(Ordering::Relaxed);
+        // The lookups a node answered: a request that failed, timed out or got
+        // a status other than 2xx says nothing about `Unknown`.
+        let answered = total.saturating_sub(failed);
         // A lookup that read more than the common three GETs or 16 KiB loaded a
         // delta (or a map, or met a changed run): the cause G-a's relative clause
         // would fail on, apart from the common one-round-trip lookup.
@@ -164,13 +178,16 @@ impl Lookups {
             "exists": self.exists.load(Ordering::Relaxed),
             "new": self.new.load(Ordering::Relaxed),
             "unknown": self.unknown.load(Ordering::Relaxed),
-            "unknown_pct": self.unknown.load(Ordering::Relaxed) as f64 * 100.0 / total.max(1) as f64,
+            "answered": answered,
+            "unknown_pct": self.unknown.load(Ordering::Relaxed) as f64 * 100.0 / answered.max(1) as f64,
+            // Every request got an answer, and there was at least one.
+            "complete": failed == 0 && answered > 0,
             "wrong": self.wrong.load(Ordering::Relaxed),
             "failed": self.failed.load(Ordering::Relaxed),
-            "node_p50_ms": us_to_ms_p(&node, 50.0),
-            "node_p99_ms": us_to_ms_p(&node, 99.0),
-            "node_max_ms": us_to_ms_p(&node, 100.0),
-            "rtt_p99_ms": us_to_ms_p(&rtt, 99.0),
+            "node_p50_ms": us_to_ms_p_json(&node, 50.0),
+            "node_p99_ms": us_to_ms_p_json(&node, 99.0),
+            "node_max_ms": us_to_ms_p_json(&node, 100.0),
+            "rtt_p99_ms": us_to_ms_p_json(&rtt, 99.0),
             "gets_mean": gets.iter().sum::<u64>() as f64 / gets.len().max(1) as f64,
             "gets_max": gets.iter().max().copied().unwrap_or(0),
             "bytes_mean": bytes.iter().sum::<u64>() as f64 / bytes.len().max(1) as f64,
