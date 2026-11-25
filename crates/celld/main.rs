@@ -2864,7 +2864,16 @@ async fn internal_registry_debug(request: Request<Incoming>, path: String) -> Ht
         })
         .unwrap_or_default();
     let body = match collect_limited_body(request.into_body(), MAX_PEER_PROTOCOL_BODY_BYTES).await {
-        Ok(body) => serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        Ok(body) if body.is_empty() => serde_json::Value::Null,
+        Ok(body) => match serde_json::from_slice(&body) {
+            Ok(body) => body,
+            Err(_) => {
+                return response(
+                    StatusCode::BAD_REQUEST,
+                    "{\"error\":\"the body is not JSON\"}",
+                )
+            }
+        },
         Err(error) => return body_read_error("registry", error),
     };
     match celld::registry_api::serve(&registry, &method, &path, &query, &body).await {
