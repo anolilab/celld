@@ -891,10 +891,12 @@ async fn deleted_records(rig: &Rig, cells: &[(String, String)]) -> Value {
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>(),
     ));
-    let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // What the claims after the record's loss got back: the count of each
+    // status, and of connection errors.
+    let statuses: Arc<Mutex<BTreeMap<String, u64>>> = Arc::default();
     let mut tasks = Vec::new();
     for worker in 0..16 {
-        let (ep, queue, served) = (ep.clone(), queue.clone(), served.clone());
+        let (ep, queue, statuses) = (ep.clone(), queue.clone(), statuses.clone());
         tasks.push(tokio::spawn(async move {
             let mut at = worker;
             loop {
@@ -903,23 +905,33 @@ async fn deleted_records(rig: &Rig, cells: &[(String, String)]) -> Value {
                 };
                 at += 1;
                 let url = format!("{}/agent/{name}", ep.public(at % ep.count()));
-                // Only the node's own refusal (503) counts as refused. A claim that
-                // was served, failed to connect or got another status is not a
-                // refusal and fails the check.
-                let refused = match ep.client.post(url).send().await {
-                    Ok(response) => response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                    Err(_) => false,
+                let seen = match ep.client.post(url).send().await {
+                    Ok(response) => response.status().as_u16().to_string(),
+                    Err(_) => "connection_error".to_owned(),
                 };
-                if !refused {
-                    served.fetch_add(1, Ordering::Relaxed);
-                }
+                *statuses.lock().unwrap().entry(seen).or_default() += 1;
             }
         }));
     }
     for task in tasks {
         let _ = task.await;
     }
-    json!({ "cells": evicted.len(), "with_ltx": with_ltx, "deleted": deleted, "registry": check.json(), "served_after_loss": served.load(Ordering::Relaxed) })
+    let statuses = statuses.lock().unwrap().clone();
+    let unconfirmed = unconfirmed_refusals(&statuses);
+    json!({ "cells": evicted.len(), "with_ltx": with_ltx, "deleted": deleted, "registry": check.json(),
+            "statuses": statuses, "unconfirmed_refusals": unconfirmed, "served_after_loss": unconfirmed })
+}
+
+/// The answers that are not a refusal until one is confirmed: every status but
+/// 503, and every connection error. A 2xx is a served claim, and any other
+/// status stays listed in the result and fails the check until it is shown to
+/// be the node's refusal.
+fn unconfirmed_refusals(statuses: &BTreeMap<String, u64>) -> u64 {
+    statuses
+        .iter()
+        .filter(|(status, _)| status.as_str() != "503")
+        .map(|(_, count)| count)
+        .sum()
 }
 
 /// How long the storage check waits between its two listings.
@@ -1456,7 +1468,7 @@ fn gates_of(cfg: &Cfg, result: &Value, gates: &mut Gates) {
                 && completeness["bases"]["bases"] == completeness["bases"]["total"]);
         gates.add(
             "G-o",
-            json!({ "claimed": completeness["claimed_cells"], "aged": completeness["aged_samples"]["misses"], "deleted_records": { "cells": c3["cells"], "registry_misses": c3["registry"]["misses"], "served_after_loss": c3["served_after_loss"] },
+            json!({ "claimed": completeness["claimed_cells"], "aged": completeness["aged_samples"]["misses"], "deleted_records": { "cells": c3["cells"], "registry_misses": c3["registry"]["misses"], "served_after_loss": c3["served_after_loss"], "statuses": c3["statuses"] },
                     "bases": completeness["bases"], "merge_check_failures": completeness["merge_check_failures"], "sampler_misses": completeness["sampler_misses"] }),
             "0 misses in (1) to (4); 0 merge-check failures and sampler misses",
             hold(misses("claimed_cells") == 0 && misses("aged_samples") == 0 && c3["registry"]["misses"] == 0 && c3["served_after_loss"] == 0 && bases_ok
