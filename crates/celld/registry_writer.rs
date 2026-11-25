@@ -133,18 +133,20 @@ impl Registry {
             return;
         }
         let now = crate::asyncrt::mono_ms();
-        let mut samples = self.samples.lock().unwrap();
+        let mut samples = crate::registry_api::enabled().then(|| self.samples.lock().unwrap());
         for key in done {
             if let Some(created) = queue.created.remove(&key) {
-                push_capped(
-                    &mut samples.claim_to_covered_ms,
-                    now.saturating_sub(created.claim_ms),
-                );
-                if let Some(flushed) = created.flushed_ms {
+                if let Some(samples) = samples.as_mut() {
                     push_capped(
-                        &mut samples.segment_to_covered_ms,
-                        now.saturating_sub(flushed),
+                        &mut samples.claim_to_covered_ms,
+                        now.saturating_sub(created.claim_ms),
                     );
+                    if let Some(flushed) = created.flushed_ms {
+                        push_capped(
+                            &mut samples.segment_to_covered_ms,
+                            now.saturating_sub(flushed),
+                        );
+                    }
                 }
             }
             queue.evidence.insert(crate::registry::evidence_key(&key));
@@ -355,7 +357,7 @@ impl Registry {
                 .ok()
         };
         let covered = waited.is_some() || (!self.cfg.bound.is_zero() && self.covered_now(&key));
-        {
+        if crate::registry_api::enabled() {
             let now = crate::asyncrt::mono_ms();
             let mut samples = self.samples.lock().unwrap();
             push_capped(
