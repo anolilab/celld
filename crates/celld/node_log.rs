@@ -574,6 +574,640 @@ fn lease_key(node: &str) -> String {
     format!("nodes/{node}.json")
 }
 
+/// Where a booting node says it serves follower requests, written before it
+/// recovers its predecessor. The lease record keeps the dead process's
+/// address until the install that follows recovery, so a fleet restarted onto
+/// new addresses could otherwise not reach one another's retained logs.
+fn boot_addr_key(node: &str) -> String {
+    format!("log/{node}.addr.json")
+}
+
+/// The published boot address, with the identity of the boot that wrote it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BootAddr {
+    node: String,
+    /// Set by the retirement of a dead node: the record names no address.
+    #[serde(default)]
+    retired: bool,
+    /// `<node>/<generation>` of the process that published.
+    session: String,
+    /// Wall clock at publication.
+    boot_at_ms: u64,
+    addr: String,
+}
+
+fn encode_boot_addr(node: &str, session: &str, boot_at_ms: u64, addr: &str) -> Vec<u8> {
+    serde_json::to_vec(&BootAddr {
+        node: node.to_string(),
+        retired: false,
+        session: session.to_string(),
+        boot_at_ms,
+        addr: addr.to_string(),
+    })
+    .expect("a boot address encodes")
+}
+
+/// Write this boot's address over whatever record is there, whoever wrote it,
+/// with a compare-and-swap on the etag that was read: a node name has one live
+/// process at a time, so the record of any other session is a dead boot's, and
+/// a late write from a dead process lands on a stale etag and loses. Boots
+/// are not ordered by wall clock, which two hosts need not share.
+async fn publish_boot_addr_to(
+    bucket: &Bucket,
+    node: &str,
+    session: &str,
+    addr: &str,
+    boot_at_ms: u64,
+) -> anyhow::Result<()> {
+    publish_boot_addr_racing(bucket, node, session, addr, boot_at_ms, async {}).await
+}
+
+/// `publish_boot_addr_to`, with `first_between` run inside the first
+/// attempt's read-and-swap window. A lost swap is retried only over a record
+/// that is no live boot's (a tombstone, a damaged record, or this session's
+/// own); a record another session published meanwhile is left alone and
+/// logged, so two processes publishing at once cannot overwrite each other.
+async fn publish_boot_addr_racing(
+    bucket: &Bucket,
+    node: &str,
+    session: &str,
+    addr: &str,
+    boot_at_ms: u64,
+    first_between: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<()> {
+    if publish_boot_addr_attempt(bucket, node, session, addr, boot_at_ms, first_between).await? {
+        return Ok(());
+    }
+    for attempt in 2..=3 {
+        let key = boot_addr_key(node);
+        if let Some((bytes, _)) = bucket.get(&key).await? {
+            if let Ok(record) = serde_json::from_slice::<BootAddr>(&bytes) {
+                if !record.retired && record.session != session {
+                    warn!(
+                        node,
+                        other = record.session,
+                        "another boot published its address at the same time; leaving its record"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        warn!(
+            node,
+            attempt, "the boot address changed under the write; writing again"
+        );
+        if publish_boot_addr_attempt(bucket, node, session, addr, boot_at_ms, async {}).await? {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("the boot address kept changing under the write")
+}
+
+/// One read-and-swap. `between` runs after the read and before the write: the
+/// window a concurrent write can land in. Returns whether the write landed.
+async fn publish_boot_addr_attempt(
+    bucket: &Bucket,
+    node: &str,
+    session: &str,
+    addr: &str,
+    boot_at_ms: u64,
+    between: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<bool> {
+    let key = boot_addr_key(node);
+    let current = bucket.get(&key).await?;
+    between.await;
+    let etag = current.as_ref().map(|(_, etag)| etag.as_str());
+    let body = encode_boot_addr(node, session, boot_at_ms, addr);
+    Ok(bucket.put_cas(&key, body, etag).await?.is_some())
+}
+
+/// How many corrupt published records this process has read.
+static CORRUPT_BOOT_ADDRS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The address a published record names for `node`. A record that does not
+/// parse names no address: it is logged and counted, and the member's lease
+/// address is still asked, so one damaged object cannot hold a member
+/// undecided for good. (A failed READ of the object is different, and stays
+/// undecided.) A record that names another node, or a session of another
+/// node, is not this node's.
+fn decode_boot_addr(node: &str, bytes: &[u8]) -> Option<String> {
+    let Ok(record) = serde_json::from_slice::<BootAddr>(bytes) else {
+        let total = CORRUPT_BOOT_ADDRS.fetch_add(1, Ordering::Relaxed) + 1;
+        warn!(
+            node,
+            total, "a published boot address is corrupt and is ignored"
+        );
+        return None;
+    };
+    if record.retired {
+        return None;
+    }
+    let own_session = record
+        .session
+        .split('/')
+        .next()
+        .is_some_and(|session_node| session_node == node);
+    (record.node == node && own_session).then_some(record.addr)
+}
+
+/// The record that replaces a retired node's boot address.
+fn retired_boot_addr(node: &str) -> Vec<u8> {
+    serde_json::to_vec(&BootAddr {
+        node: node.to_string(),
+        retired: true,
+        session: String::new(),
+        boot_at_ms: 0,
+        addr: String::new(),
+    })
+    .expect("a retired boot address encodes")
+}
+
+/// Retire a dead node's boot address: replace it with a tombstone, but only
+/// the exact record that was read, and only if it is the one the retired
+/// lease's own process published (`session` is `<node>/<generation>`), or is
+/// damaged. A successor that published during the old lease's term has
+/// another session and keeps its address; the compare-and-swap loses to a
+/// publish that lands after the read. Returns whether the tombstone landed.
+pub(crate) async fn retire_boot_addr(
+    bucket: &Bucket,
+    node: &str,
+    session: &str,
+) -> anyhow::Result<bool> {
+    retire_boot_addr_racing(bucket, node, session, async {}).await
+}
+
+/// `retire_boot_addr`, with `between` run after the read and before the
+/// write: the window a concurrent publish can land in.
+async fn retire_boot_addr_racing(
+    bucket: &Bucket,
+    node: &str,
+    session: &str,
+    between: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<bool> {
+    let key = boot_addr_key(node);
+    let Some((bytes, etag)) = bucket.get(&key).await? else {
+        return Ok(false);
+    };
+    between.await;
+    let ours = match serde_json::from_slice::<BootAddr>(&bytes) {
+        Ok(record) => !record.retired && record.session == session,
+        // Damaged: nothing can read it, so it goes.
+        Err(_) => true,
+    };
+    if !ours {
+        return Ok(false);
+    }
+    Ok(bucket
+        .put_cas(&key, retired_boot_addr(node), Some(&etag))
+        .await?
+        .is_some())
+}
+
+/// How long after this process started a long-dead, unreachable member stays
+/// undecided instead of gone. The boot ladder waits one, two and three lease
+/// terms between its four attempts, so its last attempt starts six terms in;
+/// the default hold is one term short of that, which keeps every earlier
+/// attempt from declaring a loss and leaves a margin for attempts that run
+/// long. `CELLD_RECOVERY_LOSS_HOLD_MS` overrides it (0 turns the hold off).
+fn boot_hold_ms(lease_ttl_ms: u64, configured: Option<u64>) -> u64 {
+    let term = ladder_term_ms(lease_ttl_ms);
+    let default = term.saturating_mul(RecoveryLadder::final_attempt_terms().saturating_sub(1));
+    configured
+        .unwrap_or(default)
+        .min(final_attempt_start_ms(lease_ttl_ms).saturating_sub(1))
+}
+
+/// Where the boot ladder's last attempt starts, from the first.
+fn final_attempt_start_ms(lease_ttl_ms: u64) -> u64 {
+    ladder_term_ms(lease_ttl_ms).saturating_mul(RecoveryLadder::final_attempt_terms())
+}
+
+/// The lease term the boot ladder waits in: the node's term, at least a
+/// second. The hold's check at start and its clamp both use it.
+fn ladder_term_ms(lease_ttl_ms: u64) -> u64 {
+    lease_ttl_ms.max(1_000)
+}
+
+/// How long past its lease's expiry a member stays "not conclusively gone":
+/// recovery's grace for member fate, and the dead-node GC's before it retires
+/// the member's published address.
+pub(crate) fn member_loss_grace_ms(lease_ttl_ms: u64) -> u64 {
+    lease_ttl_ms.saturating_mul(3).max(20_000)
+}
+
+/// Whether a boot that could not publish its address may go on: a node with
+/// no lease record has no predecessor to recover, and one whose address is the
+/// lease record's is still found by it. A failed lease read, or a changed
+/// address, may not.
+fn unpublished_boot_may_continue(
+    lease_addr: Option<&str>,
+    lease_read_ok: bool,
+    addr: &str,
+) -> bool {
+    lease_read_ok && lease_addr.is_none_or(|lease_addr| lease_addr == addr)
+}
+
+/// What the operator's declaration did for one member.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Declaration {
+    /// Not declared.
+    None,
+    /// Declared, and the member holds a complete fragment: used as usual.
+    Ignored,
+    /// Declared, but its lease is live.
+    Refused,
+    /// Declared, and the member is unreachable or holds no complete
+    /// fragment: counted as absent.
+    Applied,
+}
+
+/// A declaration applies only to a member that was probed first and gave no
+/// complete witness, and whose lease is not live.
+fn apply_declaration(declared: bool, witness: bool, lease_live: bool) -> Declaration {
+    if !declared {
+        Declaration::None
+    } else if witness {
+        Declaration::Ignored
+    } else if lease_live {
+        Declaration::Refused
+    } else {
+        Declaration::Applied
+    }
+}
+
+/// The declaration in force for a recovery: only the boot's own predecessor
+/// recovery uses it, never a sweep or a later recovery.
+fn declared_for_mode(declared: &BTreeSet<String>, mode: RecoverMode) -> BTreeSet<String> {
+    if mode == RecoverMode::Predecessor {
+        declared.clone()
+    } else {
+        BTreeSet::new()
+    }
+}
+
+/// The record of a declared bounded loss. `operator_declared_gone` names the
+/// members the operator's declaration counted as absent, and is empty when
+/// none did.
+fn loss_record(
+    dead: &str,
+    epoch: u64,
+    declared_at_ms: u64,
+    declared_by: &str,
+    ensemble: &BTreeSet<String>,
+    operator_declared_gone: &[String],
+) -> serde_json::Value {
+    let note = if operator_declared_gone.is_empty() {
+        "no complete true witness survived; acked writes within the final flush window \
+         may be unrecovered"
+            .to_string()
+    } else {
+        format!(
+            "no complete true witness survived, with the operator's declaration that {} \
+             is permanently gone (CELLD_RECOVERY_GONE_MEMBERS); acked writes within the \
+             final flush window may be unrecovered",
+            operator_declared_gone.join(", ")
+        )
+    };
+    serde_json::json!({
+        "leader": dead,
+        "epoch": epoch,
+        "declared_at_ms": declared_at_ms,
+        "declared_by": declared_by,
+        "ensemble": ensemble.iter().collect::<Vec<_>>(),
+        "operator_declared_gone": operator_declared_gone,
+        "note": note,
+    })
+}
+
+/// Parse `CELLD_RECOVERY_GONE_MEMBERS`: node names separated by commas.
+pub fn parse_declared_gone(value: &str) -> anyhow::Result<BTreeSet<String>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            crate::machine::validate_node_name(name)
+                .with_context(|| format!("CELLD_RECOVERY_GONE_MEMBERS names {name:?}"))?;
+            Ok(name.to_string())
+        })
+        .collect()
+}
+
+/// Refuse a hold that would keep every attempt inside it: each restart resets
+/// the hold, so a boot would then loop without ever reaching a verdict.
+pub fn validate_boot_hold(lease_ttl_ms: u64, configured: Option<u64>) -> anyhow::Result<()> {
+    let Some(hold) = configured else {
+        return Ok(());
+    };
+    let last = final_attempt_start_ms(lease_ttl_ms);
+    anyhow::ensure!(
+        hold < last,
+        "CELLD_RECOVERY_LOSS_HOLD_MS={hold} is not below the start of the last boot recovery \
+         attempt ({last} ms, {} lease terms of {} ms): no attempt could ever \
+         decide, so the node would never finish booting. Use a smaller value, or 0 to turn \
+         the hold off",
+        RecoveryLadder::final_attempt_terms(),
+        ladder_term_ms(lease_ttl_ms)
+    );
+    Ok(())
+}
+
+fn in_boot_hold(now_mono_ms: u64, started_mono_ms: u64, hold_ms: u64) -> bool {
+    now_mono_ms.saturating_sub(started_mono_ms) < hold_ms
+}
+
+/// The addresses recovery asks a member at, in order, and whether reading the
+/// published one failed, which leaves the member undecided.
+struct Candidates {
+    addrs: Vec<String>,
+    read_failed: bool,
+}
+
+fn candidate_addrs(
+    lease_addr: Option<&str>,
+    published: anyhow::Result<Option<String>>,
+) -> Candidates {
+    let mut addrs = Vec::new();
+    let mut read_failed = false;
+    match published {
+        Ok(Some(published)) => addrs.push(published),
+        Ok(None) => {}
+        Err(error) => {
+            warn!(%error, "could not read a member's published boot address");
+            read_failed = true;
+        }
+    }
+    if let Some(lease_addr) = lease_addr {
+        if !addrs.iter().any(|addr| addr == lease_addr) {
+            addrs.push(lease_addr.to_string());
+        }
+    }
+    Candidates { addrs, read_failed }
+}
+
+/// Whether a member that no address reached stays undecided. Only a member
+/// that is long dead, silent, and past the boot hold is gone.
+fn unreached_is_undecided(
+    answered: bool,
+    lease_live: bool,
+    lease_long_dead: bool,
+    in_boot_hold: bool,
+) -> bool {
+    answered || lease_live || !lease_long_dead || in_boot_hold
+}
+
+/// Whether a failed seal request leaves the member possibly alive: any reply
+/// of the peer protocol does, at any version, because a live member can refuse
+/// a request for reasons of its own (clock skew, a replayed nonce, a version
+/// difference) and no refusal is authenticated as coming from a particular
+/// node. Only a reply that is not celld's at all (the address now belongs to
+/// something else) does not.
+fn member_answered(error: &anyhow::Error) -> bool {
+    if let Some(http) = error.downcast_ref::<PeerHttpError>() {
+        return http.peer;
+    }
+    error.downcast_ref::<serde_json::Error>().is_some()
+}
+
+/// What every address of one member said.
+struct MemberFate {
+    /// An address supplied a complete, consistent fragment.
+    witness: bool,
+    /// Reading the published address failed, or a reached address returned
+    /// missing evidence rather than conclusive absence.
+    unresolved: bool,
+    reached_any: bool,
+    /// A failed request proves the member itself answered.
+    answered: bool,
+    /// Rows of the fragment being recovered, from the addresses that named it.
+    entries: Vec<Entry>,
+    /// Rows of other fragments that were not taken.
+    discarded_rows: usize,
+}
+
+impl MemberFate {
+    fn new(read_failed: bool) -> Self {
+        Self {
+            witness: false,
+            unresolved: read_failed,
+            reached_any: false,
+            answered: false,
+            entries: Vec::new(),
+            discarded_rows: 0,
+        }
+    }
+
+    /// Fold in what one address said. An address that seals but cannot supply
+    /// a complete fragment does not end the search: the member may hold the
+    /// intact fragment behind its other address.
+    fn absorb(&mut self, probe: Probe) {
+        match probe {
+            Probe::Unreached { answered } => self.answered |= answered,
+            Probe::Reached(reached) => {
+                self.reached_any = true;
+                self.unresolved |= reached.inconclusive;
+                self.witness |= reached.complete;
+                // Never merge rows across fragments: only an address that named
+                // the fragment being recovered contributes rows.
+                if reached.epoch_match {
+                    self.entries.extend(reached.entries);
+                } else {
+                    self.discarded_rows += reached.entries.len();
+                }
+            }
+        }
+    }
+
+    /// A member is conclusive only with a complete witness for the decided
+    /// fragment, or when every candidate was unreachable past the hold. Any
+    /// reply of the peer protocol without a complete witness (a refusal from
+    /// the real member behind a stale address that did answer, say) keeps it
+    /// undecided.
+    fn undecided(&self, lease_live: bool, lease_long_dead: bool, in_boot_hold: bool) -> bool {
+        self.unresolved
+            || self.answered
+            || (!self.reached_any
+                && unreached_is_undecided(self.answered, lease_live, lease_long_dead, in_boot_hold))
+    }
+}
+
+/// What one address of a member said.
+enum Probe {
+    Unreached { answered: bool },
+    Reached(Reached),
+}
+
+struct Reached {
+    /// The tail proves every retained sequence of the current fragment.
+    complete: bool,
+    /// Missing evidence, not conclusive absence.
+    inconclusive: bool,
+    /// The seal and the tail both name the fragment of the epoch being
+    /// recovered. Rows of any other fragment are not recovery's to merge.
+    epoch_match: bool,
+    entries: Vec<Entry>,
+}
+
+/// Seal one member at one address and read its tail, judging the two
+/// together: the seal answer alone carries no data.
+async fn probe_member(
+    transport: &Arc<dyn LogTransport>,
+    dead: &str,
+    epoch: u64,
+    member: &str,
+    addr: &str,
+) -> Probe {
+    let seal = SealReq {
+        leader: dead.to_string(),
+        epoch,
+    };
+    let sealed = match transport
+        .post(
+            member,
+            addr,
+            "/peer/log/seal",
+            serde_json::to_vec(&seal).unwrap_or_default(),
+            None,
+        )
+        .await
+        .and_then(|bytes| Ok(serde_json::from_slice::<SealResp>(&bytes)?))
+    {
+        Ok(sealed) => sealed,
+        // Startup serves follower requests before it renews the lease. An
+        // HTTP error proves a response, not a missing fragment: a transient
+        // scan failure on an expired member must not seal away its intact
+        // rows.
+        Err(error) => {
+            return Probe::Unreached {
+                answered: member_answered(&error),
+            }
+        }
+    };
+    let held_fragment_epoch = sealed.held_fragment_epoch.unwrap_or(sealed.fragment_epoch);
+    let tail_req = TailReq {
+        leader: dead.to_string(),
+    };
+    let tail_body = match serde_json::to_vec(&TailWireReq::ranged(tail_req)) {
+        Ok(body) => body,
+        Err(_) => {
+            return Probe::Reached(Reached {
+                complete: false,
+                inconclusive: true,
+                epoch_match: false,
+                entries: Vec::new(),
+            })
+        }
+    };
+    let mut tail = match transport
+        .post(member, addr, "/peer/log/tail", tail_body, None)
+        .await
+        .and_then(|bytes| decode_tail_resp(&bytes))
+    {
+        Ok(TailReply::Ranged(tail)) => tail,
+        Ok(TailReply::Legacy { .. }) => {
+            // A legacy body has no retained range, even when the seal claims
+            // an empty or different fragment. Do not turn missing evidence
+            // into conclusive amnesia.
+            warn!(
+                member,
+                dead, epoch, "recovery received a legacy tail without range evidence"
+            );
+            return Probe::Reached(Reached {
+                complete: false,
+                inconclusive: true,
+                epoch_match: false,
+                entries: Vec::new(),
+            });
+        }
+        Err(error) => {
+            // The seal answer and the fragment are TWO requests, and only the
+            // second carries the data. Counting the witness on the first let
+            // a fragment this pass never read satisfy the certify guard:
+            // recovery sealed the record as "the bucket is complete" while
+            // the acked frames sat fsync'd on a member that had just
+            // answered, and the fragment GC then deleted the last copy. A
+            // member that sealed has a live disk, so its fate is open, not
+            // conclusive.
+            warn!(
+                member,
+                dead,
+                epoch,
+                %error,
+                "recovery could not read a sealed member's tail"
+            );
+            return Probe::Reached(Reached {
+                complete: false,
+                inconclusive: held_fragment_epoch == epoch,
+                epoch_match: false,
+                entries: Vec::new(),
+            });
+        }
+    };
+    tail.entries.sort_by_key(|entry| entry.seq);
+    let mut complete = false;
+    let mut inconclusive = false;
+    // A matching fragment epoch identifies the right fragment, but it does
+    // not prove that every retained sequence is still readable. The seal and
+    // tail responses must describe the same range, and the ranged tail must
+    // certify its own complete read.
+    if held_fragment_epoch == epoch {
+        match sealed.base {
+            Some(base)
+                if tail.range.fragment_epoch == held_fragment_epoch
+                    && tail.range.base == base
+                    && tail.range.end == sealed.end
+                    && tail.range.complete
+                    && sealed.fragment_epoch == held_fragment_epoch
+                    && tail_covers_sealed_range(base, sealed.end, &tail.entries) =>
+            {
+                complete = true;
+            }
+            Some(base)
+                if tail.range.fragment_epoch == held_fragment_epoch
+                    && tail.range.base == base
+                    && tail.range.end == sealed.end
+                    && (!tail.range.complete
+                        || !tail_covers_sealed_range(base, sealed.end, &tail.entries)) =>
+            {
+                warn!(
+                    dead,
+                    member,
+                    base,
+                    end = sealed.end,
+                    "sealed follower returned an incomplete tail"
+                );
+            }
+            Some(base) => {
+                inconclusive = true;
+                warn!(
+                    dead,
+                    member,
+                    base,
+                    end = sealed.end,
+                    tail_epoch = tail.range.fragment_epoch,
+                    tail_base = tail.range.base,
+                    tail_end = tail.range.end,
+                    tail_complete = tail.range.complete,
+                    "sealed follower returned inconsistent tail metadata"
+                );
+            }
+            None => {
+                inconclusive = true;
+                warn!(
+                    dead,
+                    member, "sealed follower did not report its retained range"
+                );
+            }
+        }
+    }
+    Probe::Reached(Reached {
+        complete,
+        inconclusive,
+        epoch_match: held_fragment_epoch == epoch && tail.range.fragment_epoch == epoch,
+        entries: tail.entries,
+    })
+}
+
 pub(crate) struct FoldedRead {
     pub(crate) record: log_tier::LogRecord,
     /// Persisted acknowledgement history for `record.epoch`, not liveness.
@@ -2537,6 +3171,8 @@ impl SignedPeerTransport {
         Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
+                // A dead address must not cost a whole request timeout.
+                .connect_timeout(std::time::Duration::from_secs(5))
                 .tcp_nodelay(true)
                 .build()
                 .expect("build log peer client"),
@@ -2568,8 +3204,11 @@ impl LogTransport for SignedPeerTransport {
             // a protocol-incapable member separately from transport failure.
             if !response.status().is_success() {
                 let status = response.status();
-                return Err(anyhow::Error::new(PeerHttpError { status })
-                    .context(format!("peer {node} answered {status}")));
+                return Err(anyhow::Error::new(PeerHttpError {
+                    status,
+                    peer: is_peer_reply(response.headers()),
+                })
+                .context(format!("peer {node} answered {status}")));
             }
             crate::peer_auth::validate_response(response.headers())?;
             Ok(response.bytes().await?)
@@ -2602,8 +3241,11 @@ impl LogTransport for SignedPeerTransport {
             let response = request.send().await?;
             if response.status() != reqwest::StatusCode::SWITCHING_PROTOCOLS {
                 let status = response.status();
-                return Err(anyhow::Error::new(PeerHttpError { status })
-                    .context(format!("peer {node} refused the stream: {status}")));
+                return Err(anyhow::Error::new(PeerHttpError {
+                    status,
+                    peer: is_peer_reply(response.headers()),
+                })
+                .context(format!("peer {node} refused the stream: {status}")));
             }
             crate::peer_auth::validate_response(response.headers())?;
             Ok(Box::new(response.upgrade().await?) as LogStreamIo)
@@ -2611,11 +3253,20 @@ impl LogTransport for SignedPeerTransport {
     }
 }
 
+/// Whether a reply came from a celld process, whatever version it speaks.
+fn is_peer_reply(headers: &reqwest::header::HeaderMap) -> bool {
+    headers.contains_key(crate::peer_auth::RESPONSE_VERSION_HEADER)
+}
+
 /// A peer answered with an HTTP error status: typed so callers can tell
 /// "the route is not there" from transport silence.
 #[derive(Debug)]
 struct PeerHttpError {
     status: reqwest::StatusCode,
+    /// The reply carried the peer protocol's version header, at any value: a
+    /// celld process answered, possibly of another version and possibly not
+    /// the member asked for. Nothing in a refusal proves which.
+    peer: bool,
 }
 
 impl std::fmt::Display for PeerHttpError {
@@ -2718,6 +3369,12 @@ pub struct RecoveryLadder {
 
 impl RecoveryLadder {
     const MAX_ATTEMPTS: u32 = 4;
+
+    /// The lease terms from the first attempt to the start of the last: the
+    /// waits between attempts are one, two, three... terms.
+    const fn final_attempt_terms() -> u64 {
+        (Self::MAX_ATTEMPTS as u64) * (Self::MAX_ATTEMPTS as u64 - 1) / 2
+    }
 
     pub fn new(ttl_backoff: std::time::Duration) -> Self {
         Self {
@@ -4427,6 +5084,13 @@ pub struct NodeLogManager {
     /// Every predecessor session's log is proven recovered; see
     /// `ensure_predecessors_recovered` for why this can latch.
     predecessors_clean: std::sync::atomic::AtomicBool,
+    /// When this process built the manager, on the monotonic clock.
+    started_ms: u64,
+    /// `CELLD_RECOVERY_LOSS_HOLD_MS`, when set.
+    boot_hold_override_ms: Option<u64>,
+    /// Members the operator declared permanently gone
+    /// (`CELLD_RECOVERY_GONE_MEMBERS`).
+    declared_gone: Mutex<BTreeSet<String>>,
     /// Process-local single-flight locks for dead-session recovery. The map
     /// stores weak values, so observing many historical sessions does not
     /// retain one allocation per session for the process lifetime.
@@ -4831,6 +5495,22 @@ impl NodeLogManager {
         )
     }
 
+    /// Override how long a long-dead, unreachable member stays undecided
+    /// after boot (`CELLD_RECOVERY_LOSS_HOLD_MS`).
+    pub fn with_boot_hold_ms(mut self, hold_ms: Option<u64>) -> Self {
+        self.boot_hold_override_ms = hold_ms;
+        self
+    }
+
+    /// Members the operator declares permanently gone
+    /// (`CELLD_RECOVERY_GONE_MEMBERS`). Only this boot's own predecessor
+    /// recovery uses it, and only for a member that is unreachable or answers
+    /// without a complete fragment, with its lease not live.
+    pub fn with_declared_gone(self, members: BTreeSet<String>) -> Self {
+        *self.declared_gone.lock().unwrap() = members;
+        self
+    }
+
     fn new_with_log_transport(
         session: &str,
         bucket: Arc<Bucket>,
@@ -4863,6 +5543,9 @@ impl NodeLogManager {
             closing: std::sync::atomic::AtomicBool::new(false),
             flush_in_flight: std::sync::atomic::AtomicBool::new(false),
             predecessors_clean: std::sync::atomic::AtomicBool::new(false),
+            started_ms: mono_ms(),
+            boot_hold_override_ms: None,
+            declared_gone: Mutex::new(BTreeSet::new()),
             recovery_locks: Mutex::new(BTreeMap::new()),
             gc_confirmed_empty: Mutex::new(std::collections::HashSet::new()),
             epoch_gc_due: Mutex::new(BTreeMap::new()),
@@ -4903,6 +5586,8 @@ impl NodeLogManager {
         if let Err(error) = self.gc_stale_generation_bundles().await {
             warn!(%error, "stale-generation bundle GC failed; retried at the next restart");
         }
+        // The declaration was for this recovery alone.
+        self.declared_gone.lock().unwrap().clear();
         self.predecessors_clean.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -5104,20 +5789,6 @@ impl NodeLogManager {
         }
     }
 
-    async fn post<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
-        &self,
-        node: &str,
-        addr: &str,
-        path: &str,
-        req: &Req,
-    ) -> anyhow::Result<Resp> {
-        let bytes = self
-            .transport
-            .post(node, addr, path, serde_json::to_vec(req)?, None)
-            .await?;
-        Ok(serde_json::from_slice(&bytes)?)
-    }
-
     /// The tail POST: a JSON request, a binary response (the entries
     /// dominate it).
     async fn post_tail(&self, node: &str, addr: &str, req: &TailReq) -> anyhow::Result<TailReply> {
@@ -5236,7 +5907,7 @@ impl NodeLogManager {
             count += uploaded;
             if let Some((dead, beat, progress)) = claim.as_mut() {
                 progress.completed(&self.bucket, cell).await;
-                self.beat_claim(dead, beat).await?;
+                self.beat_claim(dead, beat, false).await?;
             }
         }
         Ok(count)
@@ -5284,8 +5955,15 @@ impl NodeLogManager {
     /// Refresh the claim's heartbeat once `RECOVERY_HEARTBEAT` has passed.
     /// An error means another node took the claim over because this one
     /// looked stale; the gather stops and the caller re-resolves.
-    async fn beat_claim(&self, dead: &str, beat: &mut ClaimBeat) -> anyhow::Result<()> {
-        if mono_ms().saturating_sub(beat.last_mono_ms) < RECOVERY_HEARTBEAT.as_millis() as u64 {
+    async fn beat_claim(
+        &self,
+        dead: &str,
+        beat: &mut ClaimBeat,
+        force: bool,
+    ) -> anyhow::Result<()> {
+        if !force
+            && mono_ms().saturating_sub(beat.last_mono_ms) < RECOVERY_HEARTBEAT.as_millis() as u64
+        {
             return Ok(());
         }
         let Some(folded) = read_record(&self.bucket, dead).await? else {
@@ -5465,154 +6143,105 @@ impl NodeLogManager {
             // 3x-TTL grace applies to MEMBER fate here, unrelated to the
             // sweep (which, under the fold, judges the record's own
             // published expiry with no grace).
-            let grace_ms = (self.ownership.lease_ttl_ms() * 3).max(20_000);
+            let grace_ms = member_loss_grace_ms(self.ownership.lease_ttl_ms());
+            // A member that is long dead and unreachable counts as gone only
+            // once this process has been up for the grace: the peers of a
+            // fleet that starts one by one (a staggered rollout, image pulls,
+            // an ordered start) are not listening yet, and their published
+            // address is from their last boot. The hold covers the boot
+            // ladder up to its final attempt (`boot_hold_ms`), so only the
+            // last attempt can declare a loss for such a member, and a member
+            // that really is gone still gets it declared.
+            let in_boot_hold = in_boot_hold(
+                mono_ms(),
+                self.started_ms,
+                boot_hold_ms(self.ownership.lease_ttl_ms(), self.boot_hold_override_ms),
+            );
+            let mut undecided_members: Vec<&str> = Vec::new();
+            let mut declared_applied: Vec<String> = Vec::new();
+            let declared = declared_for_mode(&self.declared_gone.lock().unwrap(), mode);
             for member in &record.ensemble {
-                self.beat_claim(dead, &mut beat).await?;
+                self.beat_claim(dead, &mut beat, false).await?;
                 let lease = self.ownership.read_node_lease(member).await;
                 let lease_live = matches!(&lease, Ok(Some(lease)) if lease.expires_ms > now);
                 let lease_long_dead = matches!(
                     &lease,
                     Ok(Some(lease)) if lease.expires_ms.saturating_add(grace_ms) < now
                 );
-                let addr = match lease {
-                    Ok(Some(lease)) => Some(lease.addr),
+                let lease_addr = match &lease {
+                    Ok(Some(lease)) => Some(lease.addr.as_str()),
                     _ => None,
                 };
-                let Some(addr) = addr else {
-                    if lease_live || !lease_long_dead {
-                        inconclusive += 1;
-                    }
-                    continue;
-                };
-                let seal = SealReq {
-                    leader: dead.to_string(),
-                    epoch: record.epoch,
-                };
-                let sealed = match self
-                    .post::<_, SealResp>(member, &addr, "/peer/log/seal", &seal)
-                    .await
-                {
-                    Ok(sealed) => sealed,
-                    Err(error) => {
-                        // Startup serves follower requests before it renews
-                        // the lease. An HTTP error proves a response, not a
-                        // missing fragment: a transient scan failure on an
-                        // expired member must not seal away its intact rows.
-                        let answered = error.downcast_ref::<PeerHttpError>().is_some()
-                            || error.downcast_ref::<serde_json::Error>().is_some();
-                        if answered || lease_live || !lease_long_dead {
-                            inconclusive += 1;
-                        }
-                        continue;
-                    }
-                };
-                let held_fragment_epoch =
-                    sealed.held_fragment_epoch.unwrap_or(sealed.fragment_epoch);
-                let tail = TailReq {
-                    leader: dead.to_string(),
-                };
-                let mut tail = match self.post_tail(member, &addr, &tail).await {
-                    Ok(TailReply::Ranged(tail)) => tail,
-                    Ok(TailReply::Legacy { .. }) => {
-                        // A legacy body has no retained range, even when the
-                        // seal claims an empty or different fragment. Do not
-                        // turn missing evidence into conclusive amnesia through
-                        // the failed-read classifier below.
-                        inconclusive += 1;
-                        warn!(
-                            member,
-                            dead,
-                            epoch = record.epoch,
-                            "recovery received a legacy tail without range evidence"
-                        );
-                        continue;
-                    }
-                    Err(error) => {
-                        // The seal answer and the fragment are TWO requests,
-                        // and only the second carries the data. Counting the
-                        // witness on the first let a fragment this pass never
-                        // read satisfy the certify guard: recovery sealed the
-                        // record as "the bucket is complete" while the acked
-                        // frames sat fsync'd on a member that had just
-                        // answered, and the fragment GC then deleted the last
-                        // copy. A member that sealed has a live disk, so its
-                        // fate is open, not conclusive — it joins the loud
-                        // retry instead.
-                        warn!(
-                            member,
-                            dead,
-                            epoch = record.epoch,
-                            %error,
-                            "recovery could not read a sealed member's tail"
-                        );
-                        if held_fragment_epoch == record.epoch {
-                            inconclusive += 1;
-                        }
-                        continue;
-                    }
-                };
-                tail.entries.sort_by_key(|entry| entry.seq);
-                // A matching fragment epoch identifies the right fragment,
-                // but it does not prove that every retained sequence is still
-                // readable. The seal and tail responses must describe the same
-                // range, and the ranged tail must certify its own complete read.
-                // A legacy response was kept inconclusive above, so it cannot
-                // certify recovery or declare loss.
-                if held_fragment_epoch == record.epoch {
-                    match sealed.base {
-                        Some(base)
-                            if tail.range.fragment_epoch == held_fragment_epoch
-                                && tail.range.base == base
-                                && tail.range.end == sealed.end
-                                && tail.range.complete
-                                && sealed.fragment_epoch == held_fragment_epoch
-                                && tail_covers_sealed_range(base, sealed.end, &tail.entries) =>
-                        {
-                            complete_witnesses += 1;
-                        }
-                        Some(base)
-                            if tail.range.fragment_epoch == held_fragment_epoch
-                                && tail.range.base == base
-                                && tail.range.end == sealed.end
-                                && (!tail.range.complete
-                                    || !tail_covers_sealed_range(
-                                        base,
-                                        sealed.end,
-                                        &tail.entries,
-                                    )) =>
-                        {
-                            warn!(
-                                dead,
-                                member,
-                                base,
-                                end = sealed.end,
-                                "sealed follower returned an incomplete tail"
-                            );
-                        }
-                        Some(base) => {
-                            inconclusive += 1;
-                            warn!(
-                                dead,
-                                member,
-                                base,
-                                end = sealed.end,
-                                tail_epoch = tail.range.fragment_epoch,
-                                tail_base = tail.range.base,
-                                tail_end = tail.range.end,
-                                tail_complete = tail.range.complete,
-                                "sealed follower returned inconsistent tail metadata"
-                            );
-                        }
-                        None => {
-                            inconclusive += 1;
-                            warn!(
-                                dead,
-                                member, "sealed follower did not report its retained range"
-                            );
-                        }
+                // A member that restarted onto a new address has not yet
+                // replaced its lease record, which still names the dead
+                // process's address, so the address it published for its boot
+                // is asked first, then the lease's. Every request is signed
+                // for the member, and only an answer that proves the member
+                // is the one speaking counts, so a stranger on either address
+                // changes nothing.
+                let candidates = candidate_addrs(lease_addr, self.read_boot_addr(member).await);
+                // Judge seal and tail together at each address, in order,
+                // until one supplies a complete fragment. The claim is beaten
+                // between probes: one probe can take as long as two request
+                // timeouts, and a member has more than one address.
+                let mut fate = MemberFate::new(candidates.read_failed);
+                for addr in &candidates.addrs {
+                    // Forced: one probe can take two request timeouts, so the
+                    // heartbeat is refreshed right before each, not on a
+                    // schedule.
+                    self.beat_claim(dead, &mut beat, true).await?;
+                    fate.absorb(
+                        probe_member(&self.transport, dead, record.epoch, member, addr).await,
+                    );
+                    if fate.witness {
+                        break;
                     }
                 }
-                for entry in tail.entries {
+                let declaration =
+                    apply_declaration(declared.contains(member), fate.witness, lease_live);
+                match declaration {
+                    Declaration::Ignored => warn!(
+                        dead,
+                        member,
+                        "the operator declared this member gone \
+                         (CELLD_RECOVERY_GONE_MEMBERS), but it holds a complete \
+                         fragment: using it and ignoring the declaration"
+                    ),
+                    Declaration::Refused => warn!(
+                        dead,
+                        member,
+                        "REFUSING the operator's declaration that this member is gone \
+                         (CELLD_RECOVERY_GONE_MEMBERS): its lease is live"
+                    ),
+                    Declaration::Applied => {
+                        warn!(
+                            dead,
+                            member,
+                            "the operator declared this member permanently gone \
+                             (CELLD_RECOVERY_GONE_MEMBERS) and it holds no complete \
+                             fragment: counting it as absent"
+                        );
+                        declared_applied.push(member.clone());
+                    }
+                    Declaration::None => {}
+                }
+                if fate.witness {
+                    complete_witnesses += 1;
+                } else if declaration == Declaration::Applied {
+                    // Conclusive by the operator's declaration.
+                } else if fate.undecided(lease_live, lease_long_dead, in_boot_hold) {
+                    inconclusive += 1;
+                    undecided_members.push(member);
+                }
+                if fate.discarded_rows > 0 {
+                    warn!(
+                        dead,
+                        member,
+                        rows = fate.discarded_rows,
+                        "recovery discarded rows of a fragment other than the one it is recovering"
+                    );
+                }
+                for entry in fate.entries {
                     if entry.is_mark() {
                         granted_marks.insert(entry.cell);
                         continue;
@@ -5636,19 +6265,22 @@ impl NodeLogManager {
                 anyhow::ensure!(
                     inconclusive == 0,
                     "node-log recovery for {dead}: no complete true witness among {:?} and \
-                     {inconclusive} member(s) undecided; refusing to seal while \
-                     member state remains unverified",
-                    record.ensemble
+                     {inconclusive} member(s) undecided ({}); refusing to seal while \
+                     member state remains unverified. If an undecided member is permanently \
+                     gone (its disk is lost), restart this node with \
+                     CELLD_RECOVERY_GONE_MEMBERS=<member> to declare it absent and let \
+                     recovery record the loss",
+                    record.ensemble,
+                    undecided_members.join(", ")
                 );
-                let loss = serde_json::json!({
-                    "leader": dead,
-                    "epoch": record.epoch,
-                    "declared_at_ms": now,
-                    "declared_by": self.node,
-                    "ensemble": record.ensemble.iter().collect::<Vec<_>>(),
-                    "note": "no complete true witness survived; acked writes within the \
-                             final flush window may be unrecovered",
-                });
+                let loss = loss_record(
+                    dead,
+                    record.epoch,
+                    now,
+                    &self.node,
+                    &record.ensemble,
+                    &declared_applied,
+                );
                 self.bucket
                     .put(
                         &format!("log/{dead}.e{}.loss.json", record.epoch),
@@ -5754,7 +6386,7 @@ impl NodeLogManager {
                 let mut fetches = futures_util::stream::iter(fetches)
                     .buffer_unordered(RECOVERY_UPLOAD_CONCURRENCY);
                 while let Some(fetched) = futures_util::StreamExt::next(&mut fetches).await {
-                    self.beat_claim(dead, &mut beat).await?;
+                    self.beat_claim(dead, &mut beat, false).await?;
                     let (key, bytes) = fetched?;
                     let rows = celld_ltx::bundle::decode_rows(&bytes)
                         .with_context(|| format!("decode retained recovery bundle {key}"))?;
@@ -6158,6 +6790,60 @@ impl NodeLogManager {
             Ok(()) => eprintln!("node-log close: sealed epoch {}", sealed.epoch),
             Err(error) => eprintln!("node-log close: seal not durable: {error:#}"),
         }
+    }
+
+    /// Publish the address this process serves follower seal and tail
+    /// requests on, ahead of `recover_self`. It replaces whatever record is
+    /// there, by compare-and-swap on the etag it read, so a late write of a
+    /// dead process loses; if another boot publishes at the same moment, that
+    /// record is left alone and the lost race is logged. Best effort: a failed
+    /// write only leaves peers on the lease record's address.
+    pub async fn publish_boot_addr(&self, addr: &str) -> anyhow::Result<()> {
+        let ttl_ms = self.ownership.lease_ttl_ms();
+        let started = mono_ms();
+        let budget_ms = final_attempt_start_ms(ttl_ms);
+        let mut backoff = std::time::Duration::from_millis(500);
+        let failure = loop {
+            let boot_at_ms = crate::ownership_store::now_ms();
+            match publish_boot_addr_to(&self.bucket, &self.node, &self.session, addr, boot_at_ms)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if mono_ms().saturating_sub(started) >= budget_ms {
+                        break error;
+                    }
+                    warn!(%error, "could not publish the boot address; retrying");
+                    crate::asyncrt::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+                }
+            }
+        };
+        // Peers find this node by its lease address until its install. Only a
+        // node whose address is unchanged can run unpublished.
+        let lease = self.ownership.read_node_lease(&self.node).await;
+        let lease_addr = match &lease {
+            Ok(Some(lease)) => Some(lease.addr.as_str()),
+            _ => None,
+        };
+        if unpublished_boot_may_continue(lease_addr, lease.is_ok(), addr) {
+            warn!(%failure, "could not publish the boot address; peers use the unchanged lease address");
+            Ok(())
+        } else {
+            Err(failure.context(format!(
+                "could not publish this node's new address {addr}, which differs from its \
+                 lease record's: peers could not recover from it"
+            )))
+        }
+    }
+
+    /// The address `node` published for its boot. An error leaves the member
+    /// undecided: a failed read is not an absent address.
+    async fn read_boot_addr(&self, node: &str) -> anyhow::Result<Option<String>> {
+        let Some((bytes, _)) = self.bucket.get(&boot_addr_key(node)).await? else {
+            return Ok(None);
+        };
+        Ok(decode_boot_addr(node, &bytes))
     }
 
     /// Startup: recover every predecessor session's open log — their
@@ -8264,5 +8950,717 @@ mod mark_wire_tests {
         encode_entry(&row(), &mut out);
         out[..4].copy_from_slice(b"CLG1");
         assert!(decode_entry(&mut out.as_slice()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod boot_addr_recovery_tests {
+    use super::*;
+
+    const DEAD: &str = "a/g1";
+    const EPOCH: u64 = 3;
+
+    #[derive(Clone)]
+    enum Answer {
+        Ok(bytes::Bytes),
+        Http(u16, bool),
+    }
+
+    /// Scripted answers by (address, path).
+    struct Script {
+        answers: HashMap<(String, String), Answer>,
+    }
+
+    impl Script {
+        fn new() -> Self {
+            Self {
+                answers: HashMap::new(),
+            }
+        }
+
+        fn on(mut self, addr: &str, path: &str, answer: Answer) -> Self {
+            self.answers.insert((addr.into(), path.into()), answer);
+            self
+        }
+
+        fn transport(self) -> Arc<dyn LogTransport> {
+            Arc::new(self)
+        }
+    }
+
+    impl LogTransport for Script {
+        fn post<'a>(
+            &'a self,
+            _node: &'a str,
+            addr: &'a str,
+            path: &'a str,
+            _body: Vec<u8>,
+            _deadline: Option<std::time::Duration>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<bytes::Bytes>> + Send + 'a>,
+        > {
+            let answer = match self.answers.get(&(addr.to_string(), path.to_string())) {
+                Some(Answer::Ok(bytes)) => Ok(bytes.clone()),
+                Some(Answer::Http(status, peer)) => Err(anyhow::Error::new(PeerHttpError {
+                    status: reqwest::StatusCode::from_u16(*status).unwrap(),
+                    peer: *peer,
+                })
+                .context("peer answered")),
+                None => Err(anyhow!("connection refused")),
+            };
+            Box::pin(async move { answer })
+        }
+    }
+
+    fn seal(base: u64, end: u64, epoch: u64) -> Answer {
+        let resp = SealResp {
+            end,
+            base: Some(base),
+            fragment_epoch: epoch,
+            held_fragment_epoch: Some(epoch),
+        };
+        Answer::Ok(serde_json::to_vec(&resp).unwrap().into())
+    }
+
+    fn entry(seq: u64) -> Entry {
+        Entry {
+            seq,
+            cell: "c".into(),
+            cell_epoch: 1,
+            txid: seq,
+            bytes: vec![seq as u8],
+        }
+    }
+
+    const STALE_BYTES: [u8; 1] = [99];
+
+    /// A row of an old fragment: the same sequence, other contents.
+    fn stale_entry(seq: u64) -> Entry {
+        Entry {
+            seq,
+            cell: "c".into(),
+            cell_epoch: 1,
+            txid: seq,
+            bytes: STALE_BYTES.to_vec(),
+        }
+    }
+
+    fn tail(base: u64, end: u64, complete: bool, epoch: u64, entries: Vec<Entry>) -> Answer {
+        let resp = TailResp {
+            range: TailRange {
+                fragment_epoch: epoch,
+                base,
+                end,
+                complete,
+            },
+            entries,
+        };
+        Answer::Ok(encode_tail_resp(&resp).into())
+    }
+
+    fn refused(status: u16, peer: bool) -> Answer {
+        Answer::Http(status, peer)
+    }
+
+    fn run<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    fn candidates(addrs: &[&str], read_failed: bool) -> Candidates {
+        Candidates {
+            addrs: addrs.iter().map(ToString::to_string).collect(),
+            read_failed,
+        }
+    }
+
+    const SEAL: &str = "/peer/log/seal";
+    const TAIL: &str = "/peer/log/tail";
+
+    /// Ask every candidate in order, as recovery does.
+    fn probe_all(transport: &Arc<dyn LogTransport>, candidates: &Candidates) -> MemberFate {
+        run(async {
+            let mut fate = MemberFate::new(candidates.read_failed);
+            for addr in &candidates.addrs {
+                fate.absorb(probe_member(transport, DEAD, EPOCH, "m", addr).await);
+                if fate.witness {
+                    break;
+                }
+            }
+            fate
+        })
+    }
+
+    /// The local store runs on the process's execution domain, which a test
+    /// binary has to bind once.
+    fn run_store<T>(future: impl std::future::Future<Output = T>) -> T {
+        crate::asyncrt::install_test_host_runtime().block_on(future)
+    }
+
+    fn store() -> (tempfile::TempDir, Bucket) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bucket = crate::dev::open_local_bucket(&dir.path().join("store.db")).unwrap();
+        (dir, bucket)
+    }
+
+    async fn stored_addr(bucket: &Bucket) -> Option<String> {
+        let (bytes, _) = bucket.get(&boot_addr_key("m")).await.unwrap()?;
+        decode_boot_addr("m", &bytes)
+    }
+
+    // A failed read of the published address is not an absent one.
+    #[test]
+    fn a_failed_boot_address_read_leaves_the_member_undecided() {
+        let read_failed = candidate_addrs(Some("lease:1"), Err(anyhow!("bucket unavailable")));
+        assert!(read_failed.read_failed);
+        // The lease address is still asked.
+        assert_eq!(read_failed.addrs, ["lease:1"]);
+        let transport = Script::new().transport();
+        let fate = probe_all(&transport, &read_failed);
+        assert!(!fate.witness);
+        // Long dead, silent, past the hold: gone, unless the read failed.
+        assert!(fate.undecided(false, true, false));
+        let absent = candidate_addrs(Some("lease:1"), Ok(None));
+        assert!(!absent.read_failed);
+        assert!(!probe_all(&transport, &absent).undecided(false, true, false));
+    }
+
+    #[test]
+    fn the_published_address_is_asked_first_and_not_twice() {
+        let both = candidate_addrs(Some("old:1"), Ok(Some("new:2".into())));
+        assert_eq!(both.addrs, ["new:2", "old:1"]);
+        let same = candidate_addrs(Some("same:1"), Ok(Some("same:1".into())));
+        assert_eq!(same.addrs, ["same:1"]);
+    }
+
+    // A corrupt record names no address: the lease address is still asked.
+    #[test]
+    fn a_corrupt_boot_address_is_counted_and_names_no_address() {
+        let before = CORRUPT_BOOT_ADDRS.load(Ordering::Relaxed);
+        assert_eq!(decode_boot_addr("m", b"{"), None);
+        assert!(CORRUPT_BOOT_ADDRS.load(Ordering::Relaxed) > before);
+        let candidates = candidate_addrs(Some("lease:1"), Ok(decode_boot_addr("m", b"\xff")));
+        assert!(!candidates.read_failed);
+        assert_eq!(candidates.addrs, ["lease:1"]);
+    }
+
+    // A member that is not listening yet is not gone inside the hold.
+    #[test]
+    fn a_silent_long_dead_member_is_gone_only_past_the_boot_hold() {
+        // answered, live, long dead, in hold
+        assert!(unreached_is_undecided(false, false, true, true));
+        assert!(!unreached_is_undecided(false, false, true, false));
+        // A lease that is only just lapsed is undecided whatever the hold.
+        assert!(unreached_is_undecided(false, false, false, false));
+        assert!(unreached_is_undecided(false, true, true, false));
+        assert!(unreached_is_undecided(true, false, true, false));
+    }
+
+    // The hold covers the ladder up to its final attempt.
+    #[test]
+    fn the_boot_hold_covers_the_ladder_up_to_its_final_attempt() {
+        let ttl_ms = 10_000_u64;
+        let hold = boot_hold_ms(ttl_ms, None);
+        // Where each attempt starts: the waits are one, two, three terms.
+        let mut ladder = RecoveryLadder::new(std::time::Duration::from_millis(ttl_ms));
+        let failure = anyhow!("no complete true witness among {{}} and 1 member(s) undecided");
+        let mut starts = vec![0_u64];
+        while let Some(wait) = ladder.next(&failure) {
+            starts.push(starts.last().unwrap() + wait.as_millis() as u64);
+        }
+        assert_eq!(starts, [0, 10_000, 30_000, 60_000]);
+        let last = *starts.last().unwrap();
+        for start in &starts[..starts.len() - 1] {
+            assert!(
+                in_boot_hold(*start, 0, hold),
+                "an attempt at {start} ms must not declare a loss"
+            );
+        }
+        // Only the last attempt may, with a margin before it.
+        assert!(!in_boot_hold(last, 0, hold));
+        assert!(hold < last);
+        assert_eq!(hold, 50_000);
+        // It scales with the lease term, and the setting wins, 0 included.
+        assert_eq!(boot_hold_ms(1_000, None), 5_000);
+        assert_eq!(boot_hold_ms(ttl_ms, Some(7)), 7);
+        assert_eq!(boot_hold_ms(ttl_ms, Some(0)), 0);
+        assert!(!in_boot_hold(1, 0, 0));
+        // `started_ms` is on the monotonic clock: a process that has been up
+        // for exactly the hold is out of it.
+        assert!(in_boot_hold(149_999, 100_000, hold));
+        assert!(!in_boot_hold(150_000, 100_000, hold));
+    }
+
+    #[test]
+    fn a_published_address_carries_the_identity_of_its_boot() {
+        let bytes = encode_boot_addr("m", "m/g7", 1234, "10.0.0.5:9");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["node"], "m");
+        assert_eq!(value["session"], "m/g7");
+        assert_eq!(value["boot_at_ms"], 1234);
+        assert_eq!(decode_boot_addr("m", &bytes).as_deref(), Some("10.0.0.5:9"));
+        // Another node's record, or a session of another node, is not this
+        // node's address.
+        assert_eq!(decode_boot_addr("other", &bytes), None);
+        let misfiled = encode_boot_addr("m", "x/g7", 1, "a:1");
+        assert_eq!(decode_boot_addr("m", &misfiled), None);
+    }
+
+    // Only a reply that is not celld's is not the member.
+    #[test]
+    fn a_reply_of_the_peer_protocol_keeps_the_member_undecided() {
+        for (status, peer, answered) in [
+            // Not celld at all: whatever holds the address now.
+            (404, false, false),
+            (401, false, false),
+            (400, false, false),
+            // Anything celld says stays undecided: skew, replay protection,
+            // another version, a wrong-target refusal nobody authenticated.
+            (401, true, true),
+            (403, true, true),
+            (404, true, true),
+            (405, true, true),
+            (409, true, true),
+            (400, true, true),
+            (503, true, true),
+        ] {
+            let transport = Script::new()
+                .on("a:1", SEAL, refused(status, peer))
+                .transport();
+            let probe = run(probe_member(&transport, DEAD, EPOCH, "m", "a:1"));
+            assert!(
+                matches!(probe, Probe::Unreached { answered: got } if got == answered),
+                "{status} peer={peer}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stranger_on_a_reused_address_does_not_block_a_loss_decision() {
+        let transport = Script::new()
+            .on("new:2", SEAL, refused(404, false))
+            .transport();
+        let fate = probe_all(&transport, &candidates(&["new:2", "old:1"], false));
+        assert!(!fate.undecided(false, true, false));
+        // A celld process there, even one that refuses with a 409, keeps the
+        // member undecided: no refusal proves which node refused.
+        let transport = Script::new()
+            .on("new:2", SEAL, refused(409, true))
+            .transport();
+        let fate = probe_all(&transport, &candidates(&["new:2", "old:1"], false));
+        assert!(fate.undecided(false, true, false));
+    }
+
+    // At the transport: a real reply of another protocol version is a celld
+    // answer, and a reply with no version header is not.
+    #[test]
+    fn a_member_on_another_protocol_version_is_still_an_answer() {
+        async fn reply_with(headers: &'static str) -> anyhow::Error {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let server = async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let reply = format!(
+                    "HTTP/1.1 401 Unauthorized\r\n{headers}content-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            };
+
+            let auth = Arc::new(PeerAuth::new([7_u8; 32], "a").unwrap());
+            let transport = SignedPeerTransport::new(auth);
+            let request = transport.post("m", &addr, "/peer/log/seal", b"{}".to_vec(), None);
+            let (_, outcome) = futures_util::future::join(server, request).await;
+            outcome.expect_err("the member refuses")
+        }
+        run(async {
+            for version in [
+                "x-cells-peer-version: 99\r\n",
+                "x-cells-peer-version: 1\r\n",
+            ] {
+                let error = reply_with(version).await;
+                assert!(member_answered(&error), "{version}: {error:#}");
+            }
+            let error = reply_with("").await;
+            assert!(!member_answered(&error), "{error:#}");
+        });
+    }
+
+    // Seal and tail are judged together per address.
+    #[test]
+    fn an_address_that_seals_but_cannot_supply_the_fragment_does_not_end_the_search() {
+        let transport = Script::new()
+            // The first address seals, and its tail is incomplete.
+            .on("first:1", SEAL, seal(0, 2, EPOCH))
+            .on("first:1", TAIL, tail(0, 2, false, EPOCH, vec![entry(1)]))
+            // The second holds the intact fragment.
+            .on("second:2", SEAL, seal(0, 2, EPOCH))
+            .on(
+                "second:2",
+                TAIL,
+                tail(0, 2, true, EPOCH, vec![entry(1), entry(2)]),
+            )
+            .transport();
+        let fate = probe_all(&transport, &candidates(&["first:1", "second:2"], false));
+        assert!(fate.witness);
+        assert!(fate.entries.iter().any(|entry| entry.seq == 2));
+        assert!(!fate.undecided(false, true, false));
+    }
+
+    #[test]
+    fn a_tail_that_cannot_be_read_at_one_address_keeps_the_member_undecided() {
+        let transport = Script::new()
+            .on("first:1", SEAL, seal(0, 2, EPOCH))
+            .on("first:1", TAIL, refused(400, true))
+            .transport();
+        let fate = probe_all(&transport, &candidates(&["first:1", "second:2"], false));
+        assert!(!fate.witness);
+        assert!(fate.undecided(false, true, false));
+    }
+
+    #[test]
+    fn an_incomplete_fragment_at_every_address_is_conclusive() {
+        let transport = Script::new()
+            .on("first:1", SEAL, seal(0, 2, EPOCH))
+            .on("first:1", TAIL, tail(0, 2, false, EPOCH, vec![entry(1)]))
+            .transport();
+        let fate = probe_all(&transport, &candidates(&["first:1"], false));
+        assert!(!fate.witness);
+        assert!(!fate.undecided(false, true, false));
+    }
+
+    // Retirement tombstones only the record of the retired lease's own boot.
+    #[test]
+    fn retirement_keeps_a_successors_address_and_takes_the_retired_ones() {
+        run_store(async {
+            let (_dir, bucket) = store();
+            let key = boot_addr_key("m");
+            // A successor published inside the old lease term.
+            bucket
+                .put(&key, encode_boot_addr("m", "m/g2", 100, "new:2"))
+                .await
+                .unwrap();
+            assert!(!retire_boot_addr(&bucket, "m", "m/g1").await.unwrap());
+            assert_eq!(stored_addr(&bucket).await.as_deref(), Some("new:2"));
+            // The retired lease's own boot.
+            assert!(retire_boot_addr(&bucket, "m", "m/g2").await.unwrap());
+            assert_eq!(stored_addr(&bucket).await, None);
+            // Retiring a tombstone is a no-op.
+            assert!(!retire_boot_addr(&bucket, "m", "m/g2").await.unwrap());
+            // A damaged record goes too.
+            bucket.put(&key, b"{".to_vec()).await.unwrap();
+            assert!(retire_boot_addr(&bucket, "m", "m/g1").await.unwrap());
+        });
+    }
+
+    #[test]
+    fn retirement_loses_to_a_publish_that_lands_between_its_read_and_its_write() {
+        run_store(async {
+            let (_dir, bucket) = store();
+            let key = boot_addr_key("m");
+            bucket
+                .put(&key, encode_boot_addr("m", "m/g1", 100, "old:1"))
+                .await
+                .unwrap();
+            // The very record the retirement is for, republished under the
+            // same session between its read and its write.
+            let landed = retire_boot_addr_racing(&bucket, "m", "m/g1", async {
+                bucket
+                    .put(&key, encode_boot_addr("m", "m/g1", 900, "again:3"))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+            assert!(!landed, "the stale tombstone must not land");
+            assert_eq!(stored_addr(&bucket).await.as_deref(), Some("again:3"));
+        });
+    }
+
+    // A restarted node's address replaces the record of any other session,
+    // whatever its host clock said: wall clocks do not order boots.
+    #[test]
+    fn a_restarted_nodes_address_replaces_a_record_from_a_later_clock() {
+        run_store(async {
+            let (_dir, bucket) = store();
+            // The previous boot's host clock was ahead.
+            publish_boot_addr_to(&bucket, "m", "m/g1", "old:1", 9_000_000)
+                .await
+                .unwrap();
+            publish_boot_addr_to(&bucket, "m", "m/g2", "new:2", 1_000)
+                .await
+                .unwrap();
+            assert_eq!(stored_addr(&bucket).await.as_deref(), Some("new:2"));
+            // A tombstone and a damaged record are replaced too, and the
+            // same boot publishing again is a plain overwrite.
+            bucket
+                .put(&boot_addr_key("m"), retired_boot_addr("m"))
+                .await
+                .unwrap();
+            publish_boot_addr_to(&bucket, "m", "m/g3", "three:3", 1)
+                .await
+                .unwrap();
+            assert_eq!(stored_addr(&bucket).await.as_deref(), Some("three:3"));
+            bucket
+                .put(&boot_addr_key("m"), b"{".to_vec())
+                .await
+                .unwrap();
+            publish_boot_addr_to(&bucket, "m", "m/g4", "four:4", 1)
+                .await
+                .unwrap();
+            assert_eq!(stored_addr(&bucket).await.as_deref(), Some("four:4"));
+        });
+    }
+
+    // A late write from a dead process lands on a stale etag and loses.
+    #[test]
+    fn a_late_write_from_a_dead_boot_loses_to_the_etag() {
+        run_store(async {
+            let (_dir, bucket) = store();
+            publish_boot_addr_to(&bucket, "m", "m/g1", "old:1", 100)
+                .await
+                .unwrap();
+            // The dead boot read the record, and its write is still in flight
+            // when the next boot publishes.
+            let landed = publish_boot_addr_attempt(&bucket, "m", "m/g1", "old:1", 100, async {
+                publish_boot_addr_to(&bucket, "m", "m/g2", "new:2", 50)
+                    .await
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+            assert!(!landed, "the late write must not land");
+            assert_eq!(stored_addr(&bucket).await.as_deref(), Some("new:2"));
+        });
+    }
+
+    // Rows of another fragment are not merged with the recovered one's.
+    #[test]
+    fn rows_of_a_stale_fragment_are_not_taken() {
+        let transport = Script::new()
+            // The stale published address answers first with an old
+            // fragment (epoch 2) and its rows.
+            .on("stale:1", SEAL, seal(0, 2, 2))
+            .on(
+                "stale:1",
+                TAIL,
+                tail(0, 2, true, 2, vec![stale_entry(1), stale_entry(2)]),
+            )
+            // The lease address holds the fragment of the epoch recovered.
+            .on("lease:2", SEAL, seal(0, 2, EPOCH))
+            .on(
+                "lease:2",
+                TAIL,
+                tail(0, 2, true, EPOCH, vec![entry(1), entry(2)]),
+            )
+            .transport();
+        let fate = probe_all(&transport, &candidates(&["stale:1", "lease:2"], false));
+        assert!(fate.witness);
+        let seqs: Vec<u64> = fate.entries.iter().map(|entry| entry.seq).collect();
+        assert_eq!(seqs, [1, 2], "only the fragment being recovered");
+        assert!(
+            fate.entries.iter().all(|entry| entry.bytes != STALE_BYTES),
+            "no row of the stale fragment"
+        );
+        assert_eq!(fate.discarded_rows, 2);
+        // Alone, a stale address contributes no rows either.
+        let alone = probe_all(
+            &Script::new()
+                .on("stale:1", SEAL, seal(0, 2, 2))
+                .on(
+                    "stale:1",
+                    TAIL,
+                    tail(0, 2, true, 2, vec![stale_entry(1), stale_entry(2)]),
+                )
+                .transport(),
+            &candidates(&["stale:1"], false),
+        );
+        assert!(!alone.witness);
+        assert!(alone.entries.is_empty());
+        assert_eq!(alone.discarded_rows, 2);
+    }
+
+    // The hold must stay below the start of the last attempt.
+    #[test]
+    fn a_boot_hold_that_could_never_decide_is_refused_and_clamped() {
+        // Six lease terms is where the last attempt starts.
+        assert!(validate_boot_hold(10_000, None).is_ok());
+        assert!(validate_boot_hold(10_000, Some(0)).is_ok());
+        assert!(validate_boot_hold(10_000, Some(59_999)).is_ok());
+        let error = validate_boot_hold(10_000, Some(60_000)).unwrap_err();
+        assert!(error.to_string().contains("CELLD_RECOVERY_LOSS_HOLD_MS"));
+        assert!(validate_boot_hold(1_000, Some(30_000)).is_err());
+        // A TTL lowered under a fixed value: the node's TTL decides.
+        assert!(validate_boot_hold(5_000, Some(40_000)).is_err());
+        // The hold in use is clamped too, whatever got through.
+        assert_eq!(boot_hold_ms(10_000, Some(1_000_000)), 59_999);
+        assert_eq!(boot_hold_ms(10_000, Some(30_000)), 30_000);
+    }
+
+    // A stale address that answers with another fragment must not make the
+    // member conclusive while its real address refuses as a live peer.
+    #[test]
+    fn a_peer_refusal_behind_a_stale_address_keeps_the_member_undecided() {
+        // The stale address names another fragment (epoch 2).
+        let stale_other = Script::new()
+            .on("stale:1", SEAL, seal(0, 2, 2))
+            .on(
+                "stale:1",
+                TAIL,
+                tail(0, 2, true, 2, vec![stale_entry(1), stale_entry(2)]),
+            )
+            .on("real:2", SEAL, refused(401, true));
+        let fate = probe_all(
+            &stale_other.transport(),
+            &candidates(&["stale:1", "real:2"], false),
+        );
+        assert!(!fate.witness);
+        assert!(fate.reached_any && fate.answered);
+        assert!(fate.undecided(false, true, false));
+        // The same with a stale address holding an incomplete fragment of
+        // the right epoch.
+        let stale_incomplete = Script::new()
+            .on("stale:1", SEAL, seal(0, 2, EPOCH))
+            .on("stale:1", TAIL, tail(0, 2, false, EPOCH, vec![entry(1)]))
+            .on("real:2", SEAL, refused(403, true));
+        let fate = probe_all(
+            &stale_incomplete.transport(),
+            &candidates(&["stale:1", "real:2"], false),
+        );
+        assert!(fate.undecided(false, true, false));
+        // Without the refusal, the incomplete fragment is conclusive.
+        let alone = Script::new().on("stale:1", SEAL, seal(0, 2, EPOCH)).on(
+            "stale:1",
+            TAIL,
+            tail(0, 2, false, EPOCH, vec![entry(1)]),
+        );
+        let fate = probe_all(&alone.transport(), &candidates(&["stale:1"], false));
+        assert!(!fate.undecided(false, true, false));
+    }
+
+    // A boot that could not publish runs only at an unchanged address.
+    #[test]
+    fn a_boot_that_could_not_publish_continues_only_at_an_unchanged_address() {
+        assert!(unpublished_boot_may_continue(Some("a:1"), true, "a:1"));
+        assert!(!unpublished_boot_may_continue(Some("a:1"), true, "b:2"));
+        // No lease record: no predecessor to recover.
+        assert!(unpublished_boot_may_continue(None, true, "b:2"));
+        // The lease could not be read, so nothing is known.
+        assert!(!unpublished_boot_may_continue(None, false, "b:2"));
+    }
+
+    // A declaration applies only to a member probed first, with no complete
+    // witness and no live lease.
+    #[test]
+    fn a_declaration_applies_only_to_a_member_that_gave_no_complete_witness() {
+        // Alive and holding a complete fragment: used as usual.
+        assert_eq!(apply_declaration(true, true, false), Declaration::Ignored);
+        assert_eq!(apply_declaration(true, true, true), Declaration::Ignored);
+        // Unreachable, or answered without a complete fragment.
+        assert_eq!(apply_declaration(true, false, false), Declaration::Applied);
+        // A live lease refuses it.
+        assert_eq!(apply_declaration(true, false, true), Declaration::Refused);
+        assert_eq!(apply_declaration(false, false, false), Declaration::None);
+    }
+
+    #[test]
+    fn a_declared_member_that_answers_with_a_complete_fragment_is_a_witness() {
+        let transport = Script::new()
+            .on("m:1", SEAL, seal(0, 2, EPOCH))
+            .on(
+                "m:1",
+                TAIL,
+                tail(0, 2, true, EPOCH, vec![entry(1), entry(2)]),
+            )
+            .transport();
+        let fate = probe_all(&transport, &candidates(&["m:1"], false));
+        assert!(fate.witness);
+        assert_eq!(
+            apply_declaration(true, fate.witness, false),
+            Declaration::Ignored
+        );
+    }
+
+    // Only the boot's own predecessor recovery uses the declaration.
+    #[test]
+    fn a_sweep_and_a_later_recovery_ignore_the_declaration() {
+        let declared: BTreeSet<String> = ["m".to_string()].into();
+        assert_eq!(
+            declared_for_mode(&declared, RecoverMode::Predecessor),
+            declared
+        );
+        assert!(declared_for_mode(&declared, RecoverMode::Sweep).is_empty());
+        assert!(declared_for_mode(&declared, RecoverMode::Boot).is_empty());
+    }
+
+    // The loss record says that an operator's declaration produced it.
+    #[test]
+    fn a_loss_record_names_the_members_the_operator_declared() {
+        let ensemble: BTreeSet<String> = ["a".to_string(), "b".to_string()].into();
+        let plain = loss_record("n/g", 3, 7, "n", &ensemble, &[]);
+        assert_eq!(plain["operator_declared_gone"], serde_json::json!([]));
+        assert!(!plain["note"].as_str().unwrap().contains("operator"));
+        let declared = loss_record("n/g", 3, 7, "n", &ensemble, &["a".to_string()]);
+        assert_eq!(declared["operator_declared_gone"], serde_json::json!(["a"]));
+        let note = declared["note"].as_str().unwrap();
+        assert!(note.contains("operator") && note.contains("a is permanently gone"));
+    }
+
+    // The hold check and the clamp use one term.
+    #[test]
+    fn the_hold_check_and_the_clamp_use_the_same_term() {
+        // A term under a second is raised to a second by both.
+        assert!(validate_boot_hold(100, Some(5_999)).is_ok());
+        assert!(validate_boot_hold(100, Some(6_000)).is_err());
+        assert_eq!(boot_hold_ms(100, Some(1_000_000)), 5_999);
+        assert_eq!(boot_hold_ms(100, None), 5_000);
+        // The grace the GC shares with recovery.
+        assert_eq!(member_loss_grace_ms(10_000), 30_000);
+        assert_eq!(member_loss_grace_ms(1_000), 20_000);
+    }
+
+    // Two processes publishing at once do not overwrite each other.
+    #[test]
+    fn a_lost_publish_race_leaves_a_concurrent_boots_record() {
+        run_store(async {
+            let (_dir, bucket) = store();
+            publish_boot_addr_to(&bucket, "m", "m/g0", "zero:0", 1)
+                .await
+                .unwrap();
+            publish_boot_addr_racing(&bucket, "m", "m/g1", "one:1", 2, async {
+                publish_boot_addr_to(&bucket, "m", "m/g2", "two:2", 3)
+                    .await
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+            assert_eq!(stored_addr(&bucket).await.as_deref(), Some("two:2"));
+            // A tombstone that lands in the window is written over.
+            publish_boot_addr_racing(&bucket, "m", "m/g3", "three:3", 4, async {
+                bucket
+                    .put(&boot_addr_key("m"), retired_boot_addr("m"))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+            assert_eq!(stored_addr(&bucket).await.as_deref(), Some("three:3"));
+        });
+    }
+
+    #[test]
+    fn declared_gone_members_are_node_names() {
+        let members = parse_declared_gone("nodelog-1, nodelog-2,,").unwrap();
+        assert_eq!(
+            members.into_iter().collect::<Vec<_>>(),
+            ["nodelog-1", "nodelog-2"]
+        );
+        assert!(parse_declared_gone("").unwrap().is_empty());
+        assert!(parse_declared_gone("not a node/name").is_err());
     }
 }

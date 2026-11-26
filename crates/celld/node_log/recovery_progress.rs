@@ -92,7 +92,7 @@ impl Progress {
         });
         let mut reads = futures_util::stream::iter(reads).buffer_unordered(BATCH);
         while let Some((meta, result)) = reads.next().await {
-            manager.beat_claim(session, beat).await?;
+            manager.beat_claim(session, beat, false).await?;
             match result {
                 Ok(cells) => {
                     for cell in cells {

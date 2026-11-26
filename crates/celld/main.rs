@@ -3732,6 +3732,15 @@ fn serve_http_connection(
     })
 }
 
+/// The members the operator declared permanently gone for this boot's
+/// recovery: `CELLD_RECOVERY_GONE_MEMBERS`.
+fn declared_gone_members() -> anyhow::Result<std::collections::BTreeSet<String>> {
+    match celld::env_vars::value("CELLD_RECOVERY_GONE_MEMBERS")? {
+        Some(value) => celld::node_log::parse_declared_gone(&value),
+        None => Ok(Default::default()),
+    }
+}
+
 /// Serve the surviving follower disks before recovering this node's own
 /// predecessor. After a correlated restart, every predecessor can need a
 /// fragment on another restarting node. Waiting to accept until recovery
@@ -4696,14 +4705,21 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 }),
                 write_lock: tokio::sync::Mutex::new(()),
             });
-            let manager = Arc::new(celld::node_log::NodeLogManager::new(
-                &format!("{node}/{process_generation}"),
-                log_bucket,
-                own_log,
-                ltx.clone(),
-                app.peer_auth.clone(),
-                celld::node_log::eviction_policy_from_env()?,
-            ));
+            let boot_hold = celld::env_vars::optional::<u64>("CELLD_RECOVERY_LOSS_HOLD_MS")?;
+            celld::node_log::validate_boot_hold(bucket_ownership.lease_ttl_ms(), boot_hold)?;
+            let declared_gone = declared_gone_members()?;
+            let manager = Arc::new(
+                celld::node_log::NodeLogManager::new(
+                    &format!("{node}/{process_generation}"),
+                    log_bucket,
+                    own_log,
+                    ltx.clone(),
+                    app.peer_auth.clone(),
+                    celld::node_log::eviction_policy_from_env()?,
+                )
+                .with_boot_hold_ms(boot_hold)
+                .with_declared_gone(declared_gone),
+            );
             let probe = Arc::downgrade(&manager);
             bucket_ownership.set_ensemble_probe(move || {
                 probe.upgrade().is_some_and(|manager| manager.proving())
@@ -4723,6 +4739,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             // and exits on exhaustion. Serve the retained follower disks
             // throughout the ladder, including retry backoffs, so a fleet
             // restart can recover without waiting for another node's lease.
+            manager.publish_boot_addr(&app.advertise).await?;
             recover_with_follower_listener(&internal_listener, app.clone(), async {
                 let ttl_backoff =
                     std::time::Duration::from_millis(actor.lease_spec.ttl_ms.max(1_000));

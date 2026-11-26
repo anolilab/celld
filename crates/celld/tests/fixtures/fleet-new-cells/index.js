@@ -1,6 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 
 export class Cell extends DurableObject {
+  async read() {
+    return (await this.ctx.storage.get("n")) ?? 0;
+  }
+
   async bump() {
     const n = ((await this.ctx.storage.get("n")) ?? 0) + 1;
     await this.ctx.storage.put("n", n);
@@ -19,6 +23,11 @@ export default {
       const id = env.OBJ.newUniqueId();
       const n = await env.OBJ.get(id).bump();
       return Response.json({ id: id.toString(), n });
+    }
+    // The value a cell holds, read back by the id `/new` returned.
+    if (url.pathname === "/read") {
+      const id = env.OBJ.idFromString(url.searchParams.get("id"));
+      return Response.json({ n: await env.OBJ.get(id).read() });
     }
     return new Response("unknown", { status: 404 });
   },
