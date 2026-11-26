@@ -105,13 +105,22 @@ fn log_events(rig: &Rig, needle: &str) -> u64 {
 async fn bring_up(rig: &mut Rig, index: usize) -> bool {
     for attempt in 1..=3 {
         rig.fleet.spawn_node(index);
-        let client = rig.fleet.client.clone();
-        let ready = tokio::time::timeout(
-            Duration::from_secs(150),
-            rig.fleet.nodes[index].wait_ready(&client),
-        )
-        .await;
-        if ready.is_ok() {
+        // Not `Node::wait_ready`, which panics: a node that is slow to come up
+        // on a loaded host is tried again, and counted if it never does.
+        let public = rig.fleet.ep.public(index);
+        let deadline = Instant::now() + Duration::from_secs(150);
+        let mut ready = false;
+        while Instant::now() < deadline && !ready {
+            ready = true;
+            for path in ["/.well-known/celld/health", "/__ready"] {
+                let reply = rig.fleet.client.get(format!("{public}{path}")).send().await;
+                ready &= reply.is_ok_and(|reply| reply.status().is_success());
+            }
+            if !ready {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+        if ready {
             return true;
         }
         say!("soak: node {index} was not ready (attempt {attempt}); starting it again");
