@@ -675,7 +675,18 @@ pub(crate) fn enqueue_mark(scope: &str, counter: u64) -> tokio::sync::oneshot::R
         counter,
         done,
     });
+    if let Some(wake) = SHIP_WAKE.get() {
+        wake.notify_one();
+    }
     wait
+}
+
+static SHIP_WAKE: OnceLock<std::sync::Arc<tokio::sync::Notify>> = OnceLock::new();
+
+/// The wake of the ship loop, so that a mark that waits for its proof does not wait
+/// for the next tick of the loop's timer. Set once, by the first log tier.
+pub(crate) fn set_ship_wake(wake: std::sync::Arc<tokio::sync::Notify>) {
+    let _ = SHIP_WAKE.set(wake);
 }
 
 pub(crate) fn take_marks() -> Vec<PendingMark> {

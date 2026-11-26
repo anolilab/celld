@@ -1540,6 +1540,9 @@ impl LtxRepl {
         let cells: Arc<Mutex<BTreeMap<(String, u64), CellHandle>>> = Arc::default();
         let dirty = Arc::new(Notify::new());
         let dirty_ship = Arc::new(Notify::new());
+        // A `Grant` mark that waits for its proof wakes the ship loop, which would
+        // otherwise find it on the next tick of its fallback timer.
+        crate::session::set_ship_wake(dirty_ship.clone());
         let registration: Arc<Mutex<RegistrationState>> = Arc::default();
         let stop = StopToken::new();
         let tasks = TaskGroup::new(stop.clone());
