@@ -1108,7 +1108,6 @@ async fn bundles(fleet: &Fleet) -> usize {
 /// sealed chunk of its session, and the retained bundles are back to an idle
 /// count within two minutes.
 #[tokio::test]
-#[ignore = "fails on the whole-fleet-kill declared loss in node-log recovery; un-ignore when that fix lands"]
 async fn s10_a_bucket_that_refuses_for_a_minute_loses_no_acknowledged_grant() {
     const MARKS_ONLY: &[(&str, &str)] = &[
         ("CELLD_LAZY_BIRTH", "shadow"),
