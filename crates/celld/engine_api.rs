@@ -239,6 +239,47 @@ pub const CELL_OVERLOAD_ERROR_MARKER: &str =
 pub const CANCEL_RETRYABLE_ERROR_MARKER: &str =
     "celld-internal-retryable-cancel-3b9a51d0-6e2c-4f7a-8c14-a0d5e7b92f68";
 
+/// What every routing-refusal marker starts with.
+#[doc(hidden)]
+pub const ROUTE_REFUSED_MARKER_PREFIX: &str = "celld-internal-route-refused-";
+
+/// Carried by the error of a request that routing refused (the cell's
+/// ownership could not be resolved, a claim was refused). It survives the V8
+/// promise boundary like the markers above, so a stateless Worker whose call
+/// to a cell was refused does not turn the refusal into an internal error: the
+/// public ingress answers it 503, as it does for the same refusal reached
+/// directly.
+///
+/// Unlike the markers above it ends in a random part chosen once per process,
+/// which a Worker cannot know unless a refusal's text reached it: a Worker that
+/// throws the prefix, or text a client sent, is not a refusal.
+#[doc(hidden)]
+pub fn route_refused_marker() -> &'static str {
+    static MARKER: OnceLock<String> = OnceLock::new();
+    MARKER.get_or_init(|| {
+        let mut bytes = [0; 16];
+        getrandom::fill(&mut bytes).expect("OS random source unavailable");
+        let nonce: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        format!("{ROUTE_REFUSED_MARKER_PREFIX}{nonce}")
+    })
+}
+
+/// Whether `text` is exactly the failure a Worker's rejected call to a refused
+/// cell gives: the rejection, the routing failure with its verdict, and this
+/// process's marker at the end. A marker anywhere else is not a refusal.
+#[doc(hidden)]
+pub fn is_routed_refusal_text(text: &str) -> bool {
+    is_routed_refusal_text_with(text, route_refused_marker())
+}
+
+fn is_routed_refusal_text_with(text: &str, marker: &str) -> bool {
+    text.strip_prefix("rejected: Error: route failed: ")
+        .and_then(|rest| rest.strip_suffix(&format!(" ({marker})")))
+        .is_some_and(|verdict| {
+            !verdict.is_empty() && !verdict.contains(ROUTE_REFUSED_MARKER_PREFIX)
+        })
+}
+
 /// The public sentences of a retryable cancel, one per cause. The error that
 /// ends the request and the 503 the ingress answers both use these, so they
 /// cannot drift apart.
@@ -1105,5 +1146,41 @@ mod ratelimit_binding_tests {
         extra["simple"]["burst"] = json!(3);
         let error = RateLimitBinding::from_manifest(&extra).unwrap_err();
         assert!(error.to_string().contains("`burst`"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod route_refusal_tests {
+    use super::*;
+
+    const MARKER: &str = "celld-internal-route-refused-0123";
+
+    #[test]
+    fn only_the_exact_rejection_of_a_refused_call_is_a_refusal() {
+        let text = |middle: &str| format!("rejected: Error: route failed: {middle} ({MARKER})");
+        assert!(is_routed_refusal_text_with(&text("ResolveFailed"), MARKER));
+        // A Worker's own error that holds the marker, before or after other text.
+        for forged in [
+            format!("rejected: Error: boom ({MARKER})"),
+            format!("rejected: Error: route failed: ResolveFailed ({MARKER}) and more"),
+            format!("rejected: Error: note {MARKER} route failed: ResolveFailed"),
+            format!("Error: route failed: ResolveFailed ({MARKER})"),
+            format!("rejected: Error: route failed:  ({MARKER})"),
+            format!("rejected: Error: route failed: x {MARKER}y ({MARKER})"),
+        ] {
+            assert!(!is_routed_refusal_text_with(&forged, MARKER), "{forged}");
+        }
+        // The right form with a marker whose random part is not this process's.
+        assert!(!is_routed_refusal_text_with(
+            &text("ResolveFailed").replace("0123", "9999"),
+            MARKER
+        ));
+    }
+
+    #[test]
+    fn the_marker_is_fixed_for_a_process_and_starts_with_the_prefix() {
+        assert_eq!(route_refused_marker(), route_refused_marker());
+        assert!(route_refused_marker().starts_with(ROUTE_REFUSED_MARKER_PREFIX));
+        assert!(route_refused_marker().len() > ROUTE_REFUSED_MARKER_PREFIX.len() + 16);
     }
 }

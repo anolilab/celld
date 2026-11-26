@@ -17,7 +17,7 @@ use celld::bucket::Bucket;
 use celld::cell_dispatch::{
     dispatch_call_attempt, dispatch_gate, local_dispatch_request_id, local_request_error,
     local_response_stream, requests_websocket_upgrade, split_do_call, CallAttempt, CallPayload,
-    RoutedRequestError, WEBSOCKET_WITHOUT_UPGRADE,
+    OutputGateRequestError, RoutedRequestError, WEBSOCKET_WITHOUT_UPGRADE,
 };
 use celld::fleet;
 use celld::generation::{
@@ -1725,6 +1725,12 @@ fn request_body_limit_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains(BODY_LIMIT_STREAM_ERROR))
 }
 
+/// A request that routing refused before the handler ran: see
+/// [`celld::cell_dispatch::is_routed_refusal`].
+fn routed_refusal_error(error: &anyhow::Error) -> bool {
+    celld::cell_dispatch::is_routed_refusal(error)
+}
+
 fn cell_overload_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.downcast_ref::<celld::js::CellOverloaded>().is_some()
@@ -2130,10 +2136,17 @@ async fn dispatch_cell_fetch(
         }
         Ok(Err(error)) if cell_overload_error(&error) => cell_overload_response(),
         Ok(Err(error)) if retryable_cancel_error(&error) => retryable_cancel_response(&error),
-        Ok(Err(error)) => match error.downcast_ref::<RoutedRequestError>() {
-            Some(error) => response(
+        Ok(Err(error)) => match error
+            .downcast_ref::<RoutedRequestError>()
+            .map(|routed| routed.0)
+            .or_else(|| {
+                error
+                    .downcast_ref::<OutputGateRequestError>()
+                    .map(|gate| gate.0)
+            }) {
+            Some(verdict) => response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("{{\"error\":\"{:?}\"}}", error.0),
+                format!("{{\"error\":\"{verdict:?}\"}}"),
             ),
             None => response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2268,7 +2281,7 @@ pub(crate) async fn dispatch_forwarded_fetch(
                 let reason = match failure {
                     LocalRequestFailure::Handler(error) => error.to_string(),
                     LocalRequestFailure::OutputGate { verdict, .. } => {
-                        RoutedRequestError(*verdict).to_string()
+                        OutputGateRequestError(*verdict).to_string()
                     }
                 };
                 websocket::reject_accepted_websocket(&app, target, &reason).await;
@@ -2561,6 +2574,13 @@ async fn handle_ingress(
         }
         Err(error) if cell_overload_error(&error) => cell_overload_response(),
         Err(error) if retryable_cancel_error(&error) => retryable_cancel_response(&error),
+        // A Worker that called a cell whose request routing refused: the
+        // refusal, not a failure of the Worker. The sentence is fixed; the
+        // error text can carry the Worker's stack.
+        Err(error) if routed_refusal_error(&error) => response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{\"error\":\"the request was refused by routing\"}",
+        ),
         Err(error) => match error.downcast_ref::<celld::pool::AdmitError>() {
             // Saturation is not a failure of the request. Answering it now
             // lets the caller retry or shed; holding the connection until its
