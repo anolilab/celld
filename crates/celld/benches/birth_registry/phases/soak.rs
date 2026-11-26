@@ -136,22 +136,25 @@ async fn await_ready(rig: &Rig, index: usize) -> bool {
 
 /// Start every node, then wait for each: after a whole-fleet kill each node's
 /// recovery of its own log reads its followers' disks, so the peers have to be
-/// listening before any one of them can be ready.
+/// listening before any one of them can be ready. A node that is not ready in
+/// time (it halted itself on its lease watchdog while recovering on a loaded
+/// host, say) is started again by itself; the nodes that are up are left alone.
 async fn bring_up_all(rig: &mut Rig) -> bool {
-    for attempt in 1..=2 {
-        for index in rig.nodes() {
-            rig.fleet.spawn_node(index);
-        }
+    for index in rig.nodes() {
+        rig.fleet.spawn_node(index);
+    }
+    for round in 1..=8 {
         let mut all = true;
         for index in rig.nodes() {
-            all &= await_ready(rig, index).await;
+            if !await_ready(rig, index).await {
+                all = false;
+                say!("soak: node {index} was not ready after a fleet start (round {round}); starting it again");
+                rig.fleet.nodes[index].kill();
+                rig.fleet.spawn_node(index);
+            }
         }
         if all {
             return true;
-        }
-        say!("soak: the fleet was not ready (attempt {attempt}); starting it again");
-        for index in rig.nodes() {
-            rig.fleet.nodes[index].kill();
         }
     }
     false
@@ -464,7 +467,21 @@ pub async fn soak() {
             })
             .collect()
     };
-    let final_check = probe::check_keys(&rig.fleet.ep, final_keys, 32, &rig.nodes()).await;
+    // In chunks: one check has a deadline of 60 s at 100 lookups a second, which
+    // is 6,000 keys.
+    let mut final_check = probe::check_keys(&rig.fleet.ep, Vec::new(), 32, &rig.nodes()).await;
+    for chunk in final_keys.chunks(4_000) {
+        let part = probe::check_keys(&rig.fleet.ep, chunk.to_vec(), 32, &rig.nodes()).await;
+        final_check.total += part.total;
+        final_check.exists += part.exists;
+        final_check.new += part.new;
+        final_check.unknown += part.unknown;
+        final_check.misses += part.misses;
+        final_check.first_misses.extend(part.first_misses);
+        for (doubt, n) in part.doubts {
+            *final_check.doubts.entry(doubt).or_default() += n;
+        }
+    }
     misses += final_check.misses;
     unknowns += final_check.unknown;
     checked += final_check.total;
@@ -512,6 +529,7 @@ pub async fn soak() {
             "claims_served_after_record_loss": record_loss_served,
         },
         "final_check": final_check.json(),
+        "final_check_valid": stopped_for.is_none(),
         "nodes_reporting": states.iter().filter(|state| state["counters"].is_object()).count(),
         "drills": drills,
         "commit": env_text("CELLD_REG_COMMIT"),
