@@ -60,6 +60,11 @@ struct OwnerWire<'a> {
     /// A leave-form record: the nonce the session announced before it wrote.
     #[serde(skip_serializing_if = "Option::is_none")]
     leave: Option<&'a str>,
+    /// A birth-form record: the minting session's record at epoch 1 that it wrote
+    /// without reading first (P1). It reads as a plain record beside the guard
+    /// that a reader runs over it when no grant covers it (P3).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    birth: bool,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +79,8 @@ struct OwnerWireOwned {
     over: Vec<String>,
     #[serde(default)]
     leave: Option<String>,
+    #[serde(default)]
+    birth: bool,
 }
 
 /// The form of a record beyond its node, epoch and `by`: a first-form record
@@ -83,6 +90,7 @@ pub(crate) struct OwnerForm {
     pub(crate) nonce: Option<String>,
     pub(crate) over: Vec<String>,
     pub(crate) leave: Option<String>,
+    pub(crate) birth: bool,
 }
 
 /// The session a node lease advertises: its tag, the tags of a preserved
@@ -951,6 +959,7 @@ impl BucketOwnership {
             nonce: owner.nonce,
             over: owner.over,
             leave: owner.leave,
+            birth: owner.birth,
         };
         let record = OwnerRecord {
             node: (!owner.node.is_empty()).then_some(owner.node),
@@ -1461,6 +1470,7 @@ impl BucketOwnership {
             nonce: None,
             over: &[],
             leave: None,
+            birth: false,
         })?;
         match self.bucket.put_cas(&key, body, Some(&current.etag)).await? {
             Some(_) => Ok(CasOutcome::Applied),
@@ -1508,6 +1518,7 @@ impl BucketOwnership {
             nonce: form.nonce.as_deref(),
             over: &form.over,
             leave: form.leave.as_deref(),
+            birth: form.birth,
         })?;
         match self.bucket.put_cas(&key, body, Some(&current.etag)).await {
             Ok(applied) => Ok(applied.is_some()),
@@ -1516,6 +1527,19 @@ impl BucketOwnership {
                 .await?
                 .is_some_and(|record| names(&record, to))),
         }
+    }
+
+    /// This node's name.
+    pub(crate) fn node_name(&self) -> &str {
+        &self.node
+    }
+
+    /// B1, the conditions under which this session may grant an id, read at the
+    /// moment a request first asks for it: the ensemble is open and proves marks,
+    /// and every live lease advertises the format, so the record about to be
+    /// written is read by every live node.
+    pub(crate) async fn may_grant(&self) -> bool {
+        self.marks_allowed().await && self.all_leases_capable(false).await
     }
 
     /// Whether a `Grant` may be appended now: the node log is open with an
@@ -1762,7 +1786,23 @@ impl BucketOwnership {
         cell: &str,
         counter: u64,
     ) -> anyhow::Result<()> {
-        if self.marks_allowed().await {
+        // An id decided as waived at its first request is never granted later
+        // (K4), and an id decided as a birth is granted or not activated: if the
+        // ensemble can no longer prove the mark, that is a failed proof, never a
+        // waive (P2).
+        let birth = session.is_birth(counter);
+        let granting = if session.is_waived(counter) {
+            false
+        } else {
+            birth || self.marks_allowed().await
+        };
+        if birth && !self.marks_allowed().await {
+            if session.fails_closed() {
+                session.mark_pending(counter);
+            }
+            anyhow::bail!("the ensemble can no longer prove the grant of {cell}");
+        }
+        if granting {
             // The grant is held only while the session is open: a session that
             // began its seal has taken its gather, and a bit added now would
             // never reach a chunk.
@@ -1882,6 +1922,12 @@ impl BucketOwnership {
     ) -> anyhow::Result<CasOutcome> {
         // A node outside the writer rule claims nothing before the gate is closed.
         self.gate_hold.wait().await;
+        // A claim over the record that the reader rules made up (B3: no record yet,
+        // the minting node decides) is over nothing: it writes nothing and is lost,
+        // so the cell is read and judged again.
+        if matches!(&guard, CasGuard::Match(etag) if etag.is_empty()) {
+            return Ok(CasOutcome::Rejected);
+        }
         let key = format!("cells/{cell}/own.json");
         let session = crate::session::current();
         let by = session.map(|session| session.tag());
@@ -1928,6 +1974,9 @@ impl BucketOwnership {
             nonce: plan.as_ref().map(|plan| plan.nonce.as_str()),
             over: plan.as_ref().map_or(&[], |plan| plan.over.as_slice()),
             leave: None,
+            birth: matches!(guard, CasGuard::Absent)
+                && epoch == 1
+                && session.is_some_and(|session| session.is_birth_scope(cell)),
         })?;
         let etag = match &guard {
             CasGuard::Absent => None,
@@ -2371,6 +2420,7 @@ mod session_wire_tests {
             nonce: None,
             over: &[],
             leave: None,
+            birth: false,
         })
         .unwrap();
         assert_eq!(body, br#"{"node":"n1","epoch":7}"#);
@@ -2381,6 +2431,7 @@ mod session_wire_tests {
             nonce: None,
             over: &[],
             leave: None,
+            birth: false,
         })
         .unwrap();
         assert_eq!(body, br#"{"node":"n1","epoch":7,"by":"ab"}"#);

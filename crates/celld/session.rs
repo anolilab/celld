@@ -74,12 +74,14 @@ impl Mode {
         }
     }
 
-    /// The mode this process runs in. Only `off` and `shadow` are available
-    /// yet: a process must not run in a mode whose rules it does not have.
+    /// The mode this process runs in. `on` is not available yet: a process must
+    /// not run in a mode whose rules it does not have.
     pub fn from_env() -> anyhow::Result<Self> {
         match Self::parse(std::env::var(ENV).ok().as_deref())? {
-            mode @ (Self::Off | Self::Shadow) => Ok(mode),
-            mode => anyhow::bail!("{ENV}={mode:?} is not supported by this build; use `shadow`"),
+            mode @ (Self::Off | Self::Shadow | Self::Read) => Ok(mode),
+            mode => anyhow::bail!(
+                "{ENV}={mode:?} is not supported by this build; use `off`, `shadow` or `read`"
+            ),
         }
     }
 }
@@ -136,6 +138,13 @@ pub struct Session {
     /// request to the bucket. A slow write of one chunk holds up the writers of
     /// that chunk only, not the session.
     chunk_writers: Mutex<HashMap<u64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// The ids whose first request was already decided: the session grants an id
+    /// at its first request or never (B1, K4), so a waived id is never granted
+    /// later and a rejected birth write is followed by a real read.
+    decided: Mutex<BTreeSet<u64>>,
+    /// The ids decided as granted without a read: their record is a birth-form
+    /// record (P1).
+    births: Mutex<BTreeSet<u64>>,
     header_writer: tokio::sync::Mutex<()>,
     /// The next counter to issue: every counter below it was issued.
     issued: AtomicU64,
@@ -195,6 +204,8 @@ impl Session {
             sealed_with_bits: AtomicBool::new(false),
             held: tokio::sync::Mutex::default(),
             chunk_writers: Mutex::default(),
+            decided: Mutex::default(),
+            births: Mutex::default(),
             header_writer: tokio::sync::Mutex::new(()),
             established: AtomicBool::new(false),
             resumed: Mutex::default(),
@@ -989,6 +1000,51 @@ impl Session {
             }
         }
         anyhow::bail!("the leave of {scope} lost every race")
+    }
+
+    /// The decision of the first request for an id of this session in a mode that
+    /// skips today's read and lookup: `Some(counter)` when the id is this
+    /// session's, not granted and not yet decided. The caller then calls
+    /// [`Self::decide_birth`] once.
+    pub(crate) fn undecided_own_counter(&self, scope: &str) -> Option<u64> {
+        let counter = self.own_counter_of_scope(scope)?;
+        let decided = self.decided.lock().expect("decided poisoned");
+        (!decided.contains(&counter) && !self.is_granted(counter)).then_some(counter)
+    }
+
+    /// Fix the decision for `counter`: grant it without a read (its record is a
+    /// birth-form record), or waive it (the standard path, for ever).
+    pub(crate) fn decide_birth(&self, counter: u64, grant: bool) {
+        self.decided
+            .lock()
+            .expect("decided poisoned")
+            .insert(counter);
+        if grant {
+            self.births.lock().expect("births poisoned").insert(counter);
+        }
+    }
+
+    /// Whether the record about to be written for `scope` is a birth-form one.
+    pub(crate) fn is_birth_scope(&self, scope: &str) -> bool {
+        self.own_counter_of_scope(scope)
+            .is_some_and(|counter| self.is_birth(counter))
+    }
+
+    pub(crate) fn is_birth(&self, counter: u64) -> bool {
+        self.births
+            .lock()
+            .expect("births poisoned")
+            .contains(&counter)
+    }
+
+    /// The id was decided and not granted: it is waived and takes the standard
+    /// path for the life of the session.
+    pub(crate) fn is_waived(&self, counter: u64) -> bool {
+        self.decided
+            .lock()
+            .expect("decided poisoned")
+            .contains(&counter)
+            && !self.is_birth(counter)
     }
 
     fn chunk_writer(&self, chunk: u64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
@@ -2389,6 +2445,24 @@ mod tests {
             .unwrap()
             .expect("written");
         assert!(store::create_chunk(&bucket, "tag", 2).await.is_err());
+    }
+
+    /// The decision of an id's first request is made once: a waived id is never
+    /// granted, a granted one is a birth, and neither is asked again.
+    #[test]
+    fn an_id_is_decided_once_as_a_birth_or_a_waive() {
+        let session = established([2; 8]);
+        let first = scope_for(&session, 0);
+        let second = scope_for(&session, 1);
+        assert_eq!(session.undecided_own_counter(&first), Some(0));
+        session.decide_birth(0, true);
+        session.decide_birth(1, false);
+        assert_eq!(session.undecided_own_counter(&first), None);
+        assert_eq!(session.undecided_own_counter(&second), None);
+        assert!(session.is_birth_scope(&first) && !session.is_waived(0));
+        assert!(!session.is_birth_scope(&second) && session.is_waived(1));
+        // An id of another session is nobody's to decide here.
+        assert_eq!(session.undecided_own_counter("Agent:nothex"), None);
     }
 
     #[test]

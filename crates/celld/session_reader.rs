@@ -74,6 +74,12 @@ pub(crate) enum Verdict {
     Proceed,
     /// The cell is refused, held and logged.
     Refuse(&'static str),
+    /// B3: the cell has no record and its session header is not sealed, so only
+    /// the minting session may make its first claim. The claim path goes on as if
+    /// the record named the session's node: a live node is forwarded to, a dead
+    /// one is recovered first (which seals the header) and the cell is judged
+    /// again by the sealed chunk.
+    Forward(OwnerRecord),
 }
 
 fn unhex(text: &str) -> Option<Vec<u8>> {
@@ -141,6 +147,20 @@ impl BucketOwnership {
             Some(header) => Some(header),
             None => match store::read_header(&bucket, &tag).await? {
                 Read::Found(header, _) if header.state != store::State::Sealed => {
+                    if record.is_none() && header.node != self.node_name() {
+                        tracing::debug!(
+                            cell,
+                            tag,
+                            node = %header.node,
+                            "no record and an unsealed header: the minting node decides"
+                        );
+                        return Ok(Verdict::Forward(OwnerRecord {
+                            node: Some(header.node),
+                            epoch: 1,
+                            etag: String::new(),
+                            by: Some(tag),
+                        }));
+                    }
                     tracing::debug!(cell, tag, "session header not sealed; standard path");
                     return Ok(Verdict::Proceed);
                 }
@@ -248,6 +268,15 @@ impl BucketOwnership {
             author_live,
             placed: false,
         });
+        // A birth-form record that no grant covers is also held to the guard of the
+        // standard path: the strictest of the two rules decides (P3).
+        let verdict = match (&verdict, record) {
+            (Take::FirstOverRecord { .. }, Some((_, form))) if form.birth => {
+                let exists = self.ltx_exists(cell).await?;
+                take::birth_guard(verdict, true, exists)
+            }
+            _ => verdict,
+        };
         let judged = record.map(|(record, _)| record.etag.clone());
         let plan = |over: Vec<String>| K5Plan {
             nonce: new_nonce(),
