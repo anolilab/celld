@@ -623,10 +623,12 @@ async fn publish_boot_addr_to(
 }
 
 /// `publish_boot_addr_to`, with `first_between` run inside the first
-/// attempt's read-and-swap window. A lost swap is retried only over a record
-/// that is no live boot's (a tombstone, a damaged record, or this session's
-/// own); a record another session published meanwhile is left alone and
-/// logged, so two processes publishing at once cannot overwrite each other.
+/// attempt's read-and-swap window. Each attempt reads the record afresh and
+/// swaps on its etag, so a record that another session wrote meanwhile (a
+/// dead earlier boot's late write, say) is read and replaced, and the boot
+/// ends with its own address published or with an error for the caller's
+/// retry and failure rule: it never returns Ok with another session's record
+/// standing.
 async fn publish_boot_addr_racing(
     bucket: &Bucket,
     node: &str,
@@ -639,22 +641,9 @@ async fn publish_boot_addr_racing(
         return Ok(());
     }
     for attempt in 2..=3 {
-        let key = boot_addr_key(node);
-        if let Some((bytes, _)) = bucket.get(&key).await? {
-            if let Ok(record) = serde_json::from_slice::<BootAddr>(&bytes) {
-                if !record.retired && record.session != session {
-                    warn!(
-                        node,
-                        other = record.session,
-                        "another boot published its address at the same time; leaving its record"
-                    );
-                    return Ok(());
-                }
-            }
-        }
         warn!(
             node,
-            attempt, "the boot address changed under the write; writing again"
+            attempt, "the boot address changed under the write; reading it again"
         );
         if publish_boot_addr_attempt(bucket, node, session, addr, boot_at_ms, async {}).await? {
             return Ok(());
@@ -816,18 +805,28 @@ enum Declaration {
     Ignored,
     /// Declared, but its lease is live.
     Refused,
+    /// Declared, but its lease could not be read, so nothing proves it
+    /// expired: not applied, and the member stays undecided.
+    Unproven,
     /// Declared, and the member is unreachable or holds no complete
     /// fragment: counted as absent.
     Applied,
 }
 
 /// A declaration applies only to a member that was probed first and gave no
-/// complete witness, and whose lease is not live.
-fn apply_declaration(declared: bool, witness: bool, lease_live: bool) -> Declaration {
+/// complete witness, and whose lease was read and is not live.
+fn apply_declaration(
+    declared: bool,
+    witness: bool,
+    lease_live: bool,
+    lease_unread: bool,
+) -> Declaration {
     if !declared {
         Declaration::None
     } else if witness {
         Declaration::Ignored
+    } else if lease_unread {
+        Declaration::Unproven
     } else if lease_live {
         Declaration::Refused
     } else {
@@ -910,6 +909,22 @@ pub fn validate_boot_hold(lease_ttl_ms: u64, configured: Option<u64>) -> anyhow:
         ladder_term_ms(lease_ttl_ms)
     );
     Ok(())
+}
+
+/// Record when the boot's recovery began, once: the ladder's retries call
+/// again and must not move it. The value 0 means "not yet".
+fn note_recovery_started(slot: &std::sync::atomic::AtomicU64, now_mono_ms: u64) {
+    let _ = slot.compare_exchange(0, now_mono_ms.max(1), Ordering::SeqCst, Ordering::SeqCst);
+}
+
+/// What the hold counts from: the start of the boot's recovery once it has
+/// begun (after the address publish), else the manager's own start.
+fn boot_hold_origin(manager_started_ms: u64, recovery_started_ms: u64) -> u64 {
+    if recovery_started_ms == 0 {
+        manager_started_ms
+    } else {
+        recovery_started_ms
+    }
 }
 
 fn in_boot_hold(now_mono_ms: u64, started_mono_ms: u64, hold_ms: u64) -> bool {
@@ -5086,6 +5101,10 @@ pub struct NodeLogManager {
     predecessors_clean: std::sync::atomic::AtomicBool,
     /// When this process built the manager, on the monotonic clock.
     started_ms: u64,
+    /// When this boot's own predecessor recovery began (0: not yet), on the
+    /// monotonic clock. The hold counts from here, after the address publish,
+    /// so that publish retries do not use up the hold.
+    recovery_started_ms: std::sync::atomic::AtomicU64,
     /// `CELLD_RECOVERY_LOSS_HOLD_MS`, when set.
     boot_hold_override_ms: Option<u64>,
     /// Members the operator declared permanently gone
@@ -5544,6 +5563,7 @@ impl NodeLogManager {
             flush_in_flight: std::sync::atomic::AtomicBool::new(false),
             predecessors_clean: std::sync::atomic::AtomicBool::new(false),
             started_ms: mono_ms(),
+            recovery_started_ms: std::sync::atomic::AtomicU64::new(0),
             boot_hold_override_ms: None,
             declared_gone: Mutex::new(BTreeSet::new()),
             recovery_locks: Mutex::new(BTreeMap::new()),
@@ -5567,6 +5587,7 @@ impl NodeLogManager {
         if self.predecessors_clean.load(Ordering::SeqCst) {
             return Ok(());
         }
+        note_recovery_started(&self.recovery_started_ms, mono_ms());
         if let Some(folded) = read_record(&self.bucket, &self.node).await? {
             let session = format!("{}/{}", self.node, folded.wire.generation);
             if session != self.session
@@ -6154,7 +6175,10 @@ impl NodeLogManager {
             // that really is gone still gets it declared.
             let in_boot_hold = in_boot_hold(
                 mono_ms(),
-                self.started_ms,
+                boot_hold_origin(
+                    self.started_ms,
+                    self.recovery_started_ms.load(Ordering::SeqCst),
+                ),
                 boot_hold_ms(self.ownership.lease_ttl_ms(), self.boot_hold_override_ms),
             );
             let mut undecided_members: Vec<&str> = Vec::new();
@@ -6197,8 +6221,12 @@ impl NodeLogManager {
                         break;
                     }
                 }
-                let declaration =
-                    apply_declaration(declared.contains(member), fate.witness, lease_live);
+                let declaration = apply_declaration(
+                    declared.contains(member),
+                    fate.witness,
+                    lease_live,
+                    lease.is_err(),
+                );
                 match declaration {
                     Declaration::Ignored => warn!(
                         dead,
@@ -6206,6 +6234,13 @@ impl NodeLogManager {
                         "the operator declared this member gone \
                          (CELLD_RECOVERY_GONE_MEMBERS), but it holds a complete \
                          fragment: using it and ignoring the declaration"
+                    ),
+                    Declaration::Unproven => warn!(
+                        dead,
+                        member,
+                        "NOT applying the operator's declaration that this member is gone \
+                         (CELLD_RECOVERY_GONE_MEMBERS): its lease could not be read, so \
+                         nothing proves it expired"
                     ),
                     Declaration::Refused => warn!(
                         dead,
@@ -6229,7 +6264,9 @@ impl NodeLogManager {
                     complete_witnesses += 1;
                 } else if declaration == Declaration::Applied {
                     // Conclusive by the operator's declaration.
-                } else if fate.undecided(lease_live, lease_long_dead, in_boot_hold) {
+                } else if declaration == Declaration::Unproven
+                    || fate.undecided(lease_live, lease_long_dead, in_boot_hold)
+                {
                     inconclusive += 1;
                     undecided_members.push(member);
                 }
@@ -9559,13 +9596,38 @@ mod boot_addr_recovery_tests {
     #[test]
     fn a_declaration_applies_only_to_a_member_that_gave_no_complete_witness() {
         // Alive and holding a complete fragment: used as usual.
-        assert_eq!(apply_declaration(true, true, false), Declaration::Ignored);
-        assert_eq!(apply_declaration(true, true, true), Declaration::Ignored);
+        assert_eq!(
+            apply_declaration(true, true, false, false),
+            Declaration::Ignored
+        );
+        assert_eq!(
+            apply_declaration(true, true, true, false),
+            Declaration::Ignored
+        );
         // Unreachable, or answered without a complete fragment.
-        assert_eq!(apply_declaration(true, false, false), Declaration::Applied);
+        assert_eq!(
+            apply_declaration(true, false, false, false),
+            Declaration::Applied
+        );
         // A live lease refuses it.
-        assert_eq!(apply_declaration(true, false, true), Declaration::Refused);
-        assert_eq!(apply_declaration(false, false, false), Declaration::None);
+        assert_eq!(
+            apply_declaration(true, false, true, false),
+            Declaration::Refused
+        );
+        assert_eq!(
+            apply_declaration(false, false, false, false),
+            Declaration::None
+        );
+        // A lease that could not be read proves nothing: not applied.
+        assert_eq!(
+            apply_declaration(true, false, false, true),
+            Declaration::Unproven
+        );
+        // A complete fragment still wins over an unread lease.
+        assert_eq!(
+            apply_declaration(true, true, false, true),
+            Declaration::Ignored
+        );
     }
 
     #[test]
@@ -9581,7 +9643,7 @@ mod boot_addr_recovery_tests {
         let fate = probe_all(&transport, &candidates(&["m:1"], false));
         assert!(fate.witness);
         assert_eq!(
-            apply_declaration(true, fate.witness, false),
+            apply_declaration(true, fate.witness, false, false),
             Declaration::Ignored
         );
     }
@@ -9624,23 +9686,24 @@ mod boot_addr_recovery_tests {
         assert_eq!(member_loss_grace_ms(1_000), 20_000);
     }
 
-    // Two processes publishing at once do not overwrite each other.
+    // A lost swap ends with this boot's own address, whoever wrote meanwhile.
     #[test]
-    fn a_lost_publish_race_leaves_a_concurrent_boots_record() {
+    fn a_lost_publish_race_ends_with_this_boots_own_address() {
         run_store(async {
             let (_dir, bucket) = store();
             publish_boot_addr_to(&bucket, "m", "m/g0", "zero:0", 1)
                 .await
                 .unwrap();
+            // A dead earlier boot's late write lands inside the window.
             publish_boot_addr_racing(&bucket, "m", "m/g1", "one:1", 2, async {
-                publish_boot_addr_to(&bucket, "m", "m/g2", "two:2", 3)
+                publish_boot_addr_to(&bucket, "m", "m/g0", "late:0", 3)
                     .await
                     .unwrap();
             })
             .await
             .unwrap();
-            assert_eq!(stored_addr(&bucket).await.as_deref(), Some("two:2"));
-            // A tombstone that lands in the window is written over.
+            assert_eq!(stored_addr(&bucket).await.as_deref(), Some("one:1"));
+            // A tombstone that lands in the window is written over too.
             publish_boot_addr_racing(&bucket, "m", "m/g3", "three:3", 4, async {
                 bucket
                     .put(&boot_addr_key("m"), retired_boot_addr("m"))
@@ -9651,6 +9714,31 @@ mod boot_addr_recovery_tests {
             .unwrap();
             assert_eq!(stored_addr(&bucket).await.as_deref(), Some("three:3"));
         });
+    }
+
+    // The hold counts from the start of the recovery, after the publish.
+    #[test]
+    fn the_hold_counts_from_the_start_of_the_recovery() {
+        let slot = std::sync::atomic::AtomicU64::new(0);
+        // Before the recovery begins, the manager's start is the origin.
+        assert_eq!(boot_hold_origin(100, slot.load(Ordering::SeqCst)), 100);
+        // The publish retried for 55 s against a 10 s-term ladder; the recovery
+        // then begins and fixes the origin once.
+        note_recovery_started(&slot, 55_100);
+        note_recovery_started(&slot, 70_000);
+        let origin = boot_hold_origin(100, slot.load(Ordering::SeqCst));
+        assert_eq!(origin, 55_100);
+        let hold = boot_hold_ms(10_000, None);
+        // The ladder's attempts start at 0, 10, 30 and 60 s from the origin:
+        // the first three are inside the hold, the last is past it, as if no
+        // time had gone to the publish.
+        for offset in [0_u64, 10_000, 30_000] {
+            assert!(in_boot_hold(origin + offset, origin, hold));
+        }
+        assert!(!in_boot_hold(origin + 60_000, origin, hold));
+        // Counted from the manager's start, the first attempt would already
+        // be past the hold.
+        assert!(!in_boot_hold(55_100, 100, hold));
     }
 
     #[test]
