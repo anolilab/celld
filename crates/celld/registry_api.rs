@@ -233,10 +233,16 @@ pub async fn serve(
                 return reply(400, serde_json::json!({ "error": "scope" }));
             };
             let started = crate::asyncrt::mono_ms();
-            let ok = registry.ensure_covered(scope).await.is_ok();
+            let allowed = registry.ensure_covered(scope).await.is_ok();
+            // In shadow a write is allowed at the wait's bound without coverage:
+            // `covered` is the state, `allowed_uncovered` the difference.
+            let covered = registry.covered_now(&objects::key_of(scope));
             reply(
                 200,
-                serde_json::json!({ "ok": ok, "ms": crate::asyncrt::mono_ms().saturating_sub(started) }),
+                serde_json::json!({
+                    "ok": allowed, "covered": covered, "allowed_uncovered": allowed && !covered,
+                    "ms": crate::asyncrt::mono_ms().saturating_sub(started),
+                }),
             )
         }
         ("POST", "/__registry/hold") => {

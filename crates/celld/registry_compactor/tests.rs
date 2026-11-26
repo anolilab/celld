@@ -5034,3 +5034,33 @@ async fn keys_of_a_background_delete_stay_tracked_while_it_stalls_and_after_its_
     .await
     .expect("confirmed deletes leave the list");
 }
+
+#[tokio::test]
+async fn the_cover_route_says_when_a_write_was_allowed_without_coverage() {
+    // In shadow the wait ends at its bound and the write goes on: `ok` says it
+    // may, `covered` says what is true.
+    let store = memory();
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            enforce: false,
+            ..config()
+        },
+    );
+    let body = serde_json::json!({ "scope": cell(1) });
+    let (status, text) = crate::registry_api::serve(
+        &node,
+        "POST",
+        "/__registry/cover",
+        &Default::default(),
+        &body,
+    )
+    .await
+    .expect("the cover route");
+    assert_eq!(status, 200);
+    let reply: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["covered"], false, "{reply}");
+    assert_eq!(reply["allowed_uncovered"], true, "{reply}");
+}
