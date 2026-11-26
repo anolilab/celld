@@ -159,11 +159,20 @@ async fn synthetic_aged_registry() {
     let epoch = 1;
     let mut next_run = 0_u64;
     let aged_count = n12 + n24;
-    let stride = u64::from(k) / aged_count.max(1);
-    let aged: Vec<(usize, u64)> = (0..aged_count)
-        .map(|at| {
-            let months = if at < n12 { months } else { months * 2 };
-            ((at * stride + 3) as usize, months)
+    assert!(
+        (1..=u64::from(k)).contains(&aged_count),
+        "CELLD_REG_SYNTH_N12 + _N24 = {aged_count}: between 1 and {k} aged partitions fit"
+    );
+    let aged: Vec<(usize, u64)> = aged_indices(aged_count, u64::from(k))
+        .into_iter()
+        .enumerate()
+        .map(|(at, index)| {
+            let months = if (at as u64) < n12 {
+                months
+            } else {
+                months * 2
+            };
+            (index, months)
         })
         .collect();
     let mut aged_json = Vec::new();
@@ -408,6 +417,43 @@ async fn synthetic_aged_registry() {
         "synth.json written; {total} records in runs, {} s",
         started.elapsed().as_secs()
     );
+}
+
+/// The partitions the aging tool ages: one in each stretch of `k / count`, so
+/// the indices are distinct and below `k` (the last is at most
+/// `(count - 1) * stride + stride - 1 < k`). With room they start at 3.
+fn aged_indices(count: u64, k: u64) -> Vec<usize> {
+    let stride = k / count;
+    let offset = 3.min(stride - 1);
+    (0..count)
+        .map(|at| (at * stride + offset) as usize)
+        .collect()
+}
+
+#[test]
+fn the_aged_partitions_are_distinct_and_inside_the_map() {
+    for (count, k) in [
+        (1, 1024),
+        (2, 1024),
+        (10, 1024),
+        (512, 1024),
+        (1023, 1024),
+        (1024, 1024),
+        (7, 8),
+    ] {
+        let indices = aged_indices(count, k);
+        assert_eq!(indices.len() as u64, count);
+        assert!(
+            indices.iter().all(|index| (*index as u64) < k),
+            "{count} of {k}: {indices:?}"
+        );
+        let mut distinct = indices.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), indices.len(), "{count} of {k}: {indices:?}");
+    }
+    // The default set keeps its places.
+    assert_eq!(&aged_indices(10, 1024)[..3], &[3, 105, 207]);
 }
 
 pub(super) fn run_dir() -> String {
