@@ -52,8 +52,8 @@ use scenarios::{
 };
 use serde_json::{json, Value};
 use support::{
-    class_of, diff, env_text, git, out, positive, run_turns, target_dir, Class, Classifier,
-    EndRule, Node, Proxy, Report, Tally, CELLD, OPERATOR_TOKEN, PROJECTED_CONCURRENT,
+    celld_bin, class_of, diff, env_text, git, out, positive, run_turns, target_dir, Class,
+    Classifier, EndRule, Node, Proxy, Report, Tally, OPERATOR_TOKEN, PROJECTED_CONCURRENT,
 };
 
 const FIXTURE: &str = "bench-agents";
@@ -213,7 +213,8 @@ async fn run_scenario(settings: &Settings, scenario: &Scenario, run: &str) -> Sc
         .join("tests/fixtures")
         .join(FIXTURE);
     // Asynchronous, so the runtime can serve the proxy the deploy talks to.
-    let deployed = tokio::process::Command::new(CELLD)
+    // The binary the nodes run, so one run tests one revision.
+    let deployed = tokio::process::Command::new(celld_bin())
         .arg("deploy")
         .arg(&fixture)
         .args([

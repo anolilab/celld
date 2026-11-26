@@ -175,6 +175,12 @@ async fn lookup_against_list_smoke() {
     .unwrap();
     eprintln!("{text}");
     assert_eq!(wrong, 0, "a wrong answer");
+    // A lookup that reaches no conclusion is not a pass: the registry must
+    // decide every key of the smoke.
+    assert_eq!(
+        unknown, 0,
+        "{unknown} of {rounds} lookups answered Unknown (wrong: {wrong})"
+    );
 }
 
 // ---------------------------------------------------------------------------
