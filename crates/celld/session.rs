@@ -939,9 +939,16 @@ impl Session {
         self.closed.load(Ordering::SeqCst)
     }
 
-    /// Give the session up: it grants nothing and mints nothing more.
-    pub fn abandon(&self) {
+    /// A session that could not be opened. In `shadow` it is given up (it grants
+    /// nothing and mints nothing more), the failure is counted, and the process
+    /// runs without a session; `read` and `on` rest on it and return the error.
+    pub fn give_up(&self, error: anyhow::Error) -> anyhow::Result<()> {
+        if self.fails_closed() {
+            return Err(error);
+        }
         self.closed.store(true, Ordering::SeqCst);
+        note_shadow_failure("open", &error);
+        Ok(())
     }
 
     /// Whether a grant, mark, checkpoint or chunk write that fails must fail
@@ -2021,6 +2028,23 @@ mod tests {
         assert!(!marks_satisfied(&shadow, &[0]));
         shadow.checkpointed.lock().unwrap().insert(0);
         assert!(marks_satisfied(&shadow, &[0]));
+    }
+
+    #[test]
+    fn a_session_that_cannot_open_is_given_up_and_counted_in_shadow_only() {
+        let shadow = Session::with_tag(Mode::Shadow, [1; 8], &[]);
+        let strict = Session::with_tag(Mode::Read, [2; 8], &[]);
+        let before = shadow_failures().get("open").copied().unwrap_or(0);
+        assert!(shadow
+            .give_up(anyhow::anyhow!("the header write failed"))
+            .is_ok());
+        assert!(shadow.is_closed());
+        assert_eq!(shadow_failures()["open"], before + 1);
+        assert!(strict
+            .give_up(anyhow::anyhow!("the header write failed"))
+            .is_err());
+        assert!(!strict.is_closed());
+        assert_eq!(shadow_failures()["open"], before + 1);
     }
 
     #[test]

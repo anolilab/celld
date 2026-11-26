@@ -139,9 +139,11 @@ pub fn decode_marks(bundle: &[u8]) -> Result<Vec<String>> {
     }
     let marks_len = u32::from_le_bytes(data[data.len() - 8..data.len() - 4].try_into().unwrap());
     let end = data.len() - 8;
-    let Some(start) = end.checked_sub(marks_len as usize) else {
-        return Ok(Vec::new());
-    };
+    // The trailer is there, so the bundle was written with marks: a length that
+    // the data cannot hold is a corrupt block, not a bundle without marks.
+    let start = end
+        .checked_sub(marks_len as usize)
+        .ok_or_else(|| malformed("marks block longer than the data"))?;
     // The block follows every row; bytes that a row covers are not a block.
     let rows_end = decode_footer(bundle)?
         .iter()
@@ -296,6 +298,37 @@ mod tests {
         assert!(decode_marks(&data).is_err());
         let rows = decode_rows(&data).unwrap();
         assert_eq!(slice(&data, &rows[0]).unwrap(), b"abc");
+    }
+
+    /// A bundle that main wrote has no marks block: it decodes to its rows, no
+    /// marks and no error, whatever bytes its rows end with.
+    #[test]
+    fn a_bundle_built_without_marks_decodes_with_no_marks_and_no_error() {
+        let mut data = b"abcCLG1".to_vec();
+        let mut footer = Vec::new();
+        footer.extend_from_slice(&1_u16.to_le_bytes());
+        footer.extend_from_slice(b"c");
+        for value in [1_u64, 1, 0, 7] {
+            footer.extend_from_slice(&value.to_le_bytes());
+        }
+        data.extend_from_slice(&footer);
+        data.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+        data.extend_from_slice(MAGIC);
+        assert_eq!(decode_marks(&data).unwrap(), Vec::<String>::new());
+        assert_eq!(decode_rows(&data).unwrap().len(), 1);
+        let plain = encode(&[entry("c", 1, b"abc")]).unwrap();
+        assert!(decode_marks(&plain).unwrap().is_empty());
+    }
+
+    /// A marks trailer whose length the data cannot hold is a corrupt block.
+    #[test]
+    fn a_marks_trailer_longer_than_the_data_is_an_error() {
+        let mut data = b"ab".to_vec();
+        data.extend_from_slice(&1_000_u32.to_le_bytes());
+        data.extend_from_slice(MARKS_MAGIC);
+        data.extend_from_slice(&0_u32.to_le_bytes());
+        data.extend_from_slice(MAGIC);
+        assert!(decode_marks(&data).is_err());
     }
 
     #[test]

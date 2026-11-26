@@ -354,7 +354,9 @@ fn sealed_header(tag: &str) -> Option<store::Header> {
 }
 
 fn remember_sealed(tag: &str, header: &store::Header) {
-    if header.state != store::State::Sealed {
+    // A lost header is the one a sealer wrote because the real one was gone. The
+    // operator repair replaces it, so it is read each time and never kept.
+    if header.state != store::State::Sealed || header.lost {
         return;
     }
     let mut cache = SEALED_HEADERS.lock().expect("sealed headers poisoned");
@@ -386,6 +388,13 @@ mod sealed_header_cache_tests {
     fn only_a_sealed_header_is_kept() {
         remember_sealed("cache-open", &header(store::State::Open));
         assert!(sealed_header("cache-open").is_none());
+        let mut lost = header(store::State::Sealed);
+        lost.lost = true;
+        remember_sealed("cache-lost", &lost);
+        assert!(
+            sealed_header("cache-lost").is_none(),
+            "a repair must be seen"
+        );
         remember_sealed("cache-sealed", &header(store::State::Sealed));
         assert_eq!(
             sealed_header("cache-sealed").map(|header| header.rev),

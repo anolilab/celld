@@ -4759,14 +4759,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 // In `shadow` nothing rests on the session, so a process that
                 // cannot open one runs without: it mints random ids and grants
                 // nothing. `read` and `on` rest on it and do not start.
-                if session.fails_closed() {
-                    return Err(error);
-                }
-                session.abandon();
-                tracing::warn!(
-                    %error,
-                    "the session could not be opened in shadow; running without one"
-                );
+                session.give_up(error)?;
+                tracing::warn!("the session could not be opened in shadow; running without one");
             }
             let bucket = Arc::new(bucket);
             tokio::spawn(async move {
