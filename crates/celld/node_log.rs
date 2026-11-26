@@ -933,6 +933,20 @@ fn boot_hold_origin(manager_started_ms: u64, recovery_started_ms: u64) -> u64 {
     }
 }
 
+/// Whether the hold keeps a long-dead, unreachable member undecided. The boot's
+/// own predecessor recovery judges such a member gone only on the ladder's
+/// final attempt, and then only once the hold has elapsed too: an attempt that
+/// waited behind another node's live claim for longer than the hold still
+/// leaves it undecided. A sweep and a later recovery have no ladder and keep
+/// the time rule alone.
+fn boot_hold_blocks(mode: RecoverMode, final_attempt: bool, hold_running: bool) -> bool {
+    if mode == RecoverMode::Predecessor {
+        !final_attempt || hold_running
+    } else {
+        hold_running
+    }
+}
+
 fn in_boot_hold(now_mono_ms: u64, started_mono_ms: u64, hold_ms: u64) -> bool {
     now_mono_ms.saturating_sub(started_mono_ms) < hold_ms
 }
@@ -945,6 +959,7 @@ struct Candidates {
 }
 
 fn candidate_addrs(
+    member: &str,
     lease_addr: Option<&str>,
     published: anyhow::Result<Option<String>>,
 ) -> Candidates {
@@ -954,7 +969,7 @@ fn candidate_addrs(
         Ok(Some(published)) => addrs.push(published),
         Ok(None) => {}
         Err(error) => {
-            warn!(%error, "could not read a member's published boot address");
+            warn!(member, %error, "could not read a member's published boot address");
             read_failed = true;
         }
     }
@@ -964,6 +979,19 @@ fn candidate_addrs(
         }
     }
     Candidates { addrs, read_failed }
+}
+
+/// Why a member is undecided, for the refusal that names it.
+fn undecided_reason(lease_unread: bool, address_unread: bool, fate: &MemberFate) -> &'static str {
+    if lease_unread {
+        "its lease could not be read"
+    } else if address_unread {
+        "its published address could not be read"
+    } else if fate.answered || fate.unresolved {
+        "it answered without a complete witness"
+    } else {
+        "no answer"
+    }
 }
 
 /// Whether a member that no address reached stays undecided. Only a member
@@ -3408,6 +3436,12 @@ impl RecoveryLadder {
         (Self::MAX_ATTEMPTS as u64) * (Self::MAX_ATTEMPTS as u64 - 1) / 2
     }
 
+    /// Whether the attempt about to run is the last one: a failure of it ends
+    /// the ladder.
+    pub fn is_final_attempt(&self) -> bool {
+        self.attempts + 1 >= Self::MAX_ATTEMPTS
+    }
+
     pub fn new(ttl_backoff: std::time::Duration) -> Self {
         Self {
             ttl_backoff,
@@ -5118,6 +5152,8 @@ pub struct NodeLogManager {
     predecessors_clean: std::sync::atomic::AtomicBool,
     /// When this process built the manager, on the monotonic clock.
     started_ms: u64,
+    /// Whether the boot ladder's current attempt is its last.
+    final_attempt: std::sync::atomic::AtomicBool,
     /// When this boot's own predecessor recovery began (0: not yet), on the
     /// monotonic clock. The hold counts from here, after the address publish,
     /// so that publish retries do not use up the hold.
@@ -5580,6 +5616,7 @@ impl NodeLogManager {
             flush_in_flight: std::sync::atomic::AtomicBool::new(false),
             predecessors_clean: std::sync::atomic::AtomicBool::new(false),
             started_ms: mono_ms(),
+            final_attempt: std::sync::atomic::AtomicBool::new(false),
             recovery_started_ms: std::sync::atomic::AtomicU64::new(0),
             boot_hold_override_ms: None,
             declared_gone: Mutex::new(BTreeSet::new()),
@@ -6190,15 +6227,19 @@ impl NodeLogManager {
             // ladder up to its final attempt (`boot_hold_ms`), so only the
             // last attempt can declare a loss for such a member, and a member
             // that really is gone still gets it declared.
-            let in_boot_hold = in_boot_hold(
-                mono_ms(),
-                boot_hold_origin(
-                    self.started_ms,
-                    self.recovery_started_ms.load(Ordering::SeqCst),
+            let in_boot_hold = boot_hold_blocks(
+                mode,
+                self.final_attempt.load(Ordering::SeqCst),
+                in_boot_hold(
+                    mono_ms(),
+                    boot_hold_origin(
+                        self.started_ms,
+                        self.recovery_started_ms.load(Ordering::SeqCst),
+                    ),
+                    boot_hold_ms(self.ownership.lease_ttl_ms(), self.boot_hold_override_ms),
                 ),
-                boot_hold_ms(self.ownership.lease_ttl_ms(), self.boot_hold_override_ms),
             );
-            let mut undecided_members: Vec<&str> = Vec::new();
+            let mut undecided_members: Vec<String> = Vec::new();
             let mut declared_applied: Vec<String> = Vec::new();
             let declared = declared_for_mode(&self.declared_gone.lock().unwrap(), mode);
             for member in &record.ensemble {
@@ -6220,7 +6261,8 @@ impl NodeLogManager {
                 // for the member, and only an answer that proves the member
                 // is the one speaking counts, so a stranger on either address
                 // changes nothing.
-                let candidates = candidate_addrs(lease_addr, self.read_boot_addr(member).await);
+                let candidates =
+                    candidate_addrs(member, lease_addr, self.read_boot_addr(member).await);
                 // Judge seal and tail together at each address, in order,
                 // until one supplies a complete fragment. The claim is beaten
                 // between probes: one probe can take as long as two request
@@ -6293,7 +6335,10 @@ impl NodeLogManager {
                     || fate.undecided(lease_live, lease_long_dead, in_boot_hold)
                 {
                     inconclusive += 1;
-                    undecided_members.push(member);
+                    undecided_members.push(format!(
+                        "{member}: {}",
+                        undecided_reason(lease.is_err(), candidates.read_failed, &fate)
+                    ));
                 }
                 if fate.discarded_rows > 0 {
                     warn!(
@@ -6919,7 +6964,13 @@ impl NodeLogManager {
     /// and nothing may ack against a fresh ensemble until those tails are
     /// in the bucket. Our own session's record cannot exist yet, so this
     /// is ordinary dead-session recovery under other keys.
-    pub async fn recover_self(&self) -> anyhow::Result<()> {
+    ///
+    /// `final_attempt` is whether the boot ladder ends with this attempt: only
+    /// then can a long-dead, unreachable member be judged gone (and the hold
+    /// has elapsed as well), whatever wall time the earlier attempts spent.
+    pub async fn recover_self(&self, final_attempt: bool) -> anyhow::Result<()> {
+        self.final_attempt
+            .store(final_attempt, std::sync::atomic::Ordering::SeqCst);
         self.ensure_predecessors_recovered().await
     }
 
@@ -9182,7 +9233,7 @@ mod boot_addr_recovery_tests {
     // A failed read of the published address is not an absent one.
     #[test]
     fn a_failed_boot_address_read_leaves_the_member_undecided() {
-        let read_failed = candidate_addrs(Some("lease:1"), Err(anyhow!("bucket unavailable")));
+        let read_failed = candidate_addrs("m", Some("lease:1"), Err(anyhow!("bucket unavailable")));
         assert!(read_failed.read_failed);
         // The lease address is still asked.
         assert_eq!(read_failed.addrs, ["lease:1"]);
@@ -9191,16 +9242,16 @@ mod boot_addr_recovery_tests {
         assert!(!fate.witness);
         // Long dead, silent, past the hold: gone, unless the read failed.
         assert!(fate.undecided(false, true, false));
-        let absent = candidate_addrs(Some("lease:1"), Ok(None));
+        let absent = candidate_addrs("m", Some("lease:1"), Ok(None));
         assert!(!absent.read_failed);
         assert!(!probe_all(&transport, &absent).undecided(false, true, false));
     }
 
     #[test]
     fn the_published_address_is_asked_first_and_not_twice() {
-        let both = candidate_addrs(Some("old:1"), Ok(Some("new:2".into())));
+        let both = candidate_addrs("m", Some("old:1"), Ok(Some("new:2".into())));
         assert_eq!(both.addrs, ["new:2", "old:1"]);
-        let same = candidate_addrs(Some("same:1"), Ok(Some("same:1".into())));
+        let same = candidate_addrs("m", Some("same:1"), Ok(Some("same:1".into())));
         assert_eq!(same.addrs, ["same:1"]);
     }
 
@@ -9210,7 +9261,7 @@ mod boot_addr_recovery_tests {
         let before = CORRUPT_BOOT_ADDRS.load(Ordering::Relaxed);
         assert_eq!(decode_boot_addr("m", b"{"), None);
         assert!(CORRUPT_BOOT_ADDRS.load(Ordering::Relaxed) > before);
-        let candidates = candidate_addrs(Some("lease:1"), Ok(decode_boot_addr("m", b"\xff")));
+        let candidates = candidate_addrs("m", Some("lease:1"), Ok(decode_boot_addr("m", b"\xff")));
         assert!(!candidates.read_failed);
         assert_eq!(candidates.addrs, ["lease:1"]);
     }
@@ -9551,6 +9602,48 @@ mod boot_addr_recovery_tests {
         assert!(!alone.witness);
         assert!(alone.entries.is_empty());
         assert_eq!(alone.discarded_rows, 2);
+    }
+
+    // A silent member is judged gone only on the boot ladder's final attempt.
+    #[test]
+    fn a_long_claim_wait_cannot_declare_a_loss_before_the_final_attempt() {
+        // The ladder tells each attempt whether it is the last.
+        let mut ladder = RecoveryLadder::new(std::time::Duration::from_millis(1));
+        let failure = anyhow!("undecided");
+        let mut finals = Vec::new();
+        loop {
+            finals.push(ladder.is_final_attempt());
+            if ladder.next(&failure).is_none() {
+                break;
+            }
+        }
+        assert_eq!(finals, [false, false, false, true]);
+        // Attempt 1 waited behind another node's claim past the hold: the
+        // hold has run out (`hold_running` false), and it still blocks.
+        assert!(boot_hold_blocks(RecoverMode::Predecessor, false, false));
+        // The final attempt decides once the hold has elapsed...
+        assert!(!boot_hold_blocks(RecoverMode::Predecessor, true, false));
+        // ...and not before.
+        assert!(boot_hold_blocks(RecoverMode::Predecessor, true, true));
+        // A sweep and a later recovery keep the time rule alone.
+        for mode in [RecoverMode::Sweep, RecoverMode::Boot] {
+            assert!(!boot_hold_blocks(mode, false, false));
+            assert!(boot_hold_blocks(mode, false, true));
+        }
+    }
+
+    // The refusal says why each member is undecided.
+    #[test]
+    fn an_undecided_member_is_named_with_its_reason() {
+        let none = MemberFate::new(false);
+        assert_eq!(undecided_reason(false, false, &none), "no answer");
+        assert!(undecided_reason(true, false, &none).contains("lease"));
+        assert!(undecided_reason(false, true, &none).contains("address"));
+        let transport = Script::new()
+            .on("a:1", SEAL, refused(401, true))
+            .transport();
+        let answered = probe_all(&transport, &candidates(&["a:1"], false));
+        assert!(undecided_reason(false, false, &answered).contains("without a complete witness"));
     }
 
     // The hold must stay below the start of the last attempt.

@@ -4777,7 +4777,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         attempt += 1;
                         recovered = match tokio::time::timeout(
                             std::time::Duration::from_secs(15 * 60),
-                            manager.recover_self(),
+                            manager.recover_self(ladder.is_final_attempt()),
                         )
                         .await
                         {
