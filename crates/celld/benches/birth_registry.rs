@@ -21,6 +21,8 @@ macro_rules! say {
     };
 }
 
+#[path = "birth_registry/gates.rs"]
+mod gates;
 #[path = "birth_registry/gen.rs"]
 mod gen;
 #[path = "birth_registry/phases.rs"]
@@ -306,6 +308,18 @@ fn record(name: &str, value: Value) {
     let mut value = value;
     if let Some(object) = value.as_object_mut() {
         object.insert("commit".into(), json!(commit()));
+        // The run these results belong to, and when they were written: a report
+        // reads only one batch, or says it mixed several.
+        object.insert(
+            "batch".into(),
+            json!(env_text("CELLD_REG_BATCH").unwrap_or_else(|| "none".into())),
+        );
+        object.insert(
+            "finished_at".into(),
+            json!(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs())),
+        );
         object.insert("thresholds".into(), json!("as planned"));
     }
     let line = json!({ "phase": name, "result": value });
