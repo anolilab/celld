@@ -137,22 +137,27 @@ pub fn decode_marks(bundle: &[u8]) -> Result<Vec<String>> {
     if data.len() < 8 || &data[data.len() - 4..] != MARKS_MAGIC {
         return Ok(Vec::new());
     }
-    let marks_len = u32::from_le_bytes(data[data.len() - 8..data.len() - 4].try_into().unwrap());
-    let end = data.len() - 8;
-    // The trailer is there, so the bundle was written with marks: a length that
-    // the data cannot hold is a corrupt block, not a bundle without marks.
-    let start = end
-        .checked_sub(marks_len as usize)
-        .ok_or_else(|| malformed("marks block longer than the data"))?;
-    // The block follows every row; bytes that a row covers are not a block.
+    // A bundle that main wrote ends in its rows: bytes that look like a trailer
+    // there belong to a row, not to a marks block, and a valid bundle never
+    // errors on them. A trailer counts only when it sits wholly after every row.
     let rows_end = decode_footer(bundle)?
         .iter()
         .map(|row| row.offset.saturating_add(row.len))
         .max()
         .unwrap_or(0);
-    if (start as u64) < rows_end {
+    let end = data.len() - 8;
+    if (end as u64) < rows_end {
         return Ok(Vec::new());
     }
+    let marks_len = u32::from_le_bytes(data[data.len() - 8..data.len() - 4].try_into().unwrap());
+    // The trailer is there, after the rows, so the bundle was written with marks:
+    // a length that the bytes between the rows and the trailer cannot hold is a
+    // corrupt block.
+    let room = end - usize::try_from(rows_end).unwrap_or(end);
+    if marks_len as usize > room {
+        return Err(malformed("marks block longer than the data"));
+    }
+    let start = end - marks_len as usize;
     let mut block = &data[start..end];
     let mut cells = Vec::new();
     while !block.is_empty() {
@@ -320,7 +325,26 @@ mod tests {
         assert!(decode_marks(&plain).unwrap().is_empty());
     }
 
-    /// A marks trailer whose length the data cannot hold is a corrupt block.
+    /// Row bytes that end like a trailer are a row's, whatever length they seem to
+    /// declare: a valid bundle of main's never errors on them.
+    #[test]
+    fn row_bytes_that_end_like_a_trailer_decode_to_no_marks() {
+        for length in [u32::MAX, 2] {
+            let mut row = b"xxxxxxxx".to_vec();
+            row.extend_from_slice(&length.to_le_bytes());
+            row.extend_from_slice(MARKS_MAGIC);
+            let body = encode(&[entry("c", 1, &row)]).unwrap();
+            assert_eq!(
+                decode_marks(&body).unwrap(),
+                Vec::<String>::new(),
+                "{length}"
+            );
+            let rows = decode_rows(&body).unwrap();
+            assert_eq!(slice(&body, &rows[0]).unwrap(), row.as_slice());
+        }
+    }
+
+    /// A real trailer after the rows whose length does not fit is a corrupt block.
     #[test]
     fn a_marks_trailer_longer_than_the_data_is_an_error() {
         let mut data = b"ab".to_vec();
