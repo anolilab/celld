@@ -1153,6 +1153,12 @@ async fn probe_member(
             }
         }
     };
+    // An older follower omits the fragment it holds, and then `fragment_epoch`
+    // stands in for it, which is 0 for an incomplete retained range. The held
+    // epoch is unknown there, not a mismatch: its rows are judged by the
+    // tail's own epoch, and the member is conclusive only with a complete
+    // witness.
+    let held_known = sealed.held_fragment_epoch.is_some();
     let held_fragment_epoch = sealed.held_fragment_epoch.unwrap_or(sealed.fragment_epoch);
     let tail_req = TailReq {
         leader: dead.to_string(),
@@ -1164,7 +1170,7 @@ async fn probe_member(
                 complete: false,
                 inconclusive: true,
                 epoch_match: false,
-                held_unread: held_fragment_epoch == epoch,
+                held_unread: held_known && held_fragment_epoch == epoch,
                 entries: Vec::new(),
             })
         }
@@ -1187,7 +1193,7 @@ async fn probe_member(
                 complete: false,
                 inconclusive: true,
                 epoch_match: false,
-                held_unread: held_fragment_epoch == epoch,
+                held_unread: held_known && held_fragment_epoch == epoch,
                 entries: Vec::new(),
             });
         }
@@ -1209,9 +1215,9 @@ async fn probe_member(
             );
             return Probe::Reached(Reached {
                 complete: false,
-                inconclusive: held_fragment_epoch == epoch,
+                inconclusive: !held_known || held_fragment_epoch == epoch,
                 epoch_match: false,
-                held_unread: held_fragment_epoch == epoch,
+                held_unread: held_known && held_fragment_epoch == epoch,
                 entries: Vec::new(),
             });
         }
@@ -1273,11 +1279,22 @@ async fn probe_member(
             }
         }
     }
+    // Without a held epoch, nothing but a complete witness is conclusive.
+    if !held_known && !complete {
+        inconclusive = true;
+    }
+    // The rows' fragment: the held epoch where it is known, else the tail's
+    // own epoch; a tail that names none (0) keeps its rows, as before.
+    let epoch_match = if held_known {
+        held_fragment_epoch == epoch && tail.range.fragment_epoch == epoch
+    } else {
+        tail.range.fragment_epoch == epoch || tail.range.fragment_epoch == 0
+    };
     Probe::Reached(Reached {
         complete,
         inconclusive,
-        epoch_match: held_fragment_epoch == epoch && tail.range.fragment_epoch == epoch,
-        held_unread: inconclusive && held_fragment_epoch == epoch,
+        epoch_match,
+        held_unread: held_known && inconclusive && held_fragment_epoch == epoch,
         entries: tail.entries,
     })
 }
@@ -9660,6 +9677,48 @@ mod boot_addr_recovery_tests {
             .transport();
         let answered = probe_all(&transport, &candidates(&["a:1"], false));
         assert!(undecided_reason(false, false, &answered).contains("without a complete witness"));
+    }
+
+    // A follower that does not say which fragment it holds is undecided
+    // unless it gave a complete witness, and its readable rows are kept.
+    #[test]
+    fn an_older_follower_without_a_held_epoch_keeps_its_rows_and_is_not_conclusive() {
+        // The seal omits `held_fragment_epoch`, and `fragment_epoch` is 0, as
+        // for an incomplete retained range; the tail is a real fragment of the
+        // epoch being recovered, and incomplete.
+        let omitted = SealResp {
+            end: 2,
+            base: Some(0),
+            fragment_epoch: 0,
+            held_fragment_epoch: None,
+        };
+        let transport = Script::new()
+            .on(
+                "old:1",
+                SEAL,
+                Answer::Ok(serde_json::to_vec(&omitted).unwrap().into()),
+            )
+            .on("old:1", TAIL, tail(0, 2, false, EPOCH, vec![entry(1)]))
+            .transport();
+        let fate = probe_all(&transport, &candidates(&["old:1"], false));
+        assert!(!fate.witness);
+        assert_eq!(fate.entries.len(), 1, "the readable rows are kept");
+        assert_eq!(fate.discarded_rows, 0);
+        // Not conclusive: no loss on this basis alone.
+        assert!(fate.undecided(false, true, false));
+        assert!(!fate.held_unread, "nothing proved what it holds");
+        // A tail naming another fragment is another fragment's rows.
+        let transport = Script::new()
+            .on(
+                "old:1",
+                SEAL,
+                Answer::Ok(serde_json::to_vec(&omitted).unwrap().into()),
+            )
+            .on("old:1", TAIL, tail(0, 2, false, 2, vec![stale_entry(1)]))
+            .transport();
+        let fate = probe_all(&transport, &candidates(&["old:1"], false));
+        assert!(fate.entries.is_empty());
+        assert!(fate.undecided(false, true, false));
     }
 
     // A member's rows come from one address only.
