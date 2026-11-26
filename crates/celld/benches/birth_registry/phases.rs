@@ -636,8 +636,12 @@ async fn load_phase(cfg: Cfg) {
         .as_ref()
         .and_then(|(before, _)| super::support::diff(&tally_after, before).ok());
     say!("{}: {sent} births sent; loads stop, settling", cfg.name);
+    let mut generator_uncovered = 0;
     if let Some(generator) = &generator {
         generator.stop();
+        // The monitor goes on until every durable segment is covered or 30 s
+        // have passed, so a late segment gives a sample or counts as uncovered.
+        generator_uncovered = generator.finish(Duration::from_secs(30)).await;
     }
     if let Some(tasks) = gen_tasks {
         for task in tasks {
@@ -684,6 +688,7 @@ async fn load_phase(cfg: Cfg) {
             "segments": g.segments.load(Ordering::Relaxed), "entries": g.entries.load(Ordering::Relaxed),
             "failed": g.failed.load(Ordering::Relaxed),
             "durable_to_covered_ms": percentiles(&g.covered_ms.lock().unwrap()),
+            "uncovered": generator_uncovered,
         })),
         "node_samples": {
             "lookup_ms": { "n": node_lookup_us.len(), "p50": ms_p(&node_lookup_us, 50.0) / 1000.0, "p99": ms_p(&node_lookup_us, 99.0) / 1000.0 },
@@ -1457,7 +1462,7 @@ fn gates_of(cfg: &Cfg, result: &Value, gates: &mut Gates) {
             "G-p",
             json!({ "passes_with_100_segments": wide.len(), "pass_p99_ms_with_100_segments": p99, "durable_to_covered_p99_ms": generator["durable_to_covered_ms"]["p99"], "failed_segment_puts": generator["failed"] }),
             "pass p99 <= 2 s with at least 100 segments in a pass; durable -> covered p99 <= 8 s",
-            hold(!wide.is_empty() && p99 <= 2000.0 && n(&generator["durable_to_covered_ms"]["p99"]) <= 8000.0),
+            hold(!wide.is_empty() && p99 <= 2000.0 && n(&generator["durable_to_covered_ms"]["p99"]) <= 8000.0 && generator["uncovered"] == 0),
         );
     }
     if cfg.name == "x4" {
@@ -1474,13 +1479,14 @@ fn gates_of(cfg: &Cfg, result: &Value, gates: &mut Gates) {
             .unwrap_or(0);
         let g_d = n(&ns["claim_to_covered_ms"]["p99"]) <= 20_000.0
             && n(&ns["segment_to_covered_ms"]["p99"]) <= 8_000.0
-            && n(&result["generator"]["durable_to_covered_ms"]["p99"]) <= 8_000.0;
+            && n(&result["generator"]["durable_to_covered_ms"]["p99"]) <= 8_000.0
+            && result["generator"]["uncovered"] == 0;
         gates.add(
             "G-s",
             json!({ "spills": c["spills"], "spills_by_records": c["spills_records"], "spills_by_deltas": c["spills_deltas"], "spills_by_timer": c["spills_timer"], "spills_at_takeover": c["spills_takeover"],
                     "live_records_max": live_max, "cap_pauses": c["cap_pauses"], "pass_p99_ms": ns["pass_ms"]["p99"],
                     "claim_to_covered_p99_ms": ns["claim_to_covered_ms"]["p99"], "segment_to_covered_p99_ms": ns["segment_to_covered_ms"]["p99"],
-                    "generator_durable_to_covered_p99_ms": result["generator"]["durable_to_covered_ms"]["p99"], "g_d_holds": g_d }),
+                    "generator_durable_to_covered_p99_ms": result["generator"]["durable_to_covered_ms"]["p99"], "generator_uncovered_segments": result["generator"]["uncovered"], "g_d_holds": g_d }),
             ">= 2 spills started by the record count; live records <= 1.5M; 0 pauses; pass p99 <= 2 s; G-d holds; per-unit requests within 15 % of steady (decided in `report`)",
             hold(n(&c["spills_records"]) >= 2.0 && live_max <= 1_500_000 && n(&c["cap_pauses"]) == 0.0 && n(&ns["pass_ms"]["p99"]) <= 2000.0 && g_d).filter(|ok| !ok),
         );
