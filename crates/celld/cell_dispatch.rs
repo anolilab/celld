@@ -32,7 +32,12 @@ pub fn local_request_error(failure: LocalRequestFailure) -> anyhow::Error {
 
 impl std::fmt::Display for RoutedRequestError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "route failed: {:?}", self.0)
+        write!(
+            formatter,
+            "route failed: {:?} ({})",
+            self.0,
+            crate::engine_api::ROUTE_REFUSED_ERROR_MARKER
+        )
     }
 }
 

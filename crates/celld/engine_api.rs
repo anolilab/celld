@@ -239,6 +239,16 @@ pub const CELL_OVERLOAD_ERROR_MARKER: &str =
 pub const CANCEL_RETRYABLE_ERROR_MARKER: &str =
     "celld-internal-retryable-cancel-3b9a51d0-6e2c-4f7a-8c14-a0d5e7b92f68";
 
+/// Carried by the error of a request that routing refused (the cell's
+/// ownership could not be resolved, a claim was refused). It survives the V8
+/// promise boundary like the markers above, so a stateless Worker whose call
+/// to a cell was refused does not turn the refusal into an internal error: the
+/// public ingress answers it 503, as it does for the same refusal reached
+/// directly.
+#[doc(hidden)]
+pub const ROUTE_REFUSED_ERROR_MARKER: &str =
+    "celld-internal-route-refused-5d0c7a42-91b6-4e0f-a3d8-2c6f1b8e7a95";
+
 /// The public sentences of a retryable cancel, one per cause. The error that
 /// ends the request and the 503 the ingress answers both use these, so they
 /// cannot drift apart.

@@ -62,9 +62,12 @@ async fn lost_record_beside_ltx_is_refused_not_reclaimed() {
         })
         .await;
 
-    assert!(
-        !server.get_status("/agent/kept").await.is_success(),
-        "a cell with LTX and no record was served"
+    // The Worker's call to the cell is refused, which the Worker does not catch:
+    // the client gets the refusal as a 503, not an internal error.
+    assert_eq!(
+        server.get_status("/agent/kept").await,
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "a cell with LTX and no record was served, or its refusal surfaced as another status"
     );
     assert!(
         server.log_text().contains("celld ownership record lost"),
@@ -73,7 +76,10 @@ async fn lost_record_beside_ltx_is_refused_not_reclaimed() {
     // The refusal is held, so a retry inside the hold is refused without
     // checking the bucket again. Here the record stays missing and the store
     // answers, so a check that ran would find the loss again and log it.
-    assert!(!server.get_status("/agent/kept").await.is_success());
+    assert_eq!(
+        server.get_status("/agent/kept").await,
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
     assert_eq!(
         server
             .log_text()

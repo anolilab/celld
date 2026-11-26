@@ -1725,6 +1725,17 @@ fn request_body_limit_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains(BODY_LIMIT_STREAM_ERROR))
 }
 
+/// A request that routing refused, whether the error still is the typed one or
+/// came back through a Worker's promise as text carrying the marker.
+fn routed_refusal_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<RoutedRequestError>().is_some()
+            || cause
+                .to_string()
+                .contains(celld::engine_api::ROUTE_REFUSED_ERROR_MARKER)
+    })
+}
+
 fn cell_overload_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.downcast_ref::<celld::js::CellOverloaded>().is_some()
@@ -2561,6 +2572,13 @@ async fn handle_ingress(
         }
         Err(error) if cell_overload_error(&error) => cell_overload_response(),
         Err(error) if retryable_cancel_error(&error) => retryable_cancel_response(&error),
+        // A Worker that called a cell whose request routing refused: the
+        // refusal, not a failure of the Worker. The sentence is fixed; the
+        // error text can carry the Worker's stack.
+        Err(error) if routed_refusal_error(&error) => response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{\"error\":\"the request was refused by routing\"}",
+        ),
         Err(error) => match error.downcast_ref::<celld::pool::AdmitError>() {
             // Saturation is not a failure of the request. Answering it now
             // lets the caller retry or shed; holding the connection until its
