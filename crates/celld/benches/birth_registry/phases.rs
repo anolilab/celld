@@ -24,6 +24,8 @@ use crate::{birth_target, failure_summary};
 mod faults;
 #[path = "phases/race.rs"]
 mod race;
+#[path = "phases/soak.rs"]
+mod soak;
 
 pub async fn run(phase: &str) {
     match phase {
@@ -42,6 +44,7 @@ pub async fn run(phase: &str) {
         "cold" => faults::cold().await,
         "race" => race::race().await,
         "flap" => faults::flap().await,
+        "soak" => soak::soak().await,
         "real" => load_phase(Cfg::real()).await,
         "selftest" => selftest().await,
         other => panic!("unknown CELLD_REG_PHASE {other:?}"),
