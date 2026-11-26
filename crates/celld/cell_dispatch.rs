@@ -36,7 +36,7 @@ impl std::fmt::Display for RoutedRequestError {
             formatter,
             "route failed: {:?} ({})",
             self.0,
-            crate::engine_api::ROUTE_REFUSED_ERROR_MARKER
+            crate::engine_api::route_refused_marker()
         )
     }
 }

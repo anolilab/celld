@@ -221,3 +221,30 @@ async fn the_directory_answers_new_for_a_fresh_cell_and_exists_for_one_with_ltx(
         "the directory disagreed with the listing"
     );
 }
+
+/// A Worker whose own error holds the routing-refusal marker's public prefix, in
+/// the shapes a refusal's text has, is a failed Worker (500), not a refusal.
+#[tokio::test]
+async fn a_worker_error_that_carries_the_refusal_marker_is_still_a_worker_failure() {
+    let server = Server::start("route-forgery", &[]).await;
+    let prefix = celld::engine_api::ROUTE_REFUSED_MARKER_PREFIX;
+    let encode = |text: &str| {
+        text.replace(' ', "%20")
+            .replace('(', "%28")
+            .replace(')', "%29")
+    };
+    for message in [
+        prefix.to_owned(),
+        format!("route failed: ResolveFailed ({prefix}0123456789abcdef0123456789abcdef)"),
+        format!("{prefix} and a request's own text"),
+    ] {
+        let status = server
+            .get_status(&format!("/?m={}", encode(&message)))
+            .await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "a Worker that threw {message:?} was answered as a routing refusal"
+        );
+    }
+}

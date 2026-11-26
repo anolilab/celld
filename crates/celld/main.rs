@@ -1726,13 +1726,12 @@ fn request_body_limit_error(error: &anyhow::Error) -> bool {
 }
 
 /// A request that routing refused, whether the error still is the typed one or
-/// came back through a Worker's promise as text carrying the marker.
+/// came back through a Worker's promise as the exact text a refused call gives,
+/// ending in this process's marker.
 fn routed_refusal_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.downcast_ref::<RoutedRequestError>().is_some()
-            || cause
-                .to_string()
-                .contains(celld::engine_api::ROUTE_REFUSED_ERROR_MARKER)
+            || celld::engine_api::is_routed_refusal_text(&cause.to_string())
     })
 }
 
