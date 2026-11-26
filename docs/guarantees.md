@@ -21,6 +21,13 @@ a supervisor that restarts the process.
   Tigris Global or Dual-region bucket provides it only in the region of the
   write, so do not enable epoch GC on one when fleet nodes are in more than one
   region.
+- No dependence on a token that differs when the same bytes are written twice.
+  A store whose token is a hash of the body (the same token for equal bytes) is
+  supported: celld never writes one body twice to the same key, and a write that
+  returns an error is settled by a read that compares what the record says, never
+  by sending the body again. `celld diagnose` reports whether the store repeats a
+  token for equal bytes (`cas token repeats for equal bytes: yes|no`); it is
+  information, not a failure.
 
 The qualified stores are Amazon S3, Cloudflare R2, Tigris, Google Cloud Storage,
 and Azure Blob Storage. The release tests run against R2; the S3 path uses the
