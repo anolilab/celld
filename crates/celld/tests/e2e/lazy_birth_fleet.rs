@@ -650,6 +650,72 @@ async fn the_bundle_of_a_granted_cell_carries_its_mark() {
     .await;
 }
 
+/// Rolling back from `shadow` to `off`: marks that `shadow` wrote into the
+/// bundles and the followers' tails are read or skipped by a node with the flag
+/// off, which recovers the log of the killed minting node cleanly, and every
+/// agent still answers with its last write.
+#[tokio::test]
+async fn a_node_with_the_flag_off_recovers_the_marks_that_shadow_wrote() {
+    let shadow: &[(&str, &str)] = &[
+        ("CELLD_LAZY_BIRTH", "shadow"),
+        ("CELLD_TEST_TAGGED_IDS", "1"),
+        ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "3600000"),
+    ];
+    let off: &[(&str, &str)] = &[("CELLD_LAZY_BIRTH", "off")];
+    let Some(fleet) = Fleet::start("do-ids", 3, shadow).await else {
+        return;
+    };
+    with_fleet(fleet, |mut fleet| async move {
+        wait_for_ensemble(&fleet).await;
+        let ids = spawn_agents(&fleet, 6).await;
+        // A bundle carries a mark, and so do the followers' tails.
+        wait_until("a bundle with a mark", Duration::from_secs(60), || async {
+            for key in fleet.keys("log/").await {
+                if !key.ends_with(".ltxb") {
+                    continue;
+                }
+                let (bytes, _) = fleet.bucket.get(&key).await.ok()??;
+                if !celld_ltx::bundle::decode_marks(&bytes).ok()?.is_empty() {
+                    return Some(());
+                }
+            }
+            None
+        })
+        .await;
+        // The minting node is killed and comes back with the flag off, as a
+        // node does in a rollback: its start recovers the log that holds marks.
+        fleet.nodes[0].kill();
+        fleet.respawn(0, off).await;
+        wait_until(
+            "the predecessor log to be recovered and sealed",
+            Duration::from_secs(120),
+            || async {
+                fleet.nodes[0]
+                    .log()
+                    .contains("node log recovered and sealed")
+                    .then_some(())
+            },
+        )
+        .await;
+        let losses: Vec<String> = fleet
+            .keys("log/")
+            .await
+            .into_iter()
+            .filter(|key| key.ends_with(".loss.json"))
+            .collect();
+        assert!(losses.is_empty(), "a loss was declared: {losses:?}");
+        for id in &ids {
+            let n = wait_until("an agent to answer", Duration::from_secs(120), || async {
+                fleet.get_json(1, &format!("/bump?id={id}")).await
+            })
+            .await;
+            assert_eq!(n["n"], 2, "a write was lost");
+        }
+        fleet
+    })
+    .await;
+}
+
 /// In `shadow` nothing rests on a grant: a request that gives up waiting for the
 /// fleet proof of its `Grant` does not fail, the cell is not left pending, and
 /// every later request for it is answered. The failure is logged and the id is
@@ -1158,6 +1224,151 @@ async fn s10_a_bucket_that_refuses_for_a_minute_loses_no_acknowledged_grant() {
         }
     }
     proxy.refuse(false);
+    fleet.nodes.clear();
+    fleet.clean().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// A proxy to the store that counts the requests that pass, by method and by the
+/// shape of the path.
+struct Counting {
+    counts: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>,
+    url: String,
+}
+
+fn shape_of(method: &str, path: &str) -> String {
+    let path = path.split('?').next().unwrap_or(path);
+    let mut shaped = String::new();
+    let mut run = String::new();
+    let flush = |run: &mut String, shaped: &mut String| {
+        if run.len() >= 16 {
+            shaped.push('*');
+        } else {
+            shaped.push_str(run);
+        }
+        run.clear();
+    };
+    for ch in path.chars() {
+        if ch.is_ascii_hexdigit() {
+            run.push(ch);
+        } else {
+            flush(&mut run, &mut shaped);
+            shaped.push(if ch.is_ascii_digit() { '#' } else { ch });
+        }
+    }
+    flush(&mut run, &mut shaped);
+    format!("{method} {shaped}")
+}
+
+impl Counting {
+    async fn start(upstream: &str) -> Counting {
+        let upstream = upstream
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the proxy");
+        let url = format!("http://{}", listener.local_addr().expect("proxy address"));
+        let counts = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let seen = counts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((inbound, _)) = listener.accept().await else {
+                    return;
+                };
+                let upstream = upstream.clone();
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let Ok(outbound) = tokio::net::TcpStream::connect(&upstream).await else {
+                        return;
+                    };
+                    let (mut in_read, mut in_write) = inbound.into_split();
+                    let (mut out_read, mut out_write) = outbound.into_split();
+                    let up = async move {
+                        let mut buffer = vec![0_u8; 64 * 1024];
+                        loop {
+                            let Ok(read) = in_read.read(&mut buffer).await else {
+                                return;
+                            };
+                            if read == 0 {
+                                return;
+                            }
+                            for line in String::from_utf8_lossy(&buffer[..read]).split("\r\n") {
+                                if let Some(request) = line.strip_suffix(" HTTP/1.1") {
+                                    let mut parts = request.split(' ');
+                                    if let (Some(method), Some(path)) = (parts.next(), parts.next())
+                                    {
+                                        *seen
+                                            .lock()
+                                            .unwrap()
+                                            .entry(shape_of(method, path))
+                                            .or_default() += 1;
+                                    }
+                                }
+                            }
+                            if out_write.write_all(&buffer[..read]).await.is_err() {
+                                return;
+                            }
+                        }
+                    };
+                    let down = async move {
+                        let _ = tokio::io::copy(&mut out_read, &mut in_write).await;
+                    };
+                    futures_util::future::join(up, down).await;
+                });
+            }
+        });
+        Counting { counts, url }
+    }
+
+    fn snapshot(&self) -> std::collections::BTreeMap<String, u64> {
+        self.counts.lock().unwrap().clone()
+    }
+}
+
+/// The requests one node sends while it closes gracefully with agents that it
+/// has just written, with the flag off. Printed, to be compared with the same
+/// test on main: a close without a session sends what it always sent.
+#[tokio::test]
+async fn a_close_with_the_flag_off_sends_the_requests_it_always_did() {
+    let off: &[(&str, &str)] = &[("CELLD_LAZY_BIRTH", "off")];
+    let Ok(upstream) = std::env::var("AWS_ENDPOINT_URL") else {
+        eprintln!("skipped: AWS_ENDPOINT_URL is not set");
+        return;
+    };
+    let counting = Counting::start(&upstream).await;
+    let Some(mut fleet) = Fleet::start("do-ids", 3, off).await else {
+        return;
+    };
+    let body = async {
+        fleet.nodes[0].kill();
+        fleet.nodes[0] = Node::spawn(fleet.home.path(), 0, &fleet.spec, &counting.url, off);
+        fleet.nodes[0].wait_ready(&fleet.client).await;
+        wait_until("an ensemble", Duration::from_secs(90), || async {
+            let lease = fleet.object("nodes/lazy-0.json").await?;
+            (lease["log"]["state"] == "open" && !lease["log"]["ensemble"].as_array()?.is_empty())
+                .then_some(())
+        })
+        .await;
+        spawn_agents(&fleet, 6).await;
+        let before = counting.snapshot();
+        fleet.nodes[0].stop();
+        let after = counting.snapshot();
+        let mut delta = std::collections::BTreeMap::new();
+        for (shape, n) in &after {
+            let added = n - before.get(shape).copied().unwrap_or(0);
+            // Lease renewals and capacity samples are time, not close.
+            if added > 0 && !shape.contains("nodes/") && !shape.contains("capacity") {
+                delta.insert(shape.clone(), added);
+            }
+        }
+        eprintln!("CLOSE_REQUESTS {}", serde_json::json!(delta));
+    };
+    let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
     fleet.nodes.clear();
     fleet.clean().await;
     if let Err(panic) = outcome {
