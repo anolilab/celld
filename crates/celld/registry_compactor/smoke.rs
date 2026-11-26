@@ -48,7 +48,8 @@ async fn lookup_against_list_smoke() {
     let endpoint = env("CELLD_REG_SYNTH_ENDPOINT").expect("CELLD_REG_SYNTH_ENDPOINT");
     let bucket = env("CELLD_REG_SYNTH_BUCKET").expect("CELLD_REG_SYNTH_BUCKET");
     let run = env("CELLD_REG_SYNTH_RUN").expect("CELLD_REG_SYNTH_RUN");
-    let out = env("CELLD_REG_SYNTH_OUT").expect("CELLD_REG_SYNTH_OUT");
+    // The aging tool's own default, so the documented commands agree.
+    let out = env("CELLD_REG_SYNTH_OUT").unwrap_or_else(super::synth::run_dir);
     let rounds: usize = env("CELLD_REG_SMOKE_N")
         .and_then(|value| value.parse().ok())
         .unwrap_or(20_000);

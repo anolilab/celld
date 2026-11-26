@@ -393,8 +393,10 @@ pub struct Registry {
     pub(crate) holds: Holds,
     /// The last events of the holder, for the debug state route.
     pub(crate) debug: Mutex<serde_json::Map<String, serde_json::Value>>,
-    /// Jobs the debug route asked the holder to run: kind and partition.
-    pub(crate) forced: Mutex<std::collections::VecDeque<(String, usize)>>,
+    /// Jobs the debug route asked the holder to run: kind, partition and the
+    /// compactor epoch that accepted the request. A holder of another epoch
+    /// drops it.
+    pub(crate) forced: Mutex<std::collections::VecDeque<(String, usize, u64)>>,
     pub(crate) queue: Mutex<Queue>,
     pub(crate) flushing: tokio::sync::Mutex<()>,
     pub(crate) queued: tokio::sync::Notify,

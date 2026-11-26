@@ -3275,6 +3275,86 @@ async fn a_map_a_commit_replaced_is_deleted_after_the_grace() {
 }
 
 #[tokio::test]
+async fn a_replaced_map_is_kept_until_the_root_that_stopped_naming_it_is_written_and_the_grace_passed(
+) {
+    let store = memory();
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            grace_ms: 600_000,
+            ..config()
+        },
+    );
+    let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &(0..10).map(cell).collect::<Vec<_>>()).await;
+    let first = spill_now(&node, &mut holding).await;
+    run_job(&node, &mut holding, first).await;
+    let replaced = {
+        let (epoch, number) = holding.root.map.expect("the first spill wrote a map");
+        objects::map_key(PREFIX, epoch, number)
+    };
+    register_and_fold(&node, &mut holding, &(10..20).map(cell).collect::<Vec<_>>()).await;
+    // The commit alone: the root still names the old map.
+    let second = spill_now(&node, &mut holding).await;
+    holding.prepared.lock().unwrap().push(second);
+    assert!(node.commit_prepared(&mut holding).await.unwrap());
+    assert!(holding.retire_next.contains(&replaced));
+    assert!(
+        !holding.retired.iter().any(|(key, _)| *key == replaced),
+        "its grace starts at the root write, not at the commit"
+    );
+    assert!(keys_under(&store, &objects::maps_root(PREFIX))
+        .await
+        .contains(&replaced));
+    // The root write that stops naming it starts the grace; the map stays.
+    holding.last_root_ms = 0;
+    assert!(node.pass(&mut holding).await.unwrap());
+    assert!(holding.retired.iter().any(|(key, _)| *key == replaced));
+    node.housekeeping(&mut holding);
+    wait_housekeeping(&holding).await;
+    assert!(
+        keys_under(&store, &objects::maps_root(PREFIX))
+            .await
+            .contains(&replaced),
+        "a replaced map is not deleted inside the grace"
+    );
+}
+
+#[tokio::test]
+async fn a_forced_job_accepted_by_an_earlier_epoch_is_dropped() {
+    let store = memory();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &(0..10).map(cell).collect::<Vec<_>>()).await;
+    // Accepted by an earlier holder of this node.
+    node.forced
+        .lock()
+        .unwrap()
+        .push_back(("spill".to_owned(), 0, holding.epoch + 1));
+    node.schedule(&mut holding);
+    assert!(
+        node.forced.lock().unwrap().is_empty(),
+        "the request is consumed"
+    );
+    assert_eq!(holding.running.load(Ordering::SeqCst), 0);
+    assert!(holding.prepared.lock().unwrap().is_empty());
+    // The same request from this epoch runs.
+    node.forced
+        .lock()
+        .unwrap()
+        .push_back(("spill".to_owned(), 0, holding.epoch));
+    node.schedule(&mut holding);
+    crate::asyncrt::timeout(Duration::from_secs(5), async {
+        while holding.prepared.lock().unwrap().is_empty() {
+            crate::asyncrt::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the forced spill was prepared");
+}
+
+#[tokio::test]
 async fn a_full_queue_drops_new_cells_counts_them_and_a_write_queues_one_again() {
     let (scripted, plain) = scripted();
     let store: Arc<dyn ObjectStore> = scripted.clone();
