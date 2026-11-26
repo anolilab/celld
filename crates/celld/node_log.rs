@@ -1030,8 +1030,10 @@ struct MemberFate {
     answered: bool,
     /// A member proved it holds the fragment, and its tail was not read.
     held_unread: bool,
-    /// Rows of the fragment being recovered, from the addresses that named it.
+    /// Rows of the fragment being recovered, from the one address chosen.
     entries: Vec<Entry>,
+    /// The chosen address gave the complete witness.
+    entries_complete: bool,
     /// Rows of other fragments that were not taken.
     discarded_rows: usize,
 }
@@ -1045,6 +1047,7 @@ impl MemberFate {
             answered: false,
             held_unread: false,
             entries: Vec::new(),
+            entries_complete: false,
             discarded_rows: 0,
         }
     }
@@ -1060,10 +1063,19 @@ impl MemberFate {
                 self.unresolved |= reached.inconclusive;
                 self.witness |= reached.complete;
                 self.held_unread |= reached.held_unread;
-                // Never merge rows across fragments: only an address that named
-                // the fragment being recovered contributes rows.
-                if reached.epoch_match {
-                    self.entries.extend(reached.entries);
+                // Rows come from exactly one address of a member, never merged:
+                // two copies of one fragment can differ in the txid they hold
+                // for a sequence, and both would survive an upload keyed by
+                // txid. Only an address that named the fragment being
+                // recovered qualifies; a complete one wins, else the one with
+                // the most rows.
+                let better = reached.epoch_match
+                    && (reached.complete
+                        || (!self.entries_complete && reached.entries.len() > self.entries.len()));
+                if better {
+                    self.discarded_rows += self.entries.len();
+                    self.entries = reached.entries;
+                    self.entries_complete = reached.complete;
                 } else {
                     self.discarded_rows += reached.entries.len();
                 }
@@ -9644,6 +9656,50 @@ mod boot_addr_recovery_tests {
             .transport();
         let answered = probe_all(&transport, &candidates(&["a:1"], false));
         assert!(undecided_reason(false, false, &answered).contains("without a complete witness"));
+    }
+
+    // A member's rows come from one address only.
+    #[test]
+    fn a_members_rows_come_from_one_address_never_merged() {
+        let row = |seq: u64, txid: u64| Entry {
+            seq,
+            cell: "c".into(),
+            cell_epoch: 1,
+            txid,
+            bytes: vec![txid as u8],
+        };
+        // An incomplete copy and a complete copy diverge on the txid of the
+        // same sequence.
+        let transport = Script::new()
+            .on("first:1", SEAL, seal(0, 2, EPOCH))
+            .on("first:1", TAIL, tail(0, 2, false, EPOCH, vec![row(1, 11)]))
+            .on("second:2", SEAL, seal(0, 2, EPOCH))
+            .on(
+                "second:2",
+                TAIL,
+                tail(0, 2, true, EPOCH, vec![row(1, 21), row(2, 22)]),
+            )
+            .transport();
+        let fate = probe_all(&transport, &candidates(&["first:1", "second:2"], false));
+        assert!(fate.witness);
+        let rows: Vec<(u64, u64)> = fate.entries.iter().map(|e| (e.seq, e.txid)).collect();
+        assert_eq!(rows, [(1, 21), (2, 22)], "only the complete address's rows");
+        assert_eq!(fate.discarded_rows, 1);
+        // Two incomplete copies: the one with the most rows, not both.
+        let transport = Script::new()
+            .on("first:1", SEAL, seal(0, 3, EPOCH))
+            .on("first:1", TAIL, tail(0, 3, false, EPOCH, vec![row(1, 11)]))
+            .on("second:2", SEAL, seal(0, 3, EPOCH))
+            .on(
+                "second:2",
+                TAIL,
+                tail(0, 3, false, EPOCH, vec![row(1, 21), row(2, 22)]),
+            )
+            .transport();
+        let fate = probe_all(&transport, &candidates(&["first:1", "second:2"], false));
+        assert!(!fate.witness);
+        let rows: Vec<(u64, u64)> = fate.entries.iter().map(|e| (e.seq, e.txid)).collect();
+        assert_eq!(rows, [(1, 21), (2, 22)]);
     }
 
     // The hold must stay below the start of the last attempt.
