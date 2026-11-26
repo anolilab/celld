@@ -6,21 +6,73 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
+use super::gates;
 use super::probe::Gates;
-use super::{out_dir, record};
+use super::{env_text, out_dir, record};
 
-const PRICE_A: f64 = 0.005 / 1000.0;
-const PRICE_B: f64 = 0.0004 / 1000.0;
 const AGENTS: f64 = 438_000_000.0;
 const NODES: f64 = 100.0;
 const MONTH_S: f64 = 30.4 * 86_400.0;
 
-fn read(name: &str) -> Option<Value> {
+/// A phase's result and where it came from.
+struct Input {
+    result: Value,
+    commit: String,
+    batch: String,
+    finished_at: u64,
+}
+
+/// The phases a report is made of and the gates each must give, so a gate whose
+/// phase left no result is listed as not evaluated and never vanishes.
+const EXPECTED: [(&str, &[&str]); 13] = [
+    (
+        "steady",
+        &["G-a", "G-b", "G-d", "G-i", "G-j", "G-l", "G-m", "G-o"],
+    ),
+    ("month1", &["G-a", "G-b", "G-d", "G-l", "G-m"]),
+    (
+        "streams",
+        &["G-a", "G-b", "G-d", "G-l", "G-m", "G-o", "G-p"],
+    ),
+    ("x4", &["G-a", "G-b", "G-d", "G-l", "G-m", "G-o", "G-s"]),
+    ("rolling", &["G-c", "G-o"]),
+    ("compactor_kill", &["G-b", "G-e", "G-m", "G-o"]),
+    ("gather", &["G-f"]),
+    ("cold", &["G-g", "G-n", "G-o"]),
+    ("race", &["G-q"]),
+    ("flap", &["G-b", "G-l", "G-o", "G-r(A)", "G-r(B)"]),
+    ("real", &["G-t (docker stand-in)"]),
+    ("units2", &["G-d", "G-l", "G-m"]),
+    ("units4", &["G-d", "G-l", "G-m"]),
+];
+
+/// The phase's saved result. With `CELLD_REG_BATCH` set only a result of that
+/// batch is read: a file from an older run is refused, not reused.
+fn read(name: &str) -> Option<Input> {
     let text =
         std::fs::read_to_string(std::path::Path::new(&out_dir()).join(format!("{name}.json")))
             .ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
-    Some(value["result"].clone())
+    let result = value["result"].clone();
+    if result.is_null() {
+        return None;
+    }
+    let batch = result["batch"].as_str().unwrap_or("unknown").to_owned();
+    if env_text("CELLD_REG_BATCH").is_some_and(|wanted| wanted != batch) {
+        say!("report: {name}.json is from batch {batch}, not this run's: ignored");
+        return None;
+    }
+    Some(Input {
+        commit: result["commit"].as_str().unwrap_or("unknown").to_owned(),
+        batch,
+        finished_at: result["finished_at"].as_u64().unwrap_or(0),
+        result,
+    })
+}
+
+/// Whether two phase results come from one run: the same commit and batch.
+fn same_run(a: &Input, b: &Input) -> bool {
+    a.commit == b.commit && a.batch == b.batch && a.commit != "unknown"
 }
 
 /// Mean node RSS in MiB over the series points between `from` and `to` seconds.
@@ -61,7 +113,9 @@ fn registry_counts(result: &Value) -> BTreeMap<String, f64> {
 }
 
 fn units(result: &Value) -> Option<Value> {
-    let window = result["tally_window_s"].as_f64()?;
+    let window = result["tally_window_s"]
+        .as_f64()
+        .filter(|window| *window > 0.0)?;
     let counts = registry_counts(result);
     let get = |name: &str| counts.get(name).copied().unwrap_or(0.0);
     let counters = &result["counters_window"];
@@ -69,9 +123,19 @@ fn units(result: &Value) -> Option<Value> {
     let nodes = result["cfg"]["nodes"].as_f64()?;
     let passes = c("passes");
     let lookups = c("lookups");
+
     let spills = c("spills");
     let merges = c("base_merges");
     let windows = window / 10.0;
+    // A phase with no lookups, passes, segments, deltas or spills has no unit to give.
+    if passes <= 0.0
+        || lookups <= 0.0
+        || spills <= 0.0
+        || get("PUT seg") <= 0.0
+        || get("PUT delta") <= 0.0
+    {
+        return None;
+    }
     // `gets` counts every GET a lookup made: one root read, the run buckets and
     // the deltas it read itself. The lookup line of the cost is the root and the
     // two run buckets (the table's 3); every delta GET, whoever made it, is
@@ -147,203 +211,69 @@ fn size_breakdown(month1: &Value, month12: &Value) -> Value {
     json!({ "month1": a, "month12": b, "month12_minus_month1_bytes": difference })
 }
 
+/// The request counts of one phase for G-s: per pass over the load window, per
+/// segment, and bytes written per spill. `steady` leaves out the forced
+/// month-24 merge (measured on its own): a one-off job that `x4` does not run.
+fn load_ratios(r: &Value, excluding_m24: bool) -> Option<(f64, f64, f64)> {
+    let c = if excluding_m24 && r["counters_excl_m24"].is_object() {
+        &r["counters_excl_m24"]
+    } else {
+        &r["counters"]
+    };
+    let n = |name: &str| c[name].as_f64();
+    let segments = n("segments_written")? + r["generator"]["segments"].as_f64().unwrap_or(0.0);
+    let w = |name: &str| r["counters_window"][name].as_f64();
+    let passes = w("passes").filter(|passes| *passes > 0.0)?;
+    let spills = n("spills").filter(|spills| *spills > 0.0)?;
+    (segments > 0.0).then_some(())?;
+    Some((
+        (w("list_requests")? + w("put_requests")? + w("get_requests")?) / passes,
+        n("get_requests")? / segments,
+        n("bytes_written")? / spills,
+    ))
+}
+
+/// The load phases' gates, judged again from the saved result under today's
+/// rules, so a result written before a rule existed does not keep its old
+/// verdict: a value the old run did not record leaves its gate not evaluated.
+fn load_phase_rows(result: &Value) -> Option<Vec<Value>> {
+    let cfg = &result["cfg"];
+    let name = cfg["name"].as_str()?;
+    if !matches!(
+        name,
+        "steady" | "month1" | "streams" | "x4" | "units2" | "units4" | "real" | "off"
+    ) {
+        return None;
+    }
+    let load = gates::LoadCfg {
+        name: name.to_owned(),
+        registry: cfg["registry"].as_bool()?,
+        lookups: cfg["lookups_per_s"].as_f64().is_some_and(|rate| rate > 0.0),
+        complete: matches!(name, "steady" | "streams" | "x4"),
+        streams: name == "streams",
+        x4: name == "x4",
+        steady: name == "steady",
+        bases_expected: cfg["generator"]["shape"] == "bases",
+        nodes: cfg["nodes"].as_u64()?,
+    };
+    Some(
+        gates::load_rows(&load, result)
+            .into_iter()
+            .map(|row| json!({ "gate": row.gate, "measured": row.measured, "threshold": row.threshold, "pass": row.pass }))
+            .collect(),
+    )
+}
+
 pub async fn report() {
     let mut gates = Gates::new();
-    let (steady, off, month1, x4) = (read("steady"), read("off"), read("month1"), read("x4"));
-    let window = |r: &Value| rss(r, 300, 600);
-    if let (Some(steady), Some(off), Some(month1)) = (&steady, &off, &month1) {
-        let (s, o, m) = (window(steady), window(off), window(month1));
-        let added = s.zip(o).map(|(s, o)| s - o);
-        let drift = s.zip(m).map(|(s, m)| (s - m).abs());
-        let x4_added = x4.as_ref().and_then(window).zip(o).map(|(x, o)| x - o);
-        let breakdown = size_breakdown(month1, steady);
-        gates.add(
-            "G-h",
-            json!({ "rss_mib_added_steady": added, "rss_mib_month12_vs_month1": drift, "rss_mib_added_x4": x4_added,
-                    "rss_mib_steady": s, "rss_mib_off": o, "rss_mib_month1": m, "window_s": "300-600",
-                    "registry_size_by_kind": breakdown }),
-            "<= 64 MiB; within 5 MiB; <= 96 MiB in x4 (mean node RSS between 5 and 10 minutes, against the registry-off control at the same real births)",
-            Some(added.is_some_and(|v| v <= 64.0) && drift.is_some_and(|v| v <= 5.0) && x4_added.is_some_and(|v| v <= 96.0)),
-        );
-    } else {
-        gates.add("G-h", json!("needs steady, off, month1 and x4"), "", None);
-    }
-    let (u2, u4) = (
-        read("units2").and_then(|r| units(&r)),
-        read("units4").and_then(|r| units(&r)),
-    );
-    let mut projection = Value::Null;
-    if let (Some(u2), Some(u4)) = (&u2, &u4) {
-        let n = |u: &Value, name: &str| u[name].as_f64().unwrap_or(f64::NAN);
-        let mean = |name: &str| (n(u2, name) + n(u4, name)) / 2.0;
-        let lookup_gets = mean("lookup_gets_per_agent");
-        let seg_puts = mean("segment_puts_per_node_per_window");
-        let seg_gets = mean("segment_gets_per_segment");
-        let a_per_pass = mean("lists_per_pass") + mean("writes_per_delta");
-        let delta_gets = mean("delta_gets_per_node_per_delta");
-        let seg_deletes = mean("segment_deletes_per_segment");
-        let seg_batches = mean("segment_delete_batches_per_pass");
-        let retire_batches = mean("retire_delete_batches_per_spill");
-        let run_puts = mean("run_puts_per_spill");
-        let run_gets = mean("run_gets_per_spill");
-        let passes_per_s = mean("passes_per_s");
-        let watch_root_gets = mean("watch_root_gets_per_node_per_s");
-        let months_windows = MONTH_S / 10.0;
-        let passes = passes_per_s * MONTH_S;
-        let spills = MONTH_S / 900.0;
-        let lines = json!({
-            "lookup": { "b": AGENTS * lookup_gets },
-            "segments": { "a": NODES * months_windows * seg_puts },
-            "compactor_reads": { "b": NODES * months_windows * seg_puts * seg_gets },
-            "passes": { "a": passes * a_per_pass },
-            "node_delta_reads": { "b": (NODES - 1.0) * passes * delta_gets },
-            // The holder's push: node-to-node HTTP, no bucket request, so no a or b.
-            // Root reads by the watch loop of each node, beyond the lookups' own.
-            "watch_root_reads": { "b": NODES * MONTH_S * watch_root_gets },
-            "root_push": { "http_requests": (NODES - 1.0) * passes, "bucket_requests": 0.0 },
-            "spills": { "a": spills * run_puts, "b": spills * run_gets },
-            "base_merges": { "a": 0.5e6 },
-            "audit_list": { "a": AGENTS / 256.0 },
-            "sampler": { "a": 0.04e6, "b": 2.1e6 },
-        });
-        // Measured per pass and per spill, from the proxy's tally of DeleteObjects.
-        let deletes = json!({
-            "segments_per_pass": { "a": passes * seg_batches },
-            "retired_after_spills": { "a": spills * retire_batches },
-        });
-        let (mut a, mut b) = (0.0, 0.0);
-        for (_, line) in lines.as_object().unwrap() {
-            a += line["a"].as_f64().unwrap_or(0.0);
-            b += line["b"].as_f64().unwrap_or(0.0);
-        }
-        let delete_requests: f64 = deletes
-            .as_object()
-            .unwrap()
-            .values()
-            .map(|line| line["a"].as_f64().unwrap_or(0.0))
-            .sum();
-        let bytes_per_cell = steady
-            .as_ref()
-            .and_then(|s| s["storage"]["run_bytes_per_cell"].as_f64())
-            .unwrap_or(69.0);
-        let storage_gb = bytes_per_cell * 5.26e9 / 1e9;
-        let storage = storage_gb * 0.023;
-        let total_deletes_free = a * PRICE_A + b * PRICE_B + storage;
-        let total = total_deletes_free + delete_requests * PRICE_A;
-        let table = [
-            ("lookup_gets_per_agent", 3.0),
-            ("segment_puts_per_node_per_window", 1.0),
-            ("segment_gets_per_segment", 1.0),
-            ("lists_per_pass", 1.0),
-            ("writes_per_delta", 2.0),
-            ("delta_gets_per_node_per_delta", 1.0),
-        ];
-        let within: Vec<Value> = table
-            .iter()
-            .map(|(name, expected)| {
-                let m = mean(name);
-                json!({ "unit": name, "measured_2n": n(u2, name), "measured_4n": n(u4, name), "table": expected, "within_15_pct": ((m - expected) / expected).abs() <= 0.15 })
-            })
-            .collect();
-        let all_within = within.iter().all(|row| row["within_15_pct"] == true);
-        projection = json!({ "lines": lines, "deletes": deletes, "class_a": a, "class_b": b, "delete_requests": delete_requests, "storage_usd": storage,
-                             "usd_per_month_deletes_free": total_deletes_free, "usd_per_month_deletes_class_a": total, "units": within });
-        gates.add(
-            "G-k",
-            json!({ "usd_per_month_deletes_counted_class_a_as_the_bench_does": total, "usd_per_month_if_deletes_are_free": total_deletes_free,
-                    "class_a_per_month_without_deletes": a, "delete_requests_per_month": delete_requests, "class_b_per_month": b, "storage_usd": storage,
-                    "segment_deletes_per_segment": seg_deletes, "segment_delete_batches_per_pass": seg_batches, "retire_delete_batches_per_spill": retire_batches,
-                    "deletes": deletes, "units": within, "plan_table_usd": 735 }),
-            "<= $800 per month; each per-unit count within 15 % of the cost table (extrapolated: 438M agents, 100 nodes, W=10 s, P=5 s, M=15 min, from per-unit counts at 2 and 4 nodes; base merges, audit LIST, sampler and storage analytic; every DeleteObjects counted as class A, as storage_requests classes it; deletes projected from the DeleteObjects requests measured per pass and per spill)",
-            Some(total <= 800.0 && all_within),
-        );
-    } else {
-        gates.add("G-k", json!("needs units2 and units4"), "", None);
-    }
-    if let Some(steady) = &steady {
-        let row = steady["gates"]
-            .as_array()
-            .and_then(|rows| rows.iter().find(|row| row["gate"] == "G-i"))
-            .map(|row| row["measured"].clone());
-        if let Some(m) = row {
-            let f = |name: &str| m[name].as_f64();
-            let inline_ok = f("pass_p99_ms").is_some_and(|v| v <= 2_000.0)
-                && f("pass_gap_p99_ms").is_some_and(|v| v <= 10_000.0)
-                && f("base_merge_month12_ms").is_some_and(|v| v <= 30_000.0)
-                && f("base_merge_month24_ms").is_some_and(|v| v <= 60_000.0)
-                && f("compactor_rss_over_other_nodes_mib_max").is_some_and(|v| v <= 256.0);
-            let per_cell = steady["storage"]["run_bytes_per_cell"]
-                .as_f64()
-                .unwrap_or(69.0);
-            let merge12 = steady["forced_merges"]
-                .as_array()
-                .and_then(|rows| rows.iter().find(|row| row["months"] == 12))
-                .and_then(|row| row["result"]["bytes_written"].as_f64());
-            let spill_gb_per_hour = 4.0 * 1024.0 * 0.5 * 42_300.0 * per_cell / 1e9;
-            let merge_gb_per_hour = merge12.map(|bytes| 1024.0 / 3.0 / 24.0 * bytes / 1e9);
-            let total = merge_gb_per_hour.map(|merge| spill_gb_per_hour + merge);
-            let within = total.is_some_and(|total| ((total - 11.25) / 11.25).abs() <= 0.25);
-            gates.add(
-                "G-i",
-                json!({ "measured_in_steady": m, "bytes_per_hour_gb": total, "spill_gb_per_hour": spill_gb_per_hour, "base_merge_gb_per_hour": merge_gb_per_hour,
-                        "table_gb_per_hour": 11.25, "bytes_per_hour_basis": "extrapolated: L1 of 3 days (42,300 records) halved on average, 4 spills an hour, one base merge every 4.2 minutes at the measured month-12 bytes written, 69 B a record" }),
-                "pass p99 <= 2 s; pass gap p99 <= 10 s; month-12 merge <= 30 s; month-24 <= 60 s; compactor RSS <= 256 MiB; bytes per hour within 25 % of the table",
-                Some(inline_ok && within),
-            );
-        }
-    }
-    if let (Some(x4), Some(steady)) = (&x4, &steady) {
-        let row = x4["gates"]
-            .as_array()
-            .and_then(|rows| rows.iter().find(|row| row["gate"] == "G-s"))
-            .map(|row| row["measured"].clone());
-        // `steady` leaves out the forced month-24 merge (measured on its own in
-        // `forced_m24_counters`): it is a one-off job that `x4` does not run.
-        let per_with = |r: &Value, excluding_m24: bool| -> Option<(f64, f64, f64)> {
-            let c = if excluding_m24 && r["counters_excl_m24"].is_object() {
-                &r["counters_excl_m24"]
-            } else {
-                &r["counters"]
-            };
-            let n = |name: &str| c[name].as_f64().unwrap_or(0.0);
-            let segments =
-                n("segments_written") + r["generator"]["segments"].as_f64().unwrap_or(0.0);
-            // Per pass is read over the load window only: the near-idle passes of
-            // the start check and the settling make up a different share of each
-            // phase and would set the ratio, not the load.
-            let w = |name: &str| r["counters_window"][name].as_f64().unwrap_or(0.0);
-            Some((
-                (w("list_requests") + w("put_requests") + w("get_requests")) / w("passes").max(1.0),
-                n("get_requests") / segments.max(1.0),
-                n("bytes_written") / n("spills").max(1.0),
-            ))
-        };
-        let per = |r: &Value| per_with(r, true);
-        if let (Some(row), Some(a), Some(b)) = (row, per(x4), per(steady)) {
-            let within = |x: f64, y: f64| ((x - y) / y).abs() <= 0.15;
-            let units = within(a.0, b.0) && within(a.1, b.1) && within(a.2, b.2);
-            let spills_by_records = row["spills_by_records"].as_f64().unwrap_or(0.0);
-            let live = row["live_records_max"].as_f64().unwrap_or(f64::MAX);
-            let ok = spills_by_records >= 2.0
-                && live <= 1_500_000.0
-                && row["cap_pauses"].as_f64() == Some(0.0)
-                && row["pass_p99_ms"].as_f64().is_some_and(|v| v <= 2_000.0)
-                && row["g_d_holds"] == true
-                && units;
-            gates.add(
-                "G-s",
-                json!({ "x4": row, "per_pass_requests": { "x4": a.0, "steady": b.0 }, "get_requests_per_segment": { "x4": a.1, "steady": b.1 }, "bytes_written_per_spill": { "x4": a.2, "steady": b.2 }, "steady_with_m24_for_reference": per_with(steady, false), "steady_forced_m24_counters": steady["forced_m24_counters"],
-                    "unit_basis": "x4 against steady without its forced month-24 merge (the job's counters measured on their own); the registry compactor's own request counters; requests per pass over the load window" }),
-                ">= 2 spills by record count; live records <= 1.5M; 0 pauses; pass p99 <= 2 s; G-d holds; requests per segment, per pass and per spill within 15 % of steady",
-                Some(ok),
-            );
-        }
-    }
-    let mut table: Vec<(String, String, Value)> = Vec::new();
-    for phase in [
+    let inputs: BTreeMap<&str, Option<Input>> = [
         "steady",
-        "streams",
+        "off",
+        "month1",
         "x4",
+        "units2",
+        "units4",
+        "streams",
         "rolling",
         "compactor_kill",
         "gather",
@@ -351,14 +281,151 @@ pub async fn report() {
         "race",
         "flap",
         "real",
-    ] {
-        for row in read(phase)
-            .and_then(|r| r["gates"].as_array().cloned())
+    ]
+    .into_iter()
+    .map(|name| (name, read(name)))
+    .collect();
+    let input = |name: &str| inputs.get(name).and_then(Option::as_ref);
+    let result = |name: &str| input(name).map(|input| &input.result);
+    let (steady, off, month1, x4) = (
+        result("steady"),
+        result("off"),
+        result("month1"),
+        result("x4"),
+    );
+    // Where each phase's data came from, so a mixed run is visible.
+    let provenance: BTreeMap<&str, Value> = inputs
+        .iter()
+        .filter_map(|(name, input)| {
+            input.as_ref().map(|input| {
+                (
+                    *name,
+                    json!({ "commit": input.commit, "batch": input.batch, "finished_at": input.finished_at }),
+                )
+            })
+        })
+        .collect();
+    let distinct: std::collections::BTreeSet<String> = inputs
+        .values()
+        .flatten()
+        .map(|input| format!("{}/{}", input.commit, input.batch))
+        .collect();
+    let mixed = distinct.len() > 1;
+    if mixed {
+        say!("report: the phase results come from more than one run: {distinct:?}");
+    }
+
+    // G-h: memory against the control and against a younger registry.
+    let window = |r: &Value| rss(r, 300, 600);
+    match (steady, off, month1) {
+        (Some(steady), Some(off), Some(month1)) => {
+            let (s, o, m) = (window(steady), window(off), window(month1));
+            let added = s.zip(o).map(|(s, o)| s - o);
+            let drift = s.zip(m).map(|(s, m)| (s - m).abs());
+            let x4_added = x4.and_then(window).zip(o).map(|(x, o)| x - o);
+            let breakdown = size_breakdown(month1, steady);
+            gates.add(
+                "G-h",
+                json!({ "rss_mib_added_steady": added, "rss_mib_month12_vs_month1": drift, "rss_mib_added_x4": x4_added,
+                        "rss_mib_steady": s, "rss_mib_off": o, "rss_mib_month1": m, "window_s": "300-600",
+                        "registry_size_by_kind": breakdown }),
+                "<= 64 MiB; within 5 MiB; <= 96 MiB in x4 (mean node RSS between 5 and 10 minutes, against the registry-off control at the same real births)",
+                gates::all(&[
+                    added.map(|v| v <= 64.0),
+                    drift.map(|v| v <= 5.0),
+                    x4_added.map(|v| v <= 96.0),
+                ]),
+            );
+        }
+        _ => gates.add("G-h", json!("needs steady, off, month1 and x4"), "", None),
+    }
+
+    // G-k: the units of the 2- and 4-node runs, from one run.
+    let (u2_in, u4_in) = (input("units2"), input("units4"));
+    let paired = match (u2_in, u4_in) {
+        (Some(a), Some(b)) => same_run(a, b),
+        _ => false,
+    };
+    let (u2, u4) = if paired {
+        (
+            u2_in.and_then(|input| units(&input.result)),
+            u4_in.and_then(|input| units(&input.result)),
+        )
+    } else {
+        (None, None)
+    };
+    let bytes_per_cell = steady.and_then(|s| s["storage"]["run_bytes_per_cell"].as_f64());
+    let (cost, projection) = gates::cost_row(u2.as_ref(), u4.as_ref(), bytes_per_cell);
+    let cost_measured = if !paired && cost.pass.is_none() {
+        json!("needs units2 and units4 from one run (same commit and batch)")
+    } else {
+        cost.measured.clone()
+    };
+    gates.add(cost.gate, cost_measured, cost.threshold, cost.pass);
+
+    // G-i: the steady phase's clauses and the bytes per hour.
+    let rows_of = |name: &str| -> Vec<Value> {
+        result(name)
+            .and_then(|r| load_phase_rows(r).or_else(|| r["gates"].as_array().cloned()))
             .unwrap_or_default()
-        {
-            let name = row["gate"].as_str().unwrap_or("").to_owned();
-            if !["G-i", "G-s"].contains(&name.as_str()) || phase == "gather" {
-                table.push((name, phase.to_owned(), row));
+    };
+    let steady_row = rows_of("steady")
+        .into_iter()
+        .find(|row| row["gate"] == "G-i")
+        .map(|row| row["measured"].clone())
+        .filter(|measured| measured.is_object());
+    let bytes_per_hour = steady.and_then(|steady| {
+        let per_cell = steady["storage"]["run_bytes_per_cell"].as_f64()?;
+        let merge12 = steady["forced_merges"]
+            .as_array()?
+            .iter()
+            .find(|row| row["months"] == 12)?["result"]["bytes_written"]
+            .as_f64()?;
+        let spill_gb_per_hour = 4.0 * 1024.0 * 0.5 * 42_300.0 * per_cell / 1e9;
+        Some(spill_gb_per_hour + 1024.0 / 3.0 / 24.0 * merge12 / 1e9)
+    });
+    let row = gates::bytes_row(steady_row.as_ref(), bytes_per_hour);
+    gates.add(row.gate, row.measured, row.threshold, row.pass);
+
+    // G-s: x4 against steady.
+    let x4_row = rows_of("x4")
+        .into_iter()
+        .find(|row| row["gate"] == "G-s")
+        .map(|row| row["measured"].clone())
+        .filter(|measured| measured.is_object());
+    let ratios = |r: Option<&Value>, excluding: bool| r.and_then(|r| load_ratios(r, excluding));
+    let mut row = gates::load_ratio_row(x4_row.as_ref(), ratios(x4, true), ratios(steady, true));
+    if mixed && row.pass.is_some() {
+        row.measured["inputs"] =
+            json!({ "x4": provenance.get("x4"), "steady": provenance.get("steady") });
+    }
+    gates.add(row.gate, row.measured, row.threshold, row.pass);
+
+    // Every gate of every phase, from the phases' own rows. A phase with no
+    // result, or a result without one of its gates, leaves a not-evaluated row.
+    let mut table: Vec<(String, String, Value)> = Vec::new();
+    for (phase, expected) in EXPECTED {
+        let rows: Vec<Value> = rows_of(phase);
+        for gate in expected {
+            let found: Vec<&Value> = rows.iter().filter(|row| row["gate"] == *gate).collect();
+            if found.is_empty() {
+                let why = if input(phase).is_none() {
+                    format!("the {phase} phase has no result in this run")
+                } else {
+                    format!("the {phase} result has no {gate} row")
+                };
+                table.push((
+                    (*gate).to_owned(),
+                    phase.to_owned(),
+                    json!({ "gate": gate, "measured": why, "threshold": "", "pass": null }),
+                ));
+            }
+            for row in found {
+                // G-i and G-s of the phases are decided in the report.
+                if matches!(*gate, "G-i" | "G-s") {
+                    continue;
+                }
+                table.push(((*gate).to_owned(), phase.to_owned(), row.clone()));
             }
         }
     }
@@ -370,14 +437,21 @@ pub async fn report() {
         ));
     }
     table.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut markdown = String::from(
+    let mut markdown = String::new();
+    if mixed {
+        markdown.push_str(&format!(
+            "Inputs from more than one run: {}.\n\n",
+            distinct.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    markdown.push_str(
         "| Gate | Phase | Verdict | Measured | Threshold |\n| --- | --- | --- | --- | --- |\n",
     );
     for (name, phase, row) in &table {
         let verdict = match row["pass"].as_bool() {
             Some(true) => "pass",
             Some(false) => "FAIL",
-            None => "not run",
+            None => "not evaluated",
         };
         markdown.push_str(&format!(
             "| {name} | {phase} | {verdict} | `{}` | {} |\n",
@@ -387,10 +461,12 @@ pub async fn report() {
     }
     let _ = std::fs::write(std::path::Path::new(&out_dir()).join("GATES.md"), &markdown);
     say!("{markdown}");
+    let _ = (AGENTS, NODES, MONTH_S);
     record(
         "report",
         json!({
             "units2": u2, "units4": u4, "projection": projection, "gates": gates.json(),
+            "inputs": provenance, "mixed_inputs": mixed,
         }),
     );
 }

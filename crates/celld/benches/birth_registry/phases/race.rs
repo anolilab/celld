@@ -269,6 +269,15 @@ pub async fn race() {
             hold(&rig, "schedule", false).await;
         }
     }
+    // Both modes ran, each with rounds and a final check over some keys.
+    let ran = modes.len() == 2
+        && rounds > 0
+        && modes.iter().all(|m| {
+            m["final_check"]["total"]
+                .as_u64()
+                .is_some_and(|total| total > 0)
+                && m["final_check"]["misses"].is_u64()
+        });
     let lost: u64 = modes
         .iter()
         .map(|m| {
@@ -279,12 +288,12 @@ pub async fn race() {
     let equal = modes
         .iter()
         .all(|m| m["records_equal_distinct_keys"] == true);
-    let discarded2 = modes[1]["merges_discarded"].as_u64().unwrap_or(0);
+    let discarded2 = modes.get(1).and_then(|m| m["merges_discarded"].as_u64());
     gates.add(
         "G-q",
-        json!({ "keys_not_reading_exists": lost, "record_count_equals_distinct_keys": equal, "mode2_merges_discarded": discarded2, "rounds_per_mode": rounds }),
-        "0; equal; >= 190 of 200 discarded in mode 2 (the race happened)",
-        Some(lost == 0 && equal && discarded2 as f64 >= rounds as f64 * 0.95),
+        json!({ "keys_not_reading_exists": lost, "record_count_equals_distinct_keys": equal, "mode2_merges_discarded": discarded2, "rounds_per_mode": rounds, "modes_run": modes.len() }),
+        "0; equal; >= 190 of 200 discarded in mode 2 (the race happened); both modes ran over some keys",
+        Some(ran && lost == 0 && equal && discarded2.is_some_and(|d| d as f64 >= rounds as f64 * 0.95)),
     );
     record("race", json!({ "modes": modes, "gates": gates.json() }));
     rig.fleet.save_logs("race");

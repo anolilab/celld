@@ -523,7 +523,7 @@ impl Gates {
         let verdict = match pass {
             Some(true) => "PASS",
             Some(false) => "FAIL",
-            None => "not run",
+            None => "not evaluated",
         };
         say!("{gate:<6} {verdict:<8} {measured}  [{threshold}]");
         self.0.push(

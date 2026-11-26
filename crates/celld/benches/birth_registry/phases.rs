@@ -14,6 +14,7 @@ use object_store::path::Path as OPath;
 use object_store::{ObjectStore, ObjectStoreExt as _};
 use serde_json::{json, Value};
 
+use super::gates;
 use super::gen::{hex, Generator, Shape, Store};
 use super::probe::{self, ms_p, Expect, Gates, Lookups, Samples};
 use super::{birth_load, env_f64, env_text, out_dir, record, Births, Fleet};
@@ -321,11 +322,16 @@ pub fn percentiles(values: &[u64]) -> Value {
 }
 
 /// The guard's own measurements on every node: how long the registry lookup and
-/// the LIST beside it took, and what each said.
+/// the LIST beside it took, and what each said. A node sends each latency as a
+/// histogram (`count`, `p50_us`, `p99_us` and `buckets_log2_us`, bucket `i`
+/// holding values below `2^i` microseconds); the buckets of every node are added
+/// and the percentiles read from the sum, as the upper bound of the bucket.
 pub async fn guard_answers(fleet: &Fleet, nodes: &[usize]) -> Value {
-    let (mut lookup_us, mut list_us) = (Vec::new(), Vec::new());
+    let mut lookup = [0_u64; 32];
+    let mut list = [0_u64; 32];
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     let mut mismatches = 0;
+    let mut reporting = 0_u64;
     for index in nodes {
         let Some(state) = probe::jget(
             &fleet.client,
@@ -336,18 +342,15 @@ pub async fn guard_answers(fleet: &Fleet, nodes: &[usize]) -> Value {
             continue;
         };
         let answers = &state["registry_answers"];
-        if answers.is_null() {
+        let (Some(node_mismatches), true) = (
+            answers["mismatches"].as_u64(),
+            answers["lookup_us"].is_object(),
+        ) else {
             continue;
-        }
-        for (name, field) in [("lookup_us", &mut lookup_us), ("list_us", &mut list_us)] {
-            field.extend(
-                answers[name]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(Value::as_u64),
-            );
+        };
+        reporting += 1;
+        for (name, sum) in [("lookup_us", &mut lookup), ("list_us", &mut list)] {
+            gates::add_buckets(sum, &answers[name]);
         }
         for answer in ["new", "exists", "unknown"] {
             for ltx in ["no_ltx", "ltx"] {
@@ -355,12 +358,11 @@ pub async fn guard_answers(fleet: &Fleet, nodes: &[usize]) -> Value {
                     answers[answer][ltx].as_u64().unwrap_or(0);
             }
         }
-        mismatches += answers["mismatches"].as_u64().unwrap_or(0);
+        mismatches += node_mismatches;
     }
     json!({
-        "counts": counts, "mismatches": mismatches,
-        "lookup_ms": { "n": lookup_us.len(), "p50": ms_p(&lookup_us, 50.0) / 1000.0, "p99": ms_p(&lookup_us, 99.0) / 1000.0 },
-        "list_ms": { "n": list_us.len(), "p50": ms_p(&list_us, 50.0) / 1000.0, "p99": ms_p(&list_us, 99.0) / 1000.0 },
+        "counts": counts, "mismatches": mismatches, "nodes_reporting": reporting,
+        "lookup_ms": gates::histogram_ms(&lookup), "list_ms": gates::histogram_ms(&list),
     })
 }
 
@@ -852,6 +854,7 @@ async fn complete(
         "deleted_records": c3, "bases": c4.as_ref().map(|c| c.json()),
         "merge_check_failures": merge_failures, "sampler_misses": sampler_misses,
         "sampler_cells": total(states, "sampler_cells"),
+        "nodes_reporting": states.iter().filter(|state| state["counters"].is_object()).count(),
     })
 }
 
@@ -1159,36 +1162,6 @@ async fn registry_listing(rig: &Rig) -> Listing {
     listing
 }
 
-/// The gates one load phase can decide on its own.
-/// G-t's third clause: the requested pass -> covered p99 stays within the
-/// backstop's bound. `covered` holds only the waits that succeeded, so a wait
-/// that ended at the bound is counted here as a sample above any bound: the
-/// p99 is a failure when more waits failed than the top 1 % of all waits can
-/// hold. Returns the verdict, the failed waits and all waits.
-pub fn backstop_waits(covered: &Value, waits: &Value) -> (bool, u64, u64) {
-    let failed = waits
-        .as_array()
-        .map(|rows| {
-            rows.iter()
-                .filter(|row| {
-                    row[2]
-                        .as_str()
-                        .is_some_and(|outcome| outcome.ends_with(":bound"))
-                })
-                .count() as u64
-        })
-        .unwrap_or(0);
-    let succeeded = covered["n"].as_u64().unwrap_or(0);
-    let total = succeeded + failed;
-    if total == 0 {
-        return (true, 0, 0);
-    }
-    let rank = (0.99 * total as f64).ceil() as u64;
-    let room = total - rank;
-    let within = succeeded == 0 || covered["p99"].as_f64().is_some_and(|p99| p99 <= 4_000.0);
-    (failed <= room && within, failed, total)
-}
-
 async fn selftest() {
     let covered = |n: u64, p99: f64| json!({ "n": n, "p99": p99 });
     let waits = |failed: usize| {
@@ -1201,20 +1174,32 @@ async fn selftest() {
     };
     // The run that was wrongly passed: 54 waits covered (p99 3,993 ms), 3 at the bound.
     assert_eq!(
-        backstop_waits(&covered(54, 3_993.0), &waits(3)),
-        (false, 3, 57)
+        gates::backstop_waits(&covered(54, 3_993.0), &waits(3)),
+        (Some(false), 3, 57)
     );
     // A clean run, and no wait at all, still hold.
     assert_eq!(
-        backstop_waits(&covered(59, 560.0), &waits(0)),
-        (true, 0, 59)
+        gates::backstop_waits(&covered(59, 560.0), &waits(0)),
+        (Some(true), 0, 59)
     );
-    assert_eq!(backstop_waits(&covered(0, 0.0), &Value::Null), (true, 0, 0));
+    assert_eq!(
+        gates::backstop_waits(&covered(0, 0.0), &Value::Null),
+        (None, 0, 0)
+    );
     // A single failure among fewer than 100 waits is the p99; among 200 it is not.
-    assert!(!backstop_waits(&covered(56, 500.0), &waits(1)).0);
-    assert!(backstop_waits(&covered(199, 500.0), &waits(1)).0);
+    assert_eq!(
+        gates::backstop_waits(&covered(56, 500.0), &waits(1)).0,
+        Some(false)
+    );
+    assert_eq!(
+        gates::backstop_waits(&covered(199, 500.0), &waits(1)).0,
+        Some(true)
+    );
     // Successes slower than the bound fail on their own.
-    assert!(!backstop_waits(&covered(59, 4_200.0), &waits(0)).0);
+    assert_eq!(
+        gates::backstop_waits(&covered(59, 4_200.0), &waits(0)).0,
+        Some(false)
+    );
     say!("selftest: backstop_waits ok");
     // A retry stays on one node by default and moves on with the switch.
     assert_eq!(
@@ -1381,192 +1366,20 @@ async fn selftest_check() {
 }
 
 fn gates_of(cfg: &Cfg, result: &Value, gates: &mut Gates) {
-    let hold = |ok: bool| Some(ok);
-    let n = |value: &Value| value.as_f64().unwrap_or(f64::NAN);
-    if !cfg.registry {
-        gates.add(
-            "control",
-            json!({ "births": result["births"] }),
-            "the registry-off control",
-            None,
-        );
-        return;
-    }
-    let lookups = &result["lookups"];
-    if cfg.lookups > 0.0 {
-        let list_p99 = result["guard"]["list_ms"]["p99"].as_f64();
-        let p99 = n(&lookups["node_p99_ms"]);
-        // A lookup that failed, or no lookup at all, fails the gates that read them.
-        let answered = lookups["complete"] == true;
-        let shape =
-            answered && n(&lookups["gets_mean"]) <= 3.05 && n(&lookups["bytes_mean"]) <= 16384.0;
-        if cfg.name == "real" {
-            // G-t: the absolute latency is reported, not gated.
-            let covered = &result["node_samples"]["pass_to_covered_ms"];
-            let (waits_hold, failed_waits, waits) =
-                backstop_waits(covered, &result["node_samples"]["waits"]);
-            gates.add(
-                "G-t (docker stand-in)",
-                json!({ "lookup_p99_ms": p99, "lookup_p50_ms": lookups["node_p50_ms"], "list_p99_ms": list_p99, "list_p50_ms": result["guard"]["list_ms"]["p50"], "guard_lookup_p99_ms": result["guard"]["lookup_ms"]["p99"], "gets_mean": lookups["gets_mean"], "bytes_mean": lookups["bytes_mean"], "bytes_max": lookups["bytes_max"], "pass_to_covered_ms": covered, "pass_to_covered_measured": n(&covered["n"]) > 0.0, "backstop_waits": waits, "backstop_waits_failed_at_the_bound": failed_waits, "heavy_lookups": lookups["heavy"], "light_lookups": lookups["light"] }),
-                "lookup p99 <= the LIST's p99; <= 3.05 GETs, <= 16 KiB; requested pass -> covered p99 <= 4 s; absolute latencies reported",
-                // With no wait at all that clause is not measured; the others decide.
-                hold(list_p99.is_none_or(|l| p99 <= l) && shape && waits_hold),
-            );
-        } else {
-            gates.add(
-                "G-a",
-                json!({ "lookup_p99_ms": p99, "list_p99_ms": list_p99, "guard_lookup_p99_ms": result["guard"]["lookup_ms"]["p99"], "gets_mean": lookups["gets_mean"], "bytes_mean": lookups["bytes_mean"], "bytes_max": lookups["bytes_max"], "heavy_lookups": lookups["heavy"], "light_lookups": lookups["light"] }),
-                "p99 <= 25 ms; <= 3.05 GETs, <= 16 KiB (the LIST's p99 is reported beside it, not a clause)",
-                hold(p99 <= 25.0 && shape),
-            );
-        }
-        gates.add("G-b", json!({ "unknown_pct": lookups["unknown_pct"], "unknown": lookups["unknown"], "of": lookups["answered"], "failed": lookups["failed"] }), "< 0.5 % of the answered lookups; no failed lookup; at least one answered", hold(answered && n(&lookups["unknown_pct"]) < 0.5));
-    }
-    let ns = &result["node_samples"];
-    gates.add(
-        "G-d",
-        json!({ "claim_to_covered_p99_ms": ns["claim_to_covered_ms"]["p99"], "segment_to_covered_p99_ms": ns["segment_to_covered_ms"]["p99"], "pass_to_covered_p99_ms": ns["pass_to_covered_ms"]["p99"], "claim_n": ns["claim_to_covered_ms"]["n"], "pass_n": ns["pass_to_covered_ms"]["n"], "uncovered_over_20s": ns["uncovered_over_20s"] }),
-        "<= 20 s; <= 8 s; <= 2 s (when a write waited); samples present; no claimed cell uncovered after 20 s",
-        // A phase with no claims, or a claim that stayed uncovered, fails. The
-        // third clause is measured only when a first write waited for a pass.
-        hold(
-            ns["claim_to_covered_ms"]["n"].as_u64().unwrap_or(0) > 0
-                && ns["uncovered_over_20s"] == 0
-                && n(&ns["claim_to_covered_ms"]["p99"]) <= 20_000.0
-                && n(&ns["segment_to_covered_ms"]["p99"]) <= 8_000.0
-                && (ns["pass_to_covered_ms"]["n"].as_u64().unwrap_or(0) == 0
-                    || n(&ns["pass_to_covered_ms"]["p99"]) <= 2_000.0),
-        ),
-    );
-    gates.add(
-        "G-m",
-        json!({ "registry_mismatch": result["guard"]["mismatches"], "counter": result["counters"]["mismatches"] }),
-        "0",
-        hold(n(&result["guard"]["mismatches"]) == 0.0 && n(&result["counters"]["mismatches"]) == 0.0),
-    );
-    if let Some(generator) = result["generator"]
-        .as_object()
-        .filter(|_| cfg.name == "streams")
-    {
-        let wide: Vec<u64> = ns["pass_log"]
-            .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .filter(|row| row[3].as_u64().unwrap_or(0) >= 100)
-                    .filter_map(|row| row[1].as_u64())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let p99 = ms_p(&wide, 99.0) / 1000.0;
-        gates.add(
-            "G-p",
-            json!({ "passes_with_100_segments": wide.len(), "pass_p99_ms_with_100_segments": p99, "durable_to_covered_p99_ms": generator["durable_to_covered_ms"]["p99"], "failed_segment_puts": generator["failed"] }),
-            "pass p99 <= 2 s with at least 100 segments in a pass; durable -> covered p99 <= 8 s",
-            hold(!wide.is_empty() && p99 <= 2000.0 && n(&generator["durable_to_covered_ms"]["p99"]) <= 8000.0 && generator["uncovered"] == 0),
-        );
-    }
-    if cfg.name == "x4" {
-        let c = &result["counters"];
-        let live_max = result["series"]
-            .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .flat_map(|row| row["nodes"].as_array().cloned().unwrap_or_default())
-                    .filter_map(|node| node["root"]["live_records"].as_u64())
-                    .max()
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0);
-        let g_d = n(&ns["claim_to_covered_ms"]["p99"]) <= 20_000.0
-            && n(&ns["segment_to_covered_ms"]["p99"]) <= 8_000.0
-            && n(&result["generator"]["durable_to_covered_ms"]["p99"]) <= 8_000.0
-            && result["generator"]["uncovered"] == 0;
-        gates.add(
-            "G-s",
-            json!({ "spills": c["spills"], "spills_by_records": c["spills_records"], "spills_by_deltas": c["spills_deltas"], "spills_by_timer": c["spills_timer"], "spills_at_takeover": c["spills_takeover"],
-                    "live_records_max": live_max, "cap_pauses": c["cap_pauses"], "pass_p99_ms": ns["pass_ms"]["p99"],
-                    "claim_to_covered_p99_ms": ns["claim_to_covered_ms"]["p99"], "segment_to_covered_p99_ms": ns["segment_to_covered_ms"]["p99"],
-                    "generator_durable_to_covered_p99_ms": result["generator"]["durable_to_covered_ms"]["p99"], "generator_uncovered_segments": result["generator"]["uncovered"], "g_d_holds": g_d }),
-            ">= 2 spills started by the record count; live records <= 1.5M; 0 pauses; pass p99 <= 2 s; G-d holds; per-unit requests within 15 % of steady (decided in `report`)",
-            hold(n(&c["spills_records"]) >= 2.0 && live_max <= 1_500_000 && n(&c["cap_pauses"]) == 0.0 && n(&ns["pass_ms"]["p99"]) <= 2000.0 && g_d).filter(|ok| !ok),
-        );
-    }
-    let completeness = &result["completeness"];
-    if !completeness.is_null() {
-        let misses = |name: &str| completeness[name]["misses"].as_u64().unwrap_or(u64::MAX);
-        let c3 = &completeness["deleted_records"];
-        let bases_ok = completeness["bases"].is_null()
-            || (completeness["bases"]["misses"] == 0
-                && completeness["bases"]["bases"] == completeness["bases"]["total"]);
-        gates.add(
-            "G-o",
-            json!({ "claimed": completeness["claimed_cells"], "aged": completeness["aged_samples"]["misses"], "deleted_records": { "cells": c3["cells"], "registry_misses": c3["registry"]["misses"], "served_after_loss": c3["served_after_loss"], "statuses": c3["statuses"] },
-                    "bases": completeness["bases"], "merge_check_failures": completeness["merge_check_failures"], "sampler_misses": completeness["sampler_misses"] }),
-            "0 misses in (1) to (4); 0 merge-check failures and sampler misses",
-            hold(misses("claimed_cells") == 0 && misses("aged_samples") == 0 && c3["registry"]["misses"] == 0 && c3["served_after_loss"] == 0 && bases_ok
-                && completeness["merge_check_failures"] == 0 && completeness["sampler_misses"] == 0),
-        );
-    }
-    let storage = &result["storage"];
-    if !storage.is_null() {
-        gates.add(
-            "G-l",
-            json!({ "run_bytes_per_cell": storage["run_bytes_per_cell"], "bytes_per_cell": storage["bytes_per_cell"], "orphans": storage["orphans"], "examples": storage["orphan_examples"] }),
-            "<= 80 B per registered cell; 0 objects that nothing names after the grace",
-            hold(n(&storage["bytes_per_cell"]) <= 80.0 && storage["orphans"] == 0),
-        );
-    }
-    if cfg.name == "steady" {
-        let oldest = result["series"]
-            .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|row| row["oldest_bundle_age_s"].as_f64())
-                    .fold(0.0, f64::max)
-            })
-            .unwrap_or(0.0);
-        gates.add(
-            "G-j",
-            json!({ "oldest_bundle_age_s_max": oldest }),
-            "<= 600 s",
-            hold(oldest <= 600.0),
-        );
-        let merge_ms = |months: u64| -> Option<f64> {
-            result["forced_merges"]
-                .as_array()?
-                .iter()
-                .find(|row| row["months"] == months)
-                .and_then(|row| row["result"]["ms"].as_f64())
-        };
-        let extra_rss = result["series"]
-            .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|row| {
-                        let nodes = row["nodes"].as_array()?;
-                        let holder = nodes.iter().position(|node| node["holder"] == true)?;
-                        let others: Vec<f64> = nodes
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, _)| *i != holder)
-                            .filter_map(|(_, node)| node["rss_mib"].as_f64())
-                            .collect();
-                        Some(
-                            nodes[holder]["rss_mib"].as_f64()?
-                                - others.iter().sum::<f64>() / others.len().max(1) as f64,
-                        )
-                    })
-                    .fold(f64::MIN, f64::max)
-            })
-            .unwrap_or(f64::NAN);
-        let (m12, m24) = (merge_ms(12), merge_ms(24));
-        gates.add(
-            "G-i",
-            json!({ "pass_p99_ms": ns["pass_ms"]["p99"], "pass_gap_p99_ms": ns["pass_gap_ms"]["p99"], "base_merge_month12_ms": m12, "base_merge_month24_ms": m24,
-                    "compactor_rss_over_other_nodes_mib_max": extra_rss, "bytes_written": result["counters"]["bytes_written"], "bytes_read": result["counters"]["bytes_read"], "spills": result["counters"]["spills"],
-                    "bytes_per_hour": "see report" }),
-            "pass p99 <= 2 s; pass gap p99 <= 2P (10 s); month-12 merge <= 30 s; month-24 <= 60 s; compactor RSS <= 256 MiB; bytes per hour within 25 % (see report)",
-            hold(n(&ns["pass_ms"]["p99"]) <= 2000.0 && n(&ns["pass_gap_ms"]["p99"]) <= 10_000.0 && m12.is_some_and(|ms| ms <= 30_000.0) && m24.is_some_and(|ms| ms <= 60_000.0) && extra_rss <= 256.0).filter(|ok| !ok),
-        );
+    let load = super::gates::LoadCfg {
+        name: cfg.name.to_owned(),
+        registry: cfg.registry,
+        lookups: cfg.lookups > 0.0,
+        complete: cfg.registry && cfg.complete,
+        streams: cfg.name == "streams",
+        x4: cfg.name == "x4",
+        steady: cfg.name == "steady",
+        bases_expected: cfg
+            .generator
+            .is_some_and(|(_, shape)| shape == Shape::Bases),
+        nodes: cfg.nodes as u64,
+    };
+    for row in super::gates::load_rows(&load, result) {
+        gates.add(row.gate, row.measured, row.threshold, row.pass);
     }
 }
