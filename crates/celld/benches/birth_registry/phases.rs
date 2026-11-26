@@ -896,10 +896,16 @@ async fn deleted_records(rig: &Rig, cells: &[(String, String)]) -> Value {
     let statuses: Arc<Mutex<BTreeMap<String, u64>>> = Arc::default();
     // The first bodies of each status, cut to 300 bytes, to tell what produced it.
     let bodies: Arc<Mutex<BTreeMap<String, Vec<String>>>> = Arc::default();
+    let refused = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut tasks = Vec::new();
     for worker in 0..16 {
-        let (ep, queue, statuses, bodies) =
-            (ep.clone(), queue.clone(), statuses.clone(), bodies.clone());
+        let (ep, queue, statuses, bodies, refused) = (
+            ep.clone(),
+            queue.clone(),
+            statuses.clone(),
+            bodies.clone(),
+            refused.clone(),
+        );
         tasks.push(tokio::spawn(async move {
             let mut at = worker;
             loop {
@@ -910,9 +916,15 @@ async fn deleted_records(rig: &Rig, cells: &[(String, String)]) -> Value {
                 let url = format!("{}/agent/{name}", ep.public(at % ep.count()));
                 let (seen, body) = match ep.client.post(url).send().await {
                     Ok(response) => {
-                        let status = response.status().as_u16().to_string();
+                        let status = response.status().as_u16();
                         let text = response.text().await.unwrap_or_default();
-                        (status, text.chars().take(300).collect::<String>())
+                        if is_refusal(status, &text) {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                        }
+                        (
+                            status.to_string(),
+                            text.chars().take(300).collect::<String>(),
+                        )
                     }
                     Err(error) => ("connection_error".to_owned(), error.to_string()),
                 };
@@ -932,21 +944,20 @@ async fn deleted_records(rig: &Rig, cells: &[(String, String)]) -> Value {
     }
     let statuses = statuses.lock().unwrap().clone();
     let bodies = bodies.lock().unwrap().clone();
-    let unconfirmed = unconfirmed_refusals(&statuses);
+    let answered: u64 = statuses.values().sum();
+    // Everything that is not a refusal: a served claim, a connection error, or
+    // a status that is not the refusal.
+    let unconfirmed = answered - refused.load(Ordering::Relaxed);
     json!({ "cells": evicted.len(), "with_ltx": with_ltx, "deleted": deleted, "registry": check.json(),
             "statuses": statuses, "bodies": bodies, "unconfirmed_refusals": unconfirmed, "served_after_loss": unconfirmed })
 }
 
-/// The answers that are not a refusal until one is confirmed: every status but
-/// 503, and every connection error. A 2xx is a served claim, and any other
-/// status stays listed in the result and fails the check until it is shown to
-/// be the node's refusal.
-fn unconfirmed_refusals(statuses: &BTreeMap<String, u64>) -> u64 {
-    statuses
-        .iter()
-        .filter(|(status, _)| status.as_str() != "503")
-        .map(|(_, count)| count)
-        .sum()
+/// Whether a claim's answer is the node's refusal of a cell whose record is lost:
+/// a 503, or the 500 the router Worker gives when its call to the cell rejects
+/// with the routing verdict (`route failed: ResolveFailed`). Any other 500, a
+/// 2xx and a connection error are not refusals.
+fn is_refusal(status: u16, body: &str) -> bool {
+    status == 503 || (status == 500 && body.contains("route failed: ResolveFailed"))
 }
 
 /// How long the storage check waits between its two listings.
