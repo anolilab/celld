@@ -810,8 +810,9 @@ enum Declaration {
     /// Declared, but the member proved it holds the fragment and only its
     /// tail could not be read: never declared gone, and stays undecided.
     Held,
-    /// Declared, but its lease could not be read, so nothing proves it
-    /// expired: not applied, and the member stays undecided.
+    /// Declared, but its lease or its published boot address could not be
+    /// read, so nothing proves it expired or that it was asked where it now
+    /// listens: not applied, and the member stays undecided.
     Unproven,
     /// Declared, and the member is unreachable or holds no complete
     /// fragment: counted as absent.
@@ -819,12 +820,13 @@ enum Declaration {
 }
 
 /// A declaration applies only to a member that was probed first and gave no
-/// complete witness, and whose lease was read and is not live.
+/// complete witness, and whose lease and published boot address were both read
+/// and whose lease is not live. `unread` is true when either read failed.
 fn apply_declaration(
     declared: bool,
     witness: bool,
     lease_live: bool,
-    lease_unread: bool,
+    unread: bool,
     held_unread: bool,
 ) -> Declaration {
     if !declared {
@@ -833,7 +835,7 @@ fn apply_declaration(
         Declaration::Ignored
     } else if held_unread {
         Declaration::Held
-    } else if lease_unread {
+    } else if unread {
         Declaration::Unproven
     } else if lease_live {
         Declaration::Refused
@@ -6317,7 +6319,7 @@ impl NodeLogManager {
                     declared.contains(member),
                     fate.witness,
                     lease_live,
-                    lease.is_err(),
+                    lease.is_err() || candidates.read_failed,
                     fate.held_unread,
                 );
                 match declaration {
@@ -6339,8 +6341,9 @@ impl NodeLogManager {
                         dead,
                         member,
                         "NOT applying the operator's declaration that this member is gone \
-                         (CELLD_RECOVERY_GONE_MEMBERS): its lease could not be read, so \
-                         nothing proves it expired"
+                         (CELLD_RECOVERY_GONE_MEMBERS): its lease or its published boot \
+                         address could not be read, so nothing proves it expired or that \
+                         it was asked at its current address"
                     ),
                     Declaration::Refused => warn!(
                         dead,
@@ -9861,7 +9864,8 @@ mod boot_addr_recovery_tests {
             apply_declaration(false, false, false, false, false),
             Declaration::None
         );
-        // A lease that could not be read proves nothing: not applied.
+        // A lease or a published address that could not be read proves
+        // nothing: not applied.
         assert_eq!(
             apply_declaration(true, false, false, true, false),
             Declaration::Unproven
