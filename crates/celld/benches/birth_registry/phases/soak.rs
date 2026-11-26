@@ -105,28 +105,74 @@ fn log_events(rig: &Rig, needle: &str) -> u64 {
 async fn bring_up(rig: &mut Rig, index: usize) -> bool {
     for attempt in 1..=3 {
         rig.fleet.spawn_node(index);
-        // Not `Node::wait_ready`, which panics: a node that is slow to come up
-        // on a loaded host is tried again, and counted if it never does.
-        let public = rig.fleet.ep.public(index);
-        let deadline = Instant::now() + Duration::from_secs(150);
-        let mut ready = false;
-        while Instant::now() < deadline && !ready {
-            ready = true;
-            for path in ["/.well-known/celld/health", "/__ready"] {
-                let reply = rig.fleet.client.get(format!("{public}{path}")).send().await;
-                ready &= reply.is_ok_and(|reply| reply.status().is_success());
-            }
-            if !ready {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        }
-        if ready {
+        if await_ready(rig, index).await {
             return true;
         }
         say!("soak: node {index} was not ready (attempt {attempt}); starting it again");
         rig.fleet.nodes[index].kill();
     }
     false
+}
+
+/// Wait up to 150 s for node `index` to answer its health and Worker routes. Not
+/// `Node::wait_ready`, which panics: a node that is slow to come up on a loaded
+/// host is tried again, and counted if it never does.
+async fn await_ready(rig: &Rig, index: usize) -> bool {
+    let public = rig.fleet.ep.public(index);
+    let deadline = Instant::now() + Duration::from_secs(150);
+    while Instant::now() < deadline {
+        let mut ready = true;
+        for path in ["/.well-known/celld/health", "/__ready"] {
+            let reply = rig.fleet.client.get(format!("{public}{path}")).send().await;
+            ready &= reply.is_ok_and(|reply| reply.status().is_success());
+        }
+        if ready {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    false
+}
+
+/// Start every node, then wait for each: after a whole-fleet kill each node's
+/// recovery of its own log reads its followers' disks, so the peers have to be
+/// listening before any one of them can be ready.
+async fn bring_up_all(rig: &mut Rig) -> bool {
+    for attempt in 1..=2 {
+        for index in rig.nodes() {
+            rig.fleet.spawn_node(index);
+        }
+        let mut all = true;
+        for index in rig.nodes() {
+            all &= await_ready(rig, index).await;
+        }
+        if all {
+            return true;
+        }
+        say!("soak: the fleet was not ready (attempt {attempt}); starting it again");
+        for index in rig.nodes() {
+            rig.fleet.nodes[index].kill();
+        }
+    }
+    false
+}
+
+/// `count` keys no cell has, from a counter: what a lookup of a brand-new cell
+/// meets, which is the path a claim takes.
+fn absent_keys(count: usize, seed: u64) -> Vec<(String, Expect)> {
+    (0..count as u64)
+        .map(|n| {
+            let mut x = seed.wrapping_add(n).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut key = String::new();
+            for _ in 0..2 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                key.push_str(&format!("{x:016x}"));
+            }
+            (key, Expect::New)
+        })
+        .collect()
 }
 
 /// Give back the blocks the store's files freed, between rounds.
@@ -176,6 +222,10 @@ pub async fn soak() {
     let mut window_drill = (0_u64, 0_u64);
     let mut window_steady = (0_u64, 0_u64);
     let mut window_late = (0_u64, 0_u64);
+    // Lookups of keys no cell has, made in the quiet windows: how often they
+    // read `Unknown`, and why.
+    let (mut absent_new, mut absent_unknown, mut absent_total) = (0_u64, 0_u64, 0_u64);
+    let mut absent_doubts: BTreeMap<String, u64> = BTreeMap::new();
     let mut round = 0_u64;
     let mut stopped_for = None;
     let mut revived = 0_u64;
@@ -250,9 +300,7 @@ pub async fn soak() {
                     tally.retire(index);
                 }
                 tokio::time::sleep(Duration::from_secs(20)).await;
-                for index in rig.nodes() {
-                    all_up &= bring_up(&mut rig, index).await;
-                }
+                all_up &= bring_up_all(&mut rig).await;
             }
             "drain_holder" => {
                 let index = rig.fleet.holder().await.unwrap_or(0);
@@ -332,6 +380,19 @@ pub async fn soak() {
             let (answers, unknown) = answered_between(&previous, &now);
             quarters.push((answers, unknown));
             previous = now;
+            let probe = probe::check_keys(
+                &rig.fleet.ep,
+                absent_keys(300, round * 1000 + quarters.len() as u64),
+                16,
+                &rig.nodes(),
+            )
+            .await;
+            absent_new += probe.new;
+            absent_unknown += probe.unknown;
+            for (doubt, n) in &probe.doubts {
+                *absent_doubts.entry(doubt.clone()).or_default() += n;
+            }
+            absent_total += probe.total;
         }
         let totals_steady_to = previous;
         let (drill_answers, drill_unknown) =
@@ -423,6 +484,10 @@ pub async fn soak() {
         "births": births_summary,
         "rounds": round,
         "nodes_revived_after_halting_themselves": revived,
+        "absent_key_lookups_in_quiet_windows": {
+            "total": absent_total, "new": absent_new, "unknown": absent_unknown,
+            "unknown_pct": pct(absent_unknown, absent_total), "doubts": absent_doubts,
+        },
         "rounds_by_kind": drills.iter().fold(BTreeMap::<String, u64>::new(), |mut by, drill| {
             *by.entry(drill["kind"].as_str().unwrap_or("?").to_owned()).or_default() += 1;
             by
