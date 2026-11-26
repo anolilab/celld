@@ -72,8 +72,12 @@ fn units(result: &Value) -> Option<Value> {
     let spills = c("spills");
     let merges = c("base_merges");
     let windows = window / 10.0;
-    // A lookup's GETs are one root read, the run buckets and the deltas it read
-    // itself; the deltas the watch loop and the cover poll read are not in them.
+    // `gets` counts every GET a lookup made: one root read, the run buckets and
+    // the deltas it read itself. The lookup line of the cost is the root and the
+    // two run buckets (the table's 3); every delta GET, whoever made it, is
+    // priced once on the delta line from the proxy's tally of GETs on deltas.
+    // The deltas a lookup read are therefore taken out here, or they would be
+    // paid twice. The watch loop's and the cover poll's are not in `gets`.
     let lookup_run_gets = c("gets") - c("lookup_delta_loads") - lookups;
     // Root GETs beyond the one each lookup makes: the watch loop of every node.
     let watch_root_gets = (get("GET root") - lookups).max(0.0);
