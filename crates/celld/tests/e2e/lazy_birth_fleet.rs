@@ -22,7 +22,7 @@ use celld::bucket::Bucket;
 use futures_util::FutureExt as _;
 use serde_json::Value;
 
-use super::harness::{client, fixture_dir, signal_group, wait_until};
+use super::harness::{client, fixture_dir, run_id, signal_group, wait_until};
 
 const CELLD: &str = env!("CARGO_BIN_EXE_celld");
 const TOKEN: &str = "lazy-birth-fleet-token";
@@ -187,13 +187,7 @@ impl Fleet {
         };
         let store = std::env::var("AWS_ENDPOINT_URL").expect("AWS_ENDPOINT_URL names the store");
         let endpoint = node_endpoint.unwrap_or_else(|| store.clone());
-        let run = format!(
-            "lazy-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
+        let run = run_id("lazy");
         let spec = format!("{}/{run}", bucket.trim_end_matches('/'));
         let home = tempfile::TempDir::new().expect("create a temp dir");
         let deployed = Command::new(CELLD)

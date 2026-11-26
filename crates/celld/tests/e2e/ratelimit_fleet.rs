@@ -19,7 +19,7 @@ use celld::bucket::Bucket;
 use futures_util::FutureExt as _;
 use serde_json::Value;
 
-use super::harness::{client, fixture_dir, signal_group, until_next_window, wait_until};
+use super::harness::{client, fixture_dir, run_id, signal_group, until_next_window, wait_until};
 
 const CELLD: &str = env!("CARGO_BIN_EXE_celld");
 const TOKEN: &str = "ratelimit-fleet-token";
@@ -126,13 +126,7 @@ async fn two_nodes_share_one_counter() {
     };
     let endpoint = std::env::var("AWS_ENDPOINT_URL").expect("AWS_ENDPOINT_URL names the store");
     // A prefix of its own, so a run starts with no cells from an earlier one.
-    let run = format!(
-        "ratelimit-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let run = run_id("ratelimit");
     let prefix = run.clone();
     let spec = format!("{}/{run}", bucket.trim_end_matches('/'));
     let bucket = spec.clone();

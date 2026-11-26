@@ -180,7 +180,11 @@ async fn a_clone_of_an_oversized_facet_is_refused() {
 /// failing, and the copy holds only what the source had committed before it.
 #[tokio::test]
 async fn a_source_write_during_a_clone_succeeds() {
-    let server = Server::start("facets", &[]).await;
+    // The clone of a 14 MiB facet is one segment whose durability proof has a
+    // 10 s deadline by default; a debug build proves 28 MiB in 9 s on an idle
+    // machine, so under load the margin is gone. The variable exists for a
+    // busy store, and this test is a busy one.
+    let server = Server::start("facets", &[("CELLD_LTX_DURABILITY_TIMEOUT_SECS", "120")]).await;
     eprintln!(
         "clone of a small facet: {} ms",
         server.get_text("/clone-timed").await

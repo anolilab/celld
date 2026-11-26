@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use celld::bucket::Bucket;
 use futures_util::FutureExt as _;
 
-use super::harness::{client, fixture_dir, signal_group, wait_until};
+use super::harness::{client, fixture_dir, run_id, signal_group, wait_until};
 
 const CELLD: &str = env!("CARGO_BIN_EXE_celld");
 const TOKEN: &str = "node-log-fleet-token";
@@ -156,13 +156,7 @@ async fn a_killed_node_finishes_its_boot_recovery() {
         return;
     };
     let endpoint = std::env::var("AWS_ENDPOINT_URL").expect("AWS_ENDPOINT_URL names the store");
-    let run = format!(
-        "nodelog-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let run = run_id("nodelog");
     let spec = format!("{}/{run}", bucket.trim_end_matches('/'));
     let home = tempfile::TempDir::new().expect("create a temp dir");
     let deployed = Command::new(CELLD)

@@ -11212,7 +11212,11 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
       const connection = __ws_connect(this._id, scope, id, JSON.stringify(requested));
       __registerWaitUntil(connection);
       if (this._polled) this._startPump();
-      connection.then((protocol) => {
+      // Settled once the connection's outcome has been delivered. A refused
+      // connection reaches the host's pull queue as a close frame AND rejects
+      // `connection` with the reason; the pump must not report the bare close
+      // before the rejection has carried that reason to the caller.
+      this._connecting = connection.then((protocol) => {
         if (this.readyState === WebSocket.READY_STATE_CLOSING) {
           if (this._pendingClose) {
             const [code, reason] = this._pendingClose;
@@ -11265,6 +11269,12 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
         }
       } else {
         const info = JSON.parse(new TextDecoder().decode(body));
+        // A dial that fails also rejects `connection`, with the reason (an
+        // egress refusal, say). Let that reach the caller first; it closes
+        // the socket, and the bare close below is then a no-op.
+        if (this.readyState === WebSocket.READY_STATE_CONNECTING && this._connecting) {
+          await this._connecting;
+        }
         this._dispatchClose(info.code, info.reason, info.wasClean);
         return;
       }

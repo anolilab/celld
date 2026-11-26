@@ -871,3 +871,21 @@ impl CountingListener {
         self.hits.load(Ordering::SeqCst)
     }
 }
+
+/// A bucket prefix of one run's own: `<name>-<unix nanos>-<pid>-<counter>`.
+///
+/// The clock alone is not unique. Its resolution can be a microsecond, and
+/// tests that start together read it in the same one, so they shared a prefix,
+/// and their parallel `celld deploy` calls lost a race on the same pointer.
+pub fn run_id(name: &str) -> String {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is past the epoch")
+        .as_nanos();
+    format!(
+        "{name}-{nanos}-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    )
+}
