@@ -236,11 +236,18 @@ impl Session {
         if !self.is_established() || self.is_closed() {
             return None;
         }
-        let counter = self.issued.fetch_add(1, Ordering::SeqCst);
+        // A counter is taken only inside a counted chunk, so a refused mint uses
+        // nothing up and the loop that counts the next chunk is asked at once.
         let counted = self.counted.load(Ordering::SeqCst);
-        if counted != u64::MAX && counter / CHUNK >= counted {
+        let Ok(counter) = self
+            .issued
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |issued| {
+                (counted == u64::MAX || issued / CHUNK < counted).then_some(issued + 1)
+            })
+        else {
+            self.nudge.notify_one();
             return None;
-        }
+        };
         let block = encrypt_counter(&self.counter_key, counter);
         Some(tagged_object_id(key, self.tag, block))
     }
@@ -1531,6 +1538,64 @@ mod tests {
                 .unwrap());
         }
 
+        /// A re-tag changes `by` and nothing else: the nonce and the nonces it
+        /// replaced of a first-form record stay, so a reader keeps applying the
+        /// nonce check to it.
+        #[tokio::test]
+        async fn a_retag_keeps_the_nonce_and_the_replaced_nonces_of_a_first_form_record() {
+            let world = world();
+            let record = serde_json::json!({
+                "node": NODE, "epoch": 5, "by": "old",
+                "nonce": "n2", "over": ["n0", "n1"],
+            });
+            world
+                .bucket
+                .put_cas(
+                    "cells/c/own.json",
+                    serde_json::to_vec(&record).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap()
+                .expect("a new record");
+            assert!(world
+                .ownership
+                .retag_owner("c", 5, "old", "new")
+                .await
+                .unwrap());
+            let (bytes, _) = world.bucket.get("cells/c/own.json").await.unwrap().unwrap();
+            let after: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                after,
+                serde_json::json!({
+                    "node": NODE, "epoch": 5, "by": "new",
+                    "nonce": "n2", "over": ["n0", "n1"],
+                })
+            );
+            // A leave-form record keeps its leave nonce the same way.
+            let leave = serde_json::json!({
+                "node": NODE, "epoch": 1, "by": "old", "leave": "l1",
+            });
+            world
+                .bucket
+                .put_cas(
+                    "cells/d/own.json",
+                    serde_json::to_vec(&leave).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap()
+                .expect("a new record");
+            assert!(world
+                .ownership
+                .retag_owner("d", 1, "old", "new")
+                .await
+                .unwrap());
+            let (bytes, _) = world.bucket.get("cells/d/own.json").await.unwrap().unwrap();
+            let after: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(after["leave"], "l1");
+        }
+
         #[tokio::test]
         async fn retag_owner_waits_for_the_gate_hold() {
             crate::asyncrt::install_test_host_runtime();
@@ -1722,7 +1787,11 @@ mod tests {
         for _ in 0..CHUNK {
             assert!(session.mint(&key()).is_some());
         }
-        assert!(session.mint(&key()).is_none(), "chunk 1 is not counted");
+        for _ in 0..10 {
+            assert!(session.mint(&key()).is_none(), "chunk 1 is not counted");
+        }
+        // A refused mint used no counter: the next id is the next counter.
+        assert_eq!(session.issued.load(Ordering::SeqCst), CHUNK);
         session.counted.store(2, Ordering::SeqCst);
         assert!(session.mint(&key()).is_some());
         session.closed.store(true, Ordering::SeqCst);
@@ -2000,6 +2069,20 @@ mod tests {
             .unwrap();
         assert!(session.seal(&bucket).await.is_err());
         assert!(!session.sealed_with_bits.load(Ordering::SeqCst));
+    }
+
+    /// A refused mint asks the loop that counts chunks to run at once.
+    #[tokio::test]
+    async fn a_refused_mint_asks_for_the_next_chunk_and_takes_no_counter() {
+        let session = Session::with_tag(Mode::Shadow, [2; 8], &[]);
+        session.counted.store(1, Ordering::SeqCst);
+        session.established.store(true, Ordering::SeqCst);
+        session.issued.store(CHUNK, Ordering::SeqCst);
+        assert!(session.mint(&key()).is_none());
+        crate::asyncrt::timeout(std::time::Duration::from_secs(1), session.nudged())
+            .await
+            .expect("the refusal nudged the checkpoint loop");
+        assert_eq!(session.issued.load(Ordering::SeqCst), CHUNK);
     }
 
     #[tokio::test]

@@ -57,6 +57,9 @@ struct OwnerWire<'a> {
     nonce: Option<&'a str>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     over: &'a [String],
+    /// A leave-form record: the nonce the session announced before it wrote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leave: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -1428,6 +1431,7 @@ impl BucketOwnership {
             by: by.as_deref(),
             nonce: None,
             over: &[],
+            leave: None,
         })?;
         match self.bucket.put_cas(&key, body, Some(&current.etag)).await? {
             Some(_) => Ok(CasOutcome::Applied),
@@ -1460,18 +1464,21 @@ impl BucketOwnership {
                 && record.by.as_deref() == Some(by)
         };
         let reader = RecordReader::Retag { epoch };
-        let Some(current) = self.resolve_owner(cell, reader).await? else {
+        let Some((current, form)) = self.resolve_owner_form(cell, reader).await? else {
             return Ok(false);
         };
         if !names(&current, from) {
             return Ok(false);
         }
+        // Only `by` changes: the nonce and the nonces it replaced, or the leave
+        // nonce, stay, so a reader still judges the record as the form it is.
         let body = serde_json::to_vec(&OwnerWire {
             node: &self.node,
             epoch,
             by: Some(to),
-            nonce: None,
-            over: &[],
+            nonce: form.nonce.as_deref(),
+            over: &form.over,
+            leave: form.leave.as_deref(),
         })?;
         match self.bucket.put_cas(&key, body, Some(&current.etag)).await {
             Ok(applied) => Ok(applied.is_some()),
@@ -1761,6 +1768,7 @@ impl BucketOwnership {
             by: by.as_deref(),
             nonce: plan.as_ref().map(|plan| plan.nonce.as_str()),
             over: plan.as_ref().map_or(&[], |plan| plan.over.as_slice()),
+            leave: None,
         })?;
         let etag = match &guard {
             CasGuard::Absent => None,
@@ -2186,6 +2194,7 @@ mod session_wire_tests {
             by: None,
             nonce: None,
             over: &[],
+            leave: None,
         })
         .unwrap();
         assert_eq!(body, br#"{"node":"n1","epoch":7}"#);
@@ -2195,6 +2204,7 @@ mod session_wire_tests {
             by: Some("ab"),
             nonce: None,
             over: &[],
+            leave: None,
         })
         .unwrap();
         assert_eq!(body, br#"{"node":"n1","epoch":7,"by":"ab"}"#);
