@@ -264,10 +264,11 @@ impl Fleet {
         None
     }
 
-    fn rss_by_node_mib(&self) -> Vec<f64> {
+    /// Each node's resident set in MiB; null for a node that could not be read.
+    fn rss_by_node_mib(&self) -> Vec<Option<f64>> {
         self.nodes
             .iter()
-            .map(|node| rss_kib(&[node.pid()]).unwrap_or(0) as f64 / 1024.0)
+            .map(|node| rss_kib(&[node.pid()]).ok().map(|kib| kib as f64 / 1024.0))
             .collect()
     }
 

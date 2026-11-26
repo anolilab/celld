@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use super::faults::wait_covered;
 use super::{total, Rig};
+use crate::gates;
 use crate::gen::{hex, key_in, put_segment};
 use crate::probe::{self, Expect, Gates};
 use crate::{env_f64, env_text, record};
@@ -110,6 +111,7 @@ pub async fn race() {
         let mut misses = Vec::new();
         let mut partition_checks = Vec::new();
         let mut timings = Vec::new();
+        let mut invalid_rounds = 0_usize;
         for round in 0..rounds {
             let began = Instant::now();
             let keys: Vec<_> = (0..100)
@@ -131,7 +133,6 @@ pub async fn race() {
                 keys.iter().map(|key| Record::birth(*key, 1)).collect(),
             )
             .await;
-            registered.extend(keys.iter().map(hex));
             holder_post(&rig, "/__registry/force", json!({ "job": "pass" })).await;
             let covered = wait_covered(
                 &rig,
@@ -139,6 +140,14 @@ pub async fn race() {
                 Duration::from_secs(60),
             )
             .await;
+            if covered.is_none() {
+                // The race needs the segment folded first; a round that timed out
+                // is not a round of the race and is left out of the counts.
+                say!("race mode {mode} round {round}: not covered in 60 s, round skipped");
+                invalid_rounds += 1;
+                continue;
+            }
+            registered.extend(keys.iter().map(hex));
             let done_before = done_jobs(&rig).await;
             if mode == 2 {
                 hold(&rig, "commit", true).await;
@@ -259,7 +268,7 @@ pub async fn race() {
             v.get(v.len() / 2).copied()
         };
         modes.push(json!({
-            "mode": mode, "rounds": rounds, "registered": registered.len(), "round_misses": misses, "final_check": final_check.json(),
+            "mode": mode, "rounds": rounds, "valid_rounds": rounds - invalid_rounds, "invalid_rounds": invalid_rounds, "registered": registered.len(), "round_misses": misses, "final_check": final_check.json(),
             "partition_checks": partition_checks, "records_equal_distinct_keys": equal, "merges_discarded": discarded,
             "merge_check_failures": total(&after, "merge_check_failures"),
             "round_ms_median": round_median,
@@ -269,32 +278,8 @@ pub async fn race() {
             hold(&rig, "schedule", false).await;
         }
     }
-    // Both modes ran, each with rounds and a final check over some keys.
-    let ran = modes.len() == 2
-        && rounds > 0
-        && modes.iter().all(|m| {
-            m["final_check"]["total"]
-                .as_u64()
-                .is_some_and(|total| total > 0)
-                && m["final_check"]["misses"].is_u64()
-        });
-    let lost: u64 = modes
-        .iter()
-        .map(|m| {
-            m["round_misses"].as_array().map_or(0, |a| a.len() as u64)
-                + m["final_check"]["misses"].as_u64().unwrap_or(0)
-        })
-        .sum();
-    let equal = modes
-        .iter()
-        .all(|m| m["records_equal_distinct_keys"] == true);
-    let discarded2 = modes.get(1).and_then(|m| m["merges_discarded"].as_u64());
-    gates.add(
-        "G-q",
-        json!({ "keys_not_reading_exists": lost, "record_count_equals_distinct_keys": equal, "mode2_merges_discarded": discarded2, "rounds_per_mode": rounds, "modes_run": modes.len() }),
-        "0; equal; >= 190 of 200 discarded in mode 2 (the race happened); both modes ran over some keys",
-        Some(ran && lost == 0 && equal && discarded2.is_some_and(|d| d as f64 >= rounds as f64 * 0.95)),
-    );
+    let row = gates::race_row(&modes, rounds);
+    gates.add(row.gate, row.measured, row.threshold, row.pass);
     record("race", json!({ "modes": modes, "gates": gates.json() }));
     rig.fleet.save_logs("race");
 }

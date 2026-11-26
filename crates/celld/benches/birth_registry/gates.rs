@@ -149,9 +149,15 @@ pub fn load_rows(cfg: &LoadCfg, result: &Value) -> Vec<Row> {
         }
         rows.push(row(
             "G-b",
-            json!({ "unknown_pct": lookups["unknown_pct"], "unknown": lookups["unknown"], "of": lookups["answered"], "failed": lookups["failed"] }),
-            "< 0.5 % of the answered lookups; no failed lookup; at least one answered",
-            all(&[complete, some(&lookups["answered"]), lt(&lookups["unknown_pct"], 0.5)]),
+            json!({ "unknown_pct": lookups["unknown_pct"], "unknown": lookups["unknown"], "wrong": lookups["wrong"],
+                    "of": lookups["answered"], "failed": lookups["failed"] }),
+            "< 0.5 % of the answered lookups; no wrong answer; no failed lookup; at least one answered",
+            all(&[
+                complete,
+                some(&lookups["answered"]),
+                zero(&lookups["wrong"]),
+                lt(&lookups["unknown_pct"], 0.5),
+            ]),
         ));
     }
     // G-d: claims were made and measured, none stayed uncovered, and the third
@@ -544,6 +550,115 @@ pub fn gather_row(rows: &[Value]) -> Row {
             waits.map(|count| count == 0),
         ]),
     )
+}
+
+/// G-n: the same keys asked before and after the fleet's disks were wiped and
+/// it restarted. Both rounds must have answered every key (`exists:..` or
+/// `new:..`, not `failed` or `unknown`), and the answers must be identical:
+/// two rounds that failed the same way are not "identical".
+pub fn restart_row(keys: usize, before: &[String], after: &[String]) -> Row {
+    let usable = |answers: &[String]| {
+        answers
+            .iter()
+            .filter(|answer| answer.starts_with("exists:") || answer.starts_with("new:"))
+            .count()
+    };
+    let different = before.iter().zip(after).filter(|(a, b)| a != b).count();
+    let unknown_after = after
+        .iter()
+        .filter(|answer| answer.starts_with("unknown"))
+        .count();
+    row(
+        "G-n",
+        json!({ "keys": keys, "answered_before": usable(before), "answered_after": usable(after),
+                "different": different, "unknown_after": unknown_after }),
+        "identical, every key answered in both rounds, 0 unknown after",
+        Some(
+            keys > 0
+                && before.len() == keys
+                && after.len() == keys
+                && usable(before) == keys
+                && usable(after) == keys
+                && different == 0
+                && unknown_after == 0,
+        ),
+    )
+}
+
+/// G-q: both modes ran, each with at least 95 % of its rounds valid (the
+/// segment was covered before the race began) and a final check over some keys;
+/// no key lost; the record count equals the distinct keys; and in mode 2 the
+/// race happened (95 % of the valid rounds discarded a merge).
+pub fn race_row(modes: &[Value], rounds: usize) -> Row {
+    let valid = |mode: &Value| mode["valid_rounds"].as_u64();
+    let needed = (rounds as f64 * 0.95).ceil() as u64;
+    let ran = modes.len() == 2
+        && rounds > 0
+        && modes.iter().all(|mode| {
+            mode["final_check"]["total"]
+                .as_u64()
+                .is_some_and(|total| total > 0)
+                && mode["final_check"]["misses"].is_u64()
+                && valid(mode).is_some_and(|valid| valid >= needed)
+        });
+    let lost: u64 = modes
+        .iter()
+        .map(|mode| {
+            mode["round_misses"]
+                .as_array()
+                .map_or(0, |misses| misses.len() as u64)
+                + mode["final_check"]["misses"].as_u64().unwrap_or(0)
+        })
+        .sum();
+    let equal = !modes.is_empty()
+        && modes
+            .iter()
+            .all(|mode| mode["records_equal_distinct_keys"] == true);
+    let discarded2 = modes
+        .get(1)
+        .and_then(|mode| mode["merges_discarded"].as_u64());
+    let valid2 = modes.get(1).and_then(valid);
+    row(
+        "G-q",
+        json!({ "keys_not_reading_exists": lost, "record_count_equals_distinct_keys": equal,
+                "mode2_merges_discarded": discarded2, "valid_rounds": modes.iter().map(valid).collect::<Vec<_>>(),
+                "rounds_per_mode": rounds, "modes_run": modes.len() }),
+        "0; equal; >= 95 % of the rounds valid in each mode; >= 95 % of the valid rounds discarded in mode 2 (the race happened)",
+        Some(
+            ran && lost == 0
+                && equal
+                && discarded2.zip(valid2).is_some_and(|(discarded, valid)| discarded as f64 >= valid as f64 * 0.95),
+        ),
+    )
+}
+
+/// The mean resident set in MiB over the series points between `from` and `to`
+/// seconds. A point counts the nodes that reported a value (a failed read is
+/// null) and is skipped when none did; `None` when no point is left.
+pub fn mean_rss_mib(series: &Value, from: u64, to: u64) -> Option<f64> {
+    let mut points = Vec::new();
+    for point in series.as_array()? {
+        let at = point["at_s"].as_u64()?;
+        if at < from || at > to {
+            continue;
+        }
+        let values: Vec<f64> = point["nodes"]
+            .as_array()?
+            .iter()
+            .filter_map(|node| node["rss_mib"].as_f64())
+            .collect();
+        if !values.is_empty() {
+            points.push(values.iter().sum::<f64>() / values.len() as f64);
+        }
+    }
+    (!points.is_empty()).then(|| points.iter().sum::<f64>() / points.len() as f64)
+}
+
+/// The first error among store results, or `None` when every one is `Ok`.
+pub fn first_error<T, E: std::fmt::Display>(results: &[Result<T, E>]) -> Option<String> {
+    results
+        .iter()
+        .find_map(|result| result.as_ref().err().map(ToString::to_string))
 }
 
 /// One of the phases' end checks of the aged registry (`G-o` outside a load
@@ -1016,5 +1131,105 @@ mod selftest {
         let mut none = [0_u64; 32];
         add_buckets(&mut none, &json!([1, 2, 3]));
         assert_eq!(none, [0; 32]);
+    }
+
+    #[test]
+    fn a_wrong_lookup_answer_fails_the_load_gate() {
+        let lookups = |wrong: u64| {
+            json!({ "complete": true, "total": 1000, "answered": 1000, "failed": 0, "unknown_pct": 0.0, "unknown": 0,
+                    "wrong": wrong, "gets_mean": 3.0, "bytes_mean": 8000.0, "node_p99_ms": 10.0 })
+        };
+        let cfg = LoadCfg {
+            name: "steady".into(),
+            registry: true,
+            lookups: true,
+            nodes: 3,
+            ..LoadCfg::default()
+        };
+        let gate_b = |wrong: u64| {
+            load_rows(&cfg, &json!({ "lookups": lookups(wrong) }))
+                .into_iter()
+                .find(|row| row.gate == "G-b")
+                .expect("G-b")
+                .pass
+        };
+        assert_eq!(gate_b(0), Some(true));
+        assert_eq!(gate_b(1), Some(false));
+        let mut missing = lookups(0);
+        missing.as_object_mut().unwrap().remove("wrong");
+        let row = load_rows(&cfg, &json!({ "lookups": missing }))
+            .into_iter()
+            .find(|row| row.gate == "G-b")
+            .unwrap();
+        assert_ne!(row.pass, Some(true));
+    }
+
+    #[test]
+    fn two_restart_rounds_that_failed_alike_are_not_identical() {
+        let ok = |n: usize| vec!["exists:false".to_owned(); n];
+        assert_eq!(restart_row(3, &ok(3), &ok(3)).pass, Some(true));
+        let failed = vec!["failed".to_owned(); 3];
+        assert_eq!(restart_row(3, &failed, &failed).pass, Some(false));
+        assert_eq!(restart_row(3, &ok(3), &failed).pass, Some(false));
+        let unknown = vec!["unknown:null".to_owned(); 3];
+        assert_eq!(restart_row(3, &unknown, &unknown).pass, Some(false));
+        assert_eq!(restart_row(0, &[], &[]).pass, Some(false));
+        assert_eq!(restart_row(3, &ok(2), &ok(3)).pass, Some(false));
+    }
+
+    #[test]
+    fn a_race_whose_rounds_timed_out_before_the_race_is_not_a_pass() {
+        let mode = |valid: u64, discarded: u64| {
+            json!({ "valid_rounds": valid, "final_check": { "total": 500, "misses": 0 }, "round_misses": [],
+                    "records_equal_distinct_keys": true, "merges_discarded": discarded })
+        };
+        assert_eq!(
+            race_row(&[mode(200, 0), mode(200, 200)], 200).pass,
+            Some(true)
+        );
+        // A mode whose rounds mostly timed out waiting for coverage.
+        assert_eq!(
+            race_row(&[mode(10, 0), mode(200, 200)], 200).pass,
+            Some(false)
+        );
+        assert_eq!(
+            race_row(&[mode(200, 0), mode(40, 40)], 200).pass,
+            Some(false)
+        );
+        // The race did not happen in mode 2.
+        assert_eq!(
+            race_row(&[mode(200, 0), mode(200, 50)], 200).pass,
+            Some(false)
+        );
+        for modes in [vec![], vec![mode(200, 0)], vec![json!({}), json!({})]] {
+            assert_ne!(race_row(&modes, 200).pass, Some(true));
+        }
+    }
+
+    #[test]
+    fn a_failed_memory_read_is_missing_and_not_zero_megabytes() {
+        let point = |at: u64, nodes: &[Option<f64>]| json!({ "at_s": at, "nodes": nodes.iter().map(|rss| json!({ "rss_mib": rss })).collect::<Vec<_>>() });
+        // One node of three failed to read: the mean is over the two that did.
+        let series = json!([point(400, &[Some(100.0), None, Some(120.0)])]);
+        assert_eq!(mean_rss_mib(&series, 300, 600), Some(110.0));
+        // A point with no value is skipped, and no point at all is None.
+        let none = json!([point(400, &[None, None])]);
+        assert_eq!(mean_rss_mib(&none, 300, 600), None);
+        assert_eq!(mean_rss_mib(&json!([]), 300, 600), None);
+        assert_eq!(
+            mean_rss_mib(&json!([point(100, &[Some(1.0)])]), 300, 600),
+            None
+        );
+        // The holder's excess needs the others' values too.
+        let holder = json!([{ "at_s": 1, "nodes": [{ "holder": true, "rss_mib": 200.0 }, { "rss_mib": null }, { "rss_mib": null }] }]);
+        assert_eq!(holder_extra_rss(&holder), None);
+    }
+
+    #[test]
+    fn the_first_store_error_is_found() {
+        let ok: Vec<Result<u32, String>> = vec![Ok(1), Ok(2)];
+        assert_eq!(first_error(&ok), None);
+        let bad: Vec<Result<u32, String>> = vec![Ok(1), Err("list failed".into())];
+        assert_eq!(first_error(&bad).as_deref(), Some("list failed"));
     }
 }

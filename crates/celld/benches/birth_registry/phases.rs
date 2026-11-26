@@ -176,7 +176,10 @@ impl Rig {
         let mut nodes = Vec::new();
         for index in 0..self.fleet.nodes.len() {
             let state = self.fleet.registry_state(index).await;
-            let rss = super::rss_kib(&[self.fleet.nodes[index].pid()]).unwrap_or(0) as f64 / 1024.0;
+            // A failed read is null, not 0 MiB.
+            let rss = super::rss_kib(&[self.fleet.nodes[index].pid()])
+                .ok()
+                .map(|kib| kib as f64 / 1024.0);
             nodes.push(json!({
                 "rss_mib": rss,
                 "holder": state.as_ref().map(|s| s["holder"].clone()),
@@ -706,7 +709,7 @@ async fn load_phase(cfg: Cfg) {
             "jobs": samples.iter().flat_map(|node| node["job_ms"].as_array().cloned().unwrap_or_default()).collect::<Vec<_>>(),
             "waits": samples.iter().flat_map(|node| node["waits"].as_array().cloned().unwrap_or_default()).collect::<Vec<_>>(),
             // Claimed cells no root named after 20 s, from the nodes' queues at read time.
-            "uncovered_over_20s": samples.iter().map(|node| node["uncovered_over_20s"].as_u64().unwrap_or(0)).sum::<u64>(),
+            "uncovered_over_20s": samples.iter().map(|node| node["uncovered_over_20s"].as_u64()).sum::<Option<u64>>(),
         },
         "guard": guard,
         "counters": counters,
