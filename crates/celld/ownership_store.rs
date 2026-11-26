@@ -1418,12 +1418,7 @@ impl BucketOwnership {
             } else {
                 Ok(())
             };
-            match trace {
-                Err(error) if !session.fails_closed() => {
-                    crate::session::note_shadow_failure("release_trace", &error);
-                }
-                result => result?,
-            }
+            crate::session::tolerate(session, "release_trace", trace)?;
         }
         let key = format!("cells/{cell}/own.json");
         let by = crate::session::current().map(|session| session.tag());
@@ -1605,13 +1600,8 @@ impl BucketOwnership {
         let Some(counter) = session.own_counter_of_scope(cell) else {
             return Ok(());
         };
-        match self.grant_or_waive(session, cell, counter).await {
-            Err(error) if !session.fails_closed() => {
-                crate::session::note_shadow_failure("grant", &error);
-                Ok(())
-            }
-            result => result,
-        }
+        let granted = self.grant_or_waive(session, cell, counter).await;
+        crate::session::tolerate(session, "grant", granted)
     }
 
     async fn grant_or_waive(
@@ -2365,12 +2355,12 @@ mod grant_tests {
         .await;
         let session = Session::with_tag(Mode::Shadow, [3; 8], &[]);
         let scope = scope_of(&session, 0);
-        let began = std::time::Instant::now();
+        let began = crate::asyncrt::mono_ms();
         ownership
             .after_first_record(&session, &scope)
             .await
             .expect("a failing grant does not fail a request in shadow");
-        assert!(began.elapsed() < std::time::Duration::from_secs(3));
+        assert!(crate::asyncrt::mono_ms() - began < 3_000);
         assert!(!session.is_pending_scope(&scope), "never wedged");
         assert!(session.is_granted(0), "the grant stays recorded");
     }

@@ -231,6 +231,22 @@ impl Fleet {
         })
     }
 
+    /// Kill every node and start all of them again at once, as an orchestrator
+    /// does after a whole-fleet stop, and wait for each to be ready.
+    pub async fn restart_all(&mut self, env: &[(&str, &str)]) {
+        for node in &mut self.nodes {
+            node.kill();
+        }
+        let count = self.nodes.len();
+        for index in 0..count {
+            self.nodes[index] =
+                Node::spawn(self.home.path(), index, &self.spec, &self.endpoint, env);
+        }
+        for node in &self.nodes {
+            node.wait_ready(&self.client).await;
+        }
+    }
+
     /// Replace node `index` by a new process on the same directory.
     pub async fn respawn(&mut self, index: usize, env: &[(&str, &str)]) {
         self.nodes[index].kill();
@@ -634,13 +650,12 @@ async fn the_bundle_of_a_granted_cell_carries_its_mark() {
     .await;
 }
 
-/// A request that gives up before the fleet proof of its `Grant` fails with an
-/// error that may be retried, the cell does not activate, and the grant is
-/// pending: the id is granted (its bit is set at the append), it never takes the
-/// standard path in its session, and every later request for it fails the same
-/// way, also when the proof comes late.
+/// In `shadow` nothing rests on a grant: a request that gives up waiting for the
+/// fleet proof of its `Grant` does not fail, the cell is not left pending, and
+/// every later request for it is answered. The failure is logged and the id is
+/// still granted in the chunk.
 #[tokio::test]
-async fn a_grant_without_a_timely_proof_is_pending_and_never_waived() {
+async fn a_grant_without_a_timely_proof_does_not_fail_or_wedge_a_request_in_shadow() {
     let env: &[(&str, &str)] = &[
         ("CELLD_LAZY_BIRTH", "shadow"),
         ("CELLD_TEST_TAGGED_IDS", "1"),
@@ -660,14 +675,17 @@ async fn a_grant_without_a_timely_proof_is_pending_and_never_waived() {
             .await
             .expect("the header");
         let counter = counter_of(&header, &id);
-        assert!(
-            fleet.get_json(0, &format!("/bump?id={id}")).await.is_none(),
-            "the request gave up before a proof"
-        );
-        // The proof comes late and changes nothing: the cell stays refused.
+        let answered = fleet.get_json(0, &format!("/bump?id={id}")).await;
+        assert_eq!(answered.expect("the request is answered")["n"], 1);
         tokio::time::sleep(Duration::from_secs(3)).await;
-        assert!(fleet.get_json(0, &format!("/bump?id={id}")).await.is_none());
-        assert!(fleet.nodes[0].log().contains("pending_grant"));
+        assert_eq!(
+            fleet
+                .get_json(0, &format!("/bump?id={id}"))
+                .await
+                .expect("not wedged")["n"],
+            2
+        );
+        assert!(fleet.nodes[0].log().contains("shadow_failure"));
         // The record exists and the id is granted in the chunk.
         let records: Vec<_> = fleet
             .keys("cells/")
@@ -1016,52 +1034,61 @@ async fn bundles(fleet: &Fleet) -> usize {
 }
 
 /// S10. The bucket refuses every request for 60 s while a node grants ids (every
-/// node halts when its lease cannot be renewed); then the fleet is started again. Meanwhile no object of a cell and no release is written
-/// (so the bundles that carry the marks stay), and afterwards every id that was
-/// acknowledged is in the sealed chunk of its session, and the retained bundles
-/// are back to the count of an idle fleet within two minutes.
+/// node halts when its lease cannot be renewed); then the fleet is started again
+/// at once. The bits live only in marks (the checkpoint is an hour away), and the
+/// cut falls right after the record of a grant applied, so the acknowledged grant
+/// has its proof only in the followers' tails. Meanwhile no object of a cell is
+/// written, and afterwards no loss is declared, every acknowledged id is in the
+/// sealed chunk of its session, and the retained bundles are back to an idle
+/// count within two minutes.
 #[tokio::test]
 async fn s10_a_bucket_that_refuses_for_a_minute_loses_no_acknowledged_grant() {
+    const MARKS_ONLY: &[(&str, &str)] = &[
+        ("CELLD_LAZY_BIRTH", "shadow"),
+        ("CELLD_TEST_TAGGED_IDS", "1"),
+        ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "3600000"),
+    ];
     let Ok(upstream) = std::env::var("AWS_ENDPOINT_URL") else {
         eprintln!("skipped: AWS_ENDPOINT_URL is not set");
         return;
     };
     let proxy = Refusing::start(&upstream).await;
     let Some(mut fleet) =
-        Fleet::start_each_at("do-ids", &[SHADOW; 3], Some(proxy.url.clone())).await
+        Fleet::start_each_at("do-ids", &[MARKS_ONLY; 3], Some(proxy.url.clone())).await
     else {
         return;
     };
     let body = async {
         wait_for_ensemble(&fleet).await;
-        // Agents are made until the cut, and the cut falls in the middle of the
-        // stream.
+        // Agents are made one after the other, and the bucket is cut the moment
+        // the last one is acknowledged: each has its record, and its mark was
+        // proven by the followers, and nothing else holds its grant. The
+        // checkpoint is an hour away.
         let mut acknowledged: Vec<String> = Vec::new();
-        let began = Instant::now();
-        let mut refusing = false;
-        let mut cut_at = None;
-        while cut_at.is_none_or(|at: Instant| at.elapsed() < Duration::from_secs(60)) {
-            if !refusing && began.elapsed() > Duration::from_secs(8) {
-                proxy.refuse(true);
-                refusing = true;
-                cut_at = Some(Instant::now());
-            }
-            if let Some(out) = fleet.get_json(0, "/spawn?n=1").await {
-                acknowledged.extend(
-                    out["ids"]
-                        .as_array()
-                        .expect("ids")
-                        .iter()
-                        .map(|id| id.as_str().expect("an id").to_string()),
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
+        for _ in 0..5 {
+            let spawned = fleet
+                .get_json(0, "/spawn?n=1")
+                .await
+                .expect("the agent is acknowledged");
+            acknowledged.extend(
+                spawned["ids"]
+                    .as_array()
+                    .expect("ids")
+                    .iter()
+                    .map(|id| id.as_str().expect("an id").to_string()),
+            );
         }
-        assert!(!acknowledged.is_empty(), "an agent was acknowledged");
+        proxy.refuse(true);
+        let cut_at = Instant::now();
+        assert_eq!(acknowledged.len(), 5);
+        tokio::time::sleep(Duration::from_secs(60).saturating_sub(cut_at.elapsed())).await;
+        // No object of a cell was written while the bucket refused, and no
+        // record was released.
         let cells = fleet.keys("cells/").await;
-        // A per-cell object is written only for what the bucket accepted before
-        // the cut, and nothing is released while it refuses: no record names no
-        // node.
+        assert!(
+            cells.iter().all(|key| !key.contains("/ltx/")),
+            "an object of a cell was written: {cells:?}"
+        );
         for key in cells.iter().filter(|key| key.ends_with("/own.json")) {
             let record = fleet.object(key).await.expect("a record");
             assert_ne!(
@@ -1069,26 +1096,23 @@ async fn s10_a_bucket_that_refuses_for_a_minute_loses_no_acknowledged_grant() {
                 "released while the bucket refused: {key}"
             );
         }
-        assert!(
-            bundles(&fleet).await >= 1,
-            "the bundles that carry the marks are kept"
-        );
-        // A node that cannot renew its lease halts; an orchestrator starts the
-        // fleet again once the store is back, and each start seals the session
-        // of its predecessor.
-        for node in &mut fleet.nodes {
-            node.kill();
-        }
+        // A node that cannot renew its lease halts. An orchestrator starts the
+        // fleet again, all nodes at once, once the store is back.
         proxy.refuse(false);
-        for index in 0..3 {
-            fleet.respawn(index, SHADOW).await;
-        }
+        fleet.restart_all(MARKS_ONLY).await;
         let tag = acknowledged[0][..16].to_string();
         let header = wait_until("the seal", Duration::from_secs(120), || async {
             let header = fleet.object(&format!("fleet/sessions/{tag}.json")).await?;
             (header["state"] == "sealed").then_some(header)
         })
         .await;
+        let losses: Vec<String> = fleet
+            .keys("log/")
+            .await
+            .into_iter()
+            .filter(|key| key.ends_with(".loss.json"))
+            .collect();
+        assert!(losses.is_empty(), "a loss was declared: {losses:?}");
         let chunk = fleet
             .object(&format!("fleet/sessions/{tag}/c/0"))
             .await
@@ -1103,7 +1127,7 @@ async fn s10_a_bucket_that_refuses_for_a_minute_loses_no_acknowledged_grant() {
         for id in &acknowledged {
             assert!(
                 granted.contains(&counter_of(&header, id)),
-                "an acknowledged grant is not in the sealed chunk: {id}"
+                "an acknowledged grant is not in the sealed chunk: {id} {chunk}"
             );
         }
         // The count of an idle fleet (the retained bundles of a quiet run).
@@ -1121,7 +1145,7 @@ async fn s10_a_bucket_that_refuses_for_a_minute_loses_no_acknowledged_grant() {
             let tail: Vec<&str> = log
                 .lines()
                 .filter(|line| {
-                    ["FENCE", "seal", "recover", "session", "lease"]
+                    ["FENCE", "seal", "recover", "session", "loss", "declared"]
                         .iter()
                         .any(|word| line.contains(word))
                 })

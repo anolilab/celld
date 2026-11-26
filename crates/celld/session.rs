@@ -408,6 +408,22 @@ pub(crate) fn note_shadow_failure(kind: &'static str, error: &dyn std::fmt::Disp
     );
 }
 
+/// The result of a step that a session may let go: in `shadow` a failure is
+/// counted under `kind` and is not an error, and elsewhere it is returned.
+pub(crate) fn tolerate(
+    session: &Session,
+    kind: &'static str,
+    result: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match result {
+        Err(error) if !session.fails_closed() => {
+            note_shadow_failure(kind, &error);
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 fn shadow_failures() -> BTreeMap<&'static str, u64> {
     SHADOW_FAILURES
         .lock()
@@ -1068,10 +1084,7 @@ pub async fn prepare_reload(
         } else {
             Ok(())
         };
-        match trace {
-            Err(error) if !session.fails_closed() => note_shadow_failure("reload_trace", &error),
-            result => result?,
-        }
+        tolerate(session, "reload_trace", trace)?;
     }
     use futures_util::StreamExt as _;
     const READS: usize = 32;
@@ -1846,6 +1859,23 @@ mod tests {
         assert!(session.dirty.lock().unwrap().contains(&0));
     }
 
+    /// The traces of a release and of a preserved restart, and the grant, go
+    /// through `tolerate`: a failure is let go in `shadow` and returned in the
+    /// modes that rest on it.
+    #[test]
+    fn a_failing_trace_is_let_go_in_shadow_and_returned_otherwise() {
+        let shadow = Session::with_tag(Mode::Shadow, [1; 8], &[]);
+        let strict = Session::with_tag(Mode::On, [2; 8], &[]);
+        for kind in ["release_trace", "reload_trace", "grant"] {
+            let before = shadow_failures().get(kind).copied().unwrap_or(0);
+            let failed = || Err(anyhow::anyhow!("a chunk write failed"));
+            assert!(tolerate(&shadow, kind, failed()).is_ok());
+            assert_eq!(shadow_failures()[kind], before + 1);
+            assert!(tolerate(&strict, kind, failed()).is_err());
+            assert!(tolerate(&strict, kind, Ok(())).is_ok());
+        }
+    }
+
     #[test]
     fn only_shadow_lets_a_failing_step_go() {
         for (mode, fails_closed) in [(Mode::Shadow, false), (Mode::Read, true), (Mode::On, true)] {
@@ -1867,9 +1897,9 @@ mod tests {
         let shadow = established([8; 8]);
         let scope = scope_for(&shadow, 0);
         shadow.grant_scope(&scope);
-        let began = std::time::Instant::now();
+        let began = crate::asyncrt::mono_ms();
         wait_with(&shadow, &scope).await.expect("shadow lets it go");
-        assert!(began.elapsed() < std::time::Duration::from_secs(4));
+        assert!(crate::asyncrt::mono_ms() - began < 4_000);
         // The same hold, with a short limit, is an error.
         let error = hold_for_bit(&shadow, &scope, 0, 50).await;
         assert!(error.is_err());
