@@ -1420,7 +1420,7 @@ impl BucketOwnership {
         // on a trace in the bucket that the cell had a record.
         if let Some(session) = crate::session::current() {
             let trace = if session.is_claimed_scope(cell) {
-                session.confirm_left(&self.bucket, cell).await
+                session.leave_trace(&self.bucket, cell).await
             } else if session.expects_record(cell) {
                 crate::session::wait_until_checkpointed(cell).await
             } else {
@@ -1827,7 +1827,18 @@ impl BucketOwnership {
                 // done before the error is reported.
                 if let (CasGuard::Absent, 1, Some(session)) = (&guard, epoch, session) {
                     if session.own_counter_of_scope(cell).is_some() {
-                        let readback = self.resolve_owner(cell, RecordReader::ClaimReread).await;
+                        // In `shadow` the read-back is bounded too: a slow store ends
+                        // it as a failed read, which `shadow` goes past.
+                        let reading = self.resolve_owner(cell, RecordReader::ClaimReread);
+                        let readback = if session.fails_closed() {
+                            reading.await
+                        } else {
+                            crate::asyncrt::timeout(SHADOW_PROOF_WAIT, reading)
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(anyhow::anyhow!("the read-back of {cell} timed out"))
+                                })
+                        };
                         self.settle_ambiguous_first_record(session, cell, by.as_deref(), readback)
                             .await?;
                     }

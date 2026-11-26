@@ -29,6 +29,11 @@ use std::sync::{Mutex, OnceLock, RwLock};
 
 pub const ENV: &str = "CELLD_LAZY_BIRTH";
 
+/// The longest a release or a reload in `shadow` waits for one leave trace, and
+/// the longest the traces of one reload take together.
+const SHADOW_TRACE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+const SHADOW_RELOAD_TRACES: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Turns tagged minting on in a debug build, for tests only.
 const TEST_TAGGED_IDS: &str = "CELLD_TEST_TAGGED_IDS";
 
@@ -124,7 +129,14 @@ pub struct Session {
     sealing: AtomicBool,
     /// The session's seal finished and every bit it holds is in a sealed chunk.
     sealed_with_bits: AtomicBool,
+    /// What the session holds of its objects: read and updated in short steps,
+    /// never across a request to the bucket.
     held: tokio::sync::Mutex<Held>,
+    /// One writer at a time per chunk, and one for the header, across the
+    /// request to the bucket. A slow write of one chunk holds up the writers of
+    /// that chunk only, not the session.
+    chunk_writers: Mutex<HashMap<u64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    header_writer: tokio::sync::Mutex<()>,
     /// The next counter to issue: every counter below it was issued.
     issued: AtomicU64,
     /// The header is written and the lease can carry the tag; minting waits
@@ -182,6 +194,8 @@ impl Session {
             sealing: AtomicBool::new(false),
             sealed_with_bits: AtomicBool::new(false),
             held: tokio::sync::Mutex::default(),
+            chunk_writers: Mutex::default(),
+            header_writer: tokio::sync::Mutex::new(()),
             established: AtomicBool::new(false),
             resumed: Mutex::default(),
         }
@@ -776,17 +790,26 @@ impl Session {
             return Ok(());
         }
         let tag = self.tag();
+        let _writing = self.header_writer.lock().await;
         let (chunk, chunk_token) = store::create_chunk(bucket, &tag, counted).await?;
-        let mut held = self.held.lock().await;
-        let (mut header, token) = held.header.clone().context("the session is not open")?;
+        let (mut header, token) = self
+            .held
+            .lock()
+            .await
+            .header
+            .clone()
+            .context("the session is not open")?;
         header.chunks = counted + 1;
         header.rev += 1;
         let Some(token) = store::swap_header(bucket, &tag, &header, &token).await? else {
             self.closed.store(true, Ordering::SeqCst);
             anyhow::bail!("the session header changed: the session stops granting");
         };
-        held.header = Some((header, token));
-        held.chunks.insert(counted, (chunk, chunk_token));
+        {
+            let mut held = self.held.lock().await;
+            held.header = Some((header, token));
+            held.chunks.insert(counted, (chunk, chunk_token));
+        }
         self.counted.store(counted + 1, Ordering::SeqCst);
         Ok(())
     }
@@ -899,9 +922,13 @@ impl Session {
         let mut nonce = [0_u8; 8];
         getrandom::fill(&mut nonce).map_err(|error| anyhow::anyhow!("nonce: {error}"))?;
         let nonce = hex(&nonce);
+        let writer = self.chunk_writer(chunk);
+        let _writing = writer.lock().await;
         for _ in 0..6 {
-            let mut held = self.held.lock().await;
-            let (current, token) = held
+            let (current, token) = self
+                .held
+                .lock()
+                .await
                 .chunks
                 .get(&chunk)
                 .cloned()
@@ -927,13 +954,13 @@ impl Session {
                         .lock()
                         .expect("granted poisoned")
                         .insert(counter);
-                    held.chunks.insert(chunk, (next, token));
+                    self.held.lock().await.chunks.insert(chunk, (next, token));
                     self.left.lock().expect("left poisoned").insert(counter);
                     return Ok(());
                 }
                 None => match store::read_chunk(bucket, &tag, chunk).await? {
                     store::Read::Found(found, token) if found.state == store::State::Open => {
-                        held.chunks.insert(chunk, (found, token));
+                        self.held.lock().await.chunks.insert(chunk, (found, token));
                     }
                     _ => {
                         self.closed.store(true, Ordering::SeqCst);
@@ -943,6 +970,31 @@ impl Session {
             }
         }
         anyhow::bail!("the leave of {scope} lost every race")
+    }
+
+    fn chunk_writer(&self, chunk: u64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.chunk_writers
+            .lock()
+            .expect("chunk writers poisoned")
+            .entry(chunk)
+            .or_default()
+            .clone()
+    }
+
+    /// The trace that a cell had a record, for a release or a preserved restart.
+    /// In `shadow` it is bounded: a slow chunk write ends in an error that the
+    /// caller lets go (and counts), so a release or a reload never waits on the
+    /// bucket for it. `read` and `on` wait for the write.
+    pub async fn leave_trace(&self, bucket: &Bucket, scope: &str) -> anyhow::Result<()> {
+        if self.fails_closed() {
+            return self.confirm_left(bucket, scope).await;
+        }
+        match crate::asyncrt::timeout(SHADOW_TRACE_WAIT, self.confirm_left(bucket, scope)).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "the leave trace of {scope} did not finish in time"
+            )),
+        }
     }
 
     pub fn mark_pending(&self, counter: u64) {
@@ -1039,14 +1091,22 @@ impl Session {
             .copied()
             .collect();
         for chunk in dirty {
-            let granted = self.granted.lock().expect("granted poisoned").clone();
-            let mut held = self.held.lock().await;
-            let Some((current, token)) = held.chunks.get(&chunk).cloned() else {
+            let writer = self.chunk_writer(chunk);
+            let _writing = writer.lock().await;
+            let held_chunk = self.held.lock().await.chunks.get(&chunk).cloned();
+            let Some((current, token)) = held_chunk else {
                 continue;
             };
+            // Only this chunk's counters are read, not the whole lifetime set.
+            let range: Vec<u64> = self
+                .granted
+                .lock()
+                .expect("granted poisoned")
+                .range(chunk * CHUNK..(chunk + 1) * CHUNK)
+                .copied()
+                .collect();
             let mut next = current.clone();
-            next.granted
-                .extend(granted.range(chunk * CHUNK..(chunk + 1) * CHUNK));
+            next.granted.extend(range);
             if next == current {
                 self.settle_dirty(chunk, &current);
                 continue;
@@ -1059,11 +1119,11 @@ impl Session {
                         .expect("checkpointed poisoned")
                         .extend(next.granted.iter().copied());
                     self.settle_dirty(chunk, &next);
-                    held.chunks.insert(chunk, (next, token));
+                    self.held.lock().await.chunks.insert(chunk, (next, token));
                 }
                 None => match store::read_chunk(bucket, &tag, chunk).await? {
                     store::Read::Found(found, token) if found.state == store::State::Open => {
-                        held.chunks.insert(chunk, (found, token));
+                        self.held.lock().await.chunks.insert(chunk, (found, token));
                     }
                     _ => {
                         self.closed.store(true, Ordering::SeqCst);
@@ -1154,12 +1214,19 @@ pub async fn prepare_reload(
     // bit in a chunk, a waived cell that it claimed needs a confirmed left entry.
     // Any failure leaves no certificate.
     let bucket = ownership.bucket_client();
+    let traces_until = crate::asyncrt::mono_ms()
+        .saturating_add(u64::try_from(SHADOW_RELOAD_TRACES.as_millis()).unwrap_or(u64::MAX));
     for cell in cells {
         let Some(counter) = session.own_counter_of_scope(&cell.id) else {
             continue;
         };
+        // In `shadow` the traces of one reload take two seconds at most.
+        if !session.fails_closed() && crate::asyncrt::mono_ms() >= traces_until {
+            note_shadow_failure("reload_trace", &"the traces of the reload ran out of time");
+            continue;
+        }
         let trace = if session.is_claimed_scope(&cell.id) {
-            session.confirm_left(&bucket, &cell.id).await
+            session.leave_trace(&bucket, &cell.id).await
         } else if session.is_granted(counter) {
             wait_until_checkpointed(&cell.id).await
         } else {
@@ -2124,6 +2191,67 @@ mod tests {
         let (mark, mut waiter) = pending(&scope);
         assert_eq!(marks_to_ship(vec![mark], true).len(), 1);
         assert!(waiter.try_recv().is_err(), "nothing was answered yet");
+    }
+
+    /// A chunk write that is slow holds up the writers of that chunk and nobody
+    /// else: the session's own state stays free, and a leave trace in `shadow`
+    /// returns within its bound instead of waiting in line.
+    #[tokio::test]
+    async fn a_slow_chunk_write_does_not_hold_a_shadow_release_or_the_session() {
+        crate::asyncrt::install_test_host_runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = crate::bucket::Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+        let session = Session::with_tag(Mode::Shadow, [5; 8], &[]);
+        session.open(&bucket, "n", "g").await.unwrap();
+        let scope = scope_for(&session, 0);
+        session.grant_scope(&scope);
+        // A write of chunk 0 is in flight and does not finish.
+        let writer = session.chunk_writer(0);
+        let in_flight = writer.lock().await;
+        let began = crate::asyncrt::mono_ms();
+        let trace = session.leave_trace(&bucket, &scope).await;
+        assert!(trace.is_err(), "the trace did not finish");
+        assert!(
+            crate::asyncrt::mono_ms() - began < 3_000,
+            "a shadow release returns within its bound"
+        );
+        // The session's state was not held across that write.
+        assert!(
+            crate::asyncrt::timeout(std::time::Duration::from_millis(200), session.held.lock())
+                .await
+                .is_ok(),
+            "the session-wide lock is free"
+        );
+        drop(in_flight);
+        session.leave_trace(&bucket, &scope).await.unwrap();
+    }
+
+    /// A checkpoint writes each chunk with the counters of its own range only.
+    #[tokio::test]
+    async fn a_checkpoint_writes_each_chunk_with_its_own_counters() {
+        crate::asyncrt::install_test_host_runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = crate::bucket::Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+        let session = Session::with_tag(Mode::Shadow, [6; 8], &[]);
+        session.open(&bucket, "n", "g").await.unwrap();
+        session.issued.store(1_000, Ordering::SeqCst);
+        session.ensure_chunk_ahead(&bucket).await.unwrap();
+        assert_eq!(session.counted.load(Ordering::SeqCst), 2);
+        session.grant_scope(&scope_for(&session, 3));
+        session.grant_scope(&scope_for(&session, CHUNK + 7));
+        session.checkpoint(&bucket).await.unwrap();
+        let read = |chunk| {
+            let (bucket, tag) = (bucket.clone(), session.tag());
+            async move {
+                match store::read_chunk(&bucket, &tag, chunk).await.unwrap() {
+                    store::Read::Found(found, _) => found.granted,
+                    _ => panic!("a chunk"),
+                }
+            }
+        };
+        assert_eq!(read(0).await, BTreeSet::from([3]));
+        assert_eq!(read(1).await, BTreeSet::from([CHUNK + 7]));
+        assert!(session.dirty.lock().unwrap().is_empty());
     }
 
     #[test]
