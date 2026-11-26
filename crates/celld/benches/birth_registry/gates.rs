@@ -267,9 +267,15 @@ pub fn load_rows(cfg: &LoadCfg, result: &Value) -> Vec<Row> {
         rows.push(row(
             "G-l",
             json!({ "run_bytes_per_cell": storage["run_bytes_per_cell"], "bytes_per_cell": storage["bytes_per_cell"],
-                    "records_in_runs": storage["records_in_runs"], "orphans": storage["orphans"], "examples": storage["orphan_examples"] }),
-            "<= 80 B per registered cell; 0 objects that nothing names after the grace; some records measured",
-            all(&[some(&storage["records_in_runs"]), le(&storage["bytes_per_cell"], 80.0), zero(&storage["orphans"])]),
+                    "records_in_runs": storage["records_in_runs"], "error": storage["error"], "orphans": storage["orphans"], "examples": storage["orphan_examples"] }),
+            "<= 80 B per registered cell; 0 objects that nothing names after the grace; some records measured; both listings complete",
+            all(&[
+                // A storage check that failed has an error and no measurement.
+                Some(storage["error"].is_null()),
+                some(&storage["records_in_runs"]),
+                le(&storage["bytes_per_cell"], 80.0),
+                zero(&storage["orphans"]),
+            ]),
         ));
     }
     if cfg.steady {
@@ -285,11 +291,18 @@ pub fn load_rows(cfg: &LoadCfg, result: &Value) -> Vec<Row> {
         let oldest = ages.iter().copied().fold(None, |max: Option<f64>, age| {
             Some(max.map_or(age, |m| m.max(age)))
         });
+        // A listing that failed gave no age: the sample is a failure, not a smaller age.
+        let list_errors = result["series"].as_array().map(|series| {
+            series
+                .iter()
+                .filter(|point| !point["bundle_list_error"].is_null())
+                .count()
+        });
         rows.push(row(
             "G-j",
-            json!({ "oldest_bundle_age_s_max": oldest, "samples": ages.len() }),
-            "<= 600 s, over at least one sample",
-            oldest.map(|age| age <= 600.0),
+            json!({ "oldest_bundle_age_s_max": oldest, "samples": ages.len(), "list_errors": list_errors }),
+            "<= 600 s, over at least one sample, and no listing failed",
+            all(&[oldest.map(|age| age <= 600.0), list_errors.map(|errors| errors == 0)]),
         ));
         let merge_ms = |months: u64| -> Option<f64> {
             result["forced_merges"]
@@ -652,6 +665,22 @@ pub fn mean_rss_mib(series: &Value, from: u64, to: u64) -> Option<f64> {
         }
     }
     (!points.is_empty()).then(|| points.iter().sum::<f64>() / points.len() as f64)
+}
+
+/// The next item of a listing, or `None` after recording its error in `error`
+/// (the first one kept): a scan that meets an error stops and reports the error,
+/// not what it saw before it.
+pub fn note_error<T, E: std::fmt::Display>(
+    item: Result<T, E>,
+    error: &mut Option<String>,
+) -> Option<T> {
+    match item {
+        Ok(value) => Some(value),
+        Err(failure) => {
+            error.get_or_insert_with(|| failure.to_string());
+            None
+        }
+    }
 }
 
 /// The first error among store results, or `None` when every one is `Ok`.
@@ -1231,5 +1260,94 @@ mod selftest {
         assert_eq!(first_error(&ok), None);
         let bad: Vec<Result<u32, String>> = vec![Ok(1), Err("list failed".into())];
         assert_eq!(first_error(&bad).as_deref(), Some("list failed"));
+    }
+
+    #[test]
+    fn a_listing_that_fails_midway_reports_the_error_and_stops() {
+        let items: Vec<Result<u32, String>> =
+            vec![Ok(1), Ok(2), Err("connection reset".into()), Ok(3)];
+        let mut error = None;
+        let mut seen = Vec::new();
+        for item in items {
+            let Some(value) = note_error(item, &mut error) else {
+                break;
+            };
+            seen.push(value);
+        }
+        assert_eq!(seen, [1, 2]);
+        assert_eq!(error.as_deref(), Some("connection reset"));
+    }
+
+    fn steady_cfg() -> LoadCfg {
+        LoadCfg {
+            name: "steady".into(),
+            registry: true,
+            steady: true,
+            nodes: 3,
+            ..LoadCfg::default()
+        }
+    }
+
+    #[test]
+    fn a_bundle_listing_that_failed_fails_g_j() {
+        let point = |age: Value, error: Value| json!({ "oldest_bundle_age_s": age, "bundle_list_error": error, "nodes": [] });
+        let gate_j = |series: Value| {
+            load_rows(&steady_cfg(), &json!({ "series": series }))
+                .into_iter()
+                .find(|row| row.gate == "G-j")
+                .unwrap()
+                .pass
+        };
+        assert_eq!(gate_j(json!([point(json!(30.0), Value::Null)])), Some(true));
+        // A partial age before the error does not pass.
+        assert_eq!(
+            gate_j(json!([
+                point(json!(30.0), Value::Null),
+                point(Value::Null, json!("listing failed"))
+            ])),
+            Some(false)
+        );
+        assert_ne!(gate_j(json!([])), Some(true));
+    }
+
+    #[test]
+    fn a_storage_check_with_a_failed_listing_fails_g_l() {
+        let gate_l = |storage: Value| {
+            load_rows(&steady_cfg(), &json!({ "storage": storage }))
+                .into_iter()
+                .find(|row| row.gate == "G-l")
+                .unwrap()
+                .pass
+        };
+        let ok =
+            json!({ "records_in_runs": 1000, "bytes_per_cell": 68.0, "orphans": 0, "error": null });
+        assert_eq!(gate_l(ok), Some(true));
+        assert_eq!(gate_l(json!({ "error": "list failed" })), Some(false));
+        let mut with_error =
+            json!({ "records_in_runs": 1000, "bytes_per_cell": 68.0, "orphans": 0 });
+        with_error["error"] = json!("second listing failed");
+        assert_eq!(gate_l(with_error), Some(false));
+    }
+
+    #[test]
+    fn empty_pass_samples_fail_the_pass_time_clause() {
+        let result = |pass_ms: Value| {
+            json!({ "node_samples": { "pass_ms": pass_ms, "pass_gap_ms": { "n": 5, "p99": 5000.0 } },
+                    "forced_merges": [{ "months": 12, "result": { "ms": 1000.0 } }, { "months": 24, "result": { "ms": 2000.0 } }],
+                    "series": [{ "nodes": [{ "holder": true, "rss_mib": 120.0 }, { "rss_mib": 100.0 }, { "rss_mib": 100.0 }] }] })
+        };
+        let gate_i = |pass_ms: Value| {
+            load_rows(&steady_cfg(), &result(pass_ms))
+                .into_iter()
+                .find(|row| row.gate == "G-i")
+                .unwrap()
+                .pass
+        };
+        // With samples the phase cannot pass the gate alone (the report adds the
+        // bytes per hour), and without any it is not evaluated: never a pass at 0 ms.
+        assert_eq!(gate_i(json!({ "n": 10, "p99": 90.0 })), None);
+        assert_eq!(gate_i(json!({ "n": 10, "p99": 9000.0 })), Some(false));
+        assert_eq!(gate_i(json!({ "n": 0, "p50": null, "p99": null })), None);
+        assert_eq!(nearest_ms(&[], 99.0), None);
     }
 }

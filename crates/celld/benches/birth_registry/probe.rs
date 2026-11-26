@@ -172,8 +172,8 @@ impl Lookups {
         }
         json!({
             "heavy": { "n": heavy_us.len(), "share_pct": heavy_us.len() as f64 * 100.0 / node.len().max(1) as f64,
-                       "node_p50_ms": us_to_ms_p(&heavy_us, 50.0), "node_p99_ms": us_to_ms_p(&heavy_us, 99.0) },
-            "light": { "n": light_us.len(), "node_p50_ms": us_to_ms_p(&light_us, 50.0), "node_p99_ms": us_to_ms_p(&light_us, 99.0) },
+                       "node_p50_ms": us_to_ms_p_json(&heavy_us, 50.0), "node_p99_ms": us_to_ms_p_json(&heavy_us, 99.0) },
+            "light": { "n": light_us.len(), "node_p50_ms": us_to_ms_p_json(&light_us, 50.0), "node_p99_ms": us_to_ms_p_json(&light_us, 99.0) },
             "total": total,
             "exists": self.exists.load(Ordering::Relaxed),
             "new": self.new.load(Ordering::Relaxed),

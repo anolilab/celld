@@ -188,15 +188,19 @@ impl Rig {
                 "counters": state.as_ref().map(|s| s["counters"].clone()),
             }));
         }
-        let oldest = if bundles {
-            oldest_bundle_age_s(&self.store, &self.prefix).await
+        let (oldest, bundle_error) = if bundles {
+            match oldest_bundle_age_s(&self.store, &self.prefix).await {
+                Ok(oldest) => (oldest, None),
+                Err(error) => (None, Some(error)),
+            }
         } else {
-            None
+            (None, None)
         };
         self.series.push(json!({
             "at_s": self.started.elapsed().as_secs(),
             "nodes": nodes,
             "oldest_bundle_age_s": oldest,
+            "bundle_list_error": bundle_error,
             "store_files": null,
         }));
     }
@@ -222,18 +226,24 @@ pub fn copy_aged(template: &str, run: &str) {
     );
 }
 
-pub async fn oldest_bundle_age_s(store: &Store, prefix: &str) -> Option<f64> {
+/// The age of the oldest retained bundle, `Ok(None)` when there is none, or the
+/// error of a listing that failed: an age read up to an error is not the oldest.
+pub async fn oldest_bundle_age_s(store: &Store, prefix: &str) -> Result<Option<f64>, String> {
     let mut listing = store.list(Some(&OPath::from(format!("{prefix}log"))));
     let now = chrono_now();
     let mut oldest: Option<f64> = None;
-    while let Some(Ok(meta)) = listing.next().await {
+    let mut error = None;
+    while let Some(item) = listing.next().await {
+        let Some(meta) = gates::note_error(item, &mut error) else {
+            break;
+        };
         if meta.location.as_ref().contains("/recovered/") {
             continue;
         }
         let age = now - meta.last_modified.timestamp() as f64;
         oldest = Some(oldest.map_or(age, |was: f64| was.max(age)));
     }
-    oldest
+    error.map_or(Ok(oldest), Err)
 }
 
 fn chrono_now() -> f64 {
@@ -696,11 +706,11 @@ async fn load_phase(cfg: Cfg) {
             "uncovered": generator_uncovered,
         })),
         "node_samples": {
-            "lookup_ms": { "n": node_lookup_us.len(), "p50": ms_p(&node_lookup_us, 50.0) / 1000.0, "p99": ms_p(&node_lookup_us, 99.0) / 1000.0 },
+            "lookup_ms": { "n": node_lookup_us.len(), "p50": gates::nearest_ms(&node_lookup_us, 50.0), "p99": gates::nearest_ms(&node_lookup_us, 99.0) },
             "claim_to_covered_ms": percentiles(&flat(&samples, "claim_to_covered_ms")),
             "segment_to_covered_ms": percentiles(&flat(&samples, "segment_to_covered_ms")),
             "pass_to_covered_ms": percentiles(&flat(&samples, "pass_to_covered_ms")),
-            "pass_ms": { "n": flat(&samples, "pass_us").len(), "p50": ms_p(&flat(&samples, "pass_us"), 50.0) / 1000.0, "p99": ms_p(&flat(&samples, "pass_us"), 99.0) / 1000.0, "max": ms_p(&flat(&samples, "pass_us"), 100.0) / 1000.0 },
+            "pass_ms": { "n": flat(&samples, "pass_us").len(), "p50": gates::nearest_ms(&flat(&samples, "pass_us"), 50.0), "p99": gates::nearest_ms(&flat(&samples, "pass_us"), 99.0), "max": gates::nearest_ms(&flat(&samples, "pass_us"), 100.0) },
             "pass_gap_ms": percentiles(&flat(&samples, "pass_gap_ms")),
             "pass_log": samples
                 .iter()
@@ -986,6 +996,9 @@ pub async fn storage_report(rig: &Rig, gap: Duration) -> Value {
     }
     tokio::time::sleep(gap).await;
     let second = registry_listing(rig).await;
+    if second.error.is_some() {
+        return json!({ "error": second.error });
+    }
     let orphans: Vec<&String> = second.unnamed.intersection(&first.unnamed).collect();
     let run_bytes = second.bytes.get("run").copied().unwrap_or(0);
     let delta_bytes = second.bytes.get("delta").copied().unwrap_or(0);
@@ -1060,7 +1073,7 @@ pub fn kind_breakdown(
 }
 
 struct Listing {
-    error: Option<&'static str>,
+    error: Option<String>,
     records: u64,
     bytes: BTreeMap<&'static str, u64>,
     objects: BTreeMap<&'static str, u64>,
@@ -1082,7 +1095,7 @@ async fn registry_listing(rig: &Rig) -> Listing {
         live_deltas: 0,
     };
     let Some(root) = rig.root().await else {
-        listing.error = Some("no root");
+        listing.error = Some("no root".to_owned());
         return listing;
     };
     let map = match root.map {
@@ -1128,7 +1141,11 @@ async fn registry_listing(rig: &Rig) -> Listing {
         .unwrap_or_default();
     let base = format!("{}fleet/reg/v1/", rig.prefix);
     let mut objects = rig.store.list(Some(&OPath::from(base.clone())));
-    while let Some(Ok(meta)) = objects.next().await {
+    while let Some(item) = objects.next().await {
+        // A listing that fails ends the scan with its error, not with what it saw.
+        let Some(meta) = gates::note_error(item, &mut listing.error) else {
+            break;
+        };
         let key = meta.location.to_string();
         let name = key.strip_prefix(&base).unwrap_or(&key).to_owned();
         let class = ["seg", "delta", "run", "map", "root"]

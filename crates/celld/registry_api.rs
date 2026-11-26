@@ -47,6 +47,9 @@ fn answer_parts(answer: &Answer) -> (&'static str, Option<serde_json::Value>, Op
     }
 }
 
+/// The most forced jobs the debug route keeps waiting for the holder.
+const FORCED_QUEUE_CAP: usize = 64;
+
 /// The job a force request names: `pass` (nothing forced), `spill`, or
 /// `base_merge` with the partition to merge. A missing or unknown job, or a
 /// partition that is missing or out of range for a base merge, is an error.
@@ -217,11 +220,14 @@ pub async fn serve(
             let queued = queued.to_owned();
             if let Some((job, partition)) = forced {
                 let epoch = registry.role.epoch.load(Ordering::Relaxed);
-                registry
-                    .forced
-                    .lock()
-                    .unwrap()
-                    .push_back((job, partition, epoch));
+                let mut queue = registry.forced.lock().unwrap();
+                if queue.len() >= FORCED_QUEUE_CAP {
+                    return reply(
+                        429,
+                        serde_json::json!({ "error": "too many forced jobs are waiting" }),
+                    );
+                }
+                queue.push_back((job, partition, epoch));
             }
             registry.pass_now.notify_one();
             reply(200, serde_json::json!({ "queued": queued }))
