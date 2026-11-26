@@ -805,6 +805,9 @@ enum Declaration {
     Ignored,
     /// Declared, but its lease is live.
     Refused,
+    /// Declared, but the member proved it holds the fragment and only its
+    /// tail could not be read: never declared gone, and stays undecided.
+    Held,
     /// Declared, but its lease could not be read, so nothing proves it
     /// expired: not applied, and the member stays undecided.
     Unproven,
@@ -820,11 +823,14 @@ fn apply_declaration(
     witness: bool,
     lease_live: bool,
     lease_unread: bool,
+    held_unread: bool,
 ) -> Declaration {
     if !declared {
         Declaration::None
     } else if witness {
         Declaration::Ignored
+    } else if held_unread {
+        Declaration::Held
     } else if lease_unread {
         Declaration::Unproven
     } else if lease_live {
@@ -994,6 +1000,8 @@ struct MemberFate {
     reached_any: bool,
     /// A failed request proves the member itself answered.
     answered: bool,
+    /// A member proved it holds the fragment, and its tail was not read.
+    held_unread: bool,
     /// Rows of the fragment being recovered, from the addresses that named it.
     entries: Vec<Entry>,
     /// Rows of other fragments that were not taken.
@@ -1007,6 +1015,7 @@ impl MemberFate {
             unresolved: read_failed,
             reached_any: false,
             answered: false,
+            held_unread: false,
             entries: Vec::new(),
             discarded_rows: 0,
         }
@@ -1022,6 +1031,7 @@ impl MemberFate {
                 self.reached_any = true;
                 self.unresolved |= reached.inconclusive;
                 self.witness |= reached.complete;
+                self.held_unread |= reached.held_unread;
                 // Never merge rows across fragments: only an address that named
                 // the fragment being recovered contributes rows.
                 if reached.epoch_match {
@@ -1060,6 +1070,9 @@ struct Reached {
     /// The seal and the tail both name the fragment of the epoch being
     /// recovered. Rows of any other fragment are not recovery's to merge.
     epoch_match: bool,
+    /// The seal proved this member holds the fragment of the epoch being
+    /// recovered, but its tail could not be read or judged.
+    held_unread: bool,
     entries: Vec<Entry>,
 }
 
@@ -1109,6 +1122,7 @@ async fn probe_member(
                 complete: false,
                 inconclusive: true,
                 epoch_match: false,
+                held_unread: held_fragment_epoch == epoch,
                 entries: Vec::new(),
             })
         }
@@ -1131,6 +1145,7 @@ async fn probe_member(
                 complete: false,
                 inconclusive: true,
                 epoch_match: false,
+                held_unread: held_fragment_epoch == epoch,
                 entries: Vec::new(),
             });
         }
@@ -1154,6 +1169,7 @@ async fn probe_member(
                 complete: false,
                 inconclusive: held_fragment_epoch == epoch,
                 epoch_match: false,
+                held_unread: held_fragment_epoch == epoch,
                 entries: Vec::new(),
             });
         }
@@ -1219,6 +1235,7 @@ async fn probe_member(
         complete,
         inconclusive,
         epoch_match: held_fragment_epoch == epoch && tail.range.fragment_epoch == epoch,
+        held_unread: inconclusive && held_fragment_epoch == epoch,
         entries: tail.entries,
     })
 }
@@ -6226,6 +6243,7 @@ impl NodeLogManager {
                     fate.witness,
                     lease_live,
                     lease.is_err(),
+                    fate.held_unread,
                 );
                 match declaration {
                     Declaration::Ignored => warn!(
@@ -6234,6 +6252,13 @@ impl NodeLogManager {
                         "the operator declared this member gone \
                          (CELLD_RECOVERY_GONE_MEMBERS), but it holds a complete \
                          fragment: using it and ignoring the declaration"
+                    ),
+                    Declaration::Held => warn!(
+                        dead,
+                        member,
+                        "NOT applying the operator's declaration that this member is gone \
+                         (CELLD_RECOVERY_GONE_MEMBERS): it proved it holds the fragment and \
+                         only its tail could not be read; it stays undecided"
                     ),
                     Declaration::Unproven => warn!(
                         dead,
@@ -9597,37 +9622,73 @@ mod boot_addr_recovery_tests {
     fn a_declaration_applies_only_to_a_member_that_gave_no_complete_witness() {
         // Alive and holding a complete fragment: used as usual.
         assert_eq!(
-            apply_declaration(true, true, false, false),
+            apply_declaration(true, true, false, false, false),
             Declaration::Ignored
         );
         assert_eq!(
-            apply_declaration(true, true, true, false),
+            apply_declaration(true, true, true, false, false),
             Declaration::Ignored
         );
         // Unreachable, or answered without a complete fragment.
         assert_eq!(
-            apply_declaration(true, false, false, false),
+            apply_declaration(true, false, false, false, false),
             Declaration::Applied
         );
         // A live lease refuses it.
         assert_eq!(
-            apply_declaration(true, false, true, false),
+            apply_declaration(true, false, true, false, false),
             Declaration::Refused
         );
         assert_eq!(
-            apply_declaration(false, false, false, false),
+            apply_declaration(false, false, false, false, false),
             Declaration::None
         );
         // A lease that could not be read proves nothing: not applied.
         assert_eq!(
-            apply_declaration(true, false, false, true),
+            apply_declaration(true, false, false, true, false),
             Declaration::Unproven
         );
         // A complete fragment still wins over an unread lease.
         assert_eq!(
-            apply_declaration(true, true, false, true),
+            apply_declaration(true, true, false, true, false),
             Declaration::Ignored
         );
+    }
+
+    // A member that proved it holds the fragment is never declared gone, even
+    // when its tail could not be read.
+    #[test]
+    fn a_member_that_proved_it_holds_the_fragment_is_never_declared_gone() {
+        // The seal names the fragment of the epoch, and the tail read fails.
+        let transport = Script::new()
+            .on("m:1", SEAL, seal(0, 2, EPOCH))
+            .on("m:1", TAIL, refused(400, true))
+            .transport();
+        let fate = probe_all(&transport, &candidates(&["m:1"], false));
+        assert!(!fate.witness && fate.held_unread);
+        assert_eq!(
+            apply_declaration(true, fate.witness, false, false, fate.held_unread),
+            Declaration::Held
+        );
+        assert!(fate.undecided(false, true, false));
+        // A member whose seal names another fragment proved nothing of the
+        // kind, and an incomplete tail it did read is conclusive.
+        let other = Script::new()
+            .on("m:1", SEAL, seal(0, 2, 2))
+            .on("m:1", TAIL, refused(400, true))
+            .transport();
+        let fate = probe_all(&other, &candidates(&["m:1"], false));
+        assert!(!fate.held_unread);
+        assert_eq!(
+            apply_declaration(true, fate.witness, false, false, fate.held_unread),
+            Declaration::Applied
+        );
+        let incomplete = Script::new()
+            .on("m:1", SEAL, seal(0, 2, EPOCH))
+            .on("m:1", TAIL, tail(0, 2, false, EPOCH, vec![entry(1)]))
+            .transport();
+        let fate = probe_all(&incomplete, &candidates(&["m:1"], false));
+        assert!(!fate.held_unread);
     }
 
     #[test]
@@ -9643,7 +9704,7 @@ mod boot_addr_recovery_tests {
         let fate = probe_all(&transport, &candidates(&["m:1"], false));
         assert!(fate.witness);
         assert_eq!(
-            apply_declaration(true, fate.witness, false, false),
+            apply_declaration(true, fate.witness, false, false, fate.held_unread),
             Declaration::Ignored
         );
     }

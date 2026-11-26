@@ -69,12 +69,13 @@ struct MarkerGcSummary {
 
 /// Process-local retry state for compatibility GC.
 ///
-/// Durable marker deletions survive cancellation. `swept` avoids repeating a
-/// fleet-wide marker scan when only conditional retirement of the node record
-/// remains, while `retries` bounds a persistently failing marker store.
+/// Durable marker deletions survive cancellation. `swept`, keyed by node AND
+/// generation (a successor generation that expired between two passes is a
+/// different dead node), avoids repeating a fleet-wide marker scan when only
+/// conditional retirement of the node record remains, while `retries` bounds a persistently failing marker store.
 #[derive(Default)]
 pub struct DeadNodeGc {
-    swept: BTreeSet<String>,
+    swept: BTreeSet<(String, String)>,
     retries: BTreeMap<String, (String, u32, u64)>,
 }
 
@@ -113,7 +114,13 @@ impl DeadNodeGc {
         let observed_ms = crate::ownership_store::now_ms();
         let NodeScan { dead, live } = scan_nodes(bucket, observed_ms).await;
         let dead_names: BTreeSet<&str> = dead.iter().map(|record| record.node.as_str()).collect();
-        self.swept.retain(|node| dead_names.contains(node.as_str()));
+        let dead_generations: BTreeSet<(&str, &str)> = dead
+            .iter()
+            .map(|record| (record.node.as_str(), record.generation.as_str()))
+            .collect();
+        self.swept.retain(|(node, generation)| {
+            dead_generations.contains(&(node.as_str(), generation.as_str()))
+        });
         self.retries
             .retain(|node, _| dead_names.contains(node.as_str()));
 
@@ -121,7 +128,9 @@ impl DeadNodeGc {
         let indexed: BTreeMap<String, String> = dead
             .iter()
             .filter(|record| {
-                !self.swept.contains(&record.node)
+                !self
+                    .swept
+                    .contains(&(record.node.clone(), record.generation.clone()))
                     && self
                         .retries
                         .get(&record.node)
@@ -152,7 +161,7 @@ impl DeadNodeGc {
         for record in dead {
             let node = record.node;
             let generation = record.generation;
-            if !self.swept.contains(&node) {
+            if !self.swept.contains(&(node.clone(), generation.clone())) {
                 let (markers, retired, failures, complete) = if generation.is_empty() {
                     (0, 0, 0, true)
                 } else {
@@ -196,11 +205,11 @@ impl DeadNodeGc {
                     continue;
                 }
                 self.retries.remove(&node);
-                self.swept.insert(node.clone());
+                self.swept.insert((node.clone(), generation.clone()));
             }
             match retire_dead_node(bucket, &node, observed_ms).await {
                 Ok(true) => {
-                    self.swept.remove(&node);
+                    self.swept.remove(&(node.clone(), generation.clone()));
                 }
                 Ok(false) => {}
                 Err(error) => warn!(%node, %error, "dead-node lease retirement failed"),
@@ -475,6 +484,39 @@ mod boot_address_retirement_tests {
                 .unwrap();
             assert!(retire_dead_node(&bucket, "dead", 1_000_000).await.unwrap());
             assert!(address_is_live(&bucket).await);
+        });
+    }
+
+    // The marker sweep a pass remembers belongs to one generation of a node:
+    // a successor generation that expired before the next pass is swept again.
+    #[test]
+    fn a_successor_generation_that_expired_between_passes_is_swept_again() {
+        crate::asyncrt::install_test_host_runtime().block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let bucket = crate::dev::open_local_bucket(&dir.path().join("store.db")).unwrap();
+            let now = crate::ownership_store::now_ms();
+            // Expired a moment ago: inside the grace, so the record stays.
+            bucket
+                .put("nodes/dead.json", lease(now - 1_000, "g1"))
+                .await
+                .unwrap();
+            let mut gc = DeadNodeGc::default();
+            gc.run_pass(&bucket, 1_000).await;
+            let g1 = ("dead".to_string(), "g1".to_string());
+            let g2 = ("dead".to_string(), "g2".to_string());
+            assert!(gc.swept.contains(&g1));
+            // The node restarted and its next generation expired before the
+            // following pass saw it live.
+            bucket
+                .put("nodes/dead.json", lease(now - 500, "g2"))
+                .await
+                .unwrap();
+            gc.run_pass(&bucket, 1_000).await;
+            assert!(
+                !gc.swept.contains(&g1),
+                "the old generation's sweep is gone"
+            );
+            assert!(gc.swept.contains(&g2), "the new generation was swept");
         });
     }
 }
