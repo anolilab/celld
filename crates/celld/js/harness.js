@@ -11229,10 +11229,15 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
         this.readyState = WebSocket.READY_STATE_OPEN;
         this.dispatchEvent(new Event("open"));
       }, (error) => {
+        // A failed dial: one `error` carrying the reason, then one `close`
+        // (1006, not clean). The close is dispatched past the closed-state
+        // guard, which this very handler trips, and without the generic
+        // abnormal-close `error` it would otherwise add a second time.
+        this._dialFailed = true;
         this.readyState = WebSocket.READY_STATE_CLOSED;
         __sockets.delete(this._id);
         this.dispatchEvent(new ErrorEvent("error", { message: String(error?.message || error), error }));
-        this._dispatchClose(1006, "", false);
+        this._dispatchClose(1006, "", false, true);
       });
     }
   }
@@ -11437,8 +11442,12 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     event._trust();
     this.dispatchEvent(event);
   }
-  _dispatchClose(code, reason, wasClean) {
-    if (this.readyState === WebSocket.READY_STATE_CLOSED) return;
+  _dispatchClose(code, reason, wasClean, errorAlreadyFired = false) {
+    // `close` fires once. A failed dial has already set the state to closed
+    // and fired its own `error`, and is let through exactly once.
+    if (this._closeDispatched) return;
+    if (this.readyState === WebSocket.READY_STATE_CLOSED && !this._dialFailed) return;
+    this._closeDispatched = true;
     this.readyState = WebSocket.READY_STATE_CLOSED;
     __sockets.delete(this._id);
     // An abnormal closure fires `error` before `close`. Code written against
@@ -11450,7 +11459,7 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     // An abnormal closure fires `error` before `close`. Code written against
     // the standard onerror never ran otherwise, which matters most for an
     // outbound socket: its peer is a remote server that can simply vanish.
-    if (!wasClean) {
+    if (!wasClean && !errorAlreadyFired) {
       this.dispatchEvent(new ErrorEvent("error", {
         message: reason
           ? `WebSocket closed abnormally: ${reason}`
