@@ -4759,7 +4759,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             publish_then_recover(
                 &internal_listener,
                 app.clone(),
-                manager.publish_boot_addr(&app.advertise),
+                // On the heap: inline, the publish's state would grow the boot
+                // function's frame, and the Worker loader that runs on this
+                // stack runs out of it in a debug build.
+                Box::pin(manager.publish_boot_addr(&app.advertise)),
                 async {
                     let ttl_backoff =
                         std::time::Duration::from_millis(actor.lease_spec.ttl_ms.max(1_000));

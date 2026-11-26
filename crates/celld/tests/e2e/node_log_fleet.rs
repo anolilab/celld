@@ -715,7 +715,20 @@ async fn whole_fleet_kill(outage: Duration, restart: Restart) {
                 .iter()
                 .filter_map(|member| member.as_str())
                 .collect();
-            assert_eq!(named, ["nodelog-1", "nodelog-2"], "{record}");
+            // The declaration names only the declared members that are in the
+            // log's ensemble: recruitment may have put one follower in it.
+            let mut in_ensemble: Vec<&str> = record["ensemble"]
+                .as_array()
+                .expect("the record names the ensemble")
+                .iter()
+                .filter_map(|member| member.as_str())
+                .filter(|member| ["nodelog-1", "nodelog-2"].contains(member))
+                .collect();
+            in_ensemble.sort_unstable();
+            let mut named = named;
+            named.sort_unstable();
+            assert!(!named.is_empty(), "{record}");
+            assert_eq!(named, in_ensemble, "{record}");
             assert!(record["note"].as_str().unwrap().contains("operator"));
             assert!(
                 ready_after < Duration::from_secs(40),
