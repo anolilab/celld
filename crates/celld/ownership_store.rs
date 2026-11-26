@@ -91,6 +91,33 @@ pub(crate) struct LeaseSessionWire {
     #[serde(default)]
     pub(crate) carried: Vec<String>,
     pub(crate) mode: crate::session::Mode,
+    /// What the process reads: 1 is the format of `Grant` marks in the log and
+    /// of first-form records with a nonce. A lease without it (a build that
+    /// writes a session and reads neither) is not capable, however many tags it
+    /// carries.
+    #[serde(default)]
+    pub(crate) format: u32,
+}
+
+/// The session format of this build, advertised in its lease.
+pub(crate) const SESSION_FORMAT: u32 = 1;
+
+/// Whether a lease read from the bucket is live and advertises the session
+/// format.
+fn lease_capable(lease: &NodeLeaseWire, now: u64) -> bool {
+    lease.expires_ms > now
+        && lease
+            .session
+            .as_ref()
+            .is_some_and(|session| session.format >= SESSION_FORMAT)
+}
+
+async fn load_lease_wire(bucket: &Bucket, node: &str) -> anyhow::Result<Option<NodeLeaseWire>> {
+    Ok(
+        load_json::<NodeLeaseWire>(bucket, &format!("nodes/{node}.json"))
+            .await?
+            .map(|(lease, _)| lease),
+    )
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -470,6 +497,9 @@ const MARKS_GATE_MS: u64 = 5_000;
 
 /// How long a record waits for the fleet proof of its `Grant`
 /// (`CELLD_LAZY_BIRTH_PROOF_WAIT_MS`, 10 s by default).
+/// The longest a request in `shadow` waits for the proof of a grant.
+const SHADOW_PROOF_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
 fn mark_proof_wait() -> std::time::Duration {
     std::time::Duration::from_millis(
         std::env::var("CELLD_LAZY_BIRTH_PROOF_WAIT_MS")
@@ -525,7 +555,7 @@ pub struct BucketOwnership {
     /// Whether the leases of an ensemble carry the capability, and when that was
     /// read, for which members: at most every [`MARKS_GATE_MS`]. Liveness is not
     /// cached; see `ensemble_live`.
-    marks_gate: std::sync::Mutex<(u64, bool, Vec<String>)>,
+    marks_gate: std::sync::Mutex<(u64, bool, Vec<String>, u64)>,
     /// Whether the node log has an installed ensemble that proves marks now: the
     /// state the ship loop proves with. Set once by the process that owns the log;
     /// without it the stored log record alone decides.
@@ -783,7 +813,7 @@ impl BucketOwnership {
             registry_answers: RegistryAnswers::default(),
             gate_hold: crate::registry_seed::hold(),
             k5: crate::session_reader::K5Plans::default(),
-            marks_gate: std::sync::Mutex::new((0, false, Vec::new())),
+            marks_gate: std::sync::Mutex::new((0, false, Vec::new(), 0)),
             ensemble_live: std::sync::OnceLock::new(),
             records_gate: std::sync::Mutex::new((0, false)),
         }
@@ -1381,10 +1411,18 @@ impl BucketOwnership {
         // A release lets another node claim the cell, and that claim must rest
         // on a trace in the bucket that the cell had a record.
         if let Some(session) = crate::session::current() {
-            if session.is_claimed_scope(cell) {
-                session.confirm_left(&self.bucket, cell).await?;
+            let trace = if session.is_claimed_scope(cell) {
+                session.confirm_left(&self.bucket, cell).await
             } else if session.expects_record(cell) {
-                crate::session::wait_until_checkpointed(cell).await?;
+                crate::session::wait_until_checkpointed(cell).await
+            } else {
+                Ok(())
+            };
+            match trace {
+                Err(error) if !session.fails_closed() => {
+                    crate::session::note_shadow_failure("release_trace", &error);
+                }
+                result => result?,
             }
         }
         let key = format!("cells/{cell}/own.json");
@@ -1467,18 +1505,28 @@ impl BucketOwnership {
         let now = crate::asyncrt::mono_ms();
         {
             let gate = self.marks_gate.lock().unwrap();
-            if gate.0 != 0 && now.saturating_sub(gate.0) < MARKS_GATE_MS && gate.2 == ensemble {
+            if gate.0 != 0
+                && now.saturating_sub(gate.0) < MARKS_GATE_MS
+                && gate.2 == ensemble
+                && now_ms() < gate.3
+            {
                 return gate.1;
             }
         }
+        // Every member must advertise the format and be live. The answer is kept
+        // for a few seconds, but never past the soonest expiry it saw.
+        let wall = now_ms();
         let mut allowed = true;
+        let mut soonest = u64::MAX;
         for member in &ensemble {
-            allowed &= matches!(
-                load_node_lease(&self.bucket, member).await,
-                Ok(Some(lease)) if !lease.tags.is_empty()
-            );
+            match load_lease_wire(&self.bucket, member).await {
+                Ok(Some(lease)) if lease_capable(&lease, wall) => {
+                    soonest = soonest.min(lease.expires_ms);
+                }
+                _ => allowed = false,
+            }
         }
-        *self.marks_gate.lock().unwrap() = (now.max(1), allowed, ensemble);
+        *self.marks_gate.lock().unwrap() = (now.max(1), allowed, ensemble, soonest);
         allowed
     }
 
@@ -1488,17 +1536,19 @@ impl BucketOwnership {
         let _ = self.ensemble_live.set(Box::new(live));
     }
 
-    /// Whether every live lease advertises the session capability. A first-form
+    /// Whether every live lease advertises the session format. A first-form
     /// record is written only then: a node of an older build reads it as a plain
-    /// record and would ignore the nonce. Cached for [`MARKS_GATE_MS`].
-    pub(crate) async fn all_leases_capable(&self) -> bool {
+    /// record and would ignore the nonce. The positive answer is cached for
+    /// [`MARKS_GATE_MS`] for judging; the write itself asks again with `fresh`.
+    pub(crate) async fn all_leases_capable(&self, fresh: bool) -> bool {
         let now = crate::asyncrt::mono_ms();
-        {
+        if !fresh {
             let gate = self.records_gate.lock().unwrap();
             if gate.0 != 0 && now.saturating_sub(gate.0) < MARKS_GATE_MS {
                 return gate.1;
             }
         }
+        let wall = now_ms();
         let mut capable = true;
         match self.bucket.list("nodes/").await {
             Ok(listed) => {
@@ -1511,9 +1561,9 @@ impl BucketOwnership {
                     else {
                         continue;
                     };
-                    match load_node_lease(&self.bucket, node).await {
-                        Ok(Some(lease)) if lease.expires_ms > now_ms() => {
-                            capable &= !lease.tags.is_empty();
+                    match load_lease_wire(&self.bucket, node).await {
+                        Ok(Some(lease)) if lease.expires_ms > wall => {
+                            capable &= lease_capable(&lease, wall);
                         }
                         Ok(_) => {}
                         Err(_) => capable = false,
@@ -1543,6 +1593,10 @@ impl BucketOwnership {
     /// a proof that comes later changes nothing, and later requests for the
     /// cell fail the same way (the wake of a pending grant at a new epoch is
     /// not built).
+    ///
+    /// In `shadow` none of this may fail or hold a request for more than a short
+    /// bound: a step that fails is logged and counted and the request goes on as
+    /// it would without a session. `read` and `on` fail closed.
     async fn after_first_record(
         &self,
         session: &crate::session::Session,
@@ -1551,14 +1605,40 @@ impl BucketOwnership {
         let Some(counter) = session.own_counter_of_scope(cell) else {
             return Ok(());
         };
+        match self.grant_or_waive(session, cell, counter).await {
+            Err(error) if !session.fails_closed() => {
+                crate::session::note_shadow_failure("grant", &error);
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    async fn grant_or_waive(
+        &self,
+        session: &crate::session::Session,
+        cell: &str,
+        counter: u64,
+    ) -> anyhow::Result<()> {
         if self.marks_allowed().await {
-            session.grant_scope(cell);
+            // The grant is held only while the session is open: a session that
+            // began its seal has taken its gather, and a bit added now would
+            // never reach a chunk.
+            anyhow::ensure!(
+                session.grant_scope(cell),
+                "the session closed before the grant of {cell} was recorded"
+            );
             // A round that failed because a member of the ensemble was gone says
             // nothing about the next ensemble: the same mark is sent again, until
             // the wait ends. The `Grant` of a counter is idempotent, and only a
             // proof that covers it activates the cell.
+            let wait = if session.fails_closed() {
+                mark_proof_wait()
+            } else {
+                mark_proof_wait().min(SHADOW_PROOF_WAIT)
+            };
             let deadline = crate::asyncrt::mono_ms()
-                .saturating_add(u64::try_from(mark_proof_wait().as_millis()).unwrap_or(u64::MAX));
+                .saturating_add(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX));
             loop {
                 let left = deadline.saturating_sub(crate::asyncrt::mono_ms());
                 if left == 0 {
@@ -1571,7 +1651,10 @@ impl BucketOwnership {
                     Err(_) => break,
                 }
             }
-            session.mark_pending(counter);
+            // Only a session that rests on the grant leaves the cell pending.
+            if session.fails_closed() {
+                session.mark_pending(counter);
+            }
             tracing::warn!(
                 event = "pending_grant",
                 cell,
@@ -1579,16 +1662,32 @@ impl BucketOwnership {
             );
             anyhow::bail!("no fleet proof of the grant of {cell}: the grant is pending");
         }
-        match crate::session_store::read_header(&self.bucket, &session.tag()).await? {
-            crate::session_store::Read::Found(header, _)
+        // The waive: the session wrote the standard-path record of this id, and
+        // must know that its header was not sealed when the write applied. With
+        // no such evidence the cell is pending like a grant without a proof, so
+        // that a retry cannot activate it.
+        let evidence = match crate::session_store::read_header(&self.bucket, &session.tag()).await {
+            Ok(crate::session_store::Read::Found(header, _))
                 if header.state == crate::session_store::State::Open =>
             {
-                // The session wrote the standard-path record of this waived id,
-                // once.
+                Ok(())
+            }
+            Ok(_) => Err(anyhow::anyhow!(
+                "no evidence that the record of {cell} was written before a seal"
+            )),
+            Err(error) => Err(error),
+        };
+        match evidence {
+            Ok(()) => {
                 session.note_claimed(counter);
                 Ok(())
             }
-            _ => anyhow::bail!("no evidence that the record of {cell} was written before a seal"),
+            Err(error) => {
+                if session.fails_closed() {
+                    session.mark_pending(counter);
+                }
+                Err(error)
+            }
         }
     }
 
@@ -1626,6 +1725,12 @@ impl BucketOwnership {
                 }
             }
         }
+        // A first-form record is written only while every live lease advertises
+        // the format, asked again now: a lease that changed since the cell was
+        // judged turns the claim into one that is judged again.
+        if plan.is_some() && !self.all_leases_capable(true).await {
+            return Ok(CasOutcome::Rejected);
+        }
         let body = serde_json::to_vec(&OwnerWire {
             node: &self.node,
             epoch,
@@ -1637,7 +1742,31 @@ impl BucketOwnership {
             CasGuard::Absent => None,
             CasGuard::Match(etag) => Some(etag.as_str()),
         };
-        match self.bucket.put_cas(&key, body, etag).await? {
+        let written = match self.bucket.put_cas(&key, body, etag).await {
+            Ok(written) => written,
+            Err(error) => {
+                // A create-only write of the session's own id whose answer was
+                // an error may have applied. The core settles it by a read and
+                // would activate the cell, so the grant is settled first: if the
+                // record is there, this session's, the grant or the waive is
+                // done before the error is reported.
+                if let (CasGuard::Absent, 1, Some(session)) = (&guard, epoch, session) {
+                    if session.own_counter_of_scope(cell).is_some() {
+                        let applied = matches!(
+                            self.resolve_owner(cell, RecordReader::ClaimReread).await,
+                            Ok(Some(record)) if record.epoch == 1
+                                && record.node.as_deref() == Some(self.node.as_str())
+                                && record.by.as_deref() == by.as_deref()
+                        );
+                        if applied {
+                            self.after_first_record(session, cell).await?;
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        };
+        match written {
             Some(_) => {
                 // The record now carries this process's own tag.
                 if let Some(session) = session {
@@ -1734,6 +1863,7 @@ impl BucketOwnership {
                     tag: session.tag(),
                     carried: record.tags.iter().skip(1).cloned().collect(),
                     mode: session.mode(),
+                    format: SESSION_FORMAT,
                 }
             }),
         })
@@ -2076,5 +2206,186 @@ mod session_wire_tests {
         assert_eq!(again.session, lease.session);
         let owner: OwnerWireOwned = serde_json::from_str(r#"{"node":"n","epoch":1}"#).unwrap();
         assert_eq!(owner.by, None);
+    }
+}
+
+#[cfg(test)]
+mod grant_tests {
+    use super::*;
+    use crate::bucket::Bucket;
+    use crate::session::{Mode, Session};
+
+    const NODE: &str = "node-a";
+
+    fn world() -> (tempfile::TempDir, Bucket, BucketOwnership) {
+        crate::asyncrt::install_test_host_runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+        let ownership = BucketOwnership::new(
+            bucket.clone(),
+            bucket.clone(),
+            NODE.to_owned(),
+            "key".to_owned(),
+        );
+        (dir, bucket, ownership)
+    }
+
+    fn lease(expires_ms: u64, format: Option<u32>) -> NodeLeaseWire {
+        let mut value = serde_json::json!({
+            "node": "m", "expires_ms": expires_ms, "probe_public_key": "k",
+        });
+        if let Some(format) = format {
+            value["session"] = serde_json::json!(
+                {"tag": "aa", "mode": "shadow", "format": format}
+            );
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn a_lease_is_capable_only_with_the_format_and_while_it_lives() {
+        assert!(lease_capable(&lease(10_000, Some(SESSION_FORMAT)), 5_000));
+        assert!(
+            !lease_capable(&lease(10_000, Some(0)), 5_000),
+            "a build without it"
+        );
+        assert!(!lease_capable(&lease(10_000, None), 5_000), "no session");
+        assert!(
+            !lease_capable(&lease(4_000, Some(SESSION_FORMAT)), 5_000),
+            "expired"
+        );
+        // A lease written before the field existed reads as format 0.
+        let older: NodeLeaseWire = serde_json::from_value(serde_json::json!({
+            "node": "m", "expires_ms": 10_000, "probe_public_key": "k",
+            "session": {"tag": "aa", "carried": ["bb"], "mode": "shadow"},
+        }))
+        .unwrap();
+        assert!(!lease_capable(&older, 5_000));
+    }
+
+    async fn put_lease(bucket: &Bucket, node: &str, lease: &NodeLeaseWire) {
+        let body = serde_json::to_vec(lease).unwrap();
+        bucket
+            .put_cas(&format!("nodes/{node}.json"), body, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_first_record_waits_for_leases_that_read_it() {
+        let (_dir, bucket, ownership) = world();
+        let future = now_ms() + 60_000;
+        put_lease(&bucket, "m", &lease(future, Some(SESSION_FORMAT))).await;
+        assert!(ownership.all_leases_capable(true).await);
+        // A build that writes a session and reads neither marks nor nonces.
+        put_lease(&bucket, "older", &lease(future, Some(0))).await;
+        assert!(!ownership.all_leases_capable(true).await);
+        // The judging cache still says no for a while, and a fresh read agrees.
+        assert!(!ownership.all_leases_capable(false).await);
+    }
+
+    /// An ensemble member whose lease has expired cannot prove a mark, however
+    /// many tags it carries.
+    #[tokio::test]
+    async fn an_expired_member_does_not_open_the_gate_for_marks() {
+        let (_dir, bucket, ownership) = world();
+        *ownership.own_log.lock().unwrap() = (
+            1,
+            Some(NodeLogWire {
+                state: "open".into(),
+                epoch: 1,
+                ensemble: vec!["m".into()],
+                tiered: 0,
+                may_have_fleet_acks: false,
+                claimant: None,
+                claimed_ms: None,
+            }),
+        );
+        put_lease(
+            &bucket,
+            "m",
+            &lease(now_ms() + 60_000, Some(SESSION_FORMAT)),
+        )
+        .await;
+        assert!(ownership.marks_allowed().await);
+        // The same member, expired: the cached answer is not reused.
+        *ownership.marks_gate.lock().unwrap() = (0, false, Vec::new(), 0);
+        bucket.delete("nodes/m.json").await.unwrap();
+        put_lease(
+            &bucket,
+            "m",
+            &lease(now_ms().saturating_sub(1), Some(SESSION_FORMAT)),
+        )
+        .await;
+        assert!(!ownership.marks_allowed().await);
+    }
+
+    #[tokio::test]
+    async fn a_waive_without_evidence_fails_closed_in_read_and_goes_on_in_shadow() {
+        let (_dir, _bucket, ownership) = world();
+        // No header was ever written: there is no evidence that the record was
+        // written before a seal.
+        let shadow = Session::with_tag(Mode::Shadow, [1; 8], &[]);
+        let strict = Session::with_tag(Mode::On, [2; 8], &[]);
+        for (session, fails_closed) in [(&shadow, false), (&strict, true)] {
+            let scope = scope_of(session, 0);
+            let outcome = ownership.after_first_record(session, &scope).await;
+            assert_eq!(outcome.is_err(), fails_closed, "{:?}", session.mode());
+            assert_eq!(
+                session.is_pending_scope(&scope),
+                fails_closed,
+                "a retry of a cell without evidence must not activate it"
+            );
+        }
+    }
+
+    /// With an ensemble whose member never proves the mark, a request in
+    /// `shadow` waits at most a short bound, does not fail and leaves the cell
+    /// able to activate.
+    #[tokio::test]
+    async fn a_mark_that_is_never_proven_does_not_hold_or_wedge_a_request_in_shadow() {
+        let (_dir, bucket, ownership) = world();
+        *ownership.own_log.lock().unwrap() = (
+            1,
+            Some(NodeLogWire {
+                state: "open".into(),
+                epoch: 1,
+                ensemble: vec!["m".into()],
+                tiered: 0,
+                may_have_fleet_acks: false,
+                claimant: None,
+                claimed_ms: None,
+            }),
+        );
+        put_lease(
+            &bucket,
+            "m",
+            &lease(now_ms() + 60_000, Some(SESSION_FORMAT)),
+        )
+        .await;
+        let session = Session::with_tag(Mode::Shadow, [3; 8], &[]);
+        let scope = scope_of(&session, 0);
+        let began = std::time::Instant::now();
+        ownership
+            .after_first_record(&session, &scope)
+            .await
+            .expect("a failing grant does not fail a request in shadow");
+        assert!(began.elapsed() < std::time::Duration::from_secs(3));
+        assert!(!session.is_pending_scope(&scope), "never wedged");
+        assert!(session.is_granted(0), "the grant stays recorded");
+    }
+
+    /// The scope of the id with counter `counter` of `session`.
+    fn scope_of(session: &Session, counter: u64) -> String {
+        crate::session::register_class("script", "Agent");
+        let key = crate::engine_api::durable_object_id_key(&crate::engine_api::namespace_key(
+            "script", "Agent",
+        ));
+        let id = crate::engine_api::tagged_object_id(
+            &key,
+            session.tag_bytes(),
+            crate::session::encrypt_counter(session.counter_key_for_tests(), counter),
+        );
+        format!("Agent:{}", crate::engine_api::durable_object_id_hex(&id))
     }
 }

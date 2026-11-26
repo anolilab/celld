@@ -118,13 +118,20 @@ impl BucketOwnership {
             return Ok(Verdict::Proceed);
         }
         let bucket = self.bucket_client();
-        let header = match store::read_header(&bucket, &tag).await? {
-            Read::Found(header, _) if header.state != store::State::Sealed => {
-                tracing::info!(cell, tag, "session header not sealed; standard path");
-                return Ok(Verdict::Proceed);
-            }
-            Read::Found(header, _) => Some(header),
-            Read::Missing | Read::Unreadable(_) => None,
+        // A sealed header never changes, so it is read once.
+        let header = match sealed_header(&tag) {
+            Some(header) => Some(header),
+            None => match store::read_header(&bucket, &tag).await? {
+                Read::Found(header, _) if header.state != store::State::Sealed => {
+                    tracing::debug!(cell, tag, "session header not sealed; standard path");
+                    return Ok(Verdict::Proceed);
+                }
+                Read::Found(header, _) => {
+                    remember_sealed(&tag, &header);
+                    Some(header)
+                }
+                Read::Missing | Read::Unreadable(_) => None,
+            },
         };
         let Some(id) = cell
             .rsplit_once(':')
@@ -237,7 +244,7 @@ impl BucketOwnership {
         let writes_marked_records = !matches!(
             verdict,
             Take::FirstNew { .. } | Take::FirstOverRecord { .. } | Take::ReplaceFirst { .. }
-        ) || self.all_leases_capable().await;
+        ) || self.all_leases_capable(false).await;
         if !writes_marked_records {
             tracing::info!(
                 event = "session_rule",
@@ -327,5 +334,62 @@ mod tests {
         assert_eq!(unhex("0aff"), Some(vec![0x0a, 0xff]));
         assert_eq!(unhex("0af"), None);
         assert_eq!(unhex("zz"), None);
+    }
+}
+
+/// The sealed headers this process has read, by tag. A sealed header is final.
+static SEALED_HEADERS: std::sync::Mutex<Option<std::collections::HashMap<String, store::Header>>> =
+    std::sync::Mutex::new(None);
+
+/// The most headers kept; past it the cache starts again.
+const SEALED_HEADERS_CAP: usize = 4_096;
+
+fn sealed_header(tag: &str) -> Option<store::Header> {
+    SEALED_HEADERS
+        .lock()
+        .expect("sealed headers poisoned")
+        .as_ref()?
+        .get(tag)
+        .cloned()
+}
+
+fn remember_sealed(tag: &str, header: &store::Header) {
+    if header.state != store::State::Sealed {
+        return;
+    }
+    let mut cache = SEALED_HEADERS.lock().expect("sealed headers poisoned");
+    let cache = cache.get_or_insert_default();
+    if cache.len() >= SEALED_HEADERS_CAP {
+        cache.clear();
+    }
+    cache.insert(tag.to_string(), header.clone());
+}
+
+#[cfg(test)]
+mod sealed_header_cache_tests {
+    use super::*;
+
+    fn header(state: store::State) -> store::Header {
+        store::Header {
+            node: "n".into(),
+            generation: "g".into(),
+            mode: crate::session::Mode::Shadow,
+            state,
+            chunks: 1,
+            rev: 3,
+            key: String::new(),
+            lost: false,
+        }
+    }
+
+    #[test]
+    fn only_a_sealed_header_is_kept() {
+        remember_sealed("cache-open", &header(store::State::Open));
+        assert!(sealed_header("cache-open").is_none());
+        remember_sealed("cache-sealed", &header(store::State::Sealed));
+        assert_eq!(
+            sealed_header("cache-sealed").map(|header| header.rev),
+            Some(3)
+        );
     }
 }

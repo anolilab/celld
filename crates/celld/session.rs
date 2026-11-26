@@ -191,6 +191,16 @@ impl Session {
         hex(&self.tag)
     }
 
+    #[cfg(test)]
+    pub(crate) fn tag_bytes(&self) -> [u8; 8] {
+        self.tag
+    }
+
+    #[cfg(test)]
+    pub(crate) fn counter_key_for_tests(&self) -> &[u8; 32] {
+        &self.counter_key
+    }
+
     pub fn mode(&self) -> Mode {
         self.mode
     }
@@ -380,12 +390,38 @@ pub(crate) fn note_verified(record: &OwnerRecord) {
     }
 }
 
+static SHADOW_FAILURES: Mutex<BTreeMap<&'static str, u64>> = Mutex::new(BTreeMap::new());
+
+/// A step of a grant that failed in `shadow` and was let go: logged, counted by
+/// `kind`, and shown in `/state`.
+pub(crate) fn note_shadow_failure(kind: &'static str, error: &dyn std::fmt::Display) {
+    *SHADOW_FAILURES
+        .lock()
+        .expect("shadow failures poisoned")
+        .entry(kind)
+        .or_default() += 1;
+    tracing::warn!(
+        event = "shadow_failure",
+        kind,
+        %error,
+        "a session step failed in shadow and the request went on"
+    );
+}
+
+fn shadow_failures() -> BTreeMap<&'static str, u64> {
+    SHADOW_FAILURES
+        .lock()
+        .expect("shadow failures poisoned")
+        .clone()
+}
+
 /// The counters of a session, for `/state`; none without a session.
 pub(crate) fn counters_json() -> Option<serde_json::Value> {
     let session = current()?;
     Some(serde_json::json!({
         "tag": session.tag(),
         "verified_under_carried_tag": CARRIED_VERIFIED.load(Ordering::Relaxed),
+        "shadow_failures": shadow_failures(),
     }))
 }
 
@@ -516,7 +552,27 @@ async fn wait_with(session: &Session, scope: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     session.nudge.notify_one();
-    let deadline = crate::asyncrt::mono_ms() + 30_000;
+    let limit_ms = if session.fails_closed() {
+        30_000
+    } else {
+        2_000
+    };
+    match hold_for_bit(session, scope, counter, limit_ms).await {
+        Err(error) if !session.fails_closed() => {
+            note_shadow_failure("checkpoint_hold", &error);
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+async fn hold_for_bit(
+    session: &Session,
+    scope: &str,
+    counter: u64,
+    limit_ms: u64,
+) -> anyhow::Result<()> {
+    let deadline = crate::asyncrt::mono_ms() + limit_ms;
     while crate::asyncrt::mono_ms() < deadline {
         // The seal of this session writes the bits: a write goes on once the
         // seal finished with them. A session that closed for any other reason
@@ -653,28 +709,31 @@ impl Session {
     /// counter is *granted*. The bit is set after the write returned, never
     /// before. Idempotent, and a no-op for any id that this session did not
     /// mint.
-    pub fn grant_scope(&self, scope: &str) {
-        if self.is_closed() {
-            return;
-        }
+    ///
+    /// Returns whether the grant is held: `false` for an id that is not this
+    /// session's and for a session that closed. The check of `closed` and the
+    /// insert happen under the lock of the granted set, which the seal also
+    /// holds when it closes and takes its gather, so a grant either is in the
+    /// gather or is refused.
+    pub fn grant_scope(&self, scope: &str) -> bool {
         let Some(counter) = self.own_counter_of_scope(scope) else {
-            return;
+            return false;
         };
+        let mut granted = self.granted.lock().expect("granted poisoned");
+        if self.is_closed() {
+            return false;
+        }
         self.granted_scopes
             .lock()
             .expect("granted scopes poisoned")
             .insert(counter, scope.to_string());
-        if self
-            .granted
-            .lock()
-            .expect("granted poisoned")
-            .insert(counter)
-        {
+        if granted.insert(counter) {
             self.dirty
                 .lock()
                 .expect("dirty poisoned")
                 .insert(counter / CHUNK);
         }
+        true
     }
 
     /// The counter of a scope `Class:<64 hex digits>` whose id carries this
@@ -842,6 +901,33 @@ impl Session {
         self.closed.load(Ordering::SeqCst)
     }
 
+    /// Give the session up: it grants nothing and mints nothing more.
+    pub fn abandon(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a grant, mark, checkpoint or chunk write that fails must fail
+    /// the request that asked for it. In `shadow` nothing depends on them yet,
+    /// so such a failure is logged and counted and the request goes on as it
+    /// would without a session; `read` and `on` rest on them and fail closed.
+    pub fn fails_closed(&self) -> bool {
+        self.mode != Mode::Shadow
+    }
+
+    /// Clear the dirty marker of `chunk` that `written` satisfies, unless a grant
+    /// of its range arrived after the snapshot that `written` was built from.
+    fn settle_dirty(&self, chunk: u64, written: &Chunk) {
+        let mut dirty = self.dirty.lock().expect("dirty poisoned");
+        dirty.remove(&chunk);
+        let granted = self.granted.lock().expect("granted poisoned");
+        if granted
+            .range(chunk * CHUNK..(chunk + 1) * CHUNK)
+            .any(|counter| !written.granted.contains(counter))
+        {
+            dirty.insert(chunk);
+        }
+    }
+
     /// Write the chunks whose bits changed, each by a compare-and-swap on the
     /// token of this session's last write of it. A lost write reads the chunk:
     /// a sealed one ends the session's grants, an open one replaces what the
@@ -865,7 +951,7 @@ impl Session {
             next.granted
                 .extend(granted.range(chunk * CHUNK..(chunk + 1) * CHUNK));
             if next == current {
-                self.dirty.lock().expect("dirty poisoned").remove(&chunk);
+                self.settle_dirty(chunk, &current);
                 continue;
             }
             next.rev += 1;
@@ -875,8 +961,8 @@ impl Session {
                         .lock()
                         .expect("checkpointed poisoned")
                         .extend(next.granted.iter().copied());
+                    self.settle_dirty(chunk, &next);
                     held.chunks.insert(chunk, (next, token));
-                    self.dirty.lock().expect("dirty poisoned").remove(&chunk);
                 }
                 None => match store::read_chunk(bucket, &tag, chunk).await? {
                     store::Read::Found(found, token) if found.state == store::State::Open => {
@@ -898,27 +984,34 @@ impl Session {
     /// chunks with the grants that no chunk holds yet.
     pub async fn seal(&self, bucket: &Bucket) -> anyhow::Result<()> {
         self.sealing.store(true, Ordering::SeqCst);
-        self.closed.store(true, Ordering::SeqCst);
-        let gather = self.granted.lock().expect("granted poisoned").clone();
+        // Closing and taking the gather are one step with respect to a grant.
+        let gather = {
+            let granted = self.granted.lock().expect("granted poisoned");
+            self.closed.store(true, Ordering::SeqCst);
+            granted.clone()
+        };
         let tag = self.tag();
+        // The bits are durable in the open chunks before the header says
+        // `Sealing`, so a rival that continues the seal finds them there and a
+        // chunk it seals first cannot lack them.
+        self.checkpoint(bucket).await?;
         store::seal_session(bucket, &tag, &gather, &BTreeSet::new()).await?;
         // A chunk that a rival sealed first keeps its own content: only when
-        // every bit this session holds is in a sealed chunk may a held write
-        // go on.
+        // every bit this session holds is in a sealed chunk may a held write go
+        // on, and the log stays open otherwise, so that its recovery gathers
+        // the marks.
         let chunks: BTreeSet<u64> = gather.iter().map(|counter| counter / CHUNK).collect();
         for chunk in chunks {
-            let Some(found) = (match store::read_chunk(bucket, &tag, chunk).await? {
-                store::Read::Found(found, _) => Some(found),
-                _ => None,
-            }) else {
-                return Ok(());
+            let found = match store::read_chunk(bucket, &tag, chunk).await? {
+                store::Read::Found(found, _) => found,
+                _ => anyhow::bail!("chunk {chunk} of the sealed session is gone"),
             };
-            if gather
-                .range(chunk * CHUNK..(chunk + 1) * CHUNK)
-                .any(|counter| !found.granted.contains(counter))
-            {
-                return Ok(());
-            }
+            anyhow::ensure!(
+                gather
+                    .range(chunk * CHUNK..(chunk + 1) * CHUNK)
+                    .all(|counter| found.granted.contains(counter)),
+                "chunk {chunk} was sealed without every grant of this session"
+            );
         }
         self.sealed_with_bits.store(true, Ordering::SeqCst);
         Ok(())
@@ -968,10 +1061,16 @@ pub async fn prepare_reload(
         let Some(counter) = session.own_counter_of_scope(&cell.id) else {
             continue;
         };
-        if session.is_claimed_scope(&cell.id) {
-            session.confirm_left(&bucket, &cell.id).await?;
+        let trace = if session.is_claimed_scope(&cell.id) {
+            session.confirm_left(&bucket, &cell.id).await
         } else if session.is_granted(counter) {
-            wait_until_checkpointed(&cell.id).await?;
+            wait_until_checkpointed(&cell.id).await
+        } else {
+            Ok(())
+        };
+        match trace {
+            Err(error) if !session.fails_closed() => note_shadow_failure("reload_trace", &error),
+            result => result?,
         }
     }
     use futures_util::StreamExt as _;
@@ -1648,7 +1747,8 @@ mod tests {
         waiting.await.unwrap().unwrap();
         // A session that closed because its chunk or header was lost under it
         // never lets the object through.
-        let lost = established([9; 8]);
+        let lost = Session::with_tag(Mode::On, [9; 8], &[]);
+        lost.establish();
         let id = durable_object_id_hex(&lost.mint(&key()).expect("established"));
         let lost_scope = format!("{CLASS}:{id}");
         lost.grant_scope(&lost_scope);
@@ -1695,6 +1795,122 @@ mod tests {
         assert!(!session.is_pending_scope(&scope(&first)));
         session.mark_pending(0);
         assert!(session.is_pending_scope(&scope(&first)));
+    }
+
+    fn scope_for(session: &Session, counter: u64) -> String {
+        register_class(SCRIPT, CLASS);
+        let id = tagged_object_id(
+            &key(),
+            session.tag,
+            encrypt_counter(&session.counter_key, counter),
+        );
+        format!("{CLASS}:{}", durable_object_id_hex(&id))
+    }
+
+    /// A grant is held only while the session is open, and the seal takes its
+    /// gather and closes the session in one step: a grant either is in the
+    /// gather or is refused.
+    #[test]
+    fn a_grant_after_the_close_is_refused_and_is_not_in_the_gather() {
+        let session = established([5; 8]);
+        let early = scope_for(&session, 0);
+        let late = scope_for(&session, 1);
+        assert!(session.grant_scope(&early));
+        let gather = {
+            let granted = session.granted.lock().unwrap();
+            session.closed.store(true, Ordering::SeqCst);
+            granted.clone()
+        };
+        assert!(!session.grant_scope(&late), "refused once closed");
+        assert_eq!(gather, BTreeSet::from([0]));
+        assert!(!session.is_granted(1));
+        assert!(!session.grant_scope("not-a-scope"));
+    }
+
+    /// A grant that arrives while a chunk is being written keeps the chunk
+    /// dirty: the marker is cleared only when the written chunk holds every
+    /// grant of its range.
+    #[test]
+    fn a_grant_that_arrives_during_a_write_keeps_its_chunk_dirty() {
+        let session = established([6; 8]);
+        session.grant_scope(&scope_for(&session, 0));
+        let written = Chunk {
+            granted: BTreeSet::from([0]),
+            ..Chunk::default()
+        };
+        session.settle_dirty(0, &written);
+        assert!(session.dirty.lock().unwrap().is_empty());
+        // Counter 1 was granted after the snapshot that `written` was built from.
+        session.grant_scope(&scope_for(&session, 1));
+        session.settle_dirty(0, &written);
+        assert!(session.dirty.lock().unwrap().contains(&0));
+    }
+
+    #[test]
+    fn only_shadow_lets_a_failing_step_go() {
+        for (mode, fails_closed) in [(Mode::Shadow, false), (Mode::Read, true), (Mode::On, true)] {
+            assert_eq!(
+                Session::with_tag(mode, [7; 8], &[]).fails_closed(),
+                fails_closed
+            );
+        }
+        let before = shadow_failures().get("test_kind").copied().unwrap_or(0);
+        note_shadow_failure("test_kind", &"a step failed");
+        assert_eq!(shadow_failures()["test_kind"], before + 1);
+    }
+
+    /// The hold on the first object of a granted cell: in `shadow` it ends after
+    /// a short bound and lets the write go; the bound of a strict mode is the
+    /// long one.
+    #[tokio::test]
+    async fn the_hold_on_a_first_object_ends_in_shadow_and_is_an_error_when_strict() {
+        let shadow = established([8; 8]);
+        let scope = scope_for(&shadow, 0);
+        shadow.grant_scope(&scope);
+        let began = std::time::Instant::now();
+        wait_with(&shadow, &scope).await.expect("shadow lets it go");
+        assert!(began.elapsed() < std::time::Duration::from_secs(4));
+        // The same hold, with a short limit, is an error.
+        let error = hold_for_bit(&shadow, &scope, 0, 50).await;
+        assert!(error.is_err());
+        assert!(Session::with_tag(Mode::On, [9; 8], &[]).fails_closed());
+    }
+
+    /// A close that finds a chunk without this session's bits is an error, so
+    /// the log stays open and its recovery gathers the marks.
+    #[tokio::test]
+    async fn a_seal_that_finds_a_chunk_without_its_bits_is_an_error() {
+        crate::asyncrt::install_test_host_runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = crate::bucket::Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+        let session = Session::with_tag(Mode::Shadow, [4; 8], &[]);
+        session.open(&bucket, "n", "g").await.unwrap();
+        session.grant_scope(&scope_for(&session, 0));
+        // A rival sealed the session first, with nothing in it.
+        store::seal_session(&bucket, &session.tag(), &BTreeSet::new(), &BTreeSet::new())
+            .await
+            .unwrap();
+        assert!(session.seal(&bucket).await.is_err());
+        assert!(!session.sealed_with_bits.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn the_empty_chunk_of_an_earlier_attempt_is_reused() {
+        crate::asyncrt::install_test_host_runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = crate::bucket::Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+        let (first, token) = store::create_chunk(&bucket, "tag", 1).await.unwrap();
+        let (again, token_again) = store::create_chunk(&bucket, "tag", 1).await.unwrap();
+        assert_eq!((first, token), (again, token_again));
+        // A chunk that holds anything is not an earlier attempt's.
+        let (mut body, token) = store::create_chunk(&bucket, "tag", 2).await.unwrap();
+        body.granted.insert(3);
+        body.rev = 1;
+        store::swap_chunk(&bucket, "tag", 2, &body, &token)
+            .await
+            .unwrap()
+            .expect("written");
+        assert!(store::create_chunk(&bucket, "tag", 2).await.is_err());
     }
 
     #[test]

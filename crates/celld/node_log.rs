@@ -5726,6 +5726,17 @@ impl NodeLogManager {
                 // ~47 s for 180 entries — while rows within a cell stay
                 // ordered; any failure aborts the pass before the record
                 // can seal.
+                // The marks of the bundles of this window join the bits too, before
+                // any row of these bundles becomes a per-cell object, and an
+                // update that cannot be confirmed stops the uploads.
+                if let Some(session) = wire.session.as_ref() {
+                    crate::session_store::add_granted_bits(
+                        &self.bucket,
+                        &session.tag,
+                        &granted_marks,
+                    )
+                    .await?;
+                }
                 if gathered.is_empty() {
                     continue;
                 }

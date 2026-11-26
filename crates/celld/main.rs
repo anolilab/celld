@@ -4750,8 +4750,24 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     if let Some(session) = celld::session::current() {
         if let Ownership::Bucket(bucket_ownership) = &actor.ownership {
             let bucket = bucket_ownership.bucket_client();
-            celld::session::seal_predecessor(&bucket, &node, &process_generation).await?;
-            session.open(&bucket, &node, &process_generation).await?;
+            let opened = async {
+                celld::session::seal_predecessor(&bucket, &node, &process_generation).await?;
+                session.open(&bucket, &node, &process_generation).await
+            }
+            .await;
+            if let Err(error) = opened {
+                // In `shadow` nothing rests on the session, so a process that
+                // cannot open one runs without: it mints random ids and grants
+                // nothing. `read` and `on` rest on it and do not start.
+                if session.fails_closed() {
+                    return Err(error);
+                }
+                session.abandon();
+                tracing::warn!(
+                    %error,
+                    "the session could not be opened in shadow; running without one"
+                );
+            }
             let bucket = Arc::new(bucket);
             tokio::spawn(async move {
                 let interval = celld::session::checkpoint_interval();

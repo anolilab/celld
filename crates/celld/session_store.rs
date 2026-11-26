@@ -208,10 +208,19 @@ pub async fn create_chunk(
     chunk: u64,
 ) -> anyhow::Result<(Chunk, String)> {
     let body = Chunk::default();
-    let token = create(bucket, &chunk_key(tag, chunk), &body)
-        .await?
-        .with_context(|| format!("the chunk {} already exists", chunk_key(tag, chunk)))?;
-    Ok((body, token))
+    if let Some(token) = create(bucket, &chunk_key(tag, chunk), &body).await? {
+        return Ok((body, token));
+    }
+    // An earlier attempt of this session created it and did not count it. An
+    // open chunk that holds nothing is that attempt's and is reused; anything
+    // else is not ours.
+    match read_chunk(bucket, tag, chunk).await? {
+        Read::Found(found, token) if found == body => Ok((found, token)),
+        _ => anyhow::bail!(
+            "the chunk {} already exists and is not empty",
+            chunk_key(tag, chunk)
+        ),
+    }
 }
 
 /// Write `header` over the one read at `token`.
