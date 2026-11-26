@@ -224,6 +224,11 @@ pub(crate) struct Design {
     pub session_merges_chunk: bool,
     /// The bound of the carried set.
     pub carried_bound: usize,
+    /// The flush moves the marks of the followers' tails into the bundle with
+    /// the rows. Off, marks stay on the followers and reach the bucket only as
+    /// a bit in the chunk: a bundle never holds a mark, so no object waits for a
+    /// bundle and a follower truncates a mark only behind the chunk.
+    pub marks_ride_bundles: bool,
 }
 
 impl Design {
@@ -282,6 +287,7 @@ impl Design {
             trace_before_release: true,
             trace_before_marker: true,
             carried_bound: 2,
+            marks_ride_bundles: true,
         }
     }
 

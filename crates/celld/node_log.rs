@@ -36,6 +36,7 @@ use anyhow::anyhow;
 use anyhow::Context;
 use celld_logic::log_tier;
 use celld_logic::log_tier::LogState;
+use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
@@ -324,6 +325,9 @@ struct BundleIndex {
     /// cell needs its evicted bundles only until its per-cell coverage passes
     /// this cut, so a covered cell costs no bundle read.
     evicted: BTreeMap<(String, u64), u64>,
+    /// The counters of the `Grant` marks that each bundle carries. Bundle GC
+    /// keeps a bundle until every one of them is in a chunk.
+    marks: HashMap<String, Vec<u64>>,
 }
 
 /// One cell epoch's view of the index. The rows, the evicted bundles, and
@@ -429,9 +433,20 @@ impl BundleIndex {
         }
     }
 
+    fn set_marks(&mut self, key: &str, counters: Vec<u64>) {
+        if !counters.is_empty() {
+            self.marks.insert(key.to_string(), counters);
+        }
+    }
+
+    fn marks_of(&self, key: &str) -> Vec<u64> {
+        self.marks.get(key).cloned().unwrap_or_default()
+    }
+
     fn remove(&mut self, keys: &[String]) {
         let removed: BTreeSet<&str> = keys.iter().map(String::as_str).collect();
         for key in &removed {
+            self.marks.remove(*key);
             let Some(bundle) = self.bundles.remove(*key) else {
                 continue;
             };
@@ -831,6 +846,10 @@ impl LiveLogTransition<'_> {
 //                  u8 complete u32 count entry*
 //   entry:         "CLE1" u64 seq u16 cell_len cell u64 cell_epoch
 //                  u64 txid u32 len bytes
+//   mark entry:    "CLG1", the same fields with txid `MARK_TXID`: a mark of the
+//                  session (a `Grant`) is not a row. A decoder that does not know
+//                  the magic rejects the whole body, so marks are appended only
+//                  while every member of the ensemble advertises the capability.
 
 const APPEND_MAGIC: &[u8; 4] = b"CLA1";
 // Keep distinct layouts and decoded variants: reading an old peer's entries
@@ -838,6 +857,10 @@ const APPEND_MAGIC: &[u8; 4] = b"CLA1";
 const LEGACY_TAIL_MAGIC: &[u8; 4] = b"CLT1";
 const TAIL_MAGIC: &[u8; 4] = b"CLT2";
 const ENTRY_MAGIC: &[u8; 4] = b"CLE1";
+const MARK_MAGIC: &[u8; 4] = b"CLG1";
+
+/// The `txid` of a mark entry, which no transaction has.
+pub const MARK_TXID: u64 = u64::MAX;
 
 pub struct Entry {
     pub seq: u64,
@@ -907,9 +930,20 @@ fn take_string(buf: &mut &[u8], what: &str) -> anyhow::Result<String> {
         .to_string())
 }
 
+impl Entry {
+    /// Whether this is a mark of the session and not a row of a cell.
+    pub fn is_mark(&self) -> bool {
+        self.txid == MARK_TXID
+    }
+}
+
 #[doc(hidden)]
 pub fn encode_entry(entry: &Entry, out: &mut Vec<u8>) {
-    out.extend_from_slice(ENTRY_MAGIC);
+    out.extend_from_slice(if entry.is_mark() {
+        MARK_MAGIC
+    } else {
+        ENTRY_MAGIC
+    });
     out.extend_from_slice(&entry.seq.to_le_bytes());
     out.extend_from_slice(&(entry.cell.len() as u16).to_le_bytes());
     out.extend_from_slice(entry.cell.as_bytes());
@@ -920,7 +954,9 @@ pub fn encode_entry(entry: &Entry, out: &mut Vec<u8>) {
 }
 
 fn decode_entry(buf: &mut &[u8]) -> anyhow::Result<Entry> {
-    if take(buf, 4, "entry magic")? != ENTRY_MAGIC {
+    let magic = take(buf, 4, "entry magic")?;
+    let mark = magic == MARK_MAGIC;
+    if magic != ENTRY_MAGIC && !mark {
         return Err(anyhow!("log wire: bad entry magic"));
     }
     let seq = take_u64(buf, "entry seq")?;
@@ -929,6 +965,10 @@ fn decode_entry(buf: &mut &[u8]) -> anyhow::Result<Entry> {
     let txid = take_u64(buf, "entry txid")?;
     let len = take_u32(buf, "entry len")? as usize;
     let bytes = take(buf, len, "entry bytes")?.to_vec();
+    anyhow::ensure!(
+        mark == (txid == MARK_TXID),
+        "log wire: a mark and a row differ by txid"
+    );
     Ok(Entry {
         seq,
         cell,
@@ -2959,6 +2999,87 @@ impl StreamWindow {
     }
 }
 
+/// How the close looks at the per-cell layout before it decides to seal. A
+/// process without a session looks once, with no wait: the close is what it has
+/// always been. A session also writes its chunks, which releases the first
+/// per-cell objects of granted cells, and looks again for a bounded time that
+/// stays well inside the budget of a stop.
+/// Run `step` for at most what is left until `deadline` (monotonic milliseconds).
+/// `None` when nothing is left or the step does not finish in time.
+async fn within<T>(deadline: u64, step: impl std::future::Future<Output = T>) -> Option<T> {
+    let left = deadline.saturating_sub(mono_ms());
+    if left == 0 {
+        return None;
+    }
+    crate::asyncrt::timeout(std::time::Duration::from_millis(left), step)
+        .await
+        .ok()
+}
+
+struct CloseLooks {
+    attempts: u32,
+    budget_ms: u64,
+}
+
+fn close_looks(session: bool) -> CloseLooks {
+    if session {
+        CloseLooks {
+            attempts: 20,
+            budget_ms: 10_000,
+        }
+    } else {
+        CloseLooks {
+            attempts: 1,
+            budget_ms: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod close_looks_tests {
+    use super::{close_looks, mono_ms, within};
+
+    #[test]
+    fn a_close_without_a_session_looks_once_and_waits_for_nothing() {
+        let looks = close_looks(false);
+        assert_eq!((looks.attempts, looks.budget_ms), (1, 0));
+    }
+
+    /// A step that never finishes is cut at the deadline, and a step that is
+    /// asked after it is not started: the loop of the close cannot outlive its
+    /// budget by waiting on a slow store.
+    #[tokio::test]
+    async fn a_slow_step_of_the_close_is_cut_at_the_deadline() {
+        crate::asyncrt::install_test_host_runtime();
+        let began = mono_ms();
+        let deadline = began + 300;
+        let slow = within(
+            deadline,
+            crate::asyncrt::sleep(std::time::Duration::from_secs(60)),
+        );
+        assert!(slow.await.is_none());
+        assert!(
+            mono_ms() - began < 2_000,
+            "returned within the budget and a margin"
+        );
+        assert!(
+            within(deadline, async { 1 }).await.is_none(),
+            "nothing is left"
+        );
+        assert_eq!(within(mono_ms() + 10_000, async { 1 }).await, Some(1));
+    }
+
+    #[test]
+    fn a_close_with_a_session_is_bounded_well_inside_a_stop() {
+        let looks = close_looks(true);
+        assert!(looks.attempts > 1);
+        assert!(looks.budget_ms <= 15_000, "{}", looks.budget_ms);
+    }
+}
+
+/// How long an ensemble must have been active before a grant relies on it.
+const PROVING_SETTLE_MS: u64 = 1_500;
+
 /// The fleet shipper for ONE ensemble at one epoch: assigns sequence
 /// numbers, POSTs one in-flight batch to every member, and reports
 /// all-acked. One batch at a time is what keeps each follower's fragment
@@ -3003,9 +3124,18 @@ pub struct FleetShipper {
     /// The stream window, when `CELLD_LOG_WINDOW` enables it. `None` keeps
     /// the round-bounded ship loop unchanged.
     stream: Option<Arc<StreamWindow>>,
+    /// When this shipper was installed, in monotonic milliseconds.
+    installed_ms: u64,
 }
 
 impl crate::ltx_repl::Shipper for FleetShipper {
+    fn members(&self) -> Vec<(String, String)> {
+        self.members
+            .iter()
+            .map(|member| (member.node.clone(), member.generation.clone()))
+            .collect()
+    }
+
     fn ship(
         &self,
         batch: Vec<ShipEntry>,
@@ -4640,6 +4770,21 @@ impl crate::ltx_repl::Shipper for NodeLogManager {
             .map_or(1, |shipper| shipper.pipeline)
     }
 
+    fn members(&self) -> Vec<(String, String)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|shipper| {
+                shipper
+                    .members
+                    .iter()
+                    .map(|member| (member.node.clone(), member.generation.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn active(&self) -> bool {
         self.inner
             .lock()
@@ -5310,6 +5455,8 @@ impl NodeLogManager {
             // possible fleet acknowledgements may declare bounded loss.
             let mut inconclusive = 0_usize;
             let mut gathered: BTreeMap<(String, u64, u64), Vec<u8>> = BTreeMap::new();
+            // The cells whose `Grant` the followers hold.
+            let mut granted_marks: BTreeSet<String> = BTreeSet::new();
             // "A blink is not death" applies to loss declaration too: a
             // member whose lease merely lapsed (a restart, a fleet-wide
             // power cycle) is NOT conclusively gone — its fsync'd fragments
@@ -5466,6 +5613,10 @@ impl NodeLogManager {
                     }
                 }
                 for entry in tail.entries {
+                    if entry.is_mark() {
+                        granted_marks.insert(entry.cell);
+                        continue;
+                    }
                     gathered.insert((entry.cell, entry.cell_epoch, entry.txid), entry.bytes);
                 }
             }
@@ -5571,6 +5722,20 @@ impl NodeLogManager {
             let mut bundles_ms = 0_u64;
             let mut upload_ms = 0_u64;
             let mut gathered_bytes = 0_u64;
+            // The bits of the marks that only the followers held go into the
+            // chunks before any row from their tails becomes a per-cell object.
+            let mut bits_added_for = 0_usize;
+            if let Some(session) = wire.session.as_ref() {
+                crate::session_store::add_granted_bits(&self.bucket, &session.tag, &granted_marks)
+                    .await?;
+                bits_added_for = granted_marks.len();
+            }
+            // Whether the dead session rested on its marks: only `read` and `on`
+            // do.
+            let marks_matter = wire
+                .session
+                .as_ref()
+                .is_some_and(|session| session.mode != crate::session::Mode::Shadow);
             let mut tail = Some(std::mem::take(&mut gathered));
             for (index, window) in windows.into_iter().enumerate() {
                 let fetch_started = mono_ms();
@@ -5593,6 +5758,19 @@ impl NodeLogManager {
                     let (key, bytes) = fetched?;
                     let rows = celld_ltx::bundle::decode_rows(&bytes)
                         .with_context(|| format!("decode retained recovery bundle {key}"))?;
+                    match celld_ltx::bundle::decode_marks(&bytes) {
+                        Ok(marks) => granted_marks.extend(marks),
+                        // The rows are what recovery is for. Marks only matter to a
+                        // session that rests on them (`read` and `on`); any other
+                        // recovers the rows, counts the bundle, and goes on.
+                        Err(error) if !marks_matter => {
+                            crate::session::note_marks_unreadable(&key, &error);
+                        }
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("decode the marks of bundle {key}"));
+                        }
+                    }
                     for row in rows {
                         let payload = celld_ltx::bundle::slice(&bytes, &row)
                             .with_context(|| format!("read a row from recovery bundle {key}"))?;
@@ -5623,6 +5801,20 @@ impl NodeLogManager {
                 // ~47 s for 180 entries — while rows within a cell stay
                 // ordered; any failure aborts the pass before the record
                 // can seal.
+                // The marks of the bundles of this window join the bits too, before
+                // any row of these bundles becomes a per-cell object, and an
+                // update that cannot be confirmed stops the uploads.
+                if let Some(session) = wire.session.as_ref() {
+                    if granted_marks.len() != bits_added_for {
+                        crate::session_store::add_granted_bits(
+                            &self.bucket,
+                            &session.tag,
+                            &granted_marks,
+                        )
+                        .await?;
+                        bits_added_for = granted_marks.len();
+                    }
+                }
                 if gathered.is_empty() {
                     continue;
                 }
@@ -5641,6 +5833,17 @@ impl NodeLogManager {
                     )
                     .await?;
                 upload_ms += mono_ms().saturating_sub(upload_started);
+            }
+            // The dead session's header and chunks are sealed after the gather
+            // and before its log record is marked sealed.
+            if let Some(session) = wire.session.as_ref() {
+                crate::session_store::seal_session(
+                    &self.bucket,
+                    &session.tag,
+                    &BTreeSet::new(),
+                    &granted_marks,
+                )
+                .await?;
             }
             // The record is re-read for the token the beats moved.
             let mut sealed = false;
@@ -5742,6 +5945,16 @@ impl NodeLogManager {
         shipper.outstanding.load(Ordering::SeqCst) > 0
     }
 
+    /// Seal the session's header and chunks when it has no log to seal. A
+    /// failure leaves them open for the next process to seal.
+    async fn seal_session_without_log(&self) {
+        if let Some(session) = crate::session::current() {
+            if let Err(error) = session.seal(&self.bucket).await {
+                warn!(%error, "node-log close: the session could not be sealed");
+            }
+        }
+    }
+
     /// The graceful-shutdown drain point: stop fleet acks, wait for the
     /// ticking bundle loop to tier what was shipped, then seal our own
     /// record. The next incarnation finds Sealed and opens a fresh epoch
@@ -5761,7 +5974,14 @@ impl NodeLogManager {
             self.closing.store(true, Ordering::SeqCst);
             self.inner.lock().unwrap().clone()
         };
-        let Some(shipper) = shipper else { return };
+        let Some(shipper) = shipper else {
+            // No shipper: this session never acknowledged past the bucket, so
+            // no row is left for a gather and nothing gates the seal of its
+            // header and chunks. A sealed header says that every acknowledged
+            // row is a per-cell object, which holds here trivially.
+            self.seal_session_without_log().await;
+            return;
+        };
         shipper.degrade("graceful shutdown");
         for _ in 0..50 {
             if self.ltx.all_shipped_tiered() {
@@ -5781,6 +6001,8 @@ impl NodeLogManager {
         // and buffered stdout may never flush before exit.
         let Some(current) = transition.current() else {
             eprintln!("node-log close: no folded log; nothing to seal");
+            // No log means no acknowledgement past the bucket (see above).
+            self.seal_session_without_log().await;
             return;
         };
         let Ok(record) = log_from_wire(&current) else {
@@ -5798,11 +6020,110 @@ impl NodeLogManager {
         // hour sealed 1,300 acked rows into orphanhood behind epoch 156.
         // An Open record is always safe: the next incarnation's recovery
         // drains the bundles.
-        let per_cell_complete = self.ltx.all_tails_tiered()
-            && match self.uncovered_bundle_rows().await {
-                Ok(uncovered) => uncovered.is_empty(),
-                Err(_) => false,
-            };
+        // The first per-cell object of a cell that the session granted is held until
+        // the grant is in a chunk: write the chunks first, which releases those
+        // uploads, and look again for as long as they are still on their way.
+        let mut tails_tiered = false;
+        let mut uncovered_rows = None;
+        let mut uncovered_cells: Option<Vec<(String, u64)>> = None;
+        let looks = close_looks(crate::session::current().is_some());
+        let deadline = mono_ms().saturating_add(looks.budget_ms);
+        if looks.attempts == 1 && looks.budget_ms == 0 {
+            // No session: one look, as the close has always taken it.
+            tails_tiered = self.ltx.all_tails_tiered();
+            if tails_tiered {
+                uncovered_rows = self
+                    .uncovered_bundle_rows()
+                    .await
+                    .ok()
+                    .map(|uncovered| uncovered.len());
+            }
+        } else {
+            for attempt in 0..looks.attempts {
+                // Every wait of the loop is under the one deadline: a store that
+                // answers slowly cannot take the close past its budget.
+                if let Some(session) = crate::session::current() {
+                    match within(deadline, session.checkpoint(&self.bucket)).await {
+                        Some(Err(error)) => {
+                            warn!(%error, "node-log close: the session could not write its chunks");
+                        }
+                        Some(Ok(())) => {}
+                        None => {
+                            warn!("node-log close: the budget ended while the session wrote its chunks");
+                            break;
+                        }
+                    }
+                }
+                tails_tiered = self.ltx.all_tails_tiered();
+                let Some(scanned) = within(deadline, self.uncovered_bundle_rows()).await else {
+                    uncovered_rows = None;
+                    warn!("node-log close: the budget ended while the bundles were scanned");
+                    break;
+                };
+                uncovered_rows = match scanned {
+                    Ok(uncovered) => {
+                        if attempt + 1 == looks.attempts || (tails_tiered && uncovered.is_empty()) {
+                            for (cell, epoch, txid) in uncovered.keys().take(3) {
+                                let facts = crate::session::current().and_then(|session| {
+                                    let counter = session.own_counter_of_scope(cell)?;
+                                    Some((
+                                        session.is_granted(counter),
+                                        session.is_checkpointed(counter),
+                                    ))
+                                });
+                                debug!(
+                                    cell = %cell,
+                                    epoch,
+                                    txid,
+                                    ?facts,
+                                    watermarks = ?self.ltx.watermarks(cell, *epoch),
+                                    "node-log close: a row of the bundles is not in its cell's objects"
+                                );
+                            }
+                        }
+                        uncovered_cells = Some(
+                            uncovered
+                                .keys()
+                                .map(|(cell, epoch, _)| (cell.clone(), *epoch))
+                                .collect::<BTreeSet<_>>()
+                                .into_iter()
+                                .collect(),
+                        );
+                        Some(uncovered.len())
+                    }
+                    Err(_) => None,
+                };
+                if let Some(cells) = &uncovered_cells {
+                    // The rows of a cell that no per-cell object covers are put there by
+                    // the direct pass that a handoff runs, with the grants in their chunks.
+                    let left = deadline.saturating_sub(mono_ms());
+                    let wait = std::time::Duration::from_millis(left.min(10_000));
+                    let synced = futures_util::stream::iter(cells.iter().cloned())
+                        .for_each_concurrent(16, |(cell, epoch)| async move {
+                            self.ltx.sync_wait(&cell, epoch, wait).await;
+                        });
+                    if within(deadline, synced).await.is_none() {
+                        break;
+                    }
+                }
+                if tails_tiered && uncovered_rows == Some(0) {
+                    if attempt > 0 {
+                        debug!(attempt, "node-log close: the per-cell layout is complete");
+                    }
+                    break;
+                }
+                if within(
+                    deadline,
+                    crate::asyncrt::sleep(std::time::Duration::from_millis(250)),
+                )
+                .await
+                .is_none()
+                {
+                    break;
+                }
+            }
+        }
+        let per_cell_complete = tails_tiered && uncovered_rows == Some(0);
         if !log_tier::graceful_seal_allowed(
             &record,
             shipper.epoch,
@@ -5810,10 +6131,21 @@ impl NodeLogManager {
             per_cell_complete,
         ) {
             eprintln!(
-                "node-log close: not sealable (record epoch {} state {:?}, shipper epoch {}); record left open",
-                record.epoch, record.state, shipper.epoch
+                "node-log close: not sealable (record epoch {} state {:?}, shipper epoch {}, batch in flight {}, per-cell layout complete {per_cell_complete}: tails tiered {tails_tiered}, uncovered bundle rows {uncovered_rows:?}); record left open",
+                record.epoch,
+                record.state,
+                shipper.epoch,
+                Self::shipper_batch_in_flight(&shipper)
             );
             return;
+        }
+        // The seal of the session's header and chunks comes before the log is
+        // marked sealed. A failure leaves both open for the next process.
+        if let Some(session) = crate::session::current() {
+            if let Err(error) = session.seal(&self.bucket).await {
+                warn!(%error, "node-log close: the session could not be sealed");
+                return;
+            }
         }
         let sealed = log_tier::LogRecord {
             state: LogState::Sealed,
@@ -5911,6 +6243,19 @@ impl NodeLogManager {
             .unwrap()
             .as_ref()
             .is_some_and(|shipper| shipper.is_active() && !shipper.members.is_empty())
+    }
+
+    /// Whether the installed ensemble can be expected to prove a mark: it is
+    /// active and has outlived [`PROVING_SETTLE_MS`]. A member that is gone
+    /// but whose lease has not expired fails the first append of every ensemble
+    /// that names it, a second or less after the ensemble opens, so a mark
+    /// taken by a younger ensemble would not be proven.
+    pub fn proving(&self) -> bool {
+        self.inner.lock().unwrap().as_ref().is_some_and(|shipper| {
+            shipper.is_active()
+                && !shipper.members.is_empty()
+                && mono_ms().saturating_sub(shipper.installed_ms) >= PROVING_SETTLE_MS
+        })
     }
 
     fn shutdown_local_fallback(&self) {
@@ -6199,6 +6544,7 @@ impl NodeLogManager {
             outstanding: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             policy: self.policy.clone(),
             stream,
+            installed_ms: mono_ms(),
         }));
         // The successor record and its in-memory shipper form one state
         // transition. Keep shutdown excluded until both values are visible.
@@ -6611,9 +6957,9 @@ impl NodeLogManager {
             }
             let key = meta.key;
             *cursor = Some(key.clone());
-            let indexed = {
+            let (indexed, mut marks) = {
                 let index = self.bundle_index.lock().unwrap();
-                index.rows(&key)
+                (index.rows(&key), index.marks_of(&key))
             };
             let rows = match indexed {
                 Some(rows) => rows,
@@ -6621,12 +6967,30 @@ impl NodeLogManager {
                     let Ok(Some((bytes, _))) = self.bucket.get(&key).await else {
                         continue;
                     };
+                    // A bundle that this process did not index: its marks are
+                    // in its footer.
+                    if let (Some(session), Ok(cells)) = (
+                        crate::session::current(),
+                        celld_ltx::bundle::decode_marks(&bytes),
+                    ) {
+                        marks.extend(
+                            cells
+                                .iter()
+                                .filter_map(|cell| session.own_counter_of_scope(cell)),
+                        );
+                    }
                     match celld_ltx::bundle::decode_rows(&bytes) {
                         Ok(rows) => rows,
                         Err(_) => continue,
                     }
                 }
             };
+            // A bundle that carries a `Grant` is kept until its bit is in a
+            // chunk: a `Grant` of a cell that never committed leaves no other
+            // trace in the bucket.
+            if !crate::session::marks_checkpointed(&marks) {
+                continue;
+            }
             let mut paired = Vec::with_capacity(rows.len());
             for row in &rows {
                 let cache_key = (row.cell.clone(), row.cell_epoch);
@@ -6987,6 +7351,24 @@ impl NodeLogManager {
             }
         };
         let seq = self.bundle_seq.fetch_add(1, Ordering::SeqCst);
+        // The `Grant` marks that no chunk holds yet ride the bundle with its
+        // rows, as entries with no bytes.
+        let mut entries = entries;
+        let mark_counters: Vec<u64> = match crate::session::current() {
+            Some(session) => {
+                let marks = session.unchecked_mark_scopes();
+                for (_, scope) in &marks {
+                    entries.push(celld_ltx::bundle::BundleEntry {
+                        cell: scope.clone(),
+                        cell_epoch: 1,
+                        txid: celld_ltx::bundle::MARK_TXID,
+                        bytes: Vec::new(),
+                    });
+                }
+                marks.into_iter().map(|(counter, _)| counter).collect()
+            }
+            None => Vec::new(),
+        };
         let body = match celld_ltx::bundle::encode(&entries) {
             Ok(body) => body,
             Err(error) => {
@@ -7040,7 +7422,11 @@ impl NodeLogManager {
                     warn!(key, "bundle flush not credited: record moved");
                     return false;
                 }
-                self.bundle_index.lock().unwrap().insert(key, rows);
+                {
+                    let mut index = self.bundle_index.lock().unwrap();
+                    index.set_marks(&key, mark_counters);
+                    index.insert(key, rows);
+                }
                 true
             }
             Err(error) => {
@@ -7279,7 +7665,7 @@ impl NodeLogManager {
                 );
             }
             for entry in tail.entries {
-                if entry.cell != cell {
+                if entry.cell != cell || entry.is_mark() {
                     continue;
                 }
                 gathered
@@ -7796,5 +8182,87 @@ mod recover_mode_tests {
             !RecoverMode::Boot.passes_gate(),
             "another node's log recovered on a cold route stays behind the gate"
         );
+    }
+}
+
+#[cfg(test)]
+mod mark_wire_tests {
+    use super::*;
+
+    fn row() -> Entry {
+        Entry {
+            seq: 7,
+            cell: "C:ab".into(),
+            cell_epoch: 3,
+            txid: 9,
+            bytes: vec![1, 2, 3],
+        }
+    }
+
+    fn mark() -> Entry {
+        Entry {
+            seq: 8,
+            cell: "C:ab".into(),
+            cell_epoch: 1,
+            txid: MARK_TXID,
+            bytes: vec![b'G'],
+        }
+    }
+
+    /// A row is encoded as before marks existed: the bytes of a node with the
+    /// flag `off` are unchanged.
+    #[test]
+    fn a_row_keeps_its_bytes() {
+        let mut out = Vec::new();
+        encode_entry(&row(), &mut out);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"CLE1");
+        expected.extend_from_slice(&7_u64.to_le_bytes());
+        expected.extend_from_slice(&4_u16.to_le_bytes());
+        expected.extend_from_slice(b"C:ab");
+        expected.extend_from_slice(&3_u64.to_le_bytes());
+        expected.extend_from_slice(&9_u64.to_le_bytes());
+        expected.extend_from_slice(&3_u32.to_le_bytes());
+        expected.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn a_mark_has_its_own_magic_and_round_trips_in_an_append_and_a_tail() {
+        let mut out = Vec::new();
+        encode_entry(&mark(), &mut out);
+        assert_eq!(&out[..4], b"CLG1");
+        let request = AppendReq {
+            leader: "n/g".into(),
+            epoch: 1,
+            truncate_to: 0,
+            entries: vec![row(), mark()],
+        };
+        let decoded = decode_append(&encode_append(&request)).unwrap();
+        assert!(!decoded.entries[0].is_mark());
+        assert!(decoded.entries[1].is_mark());
+        assert_eq!(decoded.entries[1].cell, "C:ab");
+        // A decoder that only knows `CLE1` rejects the body: the first entry of
+        // a batch of marks is refused, and so is a mark behind a row.
+        let body = encode_append(&request);
+        let first_mark = body
+            .windows(4)
+            .position(|window| window == b"CLG1")
+            .expect("a mark in the body");
+        let mut old = body.clone();
+        old[first_mark + 3] = b'E';
+        assert!(decode_append(&old).is_err(), "a mark is not a row");
+    }
+
+    #[test]
+    fn a_row_cannot_pose_as_a_mark_or_the_reverse() {
+        let mut out = Vec::new();
+        encode_entry(&mark(), &mut out);
+        out[..4].copy_from_slice(b"CLE1");
+        assert!(decode_entry(&mut out.as_slice()).is_err());
+        let mut out = Vec::new();
+        encode_entry(&row(), &mut out);
+        out[..4].copy_from_slice(b"CLG1");
+        assert!(decode_entry(&mut out.as_slice()).is_err());
     }
 }

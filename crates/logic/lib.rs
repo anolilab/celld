@@ -37,6 +37,7 @@ pub mod restore;
 pub mod routing;
 pub mod schedule;
 pub mod session;
+pub mod session_take;
 pub mod sqlite;
 pub mod sweep;
 pub mod wake;
@@ -892,6 +893,10 @@ pub struct State {
     /// `None` is a process that writes no session: every record is compared
     /// by node name, as an older binary does.
     session: Option<session::SessionTags>,
+    /// Whether the session still acts. A process that could not open its session
+    /// in `shadow` gives it up, and from then on compares and writes as a process
+    /// without one. `None` means it always acts.
+    session_active: Option<fn() -> bool>,
     /// Reads the tag in the id of a cell. Set on every node that verifies
     /// tagged ids, with or without a session of its own: a tagged id belongs
     /// to the session that minted it at epoch 1, whoever else claims it.
@@ -969,6 +974,7 @@ impl State {
             memory_headroom: false,
             shed_reason: None,
             session: None,
+            session_active: None,
             id_tag: None,
             id_unissued: None,
             resumed: BTreeMap::new(),
@@ -987,6 +993,18 @@ impl State {
         self.session = Some(tags);
     }
 
+    /// Ask `active` whether the session still acts, each time it matters.
+    pub fn set_session_active(&mut self, active: fn() -> bool) {
+        self.session_active = Some(active);
+    }
+
+    /// The tags of the session, while it acts.
+    fn session_tags(&self) -> Option<&session::SessionTags> {
+        self.session
+            .as_ref()
+            .filter(|_| self.session_active.is_none_or(|active| active()))
+    }
+
     /// Read the tag of a cell's id with `id_tag`, so the first record of a
     /// tagged id starts at the epoch its minting session does not share.
     pub fn set_id_tag(&mut self, id_tag: session::IdTagOf) {
@@ -1002,7 +1020,7 @@ impl State {
     /// process resumed in a preserved restart.
     fn names_this_process(&self, cell: &str, record: &OwnerRecord) -> bool {
         record.node.as_deref() == Some(self.node.as_str())
-            && self.session.as_ref().is_none_or(|tags| {
+            && self.session_tags().is_none_or(|tags| {
                 record.by.as_deref().is_none_or(|by| {
                     tags.is_own(Some(by))
                         || self
@@ -1020,15 +1038,14 @@ impl State {
     fn written_by_this_process(&self, record: &OwnerRecord) -> bool {
         record.node.as_deref() == Some(self.node.as_str())
             && self
-                .session
-                .as_ref()
+                .session_tags()
                 .is_none_or(|tags| record.by.as_deref() == Some(tags.own()))
     }
 
     /// The epoch of the first record of `cell`.
     fn first_record_epoch(&self, cell: &str) -> Epoch {
         let id_tag = self.id_tag.and_then(|id_tag| id_tag(cell));
-        let own = self.session.as_ref().map(session::SessionTags::own);
+        let own = self.session_tags().map(session::SessionTags::own);
         session::first_record_epoch(own, id_tag.as_deref())
     }
 
@@ -2231,7 +2248,7 @@ impl State {
         // its predecessor's certificate named, so that it knows the tag of the
         // record it serves under and carries it in its lease. Any other cell
         // takes the normal claim path.
-        if self.session.is_some() {
+        if self.session_tags().is_some() {
             cells.retain(|cell| {
                 self.resumed
                     .get(&cell.id)
@@ -7733,6 +7750,8 @@ mod reset_tests;
 mod scripted;
 #[cfg(test)]
 mod second_release_tests;
+#[cfg(test)]
+mod session_take_tests;
 #[cfg(test)]
 mod session_tests;
 #[cfg(test)]

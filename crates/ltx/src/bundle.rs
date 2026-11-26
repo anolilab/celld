@@ -16,6 +16,19 @@ use crate::TXID;
 
 const MAGIC: &[u8; 4] = b"CLB1";
 
+/// The `txid` of a mark in a [`BundleEntry`]: an entry that names a cell and
+/// carries no bytes. A mark is a fact about the session that wrote the bundle
+/// (the `Grant` of a cell), not a transaction. It is not a row of the footer:
+/// the marks are kept in a block at the end of the data section, after every
+/// row, so a reader that knows only rows (any build from before marks) sees the
+/// bundle as it always was, rows in the footer and the rest of the data
+/// ignored, and a bundle that carries marks stays readable to it.
+pub const MARK_TXID: u64 = u64::MAX;
+
+/// The end of the marks block: `[u16 len | cell]*`, the length of those entries
+/// as a little-endian u32, and this magic, as the last bytes of the data section.
+const MARKS_MAGIC: &[u8; 4] = b"CLG1";
+
 fn malformed(what: &str) -> Error {
     Error::Other(format!("bundle: {what}").into())
 }
@@ -62,7 +75,18 @@ pub struct BundleEntry {
 pub fn encode(entries: &[BundleEntry]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut footer = Vec::new();
+    let mut marks = Vec::new();
     for entry in entries {
+        if entry.txid == MARK_TXID {
+            let cell = entry.cell.as_bytes();
+            let cell_len: u16 = cell
+                .len()
+                .try_into()
+                .map_err(|_| malformed("cell name too long"))?;
+            marks.extend_from_slice(&cell_len.to_le_bytes());
+            marks.extend_from_slice(cell);
+            continue;
+        }
         let cell = entry.cell.as_bytes();
         let cell_len: u16 = cell
             .len()
@@ -80,6 +104,15 @@ pub fn encode(entries: &[BundleEntry]) -> Result<Vec<u8>> {
         }
         out.extend_from_slice(&entry.bytes);
     }
+    if !marks.is_empty() {
+        let marks_len: u32 = marks
+            .len()
+            .try_into()
+            .map_err(|_| malformed("marks too large"))?;
+        out.extend_from_slice(&marks);
+        out.extend_from_slice(&marks_len.to_le_bytes());
+        out.extend_from_slice(MARKS_MAGIC);
+    }
     let len: u32 = footer
         .len()
         .try_into()
@@ -90,8 +123,63 @@ pub fn encode(entries: &[BundleEntry]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// The rows, from a complete bundle object.
+/// The rows, from a complete bundle object. Marks are left out.
 pub fn decode_rows(bundle: &[u8]) -> Result<Vec<BundleRow>> {
+    Ok(decode_footer(bundle)?
+        .into_iter()
+        .filter(|row| row.txid != MARK_TXID)
+        .collect())
+}
+
+/// The cells whose mark a bundle carries.
+pub fn decode_marks(bundle: &[u8]) -> Result<Vec<String>> {
+    let (data, _) = split_data_and_footer(bundle)?;
+    if data.len() < 8 || &data[data.len() - 4..] != MARKS_MAGIC {
+        return Ok(Vec::new());
+    }
+    // A bundle that main wrote ends in its rows: bytes that look like a trailer
+    // there belong to a row, not to a marks block, and a valid bundle never
+    // errors on them. A trailer counts only when it sits wholly after every row.
+    let rows_end = decode_footer(bundle)?
+        .iter()
+        .map(|row| row.offset.saturating_add(row.len))
+        .max()
+        .unwrap_or(0);
+    let end = data.len() - 8;
+    if (end as u64) < rows_end {
+        return Ok(Vec::new());
+    }
+    let marks_len = u32::from_le_bytes(data[data.len() - 8..data.len() - 4].try_into().unwrap());
+    // The trailer is there, after the rows, so the bundle was written with marks:
+    // a length that the bytes between the rows and the trailer cannot hold is a
+    // corrupt block.
+    let room = end - usize::try_from(rows_end).unwrap_or(end);
+    if marks_len as usize > room {
+        return Err(malformed("marks block longer than the data"));
+    }
+    let start = end - marks_len as usize;
+    let mut block = &data[start..end];
+    let mut cells = Vec::new();
+    while !block.is_empty() {
+        if block.len() < 2 {
+            return Err(malformed("truncated mark"));
+        }
+        let cell_len = u16::from_le_bytes(block[..2].try_into().unwrap()) as usize;
+        block = &block[2..];
+        if block.len() < cell_len {
+            return Err(malformed("truncated mark"));
+        }
+        cells.push(
+            std::str::from_utf8(&block[..cell_len])
+                .map_err(|_| malformed("cell name not utf-8"))?
+                .to_string(),
+        );
+        block = &block[cell_len..];
+    }
+    Ok(cells)
+}
+
+fn decode_footer(bundle: &[u8]) -> Result<Vec<BundleRow>> {
     let (_, mut footer) = split_data_and_footer(bundle)?;
     let mut rows = Vec::new();
     while !footer.is_empty() {
@@ -135,4 +223,152 @@ pub fn slice<'a>(bundle: &'a [u8], row: &BundleRow) -> Result<&'a [u8]> {
         return Err(malformed("row overruns the data section"));
     }
     Ok(&data[start..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(cell: &str, txid: u64, bytes: &[u8]) -> BundleEntry {
+        BundleEntry {
+            cell: cell.into(),
+            cell_epoch: 1,
+            txid,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_bundle_without_marks_keeps_its_bytes() {
+        let body = encode(&[entry("c", 1, b"abc")]).unwrap();
+        let mut expected = b"abc".to_vec();
+        let mut footer = Vec::new();
+        footer.extend_from_slice(&1_u16.to_le_bytes());
+        footer.extend_from_slice(b"c");
+        for value in [1_u64, 1, 0, 3] {
+            footer.extend_from_slice(&value.to_le_bytes());
+        }
+        expected.extend_from_slice(&footer);
+        expected.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+        expected.extend_from_slice(b"CLB1");
+        assert_eq!(body, expected);
+    }
+
+    /// A build from before marks reads the footer rows and the data they point
+    /// at, and nothing else: a bundle with marks decodes for it as a bundle
+    /// without, and its rows slice as they did.
+    #[test]
+    fn a_reader_that_knows_only_rows_sees_a_bundle_with_marks_unchanged() {
+        let with = encode(&[
+            entry("c", 1, b"abc"),
+            entry("d", MARK_TXID, b""),
+            entry("e", 2, b"xy"),
+            entry("f", MARK_TXID, b""),
+        ])
+        .unwrap();
+        let without = encode(&[entry("c", 1, b"abc"), entry("e", 2, b"xy")]).unwrap();
+        // The footer, which is all that such a reader parses, is byte for byte the
+        // same, and the rows are the same two.
+        let (_, footer_with) = split_data_and_footer(&with).unwrap();
+        let (_, footer_without) = split_data_and_footer(&without).unwrap();
+        assert_eq!(footer_with, footer_without);
+        for row in decode_footer(&with).unwrap() {
+            assert_ne!(row.txid, MARK_TXID, "no row of the footer is a mark");
+            assert_eq!(slice(&with, &row).unwrap(), slice(&without, &row).unwrap());
+        }
+        assert_eq!(decode_marks(&with).unwrap(), ["d", "f"]);
+        assert!(decode_marks(&without).unwrap().is_empty());
+    }
+
+    /// A marks block that does not parse is an error of `decode_marks` alone: the
+    /// rows of the bundle still decode, so a recovery that does not rest on marks
+    /// can go on with them.
+    #[test]
+    fn a_corrupt_marks_block_spoils_the_marks_and_not_the_rows() {
+        let mut data = b"abc".to_vec();
+        // A mark that names five bytes and has one.
+        let block = [5_u8, 0, b'x'];
+        data.extend_from_slice(&block);
+        data.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        data.extend_from_slice(MARKS_MAGIC);
+        let mut footer = Vec::new();
+        footer.extend_from_slice(&1_u16.to_le_bytes());
+        footer.extend_from_slice(b"c");
+        for value in [1_u64, 1, 0, 3] {
+            footer.extend_from_slice(&value.to_le_bytes());
+        }
+        data.extend_from_slice(&footer);
+        data.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+        data.extend_from_slice(MAGIC);
+        assert!(decode_marks(&data).is_err());
+        let rows = decode_rows(&data).unwrap();
+        assert_eq!(slice(&data, &rows[0]).unwrap(), b"abc");
+    }
+
+    /// A bundle that main wrote has no marks block: it decodes to its rows, no
+    /// marks and no error, whatever bytes its rows end with.
+    #[test]
+    fn a_bundle_built_without_marks_decodes_with_no_marks_and_no_error() {
+        let mut data = b"abcCLG1".to_vec();
+        let mut footer = Vec::new();
+        footer.extend_from_slice(&1_u16.to_le_bytes());
+        footer.extend_from_slice(b"c");
+        for value in [1_u64, 1, 0, 7] {
+            footer.extend_from_slice(&value.to_le_bytes());
+        }
+        data.extend_from_slice(&footer);
+        data.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+        data.extend_from_slice(MAGIC);
+        assert_eq!(decode_marks(&data).unwrap(), Vec::<String>::new());
+        assert_eq!(decode_rows(&data).unwrap().len(), 1);
+        let plain = encode(&[entry("c", 1, b"abc")]).unwrap();
+        assert!(decode_marks(&plain).unwrap().is_empty());
+    }
+
+    /// Row bytes that end like a trailer are a row's, whatever length they seem to
+    /// declare: a valid bundle of main's never errors on them.
+    #[test]
+    fn row_bytes_that_end_like_a_trailer_decode_to_no_marks() {
+        for length in [u32::MAX, 2] {
+            let mut row = b"xxxxxxxx".to_vec();
+            row.extend_from_slice(&length.to_le_bytes());
+            row.extend_from_slice(MARKS_MAGIC);
+            let body = encode(&[entry("c", 1, &row)]).unwrap();
+            assert_eq!(
+                decode_marks(&body).unwrap(),
+                Vec::<String>::new(),
+                "{length}"
+            );
+            let rows = decode_rows(&body).unwrap();
+            assert_eq!(slice(&body, &rows[0]).unwrap(), row.as_slice());
+        }
+    }
+
+    /// A real trailer after the rows whose length does not fit is a corrupt block.
+    #[test]
+    fn a_marks_trailer_longer_than_the_data_is_an_error() {
+        let mut data = b"ab".to_vec();
+        data.extend_from_slice(&1_000_u32.to_le_bytes());
+        data.extend_from_slice(MARKS_MAGIC);
+        data.extend_from_slice(&0_u32.to_le_bytes());
+        data.extend_from_slice(MAGIC);
+        assert!(decode_marks(&data).is_err());
+    }
+
+    #[test]
+    fn a_mark_is_not_a_row_and_is_read_apart() {
+        let body = encode(&[
+            entry("c", 1, b"abc"),
+            entry("d", MARK_TXID, b""),
+            entry("e", 2, b"xy"),
+        ])
+        .unwrap();
+        let rows = decode_rows(&body).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.cell.as_str()).collect::<Vec<_>>(),
+            ["c", "e"]
+        );
+        assert_eq!(slice(&body, &rows[1]).unwrap(), b"xy");
+        assert_eq!(decode_marks(&body).unwrap(), ["d"]);
+    }
 }

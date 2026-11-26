@@ -3341,8 +3341,12 @@ impl Model for Lazy {
             Act::Flush(k) => {
                 w.b.flushes -= 1;
                 let ki = usize::from(*k);
-                let all: BTreeSet<Entry> =
-                    w.s.log[ki].f[0].union(&w.s.log[ki].f[1]).copied().collect();
+                let ride = self.d().marks_ride_bundles;
+                let all: BTreeSet<Entry> = w.s.log[ki].f[0]
+                    .union(&w.s.log[ki].f[1])
+                    .copied()
+                    .filter(|entry| ride || !entry.is_mark())
+                    .collect();
                 w.s.log[ki].bundle.extend(all);
             }
             Act::Gc(path, k) => self.gc(&mut w, *path, *k),

@@ -489,3 +489,39 @@ fn a_cell_the_successor_did_not_resume_is_claimed_once_when_it_is_forwarded_ther
     assert!(matches!(guard, CasGuard::Match(ref etag) if etag == "owner-etag"));
     assert_eq!(epoch, 4, "the next epoch, beside no other owner");
 }
+
+fn given_up() -> bool {
+    false
+}
+
+/// A session that was given up compares records as a process without one: a
+/// record without `by` at the claimed epoch is its own claim again, and a
+/// tagged id is still first claimed at epoch 2 by anyone but its minter.
+#[test]
+fn a_session_that_was_given_up_compares_records_as_one_that_never_was() {
+    let mut state = session_node(&[]);
+    state.set_session_active(given_up);
+    let op = request(&mut state, 1, "cell");
+    let effects = owner_read(&mut state, op, None);
+    let (_, epoch, op) = cas_owner(&effects).expect("first claim");
+    let effects = on_event(
+        &mut state,
+        Event::OwnerCasCompleted {
+            op,
+            result: Err(Failure::Ambiguous),
+        },
+    );
+    let read = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::ReadOwner { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("a read settles the claim");
+    // The record has no `by`: the plain record a process without a session writes.
+    let effects = owner_read(&mut state, read, Some(("ingress", epoch, None)));
+    assert!(
+        cas_owner(&effects).is_none(),
+        "it is this process's own claim: {effects:?}"
+    );
+}

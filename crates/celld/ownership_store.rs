@@ -51,6 +51,15 @@ struct OwnerWire<'a> {
     /// with `CELLD_LAZY_BIRTH=off`, so its bytes are those of an older binary.
     #[serde(skip_serializing_if = "Option::is_none")]
     by: Option<&'a str>,
+    /// A first-form record: 8 random bytes, new for every write, and the
+    /// nonces of the records it replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nonce: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    over: &'a [String],
+    /// A leave-form record: the nonce the session announced before it wrote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leave: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -59,6 +68,21 @@ struct OwnerWireOwned {
     epoch: u64,
     #[serde(default)]
     by: Option<String>,
+    #[serde(default)]
+    nonce: Option<String>,
+    #[serde(default)]
+    over: Vec<String>,
+    #[serde(default)]
+    leave: Option<String>,
+}
+
+/// The form of a record beyond its node, epoch and `by`: a first-form record
+/// has a nonce and the nonces it replaced, a leave-form record a leave nonce.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OwnerForm {
+    pub(crate) nonce: Option<String>,
+    pub(crate) over: Vec<String>,
+    pub(crate) leave: Option<String>,
 }
 
 /// The session a node lease advertises: its tag, the tags of a preserved
@@ -70,6 +94,47 @@ pub(crate) struct LeaseSessionWire {
     #[serde(default)]
     pub(crate) carried: Vec<String>,
     pub(crate) mode: crate::session::Mode,
+    /// What the process reads: 1 is the format of `Grant` marks in the log and
+    /// of first-form records with a nonce. A lease without it (a build that
+    /// writes a session and reads neither) is not capable, however many tags it
+    /// carries.
+    #[serde(default)]
+    pub(crate) format: u32,
+}
+
+/// What one refresh read of a member's lease says about marks.
+struct MemberCap {
+    generation: String,
+    capable: bool,
+    read_ms: u64,
+    expires_ms: u64,
+}
+
+/// How long a refreshed answer about a member may be used at ship time.
+const MEMBER_CAP_FRESH_MS: u64 = 5_000;
+
+/// The longest one lease read of the refresh may take.
+const MEMBER_CAP_READ: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The session format of this build, advertised in its lease.
+pub(crate) const SESSION_FORMAT: u32 = 1;
+
+/// Whether a lease read from the bucket is live and advertises the session
+/// format.
+fn lease_capable(lease: &NodeLeaseWire, now: u64) -> bool {
+    lease.expires_ms > now
+        && lease
+            .session
+            .as_ref()
+            .is_some_and(|session| session.format >= SESSION_FORMAT)
+}
+
+async fn load_lease_wire(bucket: &Bucket, node: &str) -> anyhow::Result<Option<NodeLeaseWire>> {
+    Ok(
+        load_json::<NodeLeaseWire>(bucket, &format!("nodes/{node}.json"))
+            .await?
+            .map(|(lease, _)| lease),
+    )
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -444,6 +509,23 @@ impl std::fmt::Display for LeaseCasError {
 /// so a repair takes effect well within either.
 pub(crate) const LOST_RECORD_RECHECK_MS: u64 = 10_000;
 
+/// How long the answer to "may a `Grant` be appended" holds.
+const MARKS_GATE_MS: u64 = 5_000;
+
+/// How long a record waits for the fleet proof of its `Grant`
+/// (`CELLD_LAZY_BIRTH_PROOF_WAIT_MS`, 10 s by default).
+/// The longest a request in `shadow` waits for the proof of a grant.
+const SHADOW_PROOF_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn mark_proof_wait() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("CELLD_LAZY_BIRTH_PROOF_WAIT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10_000),
+    )
+}
+
 /// The production-compatible conditional object store used by ownership
 /// effects. A failed write is reported to the core as ambiguous unless the
 /// store definitively returned HTTP 412, or the attempt provably wrote no
@@ -485,6 +567,30 @@ pub struct BucketOwnership {
     /// Claims and own-record writes wait on this until the registry's gate is
     /// closed, on a node outside its writer rule.
     gate_hold: &'static crate::registry_seed::GateHold,
+    /// The first-form record that the next conditional write of a cell carries.
+    pub(crate) k5: crate::session_reader::K5Plans,
+    /// Whether the leases of an ensemble carry the capability, and when that was
+    /// read, for which members: at most every [`MARKS_GATE_MS`]. Liveness is not
+    /// cached; see `ensemble_live`.
+    marks_gate: std::sync::Mutex<(u64, bool, Vec<String>, u64)>,
+    /// Whether the node log has an installed ensemble that proves marks now: the
+    /// state the ship loop proves with. Set once by the process that owns the log;
+    /// without it the stored log record alone decides.
+    ensemble_live: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// What the last refresh read of each member's lease: its process
+    /// generation (the identity of the lease), whether it can read marks, when
+    /// it was read and when it expires. Consulted at ship time; never filled
+    /// there.
+    member_caps: std::sync::Mutex<std::collections::HashMap<String, MemberCap>>,
+    /// The members of rounds that the ship loop asked about, so that the refresh
+    /// reads their leases too.
+    wanted_members: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// A pause before each lease read, so a test can make the reads slow.
+    #[cfg(test)]
+    lease_read_delay: std::sync::Mutex<std::time::Duration>,
+    /// The same for the capability of every live lease, for the records that an
+    /// older build would misread.
+    records_gate: std::sync::Mutex<(u64, bool)>,
 }
 
 /// How often the fleet directory answered a claim guard, by its answer and by
@@ -734,6 +840,14 @@ impl BucketOwnership {
             registry: None,
             registry_answers: RegistryAnswers::default(),
             gate_hold: crate::registry_seed::hold(),
+            k5: crate::session_reader::K5Plans::default(),
+            marks_gate: std::sync::Mutex::new((0, false, Vec::new(), 0)),
+            ensemble_live: std::sync::OnceLock::new(),
+            member_caps: std::sync::Mutex::default(),
+            wanted_members: std::sync::Mutex::default(),
+            #[cfg(test)]
+            lease_read_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
+            records_gate: std::sync::Mutex::new((0, false)),
         }
     }
 
@@ -807,15 +921,36 @@ impl BucketOwnership {
         cell: &str,
         reader: RecordReader,
     ) -> anyhow::Result<Option<OwnerRecord>> {
-        // Nothing depends on the reader yet.
-        let _ = reader;
-        self.fetch_owner(cell).await
+        Ok(self
+            .resolve_owner_form(cell, reader)
+            .await?
+            .map(|(record, _)| record))
     }
 
-    async fn fetch_owner(&self, cell: &str) -> anyhow::Result<Option<OwnerRecord>> {
+    /// [`Self::resolve_owner`] with the form of the record beyond its node,
+    /// epoch and `by`.
+    pub(crate) async fn resolve_owner_form(
+        &self,
+        cell: &str,
+        reader: RecordReader,
+    ) -> anyhow::Result<Option<(OwnerRecord, OwnerForm)>> {
+        // Nothing depends on the reader yet.
+        let _ = reader;
+        self.fetch_owner_form(cell).await
+    }
+
+    async fn fetch_owner_form(
+        &self,
+        cell: &str,
+    ) -> anyhow::Result<Option<(OwnerRecord, OwnerForm)>> {
         let key = format!("cells/{cell}/own.json");
         let Some((owner, etag)) = load_json::<OwnerWireOwned>(&self.bucket, &key).await? else {
             return Ok(None);
+        };
+        let form = OwnerForm {
+            nonce: owner.nonce,
+            over: owner.over,
+            leave: owner.leave,
         };
         let record = OwnerRecord {
             node: (!owner.node.is_empty()).then_some(owner.node),
@@ -823,7 +958,7 @@ impl BucketOwnership {
             by: owner.by,
             etag,
         };
-        Ok(Some(record))
+        Ok(Some((record, form)))
     }
 
     /// Whether the bucket holds any LTX for `cell`. LTX exists only under an
@@ -1305,12 +1440,27 @@ impl BucketOwnership {
         {
             return Ok(CasOutcome::Rejected);
         }
+        // A release lets another node claim the cell, and that claim must rest
+        // on a trace in the bucket that the cell had a record.
+        if let Some(session) = crate::session::current() {
+            let trace = if session.is_claimed_scope(cell) {
+                session.leave_trace(&self.bucket, cell).await
+            } else if session.expects_record(cell) {
+                crate::session::wait_until_checkpointed(cell).await
+            } else {
+                Ok(())
+            };
+            crate::session::tolerate(session, "release_trace", trace)?;
+        }
         let key = format!("cells/{cell}/own.json");
         let by = crate::session::current().map(|session| session.tag());
         let body = serde_json::to_vec(&OwnerWire {
             node: "",
             epoch,
             by: by.as_deref(),
+            nonce: None,
+            over: &[],
+            leave: None,
         })?;
         match self.bucket.put_cas(&key, body, Some(&current.etag)).await? {
             Some(_) => Ok(CasOutcome::Applied),
@@ -1343,16 +1493,21 @@ impl BucketOwnership {
                 && record.by.as_deref() == Some(by)
         };
         let reader = RecordReader::Retag { epoch };
-        let Some(current) = self.resolve_owner(cell, reader).await? else {
+        let Some((current, form)) = self.resolve_owner_form(cell, reader).await? else {
             return Ok(false);
         };
         if !names(&current, from) {
             return Ok(false);
         }
+        // Only `by` changes: the nonce and the nonces it replaced, or the leave
+        // nonce, stay, so a reader still judges the record as the form it is.
         let body = serde_json::to_vec(&OwnerWire {
             node: &self.node,
             epoch,
             by: Some(to),
+            nonce: form.nonce.as_deref(),
+            over: &form.over,
+            leave: form.leave.as_deref(),
         })?;
         match self.bucket.put_cas(&key, body, Some(&current.etag)).await {
             Ok(applied) => Ok(applied.is_some()),
@@ -1360,6 +1515,350 @@ impl BucketOwnership {
                 .resolve_owner(cell, reader)
                 .await?
                 .is_some_and(|record| names(&record, to))),
+        }
+    }
+
+    /// Whether a `Grant` may be appended now: the node log is open with an
+    /// ensemble, and every member of the ensemble advertises the capability in
+    /// its lease. Without that the id is granted by the chunk alone.
+    async fn marks_allowed(&self) -> bool {
+        // The id is granted only into an ensemble that can prove the mark now: the
+        // shipper is installed and not degraded. A stored record that says `open`
+        // outlives a failed member for as long as the maintenance pass needs to
+        // replace it, and a grant made in that time cannot be proven.
+        if self.ensemble_live.get().is_some_and(|live| !live()) {
+            return false;
+        }
+        let ensemble = match &self.own_log.lock().unwrap().1 {
+            Some(log) if log.state == "open" && !log.ensemble.is_empty() => log.ensemble.clone(),
+            _ => return false,
+        };
+        self.members_read_marks(&ensemble).await
+    }
+
+    /// What the ship loop may use: `Some` when a fresh read of each member's
+    /// lease answers for the very process that the round goes to (the lease's
+    /// generation is the member's), `None` when any member has no fresh answer or
+    /// another process holds its name now. Reads nothing: the answers come from
+    /// [`Self::refresh_member_capability`], which runs off the ship path.
+    pub fn members_cached_capable(&self, members: &[(String, String)]) -> Option<bool> {
+        {
+            let mut wanted = self.wanted_members.lock().unwrap();
+            wanted.extend(members.iter().map(|(node, _)| node.clone()));
+        }
+        let now = crate::asyncrt::mono_ms();
+        let wall = now_ms();
+        let caps = self.member_caps.lock().unwrap();
+        let mut all_capable = true;
+        for (node, generation) in members {
+            let cap = caps.get(node)?;
+            if cap.generation != *generation
+                || now.saturating_sub(cap.read_ms) > MEMBER_CAP_FRESH_MS
+                || cap.expires_ms <= wall
+            {
+                return None;
+            }
+            all_capable &= cap.capable;
+        }
+        Some(all_capable)
+    }
+
+    /// Read the leases of the ensemble's members and of the nodes the ship loop
+    /// asked about, together, each under a bound, and keep what they say. Run
+    /// periodically by a task of its own, so the ship loop never waits on the
+    /// bucket for it.
+    pub async fn refresh_member_capability(&self) {
+        let mut nodes: std::collections::BTreeSet<String> =
+            self.wanted_members.lock().unwrap().clone();
+        if let Some(log) = &self.own_log.lock().unwrap().1 {
+            nodes.extend(log.ensemble.iter().cloned());
+        }
+        let reads = nodes.into_iter().map(|node| async move {
+            #[cfg(test)]
+            {
+                let delay = *self.lease_read_delay.lock().unwrap();
+                crate::asyncrt::sleep(delay).await;
+            }
+            let read =
+                crate::asyncrt::timeout(MEMBER_CAP_READ, load_lease_wire(&self.bucket, &node))
+                    .await;
+            (node, read)
+        });
+        for (node, read) in futures_util::future::join_all(reads).await {
+            let wall = now_ms();
+            let mut caps = self.member_caps.lock().unwrap();
+            match read {
+                Ok(Ok(Some(lease))) => {
+                    caps.insert(
+                        node,
+                        MemberCap {
+                            generation: lease.generation.clone(),
+                            capable: lease_capable(&lease, wall),
+                            read_ms: crate::asyncrt::mono_ms(),
+                            expires_ms: lease.expires_ms,
+                        },
+                    );
+                }
+                // A lease that is gone, or a read that failed or timed out, leaves
+                // no fresh answer: what was kept goes stale.
+                Ok(Ok(None)) => {
+                    caps.remove(&node);
+                }
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+    }
+
+    /// Whether every one of `ensemble` is live and advertises the session
+    /// format, so that a round to them may carry marks. Asked when a grant is
+    /// made and again when a round is shipped. The answer is kept for a few
+    /// seconds for the same members, never past the soonest expiry it saw.
+    pub async fn members_read_marks(&self, ensemble: &[String]) -> bool {
+        if ensemble.is_empty() {
+            return false;
+        }
+        let ensemble = ensemble.to_vec();
+        let now = crate::asyncrt::mono_ms();
+        {
+            let gate = self.marks_gate.lock().unwrap();
+            if gate.0 != 0
+                && now.saturating_sub(gate.0) < MARKS_GATE_MS
+                && gate.2 == ensemble
+                && now_ms() < gate.3
+            {
+                return gate.1;
+            }
+        }
+        // Every member must advertise the format and be live. The answer is kept
+        // for a few seconds, but never past the soonest expiry it saw.
+        let wall = now_ms();
+        let mut allowed = true;
+        let mut soonest = u64::MAX;
+        // The members' leases are read together, not one after the other.
+        let reads = ensemble.iter().map(|member| async move {
+            #[cfg(test)]
+            {
+                let delay = *self.lease_read_delay.lock().unwrap();
+                crate::asyncrt::sleep(delay).await;
+            }
+            load_lease_wire(&self.bucket, member).await
+        });
+        for lease in futures_util::future::join_all(reads).await {
+            match lease {
+                Ok(Some(lease)) if lease_capable(&lease, wall) => {
+                    soonest = soonest.min(lease.expires_ms);
+                }
+                _ => allowed = false,
+            }
+        }
+        *self.marks_gate.lock().unwrap() = (now.max(1), allowed, ensemble, soonest);
+        allowed
+    }
+
+    /// Tell the store how to ask whether the node log's ensemble can prove a mark
+    /// now. Called once, where the log is built.
+    pub fn set_ensemble_probe(&self, live: impl Fn() -> bool + Send + Sync + 'static) {
+        let _ = self.ensemble_live.set(Box::new(live));
+    }
+
+    /// Whether every live lease advertises the session format. A first-form
+    /// record is written only then: a node of an older build reads it as a plain
+    /// record and would ignore the nonce. The positive answer is cached for
+    /// [`MARKS_GATE_MS`] for judging; the write itself asks again with `fresh`.
+    pub(crate) async fn all_leases_capable(&self, fresh: bool) -> bool {
+        let now = crate::asyncrt::mono_ms();
+        if !fresh {
+            let gate = self.records_gate.lock().unwrap();
+            if gate.0 != 0 && now.saturating_sub(gate.0) < MARKS_GATE_MS {
+                return gate.1;
+            }
+        }
+        let wall = now_ms();
+        let mut capable = true;
+        match self.bucket.list("nodes/").await {
+            Ok(listed) => {
+                for meta in listed {
+                    let key = meta.location.as_ref();
+                    let Some(node) = key
+                        .rsplit('/')
+                        .next()
+                        .and_then(|name| name.strip_suffix(".json"))
+                    else {
+                        continue;
+                    };
+                    match load_lease_wire(&self.bucket, node).await {
+                        Ok(Some(lease)) if lease.expires_ms > wall => {
+                            capable &= lease_capable(&lease, wall);
+                        }
+                        Ok(_) => {}
+                        Err(_) => capable = false,
+                    }
+                }
+            }
+            Err(_) => capable = false,
+        }
+        *self.records_gate.lock().unwrap() = (now.max(1), capable);
+        capable
+    }
+
+    /// What happens to the id of `cell` after its create-only record applied.
+    ///
+    /// The waive is decided before the append. While no capable ensemble
+    /// exists the id is waived in memory and takes the standard path with no
+    /// bit; the session then acts on its record only with evidence that it was
+    /// not sealed when the write applied, a read of its own header that says
+    /// `open`, started after the write returned, and without that evidence the
+    /// cell is not activated by this write.
+    ///
+    /// Otherwise the session appends the `Grant`, and from the append the id is
+    /// granted: its bit is set, and it never takes the standard path in this
+    /// session, whatever becomes of the proof. The request waits (bounded) for
+    /// the fleet proof. If it gives up first, it fails with an error that the
+    /// caller may retry, the cell does not activate, and the grant is pending:
+    /// a proof that comes later changes nothing, and later requests for the
+    /// cell fail the same way (the wake of a pending grant at a new epoch is
+    /// not built).
+    ///
+    /// In `shadow` none of this may fail or hold a request for more than a short
+    /// bound: a step that fails is logged and counted and the request goes on as
+    /// it would without a session. `read` and `on` fail closed.
+    async fn after_first_record(
+        &self,
+        session: &crate::session::Session,
+        cell: &str,
+    ) -> anyhow::Result<()> {
+        let Some(counter) = session.own_counter_of_scope(cell) else {
+            return Ok(());
+        };
+        // In `shadow` the whole step, the reads of the members' leases included,
+        // is bounded: when it does not finish in time the request goes on without
+        // marks and the failure is counted.
+        let granted = if session.fails_closed() {
+            self.grant_or_waive(session, cell, counter).await
+        } else {
+            match crate::asyncrt::timeout(
+                SHADOW_PROOF_WAIT,
+                self.grant_or_waive(session, cell, counter),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "the grant of {cell} did not finish in time"
+                )),
+            }
+        };
+        crate::session::tolerate(session, "grant", granted)
+    }
+
+    async fn grant_or_waive(
+        &self,
+        session: &crate::session::Session,
+        cell: &str,
+        counter: u64,
+    ) -> anyhow::Result<()> {
+        if self.marks_allowed().await {
+            // The grant is held only while the session is open: a session that
+            // began its seal has taken its gather, and a bit added now would
+            // never reach a chunk.
+            if !session.grant_scope(cell) {
+                if session.fails_closed() {
+                    session.mark_pending(counter);
+                }
+                anyhow::bail!("the session closed before the grant of {cell} was recorded");
+            }
+            // A round that failed because a member of the ensemble was gone says
+            // nothing about the next ensemble: the same mark is sent again, until
+            // the wait ends. The `Grant` of a counter is idempotent, and only a
+            // proof that covers it activates the cell.
+            let wait = if session.fails_closed() {
+                mark_proof_wait()
+            } else {
+                mark_proof_wait().min(SHADOW_PROOF_WAIT)
+            };
+            let deadline = crate::asyncrt::mono_ms()
+                .saturating_add(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX));
+            loop {
+                let left = deadline.saturating_sub(crate::asyncrt::mono_ms());
+                if left == 0 {
+                    break;
+                }
+                let proof = crate::session::enqueue_mark(cell, counter);
+                match crate::asyncrt::timeout(std::time::Duration::from_millis(left), proof).await {
+                    Ok(Ok(true)) => return Ok(()),
+                    Ok(_) => crate::asyncrt::sleep(std::time::Duration::from_millis(100)).await,
+                    Err(_) => break,
+                }
+            }
+            // Only a session that rests on the grant leaves the cell pending.
+            if session.fails_closed() {
+                session.mark_pending(counter);
+            }
+            tracing::warn!(
+                event = "pending_grant",
+                cell,
+                "no fleet proof of the grant in time"
+            );
+            anyhow::bail!("no fleet proof of the grant of {cell}: the grant is pending");
+        }
+        // The waive: the session wrote the standard-path record of this id, and
+        // must know that its header was not sealed when the write applied. With
+        // no such evidence the cell is pending like a grant without a proof, so
+        // that a retry cannot activate it.
+        let evidence = match crate::session_store::read_header(&self.bucket, &session.tag()).await {
+            Ok(crate::session_store::Read::Found(header, _))
+                if header.state == crate::session_store::State::Open =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(anyhow::anyhow!(
+                "no evidence that the record of {cell} was written before a seal"
+            )),
+            Err(error) => Err(error),
+        };
+        match evidence {
+            Ok(()) => {
+                session.note_claimed(counter);
+                Ok(())
+            }
+            Err(error) => {
+                if session.fails_closed() {
+                    session.mark_pending(counter);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// The read-back of a create-only write of the session's own id whose
+    /// answer was an error. A record that is this session's at epoch 1 applied,
+    /// and its grant is done now. A read that itself failed says nothing: in
+    /// `read` and `on` the cell is left pending, so that it cannot activate
+    /// without a bit; `shadow` goes on.
+    async fn settle_ambiguous_first_record(
+        &self,
+        session: &crate::session::Session,
+        cell: &str,
+        by: Option<&str>,
+        readback: anyhow::Result<Option<OwnerRecord>>,
+    ) -> anyhow::Result<()> {
+        match readback {
+            Ok(Some(record))
+                if record.epoch == 1
+                    && record.node.as_deref() == Some(self.node.as_str())
+                    && record.by.as_deref() == by =>
+            {
+                self.after_first_record(session, cell).await
+            }
+            Ok(_) => Ok(()),
+            Err(_) => {
+                if let Some(counter) = session.own_counter_of_scope(cell) {
+                    if session.fails_closed() {
+                        session.mark_pending(counter);
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1374,26 +1873,108 @@ impl BucketOwnership {
         let key = format!("cells/{cell}/own.json");
         let session = crate::session::current();
         let by = session.map(|session| session.tag());
+        // The claim of a cell by the rules of a sealed session: a first-form
+        // record with a new nonce, and then that nonce in the chunk.
+        let plan = self.k5.take(cell);
+        // A plan belongs to the record it was judged against. A write that is
+        // not that record's replacement is lost: the core reads the cell again
+        // and it is judged again. So is a write over a cell whose chunk already
+        // holds an entry that the plan does not account for.
+        if let Some(plan) = &plan {
+            if !plan.applies_to(&guard) {
+                return Ok(CasOutcome::Rejected);
+            }
+            if let crate::session_store::Read::Found(chunk, _) = crate::session_store::read_chunk(
+                &self.bucket,
+                &plan.tag,
+                plan.counter / crate::session_store::CHUNK,
+            )
+            .await?
+            {
+                if plan.conflicts_with(chunk.taken.get(&plan.counter)) {
+                    return Ok(CasOutcome::Rejected);
+                }
+            }
+        }
+        // A first-form record is written only while every live lease advertises
+        // the format, asked again now: a lease that changed since the cell was
+        // judged turns the claim into one that is judged again.
+        if plan.is_some() && !self.all_leases_capable(true).await {
+            return Ok(CasOutcome::Rejected);
+        }
         let body = serde_json::to_vec(&OwnerWire {
             node: &self.node,
             epoch,
             by: by.as_deref(),
+            nonce: plan.as_ref().map(|plan| plan.nonce.as_str()),
+            over: plan.as_ref().map_or(&[], |plan| plan.over.as_slice()),
+            leave: None,
         })?;
         let etag = match &guard {
             CasGuard::Absent => None,
             CasGuard::Match(etag) => Some(etag.as_str()),
         };
-        match self.bucket.put_cas(&key, body, etag).await? {
+        let written = match self.bucket.put_cas(&key, body, etag).await {
+            Ok(written) => written,
+            Err(error) => {
+                // A create-only write of the session's own id whose answer was
+                // an error may have applied. The core settles it by a read and
+                // would activate the cell, so the grant is settled first: if the
+                // record is there, this session's, the grant or the waive is
+                // done before the error is reported.
+                if let (CasGuard::Absent, 1, Some(session)) = (&guard, epoch, session) {
+                    if session.own_counter_of_scope(cell).is_some() {
+                        // In `shadow` the read-back is bounded too: a slow store ends
+                        // it as a failed read, which `shadow` goes past.
+                        let reading = self.resolve_owner(cell, RecordReader::ClaimReread);
+                        let readback = if session.fails_closed() {
+                            reading.await
+                        } else {
+                            crate::asyncrt::timeout(SHADOW_PROOF_WAIT, reading)
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(anyhow::anyhow!("the read-back of {cell} timed out"))
+                                })
+                        };
+                        self.settle_ambiguous_first_record(session, cell, by.as_deref(), readback)
+                            .await?;
+                    }
+                }
+                return Err(error);
+            }
+        };
+        match written {
             Some(_) => {
                 // The record now carries this process's own tag.
                 if let Some(session) = session {
                     session.forget_resumed(cell);
+                }
+                // The cell acts only after its nonce is in the chunk. If the
+                // mark fails, the answer is an error and the claim is settled by
+                // a read, which finishes the mark before it returns the record.
+                if let Some(plan) = &plan {
+                    let marked = crate::session_store::mark_taken(
+                        &self.bucket,
+                        &plan.tag,
+                        plan.counter,
+                        &plan.nonce,
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        marked == crate::session_store::Marked::Ours,
+                        "the first record of {cell} was marked by another nonce"
+                    );
                 }
                 // A create-only write is the cell's first claim, at epoch one:
                 // the record exists, and LTX can follow. Queueing the
                 // registration now lets the cell's first LTX write find its
                 // segment already written. A claim whose answer was lost, or
                 // that reaches LTX another way, registers when it writes.
+                if matches!(guard, CasGuard::Absent) && epoch == 1 {
+                    if let Some(session) = session {
+                        self.after_first_record(session, cell).await?;
+                    }
+                }
                 if matches!(guard, CasGuard::Absent) {
                     if let Some(directory) = &self.cell_directory {
                         directory.register_at_claim(cell);
@@ -1459,6 +2040,7 @@ impl BucketOwnership {
                     tag: session.tag(),
                     carried: record.tags.iter().skip(1).cloned().collect(),
                     mode: session.mode(),
+                    format: SESSION_FORMAT,
                 }
             }),
         })
@@ -1761,6 +2343,9 @@ mod session_wire_tests {
             node: "n1",
             epoch: 7,
             by: None,
+            nonce: None,
+            over: &[],
+            leave: None,
         })
         .unwrap();
         assert_eq!(body, br#"{"node":"n1","epoch":7}"#);
@@ -1768,6 +2353,9 @@ mod session_wire_tests {
             node: "n1",
             epoch: 7,
             by: Some("ab"),
+            nonce: None,
+            over: &[],
+            leave: None,
         })
         .unwrap();
         assert_eq!(body, br#"{"node":"n1","epoch":7,"by":"ab"}"#);
@@ -1797,5 +2385,271 @@ mod session_wire_tests {
         assert_eq!(again.session, lease.session);
         let owner: OwnerWireOwned = serde_json::from_str(r#"{"node":"n","epoch":1}"#).unwrap();
         assert_eq!(owner.by, None);
+    }
+}
+
+#[cfg(test)]
+mod grant_tests {
+    use super::*;
+    use crate::bucket::Bucket;
+    use crate::session::{Mode, Session};
+
+    const NODE: &str = "node-a";
+
+    fn world() -> (tempfile::TempDir, Bucket, BucketOwnership) {
+        crate::asyncrt::install_test_host_runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+        let ownership = BucketOwnership::new(
+            bucket.clone(),
+            bucket.clone(),
+            NODE.to_owned(),
+            "key".to_owned(),
+        );
+        (dir, bucket, ownership)
+    }
+
+    fn lease(expires_ms: u64, format: Option<u32>) -> NodeLeaseWire {
+        let mut value = serde_json::json!({
+            "node": "m", "expires_ms": expires_ms, "probe_public_key": "k",
+        });
+        if let Some(format) = format {
+            value["session"] = serde_json::json!(
+                {"tag": "aa", "mode": "shadow", "format": format}
+            );
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn a_lease_is_capable_only_with_the_format_and_while_it_lives() {
+        assert!(lease_capable(&lease(10_000, Some(SESSION_FORMAT)), 5_000));
+        assert!(
+            !lease_capable(&lease(10_000, Some(0)), 5_000),
+            "a build without it"
+        );
+        assert!(!lease_capable(&lease(10_000, None), 5_000), "no session");
+        assert!(
+            !lease_capable(&lease(4_000, Some(SESSION_FORMAT)), 5_000),
+            "expired"
+        );
+        // A lease written before the field existed reads as format 0.
+        let older: NodeLeaseWire = serde_json::from_value(serde_json::json!({
+            "node": "m", "expires_ms": 10_000, "probe_public_key": "k",
+            "session": {"tag": "aa", "carried": ["bb"], "mode": "shadow"},
+        }))
+        .unwrap();
+        assert!(!lease_capable(&older, 5_000));
+    }
+
+    async fn put_lease(bucket: &Bucket, node: &str, lease: &NodeLeaseWire) {
+        let body = serde_json::to_vec(lease).unwrap();
+        bucket
+            .put_cas(&format!("nodes/{node}.json"), body, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_first_record_waits_for_leases_that_read_it() {
+        let (_dir, bucket, ownership) = world();
+        let future = now_ms() + 60_000;
+        put_lease(&bucket, "m", &lease(future, Some(SESSION_FORMAT))).await;
+        assert!(ownership.all_leases_capable(true).await);
+        // A build that writes a session and reads neither marks nor nonces.
+        put_lease(&bucket, "older", &lease(future, Some(0))).await;
+        assert!(!ownership.all_leases_capable(true).await);
+        // The judging cache still says no for a while, and a fresh read agrees.
+        assert!(!ownership.all_leases_capable(false).await);
+    }
+
+    /// An ensemble member whose lease has expired cannot prove a mark, however
+    /// many tags it carries.
+    #[tokio::test]
+    async fn an_expired_member_does_not_open_the_gate_for_marks() {
+        let (_dir, bucket, ownership) = world();
+        *ownership.own_log.lock().unwrap() = (
+            1,
+            Some(NodeLogWire {
+                state: "open".into(),
+                epoch: 1,
+                ensemble: vec!["m".into()],
+                tiered: 0,
+                may_have_fleet_acks: false,
+                claimant: None,
+                claimed_ms: None,
+            }),
+        );
+        put_lease(
+            &bucket,
+            "m",
+            &lease(now_ms() + 60_000, Some(SESSION_FORMAT)),
+        )
+        .await;
+        assert!(ownership.marks_allowed().await);
+        // The same member, expired: the cached answer is not reused.
+        *ownership.marks_gate.lock().unwrap() = (0, false, Vec::new(), 0);
+        bucket.delete("nodes/m.json").await.unwrap();
+        put_lease(
+            &bucket,
+            "m",
+            &lease(now_ms().saturating_sub(1), Some(SESSION_FORMAT)),
+        )
+        .await;
+        assert!(!ownership.marks_allowed().await);
+    }
+
+    /// A member without the format joins the ensemble after a grant: the round
+    /// to the new set may not carry marks.
+    #[tokio::test]
+    async fn a_member_without_the_format_that_joins_later_closes_the_gate_for_marks() {
+        let (_dir, bucket, ownership) = world();
+        let future = now_ms() + 60_000;
+        put_lease(&bucket, "m", &lease(future, Some(SESSION_FORMAT))).await;
+        put_lease(&bucket, "older", &lease(future, Some(0))).await;
+        assert!(ownership.members_read_marks(&["m".to_string()]).await);
+        // The ensemble now names the older node as well.
+        assert!(
+            !ownership
+                .members_read_marks(&["m".to_string(), "older".to_string()])
+                .await
+        );
+        // And an empty ensemble reads nothing.
+        assert!(!ownership.members_read_marks(&[]).await);
+    }
+
+    /// A slow read of the members' leases does not hold a request in `shadow`
+    /// beyond its bound: the step is cut, counted, and the request goes on.
+    #[tokio::test]
+    async fn slow_lease_reads_do_not_hold_a_shadow_request_past_its_bound() {
+        let (_dir, bucket, ownership) = world();
+        *ownership.own_log.lock().unwrap() = (
+            1,
+            Some(NodeLogWire {
+                state: "open".into(),
+                epoch: 1,
+                ensemble: vec!["m".into(), "n".into()],
+                tiered: 0,
+                may_have_fleet_acks: false,
+                claimant: None,
+                claimed_ms: None,
+            }),
+        );
+        let future = now_ms() + 60_000;
+        put_lease(&bucket, "m", &lease(future, Some(SESSION_FORMAT))).await;
+        put_lease(&bucket, "n", &lease(future, Some(SESSION_FORMAT))).await;
+        *ownership.lease_read_delay.lock().unwrap() = std::time::Duration::from_secs(30);
+        let session = Session::with_tag(Mode::Shadow, [8; 8], &[]);
+        let scope = scope_of(&session, 0);
+        let began = crate::asyncrt::mono_ms();
+        ownership
+            .after_first_record(&session, &scope)
+            .await
+            .expect("a slow store does not fail a shadow request");
+        assert!(
+            crate::asyncrt::mono_ms() - began < 2_000,
+            "bounded by the shadow wait, not by the lease reads"
+        );
+        assert!(!session.is_pending_scope(&scope));
+    }
+
+    #[tokio::test]
+    async fn a_waive_without_evidence_fails_closed_in_read_and_goes_on_in_shadow() {
+        let (_dir, _bucket, ownership) = world();
+        // No header was ever written: there is no evidence that the record was
+        // written before a seal.
+        let shadow = Session::with_tag(Mode::Shadow, [1; 8], &[]);
+        let strict = Session::with_tag(Mode::On, [2; 8], &[]);
+        for (session, fails_closed) in [(&shadow, false), (&strict, true)] {
+            let scope = scope_of(session, 0);
+            let outcome = ownership.after_first_record(session, &scope).await;
+            assert_eq!(outcome.is_err(), fails_closed, "{:?}", session.mode());
+            assert_eq!(
+                session.is_pending_scope(&scope),
+                fails_closed,
+                "a retry of a cell without evidence must not activate it"
+            );
+        }
+    }
+
+    /// With an ensemble whose member never proves the mark, a request in
+    /// `shadow` waits at most a short bound, does not fail and leaves the cell
+    /// able to activate.
+    #[tokio::test]
+    async fn a_mark_that_is_never_proven_does_not_hold_or_wedge_a_request_in_shadow() {
+        let (_dir, bucket, ownership) = world();
+        *ownership.own_log.lock().unwrap() = (
+            1,
+            Some(NodeLogWire {
+                state: "open".into(),
+                epoch: 1,
+                ensemble: vec!["m".into()],
+                tiered: 0,
+                may_have_fleet_acks: false,
+                claimant: None,
+                claimed_ms: None,
+            }),
+        );
+        put_lease(
+            &bucket,
+            "m",
+            &lease(now_ms() + 60_000, Some(SESSION_FORMAT)),
+        )
+        .await;
+        let session = Session::with_tag(Mode::Shadow, [3; 8], &[]);
+        let scope = scope_of(&session, 0);
+        let began = crate::asyncrt::mono_ms();
+        ownership
+            .after_first_record(&session, &scope)
+            .await
+            .expect("a failing grant does not fail a request in shadow");
+        assert!(crate::asyncrt::mono_ms() - began < 3_000);
+        assert!(!session.is_pending_scope(&scope), "never wedged");
+        assert!(session.is_granted(0), "the grant stays recorded");
+    }
+
+    /// A failed read-back of an ambiguous first record leaves the cell pending in
+    /// `read` and `on` and lets `shadow` go on; a read that shows the record
+    /// finishes its grant.
+    #[tokio::test]
+    async fn a_failed_readback_of_a_first_record_leaves_a_strict_cell_pending() {
+        let (_dir, _bucket, ownership) = world();
+        let shadow = Session::with_tag(Mode::Shadow, [4; 8], &[]);
+        let strict = Session::with_tag(Mode::On, [5; 8], &[]);
+        for (session, pending) in [(&shadow, false), (&strict, true)] {
+            let scope = scope_of(session, 0);
+            let failed: anyhow::Result<Option<OwnerRecord>> = Err(anyhow::anyhow!("read failed"));
+            ownership
+                .settle_ambiguous_first_record(session, &scope, None, failed)
+                .await
+                .unwrap();
+            assert_eq!(
+                session.is_pending_scope(&scope),
+                pending,
+                "{:?}",
+                session.mode()
+            );
+        }
+        // A record that is another's, or none, decides nothing.
+        let scope = scope_of(&strict, 1);
+        ownership
+            .settle_ambiguous_first_record(&strict, &scope, None, Ok(None))
+            .await
+            .unwrap();
+        assert!(!strict.is_pending_scope(&scope));
+    }
+
+    /// The scope of the id with counter `counter` of `session`.
+    fn scope_of(session: &Session, counter: u64) -> String {
+        crate::session::register_class("script", "Agent");
+        let key = crate::engine_api::durable_object_id_key(&crate::engine_api::namespace_key(
+            "script", "Agent",
+        ));
+        let id = crate::engine_api::tagged_object_id(
+            &key,
+            session.tag_bytes(),
+            crate::session::encrypt_counter(session.counter_key_for_tests(), counter),
+        );
+        format!("Agent:{}", crate::engine_api::durable_object_id_hex(&id))
     }
 }

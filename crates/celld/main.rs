@@ -4704,6 +4704,14 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 app.peer_auth.clone(),
                 celld::node_log::eviction_policy_from_env()?,
             ));
+            let probe = Arc::downgrade(&manager);
+            bucket_ownership.set_ensemble_probe(move || {
+                probe.upgrade().is_some_and(|manager| manager.proving())
+            });
+            let gate = bucket_ownership.clone();
+            celld::session::set_mark_gate(Box::new(move |members| {
+                gate.members_cached_capable(members)
+            }));
             *actor.node_log.lock().unwrap() = Some(manager.clone());
             // Recovery-before-install is fatal for every posture: the
             // predecessor's folded state lives in the lease record this
@@ -4765,15 +4773,54 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // before the lease that carries its tag is installed.
     if let Some(session) = celld::session::current() {
         if let Ownership::Bucket(bucket_ownership) = &actor.ownership {
-            celld::session::create_header(
-                &bucket_ownership.bucket_client(),
-                session,
-                &node,
-                &process_generation,
-            )
-            .await?;
+            let bucket = bucket_ownership.bucket_client();
+            let opened = async {
+                celld::session::seal_predecessor(&bucket, &node, &process_generation).await?;
+                session.open(&bucket, &node, &process_generation).await
+            }
+            .await;
+            if let Err(error) = opened {
+                // In `shadow` nothing rests on the session, so a process that
+                // cannot open one runs without: it mints random ids and grants
+                // nothing. `read` and `on` rest on it and do not start.
+                session.give_up(error)?;
+                tracing::warn!("the session could not be opened in shadow; running without one");
+            }
+            // The members' capability is read here, off the ship path, and the
+            // ship loop uses only the answer. It starts with a session that opened
+            // and stops when the session closes.
+            if !session.is_closed() {
+                let refresher = bucket_ownership.clone();
+                tokio::spawn(async move {
+                    while !session.is_closed() {
+                        refresher.refresh_member_capability().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                });
+            }
+            let bucket = Arc::new(bucket);
+            tokio::spawn(async move {
+                let interval = celld::session::checkpoint_interval();
+                let mut last = tokio::time::Instant::now();
+                while !session.is_closed() {
+                    let asked = celld::asyncrt::select! {
+                        () = session.nudged() => true,
+                        () = tokio::time::sleep(std::time::Duration::from_millis(500)) => false,
+                    };
+                    if let Err(error) = session.ensure_chunk_ahead(&bucket).await {
+                        tracing::warn!(%error, "session chunk");
+                    }
+                    if asked || last.elapsed() >= interval {
+                        last = tokio::time::Instant::now();
+                        if let Err(error) = session.checkpoint(&bucket).await {
+                            tracing::warn!(%error, "session checkpoint");
+                        }
+                    }
+                }
+            });
+        } else {
+            session.establish();
         }
-        session.establish();
     }
     let mut durability_owner = durability_owner.select();
     let (do_call_tx, mut do_call_rx) = mpsc::unbounded_channel();
