@@ -3781,6 +3781,23 @@ async fn recover_with_follower_listener(
     while connections.next().await.is_some() {}
     result
 }
+
+/// Publish this boot's address and recover its predecessor, serving the
+/// follower disks the whole time: the publish can retry for as long as the
+/// boot ladder, and a peer that is recovering needs this node's seal and tail
+/// answers throughout, not only after the publish lands.
+async fn publish_then_recover(
+    listener: &tokio::net::TcpListener,
+    app: AppHandle,
+    publish: impl std::future::Future<Output = anyhow::Result<()>>,
+    recover: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    recover_with_follower_listener(listener, app, async {
+        publish.await?;
+        recover.await
+    })
+    .await
+}
 #[path = "main/cli.rs"]
 mod cli;
 use cli::{action_from_process, print_help, Action};
@@ -4739,47 +4756,51 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             // and exits on exhaustion. Serve the retained follower disks
             // throughout the ladder, including retry backoffs, so a fleet
             // restart can recover without waiting for another node's lease.
-            manager.publish_boot_addr(&app.advertise).await?;
-            recover_with_follower_listener(&internal_listener, app.clone(), async {
-                let ttl_backoff =
-                    std::time::Duration::from_millis(actor.lease_spec.ttl_ms.max(1_000));
-                let mut recovered: anyhow::Result<()>;
-                // A boot waits behind a peer's live recovery claim and takes
-                // it over only once its heartbeat is stale, so one attempt
-                // can legitimately last as long as the peer's gather. The
-                // bound is a backstop against a wedge, not a pace.
-                let mut ladder = celld::node_log::RecoveryLadder::new(ttl_backoff);
-                let mut attempt = 0_u32;
-                loop {
-                    attempt += 1;
-                    recovered = match tokio::time::timeout(
-                        std::time::Duration::from_secs(15 * 60),
-                        manager.recover_self(),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => Err(anyhow::anyhow!("predecessor recovery timed out")),
-                    };
-                    let Err(error) = recovered.as_ref() else {
-                        break;
-                    };
-                    eprintln!("celld predecessor recovery attempt {attempt} failed: {error:#}");
-                    // A live predecessor lease is waited out once to its
-                    // expiry; every other failure, and a predecessor that
-                    // keeps renewing, backs off a full TTL times the attempt.
-                    let Some(wait) = ladder.next(error) else {
-                        break;
-                    };
-                    tokio::time::sleep(wait).await;
-                }
-                recovered.map_err(|error| {
-                    anyhow::anyhow!(
-                        "refusing to install a lease over an unrecovered \
+            publish_then_recover(
+                &internal_listener,
+                app.clone(),
+                manager.publish_boot_addr(&app.advertise),
+                async {
+                    let ttl_backoff =
+                        std::time::Duration::from_millis(actor.lease_spec.ttl_ms.max(1_000));
+                    let mut recovered: anyhow::Result<()>;
+                    // A boot waits behind a peer's live recovery claim and takes
+                    // it over only once its heartbeat is stale, so one attempt
+                    // can legitimately last as long as the peer's gather. The
+                    // bound is a backstop against a wedge, not a pace.
+                    let mut ladder = celld::node_log::RecoveryLadder::new(ttl_backoff);
+                    let mut attempt = 0_u32;
+                    loop {
+                        attempt += 1;
+                        recovered = match tokio::time::timeout(
+                            std::time::Duration::from_secs(15 * 60),
+                            manager.recover_self(),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => Err(anyhow::anyhow!("predecessor recovery timed out")),
+                        };
+                        let Err(error) = recovered.as_ref() else {
+                            break;
+                        };
+                        eprintln!("celld predecessor recovery attempt {attempt} failed: {error:#}");
+                        // A live predecessor lease is waited out once to its
+                        // expiry; every other failure, and a predecessor that
+                        // keeps renewing, backs off a full TTL times the attempt.
+                        let Some(wait) = ladder.next(error) else {
+                            break;
+                        };
+                        tokio::time::sleep(wait).await;
+                    }
+                    recovered.map_err(|error| {
+                        anyhow::anyhow!(
+                            "refusing to install a lease over an unrecovered \
                          predecessor log: {error:#}"
-                    )
-                })
-            })
+                        )
+                    })
+                },
+            )
             .await?;
             let mut owner = celld::node_log::DurabilityOwner::new(manager, durability == "fleet");
             owner.start_background(follower.clone());
@@ -6237,3 +6258,7 @@ mod test_stub;
 #[cfg(test)]
 #[path = "main/operator_token_tests.rs"]
 mod operator_token_tests;
+
+#[cfg(test)]
+#[path = "main/boot_listener_tests.rs"]
+mod boot_listener_tests;

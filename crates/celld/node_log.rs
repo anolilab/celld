@@ -6855,11 +6855,17 @@ impl NodeLogManager {
     }
 
     /// Publish the address this process serves follower seal and tail
-    /// requests on, ahead of `recover_self`. It replaces whatever record is
-    /// there, by compare-and-swap on the etag it read, so a late write of a
-    /// dead process loses; if another boot publishes at the same moment, that
-    /// record is left alone and the lost race is logged. Best effort: a failed
-    /// write only leaves peers on the lease record's address.
+    /// requests on, ahead of `recover_self`.
+    ///
+    /// Each attempt reads the record afresh and swaps on the etag it read, so
+    /// a late write of a dead process loses; a lost swap re-reads and swaps
+    /// again until this boot's own address stands. A failed write is retried
+    /// with backoff for the length of the boot ladder. If it still has not
+    /// landed, the boot continues (with a warning) only when its address is
+    /// the one its lease record already names, which peers use; at any other
+    /// address, or when the lease cannot be read, this returns an error and
+    /// the boot aborts rather than run where no peer can find its follower
+    /// disk.
     pub async fn publish_boot_addr(&self, addr: &str) -> anyhow::Result<()> {
         let ttl_ms = self.ownership.lease_ttl_ms();
         let started = mono_ms();

@@ -1922,17 +1922,7 @@ mod pipe_tests {
     /// A test binds it before it registers anything, so the registries it
     /// uses stay the same ones for its whole run.
     fn host() {
-        static HOST: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-        HOST.get_or_init(|| {
-            std::env::set_var("CELLD_HANDLER_BUDGET_S", "1");
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .expect("host runtime");
-            celld::asyncrt::set_host_handle(runtime.handle().clone());
-            runtime
-        });
+        crate::boot_listener_tests::host();
     }
 
     /// Starts a pipe between caller socket `caller` and object socket
