@@ -1504,6 +1504,18 @@ impl BucketOwnership {
             Some(log) if log.state == "open" && !log.ensemble.is_empty() => log.ensemble.clone(),
             _ => return false,
         };
+        self.members_read_marks(&ensemble).await
+    }
+
+    /// Whether every one of `ensemble` is live and advertises the session
+    /// format, so that a round to them may carry marks. Asked when a grant is
+    /// made and again when a round is shipped. The answer is kept for a few
+    /// seconds for the same members, never past the soonest expiry it saw.
+    pub async fn members_read_marks(&self, ensemble: &[String]) -> bool {
+        if ensemble.is_empty() {
+            return false;
+        }
+        let ensemble = ensemble.to_vec();
         let now = crate::asyncrt::mono_ms();
         {
             let gate = self.marks_gate.lock().unwrap();
@@ -2346,6 +2358,25 @@ mod grant_tests {
         )
         .await;
         assert!(!ownership.marks_allowed().await);
+    }
+
+    /// A member without the format joins the ensemble after a grant: the round
+    /// to the new set may not carry marks.
+    #[tokio::test]
+    async fn a_member_without_the_format_that_joins_later_closes_the_gate_for_marks() {
+        let (_dir, bucket, ownership) = world();
+        let future = now_ms() + 60_000;
+        put_lease(&bucket, "m", &lease(future, Some(SESSION_FORMAT))).await;
+        put_lease(&bucket, "older", &lease(future, Some(0))).await;
+        assert!(ownership.members_read_marks(&["m".to_string()]).await);
+        // The ensemble now names the older node as well.
+        assert!(
+            !ownership
+                .members_read_marks(&["m".to_string(), "older".to_string()])
+                .await
+        );
+        // And an empty ensemble reads nothing.
+        assert!(!ownership.members_read_marks(&[]).await);
     }
 
     #[tokio::test]

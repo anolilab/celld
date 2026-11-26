@@ -4688,6 +4688,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             bucket_ownership.set_ensemble_probe(move || {
                 probe.upgrade().is_some_and(|manager| manager.proving())
             });
+            let gate = bucket_ownership.clone();
+            celld::session::set_mark_gate(Box::new(move |members| {
+                let gate = gate.clone();
+                Box::pin(async move { gate.members_read_marks(&members).await })
+            }));
             *actor.node_log.lock().unwrap() = Some(manager.clone());
             // Recovery-before-install is fatal for every posture: the
             // predecessor's folded state lives in the lease record this

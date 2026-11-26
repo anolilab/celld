@@ -3093,6 +3093,13 @@ pub struct FleetShipper {
 }
 
 impl crate::ltx_repl::Shipper for FleetShipper {
+    fn members(&self) -> Vec<String> {
+        self.members
+            .iter()
+            .map(|member| member.node.clone())
+            .collect()
+    }
+
     fn ship(
         &self,
         batch: Vec<ShipEntry>,
@@ -4725,6 +4732,21 @@ impl crate::ltx_repl::Shipper for NodeLogManager {
             .unwrap()
             .as_ref()
             .map_or(1, |shipper| shipper.pipeline)
+    }
+
+    fn members(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|shipper| {
+                shipper
+                    .members
+                    .iter()
+                    .map(|member| member.node.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn active(&self) -> bool {

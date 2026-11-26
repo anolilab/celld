@@ -646,6 +646,54 @@ pub(crate) fn take_marks() -> Vec<PendingMark> {
     std::mem::take(&mut *MARKS.lock().expect("marks poisoned"))
 }
 
+/// Tells whether every one of the given nodes can read marks.
+pub type MarkGate = Box<
+    dyn Fn(Vec<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+
+static MARK_GATE: OnceLock<MarkGate> = OnceLock::new();
+
+/// Install the check that ship time asks of the members of a round. Without
+/// one, marks are shipped.
+pub fn set_mark_gate(gate: MarkGate) {
+    let _ = MARK_GATE.set(gate);
+}
+
+/// The marks that may ride this round of the ship loop. The members were able
+/// to read marks when the grants were made; one that joined since (a rolling
+/// deploy, a rollback) would reject the whole body and the rows of the round
+/// would lose their proof. So the members are asked again now, and when one
+/// cannot read marks none is shipped: the waiters are told the round did not
+/// prove them, and in `shadow` each is counted as dropped. The grant stays in
+/// the session's memory and reaches its chunk by the checkpoint.
+pub(crate) async fn marks_for_round(members: &[String]) -> Vec<PendingMark> {
+    if !marks_pending() {
+        return Vec::new();
+    }
+    let pending = take_marks();
+    let capable = match MARK_GATE.get() {
+        Some(gate) => gate(members.to_vec()).await,
+        None => true,
+    };
+    marks_to_ship(pending, capable)
+}
+
+fn marks_to_ship(pending: Vec<PendingMark>, capable: bool) -> Vec<PendingMark> {
+    if capable {
+        return pending;
+    }
+    for mark in pending {
+        note_shadow_failure(
+            "marks_dropped",
+            &format_args!("{} would reach a member that cannot read marks", mark.scope),
+        );
+        let _ = mark.done.send(false);
+    }
+    Vec::new()
+}
+
 pub(crate) fn marks_pending() -> bool {
     !MARKS.lock().expect("marks poisoned").is_empty()
 }
@@ -2045,6 +2093,37 @@ mod tests {
             .is_err());
         assert!(!strict.is_closed());
         assert_eq!(shadow_failures()["open"], before + 1);
+    }
+
+    /// A member that cannot read marks joined after the grant: the marks of the
+    /// round are not shipped, their waiters are told, each is counted as dropped,
+    /// and the grant itself stays recorded for the checkpoint.
+    #[test]
+    fn marks_do_not_ride_a_round_to_a_member_that_cannot_read_them() {
+        let session = established([6; 8]);
+        let scope = scope_for(&session, 0);
+        session.grant_scope(&scope);
+        let pending = |scope: &str| {
+            let (done, wait) = tokio::sync::oneshot::channel();
+            (
+                PendingMark {
+                    scope: scope.to_string(),
+                    counter: 0,
+                    done,
+                },
+                wait,
+            )
+        };
+        let (mark, mut waiter) = pending(&scope);
+        let before = shadow_failures().get("marks_dropped").copied().unwrap_or(0);
+        assert!(marks_to_ship(vec![mark], false).is_empty());
+        assert_eq!(waiter.try_recv(), Ok(false), "the waiter is told");
+        assert_eq!(shadow_failures()["marks_dropped"], before + 1);
+        assert!(session.is_granted(0), "the grant stays for the checkpoint");
+        // When every member can read them, they ship.
+        let (mark, mut waiter) = pending(&scope);
+        assert_eq!(marks_to_ship(vec![mark], true).len(), 1);
+        assert!(waiter.try_recv().is_err(), "nothing was answered yet");
     }
 
     #[test]
