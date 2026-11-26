@@ -16,11 +16,18 @@ use crate::TXID;
 
 const MAGIC: &[u8; 4] = b"CLB1";
 
-/// The `txid` of a mark: a row of the footer that names a cell and carries no
-/// bytes. A mark is a fact about the session that wrote the bundle (the
-/// `Grant` of a cell), not a transaction; [`decode_rows`] does not return it,
-/// so a reader that knows only rows sees the bundle as it always was.
+/// The `txid` of a mark in a [`BundleEntry`]: an entry that names a cell and
+/// carries no bytes. A mark is a fact about the session that wrote the bundle
+/// (the `Grant` of a cell), not a transaction. It is not a row of the footer:
+/// the marks are kept in a block at the end of the data section, after every
+/// row, so a reader that knows only rows (any build from before marks) sees the
+/// bundle as it always was, rows in the footer and the rest of the data
+/// ignored, and a bundle that carries marks stays readable to it.
 pub const MARK_TXID: u64 = u64::MAX;
+
+/// The end of the marks block: `[u16 len | cell]*`, the length of those entries
+/// as a little-endian u32, and this magic, as the last bytes of the data section.
+const MARKS_MAGIC: &[u8; 4] = b"CLG1";
 
 fn malformed(what: &str) -> Error {
     Error::Other(format!("bundle: {what}").into())
@@ -68,7 +75,18 @@ pub struct BundleEntry {
 pub fn encode(entries: &[BundleEntry]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut footer = Vec::new();
+    let mut marks = Vec::new();
     for entry in entries {
+        if entry.txid == MARK_TXID {
+            let cell = entry.cell.as_bytes();
+            let cell_len: u16 = cell
+                .len()
+                .try_into()
+                .map_err(|_| malformed("cell name too long"))?;
+            marks.extend_from_slice(&cell_len.to_le_bytes());
+            marks.extend_from_slice(cell);
+            continue;
+        }
         let cell = entry.cell.as_bytes();
         let cell_len: u16 = cell
             .len()
@@ -85,6 +103,15 @@ pub fn encode(entries: &[BundleEntry]) -> Result<Vec<u8>> {
             footer.extend_from_slice(&value.to_le_bytes());
         }
         out.extend_from_slice(&entry.bytes);
+    }
+    if !marks.is_empty() {
+        let marks_len: u32 = marks
+            .len()
+            .try_into()
+            .map_err(|_| malformed("marks too large"))?;
+        out.extend_from_slice(&marks);
+        out.extend_from_slice(&marks_len.to_le_bytes());
+        out.extend_from_slice(MARKS_MAGIC);
     }
     let len: u32 = footer
         .len()
@@ -106,11 +133,43 @@ pub fn decode_rows(bundle: &[u8]) -> Result<Vec<BundleRow>> {
 
 /// The cells whose mark a bundle carries.
 pub fn decode_marks(bundle: &[u8]) -> Result<Vec<String>> {
-    Ok(decode_footer(bundle)?
-        .into_iter()
-        .filter(|row| row.txid == MARK_TXID)
-        .map(|row| row.cell)
-        .collect())
+    let (data, _) = split_data_and_footer(bundle)?;
+    if data.len() < 8 || &data[data.len() - 4..] != MARKS_MAGIC {
+        return Ok(Vec::new());
+    }
+    let marks_len = u32::from_le_bytes(data[data.len() - 8..data.len() - 4].try_into().unwrap());
+    let end = data.len() - 8;
+    let Some(start) = end.checked_sub(marks_len as usize) else {
+        return Ok(Vec::new());
+    };
+    // The block follows every row; bytes that a row covers are not a block.
+    let rows_end = decode_footer(bundle)?
+        .iter()
+        .map(|row| row.offset.saturating_add(row.len))
+        .max()
+        .unwrap_or(0);
+    if (start as u64) < rows_end {
+        return Ok(Vec::new());
+    }
+    let mut block = &data[start..end];
+    let mut cells = Vec::new();
+    while !block.is_empty() {
+        if block.len() < 2 {
+            return Err(malformed("truncated mark"));
+        }
+        let cell_len = u16::from_le_bytes(block[..2].try_into().unwrap()) as usize;
+        block = &block[2..];
+        if block.len() < cell_len {
+            return Err(malformed("truncated mark"));
+        }
+        cells.push(
+            std::str::from_utf8(&block[..cell_len])
+                .map_err(|_| malformed("cell name not utf-8"))?
+                .to_string(),
+        );
+        block = &block[cell_len..];
+    }
+    Ok(cells)
 }
 
 fn decode_footer(bundle: &[u8]) -> Result<Vec<BundleRow>> {
@@ -186,6 +245,32 @@ mod tests {
         expected.extend_from_slice(&(footer.len() as u32).to_le_bytes());
         expected.extend_from_slice(b"CLB1");
         assert_eq!(body, expected);
+    }
+
+    /// A build from before marks reads the footer rows and the data they point
+    /// at, and nothing else: a bundle with marks decodes for it as a bundle
+    /// without, and its rows slice as they did.
+    #[test]
+    fn a_reader_that_knows_only_rows_sees_a_bundle_with_marks_unchanged() {
+        let with = encode(&[
+            entry("c", 1, b"abc"),
+            entry("d", MARK_TXID, b""),
+            entry("e", 2, b"xy"),
+            entry("f", MARK_TXID, b""),
+        ])
+        .unwrap();
+        let without = encode(&[entry("c", 1, b"abc"), entry("e", 2, b"xy")]).unwrap();
+        // The footer, which is all that such a reader parses, is byte for byte the
+        // same, and the rows are the same two.
+        let (_, footer_with) = split_data_and_footer(&with).unwrap();
+        let (_, footer_without) = split_data_and_footer(&without).unwrap();
+        assert_eq!(footer_with, footer_without);
+        for row in decode_footer(&with).unwrap() {
+            assert_ne!(row.txid, MARK_TXID, "no row of the footer is a mark");
+            assert_eq!(slice(&with, &row).unwrap(), slice(&without, &row).unwrap());
+        }
+        assert_eq!(decode_marks(&with).unwrap(), ["d", "f"]);
+        assert!(decode_marks(&without).unwrap().is_empty());
     }
 
     #[test]

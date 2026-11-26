@@ -360,17 +360,24 @@ pub async fn add_granted_bits(
     let counters = counters_of_marks(&header, tag, marks);
     let chunks: BTreeSet<u64> = counters.iter().map(|counter| counter / CHUNK).collect();
     for chunk in chunks {
+        // A chunk ends this loop only when its bits are in it, or it cannot take
+        // them (sealed or gone). A loop that loses every race has confirmed
+        // nothing, and the rows that depend on the bits must not be uploaded.
+        let mut settled = false;
         for _ in 0..6 {
             let Read::Found(found, token) = read_chunk(bucket, tag, chunk).await? else {
+                settled = true;
                 break;
             };
             if found.state == State::Sealed {
+                settled = true;
                 break;
             }
             let mut next = found.clone();
             next.granted
                 .extend(counters.range(chunk * CHUNK..(chunk + 1) * CHUNK));
             if next == found {
+                settled = true;
                 break;
             }
             next.rev += 1;
@@ -378,9 +385,15 @@ pub async fn add_granted_bits(
                 .await?
                 .is_some()
             {
+                settled = true;
                 break;
             }
         }
+        anyhow::ensure!(
+            settled,
+            "adding granted bits to {} lost every race",
+            chunk_key(tag, chunk)
+        );
     }
     Ok(())
 }
