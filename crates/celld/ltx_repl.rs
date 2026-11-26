@@ -249,9 +249,10 @@ pub trait Shipper: Send + Sync + 'static {
         true
     }
 
-    /// The nodes this shipper's rounds go to, for the check that every one of
-    /// them can read the marks a round would carry.
-    fn members(&self) -> Vec<String> {
+    /// The nodes this shipper's rounds go to, each with the process generation
+    /// whose lease named it, for the check that every one of them can read the
+    /// marks a round would carry.
+    fn members(&self) -> Vec<(String, String)> {
         Vec::new()
     }
 
@@ -5244,7 +5245,7 @@ async fn ship_loop(
         // A member that cannot read marks (a node of an older build that joined the
         // ensemble after the grants were made) would reject the whole body, and the
         // rows of the round would lose their proof: the marks are not shipped to it.
-        let marks = crate::session::marks_for_round(&active.members()).await;
+        let marks = crate::session::marks_for_round(&active.members());
         if credits.is_empty() && marks.is_empty() {
             continue;
         }

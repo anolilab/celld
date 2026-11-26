@@ -4690,9 +4690,21 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             });
             let gate = bucket_ownership.clone();
             celld::session::set_mark_gate(Box::new(move |members| {
-                let gate = gate.clone();
-                Box::pin(async move { gate.members_read_marks(&members).await })
+                gate.members_cached_capable(members)
             }));
+            // The members' capability is read here, off the ship path, and the
+            // ship loop uses only the answer.
+            // Only a process that runs as a session has marks to ship; without one
+            // nothing is read.
+            if celld::session::current().is_some() {
+                let refresher = bucket_ownership.clone();
+                tokio::spawn(async move {
+                    loop {
+                        refresher.refresh_member_capability().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                });
+            }
             *actor.node_log.lock().unwrap() = Some(manager.clone());
             // Recovery-before-install is fatal for every posture: the
             // predecessor's folded state lives in the lease record this

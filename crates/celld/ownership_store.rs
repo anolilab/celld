@@ -102,6 +102,20 @@ pub(crate) struct LeaseSessionWire {
     pub(crate) format: u32,
 }
 
+/// What one refresh read of a member's lease says about marks.
+struct MemberCap {
+    generation: String,
+    capable: bool,
+    read_ms: u64,
+    expires_ms: u64,
+}
+
+/// How long a refreshed answer about a member may be used at ship time.
+const MEMBER_CAP_FRESH_MS: u64 = 5_000;
+
+/// The longest one lease read of the refresh may take.
+const MEMBER_CAP_READ: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The session format of this build, advertised in its lease.
 pub(crate) const SESSION_FORMAT: u32 = 1;
 
@@ -563,6 +577,14 @@ pub struct BucketOwnership {
     /// state the ship loop proves with. Set once by the process that owns the log;
     /// without it the stored log record alone decides.
     ensemble_live: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// What the last refresh read of each member's lease: its process
+    /// generation (the identity of the lease), whether it can read marks, when
+    /// it was read and when it expires. Consulted at ship time; never filled
+    /// there.
+    member_caps: std::sync::Mutex<std::collections::HashMap<String, MemberCap>>,
+    /// The members of rounds that the ship loop asked about, so that the refresh
+    /// reads their leases too.
+    wanted_members: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// A pause before each lease read, so a test can make the reads slow.
     #[cfg(test)]
     lease_read_delay: std::sync::Mutex<std::time::Duration>,
@@ -821,6 +843,8 @@ impl BucketOwnership {
             k5: crate::session_reader::K5Plans::default(),
             marks_gate: std::sync::Mutex::new((0, false, Vec::new(), 0)),
             ensemble_live: std::sync::OnceLock::new(),
+            member_caps: std::sync::Mutex::default(),
+            wanted_members: std::sync::Mutex::default(),
             #[cfg(test)]
             lease_read_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
             records_gate: std::sync::Mutex::new((0, false)),
@@ -1510,6 +1534,79 @@ impl BucketOwnership {
             _ => return false,
         };
         self.members_read_marks(&ensemble).await
+    }
+
+    /// What the ship loop may use: `Some` when a fresh read of each member's
+    /// lease answers for the very process that the round goes to (the lease's
+    /// generation is the member's), `None` when any member has no fresh answer or
+    /// another process holds its name now. Reads nothing: the answers come from
+    /// [`Self::refresh_member_capability`], which runs off the ship path.
+    pub fn members_cached_capable(&self, members: &[(String, String)]) -> Option<bool> {
+        {
+            let mut wanted = self.wanted_members.lock().unwrap();
+            wanted.extend(members.iter().map(|(node, _)| node.clone()));
+        }
+        let now = crate::asyncrt::mono_ms();
+        let wall = now_ms();
+        let caps = self.member_caps.lock().unwrap();
+        let mut all_capable = true;
+        for (node, generation) in members {
+            let cap = caps.get(node)?;
+            if cap.generation != *generation
+                || now.saturating_sub(cap.read_ms) > MEMBER_CAP_FRESH_MS
+                || cap.expires_ms <= wall
+            {
+                return None;
+            }
+            all_capable &= cap.capable;
+        }
+        Some(all_capable)
+    }
+
+    /// Read the leases of the ensemble's members and of the nodes the ship loop
+    /// asked about, together, each under a bound, and keep what they say. Run
+    /// periodically by a task of its own, so the ship loop never waits on the
+    /// bucket for it.
+    pub async fn refresh_member_capability(&self) {
+        let mut nodes: std::collections::BTreeSet<String> =
+            self.wanted_members.lock().unwrap().clone();
+        if let Some(log) = &self.own_log.lock().unwrap().1 {
+            nodes.extend(log.ensemble.iter().cloned());
+        }
+        let reads = nodes.into_iter().map(|node| async move {
+            #[cfg(test)]
+            {
+                let delay = *self.lease_read_delay.lock().unwrap();
+                crate::asyncrt::sleep(delay).await;
+            }
+            let read =
+                crate::asyncrt::timeout(MEMBER_CAP_READ, load_lease_wire(&self.bucket, &node))
+                    .await;
+            (node, read)
+        });
+        for (node, read) in futures_util::future::join_all(reads).await {
+            let wall = now_ms();
+            let mut caps = self.member_caps.lock().unwrap();
+            match read {
+                Ok(Ok(Some(lease))) => {
+                    caps.insert(
+                        node,
+                        MemberCap {
+                            generation: lease.generation.clone(),
+                            capable: lease_capable(&lease, wall),
+                            read_ms: crate::asyncrt::mono_ms(),
+                            expires_ms: lease.expires_ms,
+                        },
+                    );
+                }
+                // A lease that is gone, or a read that failed or timed out, leaves
+                // no fresh answer: what was kept goes stale.
+                Ok(Ok(None)) => {
+                    caps.remove(&node);
+                }
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
     }
 
     /// Whether every one of `ensemble` is live and advertises the session
