@@ -930,11 +930,6 @@ fn credit_percell_upload(handle: &Cell, txid: u64) {
     handle.durable_txid.fetch_max(txid, Ordering::SeqCst);
 }
 
-/// Whether the bucket covers every cell row in one shipped batch, so that
-/// followers can truncate it. The ledger holds each handle after the cell
-/// stops, so every path that leaves rows only in the bucket, and every path
-/// that deletes them, must credit `durable_txid`, or this batch and every
-/// later batch stay on follower disks until the next epoch.
 /// What a shipped batch holds that must reach the bucket before the followers
 /// may truncate it: the top position of each cell, and the `Grant` marks, which
 /// reach the bucket as a bit in the session's chunk.
@@ -944,6 +939,11 @@ struct ShipBatch {
     marks: Vec<u64>,
 }
 
+/// Whether the bucket covers every cell row in one shipped batch, so that
+/// followers can truncate it. The ledger holds each handle after the cell
+/// stops, so every path that leaves rows only in the bucket, and every path
+/// that deletes them, must credit `durable_txid`, or this batch and every
+/// later batch stay on follower disks until the next epoch.
 fn ship_batch_covered(cells: &[(CellHandle, u64)]) -> bool {
     cells
         .iter()
@@ -1746,11 +1746,6 @@ impl LtxRepl {
             })
     }
 
-    /// The final process-seal barrier. A cell that leaves the active map can
-    /// still have fleet-acked rows outside the per-cell layout. Ending a cell
-    /// installs that fact in `dirty_tails` before it removes the active handle,
-    /// and this method reads the same two stores in that order. Therefore, the
-    /// final check observes either the undrained active handle or its marker.
     /// The watermarks of a resident cell: per-cell coverage, durable and shipped.
     pub(crate) fn watermarks(&self, cell: &str, epoch: u64) -> Option<(u64, u64, u64)> {
         let cells = self.cells.lock().unwrap();
@@ -1762,6 +1757,11 @@ impl LtxRepl {
         ))
     }
 
+    /// The final process-seal barrier. A cell that leaves the active map can
+    /// still have fleet-acked rows outside the per-cell layout. Ending a cell
+    /// installs that fact in `dirty_tails` before it removes the active handle,
+    /// and this method reads the same two stores in that order. Therefore, the
+    /// final check observes either the undrained active handle or its marker.
     pub(crate) fn all_tails_tiered(&self) -> bool {
         let cells = self.cells.lock().unwrap();
         Self::all_cells_shipped_tiered(&cells) && self.dirty_tails.lock().unwrap().is_empty()

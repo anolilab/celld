@@ -2999,6 +2999,48 @@ impl StreamWindow {
     }
 }
 
+/// How the close looks at the per-cell layout before it decides to seal. A
+/// process without a session looks once, with no wait: the close is what it has
+/// always been. A session also writes its chunks, which releases the first
+/// per-cell objects of granted cells, and looks again for a bounded time that
+/// stays well inside the budget of a stop.
+struct CloseLooks {
+    attempts: u32,
+    budget_ms: u64,
+}
+
+fn close_looks(session: bool) -> CloseLooks {
+    if session {
+        CloseLooks {
+            attempts: 20,
+            budget_ms: 10_000,
+        }
+    } else {
+        CloseLooks {
+            attempts: 1,
+            budget_ms: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod close_looks_tests {
+    use super::close_looks;
+
+    #[test]
+    fn a_close_without_a_session_looks_once_and_waits_for_nothing() {
+        let looks = close_looks(false);
+        assert_eq!((looks.attempts, looks.budget_ms), (1, 0));
+    }
+
+    #[test]
+    fn a_close_with_a_session_is_bounded_well_inside_a_stop() {
+        let looks = close_looks(true);
+        assert!(looks.attempts > 1);
+        assert!(looks.budget_ms <= 15_000, "{}", looks.budget_ms);
+    }
+}
+
 /// How long an ensemble must have been active before a grant relies on it.
 const PROVING_SETTLE_MS: u64 = 1_500;
 
@@ -5814,13 +5856,6 @@ impl NodeLogManager {
         shipper.outstanding.load(Ordering::SeqCst) > 0
     }
 
-    /// The graceful-shutdown drain point: stop fleet acks, wait for the
-    /// ticking bundle loop to tier what was shipped, then seal our own
-    /// record. The next incarnation finds Sealed and opens a fresh epoch
-    /// with no gather at all — without this, a routine restart hands
-    /// recovery a whole epoch of already-drained bundles to re-fold.
-    /// Best-effort: any failure leaves the record Open, and recovery
-    /// does what it always does.
     /// Seal the session's header and chunks when it has no log to seal. A
     /// failure leaves them open for the next process to seal.
     async fn seal_session_without_log(&self) {
@@ -5831,6 +5866,13 @@ impl NodeLogManager {
         }
     }
 
+    /// The graceful-shutdown drain point: stop fleet acks, wait for the
+    /// ticking bundle loop to tier what was shipped, then seal our own
+    /// record. The next incarnation finds Sealed and opens a fresh epoch
+    /// with no gather at all — without this, a routine restart hands
+    /// recovery a whole epoch of already-drained bundles to re-fold.
+    /// Best-effort: any failure leaves the record Open, and recovery
+    /// does what it always does.
     pub async fn close_gracefully(&self) {
         let shipper = {
             let mut transition = self.live_log.lock().await;
@@ -5895,64 +5937,81 @@ impl NodeLogManager {
         let mut tails_tiered = false;
         let mut uncovered_rows = None;
         let mut uncovered_cells: Option<Vec<(String, u64)>> = None;
-        for attempt in 0..20 {
-            if let Some(session) = crate::session::current() {
-                if let Err(error) = session.checkpoint(&self.bucket).await {
-                    warn!(%error, "node-log close: the session could not write its chunks");
-                }
-            }
+        let looks = close_looks(crate::session::current().is_some());
+        let deadline = mono_ms().saturating_add(looks.budget_ms);
+        if looks.attempts == 1 && looks.budget_ms == 0 {
+            // No session: one look, as the close has always taken it.
             tails_tiered = self.ltx.all_tails_tiered();
-            uncovered_rows = match self.uncovered_bundle_rows().await {
-                Ok(uncovered) => {
-                    if attempt == 19 || (tails_tiered && uncovered.is_empty()) {
-                        for (cell, epoch, txid) in uncovered.keys().take(3) {
-                            let facts = crate::session::current().and_then(|session| {
-                                let counter = session.own_counter_of_scope(cell)?;
-                                Some((
-                                    session.is_granted(counter),
-                                    session.is_checkpointed(counter),
-                                ))
-                            });
-                            debug!(
-                                cell = %cell,
-                                epoch,
-                                txid,
-                                ?facts,
-                                watermarks = ?self.ltx.watermarks(cell, *epoch),
-                                "node-log close: a row of the bundles is not in its cell's objects"
-                            );
-                        }
+            if tails_tiered {
+                uncovered_rows = self
+                    .uncovered_bundle_rows()
+                    .await
+                    .ok()
+                    .map(|uncovered| uncovered.len());
+            }
+        } else {
+            for attempt in 0..looks.attempts {
+                if let Some(session) = crate::session::current() {
+                    if let Err(error) = session.checkpoint(&self.bucket).await {
+                        warn!(%error, "node-log close: the session could not write its chunks");
                     }
-                    uncovered_cells = Some(
-                        uncovered
-                            .keys()
-                            .map(|(cell, epoch, _)| (cell.clone(), *epoch))
-                            .collect::<BTreeSet<_>>()
-                            .into_iter()
-                            .collect(),
-                    );
-                    Some(uncovered.len())
                 }
-                Err(_) => None,
-            };
-            if let Some(cells) = &uncovered_cells {
-                // The rows of a cell that no per-cell object covers are put there by
-                // the direct pass that a handoff runs, with the grants in their chunks.
-                futures_util::stream::iter(cells.iter().cloned())
-                    .for_each_concurrent(16, |(cell, epoch)| async move {
-                        self.ltx
-                            .sync_wait(&cell, epoch, std::time::Duration::from_secs(10))
-                            .await;
-                    })
-                    .await;
-            }
-            if tails_tiered && uncovered_rows == Some(0) {
-                if attempt > 0 {
-                    debug!(attempt, "node-log close: the per-cell layout is complete");
+                tails_tiered = self.ltx.all_tails_tiered();
+                uncovered_rows = match self.uncovered_bundle_rows().await {
+                    Ok(uncovered) => {
+                        if attempt + 1 == looks.attempts || (tails_tiered && uncovered.is_empty()) {
+                            for (cell, epoch, txid) in uncovered.keys().take(3) {
+                                let facts = crate::session::current().and_then(|session| {
+                                    let counter = session.own_counter_of_scope(cell)?;
+                                    Some((
+                                        session.is_granted(counter),
+                                        session.is_checkpointed(counter),
+                                    ))
+                                });
+                                debug!(
+                                    cell = %cell,
+                                    epoch,
+                                    txid,
+                                    ?facts,
+                                    watermarks = ?self.ltx.watermarks(cell, *epoch),
+                                    "node-log close: a row of the bundles is not in its cell's objects"
+                                );
+                            }
+                        }
+                        uncovered_cells = Some(
+                            uncovered
+                                .keys()
+                                .map(|(cell, epoch, _)| (cell.clone(), *epoch))
+                                .collect::<BTreeSet<_>>()
+                                .into_iter()
+                                .collect(),
+                        );
+                        Some(uncovered.len())
+                    }
+                    Err(_) => None,
+                };
+                let left = deadline.saturating_sub(mono_ms());
+                let wait = std::time::Duration::from_millis(left.clamp(250, 10_000));
+                if let Some(cells) = &uncovered_cells {
+                    // The rows of a cell that no per-cell object covers are put there by
+                    // the direct pass that a handoff runs, with the grants in their chunks.
+                    futures_util::stream::iter(cells.iter().cloned())
+                        .for_each_concurrent(16, |(cell, epoch)| async move {
+                            self.ltx.sync_wait(&cell, epoch, wait).await;
+                        })
+                        .await;
                 }
-                break;
+                if tails_tiered && uncovered_rows == Some(0) {
+                    if attempt > 0 {
+                        debug!(attempt, "node-log close: the per-cell layout is complete");
+                    }
+                    break;
+                }
+                if mono_ms() >= deadline {
+                    break;
+                }
+                crate::asyncrt::sleep(std::time::Duration::from_millis(250)).await;
             }
-            crate::asyncrt::sleep(std::time::Duration::from_millis(250)).await;
         }
         let per_cell_complete = tails_tiered && uncovered_rows == Some(0);
         if !log_tier::graceful_seal_allowed(
