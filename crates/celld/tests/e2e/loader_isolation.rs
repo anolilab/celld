@@ -252,3 +252,30 @@ async fn loaded_code_cannot_reach_the_internal_listener_of_a_host_object() {
         assert!(message.contains("egress refused"), "{op}: {result}");
     }
 }
+
+/// A refused dial fires exactly one `error` carrying the refusal, then exactly
+/// one `close` (1006, not clean), in that order.
+#[tokio::test]
+async fn a_refused_websocket_dial_fires_error_then_close_once_each() {
+    let server = Server::start("loader-isolation", &[("CELLD_EGRESS", "public")]).await;
+    let id = seed_host(&server, "vault", "internal-secret").await;
+    let internal = server.internal_url(&format!("/cell/{id}")).await;
+    let result = loaded(
+        &server,
+        "default",
+        "websocket-events",
+        &[("url", &internal)],
+    )
+    .await;
+    assert_eq!(result["ok"], true, "{result}");
+    let events = result["events"].as_array().expect("the events").clone();
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(types, ["error", "close"], "{result}");
+    let message = events[0]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("egress refused"), "{result}");
+    assert_eq!(events[1]["code"], 1006, "{result}");
+    assert_eq!(events[1]["wasClean"], false, "{result}");
+}
