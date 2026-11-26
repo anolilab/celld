@@ -1961,6 +1961,12 @@ async fn first_request_times(nodes: usize, mode: &'static str, count: usize) -> 
 /// the median is reported.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s3_the_first_response_of_a_minted_agent_in_read_is_not_slower_than_off() {
+    // `LAZY_FLEET_S3_PAIRS=n` runs the interleaved pair mode instead (see
+    // `s3_pairs`): the gate for a quiet host.
+    if let Ok(pairs) = std::env::var("LAZY_FLEET_S3_PAIRS") {
+        s3_pairs(pairs.parse().expect("a number of pairs")).await;
+        return;
+    }
     for nodes in [2, 4] {
         let off = first_request_times(nodes, "off", 300).await;
         let read = first_request_times(nodes, "read", 300).await;
@@ -1992,6 +1998,58 @@ async fn s3_the_first_response_of_a_minted_agent_in_read_is_not_slower_than_off(
         assert!(
             p(&read, 0.5) <= p(&off, 0.5) + 100.0 && p(&read, 0.9) <= p(&off, 0.9) + 150.0,
             "{nodes} nodes: read is far slower than off"
+        );
+    }
+}
+
+fn quantile(times: &[f64], q: f64) -> f64 {
+    times[((times.len() as f64 * q) as usize).min(times.len() - 1)]
+}
+
+fn median(mut values: Vec<f64>) -> f64 {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    values[values.len() / 2]
+}
+
+/// The gate of S3 for a quiet host: `pairs` runs of the flag off and of `read`,
+/// alternating, the order swapping from one pair to the next so that a drift of
+/// the host falls on both. Each pair gives the difference of the median and of the
+/// 99th percentile of the first response (read minus off). `read` is not slower if
+/// the median of those differences is not above the noise floor, at 2 and at 4
+/// nodes. Start it when nothing else runs on the host.
+async fn s3_pairs(pairs: usize) {
+    for nodes in [2, 4] {
+        let (mut d50, mut d99) = (Vec::new(), Vec::new());
+        for pair in 0..pairs {
+            let (off, read) = if pair % 2 == 0 {
+                let off = first_request_times(nodes, "off", 300).await;
+                (off, first_request_times(nodes, "read", 300).await)
+            } else {
+                let read = first_request_times(nodes, "read", 300).await;
+                (first_request_times(nodes, "off", 300).await, read)
+            };
+            if off.is_empty() || read.is_empty() {
+                return;
+            }
+            d50.push(quantile(&read, 0.5) - quantile(&off, 0.5));
+            d99.push(quantile(&read, 0.99) - quantile(&off, 0.99));
+            eprintln!(
+                "S3 pair {pair} at {nodes} nodes: off p50 {:.1} p99 {:.1} ms, read p50 {:.1} p99 {:.1} ms",
+                quantile(&off, 0.5),
+                quantile(&off, 0.99),
+                quantile(&read, 0.5),
+                quantile(&read, 0.99)
+            );
+        }
+        let (m50, m99) = (median(d50.clone()), median(d99.clone()));
+        eprintln!("S3 {nodes} nodes over {pairs} pairs: read minus off, median of p50 {m50:+.1} ms, median of p99 {m99:+.1} ms (p50 {d50:?}, p99 {d99:?})");
+        assert!(
+            m50 <= 1.0,
+            "{nodes} nodes: the median of read is slower than off by {m50:.1} ms"
+        );
+        assert!(
+            m99 <= 5.0,
+            "{nodes} nodes: the 99th percentile of read is slower than off by {m99:.1} ms"
         );
     }
 }
