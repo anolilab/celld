@@ -563,6 +563,9 @@ pub struct BucketOwnership {
     /// state the ship loop proves with. Set once by the process that owns the log;
     /// without it the stored log record alone decides.
     ensemble_live: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// A pause before each lease read, so a test can make the reads slow.
+    #[cfg(test)]
+    lease_read_delay: std::sync::Mutex<std::time::Duration>,
     /// The same for the capability of every live lease, for the records that an
     /// older build would misread.
     records_gate: std::sync::Mutex<(u64, bool)>,
@@ -818,6 +821,8 @@ impl BucketOwnership {
             k5: crate::session_reader::K5Plans::default(),
             marks_gate: std::sync::Mutex::new((0, false, Vec::new(), 0)),
             ensemble_live: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            lease_read_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
             records_gate: std::sync::Mutex::new((0, false)),
         }
     }
@@ -1532,8 +1537,17 @@ impl BucketOwnership {
         let wall = now_ms();
         let mut allowed = true;
         let mut soonest = u64::MAX;
-        for member in &ensemble {
-            match load_lease_wire(&self.bucket, member).await {
+        // The members' leases are read together, not one after the other.
+        let reads = ensemble.iter().map(|member| async move {
+            #[cfg(test)]
+            {
+                let delay = *self.lease_read_delay.lock().unwrap();
+                crate::asyncrt::sleep(delay).await;
+            }
+            load_lease_wire(&self.bucket, member).await
+        });
+        for lease in futures_util::future::join_all(reads).await {
+            match lease {
                 Ok(Some(lease)) if lease_capable(&lease, wall) => {
                     soonest = soonest.min(lease.expires_ms);
                 }
@@ -1619,7 +1633,24 @@ impl BucketOwnership {
         let Some(counter) = session.own_counter_of_scope(cell) else {
             return Ok(());
         };
-        let granted = self.grant_or_waive(session, cell, counter).await;
+        // In `shadow` the whole step, the reads of the members' leases included,
+        // is bounded: when it does not finish in time the request goes on without
+        // marks and the failure is counted.
+        let granted = if session.fails_closed() {
+            self.grant_or_waive(session, cell, counter).await
+        } else {
+            match crate::asyncrt::timeout(
+                SHADOW_PROOF_WAIT,
+                self.grant_or_waive(session, cell, counter),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "the grant of {cell} did not finish in time"
+                )),
+            }
+        };
         crate::session::tolerate(session, "grant", granted)
     }
 
@@ -2377,6 +2408,41 @@ mod grant_tests {
         );
         // And an empty ensemble reads nothing.
         assert!(!ownership.members_read_marks(&[]).await);
+    }
+
+    /// A slow read of the members' leases does not hold a request in `shadow`
+    /// beyond its bound: the step is cut, counted, and the request goes on.
+    #[tokio::test]
+    async fn slow_lease_reads_do_not_hold_a_shadow_request_past_its_bound() {
+        let (_dir, bucket, ownership) = world();
+        *ownership.own_log.lock().unwrap() = (
+            1,
+            Some(NodeLogWire {
+                state: "open".into(),
+                epoch: 1,
+                ensemble: vec!["m".into(), "n".into()],
+                tiered: 0,
+                may_have_fleet_acks: false,
+                claimant: None,
+                claimed_ms: None,
+            }),
+        );
+        let future = now_ms() + 60_000;
+        put_lease(&bucket, "m", &lease(future, Some(SESSION_FORMAT))).await;
+        put_lease(&bucket, "n", &lease(future, Some(SESSION_FORMAT))).await;
+        *ownership.lease_read_delay.lock().unwrap() = std::time::Duration::from_secs(30);
+        let session = Session::with_tag(Mode::Shadow, [8; 8], &[]);
+        let scope = scope_of(&session, 0);
+        let began = crate::asyncrt::mono_ms();
+        ownership
+            .after_first_record(&session, &scope)
+            .await
+            .expect("a slow store does not fail a shadow request");
+        assert!(
+            crate::asyncrt::mono_ms() - began < 2_000,
+            "bounded by the shadow wait, not by the lease reads"
+        );
+        assert!(!session.is_pending_scope(&scope));
     }
 
     #[tokio::test]

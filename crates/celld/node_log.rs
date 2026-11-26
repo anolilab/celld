@@ -3004,6 +3004,18 @@ impl StreamWindow {
 /// always been. A session also writes its chunks, which releases the first
 /// per-cell objects of granted cells, and looks again for a bounded time that
 /// stays well inside the budget of a stop.
+/// Run `step` for at most what is left until `deadline` (monotonic milliseconds).
+/// `None` when nothing is left or the step does not finish in time.
+async fn within<T>(deadline: u64, step: impl std::future::Future<Output = T>) -> Option<T> {
+    let left = deadline.saturating_sub(mono_ms());
+    if left == 0 {
+        return None;
+    }
+    crate::asyncrt::timeout(std::time::Duration::from_millis(left), step)
+        .await
+        .ok()
+}
+
 struct CloseLooks {
     attempts: u32,
     budget_ms: u64,
@@ -3025,12 +3037,36 @@ fn close_looks(session: bool) -> CloseLooks {
 
 #[cfg(test)]
 mod close_looks_tests {
-    use super::close_looks;
+    use super::{close_looks, mono_ms, within};
 
     #[test]
     fn a_close_without_a_session_looks_once_and_waits_for_nothing() {
         let looks = close_looks(false);
         assert_eq!((looks.attempts, looks.budget_ms), (1, 0));
+    }
+
+    /// A step that never finishes is cut at the deadline, and a step that is
+    /// asked after it is not started: the loop of the close cannot outlive its
+    /// budget by waiting on a slow store.
+    #[tokio::test]
+    async fn a_slow_step_of_the_close_is_cut_at_the_deadline() {
+        crate::asyncrt::install_test_host_runtime();
+        let began = mono_ms();
+        let deadline = began + 300;
+        let slow = within(
+            deadline,
+            crate::asyncrt::sleep(std::time::Duration::from_secs(60)),
+        );
+        assert!(slow.await.is_none());
+        assert!(
+            mono_ms() - began < 2_000,
+            "returned within the budget and a margin"
+        );
+        assert!(
+            within(deadline, async { 1 }).await.is_none(),
+            "nothing is left"
+        );
+        assert_eq!(within(mono_ms() + 10_000, async { 1 }).await, Some(1));
     }
 
     #[test]
@@ -6004,13 +6040,27 @@ impl NodeLogManager {
             }
         } else {
             for attempt in 0..looks.attempts {
+                // Every wait of the loop is under the one deadline: a store that
+                // answers slowly cannot take the close past its budget.
                 if let Some(session) = crate::session::current() {
-                    if let Err(error) = session.checkpoint(&self.bucket).await {
-                        warn!(%error, "node-log close: the session could not write its chunks");
+                    match within(deadline, session.checkpoint(&self.bucket)).await {
+                        Some(Err(error)) => {
+                            warn!(%error, "node-log close: the session could not write its chunks");
+                        }
+                        Some(Ok(())) => {}
+                        None => {
+                            warn!("node-log close: the budget ended while the session wrote its chunks");
+                            break;
+                        }
                     }
                 }
                 tails_tiered = self.ltx.all_tails_tiered();
-                uncovered_rows = match self.uncovered_bundle_rows().await {
+                let Some(scanned) = within(deadline, self.uncovered_bundle_rows()).await else {
+                    uncovered_rows = None;
+                    warn!("node-log close: the budget ended while the bundles were scanned");
+                    break;
+                };
+                uncovered_rows = match scanned {
                     Ok(uncovered) => {
                         if attempt + 1 == looks.attempts || (tails_tiered && uncovered.is_empty()) {
                             for (cell, epoch, txid) in uncovered.keys().take(3) {
@@ -6043,16 +6093,18 @@ impl NodeLogManager {
                     }
                     Err(_) => None,
                 };
-                let left = deadline.saturating_sub(mono_ms());
-                let wait = std::time::Duration::from_millis(left.clamp(250, 10_000));
                 if let Some(cells) = &uncovered_cells {
                     // The rows of a cell that no per-cell object covers are put there by
                     // the direct pass that a handoff runs, with the grants in their chunks.
-                    futures_util::stream::iter(cells.iter().cloned())
+                    let left = deadline.saturating_sub(mono_ms());
+                    let wait = std::time::Duration::from_millis(left.min(10_000));
+                    let synced = futures_util::stream::iter(cells.iter().cloned())
                         .for_each_concurrent(16, |(cell, epoch)| async move {
                             self.ltx.sync_wait(&cell, epoch, wait).await;
-                        })
-                        .await;
+                        });
+                    if within(deadline, synced).await.is_none() {
+                        break;
+                    }
                 }
                 if tails_tiered && uncovered_rows == Some(0) {
                     if attempt > 0 {
@@ -6060,10 +6112,15 @@ impl NodeLogManager {
                     }
                     break;
                 }
-                if mono_ms() >= deadline {
+                if within(
+                    deadline,
+                    crate::asyncrt::sleep(std::time::Duration::from_millis(250)),
+                )
+                .await
+                .is_none()
+                {
                     break;
                 }
-                crate::asyncrt::sleep(std::time::Duration::from_millis(250)).await;
             }
         }
         let per_cell_complete = tails_tiered && uncovered_rows == Some(0);
