@@ -3211,6 +3211,8 @@ async fn a_map_a_failed_commit_may_have_written_is_deleted_after_the_grace() {
     let spill = spill_now(&node, &mut holding).await;
     run_job(&node, &mut holding, spill).await;
     assert_eq!(node.counters.jobs_discarded.load(Ordering::Relaxed), 1);
+    // A commit that failed is counted apart from a job whose inputs changed.
+    assert_eq!(node.counters.commits_failed.load(Ordering::Relaxed), 1);
     assert_eq!(
         keys_under(&plain, &objects::maps_root(PREFIX)).await.len(),
         1,

@@ -1684,6 +1684,7 @@ impl Registry {
                 Err(why) => {
                     if let Some(key) = stray {
                         holding.retired.push((key, crate::asyncrt::mono_ms()));
+                        self.counters.commits_failed.fetch_add(1, Ordering::Relaxed);
                     }
                     self.counters.jobs_discarded.fetch_add(1, Ordering::Relaxed);
                     tracing::info!(event = "registry_job_discarded", kind = job.kind, ?why);

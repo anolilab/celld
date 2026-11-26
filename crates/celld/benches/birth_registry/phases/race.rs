@@ -66,6 +66,18 @@ async fn done_jobs(rig: &Rig) -> u64 {
         + c["jobs_discarded"].as_u64().unwrap_or(0)
 }
 
+/// Commits that failed so far, over every node: a failed commit is also counted
+/// as a discarded job, so a round that saw one is not evidence of the race.
+async fn commit_failures(rig: &Rig) -> u64 {
+    let mut failed = 0;
+    for index in rig.nodes() {
+        if let Some(state) = rig.fleet.registry_state(index).await {
+            failed += state["counters"]["commits_failed"].as_u64().unwrap_or(0);
+        }
+    }
+    failed
+}
+
 pub async fn race() {
     let rounds: usize = env_f64("CELLD_REG_ROUNDS", 200.0) as usize;
     let template = env_text("CELLD_REG_AGED").unwrap();
@@ -93,6 +105,7 @@ pub async fn race() {
         let nodes = rig.nodes();
         let (before, _) = super::gather(&rig.fleet, &nodes, false).await;
         let discarded_before = total(&before, "jobs_discarded");
+        let failed_before = total(&before, "commits_failed");
         let initial_distinct = match rig.fleet.holder().await {
             Some(holder) => probe::jget(
                 &rig.fleet.client,
@@ -149,6 +162,9 @@ pub async fn race() {
             }
             registered.extend(keys.iter().map(hex));
             let done_before = done_jobs(&rig).await;
+            let failures_before = commit_failures(&rig).await;
+            let mut prepares_in_time = true;
+            let mut jobs_in_time = false;
             if mode == 2 {
                 hold(&rig, "commit", true).await;
             }
@@ -174,6 +190,7 @@ pub async fn race() {
                         break;
                     }
                     if waited.elapsed() > Duration::from_secs(300) {
+                        prepares_in_time = false;
                         break;
                     }
                 }
@@ -188,8 +205,17 @@ pub async fn race() {
                         running == 0 && prepared == 0 && forced == 0
                     })
                 {
+                    jobs_in_time = true;
                     break;
                 }
+            }
+            let failed_commits = commit_failures(&rig).await.saturating_sub(failures_before);
+            if !gates::round_valid(true, jobs_in_time, prepares_in_time, failed_commits) {
+                say!(
+                    "race mode {mode} round {round}: not valid (jobs in time {jobs_in_time}, prepared in time {prepares_in_time}, failed commits {failed_commits}), skipped"
+                );
+                invalid_rounds += 1;
+                continue;
             }
             let mut check: Vec<(String, Expect)> = registered
                 .iter()
@@ -245,7 +271,10 @@ pub async fn race() {
         full.extend(registered.iter().map(|k| (k.clone(), Expect::Exists)));
         let final_check = probe::check_keys(&rig.fleet.ep, full, 32, &nodes).await;
         let (after, _) = super::gather(&rig.fleet, &nodes, false).await;
-        let discarded = total(&after, "jobs_discarded").saturating_sub(discarded_before);
+        // Real discards: a failed commit is also counted as a discarded job.
+        let discarded = total(&after, "jobs_discarded")
+            .saturating_sub(discarded_before)
+            .saturating_sub(total(&after, "commits_failed").saturating_sub(failed_before));
         // One report at every sampling point, each equal: none at all, or a
         // missing one, is a failure and not an empty pass.
         let expected_reports = (0..rounds)

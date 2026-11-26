@@ -276,6 +276,9 @@ pub(crate) struct Counters {
     pub spills_timer: AtomicU64,
     pub base_merges: AtomicU64,
     pub jobs_discarded: AtomicU64,
+    /// Of `jobs_discarded`, the jobs whose commit failed (a map that could not be
+    /// written), not jobs whose inputs changed under them.
+    pub commits_failed: AtomicU64,
     /// Segments a pass left for the next one because its read budget ran out.
     pub reads_deferred: AtomicU64,
     pub merge_check_failures: AtomicU64,
@@ -1053,6 +1056,7 @@ impl Registry {
             ("spills_timer", &counters.spills_timer),
             ("base_merges", &counters.base_merges),
             ("jobs_discarded", &counters.jobs_discarded),
+            ("commits_failed", &counters.commits_failed),
             ("reads_deferred", &counters.reads_deferred),
             ("merge_check_failures", &counters.merge_check_failures),
             ("takeovers", &counters.takeovers),

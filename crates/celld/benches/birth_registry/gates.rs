@@ -598,6 +598,19 @@ pub fn restart_row(keys: usize, before: &[String], after: &[String]) -> Row {
     )
 }
 
+/// Whether a race round counts: its segment was covered before the race began,
+/// both forced jobs finished within their wait (and, in mode 2, both were
+/// prepared within theirs), and no commit failed. A round that fails any of
+/// these is left out; the gate needs enough of the rest.
+pub fn round_valid(
+    covered: bool,
+    jobs_finished_in_time: bool,
+    prepares_in_time: bool,
+    commit_failures: u64,
+) -> bool {
+    covered && jobs_finished_in_time && prepares_in_time && commit_failures == 0
+}
+
 /// G-q: both modes ran, each with at least 95 % of its rounds valid (the
 /// segment was covered before the race began) and a final check over some keys;
 /// no key lost; the record count equals the distinct keys; and in mode 2 the
@@ -1349,5 +1362,30 @@ mod selftest {
         assert_eq!(gate_i(json!({ "n": 10, "p99": 9000.0 })), Some(false));
         assert_eq!(gate_i(json!({ "n": 0, "p50": null, "p99": null })), None);
         assert_eq!(nearest_ms(&[], 99.0), None);
+    }
+
+    #[test]
+    fn a_race_round_that_timed_out_or_failed_a_commit_is_not_valid() {
+        assert!(round_valid(true, true, true, 0));
+        assert!(!round_valid(false, true, true, 0), "not covered");
+        assert!(
+            !round_valid(true, false, true, 0),
+            "the forced jobs did not finish in time"
+        );
+        assert!(
+            !round_valid(true, true, false, 0),
+            "mode 2's jobs were not prepared in time"
+        );
+        assert!(
+            !round_valid(true, true, true, 1),
+            "a commit failed, so a discard may not be the race"
+        );
+        // Enough such rounds sink the gate through the valid-round count.
+        let mode = |valid: u64| {
+            json!({ "valid_rounds": valid, "final_check": { "total": 500, "misses": 0 }, "round_misses": [],
+                    "records_equal_distinct_keys": true, "merges_discarded": valid })
+        };
+        assert_eq!(race_row(&[mode(200), mode(200)], 200).pass, Some(true));
+        assert_eq!(race_row(&[mode(200), mode(150)], 200).pass, Some(false));
     }
 }
