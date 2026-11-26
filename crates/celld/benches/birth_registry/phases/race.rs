@@ -12,14 +12,20 @@ use crate::probe::{self, Expect, Gates};
 use crate::{env_f64, env_text, record};
 use celld_logic::registry::Record;
 
+/// Set a hold on every node. A node that does not accept it ends the phase: a
+/// race run without its fault would pass for nothing.
 async fn hold(rig: &Rig, what: &str, on: bool) {
     for index in rig.nodes() {
-        let _ = probe::jpost(
+        let reply = probe::jpost(
             &rig.fleet.client,
             &format!("{}/__registry/hold", rig.fleet.ep.internal(index)),
             json!({ "what": what, "on": on, "ms": 0 }),
         )
         .await;
+        assert!(
+            reply.as_ref().is_some_and(|reply| reply["ok"] == true),
+            "node {index} did not accept the {what} hold ({on}): {reply:?}"
+        );
     }
 }
 
@@ -231,7 +237,14 @@ pub async fn race() {
         let final_check = probe::check_keys(&rig.fleet.ep, full, 32, &nodes).await;
         let (after, _) = super::gather(&rig.fleet, &nodes, false).await;
         let discarded = total(&after, "jobs_discarded").saturating_sub(discarded_before);
+        // One report at every sampling point, each equal: none at all, or a
+        // missing one, is a failure and not an empty pass.
+        let expected_reports = (0..rounds)
+            .filter(|round| (round + 1).is_multiple_of(25) || round + 1 == rounds)
+            .count();
         let equal = initial_distinct.is_some()
+            && !partition_checks.is_empty()
+            && partition_checks.len() == expected_reports
             && partition_checks.iter().all(|c| {
                 !c["report"].is_null()
                     && c["report"]["declared_records"] == c["report"]["distinct_keys"]

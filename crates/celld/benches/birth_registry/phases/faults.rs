@@ -60,8 +60,10 @@ impl Load {
 
     pub async fn stop(self) -> (Value, Value) {
         self.births.stop.store(true, Ordering::Relaxed);
+        let mut uncovered = 0;
         if let Some(generator) = &self.generator {
             generator.stop();
+            uncovered = generator.finish(Duration::from_secs(30)).await;
         }
         let _ = self.task.await;
         for task in self.tasks {
@@ -69,7 +71,8 @@ impl Load {
         }
         let generator = self.generator.as_ref().map(|g| {
             json!({ "segments": g.segments.load(Ordering::Relaxed), "failed": g.failed.load(Ordering::Relaxed),
-                    "durable_to_covered_ms": super::percentiles(&g.covered_ms.lock().unwrap()) })
+                    "durable_to_covered_ms": super::percentiles(&g.covered_ms.lock().unwrap()),
+                    "uncovered": uncovered })
         });
         (self.births.summary(), generator.unwrap_or(Value::Null))
     }
@@ -509,13 +512,18 @@ pub async fn node_kill() {
                 let survivors: Vec<usize> = (0..3).filter(|i| *i != victim).collect();
                 let pending = Arc::new(Mutex::new(names.clone()));
                 let slowest = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                // Cells that got an answer, and cells given up on after 180 s.
+                let answered = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let unanswered = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let mut tasks = Vec::new();
                 for worker in 0..16 {
-                    let (ep, pending, slowest, survivors) = (
+                    let (ep, pending, slowest, survivors, answered, unanswered) = (
                         rig.fleet.ep.clone(),
                         pending.clone(),
                         slowest.clone(),
                         survivors.clone(),
+                        answered.clone(),
+                        unanswered.clone(),
                     );
                     tasks.push(tokio::spawn(async move {
                         let mut at_node = worker;
@@ -524,6 +532,7 @@ pub async fn node_kill() {
                                 return;
                             };
                             let began = Instant::now();
+                            let mut got_answer = false;
                             loop {
                                 at_node += 1;
                                 let url = format!(
@@ -537,6 +546,7 @@ pub async fn node_kill() {
                                     .await
                                     .is_ok_and(|r| r.status().is_success())
                                 {
+                                    got_answer = true;
                                     break;
                                 }
                                 if began.elapsed() > Duration::from_secs(180) {
@@ -544,8 +554,14 @@ pub async fn node_kill() {
                                 }
                                 tokio::time::sleep(Duration::from_millis(200)).await;
                             }
-                            let _ = began;
-                            slowest.fetch_max(at.elapsed().as_millis() as u64, Ordering::Relaxed);
+                            // Only a cell that answered gives a time.
+                            if got_answer {
+                                answered.fetch_add(1, Ordering::Relaxed);
+                                slowest
+                                    .fetch_max(at.elapsed().as_millis() as u64, Ordering::Relaxed);
+                            } else {
+                                unanswered.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }));
                 }
@@ -553,6 +569,10 @@ pub async fn node_kill() {
                     let _ = task.await;
                 }
                 let all_answer_ms = slowest.load(Ordering::Relaxed);
+                let (answered, unanswered) = (
+                    answered.load(Ordering::Relaxed),
+                    unanswered.load(Ordering::Relaxed),
+                );
                 let (waits, would) = if build == "registry" {
                     let (after, samples) = gather(&rig.fleet, &survivors, false).await;
                     let waited = total(&after, "backstop_waits")
@@ -573,7 +593,7 @@ pub async fn node_kill() {
                     (Value::Null, 0)
                 };
                 say!("gather {build}/{victim_kind}/{repeat}: victim {victim}, {} cells, all answered in {all_answer_ms} ms, {waits}", names.len());
-                rows.push(json!({ "build": build, "victim": victim_kind, "repeat": repeat, "victim_node": victim, "cells": names.len(), "all_answer_ms": all_answer_ms, "coverage": waits, "waited": would }));
+                rows.push(json!({ "build": build, "victim": victim_kind, "repeat": repeat, "victim_node": victim, "cells": names.len(), "answered": answered, "unanswered": unanswered, "all_answer_ms": all_answer_ms, "coverage": waits, "waited": would }));
                 rig.fleet
                     .save_logs(&format!("gather-{build}-{victim_kind}-{repeat}"));
             }
@@ -593,6 +613,11 @@ pub async fn node_kill() {
     let reg_ms = median("registry", "non_holder");
     let main_holder_ms = median("main", "holder");
     let reg_holder_ms = median("registry", "holder");
+    // Every requested cell of every round answered, or the timings mean nothing.
+    let all_answered = !rows.is_empty()
+        && rows.iter().all(|r| {
+            r["unanswered"] == 0 && r["answered"] == r["cells"] && r["cells"].as_u64() > Some(0)
+        });
     let waits: u64 = rows
         .iter()
         .filter(|r| r["build"] == "registry")
@@ -600,9 +625,9 @@ pub async fn node_kill() {
         .sum();
     gates.add(
         "G-f",
-        json!({ "non_holder_victim_ms": { "registry": reg_ms, "main": main_ms }, "holder_victim_ms": { "registry": reg_holder_ms, "main": main_holder_ms }, "waits_for_cells_older_than_20s": waits }),
-        "<= main + 20 %; holder victim <= main + 5 s; 0 waits",
-        Some(reg_ms <= main_ms * 1.2 && reg_holder_ms <= main_holder_ms + 5000.0 && waits == 0),
+        json!({ "non_holder_victim_ms": { "registry": reg_ms, "main": main_ms }, "holder_victim_ms": { "registry": reg_holder_ms, "main": main_holder_ms }, "waits_for_cells_older_than_20s": waits, "every_cell_answered": all_answered }),
+        "<= main + 20 %; holder victim <= main + 5 s; 0 waits; every requested cell answered",
+        Some(all_answered && reg_ms <= main_ms * 1.2 && reg_holder_ms <= main_holder_ms + 5000.0 && waits == 0),
     );
     record("gather", json!({ "rows": rows, "gates": gates.json() }));
 }

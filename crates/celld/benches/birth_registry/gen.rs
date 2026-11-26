@@ -61,6 +61,9 @@ pub struct Generator {
     pub store: Store,
     pub prefix: String,
     pub stop: Arc<AtomicBool>,
+    /// Ends the monitor, after the producers stopped and `finish` waited for
+    /// the segments still to be covered.
+    pub monitor_stop: AtomicBool,
     pub segments: AtomicU64,
     pub entries: AtomicU64,
     pub failed: AtomicU64,
@@ -90,6 +93,7 @@ impl Generator {
             store,
             prefix: prefix.to_owned(),
             stop: Arc::new(AtomicBool::new(false)),
+            monitor_stop: AtomicBool::new(false),
             segments: AtomicU64::new(0),
             entries: AtomicU64::new(0),
             failed: AtomicU64::new(0),
@@ -111,8 +115,21 @@ impl Generator {
         tasks
     }
 
+    /// Stop producing segments. The monitor keeps watching until `finish`.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// After `stop`: wait until every durable segment has been seen in a delta,
+    /// or `within` has passed, then end the monitor. Returns the segments still
+    /// uncovered, which a gate counts as failures.
+    pub async fn finish(&self, within: Duration) -> usize {
+        let deadline = Instant::now() + within;
+        while !self.durable.lock().unwrap().is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        self.monitor_stop.store(true, Ordering::Relaxed);
+        self.durable.lock().unwrap().len()
     }
 
     fn entries_per_segment(&self) -> usize {
@@ -227,7 +244,7 @@ impl Generator {
     async fn monitor(self: Arc<Self>) {
         let mut seen: HashSet<DeltaId> = HashSet::new();
         let mut tick = tokio::time::interval(Duration::from_millis(500));
-        while !self.stop.load(Ordering::Relaxed) {
+        while !self.monitor_stop.load(Ordering::Relaxed) {
             tick.tick().await;
             let Some(root) = read_root(&self.store, &self.prefix).await else {
                 continue;
