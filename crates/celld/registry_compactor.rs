@@ -1916,8 +1916,14 @@ impl Registry {
                 .map_or(u64::MAX, |at| now.saturating_sub(at)),
             self.cfg.spill_ms,
         ) && !holding.root.deltas.is_empty();
-        let forced = self.forced.lock().unwrap().pop_front();
-        let kind = if let Some((forced_kind, partition)) = forced {
+        // A request an earlier holder of this node accepted is not this one's.
+        let forced = self
+            .forced
+            .lock()
+            .unwrap()
+            .pop_front()
+            .filter(|(_, _, epoch)| *epoch == holding.epoch);
+        let kind = if let Some((forced_kind, partition, _)) = forced {
             // The debug route checks the name and the partition; anything else
             // that reaches here is dropped, not run as a base merge.
             match forced_kind.as_str() {

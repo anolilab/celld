@@ -73,6 +73,34 @@ fn parse_force(
     }
 }
 
+/// A hold request: which hold, whether it is on, and for `root_write` the delay.
+/// A missing or mistyped `what`, `on` or delay is an error, so a malformed
+/// request cannot release a hold.
+#[derive(Debug, PartialEq, Eq)]
+enum HoldRequest {
+    Commit(bool),
+    Schedule(bool),
+    RootWrite(u64),
+}
+
+fn parse_hold(body: &serde_json::Value) -> Result<HoldRequest, &'static str> {
+    let on = body
+        .get("on")
+        .and_then(|on| on.as_bool())
+        .ok_or("on: a boolean")?;
+    match body.get("what").and_then(|what| what.as_str()) {
+        Some("commit") => Ok(HoldRequest::Commit(on)),
+        Some("schedule") => Ok(HoldRequest::Schedule(on)),
+        Some("root_write") if !on => Ok(HoldRequest::RootWrite(0)),
+        Some("root_write") => body
+            .get("ms")
+            .and_then(|ms| ms.as_u64())
+            .map(HoldRequest::RootWrite)
+            .ok_or("ms: a number"),
+        _ => Err("what: commit, schedule or root_write"),
+    }
+}
+
 /// Serve one debug request. `None` for a path that is not a registry route.
 pub async fn serve(
     registry: &Arc<Registry>,
@@ -187,8 +215,13 @@ pub async fn serve(
             };
             let queued = forced.as_ref().map_or("pass", |(job, _)| job.as_str());
             let queued = queued.to_owned();
-            if let Some(forced) = forced {
-                registry.forced.lock().unwrap().push_back(forced);
+            if let Some((job, partition)) = forced {
+                let epoch = registry.role.epoch.load(Ordering::Relaxed);
+                registry
+                    .forced
+                    .lock()
+                    .unwrap()
+                    .push_back((job, partition, epoch));
             }
             registry.pass_now.notify_one();
             reply(200, serde_json::json!({ "queued": queued }))
@@ -207,20 +240,14 @@ pub async fn serve(
             )
         }
         ("POST", "/__registry/hold") => {
-            let on = body.get("on").and_then(|on| on.as_bool()).unwrap_or(false);
             let holds = &registry.holds;
-            match body.get("what").and_then(|what| what.as_str()) {
-                Some("commit") => holds.commit.store(on, Ordering::Relaxed),
-                Some("schedule") => holds.schedule.store(on, Ordering::Relaxed),
-                Some("root_write") => holds.root_write_ms.store(
-                    if on {
-                        body.get("ms").and_then(|ms| ms.as_u64()).unwrap_or(0)
-                    } else {
-                        0
-                    },
-                    Ordering::Relaxed,
-                ),
-                _ => return reply(400, serde_json::json!({ "error": "what" })),
+            match parse_hold(body) {
+                Ok(HoldRequest::Commit(on)) => holds.commit.store(on, Ordering::Relaxed),
+                Ok(HoldRequest::Schedule(on)) => holds.schedule.store(on, Ordering::Relaxed),
+                Ok(HoldRequest::RootWrite(ms)) => {
+                    holds.root_write_ms.store(ms, Ordering::Relaxed);
+                }
+                Err(error) => return reply(400, serde_json::json!({ "error": error })),
             }
             reply(200, serde_json::json!({ "ok": true }))
         }
@@ -254,6 +281,37 @@ mod tests {
             json!({ "job": "base_merge", "partition": "3" }),
         ] {
             assert!(parse_force(&bad, 8).is_err(), "{bad} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_hold_request_needs_a_known_hold_and_a_boolean() {
+        use serde_json::json;
+        assert_eq!(
+            parse_hold(&json!({ "what": "commit", "on": true })),
+            Ok(HoldRequest::Commit(true))
+        );
+        assert_eq!(
+            parse_hold(&json!({ "what": "schedule", "on": false })),
+            Ok(HoldRequest::Schedule(false))
+        );
+        assert_eq!(
+            parse_hold(&json!({ "what": "root_write", "on": true, "ms": 35000 })),
+            Ok(HoldRequest::RootWrite(35_000))
+        );
+        assert_eq!(
+            parse_hold(&json!({ "what": "root_write", "on": false })),
+            Ok(HoldRequest::RootWrite(0))
+        );
+        for bad in [
+            json!({ "what": "commit" }),
+            json!({ "what": "commit", "on": "true" }),
+            json!({ "on": true }),
+            json!({ "what": "other", "on": true }),
+            json!({ "what": "root_write", "on": true }),
+            json!(null),
+        ] {
+            assert!(parse_hold(&bad).is_err(), "{bad} was accepted");
         }
     }
 

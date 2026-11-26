@@ -410,7 +410,7 @@ async fn synthetic_aged_registry() {
     );
 }
 
-fn run_dir() -> String {
+pub(super) fn run_dir() -> String {
     format!(
         "{}/.t3/scratch/registry-spike",
         std::env::var("HOME").unwrap_or_default()
