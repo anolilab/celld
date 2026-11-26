@@ -175,6 +175,7 @@ pub async fn soak() {
     // (answers, unknown) of the windows with a fault and of the quiet ones.
     let mut window_drill = (0_u64, 0_u64);
     let mut window_steady = (0_u64, 0_u64);
+    let mut window_late = (0_u64, 0_u64);
     let mut round = 0_u64;
     let mut stopped_for = None;
     let mut revived = 0_u64;
@@ -320,9 +321,19 @@ pub async fn soak() {
         checked += check.total;
         tally.poll(&rig).await;
         let totals_steady_from = tally.totals();
-        tokio::time::sleep(steady).await;
-        tally.poll(&rig).await;
-        let totals_steady_to = tally.totals();
+        // The quiet window in four parts, so the first one, which still carries
+        // the warm-up of a node that restarted, can be told from the rest.
+        let mut quarters = Vec::new();
+        let mut previous = totals_steady_from.clone();
+        for _ in 0..4 {
+            tokio::time::sleep(steady / 4).await;
+            tally.poll(&rig).await;
+            let now = tally.totals();
+            let (answers, unknown) = answered_between(&previous, &now);
+            quarters.push((answers, unknown));
+            previous = now;
+        }
+        let totals_steady_to = previous;
         let (drill_answers, drill_unknown) =
             answered_between(&totals_before_drill, &totals_after_drill);
         let (steady_answers, steady_unknown) =
@@ -331,6 +342,9 @@ pub async fn soak() {
         window_drill.1 += drill_unknown;
         window_steady.0 += steady_answers;
         window_steady.1 += steady_unknown;
+        // The last two quarters: two to four minutes after the settle.
+        window_late.0 += quarters[2].0 + quarters[3].0;
+        window_late.1 += quarters[2].1 + quarters[3].1;
         let guard = guard_answers(&rig.fleet, &rig.nodes()).await;
         let totals = tally.totals();
         let progress = json!({
@@ -341,6 +355,7 @@ pub async fn soak() {
             "check": check.json(),
             "recheck": recheck,
             "unknown_drill": { "answers": drill_answers, "unknown": drill_unknown, "pct": pct(drill_unknown, drill_answers) },
+            "unknown_steady_quarters": quarters.iter().map(|(a, u)| json!({ "answers": a, "unknown": u, "pct": pct(*u, *a) })).collect::<Vec<_>>(),
             "unknown_steady": { "answers": steady_answers, "unknown": steady_unknown, "pct": pct(steady_unknown, steady_answers) },
             "guard_mismatches": guard["mismatches"],
             "mismatch_events": log_events(&rig, "registry_mismatch"),
@@ -416,6 +431,7 @@ pub async fn soak() {
         "answers": {
             "answered": answered, "unknown_pct": unknown_pct,
             "steady": { "answers": window_steady.0, "unknown": window_steady.1, "pct": pct(window_steady.1, window_steady.0) },
+            "steady_last_two_quarters": { "answers": window_late.0, "unknown": window_late.1, "pct": pct(window_late.1, window_late.0) },
             "drill": { "answers": window_drill.0, "unknown": window_drill.1, "pct": pct(window_drill.1, window_drill.0) },
         },
         "wrong_answers": {
