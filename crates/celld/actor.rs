@@ -53,6 +53,7 @@ fn with_session(mut state: State) -> State {
     state.set_id_unissued(crate::session::scope_unissued);
     if let Some(session) = crate::session::current() {
         state.set_session(session.tags().clone());
+        state.set_session_active(crate::session::is_active);
         state.set_resumed(session.resumed_snapshot());
     }
     state

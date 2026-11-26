@@ -359,6 +359,11 @@ pub fn decrypt_counter(key: &[u8; 32], block: [u8; 8]) -> u64 {
 
 static SESSION: OnceLock<Session> = OnceLock::new();
 
+/// A session that could not be opened in `shadow` is given up: it stays installed
+/// (the process holds references to it) and no longer counts, so that the process
+/// behaves in every respect as one that runs with the flag `off`.
+static GIVEN_UP: AtomicBool = AtomicBool::new(false);
+
 /// Install the session of this process. A second install is a bug.
 pub fn install(session: Session) -> &'static Session {
     assert!(SESSION.set(session).is_ok(), "a session is installed once");
@@ -366,7 +371,12 @@ pub fn install(session: Session) -> &'static Session {
 }
 
 pub fn current() -> Option<&'static Session> {
-    SESSION.get()
+    SESSION.get().filter(|_| !GIVEN_UP.load(Ordering::SeqCst))
+}
+
+/// Whether the session of this process acts: one is installed and not given up.
+pub fn is_active() -> bool {
+    current().is_some()
 }
 
 /// Whether `record` names this process, or a predecessor whose cell this
@@ -1056,6 +1066,12 @@ impl Session {
             return Err(error);
         }
         self.closed.store(true, Ordering::SeqCst);
+        if std::ptr::eq(
+            self,
+            SESSION.get().map_or(std::ptr::null(), |session| session),
+        ) {
+            GIVEN_UP.store(true, Ordering::SeqCst);
+        }
         note_shadow_failure("open", &error);
         Ok(())
     }
@@ -2152,6 +2168,26 @@ mod tests {
         assert!(!marks_satisfied(&shadow, &[0]));
         shadow.checkpointed.lock().unwrap().insert(0);
         assert!(marks_satisfied(&shadow, &[0]));
+    }
+
+    /// A session that is given up stops counting: nothing is advertised, written
+    /// or closed as a session, so the process is as one with the flag `off`.
+    #[test]
+    fn a_session_given_up_in_shadow_is_not_current() {
+        let slot: OnceLock<Session> = OnceLock::new();
+        let given_up = AtomicBool::new(false);
+        let current = |slot: &OnceLock<Session>, given_up: &AtomicBool| {
+            slot.get()
+                .filter(|_| !given_up.load(Ordering::SeqCst))
+                .is_some()
+        };
+        assert!(!current(&slot, &given_up), "none installed");
+        slot.set(Session::with_tag(Mode::Shadow, [4; 8], &[]))
+            .ok()
+            .unwrap();
+        assert!(current(&slot, &given_up));
+        given_up.store(true, Ordering::SeqCst);
+        assert!(!current(&slot, &given_up), "given up");
     }
 
     #[test]

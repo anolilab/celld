@@ -338,19 +338,29 @@ mod tests {
 }
 
 /// The sealed headers this process has read, by tag. A sealed header is final.
-static SEALED_HEADERS: std::sync::Mutex<Option<std::collections::HashMap<String, store::Header>>> =
-    std::sync::Mutex::new(None);
+static SEALED_HEADERS: std::sync::Mutex<
+    Option<std::collections::HashMap<String, (store::Header, u64)>>,
+> = std::sync::Mutex::new(None);
+
+/// How long a sealed header is kept: it never changes, but an operator may delete
+/// or replace it, and a header that is gone must be noticed.
+const SEALED_HEADERS_TTL_MS: u64 = 5 * 60 * 1_000;
 
 /// The most headers kept; past it the cache starts again.
 const SEALED_HEADERS_CAP: usize = 4_096;
 
 fn sealed_header(tag: &str) -> Option<store::Header> {
+    sealed_header_at(tag, crate::asyncrt::mono_ms())
+}
+
+fn sealed_header_at(tag: &str, now_ms: u64) -> Option<store::Header> {
     SEALED_HEADERS
         .lock()
         .expect("sealed headers poisoned")
         .as_ref()?
         .get(tag)
-        .cloned()
+        .filter(|(_, kept_ms)| now_ms.saturating_sub(*kept_ms) < SEALED_HEADERS_TTL_MS)
+        .map(|(header, _)| header.clone())
 }
 
 fn remember_sealed(tag: &str, header: &store::Header) {
@@ -364,7 +374,7 @@ fn remember_sealed(tag: &str, header: &store::Header) {
     if cache.len() >= SEALED_HEADERS_CAP {
         cache.clear();
     }
-    cache.insert(tag.to_string(), header.clone());
+    cache.insert(tag.to_string(), (header.clone(), crate::asyncrt::mono_ms()));
 }
 
 #[cfg(test)]
@@ -400,5 +410,16 @@ mod sealed_header_cache_tests {
             sealed_header("cache-sealed").map(|header| header.rev),
             Some(3)
         );
+        // A header kept for longer than its lifetime is read again.
+        let kept = SEALED_HEADERS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get("cache-sealed")
+            .unwrap()
+            .1;
+        assert!(sealed_header_at("cache-sealed", kept + SEALED_HEADERS_TTL_MS - 1).is_some());
+        assert!(sealed_header_at("cache-sealed", kept + SEALED_HEADERS_TTL_MS + 1).is_none());
     }
 }

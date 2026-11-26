@@ -4692,19 +4692,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             celld::session::set_mark_gate(Box::new(move |members| {
                 gate.members_cached_capable(members)
             }));
-            // The members' capability is read here, off the ship path, and the
-            // ship loop uses only the answer.
-            // Only a process that runs as a session has marks to ship; without one
-            // nothing is read.
-            if celld::session::current().is_some() {
-                let refresher = bucket_ownership.clone();
-                tokio::spawn(async move {
-                    loop {
-                        refresher.refresh_member_capability().await;
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    }
-                });
-            }
             *actor.node_log.lock().unwrap() = Some(manager.clone());
             // Recovery-before-install is fatal for every posture: the
             // predecessor's folded state lives in the lease record this
@@ -4778,6 +4765,18 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 // nothing. `read` and `on` rest on it and do not start.
                 session.give_up(error)?;
                 tracing::warn!("the session could not be opened in shadow; running without one");
+            }
+            // The members' capability is read here, off the ship path, and the
+            // ship loop uses only the answer. It starts with a session that opened
+            // and stops when the session closes.
+            if !session.is_closed() {
+                let refresher = bucket_ownership.clone();
+                tokio::spawn(async move {
+                    while !session.is_closed() {
+                        refresher.refresh_member_capability().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                });
             }
             let bucket = Arc::new(bucket);
             tokio::spawn(async move {
