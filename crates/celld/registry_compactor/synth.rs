@@ -97,8 +97,10 @@ fn hex(key: &Key) -> String {
     objects::hex_key(key)
 }
 
-/// Free space in GiB where the store keeps its data, or on this disk.
-fn free_gib() -> f64 {
+/// The smallest free space in GiB of the disks that were measured: where the
+/// store keeps its data (`CELLD_REG_STORE_CONTAINER`) and this one. `None` when
+/// no probe gave a number, so the caller stops instead of assuming room.
+fn free_gib() -> Option<f64> {
     let probe = |program: &str, args: &[&str]| -> Option<f64> {
         let output = std::process::Command::new(program)
             .args(args)
@@ -109,13 +111,14 @@ fn free_gib() -> f64 {
         let kib: f64 = line.split_whitespace().nth(3)?.parse().ok()?;
         Some(kib / (1 << 20) as f64)
     };
+    let container = env("CELLD_REG_STORE_CONTAINER").unwrap_or_else(|| "rustfs-reg".to_owned());
     [
         probe("df", &["-k", "."]),
-        probe("docker", &["exec", "rustfs-reg", "df", "-k", "/data"]),
+        probe("docker", &["exec", &container, "df", "-k", "/data"]),
     ]
     .into_iter()
     .flatten()
-    .fold(f64::MAX, f64::min)
+    .reduce(f64::min)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -179,9 +182,12 @@ async fn synthetic_aged_registry() {
     let mut samples = serde_json::Map::new();
     let started = std::time::Instant::now();
     for (index, months) in &aged {
+        let free = free_gib().unwrap_or_else(|| {
+            panic!("no disk probe answered: stopping before partition {index} without a free-space measurement")
+        });
         assert!(
-            free_gib() > 12.0,
-            "less than 12 GiB free: stopping before partition {index}"
+            free > 12.0,
+            "{free:.1} GiB free, less than 12: stopping before partition {index}"
         );
         let partition = map.partitions[*index];
         let hi = map.hi(*index);

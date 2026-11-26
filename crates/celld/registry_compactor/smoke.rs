@@ -53,6 +53,10 @@ async fn lookup_against_list_smoke() {
     let rounds: usize = env("CELLD_REG_SMOKE_N")
         .and_then(|value| value.parse().ok())
         .unwrap_or(20_000);
+    assert!(
+        rounds > 0,
+        "CELLD_REG_SMOKE_N must be at least 1: a smoke of no lookups checks nothing"
+    );
     let store: Arc<dyn ObjectStore> = Arc::new(
         AmazonS3Builder::new()
             .with_endpoint(endpoint)

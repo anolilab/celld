@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use super::{full_aged_check, gather, guard_answers, storage_report, total, Rig};
+use crate::gates;
 use crate::gen::{Generator, Shape};
 use crate::probe::{self, ms_p, Expect, Gates, Lookups};
 use crate::{birth_load, env_f64, env_text, record, Births};
@@ -75,6 +76,23 @@ impl Load {
                     "uncovered": uncovered })
         });
         (self.births.summary(), generator.unwrap_or(Value::Null))
+    }
+}
+
+/// Send a hold request to every node. A node that does not accept it ends the
+/// phase: a run without its fault would pass for nothing.
+async fn hold_all(rig: &Rig, body: Value) {
+    for index in rig.nodes() {
+        let reply = probe::jpost(
+            &rig.fleet.client,
+            &format!("{}/__registry/hold", rig.fleet.ep.internal(index)),
+            body.clone(),
+        )
+        .await;
+        assert!(
+            reply.as_ref().is_some_and(|reply| reply["ok"] == true),
+            "node {index} did not accept the hold {body}: {reply:?}"
+        );
     }
 }
 
@@ -261,22 +279,26 @@ pub async fn rolling() {
     let takeover_spills = total(&states, "spills_takeover");
     let (births, generator) = load.stop().await;
     let ok = births["ok"].as_f64().unwrap_or(0.0);
-    let sent = births["sent"].as_f64().unwrap_or(1.0);
+    let sent = births["sent"].as_f64().unwrap_or(0.0);
     let success = ok * 100.0 / sent.max(1.0);
     let mut gates = Gates::new();
     gates.add(
         "G-c",
         json!({ "new_id_success_pct": success, "rate_per_s": rate, "sent": sent, "spills_committed_since_restart_began": spills, "spills_started_by_takeover_in_final_processes": takeover_spills, "spills_forced_at_each_restart": 3, "base_merges": merges, "live_deltas_max": deltas_max, "restart_ms": restart_ms }),
         ">= 99.9 %; >= 1 spill; deltas never at the cap of 512 (rate lowered from 100/s to what the host sustains)",
-        Some(success >= 99.9 && spills >= 1 && deltas_max < 512),
+        // Births were sent, every node was restarted, and the deltas were read at
+        // least once (a failed read leaves 0, which is not "never at the cap").
+        gates::all(&[
+            Some(sent > 0.0),
+            Some(success >= 99.9),
+            Some(spills >= 1),
+            Some(steps.len() == nodes.len()),
+            Some(deltas_max > 0 && deltas_max < 512),
+        ]),
     );
     let check = full_aged_check(&rig, 10_000, 2_000).await;
-    gates.add(
-        "G-o",
-        json!(check.json()),
-        "0 misses",
-        Some(check.misses == 0),
-    );
+    let row = gates::check_row("G-o", &check.json());
+    gates.add(row.gate, row.measured, row.threshold, row.pass);
     let storage = storage_report(&rig, super::storage_gap()).await;
     record(
         "rolling",
@@ -421,33 +443,25 @@ pub async fn compactor_kill() {
         + summary["failed"].as_u64().unwrap_or(0)
         + u64::from(summary["answered"].as_u64().unwrap_or(0) == 0);
     rows.push(json!({ "case": "kill_quiet", "holder": holder, "next_holder_root_ms": quiet, "lookups": summary }));
-    let ms = |case: usize, key: &str| rows[case][key].as_u64();
-    gates.add(
-        "G-e",
-        json!({ "kill_under_load_ms": ms(0, "next_holder_root_ms"), "kill_quiet_ms": quiet, "drain_handover_ms": ms(1, "handover_root_ms"), "drain_next_holder_ms": ms(1, "next_holder_root_ms") }),
-        "<= 25 s; <= 40 s; drain -> next root <= 8 s",
-        Some(ms(0, "next_holder_root_ms").is_some_and(|v| v <= 25_000) && quiet.is_some_and(|v| v <= 40_000) && ms(1, "handover_root_ms").is_some_and(|v| v <= 8_000)),
-    );
+    let row = gates::failover_row(&json!(rows), quiet);
+    gates.add(row.gate, row.measured, row.threshold, row.pass);
     gates.add(
         "G-b",
         json!({ "unknown_or_wrong_during_kill_and_drain": unknown_total }),
         "0",
-        Some(unknown_total == 0),
+        // Every case measured its lookups, and none was unknown, wrong or failed.
+        Some(unknown_total == 0 && rows.len() == 3),
     );
     rig.fleet.restart(holder).await;
     let check = full_aged_check(&rig, 10_000, 2_000).await;
-    gates.add(
-        "G-o",
-        json!(check.json()),
-        "0 misses",
-        Some(check.misses == 0),
-    );
+    let row = gates::check_row("G-o", &check.json());
+    gates.add(row.gate, row.measured, row.threshold, row.pass);
     let (states, _) = gather(&rig.fleet, &rig.nodes(), false).await;
     gates.add(
         "G-m",
-        json!({ "mismatches": total(&states, "mismatches") }),
-        "0",
-        Some(total(&states, "mismatches") == 0),
+        json!({ "mismatches": total(&states, "mismatches"), "nodes_reporting": states.len() }),
+        "0, from every node",
+        Some(total(&states, "mismatches") == 0 && states.len() == rig.nodes().len()),
     );
     record(
         "compactor_kill",
@@ -600,35 +614,8 @@ pub async fn node_kill() {
         }
     }
     std::env::remove_var("CELLD_BENCH_BIN");
-    let median = |build: &str, kind: &str| -> f64 {
-        let mut values: Vec<u64> = rows
-            .iter()
-            .filter(|r| r["build"] == build && r["victim"] == kind)
-            .filter_map(|r| r["all_answer_ms"].as_u64())
-            .collect();
-        values.sort_unstable();
-        values.get(values.len() / 2).copied().unwrap_or(0) as f64
-    };
-    let main_ms = median("main", "non_holder");
-    let reg_ms = median("registry", "non_holder");
-    let main_holder_ms = median("main", "holder");
-    let reg_holder_ms = median("registry", "holder");
-    // Every requested cell of every round answered, or the timings mean nothing.
-    let all_answered = !rows.is_empty()
-        && rows.iter().all(|r| {
-            r["unanswered"] == 0 && r["answered"] == r["cells"] && r["cells"].as_u64() > Some(0)
-        });
-    let waits: u64 = rows
-        .iter()
-        .filter(|r| r["build"] == "registry")
-        .map(|r| r["waited"].as_u64().unwrap_or(0))
-        .sum();
-    gates.add(
-        "G-f",
-        json!({ "non_holder_victim_ms": { "registry": reg_ms, "main": main_ms }, "holder_victim_ms": { "registry": reg_holder_ms, "main": main_holder_ms }, "waits_for_cells_older_than_20s": waits, "every_cell_answered": all_answered }),
-        "<= main + 20 %; holder victim <= main + 5 s; 0 waits; every requested cell answered",
-        Some(all_answered && reg_ms <= main_ms * 1.2 && reg_holder_ms <= main_holder_ms + 5000.0 && waits == 0),
-    );
+    let row = gates::gather_row(&rows);
+    gates.add(row.gate, row.measured, row.threshold, row.pass);
     record("gather", json!({ "rows": rows, "gates": gates.json() }));
 }
 
@@ -726,21 +713,24 @@ pub async fn cold() {
         "G-g",
         json!({ "node_ready_ms": ready, "first_registry_answer_after_ready_ms": first, "fleet_ms": fleet_ms }),
         "first answer <= 5 s after ready; whole fleet <= 120 s",
-        Some(first.iter().all(|ms| *ms <= 5_000) && fleet_ms <= 120_000),
+        // Every node answered, within its bound.
+        Some(first.len() == 3 && first.iter().all(|ms| *ms <= 5_000) && fleet_ms <= 120_000),
     );
     gates.add(
         "G-n",
         json!({ "keys": keys.len(), "different": different, "unknown_after": unknown }),
         "identical",
-        Some(different == 0),
+        // Both rounds answered every key.
+        Some(
+            !keys.is_empty()
+                && before.len() == keys.len()
+                && after.len() == keys.len()
+                && different == 0,
+        ),
     );
     let check = full_aged_check(&rig, 10_000, 2_000).await;
-    gates.add(
-        "G-o",
-        json!(check.json()),
-        "0 misses",
-        Some(check.misses == 0),
-    );
+    let row = gates::check_row("G-o", &check.json());
+    gates.add(row.gate, row.measured, row.threshold, row.pass);
     record("cold", json!({ "births": births, "gates": gates.json() }));
     rig.fleet.save_logs("cold");
 }
@@ -897,46 +887,39 @@ pub async fn flap() {
         rounds.push(json!({
             "round": round, "holder": holder, "takeover_after_stop_ms": takeover, "role_changes": changes,
             "roots_by_stopped_holder_after_continue": old_roots_after_cont, "stand_down_ms": stood_down, "stopped_holder_exited": exited,
-            "interrupted_spill_committed_again_ms": spill_again, "claim_to_covered_max_ms": ms_p(&claims, 100.0),
+            "interrupted_spill_committed_again_ms": spill_again, "claim_to_covered_max_ms": (!claims.is_empty()).then(|| ms_p(&claims, 100.0)),
         }));
         say!("flap round {round}: {}", rounds.last().unwrap());
     }
-    let pass = rounds.iter().all(|r| {
-        r["takeover_after_stop_ms"]
-            .as_u64()
-            .is_some_and(|v| v <= 40_000)
-            && r["role_changes"] == 1
-            && r["roots_by_stopped_holder_after_continue"] == 0
-            && r["stand_down_ms"].as_u64().is_some_and(|v| v <= 10_000)
-            && r["interrupted_spill_committed_again_ms"]
+    let expected_rounds = flap_rounds;
+    let pass = !rounds.is_empty()
+        && rounds.len() == expected_rounds
+        && rounds.iter().all(|r| {
+            r["takeover_after_stop_ms"]
                 .as_u64()
-                .is_some_and(|v| v <= 120_000)
-            && r["claim_to_covered_max_ms"]
-                .as_f64()
-                .is_some_and(|v| v <= 60_000.0)
-    });
+                .is_some_and(|v| v <= 40_000)
+                && r["role_changes"] == 1
+                && r["roots_by_stopped_holder_after_continue"] == 0
+                && r["stand_down_ms"].as_u64().is_some_and(|v| v <= 10_000)
+                && r["interrupted_spill_committed_again_ms"]
+                    .as_u64()
+                    .is_some_and(|v| v <= 120_000)
+                && r["claim_to_covered_max_ms"]
+                    .as_f64()
+                    .is_some_and(|v| v <= 60_000.0)
+        });
     gates.add("G-r(A)", json!({ "rounds": rounds }), "takeover <= 40 s; 1 role change; 0 roots after continue; stand down <= 10 s; spill again <= 2 min; claims covered <= 60 s", Some(pass));
-    for index in 0..3 {
-        let _ = probe::jpost(
-            &rig.fleet.client,
-            &format!("{}/__registry/hold", rig.fleet.ep.internal(index)),
-            json!({ "what": "root_write", "on": true, "ms": 35_000 }),
-        )
-        .await;
-    }
+    hold_all(
+        &rig,
+        json!({ "what": "root_write", "on": true, "ms": 35_000 }),
+    )
+    .await;
     let watch = RootWatch::start(&rig);
     tokio::time::sleep(Duration::from_secs(
         env_f64("CELLD_REG_FLAP_HOLD_S", 600.0) as u64
     ))
     .await;
-    for index in 0..3 {
-        let _ = probe::jpost(
-            &rig.fleet.client,
-            &format!("{}/__registry/hold", rig.fleet.ep.internal(index)),
-            json!({ "what": "root_write", "on": false }),
-        )
-        .await;
-    }
+    hold_all(&rig, json!({ "what": "root_write", "on": false })).await;
     let released = Instant::now();
     let probe_name = format!("flap/{}/{:010}", rig.run, 1);
     let key = crate::gen::gen_key(&rig.run, 7_777, 1);
@@ -967,7 +950,8 @@ pub async fn flap() {
         "G-r(B)",
         json!({ "role_changes_in_10_min": changes, "coverage_after_release_ms": covered }),
         "<= 5 role changes; coverage <= 60 s",
-        Some(changes <= 5 && covered.is_some_and(|ms| ms <= 60_000)),
+        // The watch saw roots at all, and the probe segment was covered.
+        Some(!events.is_empty() && changes <= 5 && covered.is_some_and(|ms| ms <= 60_000)),
     );
     stats.stop.store(true, Ordering::Relaxed);
     let _ = lookup_task.await;
@@ -976,18 +960,17 @@ pub async fn flap() {
     let (births, generator) = load.stop().await;
     tokio::time::sleep(Duration::from_secs(60)).await;
     let check = full_aged_check(&rig, 10_000, 2_000).await;
-    gates.add(
-        "G-o",
-        json!(check.json()),
-        "0 misses",
-        Some(check.misses == 0),
-    );
+    let row = gates::check_row("G-o", &check.json());
+    gates.add(row.gate, row.measured, row.threshold, row.pass);
     let storage = storage_report(&rig, super::storage_gap()).await;
     gates.add(
         "G-l",
         json!({ "orphans": storage["orphans"], "examples": storage["orphan_examples"] }),
-        "0 (after the grace)",
-        Some(storage["orphans"] == 0),
+        "0 (after the grace), over some records",
+        gates::all(&[
+            gates::some(&storage["records_in_runs"]),
+            gates::zero(&storage["orphans"]),
+        ]),
     );
     record(
         "flap",
