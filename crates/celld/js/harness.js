@@ -11212,7 +11212,11 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
       const connection = __ws_connect(this._id, scope, id, JSON.stringify(requested));
       __registerWaitUntil(connection);
       if (this._polled) this._startPump();
-      connection.then((protocol) => {
+      // Settled once the connection's outcome has been delivered. A refused
+      // connection reaches the host's pull queue as a close frame AND rejects
+      // `connection` with the reason; the pump must not report the bare close
+      // before the rejection has carried that reason to the caller.
+      this._connecting = connection.then((protocol) => {
         if (this.readyState === WebSocket.READY_STATE_CLOSING) {
           if (this._pendingClose) {
             const [code, reason] = this._pendingClose;
@@ -11225,10 +11229,15 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
         this.readyState = WebSocket.READY_STATE_OPEN;
         this.dispatchEvent(new Event("open"));
       }, (error) => {
+        // A failed dial: one `error` carrying the reason, then one `close`
+        // (1006, not clean). The close is dispatched past the closed-state
+        // guard, which this very handler trips, and without the generic
+        // abnormal-close `error` it would otherwise add a second time.
+        this._dialFailed = true;
         this.readyState = WebSocket.READY_STATE_CLOSED;
         __sockets.delete(this._id);
         this.dispatchEvent(new ErrorEvent("error", { message: String(error?.message || error), error }));
-        this._dispatchClose(1006, "", false);
+        this._dispatchClose(1006, "", false, true);
       });
     }
   }
@@ -11265,6 +11274,12 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
         }
       } else {
         const info = JSON.parse(new TextDecoder().decode(body));
+        // A dial that fails also rejects `connection`, with the reason (an
+        // egress refusal, say). Let that reach the caller first; it closes
+        // the socket, and the bare close below is then a no-op.
+        if (this.readyState === WebSocket.READY_STATE_CONNECTING && this._connecting) {
+          await this._connecting;
+        }
         this._dispatchClose(info.code, info.reason, info.wasClean);
         return;
       }
@@ -11427,8 +11442,12 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     event._trust();
     this.dispatchEvent(event);
   }
-  _dispatchClose(code, reason, wasClean) {
-    if (this.readyState === WebSocket.READY_STATE_CLOSED) return;
+  _dispatchClose(code, reason, wasClean, errorAlreadyFired = false) {
+    // `close` fires once. A failed dial has already set the state to closed
+    // and fired its own `error`, and is let through exactly once.
+    if (this._closeDispatched) return;
+    if (this.readyState === WebSocket.READY_STATE_CLOSED && !this._dialFailed) return;
+    this._closeDispatched = true;
     this.readyState = WebSocket.READY_STATE_CLOSED;
     __sockets.delete(this._id);
     // An abnormal closure fires `error` before `close`. Code written against
@@ -11440,7 +11459,7 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     // An abnormal closure fires `error` before `close`. Code written against
     // the standard onerror never ran otherwise, which matters most for an
     // outbound socket: its peer is a remote server that can simply vanish.
-    if (!wasClean) {
+    if (!wasClean && !errorAlreadyFired) {
       this.dispatchEvent(new ErrorEvent("error", {
         message: reason
           ? `WebSocket closed abnormally: ${reason}`

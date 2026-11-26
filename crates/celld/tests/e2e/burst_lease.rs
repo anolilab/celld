@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use celld::bucket::Bucket;
 use futures_util::{FutureExt as _, StreamExt as _};
 
-use super::harness::{client, fixture_dir, signal_group, wait_until};
+use super::harness::{client, fixture_dir, run_id, signal_group, wait_until};
 
 const CELLD: &str = env!("CARGO_BIN_EXE_celld");
 
@@ -45,13 +45,7 @@ async fn a_burst_of_cell_wakes_does_not_fence_the_node() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(1000);
-    let run = format!(
-        "burst-lease-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let run = run_id("burst-lease");
     let spec = format!("{}/{run}", bucket.trim_end_matches('/'));
     let home = tempfile::TempDir::new().expect("create a temp dir");
     let deployed = Command::new(CELLD)

@@ -36,6 +36,22 @@ const OUTBOUND_CODE = `
           });
           return Response.json({ ok: true });
         }
+        if (op === "websocket-events") {
+          // Every event the socket fires, in order, until it has closed.
+          const events = [];
+          const socket = new WebSocket(target.replace(/^http/, "ws"));
+          await new Promise((resolve) => {
+            socket.addEventListener("open", () => events.push({ type: "open" }));
+            socket.addEventListener("error", (event) => events.push({ type: "error", message: event.message }));
+            socket.addEventListener("close", (event) => {
+              events.push({ type: "close", code: event.code, wasClean: event.wasClean });
+              // A late duplicate would arrive after this; give it the chance.
+              setTimeout(resolve, 200);
+            });
+            setTimeout(resolve, 5000);
+          });
+          return Response.json({ ok: true, events });
+        }
         if (op === "connect") {
           const socket = connect({ hostname: params.get("host"), port: Number(params.get("port")) });
           await socket.opened;
