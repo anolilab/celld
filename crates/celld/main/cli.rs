@@ -405,6 +405,12 @@ TUNING:
                                   connections (refuses a bad file)
   CELLD_RECOVERY_RETRY_MS         Dead-owner recovery retry backoff (default: 1000)
   CELLD_RECOVERY_RETRIES          Recovery retries before a request fails (default: 240)
+  CELLD_RECOVERY_LOSS_HOLD_MS     Extra time bound on top of the rule that only the boot's last
+                                  recovery attempt can declare a long-dead, unreachable
+                                  follower gone (default: 5 lease terms; 0 removes only the
+                                  bound). To end the wait sooner, see the next variable
+  CELLD_RECOVERY_GONE_MEMBERS     Followers declared permanently gone for this boot's recovery
+                                  (node names, comma separated; default: none)
   CELLD_LOCAL_CACHE_MAX_BYTES     Hibernated SQLite cache limit (default: 2 GiB; 0 disables)
   CELLD_MAX_RESIDENT_CELLS        Resident-cell hard cap, enforced at admission
   CELLD_MAX_CELL_REQUESTS         Concurrent fetches per cell (default: 64)

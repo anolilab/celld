@@ -69,12 +69,13 @@ struct MarkerGcSummary {
 
 /// Process-local retry state for compatibility GC.
 ///
-/// Durable marker deletions survive cancellation. `swept` avoids repeating a
-/// fleet-wide marker scan when only conditional retirement of the node record
-/// remains, while `retries` bounds a persistently failing marker store.
+/// Durable marker deletions survive cancellation. `swept`, keyed by node AND
+/// generation (a successor generation that expired between two passes is a
+/// different dead node), avoids repeating a fleet-wide marker scan when only
+/// conditional retirement of the node record remains, while `retries` bounds a persistently failing marker store.
 #[derive(Default)]
 pub struct DeadNodeGc {
-    swept: BTreeSet<String>,
+    swept: BTreeSet<(String, String)>,
     retries: BTreeMap<String, (String, u32, u64)>,
 }
 
@@ -113,7 +114,13 @@ impl DeadNodeGc {
         let observed_ms = crate::ownership_store::now_ms();
         let NodeScan { dead, live } = scan_nodes(bucket, observed_ms).await;
         let dead_names: BTreeSet<&str> = dead.iter().map(|record| record.node.as_str()).collect();
-        self.swept.retain(|node| dead_names.contains(node.as_str()));
+        let dead_generations: BTreeSet<(&str, &str)> = dead
+            .iter()
+            .map(|record| (record.node.as_str(), record.generation.as_str()))
+            .collect();
+        self.swept.retain(|(node, generation)| {
+            dead_generations.contains(&(node.as_str(), generation.as_str()))
+        });
         self.retries
             .retain(|node, _| dead_names.contains(node.as_str()));
 
@@ -121,7 +128,9 @@ impl DeadNodeGc {
         let indexed: BTreeMap<String, String> = dead
             .iter()
             .filter(|record| {
-                !self.swept.contains(&record.node)
+                !self
+                    .swept
+                    .contains(&(record.node.clone(), record.generation.clone()))
                     && self
                         .retries
                         .get(&record.node)
@@ -152,7 +161,7 @@ impl DeadNodeGc {
         for record in dead {
             let node = record.node;
             let generation = record.generation;
-            if !self.swept.contains(&node) {
+            if !self.swept.contains(&(node.clone(), generation.clone())) {
                 let (markers, retired, failures, complete) = if generation.is_empty() {
                     (0, 0, 0, true)
                 } else {
@@ -196,11 +205,11 @@ impl DeadNodeGc {
                     continue;
                 }
                 self.retries.remove(&node);
-                self.swept.insert(node.clone());
+                self.swept.insert((node.clone(), generation.clone()));
             }
             match retire_dead_node(bucket, &node, observed_ms).await {
                 Ok(true) => {
-                    self.swept.remove(&node);
+                    self.swept.remove(&(node.clone(), generation.clone()));
                 }
                 Ok(false) => {}
                 Err(error) => warn!(%node, %error, "dead-node lease retirement failed"),
@@ -340,6 +349,17 @@ async fn retire_dead_node(bucket: &Bucket, node: &str, now_ms: u64) -> anyhow::R
     ) {
         return Ok(false);
     }
+    // A lease that lapsed for a moment is not a retired node: the published
+    // address stays, and so does the record, until the lease has been dead
+    // past the grace recovery itself gives a member.
+    let ttl_ms = crate::env_vars::positive_or("CELLD_TTL_MS", 10_000).unwrap_or(10_000);
+    if now_ms
+        <= record
+            .expires_ms
+            .saturating_add(crate::node_log::member_loss_grace_ms(ttl_ms))
+    {
+        return Ok(false);
+    }
     // A folded record is never deleted. Two reasons compose. An unsealed log
     // is the fleet's only pointer to an unrecovered tail, so the record must outlive
     // recovery — the dead-leader sweep seals it, and a later pass
@@ -360,6 +380,10 @@ async fn retire_dead_node(bucket: &Bucket, node: &str, now_ms: u64) -> anyhow::R
         if record.expires_ms == 0 {
             return Ok(false);
         }
+        // The address goes first: once the lease is tombstoned no later pass
+        // looks at this node again, so a failure here is retried by leaving
+        // the lease as it is.
+        retire_boot_address(bucket, node, &format!("{node}/{}", record.generation())).await?;
         let tombstone = serde_json::to_vec(&NodeWire {
             expires_ms: 0,
             ..record
@@ -371,6 +395,7 @@ async fn retire_dead_node(bucket: &Bucket, node: &str, now_ms: u64) -> anyhow::R
     // (`expires_ms: 0`, still a dead record), then delete. A crash between
     // the two leaves a record that still reads as dead and retires on the
     // next pass.
+    retire_boot_address(bucket, node, &format!("{node}/{}", record.generation())).await?;
     let tombstone = serde_json::to_vec(&NodeWire {
         expires_ms: 0,
         ..record
@@ -384,6 +409,15 @@ async fn retire_dead_node(bucket: &Bucket, node: &str, now_ms: u64) -> anyhow::R
     }
 }
 
+/// A retired node's published boot address goes with its lease, before it. An
+/// error keeps the lease, so the next pass retries both.
+async fn retire_boot_address(bucket: &Bucket, node: &str, session: &str) -> anyhow::Result<()> {
+    crate::node_log::retire_boot_addr(bucket, node, session)
+        .await
+        .map(|_| ())
+        .with_context(|| format!("retire the boot address of {node}"))
+}
+
 async fn read_node(bucket: &Bucket, key: &str) -> anyhow::Result<Option<(NodeWire, String)>> {
     let Some((bytes, etag)) = bucket.get(key).await? else {
         return Ok(None);
@@ -391,4 +425,98 @@ async fn read_node(bucket: &Bucket, key: &str) -> anyhow::Result<Option<(NodeWir
     let record = serde_json::from_slice(&bytes)
         .with_context(|| format!("decode {}://{}/{key}", bucket.scheme(), bucket.name))?;
     Ok(Some((record, etag)))
+}
+
+#[cfg(test)]
+mod boot_address_retirement_tests {
+    use super::*;
+
+    fn lease(expires_ms: u64, generation: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "node": "dead",
+            "expires_ms": expires_ms,
+            "ownership_index_generation": generation,
+        }))
+        .unwrap()
+    }
+
+    fn published(session: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "node": "dead",
+            "session": session,
+            "boot_at_ms": 1,
+            "addr": "127.0.0.1:1",
+        }))
+        .unwrap()
+    }
+
+    async fn address_is_live(bucket: &Bucket) -> bool {
+        let (bytes, _) = bucket.get("log/dead.addr.json").await.unwrap().unwrap();
+        !String::from_utf8_lossy(&bytes).contains("\"retired\":true")
+    }
+
+    // The address of the retired lease's own boot is retired with the lease,
+    // before the lease record goes; a successor's address stays.
+    #[test]
+    fn a_dead_nodes_own_address_is_retired_with_its_lease() {
+        crate::asyncrt::install_test_host_runtime().block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let bucket = crate::dev::open_local_bucket(&dir.path().join("store.db")).unwrap();
+            bucket.put("nodes/dead.json", lease(1, "g1")).await.unwrap();
+            bucket
+                .put("log/dead.addr.json", published("dead/g1"))
+                .await
+                .unwrap();
+            // A lease that lapsed a moment ago is not retired.
+            assert!(!retire_dead_node(&bucket, "dead", 10_000).await.unwrap());
+            assert!(address_is_live(&bucket).await);
+            assert!(bucket.get("nodes/dead.json").await.unwrap().is_some());
+            assert!(retire_dead_node(&bucket, "dead", 1_000_000).await.unwrap());
+            assert!(!address_is_live(&bucket).await);
+            assert!(bucket.get("nodes/dead.json").await.unwrap().is_none());
+
+            // A successor that published inside the old lease term keeps its
+            // address.
+            bucket.put("nodes/dead.json", lease(1, "g1")).await.unwrap();
+            bucket
+                .put("log/dead.addr.json", published("dead/g2"))
+                .await
+                .unwrap();
+            assert!(retire_dead_node(&bucket, "dead", 1_000_000).await.unwrap());
+            assert!(address_is_live(&bucket).await);
+        });
+    }
+
+    // The marker sweep a pass remembers belongs to one generation of a node:
+    // a successor generation that expired before the next pass is swept again.
+    #[test]
+    fn a_successor_generation_that_expired_between_passes_is_swept_again() {
+        crate::asyncrt::install_test_host_runtime().block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let bucket = crate::dev::open_local_bucket(&dir.path().join("store.db")).unwrap();
+            let now = crate::ownership_store::now_ms();
+            // Expired a moment ago: inside the grace, so the record stays.
+            bucket
+                .put("nodes/dead.json", lease(now - 1_000, "g1"))
+                .await
+                .unwrap();
+            let mut gc = DeadNodeGc::default();
+            gc.run_pass(&bucket, 1_000).await;
+            let g1 = ("dead".to_string(), "g1".to_string());
+            let g2 = ("dead".to_string(), "g2".to_string());
+            assert!(gc.swept.contains(&g1));
+            // The node restarted and its next generation expired before the
+            // following pass saw it live.
+            bucket
+                .put("nodes/dead.json", lease(now - 500, "g2"))
+                .await
+                .unwrap();
+            gc.run_pass(&bucket, 1_000).await;
+            assert!(
+                !gc.swept.contains(&g1),
+                "the old generation's sweep is gone"
+            );
+            assert!(gc.swept.contains(&g2), "the new generation was swept");
+        });
+    }
 }
