@@ -424,6 +424,12 @@ pub(crate) fn tolerate(
     }
 }
 
+/// A bundle whose marks block cannot be read, found by a recovery that does not
+/// rest on marks: counted, logged, and its rows recovered.
+pub(crate) fn note_marks_unreadable(bundle: &str, error: &dyn std::fmt::Display) {
+    note_shadow_failure("bundle_marks", &format_args!("{bundle}: {error}"));
+}
+
 fn shadow_failures() -> BTreeMap<&'static str, u64> {
     SHADOW_FAILURES
         .lock()
@@ -640,11 +646,20 @@ pub(crate) fn marks_pending() -> bool {
 /// Whether the bit of every counter is in a chunk in the bucket. A follower
 /// may truncate a batch with marks only then.
 pub(crate) fn marks_checkpointed(counters: &[u64]) -> bool {
-    counters.is_empty()
-        || current().is_none_or(|session| {
-            let written = session.checkpointed.lock().expect("checkpointed poisoned");
-            counters.iter().all(|counter| written.contains(counter))
-        })
+    counters.is_empty() || current().is_none_or(|session| marks_satisfied(session, counters))
+}
+
+/// Whether the marks of `counters` no longer hold back a bundle or a follower's
+/// truncation: their bits are in a chunk, or the session ended its grants
+/// without sealing (a chunk or header lost under it, a rival's seal) and nothing
+/// will ever write them. In `shadow` that is enough; `read` and `on` rest on the
+/// bits and keep holding.
+fn marks_satisfied(session: &Session, counters: &[u64]) -> bool {
+    if !session.fails_closed() && session.is_closed() && !session.sealing.load(Ordering::SeqCst) {
+        return true;
+    }
+    let written = session.checkpointed.lock().expect("checkpointed poisoned");
+    counters.iter().all(|counter| written.contains(counter))
 }
 
 /// How often the session writes the chunks that changed.
@@ -932,10 +947,14 @@ impl Session {
 
     /// Clear the dirty marker of `chunk` that `written` satisfies, unless a grant
     /// of its range arrived after the snapshot that `written` was built from.
+    ///
+    /// The locks are taken in the order `granted`, then `dirty`, as
+    /// [`Self::grant_scope`] takes them, so the two cannot deadlock, and a grant
+    /// cannot slip between the check and the removal.
     fn settle_dirty(&self, chunk: u64, written: &Chunk) {
+        let granted = self.granted.lock().expect("granted poisoned");
         let mut dirty = self.dirty.lock().expect("dirty poisoned");
         dirty.remove(&chunk);
-        let granted = self.granted.lock().expect("granted poisoned");
         if granted
             .range(chunk * CHUNK..(chunk + 1) * CHUNK)
             .any(|counter| !written.granted.contains(counter))
@@ -1874,6 +1893,65 @@ mod tests {
             assert!(tolerate(&strict, kind, failed()).is_err());
             assert!(tolerate(&strict, kind, Ok(())).is_ok());
         }
+    }
+
+    /// `grant_scope` takes the granted set and then the dirty set; the settling of
+    /// a chunk takes them in the same order. Run against each other, they finish.
+    #[test]
+    fn a_grant_and_the_settling_of_a_chunk_do_not_deadlock() {
+        let session = std::sync::Arc::new(established([3; 8]));
+        let scopes: Vec<String> = (0..64)
+            .map(|counter| scope_for(&session, counter))
+            .collect();
+        let written = Chunk::default();
+        let (done, finished) = std::sync::mpsc::channel();
+        let grants = {
+            let (session, done) = (session.clone(), done.clone());
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    for scope in &scopes {
+                        session.grant_scope(scope);
+                    }
+                }
+                done.send(()).unwrap();
+            })
+        };
+        let settling = {
+            let session = session.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20_000 {
+                    session.settle_dirty(0, &written);
+                }
+                done.send(()).unwrap();
+            })
+        };
+        for _ in 0..2 {
+            finished
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("a grant and a settling deadlocked");
+        }
+        grants.join().unwrap();
+        settling.join().unwrap();
+    }
+
+    /// A session that ended its grants without sealing leaves nothing to wait
+    /// for in `shadow`, so a shipped batch whose marks were never checkpointed
+    /// is not held for ever; `read` and `on` keep the hold.
+    #[test]
+    fn a_session_closed_while_alive_does_not_hold_marks_in_shadow() {
+        let shadow = established([1; 8]);
+        let strict = Session::with_tag(Mode::On, [2; 8], &[]);
+        for session in [&shadow, &strict] {
+            assert!(!marks_satisfied(session, &[0]), "open and unwritten");
+            session.closed.store(true, Ordering::SeqCst);
+        }
+        assert!(marks_satisfied(&shadow, &[0]), "closed under it, in shadow");
+        assert!(!marks_satisfied(&strict, &[0]), "read and on keep holding");
+        // A close that is a seal in progress still waits for its bits.
+        shadow.sealing.store(true, Ordering::SeqCst);
+        assert!(!marks_satisfied(&shadow, &[0]));
+        shadow.checkpointed.lock().unwrap().insert(0);
+        assert!(marks_satisfied(&shadow, &[0]));
     }
 
     #[test]

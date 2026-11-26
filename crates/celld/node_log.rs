@@ -5666,10 +5666,18 @@ impl NodeLogManager {
             let mut gathered_bytes = 0_u64;
             // The bits of the marks that only the followers held go into the
             // chunks before any row from their tails becomes a per-cell object.
+            let mut bits_added_for = 0_usize;
             if let Some(session) = wire.session.as_ref() {
                 crate::session_store::add_granted_bits(&self.bucket, &session.tag, &granted_marks)
                     .await?;
+                bits_added_for = granted_marks.len();
             }
+            // Whether the dead session rested on its marks: only `read` and `on`
+            // do.
+            let marks_matter = wire
+                .session
+                .as_ref()
+                .is_some_and(|session| session.mode != crate::session::Mode::Shadow);
             let mut tail = Some(std::mem::take(&mut gathered));
             for (index, window) in windows.into_iter().enumerate() {
                 let fetch_started = mono_ms();
@@ -5692,10 +5700,19 @@ impl NodeLogManager {
                     let (key, bytes) = fetched?;
                     let rows = celld_ltx::bundle::decode_rows(&bytes)
                         .with_context(|| format!("decode retained recovery bundle {key}"))?;
-                    granted_marks.extend(
-                        celld_ltx::bundle::decode_marks(&bytes)
-                            .with_context(|| format!("decode the marks of bundle {key}"))?,
-                    );
+                    match celld_ltx::bundle::decode_marks(&bytes) {
+                        Ok(marks) => granted_marks.extend(marks),
+                        // The rows are what recovery is for. Marks only matter to a
+                        // session that rests on them (`read` and `on`); any other
+                        // recovers the rows, counts the bundle, and goes on.
+                        Err(error) if !marks_matter => {
+                            crate::session::note_marks_unreadable(&key, &error);
+                        }
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("decode the marks of bundle {key}"));
+                        }
+                    }
                     for row in rows {
                         let payload = celld_ltx::bundle::slice(&bytes, &row)
                             .with_context(|| format!("read a row from recovery bundle {key}"))?;
@@ -5730,12 +5747,15 @@ impl NodeLogManager {
                 // any row of these bundles becomes a per-cell object, and an
                 // update that cannot be confirmed stops the uploads.
                 if let Some(session) = wire.session.as_ref() {
-                    crate::session_store::add_granted_bits(
-                        &self.bucket,
-                        &session.tag,
-                        &granted_marks,
-                    )
-                    .await?;
+                    if granted_marks.len() != bits_added_for {
+                        crate::session_store::add_granted_bits(
+                            &self.bucket,
+                            &session.tag,
+                            &granted_marks,
+                        )
+                        .await?;
+                        bits_added_for = granted_marks.len();
+                    }
                 }
                 if gathered.is_empty() {
                     continue;

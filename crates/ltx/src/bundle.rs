@@ -273,6 +273,31 @@ mod tests {
         assert!(decode_marks(&without).unwrap().is_empty());
     }
 
+    /// A marks block that does not parse is an error of `decode_marks` alone: the
+    /// rows of the bundle still decode, so a recovery that does not rest on marks
+    /// can go on with them.
+    #[test]
+    fn a_corrupt_marks_block_spoils_the_marks_and_not_the_rows() {
+        let mut data = b"abc".to_vec();
+        // A mark that names five bytes and has one.
+        let block = [5_u8, 0, b'x'];
+        data.extend_from_slice(&block);
+        data.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        data.extend_from_slice(MARKS_MAGIC);
+        let mut footer = Vec::new();
+        footer.extend_from_slice(&1_u16.to_le_bytes());
+        footer.extend_from_slice(b"c");
+        for value in [1_u64, 1, 0, 3] {
+            footer.extend_from_slice(&value.to_le_bytes());
+        }
+        data.extend_from_slice(&footer);
+        data.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+        data.extend_from_slice(MAGIC);
+        assert!(decode_marks(&data).is_err());
+        let rows = decode_rows(&data).unwrap();
+        assert_eq!(slice(&data, &rows[0]).unwrap(), b"abc");
+    }
+
     #[test]
     fn a_mark_is_not_a_row_and_is_read_apart() {
         let body = encode(&[

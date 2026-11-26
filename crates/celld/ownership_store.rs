@@ -1614,10 +1614,12 @@ impl BucketOwnership {
             // The grant is held only while the session is open: a session that
             // began its seal has taken its gather, and a bit added now would
             // never reach a chunk.
-            anyhow::ensure!(
-                session.grant_scope(cell),
-                "the session closed before the grant of {cell} was recorded"
-            );
+            if !session.grant_scope(cell) {
+                if session.fails_closed() {
+                    session.mark_pending(counter);
+                }
+                anyhow::bail!("the session closed before the grant of {cell} was recorded");
+            }
             // A round that failed because a member of the ensemble was gone says
             // nothing about the next ensemble: the same mark is sent again, until
             // the wait ends. The `Grant` of a counter is idempotent, and only a
@@ -1677,6 +1679,38 @@ impl BucketOwnership {
                     session.mark_pending(counter);
                 }
                 Err(error)
+            }
+        }
+    }
+
+    /// The read-back of a create-only write of the session's own id whose
+    /// answer was an error. A record that is this session's at epoch 1 applied,
+    /// and its grant is done now. A read that itself failed says nothing: in
+    /// `read` and `on` the cell is left pending, so that it cannot activate
+    /// without a bit; `shadow` goes on.
+    async fn settle_ambiguous_first_record(
+        &self,
+        session: &crate::session::Session,
+        cell: &str,
+        by: Option<&str>,
+        readback: anyhow::Result<Option<OwnerRecord>>,
+    ) -> anyhow::Result<()> {
+        match readback {
+            Ok(Some(record))
+                if record.epoch == 1
+                    && record.node.as_deref() == Some(self.node.as_str())
+                    && record.by.as_deref() == by =>
+            {
+                self.after_first_record(session, cell).await
+            }
+            Ok(_) => Ok(()),
+            Err(_) => {
+                if let Some(counter) = session.own_counter_of_scope(cell) {
+                    if session.fails_closed() {
+                        session.mark_pending(counter);
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -1742,15 +1776,9 @@ impl BucketOwnership {
                 // done before the error is reported.
                 if let (CasGuard::Absent, 1, Some(session)) = (&guard, epoch, session) {
                     if session.own_counter_of_scope(cell).is_some() {
-                        let applied = matches!(
-                            self.resolve_owner(cell, RecordReader::ClaimReread).await,
-                            Ok(Some(record)) if record.epoch == 1
-                                && record.node.as_deref() == Some(self.node.as_str())
-                                && record.by.as_deref() == by.as_deref()
-                        );
-                        if applied {
-                            self.after_first_record(session, cell).await?;
-                        }
+                        let readback = self.resolve_owner(cell, RecordReader::ClaimReread).await;
+                        self.settle_ambiguous_first_record(session, cell, by.as_deref(), readback)
+                            .await?;
                     }
                 }
                 return Err(error);
@@ -2363,6 +2391,37 @@ mod grant_tests {
         assert!(crate::asyncrt::mono_ms() - began < 3_000);
         assert!(!session.is_pending_scope(&scope), "never wedged");
         assert!(session.is_granted(0), "the grant stays recorded");
+    }
+
+    /// A failed read-back of an ambiguous first record leaves the cell pending in
+    /// `read` and `on` and lets `shadow` go on; a read that shows the record
+    /// finishes its grant.
+    #[tokio::test]
+    async fn a_failed_readback_of_a_first_record_leaves_a_strict_cell_pending() {
+        let (_dir, _bucket, ownership) = world();
+        let shadow = Session::with_tag(Mode::Shadow, [4; 8], &[]);
+        let strict = Session::with_tag(Mode::On, [5; 8], &[]);
+        for (session, pending) in [(&shadow, false), (&strict, true)] {
+            let scope = scope_of(session, 0);
+            let failed: anyhow::Result<Option<OwnerRecord>> = Err(anyhow::anyhow!("read failed"));
+            ownership
+                .settle_ambiguous_first_record(session, &scope, None, failed)
+                .await
+                .unwrap();
+            assert_eq!(
+                session.is_pending_scope(&scope),
+                pending,
+                "{:?}",
+                session.mode()
+            );
+        }
+        // A record that is another's, or none, decides nothing.
+        let scope = scope_of(&strict, 1);
+        ownership
+            .settle_ambiguous_first_record(&strict, &scope, None, Ok(None))
+            .await
+            .unwrap();
+        assert!(!strict.is_pending_scope(&scope));
     }
 
     /// The scope of the id with counter `counter` of `session`.
