@@ -17,7 +17,7 @@ use celld::bucket::Bucket;
 use celld::cell_dispatch::{
     dispatch_call_attempt, dispatch_gate, local_dispatch_request_id, local_request_error,
     local_response_stream, requests_websocket_upgrade, split_do_call, CallAttempt, CallPayload,
-    RoutedRequestError, WEBSOCKET_WITHOUT_UPGRADE,
+    OutputGateRequestError, RoutedRequestError, WEBSOCKET_WITHOUT_UPGRADE,
 };
 use celld::fleet;
 use celld::generation::{
@@ -1725,14 +1725,10 @@ fn request_body_limit_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains(BODY_LIMIT_STREAM_ERROR))
 }
 
-/// A request that routing refused, whether the error still is the typed one or
-/// came back through a Worker's promise as the exact text a refused call gives,
-/// ending in this process's marker.
+/// A request that routing refused before the handler ran: see
+/// [`celld::cell_dispatch::is_routed_refusal`].
 fn routed_refusal_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause.downcast_ref::<RoutedRequestError>().is_some()
-            || celld::engine_api::is_routed_refusal_text(&cause.to_string())
-    })
+    celld::cell_dispatch::is_routed_refusal(error)
 }
 
 fn cell_overload_error(error: &anyhow::Error) -> bool {
@@ -2140,10 +2136,17 @@ async fn dispatch_cell_fetch(
         }
         Ok(Err(error)) if cell_overload_error(&error) => cell_overload_response(),
         Ok(Err(error)) if retryable_cancel_error(&error) => retryable_cancel_response(&error),
-        Ok(Err(error)) => match error.downcast_ref::<RoutedRequestError>() {
-            Some(error) => response(
+        Ok(Err(error)) => match error
+            .downcast_ref::<RoutedRequestError>()
+            .map(|routed| routed.0)
+            .or_else(|| {
+                error
+                    .downcast_ref::<OutputGateRequestError>()
+                    .map(|gate| gate.0)
+            }) {
+            Some(verdict) => response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("{{\"error\":\"{:?}\"}}", error.0),
+                format!("{{\"error\":\"{verdict:?}\"}}"),
             ),
             None => response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2278,7 +2281,7 @@ pub(crate) async fn dispatch_forwarded_fetch(
                 let reason = match failure {
                     LocalRequestFailure::Handler(error) => error.to_string(),
                     LocalRequestFailure::OutputGate { verdict, .. } => {
-                        RoutedRequestError(*verdict).to_string()
+                        OutputGateRequestError(*verdict).to_string()
                     }
                 };
                 websocket::reject_accepted_websocket(&app, target, &reason).await;

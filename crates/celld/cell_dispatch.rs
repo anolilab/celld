@@ -13,35 +13,87 @@ use celld_logic::{Epoch, NodeId, RequestError, Route, WebSocketKind};
 use futures_util::StreamExt as _;
 use tokio::sync::oneshot;
 
+/// The route of a request was refused: the request went no further.
 #[derive(Debug)]
 pub struct RoutedRequestError(pub RequestError);
+
+/// The output gate failed an effect raised inside a handler. Unlike a routed
+/// refusal the handler ran, so the request may have had effects and must not
+/// read as "refused, retry it".
+#[derive(Debug)]
+pub struct OutputGateRequestError(pub RequestError);
+
+/// Whether a verdict of the routing stage means the handler never ran: the
+/// only verdicts a client may be told to retry as a refusal. The match has no
+/// wildcard, so a new verdict has to be placed here. `DurabilityUnproven` is a
+/// write that ran and could not be proven durable.
+pub fn refused_before_handler(verdict: RequestError) -> bool {
+    match verdict {
+        RequestError::NodeUnavailable
+        | RequestError::ResolveFailed
+        | RequestError::AcquireFailed
+        | RequestError::RestoreFailed
+        | RequestError::RuntimeFailed
+        | RequestError::PublishFailed
+        | RequestError::NodeFenced
+        | RequestError::PeerIncompatible
+        | RequestError::CapacityExhausted => true,
+        RequestError::DurabilityUnproven => false,
+    }
+}
 
 /// The gate's verdict as the answer's error, with the handler's own failure
 /// kept below it when the answer was one: the client needs the verdict, and
 /// the operator reading the chain needs what the handler said too. The
-/// verdict stays on top, so the routed-error match still finds it.
+/// verdict stays on top, so the gate-error match still finds it.
 pub fn local_request_error(failure: LocalRequestFailure) -> anyhow::Error {
     match failure {
         LocalRequestFailure::Handler(error) => error,
         LocalRequestFailure::OutputGate { verdict, handler } => match handler {
-            Some(handler) => handler.context(RoutedRequestError(verdict)),
-            None => anyhow::Error::new(RoutedRequestError(verdict)),
+            Some(handler) => handler.context(OutputGateRequestError(verdict)),
+            None => anyhow::Error::new(OutputGateRequestError(verdict)),
         },
     }
 }
 
 impl std::fmt::Display for RoutedRequestError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "route failed: {:?} ({})",
-            self.0,
-            crate::engine_api::route_refused_marker()
-        )
+        write!(formatter, "route failed: {:?}", self.0)?;
+        // Only a refusal before the handler carries the marker that lets the
+        // public ingress answer it 503 after a Worker passed it on.
+        if refused_before_handler(self.0) {
+            write!(
+                formatter,
+                " ({})",
+                crate::engine_api::route_refused_marker()
+            )?;
+        }
+        Ok(())
     }
 }
 
 impl std::error::Error for RoutedRequestError {}
+
+impl std::fmt::Display for OutputGateRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "route failed: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for OutputGateRequestError {}
+
+/// A request that routing refused before the handler ran, whether the error is
+/// still the typed one or came back through a Worker's promise as the exact
+/// text a refused call gives, ending in this process's marker. An output-gate
+/// failure is never one.
+pub fn is_routed_refusal(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<RoutedRequestError>()
+            .is_some_and(|routed| refused_before_handler(routed.0))
+            || crate::engine_api::is_routed_refusal_text(&cause.to_string())
+    })
+}
 
 /// The output gate for an effect raised inside a handler, as opposed to the
 /// handler's own response.
@@ -174,8 +226,8 @@ pub fn split_do_call(
 /// `route_error` record for a refused route, and an `ok`/`error` record with
 /// the dispatch time for a local dispatch. A single `Completed(Result)` variant
 /// would erase that distinction, and a `RoutedRequestError` downcast cannot
-/// recover it, because `local_request_error` also puts a `RoutedRequestError`
-/// on top of an output-gate failure. The outcome class therefore crosses this
+/// recover it, because `local_request_error` also puts an
+/// `OutputGateRequestError` on top of an output-gate failure. The outcome class therefore crosses this
 /// boundary explicitly, while the error values themselves are built here so
 /// the client-facing messages live in one place.
 pub enum CallAttempt {
@@ -458,4 +510,80 @@ pub fn local_response_stream(
             }
         },
     ))
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    const ALL: [RequestError; 10] = [
+        RequestError::NodeUnavailable,
+        RequestError::ResolveFailed,
+        RequestError::AcquireFailed,
+        RequestError::RestoreFailed,
+        RequestError::RuntimeFailed,
+        RequestError::PublishFailed,
+        RequestError::NodeFenced,
+        RequestError::PeerIncompatible,
+        RequestError::CapacityExhausted,
+        RequestError::DurabilityUnproven,
+    ];
+
+    #[test]
+    fn exactly_the_verdicts_before_the_handler_are_refusals() {
+        let before: Vec<RequestError> = ALL
+            .into_iter()
+            .filter(|verdict| refused_before_handler(*verdict))
+            .collect();
+        assert_eq!(
+            before,
+            [
+                RequestError::NodeUnavailable,
+                RequestError::ResolveFailed,
+                RequestError::AcquireFailed,
+                RequestError::RestoreFailed,
+                RequestError::RuntimeFailed,
+                RequestError::PublishFailed,
+                RequestError::NodeFenced,
+                RequestError::PeerIncompatible,
+                RequestError::CapacityExhausted,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_routed_refusal_is_a_refusal_and_an_output_gate_failure_never_is() {
+        for verdict in ALL {
+            // As the ingress sees them directly and as a Worker's rejected call
+            // carries them across the promise boundary.
+            let routed = anyhow::Error::new(RoutedRequestError(verdict));
+            let routed_text = format!("rejected: Error: {routed}");
+            assert_eq!(
+                is_routed_refusal(&routed),
+                refused_before_handler(verdict),
+                "{verdict:?} as a routed error"
+            );
+            assert_eq!(
+                crate::engine_api::is_routed_refusal_text(&routed_text),
+                refused_before_handler(verdict),
+                "{verdict:?} as a Worker's rejection"
+            );
+            // The handler ran: the same verdict from the output gate, with and
+            // without the handler's own failure under it.
+            for handler in [None, Some(anyhow::anyhow!("the handler's own failure"))] {
+                let gate =
+                    local_request_error(LocalRequestFailure::OutputGate { verdict, handler });
+                assert!(
+                    !is_routed_refusal(&gate),
+                    "{verdict:?} from the output gate"
+                );
+                let gate_text = format!("rejected: Error: {gate}");
+                assert!(
+                    !crate::engine_api::is_routed_refusal_text(&gate_text),
+                    "{verdict:?} from the output gate, through a Worker"
+                );
+                assert!(gate.downcast_ref::<OutputGateRequestError>().is_some());
+            }
+        }
+    }
 }
