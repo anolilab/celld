@@ -704,11 +704,6 @@ pub async fn cold() {
     }
     let fleet_ms = began.elapsed().as_millis() as u64;
     let after = answers(&rig, &keys).await;
-    let different = before.iter().zip(&after).filter(|(a, b)| a != b).count();
-    let unknown = after
-        .iter()
-        .filter(|answer| answer.starts_with("unknown"))
-        .count();
     gates.add(
         "G-g",
         json!({ "node_ready_ms": ready, "first_registry_answer_after_ready_ms": first, "fleet_ms": fleet_ms }),
@@ -716,18 +711,8 @@ pub async fn cold() {
         // Every node answered, within its bound.
         Some(first.len() == 3 && first.iter().all(|ms| *ms <= 5_000) && fleet_ms <= 120_000),
     );
-    gates.add(
-        "G-n",
-        json!({ "keys": keys.len(), "different": different, "unknown_after": unknown }),
-        "identical",
-        // Both rounds answered every key.
-        Some(
-            !keys.is_empty()
-                && before.len() == keys.len()
-                && after.len() == keys.len()
-                && different == 0,
-        ),
-    );
+    let row = gates::restart_row(keys.len(), &before, &after);
+    gates.add(row.gate, row.measured, row.threshold, row.pass);
     let check = full_aged_check(&rig, 10_000, 2_000).await;
     let row = gates::check_row("G-o", &check.json());
     gates.add(row.gate, row.measured, row.threshold, row.pass);

@@ -1251,6 +1251,9 @@ pub const OPERATOR_TOKEN: &str = "bench-operator-token";
 /// the bench targets that run a real fleet.
 pub struct Node {
     child: Child,
+    /// The process group was killed and the child reaped (or it exited): its
+    /// group id may be another process's now, so nothing signals it again.
+    reaped: bool,
     pub public: String,
     pub internal: String,
 }
@@ -1301,6 +1304,7 @@ impl Node {
             .expect("spawn celld");
         Node {
             child,
+            reaped: false,
             public: format!("http://127.0.0.1:{public}"),
             internal: format!("http://127.0.0.1:{internal}"),
         }
@@ -1338,6 +1342,7 @@ impl Node {
         let group = format!("-{}", self.child.id());
         let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
         let _ = self.child.wait();
+        self.reaped = true;
     }
 
     /// Ask the node to drain and hand its cells off, then wait for it to exit.
@@ -1349,6 +1354,7 @@ impl Node {
         let deadline = Instant::now() + within;
         while Instant::now() < deadline {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
+                self.reaped = true;
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1359,6 +1365,10 @@ impl Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
+        // A child that exited was reaped by `try_wait`: its group id is free.
+        if self.reaped || matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
         let group = format!("-{}", self.child.id());
         let _ = Command::new("kill").args(["-TERM", "--", &group]).status();
         let deadline = Instant::now() + Duration::from_secs(45);

@@ -77,22 +77,7 @@ fn same_run(a: &Input, b: &Input) -> bool {
 
 /// Mean node RSS in MiB over the series points between `from` and `to` seconds.
 fn rss(result: &Value, from: u64, to: u64) -> Option<f64> {
-    let mut values = Vec::new();
-    for row in result["series"].as_array()? {
-        let at = row["at_s"].as_u64()?;
-        if at < from || at > to {
-            continue;
-        }
-        let nodes = row["nodes"].as_array()?;
-        values.push(
-            nodes
-                .iter()
-                .filter_map(|n| n["rss_mib"].as_f64())
-                .sum::<f64>()
-                / nodes.len().max(1) as f64,
-        );
-    }
-    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+    gates::mean_rss_mib(&result["series"], from, to)
 }
 
 /// Requests under the registry's key root, by kind and object class.

@@ -149,7 +149,10 @@ async fn lookup_against_list_smoke() {
         }
         let began = std::time::Instant::now();
         let cell = Path::from(format!("{prefix}cells/Agent:smoke-{round}/ltx"));
-        let _ = store.list(Some(&cell)).collect::<Vec<_>>().await;
+        let listed = store.list(Some(&cell)).collect::<Vec<_>>().await;
+        if let Some(error) = crate::registry_bench_gates::first_error(&listed) {
+            panic!("the LIST beside the lookup failed: {error}");
+        }
         lists.push(began.elapsed().as_micros() as u64);
         let began = std::time::Instant::now();
         objects::read_page(store.as_ref(), &run_key, (round as u64 * 7) % pages)
