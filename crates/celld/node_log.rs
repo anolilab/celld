@@ -752,12 +752,14 @@ async fn retire_boot_addr_racing(
         .is_some())
 }
 
-/// How long after this process started a long-dead, unreachable member stays
-/// undecided instead of gone. The boot ladder waits one, two and three lease
-/// terms between its four attempts, so its last attempt starts six terms in;
-/// the default hold is one term short of that, which keeps every earlier
-/// attempt from declaring a loss and leaves a margin for attempts that run
-/// long. `CELLD_RECOVERY_LOSS_HOLD_MS` overrides it (0 turns the hold off).
+/// How long, counted from the start of the boot's own predecessor recovery
+/// (after the address publish, see `boot_hold_origin`), a long-dead,
+/// unreachable member stays undecided instead of gone. The boot ladder waits
+/// one, two and three lease terms between its four attempts, so its last
+/// attempt starts six terms in; the default hold is five terms. The hold is an
+/// extra time bound on top of the rule that only the ladder's final attempt
+/// may judge such a member gone (`boot_hold_blocks`).
+/// `CELLD_RECOVERY_LOSS_HOLD_MS` overrides it; 0 removes only this time bound.
 fn boot_hold_ms(lease_ttl_ms: u64, configured: Option<u64>) -> u64 {
     let term = ladder_term_ms(lease_ttl_ms);
     let default = term.saturating_mul(RecoveryLadder::final_attempt_terms().saturating_sub(1));
@@ -6231,8 +6233,10 @@ impl NodeLogManager {
             // sweep (which, under the fold, judges the record's own
             // published expiry with no grace).
             let grace_ms = member_loss_grace_ms(self.ownership.lease_ttl_ms());
-            // A member that is long dead and unreachable counts as gone only
-            // once this process has been up for the grace: the peers of a
+            // A member that is long dead and unreachable counts as gone in
+            // the boot's own recovery only on the ladder's final attempt, and
+            // only once the hold (`boot_hold_ms`, counted from the start of
+            // that recovery) has elapsed: the peers of a
             // fleet that starts one by one (a staggered rollout, image pulls,
             // an ordered start) are not listening yet, and their published
             // address is from their last boot. The hold covers the boot
