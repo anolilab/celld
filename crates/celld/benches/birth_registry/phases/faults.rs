@@ -220,6 +220,20 @@ pub async fn calibrate() {
     );
 }
 
+/// The spills a node's counters show that something other than a force request
+/// started: the timer, the record count, the delta count or a takeover.
+fn unforced_spills(counters: &Value) -> u64 {
+    [
+        "spills_timer",
+        "spills_records",
+        "spills_deltas",
+        "spills_takeover",
+    ]
+    .into_iter()
+    .map(|name| counters[name].as_u64().unwrap_or(0))
+    .sum()
+}
+
 pub async fn rolling() {
     let rate = env_f64("CELLD_REG_RATE", 20.0);
     let mut rig = Rig::new(
@@ -242,19 +256,32 @@ pub async fn rolling() {
         total(&start_states, "spills"),
         total(&start_states, "base_merges"),
     );
+    let unforced_at_start: u64 = start_states
+        .iter()
+        .map(|state| unforced_spills(&state["counters"]))
+        .sum();
+    let mut forced_requested = 0_u64;
+    let mut forced_accepted = 0_u64;
+    let mut unforced = 0_u64;
     let started = Instant::now();
     for index in nodes.clone() {
         let was_holder = rig.fleet.holder().await == Some(index);
+        // The forced spill: the request must be accepted by the holder.
+        forced_requested += 1;
         if let Some(holder) = rig.fleet.holder().await {
-            let _ = probe::jpost(
+            let reply = probe::jpost(
                 &rig.fleet.client,
                 &format!("{}/__registry/force", rig.fleet.ep.internal(holder)),
                 json!({ "job": "spill", "partition": 0 }),
             )
             .await;
+            if reply.is_some_and(|reply| reply["queued"] == "spill") {
+                forced_accepted += 1;
+            }
         }
         if let Some(state) = rig.fleet.registry_state(index).await {
             spills += state["counters"]["spills"].as_u64().unwrap_or(0);
+            unforced += unforced_spills(&state["counters"]);
             merges += state["counters"]["base_merges"].as_u64().unwrap_or(0);
         }
         let began = Instant::now();
@@ -274,6 +301,15 @@ pub async fn rolling() {
     tokio::time::sleep(Duration::from_secs(30)).await;
     deltas_max = deltas_max.max(max_live_deltas(&rig).await);
     let (states, _) = gather(&rig.fleet, &rig.nodes(), false).await;
+    unforced += states
+        .iter()
+        .map(|state| unforced_spills(&state["counters"]))
+        .sum::<u64>();
+    // Spills the timer, the record count, the delta count or a takeover started
+    // are not the forced ones; what is left over was started by a force request.
+    let forced_spills = (spills + total(&states, "spills"))
+        .saturating_sub(spills_at_start)
+        .saturating_sub(unforced.saturating_sub(unforced_at_start));
     spills = (spills + total(&states, "spills")).saturating_sub(spills_at_start);
     merges = (merges + total(&states, "base_merges")).saturating_sub(merges_at_start);
     let takeover_spills = total(&states, "spills_takeover");
@@ -282,20 +318,14 @@ pub async fn rolling() {
     let sent = births["sent"].as_f64().unwrap_or(0.0);
     let success = ok * 100.0 / sent.max(1.0);
     let mut gates = Gates::new();
-    gates.add(
-        "G-c",
-        json!({ "new_id_success_pct": success, "rate_per_s": rate, "sent": sent, "spills_committed_since_restart_began": spills, "spills_started_by_takeover_in_final_processes": takeover_spills, "spills_forced_at_each_restart": 3, "base_merges": merges, "live_deltas_max": deltas_max, "restart_ms": restart_ms }),
-        ">= 99.9 %; >= 1 spill; deltas never at the cap of 512 (rate lowered from 100/s to what the host sustains)",
-        // Births were sent, every node was restarted, and the deltas were read at
-        // least once (a failed read leaves 0, which is not "never at the cap").
-        gates::all(&[
-            Some(sent > 0.0),
-            Some(success >= 99.9),
-            Some(spills >= 1),
-            Some(steps.len() == nodes.len()),
-            Some(deltas_max > 0 && deltas_max < 512),
-        ]),
-    );
+    let row = gates::rolling_row(&json!({
+        "new_id_success_pct": success, "rate_per_s": rate, "sent": sent,
+        "spills_committed_since_restart_began": spills, "forced_spills_committed": forced_spills,
+        "forced_requested": forced_requested, "forced_accepted": forced_accepted,
+        "spills_started_by_takeover_in_final_processes": takeover_spills, "base_merges": merges,
+        "live_deltas_max": deltas_max, "restart_ms": restart_ms, "restarted_nodes": steps.len(), "nodes": nodes.len(),
+    }));
+    gates.add(row.gate, row.measured, row.threshold, row.pass);
     let check = full_aged_check(&rig, 10_000, 2_000).await;
     let row = gates::check_row("G-o", &check.json());
     gates.add(row.gate, row.measured, row.threshold, row.pass);
@@ -387,7 +417,6 @@ pub async fn compactor_kill() {
     let load = Load::start(&rig, 5.0, Some(162.0), 1.0, 0);
     tokio::time::sleep(Duration::from_secs(90)).await;
     let mut rows = Vec::new();
-    let mut unknown_total = 0;
     for case in ["kill_under_load", "drain_under_load"] {
         let holder = rig.fleet.holder().await.expect("a holder");
         let survivors: Vec<usize> = (0..3).filter(|index| *index != holder).collect();
@@ -410,10 +439,6 @@ pub async fn compactor_kill() {
         stats.stop.store(true, Ordering::Relaxed);
         let _ = task.await;
         let summary = stats.summary();
-        unknown_total += summary["unknown"].as_u64().unwrap_or(0)
-            + summary["wrong"].as_u64().unwrap_or(0)
-            + summary["failed"].as_u64().unwrap_or(0)
-            + u64::from(summary["answered"].as_u64().unwrap_or(0) == 0);
         rows.push(json!({ "case": case, "holder": holder, "handover_root_ms": handover, "next_holder_root_ms": next, "lookups": summary }));
         say!("{case}: {}", rows.last().unwrap());
         rig.fleet.restart(holder).await;
@@ -438,31 +463,28 @@ pub async fn compactor_kill() {
     stats.stop.store(true, Ordering::Relaxed);
     let _ = task.await;
     let summary = stats.summary();
-    unknown_total += summary["unknown"].as_u64().unwrap_or(0)
-        + summary["wrong"].as_u64().unwrap_or(0)
-        + summary["failed"].as_u64().unwrap_or(0)
-        + u64::from(summary["answered"].as_u64().unwrap_or(0) == 0);
     rows.push(json!({ "case": "kill_quiet", "holder": holder, "next_holder_root_ms": quiet, "lookups": summary }));
     let row = gates::failover_row(&json!(rows), quiet);
     gates.add(row.gate, row.measured, row.threshold, row.pass);
-    gates.add(
-        "G-b",
-        json!({ "unknown_or_wrong_during_kill_and_drain": unknown_total }),
-        "0",
-        // Every case measured its lookups, and none was unknown, wrong or failed.
-        Some(unknown_total == 0 && rows.len() == 3),
+    let loads: Vec<Value> = rows.iter().map(|case| case["lookups"].clone()).collect();
+    let row = gates::lookups_row(
+        &loads,
+        3,
+        gates::Unknown::Never,
+        "0 failed, 0 wrong, 0 unknown in the kill under load, the drain and the quiet kill",
     );
+    gates.add(row.gate, row.measured, row.threshold, row.pass);
     rig.fleet.restart(holder).await;
     let check = full_aged_check(&rig, 10_000, 2_000).await;
     let row = gates::check_row("G-o", &check.json());
     gates.add(row.gate, row.measured, row.threshold, row.pass);
     let (states, _) = gather(&rig.fleet, &rig.nodes(), false).await;
-    gates.add(
-        "G-m",
-        json!({ "mismatches": total(&states, "mismatches"), "nodes_reporting": states.len() }),
-        "0, from every node",
-        Some(total(&states, "mismatches") == 0 && states.len() == rig.nodes().len()),
+    let row = gates::mismatch_row(
+        &[&json!(total(&states, "mismatches"))],
+        &json!(states.len()),
+        rig.nodes().len() as u64,
     );
+    gates.add(row.gate, row.measured, row.threshold, row.pass);
     record(
         "compactor_kill",
         json!({ "rows": rows, "births": births, "generator": generator, "gates": gates.json() }),
@@ -941,22 +963,21 @@ pub async fn flap() {
     stats.stop.store(true, Ordering::Relaxed);
     let _ = lookup_task.await;
     let summary = stats.summary();
-    gates.add("G-b", json!({ "failed": summary["failed"], "answered": summary["answered"], "unknown": summary["unknown"], "wrong": summary["wrong"], "of": summary["total"] }), "0 (the 35 s root hold runs with the default 2 s lookup deadline: only Unknown from a lookup counts)", Some(summary["wrong"] == 0 && summary["unknown"] == 0 && summary["complete"] == true));
+    let row = gates::lookups_row(
+        std::slice::from_ref(&summary),
+        1,
+        gates::Unknown::Never,
+        "0 failed, 0 wrong, 0 unknown (the 35 s root hold runs with the default 2 s lookup deadline: only Unknown from a lookup counts)",
+    );
+    gates.add(row.gate, row.measured, row.threshold, row.pass);
     let (births, generator) = load.stop().await;
     tokio::time::sleep(Duration::from_secs(60)).await;
     let check = full_aged_check(&rig, 10_000, 2_000).await;
     let row = gates::check_row("G-o", &check.json());
     gates.add(row.gate, row.measured, row.threshold, row.pass);
     let storage = storage_report(&rig, super::storage_gap()).await;
-    gates.add(
-        "G-l",
-        json!({ "orphans": storage["orphans"], "examples": storage["orphan_examples"] }),
-        "0 (after the grace), over some records",
-        gates::all(&[
-            gates::some(&storage["records_in_runs"]),
-            gates::zero(&storage["orphans"]),
-        ]),
-    );
+    let row = gates::storage_row(&storage);
+    gates.add(row.gate, row.measured, row.threshold, row.pass);
     record(
         "flap",
         json!({ "births": births, "generator": generator, "lookups": summary, "storage": storage, "gates": gates.json() }),

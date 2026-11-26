@@ -97,6 +97,110 @@ pub struct LoadCfg {
     pub nodes: u64,
 }
 
+/// What a lookup load may leave unknown.
+#[derive(Debug, Clone, Copy)]
+pub enum Unknown {
+    /// Less than this share of the answered lookups (a load phase).
+    Below(f64),
+    /// None at all (a phase that stops or restarts the holder).
+    Never,
+}
+
+/// The lookup gate G-b, for one phase's `Lookups::summary()`: every request got
+/// an answer and at least one was made, none was wrong, and the unknown ones are
+/// within `allowed`. Every phase judges its lookups here, so none leaves a
+/// counter out.
+pub fn lookup_gate(summary: &Value, allowed: Unknown) -> Tri {
+    all(&[
+        is(&summary["complete"], true),
+        some(&summary["answered"]),
+        zero(&summary["failed"]),
+        zero(&summary["wrong"]),
+        match allowed {
+            Unknown::Below(pct) => lt(&summary["unknown_pct"], pct),
+            Unknown::Never => zero(&summary["unknown"]),
+        },
+    ])
+}
+
+/// G-b of a phase with several lookup loads (kill, drain, quiet kill): every
+/// one is judged by [`lookup_gate`], and all `expected` ran.
+pub fn lookups_row(
+    summaries: &[Value],
+    expected: usize,
+    allowed: Unknown,
+    threshold: &'static str,
+) -> Row {
+    let each: Vec<Tri> = summaries
+        .iter()
+        .map(|summary| lookup_gate(summary, allowed))
+        .collect();
+    let mut clauses = each.clone();
+    clauses.push(Some(summaries.len() == expected && expected > 0));
+    row(
+        "G-b",
+        json!({ "loads": summaries.iter().map(|summary| json!({
+            "failed": summary["failed"], "answered": summary["answered"], "unknown": summary["unknown"],
+            "wrong": summary["wrong"], "of": summary["total"] })).collect::<Vec<_>>(),
+            "expected_loads": expected }),
+        threshold,
+        all(&clauses),
+    )
+}
+
+/// G-m: no registry mismatch in any of `counts`, from every node.
+pub fn mismatch_row(counts: &[&Value], reporting: &Value, nodes: u64) -> Row {
+    let mut clauses: Vec<Tri> = counts.iter().map(|count| zero(count)).collect();
+    clauses.push(uint(reporting).map(|reporting| nodes > 0 && reporting == nodes));
+    row(
+        "G-m",
+        json!({ "mismatches": counts, "nodes_reporting": reporting, "nodes": nodes }),
+        "0, from every node",
+        all(&clauses),
+    )
+}
+
+/// G-l: the registry's stored size and objects that nothing names, from a storage
+/// check whose two listings both completed and that saw some records.
+pub fn storage_row(storage: &Value) -> Row {
+    row(
+        "G-l",
+        json!({ "run_bytes_per_cell": storage["run_bytes_per_cell"], "bytes_per_cell": storage["bytes_per_cell"],
+                "records_in_runs": storage["records_in_runs"], "error": storage["error"],
+                "orphans": storage["orphans"], "examples": storage["orphan_examples"] }),
+        "<= 80 B per registered cell; 0 objects that nothing names after the grace; some records measured; both listings complete",
+        all(&[
+            Some(storage["error"].is_null()),
+            some(&storage["records_in_runs"]),
+            le(&storage["bytes_per_cell"], 80.0),
+            zero(&storage["orphans"]),
+        ]),
+    )
+}
+
+/// G-c: new ids succeeded through the rolling restart, every node was
+/// restarted, the deltas were read, and the spills that count are the ones the
+/// forced requests produced: every force request was accepted, and as many
+/// spills as were forced were committed beyond those the timer, the record count,
+/// the delta count or a takeover started.
+pub fn rolling_row(measured: &Value) -> Row {
+    let forced_requested = uint(&measured["forced_requested"]);
+    row(
+        "G-c",
+        measured.clone(),
+        ">= 99.9 %; every forced spill accepted and >= 1 forced spill committed; deltas never at the cap of 512 (rate lowered from 100/s to what the host sustains)",
+        all(&[
+            num(&measured["sent"]).map(|sent| sent > 0.0),
+            ge(&measured["new_id_success_pct"], 99.9),
+            forced_requested.map(|requested| requested > 0),
+            uint(&measured["forced_accepted"]).zip(forced_requested).map(|(accepted, requested)| accepted == requested),
+            some(&measured["forced_spills_committed"]),
+            uint(&measured["restarted_nodes"]).zip(uint(&measured["nodes"])).map(|(done, all)| all > 0 && done == all),
+            uint(&measured["live_deltas_max"]).map(|deltas| deltas > 0 && deltas < 512),
+        ]),
+    )
+}
+
 /// A load phase's gates, from its result JSON.
 pub fn load_rows(cfg: &LoadCfg, result: &Value) -> Vec<Row> {
     let mut rows = Vec::new();
@@ -152,12 +256,7 @@ pub fn load_rows(cfg: &LoadCfg, result: &Value) -> Vec<Row> {
             json!({ "unknown_pct": lookups["unknown_pct"], "unknown": lookups["unknown"], "wrong": lookups["wrong"],
                     "of": lookups["answered"], "failed": lookups["failed"] }),
             "< 0.5 % of the answered lookups; no wrong answer; no failed lookup; at least one answered",
-            all(&[
-                complete,
-                some(&lookups["answered"]),
-                zero(&lookups["wrong"]),
-                lt(&lookups["unknown_pct"], 0.5),
-            ]),
+            lookup_gate(lookups, Unknown::Below(0.5)),
         ));
     }
     // G-d: claims were made and measured, none stayed uncovered, and the third
@@ -183,16 +282,10 @@ pub fn load_rows(cfg: &LoadCfg, result: &Value) -> Vec<Row> {
         ]),
     ));
     let guard = &result["guard"];
-    rows.push(row(
-        "G-m",
-        json!({ "registry_mismatch": guard["mismatches"], "counter": result["counters"]["mismatches"],
-                "nodes_reporting": guard["nodes_reporting"], "nodes": cfg.nodes }),
-        "0, from every node",
-        all(&[
-            zero(&guard["mismatches"]),
-            zero(&result["counters"]["mismatches"]),
-            uint(&guard["nodes_reporting"]).map(|reporting| cfg.nodes > 0 && reporting == cfg.nodes),
-        ]),
+    rows.push(mismatch_row(
+        &[&guard["mismatches"], &result["counters"]["mismatches"]],
+        &guard["nodes_reporting"],
+        cfg.nodes,
     ));
     if cfg.streams {
         let generator = &result["generator"];
@@ -264,19 +357,7 @@ pub fn load_rows(cfg: &LoadCfg, result: &Value) -> Vec<Row> {
     }
     let storage = &result["storage"];
     if !storage.is_null() || cfg.registry {
-        rows.push(row(
-            "G-l",
-            json!({ "run_bytes_per_cell": storage["run_bytes_per_cell"], "bytes_per_cell": storage["bytes_per_cell"],
-                    "records_in_runs": storage["records_in_runs"], "error": storage["error"], "orphans": storage["orphans"], "examples": storage["orphan_examples"] }),
-            "<= 80 B per registered cell; 0 objects that nothing names after the grace; some records measured; both listings complete",
-            all(&[
-                // A storage check that failed has an error and no measurement.
-                Some(storage["error"].is_null()),
-                some(&storage["records_in_runs"]),
-                le(&storage["bytes_per_cell"], 80.0),
-                zero(&storage["orphans"]),
-            ]),
-        ));
+        rows.push(storage_row(storage));
     }
     if cfg.steady {
         let ages: Vec<f64> = result["series"]
@@ -1387,5 +1468,96 @@ mod selftest {
         };
         assert_eq!(race_row(&[mode(200), mode(200)], 200).pass, Some(true));
         assert_eq!(race_row(&[mode(200), mode(150)], 200).pass, Some(false));
+    }
+
+    fn summary(failed: u64, unknown: u64, wrong: u64, answered: u64) -> Value {
+        json!({ "complete": failed == 0 && answered > 0, "answered": answered, "failed": failed, "unknown": unknown, "wrong": wrong,
+                "total": answered + failed, "unknown_pct": unknown as f64 * 100.0 / answered.max(1) as f64 })
+    }
+
+    #[test]
+    fn every_phase_judges_its_lookups_through_one_gate() {
+        let phase = Unknown::Never;
+        assert_eq!(lookup_gate(&summary(0, 0, 0, 100), phase), Some(true));
+        // Each counter alone fails it, the flap phase's missing `failed` included.
+        assert_eq!(lookup_gate(&summary(1, 0, 0, 100), phase), Some(false));
+        assert_eq!(lookup_gate(&summary(0, 1, 0, 100), phase), Some(false));
+        assert_eq!(lookup_gate(&summary(0, 0, 1, 100), phase), Some(false));
+        // No lookup at all, and a summary without the counters, never pass.
+        assert_ne!(lookup_gate(&summary(0, 0, 0, 0), phase), Some(true));
+        assert_ne!(lookup_gate(&json!({}), phase), Some(true));
+        assert_ne!(lookup_gate(&Value::Null, Unknown::Below(0.5)), Some(true));
+        // A load phase allows a small share of unknown, not a wrong or failed one.
+        assert_eq!(
+            lookup_gate(&summary(0, 1, 0, 1000), Unknown::Below(0.5)),
+            Some(true)
+        );
+        assert_eq!(
+            lookup_gate(&summary(0, 10, 0, 1000), Unknown::Below(0.5)),
+            Some(false)
+        );
+        assert_eq!(
+            lookup_gate(&summary(1, 0, 0, 1000), Unknown::Below(0.5)),
+            Some(false)
+        );
+        // Several loads: all must have run, and each must pass.
+        let good = summary(0, 0, 0, 10);
+        assert_eq!(
+            lookups_row(&[good.clone(), good.clone(), good.clone()], 3, phase, "").pass,
+            Some(true)
+        );
+        assert_eq!(
+            lookups_row(&[good.clone(), good.clone()], 3, phase, "").pass,
+            Some(false)
+        );
+        assert_eq!(
+            lookups_row(&[good.clone(), summary(2, 0, 0, 10), good], 3, phase, "").pass,
+            Some(false)
+        );
+        assert_ne!(lookups_row(&[], 0, phase, "").pass, Some(true));
+    }
+
+    #[test]
+    fn the_mismatch_and_storage_gates_are_shared_and_need_their_data() {
+        let nodes = 3;
+        assert_eq!(
+            mismatch_row(&[&json!(0), &json!(0)], &json!(3), nodes).pass,
+            Some(true)
+        );
+        assert_eq!(
+            mismatch_row(&[&json!(0), &json!(1)], &json!(3), nodes).pass,
+            Some(false)
+        );
+        assert_ne!(
+            mismatch_row(&[&json!(0), &json!(0)], &json!(2), nodes).pass,
+            Some(true)
+        );
+        assert_ne!(
+            mismatch_row(&[&Value::Null], &json!(3), nodes).pass,
+            Some(true)
+        );
+        assert_ne!(mismatch_row(&[], &Value::Null, nodes).pass, Some(true));
+        assert_ne!(storage_row(&json!({})).pass, Some(true));
+        assert_ne!(storage_row(&Value::Null).pass, Some(true));
+    }
+
+    #[test]
+    fn a_rolling_restart_counts_only_the_spills_it_forced() {
+        let measured = |accepted: u64, forced_spills: u64| {
+            json!({ "sent": 3000.0, "new_id_success_pct": 100.0, "forced_requested": 3, "forced_accepted": accepted,
+                    "forced_spills_committed": forced_spills, "restarted_nodes": 3, "nodes": 3, "live_deltas_max": 20 })
+        };
+        assert_eq!(rolling_row(&measured(3, 3)).pass, Some(true));
+        // A force request that was refused, even with spills (the timer's) in the counters.
+        assert_eq!(rolling_row(&measured(2, 3)).pass, Some(false));
+        // No spill the forced requests produced: an unrelated spill does not satisfy the gate.
+        assert_eq!(rolling_row(&measured(3, 0)).pass, Some(false));
+        for broken in [
+            Value::Null,
+            json!({}),
+            json!({ "forced_requested": 0, "forced_accepted": 0 }),
+        ] {
+            assert_ne!(rolling_row(&broken).pass, Some(true));
+        }
     }
 }
