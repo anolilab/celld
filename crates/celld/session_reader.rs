@@ -101,6 +101,24 @@ impl BucketOwnership {
         cell: &str,
         record: Option<(&OwnerRecord, &OwnerForm)>,
     ) -> anyhow::Result<Verdict> {
+        // The reads of another session's header and chunk are bounded, and a read
+        // that does not finish refuses the cell (it is held and logged like any
+        // lost record): the first-form rules fail closed.
+        match crate::asyncrt::timeout(taker_step_wait(), self.judge_tagged_unbounded(cell, record))
+            .await
+        {
+            Ok(verdict) => verdict,
+            Err(_) => Ok(Verdict::Refuse(
+                "the session record could not be read in time",
+            )),
+        }
+    }
+
+    async fn judge_tagged_unbounded(
+        &self,
+        cell: &str,
+        record: Option<(&OwnerRecord, &OwnerForm)>,
+    ) -> anyhow::Result<Verdict> {
         let Some(own) = session::current() else {
             return Ok(Verdict::Proceed);
         };
@@ -336,6 +354,26 @@ mod tests {
         assert_eq!(unhex("zz"), None);
     }
 }
+
+/// The longest a step of the path that claims another session's id waits for the
+/// bucket. A step that does not finish fails closed.
+const TAKER_STEP_WAIT_MS: u64 = 5_000;
+
+/// The bound of one step of that path; a test shortens it.
+pub(crate) fn taker_step_wait() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let ms = TAKER_WAIT_OVERRIDE_MS.load(std::sync::atomic::Ordering::SeqCst);
+        if ms != 0 {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    std::time::Duration::from_millis(TAKER_STEP_WAIT_MS)
+}
+
+#[cfg(test)]
+pub(crate) static TAKER_WAIT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// The sealed headers this process has read, by tag. A sealed header is final.
 static SEALED_HEADERS: std::sync::Mutex<

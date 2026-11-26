@@ -1666,6 +1666,11 @@ impl BucketOwnership {
     /// record and would ignore the nonce. The positive answer is cached for
     /// [`MARKS_GATE_MS`] for judging; the write itself asks again with `fresh`.
     pub(crate) async fn all_leases_capable(&self, fresh: bool) -> bool {
+        #[cfg(test)]
+        {
+            let delay = *self.lease_read_delay.lock().unwrap();
+            crate::asyncrt::sleep(delay).await;
+        }
         let now = crate::asyncrt::mono_ms();
         if !fresh {
             let gate = self.records_gate.lock().unwrap();
@@ -1850,8 +1855,15 @@ impl BucketOwnership {
             {
                 self.after_first_record(session, cell).await
             }
-            Ok(_) => Ok(()),
-            Err(_) => {
+            // The write is not seen now, and it may still land: a create-only write
+            // that was sent and whose answer was lost applies at any later time.
+            // A session whose reads trust its bits cannot let the cell act on a
+            // record that may appear without its grant: the id is left pending for
+            // the life of the session, and every request for it is refused. The
+            // record, if it lands, is a birth-form record that no grant covers,
+            // and a reader treats it as absent (the guard of the standard path).
+            // `shadow` goes on.
+            Ok(_) | Err(_) => {
                 if let Some(counter) = session.own_counter_of_scope(cell) {
                     if session.fails_closed() {
                         session.mark_pending(counter);
@@ -1899,7 +1911,14 @@ impl BucketOwnership {
         // A first-form record is written only while every live lease advertises
         // the format, asked again now: a lease that changed since the cell was
         // judged turns the claim into one that is judged again.
-        if plan.is_some() && !self.all_leases_capable(true).await {
+        if plan.is_some()
+            && !crate::asyncrt::timeout(
+                crate::session_reader::taker_step_wait(),
+                self.all_leases_capable(true),
+            )
+            .await
+            .unwrap_or(false)
+        {
             return Ok(CasOutcome::Rejected);
         }
         let body = serde_json::to_vec(&OwnerWire {
@@ -1953,13 +1972,19 @@ impl BucketOwnership {
                 // mark fails, the answer is an error and the claim is settled by
                 // a read, which finishes the mark before it returns the record.
                 if let Some(plan) = &plan {
-                    let marked = crate::session_store::mark_taken(
-                        &self.bucket,
-                        &plan.tag,
-                        plan.counter,
-                        &plan.nonce,
+                    // Bounded, and an error when it does not finish: the cell does
+                    // not act, and the settling read finishes the mark.
+                    let marked = crate::asyncrt::timeout(
+                        crate::session_reader::taker_step_wait(),
+                        crate::session_store::mark_taken(
+                            &self.bucket,
+                            &plan.tag,
+                            plan.counter,
+                            &plan.nonce,
+                        ),
                     )
-                    .await?;
+                    .await
+                    .map_err(|_| anyhow::anyhow!("the mark of {cell} did not finish in time"))??;
                     anyhow::ensure!(
                         marked == crate::session_store::Marked::Ours,
                         "the first record of {cell} was marked by another nonce"
@@ -2608,6 +2633,42 @@ mod grant_tests {
         assert!(session.is_granted(0), "the grant stays recorded");
     }
 
+    /// The write of a first-form record asks for a fresh read of the leases. When
+    /// that read does not finish in time the write is not sent: the claim is lost
+    /// and judged again, and the request is not held beyond the bound.
+    #[tokio::test]
+    async fn a_first_form_write_is_not_sent_when_the_capability_check_does_not_finish() {
+        let (_dir, _bucket, ownership) = world();
+        crate::session_reader::TAKER_WAIT_OVERRIDE_MS.store(100, Ordering::SeqCst);
+        *ownership.lease_read_delay.lock().unwrap() = std::time::Duration::from_secs(30);
+        ownership.k5.set(
+            "Agent:cell",
+            crate::session_reader::K5Plan {
+                nonce: "n1".into(),
+                over: Vec::new(),
+                tag: "aa".into(),
+                counter: 0,
+                etag: None,
+            },
+        );
+        let began = crate::asyncrt::mono_ms();
+        let outcome = ownership
+            .cas_owner("Agent:cell", celld_logic::CasGuard::Absent, 2)
+            .await
+            .unwrap();
+        crate::session_reader::TAKER_WAIT_OVERRIDE_MS.store(0, Ordering::SeqCst);
+        assert!(matches!(outcome, celld_logic::CasOutcome::Rejected));
+        assert!(crate::asyncrt::mono_ms() - began < 2_000, "bounded");
+        assert!(
+            ownership
+                .resolve_owner("Agent:cell", RecordReader::Claim)
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing was written"
+        );
+    }
+
     /// A failed read-back of an ambiguous first record leaves the cell pending in
     /// `read` and `on` and lets `shadow` go on; a read that shows the record
     /// finishes its grant.
@@ -2630,13 +2691,24 @@ mod grant_tests {
                 session.mode()
             );
         }
-        // A record that is another's, or none, decides nothing.
+        // A read-back that finds nothing does not show that the write did not
+        // apply: it may land later. The cell of a session that trusts its bits is
+        // left pending for good; shadow goes on.
         let scope = scope_of(&strict, 1);
         ownership
             .settle_ambiguous_first_record(&strict, &scope, None, Ok(None))
             .await
             .unwrap();
-        assert!(!strict.is_pending_scope(&scope));
+        assert!(
+            strict.is_pending_scope(&scope),
+            "a write that may land later"
+        );
+        let scope = scope_of(&shadow, 1);
+        ownership
+            .settle_ambiguous_first_record(&shadow, &scope, None, Ok(None))
+            .await
+            .unwrap();
+        assert!(!shadow.is_pending_scope(&scope));
     }
 
     /// The scope of the id with counter `counter` of `session`.
