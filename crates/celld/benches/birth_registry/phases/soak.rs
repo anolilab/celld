@@ -162,6 +162,18 @@ async fn bring_up_all(rig: &mut Rig) -> bool {
     false
 }
 
+/// Wait until every node answers its health and Worker routes. A check run
+/// while a node is still down counts that node's silence as the cells' fault.
+async fn await_all_ready(rig: &Rig) -> bool {
+    for index in rig.nodes() {
+        if !await_ready(rig, index).await {
+            say!("soak: node {index} was not ready for the check");
+            return false;
+        }
+    }
+    true
+}
+
 /// `count` keys no cell has, from a counter: what a lookup of a brand-new cell
 /// meets, which is the path a claim takes.
 fn absent_keys(count: usize, seed: u64) -> Vec<(String, Expect)> {
@@ -342,6 +354,10 @@ pub async fn soak() {
             break;
         }
         tokio::time::sleep(settle).await;
+        if !await_all_ready(&rig).await {
+            stopped_for = Some("a node was not ready for the check".to_owned());
+            break;
+        }
         tally.poll(&rig).await;
         let totals_after_drill = tally.totals();
         // Completeness after the drill: claimed cells older than 20 s read Exists
@@ -465,7 +481,14 @@ pub async fn soak() {
     tally.poll(&rig).await;
     // The last check, wider: claimed cells older than 20 s, a bounded sample of
     // them, on every node.
-    let final_keys: Vec<(String, Expect)> = {
+    // Not made while a node is down: its silence is not an answer about a cell.
+    let all_ready = await_all_ready(&rig).await;
+    if !all_ready && stopped_for.is_none() {
+        stopped_for = Some("a node was not ready for the final check".to_owned());
+    }
+    let final_keys: Vec<(String, Expect)> = if !all_ready {
+        Vec::new()
+    } else {
         let cells = births.cells.lock().unwrap();
         let step = (cells.len() / 20_000).max(1);
         cells
@@ -505,6 +528,10 @@ pub async fn soak() {
     let answered = totals.get("new").copied().unwrap_or(0)
         + totals.get("exists").copied().unwrap_or(0)
         + totals.get("unknown").copied().unwrap_or(0);
+    let nodes_reporting = states
+        .iter()
+        .filter(|state| state["counters"].is_object())
+        .count();
     let unknown_pct =
         totals.get("unknown").copied().unwrap_or(0) as f64 * 100.0 / (answered.max(1)) as f64;
     let result = json!({
@@ -544,8 +571,8 @@ pub async fn soak() {
             "claims_served_after_record_loss": record_loss_served,
         },
         "final_check": final_check.json(),
-        "final_check_valid": stopped_for.is_none(),
-        "nodes_reporting": states.iter().filter(|state| state["counters"].is_object()).count(),
+        "final_check_valid": stopped_for.is_none() && nodes_reporting == rig.nodes().len(),
+        "nodes_reporting": nodes_reporting,
         "drills": drills,
         "commit": env_text("CELLD_REG_COMMIT"),
     });
