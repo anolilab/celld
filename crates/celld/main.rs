@@ -2844,6 +2844,46 @@ async fn internal_registry_root(request: Request<Incoming>, app: AppHandle) -> H
     peer_response(response(StatusCode::OK, "{\"ok\":true}"))
 }
 
+/// The registry's debug routes, which exist only with
+/// `CELLD_REGISTRY_DEBUG_API=1`.
+async fn internal_registry_debug(request: Request<Incoming>, path: String) -> HttpReply {
+    let Some(registry) = celld::registry::global() else {
+        return response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{\"error\":\"no registry\"}",
+        );
+    };
+    let method = request.method().to_string();
+    let query: std::collections::BTreeMap<String, String> = request
+        .uri()
+        .query()
+        .map(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let body = match collect_limited_body(request.into_body(), MAX_PEER_PROTOCOL_BODY_BYTES).await {
+        Ok(body) if body.is_empty() => serde_json::Value::Null,
+        Ok(body) => match serde_json::from_slice(&body) {
+            Ok(body) => body,
+            Err(_) => {
+                return response(
+                    StatusCode::BAD_REQUEST,
+                    "{\"error\":\"the body is not JSON\"}",
+                )
+            }
+        },
+        Err(error) => return body_read_error("registry", error),
+    };
+    match celld::registry_api::serve(&registry, &method, &path, &query, &body).await {
+        Some((status, text)) => {
+            response(StatusCode::from_u16(status).unwrap_or(StatusCode::OK), text)
+        }
+        None => response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}"),
+    }
+}
+
 /// A node outside the birth registry's writer rule (the flag is off, or it has bucket
 /// durability) raises the registry's gate number, when the bucket has a registry root,
 /// before it does any per-cell work, once its own lease, matched by generation, says
@@ -3272,6 +3312,9 @@ async fn handle_internal(
         }
         "/peer/registry/root" if celld::registry::global().is_some() => {
             internal_registry_root(request, app).await
+        }
+        _ if path.starts_with("/__registry/") && celld::registry_api::enabled() => {
+            internal_registry_debug(request, path.clone()).await
         }
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),

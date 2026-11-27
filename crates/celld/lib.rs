@@ -82,6 +82,10 @@ pub mod queue_policy;
 pub mod r2_cli;
 pub(crate) mod r2_store;
 pub mod registry;
+pub mod registry_api;
+#[cfg(test)]
+#[path = "benches/birth_registry/gates.rs"]
+mod registry_bench_gates;
 pub(crate) mod registry_compactor;
 pub(crate) mod registry_objects;
 pub(crate) mod registry_pace;

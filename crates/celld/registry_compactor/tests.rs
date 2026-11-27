@@ -3211,6 +3211,8 @@ async fn a_map_a_failed_commit_may_have_written_is_deleted_after_the_grace() {
     let spill = spill_now(&node, &mut holding).await;
     run_job(&node, &mut holding, spill).await;
     assert_eq!(node.counters.jobs_discarded.load(Ordering::Relaxed), 1);
+    // A commit that failed is counted apart from a job whose inputs changed.
+    assert_eq!(node.counters.commits_failed.load(Ordering::Relaxed), 1);
     assert_eq!(
         keys_under(&plain, &objects::maps_root(PREFIX)).await.len(),
         1,
@@ -3225,6 +3227,133 @@ async fn a_map_a_failed_commit_may_have_written_is_deleted_after_the_grace() {
     assert!(keys_under(&plain, &objects::maps_root(PREFIX))
         .await
         .is_empty());
+}
+
+#[tokio::test]
+async fn a_lookup_counts_only_the_deltas_it_read_itself() {
+    let store = memory();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    let reader = registry_on(&store, "reader");
+    register_and_fold(&node, &mut holding, &[cell(1)]).await;
+    // A refresh outside a lookup (the watch loop, the cover poll) loads the delta.
+    assert!(reader.refresh(&Io::default()).await.is_some());
+    let load = |value: &std::sync::atomic::AtomicU64| value.load(Ordering::Relaxed);
+    assert_eq!(load(&reader.counters.delta_loads), 1);
+    assert_eq!(load(&reader.counters.lookup_delta_loads), 0);
+    // The next delta is read by a lookup, and only that one is counted as its own.
+    register_and_fold(&node, &mut holding, &[cell(2)]).await;
+    assert!(matches!(answer(&reader, &cell(2)).await, Answer::Exists(_)));
+    assert_eq!(load(&reader.counters.delta_loads), 2);
+    assert_eq!(load(&reader.counters.lookup_delta_loads), 1);
+}
+
+#[tokio::test]
+async fn a_map_a_commit_replaced_is_deleted_after_the_grace() {
+    let store = memory();
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            grace_ms: 0,
+            ..config()
+        },
+    );
+    let mut holding = holder_of(&node).await;
+    for round in 0..3_u32 {
+        let cells: Vec<String> = (0..10).map(|index| cell(round * 10 + index)).collect();
+        register_and_fold(&node, &mut holding, &cells).await;
+        let spill = spill_now(&node, &mut holding).await;
+        run_job(&node, &mut holding, spill).await;
+    }
+    assert_eq!(node.counters.spills.load(Ordering::Relaxed), 3);
+    node.housekeeping(&mut holding);
+    wait_housekeeping(&holding).await;
+    assert_eq!(
+        keys_under(&store, &objects::maps_root(PREFIX)).await.len(),
+        1,
+        "only the map the root names stays"
+    );
+}
+
+#[tokio::test]
+async fn a_replaced_map_is_kept_until_the_root_that_stopped_naming_it_is_written_and_the_grace_passed(
+) {
+    let store = memory();
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            grace_ms: 600_000,
+            ..config()
+        },
+    );
+    let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &(0..10).map(cell).collect::<Vec<_>>()).await;
+    let first = spill_now(&node, &mut holding).await;
+    run_job(&node, &mut holding, first).await;
+    let replaced = {
+        let (epoch, number) = holding.root.map.expect("the first spill wrote a map");
+        objects::map_key(PREFIX, epoch, number)
+    };
+    register_and_fold(&node, &mut holding, &(10..20).map(cell).collect::<Vec<_>>()).await;
+    // The commit alone: the root still names the old map.
+    let second = spill_now(&node, &mut holding).await;
+    holding.prepared.lock().unwrap().push(second);
+    assert!(node.commit_prepared(&mut holding).await.unwrap());
+    assert!(holding.retire_next.contains(&replaced));
+    assert!(
+        !holding.retired.iter().any(|(key, _)| *key == replaced),
+        "its grace starts at the root write, not at the commit"
+    );
+    assert!(keys_under(&store, &objects::maps_root(PREFIX))
+        .await
+        .contains(&replaced));
+    // The root write that stops naming it starts the grace; the map stays.
+    holding.last_root_ms = 0;
+    assert!(node.pass(&mut holding).await.unwrap());
+    assert!(holding.retired.iter().any(|(key, _)| *key == replaced));
+    node.housekeeping(&mut holding);
+    wait_housekeeping(&holding).await;
+    assert!(
+        keys_under(&store, &objects::maps_root(PREFIX))
+            .await
+            .contains(&replaced),
+        "a replaced map is not deleted inside the grace"
+    );
+}
+
+#[tokio::test]
+async fn a_forced_job_accepted_by_an_earlier_epoch_is_dropped() {
+    let store = memory();
+    let node = registry_on(&store, "node-a");
+    let mut holding = holder_of(&node).await;
+    register_and_fold(&node, &mut holding, &(0..10).map(cell).collect::<Vec<_>>()).await;
+    // Accepted by an earlier holder of this node.
+    node.forced
+        .lock()
+        .unwrap()
+        .push_back(("spill".to_owned(), 0, holding.epoch + 1));
+    node.schedule(&mut holding);
+    assert!(
+        node.forced.lock().unwrap().is_empty(),
+        "the request is consumed"
+    );
+    assert_eq!(holding.running.load(Ordering::SeqCst), 0);
+    assert!(holding.prepared.lock().unwrap().is_empty());
+    // The same request from this epoch runs.
+    node.forced
+        .lock()
+        .unwrap()
+        .push_back(("spill".to_owned(), 0, holding.epoch));
+    node.schedule(&mut holding);
+    crate::asyncrt::timeout(Duration::from_secs(5), async {
+        while holding.prepared.lock().unwrap().is_empty() {
+            crate::asyncrt::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the forced spill was prepared");
 }
 
 #[tokio::test]
@@ -3941,7 +4070,10 @@ async fn a_seed_is_not_a_job_so_spills_go_on_while_it_lists() {
     scripted.hold("fleet-a/cells");
     holding.last_seed_ms = None;
     register_and_fold(&node, &mut holding, &[cell(1)]).await;
-    crate::asyncrt::timeout(Duration::from_secs(5), async {
+    // The wait ends on the event (the seed's listing started), not on a short
+    // clock: on a host under load a pass and the spawned listing can take longer
+    // than 5 s to meet, and the bound only catches a seed that never starts.
+    crate::asyncrt::timeout(Duration::from_secs(120), async {
         while !holding.seeding.load(Ordering::SeqCst) {
             holding.last_seed_ms = None;
             node.pass(&mut holding).await.unwrap();
@@ -4906,4 +5038,34 @@ async fn keys_of_a_background_delete_stay_tracked_while_it_stalls_and_after_its_
     })
     .await
     .expect("confirmed deletes leave the list");
+}
+
+#[tokio::test]
+async fn the_cover_route_says_when_a_write_was_allowed_without_coverage() {
+    // In shadow the wait ends at its bound and the write goes on: `ok` says it
+    // may, `covered` says what is true.
+    let store = memory();
+    let node = registry_with(
+        &store,
+        "node-a",
+        Config {
+            enforce: false,
+            ..config()
+        },
+    );
+    let body = serde_json::json!({ "scope": cell(1) });
+    let (status, text) = crate::registry_api::serve(
+        &node,
+        "POST",
+        "/__registry/cover",
+        &Default::default(),
+        &body,
+    )
+    .await
+    .expect("the cover route");
+    assert_eq!(status, 200);
+    let reply: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["covered"], false, "{reply}");
+    assert_eq!(reply["allowed_uncovered"], true, "{reply}");
 }

@@ -12,7 +12,7 @@
 //! queues it, flushes, asks the holder for a pass and waits, never longer than
 //! the bound. The claim acknowledgement never waits for any of this.
 
-use crate::registry::{Created, Io, Registry};
+use crate::registry::{push_capped, Created, Io, Registry};
 use crate::registry_objects::{self as objects, cell_of_ltx_key};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -64,8 +64,10 @@ impl Registry {
             }
             if queue.created.len() < self.cfg.created_cap {
                 queue.created.entry(key).or_insert(Created {
+                    claim_ms: crate::asyncrt::mono_ms(),
                     created_here: epoch == 1,
                     seg: None,
+                    flushed_ms: None,
                 });
             }
         }
@@ -130,8 +132,23 @@ impl Registry {
         if done.is_empty() {
             return;
         }
+        let now = crate::asyncrt::mono_ms();
+        let mut samples = crate::registry_api::enabled().then(|| self.samples.lock().unwrap());
         for key in done {
-            queue.created.remove(&key);
+            if let Some(created) = queue.created.remove(&key) {
+                if let Some(samples) = samples.as_mut() {
+                    push_capped(
+                        &mut samples.claim_to_covered_ms,
+                        now.saturating_sub(created.claim_ms),
+                    );
+                    if let Some(flushed) = created.flushed_ms {
+                        push_capped(
+                            &mut samples.segment_to_covered_ms,
+                            now.saturating_sub(flushed),
+                        );
+                    }
+                }
+            }
             queue.evidence.insert(crate::registry::evidence_key(&key));
         }
     }
@@ -172,9 +189,11 @@ impl Registry {
         let mut queue = self.queue.lock().unwrap();
         match written {
             Ok(()) => {
+                let now = crate::asyncrt::mono_ms();
                 for record in &records {
                     if let Some(created) = queue.created.get_mut(&record.key) {
                         created.seg = Some(key.clone());
+                        created.flushed_ms = Some(now);
                     }
                 }
                 self.counters
@@ -330,11 +349,32 @@ impl Registry {
             return Ok(());
         }
         let started = crate::asyncrt::mono_ms();
-        let covered = !self.cfg.bound.is_zero()
-            && (crate::asyncrt::timeout(self.cfg.bound, self.cover(&key))
+        let waited = if self.cfg.bound.is_zero() {
+            None
+        } else {
+            crate::asyncrt::timeout(self.cfg.bound, self.cover(&key))
                 .await
-                .is_ok()
-                || self.covered_now(&key));
+                .ok()
+        };
+        let covered = waited.is_some() || (!self.cfg.bound.is_zero() && self.covered_now(&key));
+        if crate::registry_api::enabled() {
+            let now = crate::asyncrt::mono_ms();
+            let mut samples = self.samples.lock().unwrap();
+            push_capped(
+                &mut samples.waits,
+                (
+                    objects::hex_key(&key),
+                    now.saturating_sub(started),
+                    format!("backstop:{}", if covered { "covered" } else { "bound" }),
+                ),
+            );
+            if let Some(requested) = waited.flatten() {
+                push_capped(
+                    &mut samples.pass_to_covered_ms,
+                    now.saturating_sub(requested),
+                );
+            }
+        }
         if !covered {
             // The cell stays queued, so a retry finds it folded.
             self.queue_for_coverage(&key);
@@ -363,8 +403,10 @@ impl Registry {
         self.enqueue(&mut queue, *key, Record::birth(*key, 0));
         if queue.created.len() < self.cfg.created_cap {
             queue.created.entry(*key).or_insert(Created {
+                claim_ms: crate::asyncrt::mono_ms(),
                 created_here: false,
                 seg: None,
+                flushed_ms: None,
             });
         }
         drop(queue);
@@ -372,7 +414,7 @@ impl Registry {
     }
 
     /// Return once coverage of `key` is observed. The caller bounds it.
-    async fn cover(&self, key: &Key) {
+    async fn cover(&self, key: &Key) -> Option<u64> {
         let created = self
             .queue
             .lock()
@@ -389,7 +431,7 @@ impl Registry {
                     .backstop_exists
                     .fetch_add(1, Ordering::Relaxed);
                 self.add_evidence(key);
-                return;
+                return None;
             }
             self.queue_for_coverage(key);
         }
@@ -397,15 +439,16 @@ impl Registry {
         self.waiters.fetch_add(1, Ordering::Relaxed);
         let _waiting = Waiting(self);
         let _ = self.flush_now().await;
+        let requested = crate::asyncrt::mono_ms();
         self.request_pass().await;
         loop {
             if self.covered_now(key) {
-                return;
+                return Some(requested);
             }
             let io = Io::default();
             let _ = self.refresh(&io).await;
             if self.covered_now(key) {
-                return;
+                return Some(requested);
             }
             let (flushed, folded_away) = {
                 let queue = self.queue.lock().unwrap();
@@ -425,7 +468,7 @@ impl Registry {
             // the cell is not tracked: only a lookup can still show the cell.
             if folded_away && matches!(self.lookup(key).await.answer, Answer::Exists(_)) {
                 self.add_evidence(key);
-                return;
+                return Some(requested);
             }
             crate::asyncrt::select_biased! {
                 "a root observation ends the poll pause";

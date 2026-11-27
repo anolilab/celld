@@ -62,6 +62,9 @@ pub(crate) const SHADOW_LOOKUPS: usize = 16;
 pub(crate) const LOOKUP_DEADLINE: Duration = Duration::from_secs(2);
 /// Cells whose coverage this process has observed.
 const EVIDENCE_CAP: usize = 1 << 19;
+/// Samples a node keeps for the bench, per kind, so a long run does not grow
+/// without bound.
+const SAMPLES_CAP: usize = 400_000;
 /// Delta ids one root push is read for.
 pub(crate) const PUSH_IDS: usize = 8;
 /// Cached deltas that no root this node read names: what pushes may add.
@@ -218,12 +221,20 @@ pub(crate) struct Snapshot {
 pub(crate) struct Io {
     pub gets: AtomicU64,
     pub bytes: AtomicU64,
+    /// Of `gets`, the delta reads this lookup made itself.
+    pub delta_gets: AtomicU64,
 }
 
 impl Io {
     pub(crate) fn get(&self, bytes: usize) {
         self.gets.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// A delta read, which is also a get.
+    pub(crate) fn delta_get(&self, bytes: usize) {
+        self.get(bytes);
+        self.delta_gets.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -245,6 +256,10 @@ pub(crate) struct Counters {
     pub bytes: AtomicU64,
     pub root_reads: AtomicU64,
     pub delta_loads: AtomicU64,
+    /// Of `delta_loads`, the deltas a lookup read itself, which are the ones in
+    /// its `gets`; the watch loop, the cover poll and the debug routes read the
+    /// others.
+    pub lookup_delta_loads: AtomicU64,
     pub segments_written: AtomicU64,
     pub backstop_lookups: AtomicU64,
     pub backstop_exists: AtomicU64,
@@ -261,6 +276,9 @@ pub(crate) struct Counters {
     pub spills_timer: AtomicU64,
     pub base_merges: AtomicU64,
     pub jobs_discarded: AtomicU64,
+    /// Of `jobs_discarded`, the jobs whose commit failed (a map that could not be
+    /// written), not jobs whose inputs changed under them.
+    pub commits_failed: AtomicU64,
     /// Segments a pass left for the next one because its read budget ran out.
     pub reads_deferred: AtomicU64,
     pub merge_check_failures: AtomicU64,
@@ -299,9 +317,45 @@ pub(crate) struct Counters {
     pub seed_blocked: AtomicU64,
 }
 
+/// What the bench reads over the debug routes: raw latency samples, kept only
+/// when the debug routes are on (`push_capped` records nothing otherwise).
+#[derive(Debug, Default)]
+pub(crate) struct Samples {
+    pub lookup_us: Vec<u64>,
+    pub claim_to_covered_ms: Vec<u64>,
+    pub segment_to_covered_ms: Vec<u64>,
+    pub pass_to_covered_ms: Vec<u64>,
+    pub pass_us: Vec<u64>,
+    pub pass_gap_ms: Vec<u64>,
+    /// Each pass: when it started, how long it took, the jobs running beside it and the segments it folded.
+    pub pass_log: Vec<(u64, u64, u64, u64)>,
+    pub job_ms: Vec<(String, u64)>,
+    pub waits: Vec<(String, u64, String)>,
+}
+
+/// Record `value` for the bench: nothing unless `CELLD_REGISTRY_DEBUG_API=1`.
+pub(crate) fn push_capped<T>(samples: &mut Vec<T>, value: T) {
+    if crate::registry_api::enabled() && samples.len() < SAMPLES_CAP {
+        samples.push(value);
+    }
+}
+
+/// Test hooks the bench sets over the debug routes; all off by default.
+#[derive(Debug, Default)]
+pub(crate) struct Holds {
+    /// Keep prepared jobs from committing.
+    pub commit: AtomicBool,
+    /// Let two jobs prepare at once.
+    pub schedule: AtomicBool,
+    /// Delay every root write by this many milliseconds.
+    pub root_write_ms: AtomicU64,
+}
+
 /// A cell this process queued at a claim, until its coverage is observed.
 #[derive(Debug)]
 pub(crate) struct Created {
+    pub claim_ms: u64,
+    pub flushed_ms: Option<u64>,
     /// This process created the cell (epoch 1): it needs no lookup, only its own entry's coverage.
     pub created_here: bool,
     pub seg: Option<String>,
@@ -338,6 +392,14 @@ pub struct Registry {
     pub(crate) cfg: Config,
     view: Mutex<View>,
     pub(crate) counters: Counters,
+    pub(crate) samples: Mutex<Samples>,
+    pub(crate) holds: Holds,
+    /// The last events of the holder, for the debug state route.
+    pub(crate) debug: Mutex<serde_json::Map<String, serde_json::Value>>,
+    /// Jobs the debug route asked the holder to run: kind, partition and the
+    /// compactor epoch that accepted the request. A holder of another epoch
+    /// drops it.
+    pub(crate) forced: Mutex<std::collections::VecDeque<(String, usize, u64)>>,
     pub(crate) queue: Mutex<Queue>,
     pub(crate) flushing: tokio::sync::Mutex<()>,
     pub(crate) queued: tokio::sync::Notify,
@@ -411,6 +473,10 @@ impl Registry {
             cfg,
             view: Mutex::new(View::default()),
             counters: Counters::default(),
+            samples: Mutex::new(Samples::default()),
+            holds: Holds::default(),
+            debug: Mutex::new(serde_json::Map::new()),
+            forced: Mutex::new(std::collections::VecDeque::new()),
             queue: Mutex::new(Queue {
                 waiting: BTreeMap::new(),
                 created: HashMap::new(),
@@ -646,7 +712,7 @@ impl Registry {
         let load = cell
             .get_or_try_init(|| async {
                 let (delta, size) = objects::read_delta(store.as_ref(), &self.prefix, id).await?;
-                io.get(size);
+                io.delta_get(size);
                 if pushed {
                     &self.counters.prefetch_loads
                 } else {
@@ -841,6 +907,9 @@ impl Registry {
         let counters = &self.counters;
         counters.lookups.fetch_add(1, Ordering::Relaxed);
         counters.gets.fetch_add(gets, Ordering::Relaxed);
+        counters
+            .lookup_delta_loads
+            .fetch_add(io.delta_gets.load(Ordering::Relaxed), Ordering::Relaxed);
         counters.bytes.fetch_add(bytes, Ordering::Relaxed);
         match answer {
             Answer::New => &counters.new,
@@ -848,6 +917,9 @@ impl Registry {
             Answer::Unknown(_) => &counters.unknown,
         }
         .fetch_add(1, Ordering::Relaxed);
+        if crate::registry_api::enabled() {
+            push_capped(&mut self.samples.lock().unwrap().lookup_us, micros);
+        }
         LookupResult {
             answer,
             gets,
@@ -968,6 +1040,7 @@ impl Registry {
             ("bytes", &counters.bytes),
             ("root_reads", &counters.root_reads),
             ("delta_loads", &counters.delta_loads),
+            ("lookup_delta_loads", &counters.lookup_delta_loads),
             ("segments_written", &counters.segments_written),
             ("backstop_lookups", &counters.backstop_lookups),
             ("backstop_exists", &counters.backstop_exists),
@@ -983,6 +1056,7 @@ impl Registry {
             ("spills_timer", &counters.spills_timer),
             ("base_merges", &counters.base_merges),
             ("jobs_discarded", &counters.jobs_discarded),
+            ("commits_failed", &counters.commits_failed),
             ("reads_deferred", &counters.reads_deferred),
             ("merge_check_failures", &counters.merge_check_failures),
             ("takeovers", &counters.takeovers),
@@ -1013,7 +1087,7 @@ impl Registry {
         .into_iter()
         .map(|(name, value)| (name.to_owned(), load(value).into()))
         .collect();
-        serde_json::json!({
+        let mut state = serde_json::json!({
             "node": self.node,
             "session": self.session,
             "holder": self.role.holder.load(Ordering::Relaxed),
@@ -1022,7 +1096,41 @@ impl Registry {
             "queue": { "waiting": waiting, "created": created, "evidence": evidence },
             "waiters": self.waiters.load(Ordering::Relaxed),
             "counters": counters_json,
-        })
+        });
+        let debug = self.debug.lock().unwrap().clone();
+        if let Some(object) = state.as_object_mut() {
+            object.extend(debug);
+        }
+        state
+    }
+
+    /// The raw samples for the bench, and a reset of them when `take`.
+    pub(crate) fn samples_json(&self, take: bool) -> serde_json::Value {
+        // Cells claimed here that no root has named after 20 s: they leave no
+        // sample, so the gate reads them from the queue.
+        let now = crate::asyncrt::mono_ms();
+        let uncovered_over_20s = self
+            .queue
+            .lock()
+            .unwrap()
+            .created
+            .values()
+            .filter(|created| now.saturating_sub(created.claim_ms) > 20_000)
+            .count();
+        let mut samples = self.samples.lock().unwrap();
+        let value = serde_json::json!({
+            "uncovered_over_20s": uncovered_over_20s,
+            "lookup_us": samples.lookup_us,
+            "claim_to_covered_ms": samples.claim_to_covered_ms,
+            "segment_to_covered_ms": samples.segment_to_covered_ms,
+            "pass_to_covered_ms": samples.pass_to_covered_ms,
+            "pass_us": samples.pass_us, "pass_gap_ms": samples.pass_gap_ms,
+            "pass_log": samples.pass_log, "job_ms": samples.job_ms, "waits": samples.waits,
+        });
+        if take {
+            *samples = Samples::default();
+        }
+        value
     }
 }
 

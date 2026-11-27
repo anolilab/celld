@@ -234,6 +234,7 @@ pub fn validate() -> anyhow::Result<()> {
     for name in [
         "CELLD_CELL_DIRECTORY_SHADOW",
         "CELLD_CLOUD",
+        "CELLD_REGISTRY_DEBUG_API",
         "CELLD_LTX_COMPACTION",
         "CELLD_LTX_PAGED",
         "CELLD_RESUME_DORMANT_LOCAL",
