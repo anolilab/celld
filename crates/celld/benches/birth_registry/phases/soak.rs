@@ -3,7 +3,9 @@
 //! restarts nodes one by one, kills one, kills all three, drains the holder and
 //! deletes cell records, round after round. Every wrong answer counts: the
 //! `registry_mismatch` and `registry_incomplete` events of every node's log, the
-//! sampler's misses, and the keys of claimed cells that do not read `Exists`.
+//! sampler's misses, and the keys of claimed cells that read `New`. Claimed cells
+//! that read neither `Exists` nor `New` after the settle stop the soak too, but
+//! as a completeness stop, not as a wrong answer.
 //!
 //! It adds no harness of its own: the fleet, the load, the debug routes, the
 //! completeness check and the record-loss drill are those of the other phases.
@@ -217,6 +219,10 @@ pub async fn soak() {
     tally.poll(&rig).await;
 
     let mut drills: Vec<Value> = Vec::new();
+    // Claimed keys that read `New`: the wrong answer.
+    let mut new_claimed = 0_u64;
+    // Claimed keys that, after the settle and one more look, read neither `Exists`
+    // nor `New`: a node that was not covered yet or did not answer. Not wrong.
     let mut misses = 0_u64;
     let mut unknowns = 0_u64;
     let mut checked = 0_u64;
@@ -360,15 +366,18 @@ pub async fn soak() {
         // `New` for a claimed cell is a wrong answer at once. Unknown right after
         // a restart is a node that is not yet covered: ask again after another
         // settle, and only an answer that is still not `Exists` counts.
-        misses += check.new;
+        new_claimed += check.new;
         let mut recheck = Value::Null;
         if check.misses > check.new {
             tokio::time::sleep(Duration::from_secs(60)).await;
             let again = probe::check_keys(&rig.fleet.ep, sample.clone(), 32, &rig.nodes()).await;
-            misses += again.misses;
+            new_claimed += again.new;
+            misses += again.misses - again.new;
+            unknowns += again.unknown;
             recheck = again.json();
+        } else {
+            unknowns += check.unknown;
         }
-        unknowns += check.unknown;
         checked += check.total;
         tally.poll(&rig).await;
         let totals_steady_from = tally.totals();
@@ -434,11 +443,15 @@ pub async fn soak() {
         fstrim();
         if progress["mismatch_events"].as_u64().unwrap_or(0) > 0
             || progress["incomplete_events"].as_u64().unwrap_or(0) > 0
-            || misses > 0
+            || new_claimed > 0
             || totals.get("sampler_misses").copied().unwrap_or(0) > 0
             || totals.get("mismatches").copied().unwrap_or(0) > 0
         {
             stopped_for = Some("a wrong answer".to_owned());
+            break;
+        }
+        if misses > 0 {
+            stopped_for = Some("claimed cells not Exists after the settle".to_owned());
             break;
         }
         if free_gb() < floor_gb {
@@ -482,7 +495,8 @@ pub async fn soak() {
             *final_check.doubts.entry(doubt).or_default() += n;
         }
     }
-    misses += final_check.misses;
+    new_claimed += final_check.new;
+    misses += final_check.misses - final_check.new;
     unknowns += final_check.unknown;
     checked += final_check.total;
     let guard = guard_answers(&rig.fleet, &rig.nodes()).await;
@@ -523,7 +537,8 @@ pub async fn soak() {
             "sampler_misses": totals.get("sampler_misses"),
             "counter_mismatches": totals.get("mismatches"),
             "guard_mismatches_final": guard["mismatches"],
-            "claimed_keys_not_exists": misses,
+            "claimed_keys_new": new_claimed,
+            "claimed_keys_not_exists": misses + new_claimed,
             "claimed_keys_checked": checked,
             "claimed_keys_unknown": unknowns,
             "claims_served_after_record_loss": record_loss_served,
