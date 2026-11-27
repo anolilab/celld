@@ -433,6 +433,191 @@ fn placement_skips_an_ingress_only_peer_that_reports_no_cells() {
     );
 }
 
+fn minted_here(cell: &str) -> bool {
+    cell == "minted"
+}
+
+/// A full node that minted an id and has no record for it serves it itself: a peer
+/// would find no record under an open session and forward the request back.
+#[test]
+fn a_full_node_serves_the_unrecorded_id_it_minted_instead_of_placing_it() {
+    let mut state = started(1);
+    state.set_minted_here(minted_here);
+    let op = request(&mut state, 1, "resident");
+    owner_read(&mut state, op, None);
+    assert!(!state.has_capacity());
+    // An id of another session is placed on a peer, as before.
+    let op = request(&mut state, 2, "other");
+    let effects = owner_read(&mut state, op, None);
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ReadCapacityPeers { .. })),
+        "{effects:?}"
+    );
+    // The minted id is not.
+    let op = request(&mut state, 3, "minted");
+    let effects = owner_read(&mut state, op, None);
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ReadCapacityPeers { .. })),
+        "{effects:?}"
+    );
+    let cell = &state.cells["minted"];
+    assert_eq!(cell.phase, Phase::WaitingCapacity);
+    assert!(matches!(
+        cell.waiting_for,
+        Some(Activation::Claim(Claim {
+            guard: CasGuard::Absent,
+            ..
+        }))
+    ));
+}
+
+/// A draining minter refuses the unrecorded id like any inactive cell, with a
+/// retryable error and without placing it on a peer: it does not strand the
+/// request in a forward loop, and a peer judges the cell once the seal ends the
+/// session.
+#[test]
+fn a_draining_node_refuses_the_unrecorded_id_it_minted_without_placing_it() {
+    let mut state = started(4);
+    state.set_minted_here(minted_here);
+    on_event(&mut state, Event::ReleaseAll);
+    let effects = on_event(
+        &mut state,
+        Event::RequestAt {
+            request: 1,
+            cell: "minted".into(),
+            now_mono_ms: 0,
+        },
+    );
+    assert!(
+        effects.contains(&Effect::Complete {
+            request: 1,
+            result: Err(RequestError::NodeUnavailable),
+        }),
+        "{effects:?}"
+    );
+    assert!(!effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::ReadCapacityPeers { .. })));
+}
+
+/// The record the reader rules make up for a cell that has none while its id's
+/// session is open (B3) names the session's node and has an empty etag.
+fn forwarded_record_resolved(state: &mut State, lease: Option<NodeLeaseRecord>) -> Vec<Effect> {
+    let op = request(state, 1, "cell");
+    let effects = on_event(
+        state,
+        Event::OwnerRead {
+            op,
+            now_ms: NOW_MS,
+            result: Ok(Some(OwnerRecord {
+                node: Some("dead".into()),
+                epoch: 1,
+                by: Some("aa".into()),
+                etag: String::new(),
+            })),
+        },
+    );
+    let [Effect::ReadNodeLease { op, .. }] = work(&effects)[..] else {
+        panic!("expected a node lease read, got {effects:?}");
+    };
+    on_event(
+        state,
+        Event::NodeLeaseRead {
+            op: *op,
+            now_ms: NOW_MS,
+            result: Ok(lease),
+        },
+    )
+}
+
+/// A dead session with no node record at all, or a sealed one, is still closed by
+/// the gate: the made-up record is written over by nobody, so a claim that went
+/// straight on would be lost and the cell read again for ever.
+#[test]
+fn a_forwarded_record_runs_the_gate_on_its_node_whatever_its_lease_says() {
+    for lease in [
+        None,
+        Some(lease_record("dead", NOW_MS - 1, Some(LogState::Sealed))),
+        Some(lease_record("dead", NOW_MS - 1, None)),
+    ] {
+        let mut state = started(2);
+        let effects = forwarded_record_resolved(&mut state, lease.clone());
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::RecoverNodeLog { owner, .. } if owner == "dead"
+            )),
+            "{lease:?}: {effects:?}"
+        );
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::CasOwner { .. })));
+    }
+}
+
+/// A refusal that the rules give once the gate ran is final: the request fails,
+/// and the gate is not scheduled again behind a backoff.
+#[test]
+fn a_refusal_after_the_gate_ends_the_request_and_an_error_backs_off() {
+    let mut state = started(2);
+    let effects = forwarded_record_resolved(&mut state, None);
+    let op = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::RecoverNodeLog { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("log recovery");
+    let effects = on_event(
+        &mut state,
+        Event::NodeLogRecovered {
+            op,
+            result: Err(Failure::Definite),
+        },
+    );
+    assert!(
+        effects.contains(&Effect::Complete {
+            request: 1,
+            result: Err(RequestError::ResolveFailed),
+        }),
+        "{effects:?}"
+    );
+    assert!(!effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::ScheduleTimer { .. })));
+    // An error that may pass waits behind a timer instead.
+    let mut state = started(2);
+    let effects = forwarded_record_resolved(&mut state, None);
+    let op = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::RecoverNodeLog { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("log recovery");
+    let effects = on_event(
+        &mut state,
+        Event::NodeLogRecovered {
+            op,
+            result: Err(Failure::Ambiguous),
+        },
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ScheduleTimer {
+                timer: Timer::OwnerLogRecoveryRetry { .. },
+                ..
+            }
+        )),
+        "{effects:?}"
+    );
+}
+
 #[test]
 fn placement_fails_when_every_peer_is_ingress_only() {
     let mut state = started(0);
