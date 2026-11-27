@@ -850,7 +850,8 @@ pub fn cost_row(
         "segment_puts_per_node_per_window",
         "segment_gets_per_segment",
         "lists_per_pass",
-        "writes_per_delta",
+        "delta_writes_per_s",
+        "deltas_per_s",
         "delta_gets_per_node_per_delta",
         "segment_deletes_per_segment",
         "segment_delete_batches_per_pass",
@@ -872,7 +873,7 @@ pub fn cost_row(
             Value::Null,
         );
     };
-    let &[lookup_gets, seg_puts, seg_gets, lists, writes, delta_gets, seg_deletes, seg_batches, retire_batches, run_puts, run_gets, passes_per_s, watch_root] =
+    let &[lookup_gets, seg_puts, seg_gets, lists, delta_writes_per_s, deltas_per_s, delta_gets, seg_deletes, seg_batches, retire_batches, run_puts, run_gets, passes_per_s, watch_root] =
         values.as_slice()
     else {
         return (row("G-k", json!("units"), "", None), Value::Null);
@@ -880,15 +881,18 @@ pub fn cost_row(
     let months_windows = MONTH_S / 10.0;
     let passes = passes_per_s * MONTH_S;
     let spills = MONTH_S / 900.0;
-    let a_per_pass = lists + writes;
+    // A delta is written only by a pass that folded segments, so what a delta
+    // costs (its write with the root, its reads) is priced per delta written, not
+    // per pass; only the LIST is a cost of every pass.
+    let deltas = deltas_per_s * MONTH_S;
     let lines = json!({
         "lookup": { "b": AGENTS * lookup_gets },
         "segments": { "a": NODES * months_windows * seg_puts },
         "compactor_reads": { "b": NODES * months_windows * seg_puts * seg_gets },
-        "passes": { "a": passes * a_per_pass },
-        "node_delta_reads": { "b": (NODES - 1.0) * passes * delta_gets },
+        "passes": { "a": passes * lists + delta_writes_per_s * MONTH_S },
+        "node_delta_reads": { "b": (NODES - 1.0) * deltas * delta_gets },
         "watch_root_reads": { "b": NODES * MONTH_S * watch_root },
-        "root_push": { "http_requests": (NODES - 1.0) * passes, "bucket_requests": 0.0 },
+        "root_push": { "http_requests": (NODES - 1.0) * deltas, "bucket_requests": 0.0 },
         "spills": { "a": spills * run_puts, "b": spills * run_gets },
         "base_merges": { "a": 0.5e6 },
         "audit_list": { "a": AGENTS / 256.0 },
@@ -1168,11 +1172,25 @@ mod selftest {
     fn the_cost_gate_checks_each_run_on_its_own() {
         let unit = |gets: f64| {
             json!({ "lookup_gets_per_agent": gets, "segment_puts_per_node_per_window": 1.0, "segment_gets_per_segment": 1.0,
-                    "lists_per_pass": 1.0, "writes_per_delta": 2.0, "delta_gets_per_node_per_delta": 1.0,
+                    "lists_per_pass": 1.0, "writes_per_delta": 2.0, "delta_writes_per_s": 0.04, "deltas_per_s": 0.02, "delta_gets_per_node_per_delta": 1.0,
                     "segment_deletes_per_segment": 0.4, "segment_delete_batches_per_pass": 0.5, "retire_delete_batches_per_spill": 9.0,
                     "run_puts_per_spill": 100.0, "run_gets_per_spill": 100.0, "passes_per_s": 0.2,
                     "watch_root_gets_per_node_per_s": 0.0 })
         };
+        // A delta is written only by a pass that folded segments: with fewer deltas
+        // than passes the delta lines cost less than if priced per pass.
+        let mut sparse = unit(3.0);
+        sparse["deltas_per_s"] = json!(0.002);
+        sparse["delta_writes_per_s"] = json!(0.004);
+        let cost = |u: &Value| {
+            cost_row(Some(u), Some(u), Some(69.0)).0.measured["class_b_per_month"]
+                .as_f64()
+                .unwrap()
+        };
+        assert!(
+            cost(&sparse) < cost(&unit(3.0)),
+            "delta reads follow the deltas, not the passes"
+        );
         let (good, _) = cost_row(Some(&unit(3.0)), Some(&unit(3.0)), Some(69.0));
         assert_eq!(good.pass, Some(true), "{:?}", good.measured);
         // Errors in opposite directions average to the table and still fail.

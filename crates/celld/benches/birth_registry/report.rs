@@ -139,6 +139,9 @@ fn units(result: &Value) -> Option<Value> {
         "segment_gets_per_segment": get("GET seg") / get("PUT seg").max(1.0),
         "lists_per_pass": get("LIST seg") / passes.max(1.0),
         "writes_per_delta": (get("PUT delta") + get("PUT root")) / get("PUT delta").max(1.0),
+        // Per second, since a delta is written only by a pass that folded segments.
+        "deltas_per_s": get("PUT delta") / window,
+        "delta_writes_per_s": (get("PUT delta") + get("PUT root")) / window,
         // The holder writes each delta and seeds its own cache from memory, so it
         // never reads one: the unit is per node that is not the holder.
         "delta_gets_per_node_per_delta": get("GET delta") / ((nodes - 1.0).max(1.0) * get("PUT delta")).max(1.0),
