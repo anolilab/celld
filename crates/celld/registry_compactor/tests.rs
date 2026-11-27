@@ -4070,7 +4070,10 @@ async fn a_seed_is_not_a_job_so_spills_go_on_while_it_lists() {
     scripted.hold("fleet-a/cells");
     holding.last_seed_ms = None;
     register_and_fold(&node, &mut holding, &[cell(1)]).await;
-    crate::asyncrt::timeout(Duration::from_secs(5), async {
+    // The wait ends on the event (the seed's listing started), not on a short
+    // clock: on a host under load a pass and the spawned listing can take longer
+    // than 5 s to meet, and the bound only catches a seed that never starts.
+    crate::asyncrt::timeout(Duration::from_secs(120), async {
         while !holding.seeding.load(Ordering::SeqCst) {
             holding.last_seed_ms = None;
             node.pass(&mut holding).await.unwrap();
