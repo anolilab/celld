@@ -124,17 +124,30 @@ const MEMBER_CAP_FRESH_MS: u64 = 5_000;
 /// The longest one lease read of the refresh may take.
 const MEMBER_CAP_READ: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The session format of this build, advertised in its lease.
+/// The format of `Grant` marks in the log and of first-form records with a nonce.
+/// A node that advertises at least this reads both.
 pub(crate) const SESSION_FORMAT: u32 = 1;
+
+/// The format that adds the birth-form record and the reader rules that guard it
+/// (B3, B7, P3, P4), which every build from A5 on runs in every mode. A session
+/// grants an id without a read only while every live lease advertises this: a
+/// node of format 1 ignores `birth` and runs no P3, so it could claim an id
+/// whose record was lost.
+pub(crate) const BIRTH_FORMAT: u32 = 2;
 
 /// Whether a lease read from the bucket is live and advertises the session
 /// format.
 fn lease_capable(lease: &NodeLeaseWire, now: u64) -> bool {
-    lease.expires_ms > now
-        && lease
-            .session
-            .as_ref()
-            .is_some_and(|session| session.format >= SESSION_FORMAT)
+    lease_format(lease, now) >= SESSION_FORMAT
+}
+
+/// The session format a lease advertises: 0 for a lease that has expired, that
+/// carries no session, or that predates the field.
+fn lease_format(lease: &NodeLeaseWire, now: u64) -> u32 {
+    if lease.expires_ms <= now {
+        return 0;
+    }
+    lease.session.as_ref().map_or(0, |session| session.format)
 }
 
 async fn load_lease_wire(bucket: &Bucket, node: &str) -> anyhow::Result<Option<NodeLeaseWire>> {
@@ -596,9 +609,13 @@ pub struct BucketOwnership {
     /// A pause before each lease read, so a test can make the reads slow.
     #[cfg(test)]
     lease_read_delay: std::sync::Mutex<std::time::Duration>,
+    /// The same before the read of a session chunk on the claim path.
+    #[cfg(test)]
+    chunk_read_delay: std::sync::Mutex<std::time::Duration>,
     /// The same for the capability of every live lease, for the records that an
     /// older build would misread.
-    records_gate: std::sync::Mutex<(u64, bool)>,
+    /// The lowest session format among the live leases, with the time it was read.
+    records_gate: std::sync::Mutex<(u64, u32)>,
 }
 
 /// How often the fleet directory answered a claim guard, by its answer and by
@@ -855,7 +872,9 @@ impl BucketOwnership {
             wanted_members: std::sync::Mutex::default(),
             #[cfg(test)]
             lease_read_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
-            records_gate: std::sync::Mutex::new((0, false)),
+            #[cfg(test)]
+            chunk_read_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
+            records_gate: std::sync::Mutex::new((0, 0)),
         }
     }
 
@@ -1534,12 +1553,18 @@ impl BucketOwnership {
         &self.node
     }
 
+    /// The pause a test put before the reads of the claim path.
+    #[cfg(test)]
+    pub(crate) fn read_delay(&self) -> std::time::Duration {
+        *self.chunk_read_delay.lock().unwrap()
+    }
+
     /// B1, the conditions under which this session may grant an id, read at the
     /// moment a request first asks for it: the ensemble is open and proves marks,
     /// and every live lease advertises the format, so the record about to be
     /// written is read by every live node.
     pub(crate) async fn may_grant(&self) -> bool {
-        self.marks_allowed().await && self.all_leases_capable(false).await
+        self.marks_allowed().await && self.all_leases_at(BIRTH_FORMAT, false).await
     }
 
     /// Whether a `Grant` may be appended now: the node log is open with an
@@ -1690,6 +1715,12 @@ impl BucketOwnership {
     /// record and would ignore the nonce. The positive answer is cached for
     /// [`MARKS_GATE_MS`] for judging; the write itself asks again with `fresh`.
     pub(crate) async fn all_leases_capable(&self, fresh: bool) -> bool {
+        self.all_leases_at(SESSION_FORMAT, fresh).await
+    }
+
+    /// Whether every live lease advertises at least `format`. A lease that cannot
+    /// be read counts as format 0.
+    pub(crate) async fn all_leases_at(&self, format: u32, fresh: bool) -> bool {
         #[cfg(test)]
         {
             let delay = *self.lease_read_delay.lock().unwrap();
@@ -1699,11 +1730,11 @@ impl BucketOwnership {
         if !fresh {
             let gate = self.records_gate.lock().unwrap();
             if gate.0 != 0 && now.saturating_sub(gate.0) < MARKS_GATE_MS {
-                return gate.1;
+                return gate.1 >= format;
             }
         }
         let wall = now_ms();
-        let mut capable = true;
+        let mut lowest = u32::MAX;
         match self.bucket.list("nodes/").await {
             Ok(listed) => {
                 for meta in listed {
@@ -1717,17 +1748,17 @@ impl BucketOwnership {
                     };
                     match load_lease_wire(&self.bucket, node).await {
                         Ok(Some(lease)) if lease.expires_ms > wall => {
-                            capable &= lease_capable(&lease, wall);
+                            lowest = lowest.min(lease_format(&lease, wall));
                         }
                         Ok(_) => {}
-                        Err(_) => capable = false,
+                        Err(_) => lowest = 0,
                     }
                 }
             }
-            Err(_) => capable = false,
+            Err(_) => lowest = 0,
         }
-        *self.records_gate.lock().unwrap() = (now.max(1), capable);
-        capable
+        *self.records_gate.lock().unwrap() = (now.max(1), lowest);
+        lowest >= format
     }
 
     /// What happens to the id of `cell` after its create-only record applied.
@@ -1895,6 +1926,10 @@ impl BucketOwnership {
             {
                 self.after_first_record(session, cell).await
             }
+            // Another record is there: a create-only write cannot apply over it,
+            // so this session's write never will, and nothing is pending. The id
+            // is read as usual and belongs to whoever wrote that record.
+            Ok(Some(_)) => Ok(()),
             // The write is not seen now, and it may still land: a create-only write
             // that was sent and whose answer was lost applies at any later time.
             // A session whose reads trust its bits cannot let the cell act on a
@@ -1903,7 +1938,7 @@ impl BucketOwnership {
             // record, if it lands, is a birth-form record that no grant covers,
             // and a reader treats it as absent (the guard of the standard path).
             // `shadow` goes on.
-            Ok(_) | Err(_) => {
+            Ok(None) | Err(_) => {
                 if let Some(counter) = session.own_counter_of_scope(cell) {
                     if session.fails_closed() {
                         session.mark_pending(counter);
@@ -1942,13 +1977,28 @@ impl BucketOwnership {
             if !plan.applies_to(&guard) {
                 return Ok(CasOutcome::Rejected);
             }
-            if let crate::session_store::Read::Found(chunk, _) = crate::session_store::read_chunk(
-                &self.bucket,
-                &plan.tag,
-                plan.counter / crate::session_store::CHUNK,
-            )
-            .await?
-            {
+            // The read is bounded like every step of this path; one that does not
+            // finish loses the claim, and the cell is judged again (and refused if
+            // the bucket is still too slow).
+            let Ok(chunk) =
+                crate::asyncrt::timeout(crate::session_reader::taker_step_wait(), async {
+                    #[cfg(test)]
+                    {
+                        let delay = *self.chunk_read_delay.lock().unwrap();
+                        crate::asyncrt::sleep(delay).await;
+                    }
+                    crate::session_store::read_chunk(
+                        &self.bucket,
+                        &plan.tag,
+                        plan.counter / crate::session_store::CHUNK,
+                    )
+                    .await
+                })
+                .await
+            else {
+                return Ok(CasOutcome::Rejected);
+            };
+            if let crate::session_store::Read::Found(chunk, _) = chunk? {
                 if plan.conflicts_with(chunk.taken.get(&plan.counter)) {
                     return Ok(CasOutcome::Rejected);
                 }
@@ -2114,7 +2164,7 @@ impl BucketOwnership {
                     tag: session.tag(),
                     carried: record.tags.iter().skip(1).cloned().collect(),
                     mode: session.mode(),
-                    format: SESSION_FORMAT,
+                    format: BIRTH_FORMAT,
                 }
             }),
         })
@@ -2472,6 +2522,10 @@ mod grant_tests {
 
     const NODE: &str = "node-a";
 
+    /// The tests that shorten the bound of a claim step share one process-wide
+    /// setting, so they run one at a time.
+    static SHORT_WAIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn world() -> (tempfile::TempDir, Bucket, BucketOwnership) {
         crate::asyncrt::install_test_host_runtime();
         let dir = tempfile::tempdir().unwrap();
@@ -2537,6 +2591,42 @@ mod grant_tests {
         assert!(!ownership.all_leases_capable(true).await);
         // The judging cache still says no for a while, and a fresh read agrees.
         assert!(!ownership.all_leases_capable(false).await);
+    }
+
+    /// A build from before the birth-form record ignores `birth` and runs no P3, so
+    /// it must not stand beside a session that grants without a read: a live lease
+    /// that advertises the marks format only closes the grant gate, though it
+    /// still reads marks and first-form records.
+    #[tokio::test]
+    async fn a_live_lease_below_the_birth_format_closes_the_grant_gate() {
+        let (_dir, bucket, ownership) = world();
+        let future = now_ms() + 60_000;
+        *ownership.own_log.lock().unwrap() = (
+            1,
+            Some(NodeLogWire {
+                state: "open".into(),
+                epoch: 1,
+                ensemble: vec!["m".into()],
+                tiered: 0,
+                may_have_fleet_acks: false,
+                claimant: None,
+                claimed_ms: None,
+            }),
+        );
+        put_lease(&bucket, "m", &lease(future, Some(BIRTH_FORMAT))).await;
+        assert!(ownership.may_grant().await);
+        // A node that reads marks and nonces but not the birth form.
+        put_lease(&bucket, "a4", &lease(future, Some(SESSION_FORMAT))).await;
+        *ownership.records_gate.lock().unwrap() = (0, 0);
+        assert!(!ownership.may_grant().await, "a format-1 member");
+        assert!(
+            ownership.all_leases_capable(true).await,
+            "first-form records are still read by it"
+        );
+        // Its lease ending reopens the gate.
+        bucket.delete("nodes/a4.json").await.unwrap();
+        *ownership.records_gate.lock().unwrap() = (0, 0);
+        assert!(ownership.may_grant().await);
     }
 
     /// An ensemble member whose lease has expired cannot prove a mark, however
@@ -2690,6 +2780,7 @@ mod grant_tests {
     #[tokio::test]
     async fn a_first_form_write_is_not_sent_when_the_capability_check_does_not_finish() {
         let (_dir, _bucket, ownership) = world();
+        let _short = SHORT_WAIT.lock().await;
         crate::session_reader::TAKER_WAIT_OVERRIDE_MS.store(100, Ordering::SeqCst);
         *ownership.lease_read_delay.lock().unwrap() = std::time::Duration::from_secs(30);
         ownership.k5.set(
@@ -2718,6 +2809,54 @@ mod grant_tests {
                 .is_none(),
             "nothing was written"
         );
+    }
+
+    /// The read of the chunk that a first-form claim checks before it writes is
+    /// bounded too: a slow one loses the claim and nothing is written.
+    #[tokio::test]
+    async fn a_first_form_write_is_not_sent_when_the_chunk_read_does_not_finish() {
+        let (_dir, _bucket, ownership) = world();
+        let _short = SHORT_WAIT.lock().await;
+        crate::session_reader::TAKER_WAIT_OVERRIDE_MS.store(100, Ordering::SeqCst);
+        *ownership.chunk_read_delay.lock().unwrap() = std::time::Duration::from_secs(30);
+        ownership.k5.set(
+            "Agent:cell",
+            crate::session_reader::K5Plan {
+                nonce: "n1".into(),
+                over: Vec::new(),
+                tag: "aa".into(),
+                counter: 0,
+                etag: None,
+            },
+        );
+        let began = crate::asyncrt::mono_ms();
+        let outcome = ownership
+            .cas_owner("Agent:cell", celld_logic::CasGuard::Absent, 2)
+            .await
+            .unwrap();
+        crate::session_reader::TAKER_WAIT_OVERRIDE_MS.store(0, Ordering::SeqCst);
+        assert!(matches!(outcome, celld_logic::CasOutcome::Rejected));
+        assert!(crate::asyncrt::mono_ms() - began < 2_000, "bounded");
+        assert!(ownership
+            .resolve_owner("Agent:cell", RecordReader::Claim)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// A judge that does not finish in time is a timeout with a reason of its own,
+    /// not a lost record.
+    #[tokio::test]
+    async fn a_judge_that_does_not_finish_in_time_is_a_timeout_not_a_lost_record() {
+        let (_dir, _bucket, ownership) = world();
+        let _short = SHORT_WAIT.lock().await;
+        crate::session_reader::TAKER_WAIT_OVERRIDE_MS.store(100, Ordering::SeqCst);
+        *ownership.chunk_read_delay.lock().unwrap() = std::time::Duration::from_secs(30);
+        let other = Session::with_tag(Mode::Shadow, [9; 8], &[]);
+        let scope = scope_of(&other, 0);
+        let verdict = ownership.judge_tagged(&scope, None).await.unwrap();
+        crate::session_reader::TAKER_WAIT_OVERRIDE_MS.store(0, Ordering::SeqCst);
+        assert_eq!(verdict, crate::session_reader::Verdict::TimedOut);
     }
 
     /// A failed read-back of an ambiguous first record leaves the cell pending in
@@ -2760,6 +2899,23 @@ mod grant_tests {
             .await
             .unwrap();
         assert!(!shadow.is_pending_scope(&scope));
+        // Another node's record is there: the create-only write can never apply, so
+        // nothing is pending and the id is read as usual.
+        let scope = scope_of(&strict, 2);
+        let theirs = OwnerRecord {
+            node: Some("other".into()),
+            epoch: 2,
+            etag: "e".into(),
+            by: Some("bb".into()),
+        };
+        ownership
+            .settle_ambiguous_first_record(&strict, &scope, None, Ok(Some(theirs)))
+            .await
+            .unwrap();
+        assert!(
+            !strict.is_pending_scope(&scope),
+            "another record is not a write that may land"
+        );
     }
 
     /// The scope of the id with counter `counter` of `session`.

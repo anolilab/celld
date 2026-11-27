@@ -561,6 +561,28 @@ pub(crate) fn scope_unissued(scope: &str) -> bool {
     scope_unissued_by(current(), scope)
 }
 
+/// Whether `scope` is an id that this process's open session minted. Such a cell
+/// is served here and never placed on a peer (B3): while the session is open, a
+/// peer that finds no record forwards the request back to the minting node.
+pub(crate) fn scope_minted_here(scope: &str) -> bool {
+    scope_minted_by(current(), scope)
+}
+
+fn scope_minted_by(session: Option<&Session>, scope: &str) -> bool {
+    let Some(session) = session else {
+        return false;
+    };
+    !session.is_closed()
+        && match kind_of_scope(scope) {
+            Some(IdKind::Tagged { tag, block }) => {
+                tag == session.tag
+                    && decrypt_counter(&session.counter_key, block)
+                        < session.issued.load(Ordering::SeqCst)
+            }
+            _ => false,
+        }
+}
+
 fn scope_unissued_by(session: Option<&Session>, scope: &str) -> bool {
     let Some(session) = session else {
         return false;
@@ -1019,6 +1041,11 @@ impl Session {
     /// [`Self::decide_birth`] once.
     pub(crate) fn undecided_own_counter(&self, scope: &str) -> Option<u64> {
         let counter = self.own_counter_of_scope(scope)?;
+        // An id that was never issued is nobody's to decide (a forged one would
+        // otherwise grow the sets for ever); the core refuses to claim it.
+        if counter >= self.issued.load(Ordering::SeqCst) {
+            return None;
+        }
         let decided = self.decided.lock().expect("decided poisoned");
         (!decided.contains(&counter) && !self.is_granted(counter)).then_some(counter)
     }
@@ -1283,6 +1310,75 @@ pub async fn seal_predecessor(bucket: &Bucket, node: &str, generation: &str) -> 
         }
         _ => Ok(()),
     }
+}
+
+/// B3: close the header of the session `tag`, whose node `node` is not live,
+/// after the takeover gate ran on that node. It is the step that ends the
+/// forward of a cell that has no record while the header is still open: without
+/// it a dead session that had no log, or whose node record is gone, would be
+/// forwarded to for ever. A header that names another node is left alone.
+///
+/// The header is read first and its token kept; then the node record is read;
+/// only then is the header closed. Where nothing fences the session (its node
+/// record is absent, or names another generation) the close is the one
+/// compare-and-swap on the token that was read before the node record, and it is
+/// never sent again on a token read after it: a lost close returns an error, and
+/// the caller starts again from the header read. A session that is fenced (its
+/// node record names its generation, with a lease that ran out) is closed by
+/// the ordinary seal, which may retry.
+pub async fn seal_dead_session(bucket: &Bucket, tag: &str, node: &str) -> anyhow::Result<()> {
+    let (gather, marks) = (BTreeSet::<u64>::new(), BTreeSet::<String>::new());
+    let (header, token) = match store::read_header(bucket, tag).await? {
+        store::Read::Found(header, _) if header.state == store::State::Sealed => return Ok(()),
+        // A close that began is continued by any node: the fence of the first
+        // step already holds.
+        store::Read::Found(header, _) if header.state == store::State::Sealing => {
+            return store::seal_session(bucket, tag, &gather, &marks).await;
+        }
+        store::Read::Found(header, token) => (header, token),
+        // A missing or unreadable header is replaced by a sealed, lost one.
+        _ => return store::seal_session(bucket, tag, &gather, &marks).await,
+    };
+    // The header of another node's session is not this node's to close.
+    if header.node != node {
+        return Ok(());
+    }
+    let record = match bucket.get(&format!("nodes/{node}.json")).await? {
+        Some((bytes, _)) => Some(serde_json::from_slice::<
+            crate::ownership_store::NodeLeaseWire,
+        >(&bytes)?),
+        None => None,
+    };
+    let now = crate::ownership_store::now_ms();
+    let fenced = match &record {
+        Some(lease) if lease.generation == header.generation => {
+            anyhow::ensure!(
+                lease.expires_ms <= now,
+                "the node {node} of session {tag} is live"
+            );
+            true
+        }
+        // A live record of another generation is a successor that installed
+        // without sealing this header: the order was broken, and nothing here
+        // closes it.
+        Some(lease) if lease.expires_ms > now => {
+            anyhow::bail!("node {node} runs a later generation than the header of {tag}")
+        }
+        _ => false,
+    };
+    if fenced {
+        return store::seal_session(bucket, tag, &gather, &marks).await;
+    }
+    let mut sealing = header;
+    sealing.state = store::State::Sealing;
+    sealing.rev += 1;
+    anyhow::ensure!(
+        store::swap_header(bucket, tag, &sealing, &token)
+            .await?
+            .is_some(),
+        "closing the header of {tag} lost its race; reading it again"
+    );
+    store::seal_session(bucket, tag, &gather, &marks).await
 }
 
 /// Name the session in the records of a preserved restart's cells, before the
@@ -1640,6 +1736,32 @@ mod tests {
         assert!(!session.resumed_at("c", "gone", 4));
         session.note_resumed("c", "old", 4);
         assert!(session.resumed_at("c", "old", 4));
+    }
+
+    /// An id of the own open session that was issued is served on this node; an id
+    /// of another session, an unissued counter, or any id after the session closed
+    /// is not "minted here".
+    #[test]
+    fn only_an_issued_id_of_the_own_open_session_is_minted_here() {
+        register_class(SCRIPT, CLASS);
+        let session = established([7; 8]);
+        let at = |counter| {
+            let block = encrypt_counter(&session.counter_key, counter);
+            let id = tagged_object_id(&key(), [7; 8], block);
+            format!("{CLASS}:{}", durable_object_id_hex(&id))
+        };
+        session.mint(&key()).expect("counter 0");
+        assert!(scope_minted_by(Some(&session), &at(0)));
+        assert!(!scope_minted_by(Some(&session), &at(1)), "not issued");
+        assert!(!scope_minted_by(None, &at(0)), "no session");
+        let other = tagged_object_id(&key(), [8; 8], [3; 8]);
+        assert!(!scope_minted_by(
+            Some(&session),
+            &format!("{CLASS}:{}", durable_object_id_hex(&other))
+        ));
+        assert!(!scope_minted_by(Some(&session), "Agent:plain"));
+        session.closed.store(true, Ordering::SeqCst);
+        assert!(!scope_minted_by(Some(&session), &at(0)), "a closed session");
     }
 
     #[test]
@@ -2463,8 +2585,16 @@ mod tests {
     #[test]
     fn an_id_is_decided_once_as_a_birth_or_a_waive() {
         let session = established([2; 8]);
+        session.issued.store(2, Ordering::SeqCst);
         let first = scope_for(&session, 0);
         let second = scope_for(&session, 1);
+        // A counter that was never issued is not decided, so a forged id grows
+        // nothing.
+        assert_eq!(
+            session.undecided_own_counter(&scope_for(&session, 2)),
+            None,
+            "unissued"
+        );
         assert_eq!(session.undecided_own_counter(&first), Some(0));
         session.decide_birth(0, true);
         session.decide_birth(1, false);

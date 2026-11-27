@@ -74,6 +74,10 @@ pub(crate) enum Verdict {
     Proceed,
     /// The cell is refused, held and logged.
     Refuse(&'static str),
+    /// The header or the chunk was not read in time. Nothing is known to be lost,
+    /// so the cell is refused for now and judged again after the hold; it is not
+    /// reported as a lost record.
+    TimedOut,
     /// B3: the cell has no record and its session header is not sealed, so only
     /// the minting session may make its first claim. The claim path goes on as if
     /// the record named the session's node: a live node is forwarded to, a dead
@@ -114,9 +118,7 @@ impl BucketOwnership {
             .await
         {
             Ok(verdict) => verdict,
-            Err(_) => Ok(Verdict::Refuse(
-                "the session record could not be read in time",
-            )),
+            Err(_) => Ok(Verdict::TimedOut),
         }
     }
 
@@ -125,16 +127,22 @@ impl BucketOwnership {
         cell: &str,
         record: Option<(&OwnerRecord, &OwnerForm)>,
     ) -> anyhow::Result<Verdict> {
-        let Some(own) = session::current() else {
-            return Ok(Verdict::Proceed);
-        };
+        #[cfg(test)]
+        crate::asyncrt::sleep(self.read_delay()).await;
+        // The rules run in every mode of this build, and in a process with no
+        // session at all (`off`, or a `shadow` session that was given up): they
+        // follow what another session's header says, never the reader's own flag
+        // (B7). Such a process is no session's author, and it writes no first-form
+        // record.
+        let own = session::current();
+        let own_tag = own.map(|own| own.tag());
         // A plan belongs to one decision: a cell that is read again is judged
         // again.
         self.k5.take(cell);
         let Some(tag) = session::id_tag_of_scope(cell) else {
             return Ok(Verdict::Proceed);
         };
-        if tag == own.tag() {
+        if own_tag.as_deref() == Some(tag.as_str()) {
             return Ok(Verdict::Proceed);
         }
         // A record of an older binary names no session and is not judged.
@@ -147,7 +155,13 @@ impl BucketOwnership {
             Some(header) => Some(header),
             None => match store::read_header(&bucket, &tag).await? {
                 Read::Found(header, _) if header.state != store::State::Sealed => {
-                    if record.is_none() && header.node != self.node_name() {
+                    // A `shadow` session still writes the record of every id with
+                    // the create-only write of today, which arbitrates between it
+                    // and any taker, so only `read` and `on` need the forward.
+                    if record.is_none()
+                        && header.node != self.node_name()
+                        && header.mode != session::Mode::Shadow
+                    {
                         tracing::debug!(
                             cell,
                             tag,
@@ -211,7 +225,10 @@ impl BucketOwnership {
         // finish it, so the cell acts only after the mark.
         if let (Some((record, form)), Some(entries)) = (record, cell_entries.as_mut()) {
             if let (Some(nonce), Some(by)) = (&form.nonce, &record.by) {
-                if *by == own.tag() && entries.taken.is_none() && !entries.unknown {
+                if own_tag.as_deref() == Some(by.as_str())
+                    && entries.taken.is_none()
+                    && !entries.unknown
+                {
                     entries.taken = Some(
                         match store::mark_taken(&bucket, &tag, counter, nonce).await? {
                             store::Marked::Ours => nonce.clone(),
@@ -291,7 +308,7 @@ impl BucketOwnership {
         let writes_marked_records = !matches!(
             verdict,
             Take::FirstNew { .. } | Take::FirstOverRecord { .. } | Take::ReplaceFirst { .. }
-        ) || self.all_leases_capable(false).await;
+        ) || (own.is_some() && self.all_leases_capable(false).await);
         if !writes_marked_records {
             tracing::info!(
                 event = "session_rule",

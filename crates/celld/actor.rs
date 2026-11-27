@@ -51,6 +51,7 @@ const MAX_ALARM_HANDLER_BUDGET_MS: u64 = 365 * 24 * 60 * 60 * 1000;
 fn with_session(mut state: State) -> State {
     state.set_id_tag(crate::session::id_tag_of_scope);
     state.set_id_unissued(crate::session::scope_unissued);
+    state.set_minted_here(crate::session::scope_minted_here);
     if let Some(session) = crate::session::current() {
         state.set_session(session.tags().clone());
         state.set_session_active(crate::session::is_active);
@@ -225,9 +226,8 @@ async fn judged_refusal(
     form: Option<&crate::ownership_store::OwnerForm>,
 ) -> Result<Judged, Failure> {
     use crate::session_reader::Verdict;
-    if crate::session::current().is_none() {
-        return Ok(Judged::Proceed);
-    }
+    // The rules for another session's id run in every mode, also in a process
+    // without a session; only the check of this process's own record needs one.
     // The session wrote a record for this id and none exists: it is lost, and the
     // session never writes a first record for the id again.
     if record.is_none() && crate::session::current().is_some_and(|s| s.expects_record(cell)) {
@@ -248,6 +248,15 @@ async fn judged_refusal(
     {
         Verdict::Proceed => Ok(Judged::Proceed),
         Verdict::Forward(record) => Ok(Judged::Forward(record)),
+        Verdict::TimedOut => {
+            eprintln!(
+                "celld session records of {cell} were not read in time; refusing the cell for \
+                 {} s and judging it again after that. No record is known to be lost.",
+                crate::ownership_store::LOST_RECORD_RECHECK_MS / 1_000
+            );
+            bucket.hold_lost_record(cell, crate::asyncrt::mono_ms());
+            Ok(Judged::Refuse(Failure::Definite))
+        }
         Verdict::Refuse(reason) => {
             eprintln!(
                 "celld ownership record lost: {cell}: {reason}; refusing the cell for {} s. \
@@ -257,6 +266,44 @@ async fn judged_refusal(
             bucket.hold_lost_record(cell, crate::asyncrt::mono_ms());
             Ok(Judged::Refuse(Failure::Definite))
         }
+    }
+}
+
+/// What follows the takeover gate on a dead node for a cell of a tagged id that
+/// another session minted: close that session's header when it is the dead
+/// node's own and still open (B3), then judge the cell again, because the rules
+/// that ran before the gate saw an unsealed header and could decide only part of
+/// the cell (a record with a dead author skipped P3 and K8; a cell with no record
+/// was forwarded to this node). A refusal is final (`Definite`); a header that
+/// cannot be closed is an error, which the core tries again behind a backoff and
+/// a bounded number of times before it fails the request.
+async fn settle_session_after_recovery(
+    bucket: &BucketOwnership,
+    cell: &str,
+    owner: &str,
+) -> Result<(), Failure> {
+    let Some(tag) = crate::session::id_tag_of_scope(cell) else {
+        return Ok(());
+    };
+    if crate::session::current().is_some_and(|session| session.tag() == tag) {
+        return Ok(());
+    }
+    if let Err(error) =
+        crate::session::seal_dead_session(&bucket.bucket_client(), &tag, owner).await
+    {
+        eprintln!("celld could not close the session {tag} of {owner} for {cell}: {error:#}");
+        return Err(Failure::Ambiguous);
+    }
+    let (record, form) = bucket
+        .resolve_owner_form(cell, RecordReader::Claim)
+        .await
+        .map_err(ownership_read_failed)?
+        .map_or((None, None), |(record, form)| (Some(record), Some(form)));
+    match judged_refusal(bucket, cell, record.as_ref(), form.as_ref()).await? {
+        Judged::Proceed => Ok(()),
+        Judged::Refuse(refusal) => Err(refusal),
+        // The header is open again or still: nothing was settled.
+        Judged::Forward(_) => Err(Failure::Ambiguous),
     }
 }
 
@@ -3410,6 +3457,12 @@ impl Actor {
                                 );
                                 Failure::Ambiguous
                             }),
+                    };
+                    let result = match (&ownership, result) {
+                        (Ownership::Bucket(bucket), Ok(())) => {
+                            settle_session_after_recovery(bucket, &cell, &owner).await
+                        }
+                        (_, result) => result,
                     };
                     if result.is_ok() {
                         if let Ownership::Bucket(bucket) = &ownership {

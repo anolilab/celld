@@ -2028,9 +2028,13 @@ async fn s3_pairs(pairs: usize) {
                 let read = first_request_times(nodes, "read", 300).await;
                 (first_request_times(nodes, "off", 300).await, read)
             };
-            if off.is_empty() || read.is_empty() {
-                return;
-            }
+            // The pair mode is a gate asked for by name: without a fleet it has
+            // measured nothing, and must not pass.
+            assert!(
+                !off.is_empty() && !read.is_empty(),
+                "LAZY_FLEET_S3_PAIRS is set and no fleet started: set CELLD_STORE_CONTRACT_BUCKET \
+                 and AWS_ENDPOINT_URL"
+            );
             d50.push(quantile(&read, 0.5) - quantile(&off, 0.5));
             d99.push(quantile(&read, 0.99) - quantile(&off, 0.99));
             eprintln!(
@@ -2052,6 +2056,125 @@ async fn s3_pairs(pairs: usize) {
             "{nodes} nodes: the 99th percentile of read is slower than off by {m99:.1} ms"
         );
     }
+}
+
+/// A node with the flag off has no session and still reads another session's id by
+/// that session's header (B7). An id minted by a live `read` node that has not
+/// decided it yet has no record: the off node forwards to the minting node and
+/// never claims the cell at epoch 2 beside it, which is what a node from before
+/// the reader rules did.
+#[tokio::test]
+async fn a_node_with_the_flag_off_forwards_an_undecided_minted_id_to_its_minter() {
+    let Some(mut fleet) = Fleet::start("do-ids", 3, READ).await else {
+        return;
+    };
+    let body = async {
+        wait_for_ensemble(&fleet).await;
+        let ids = mint(&fleet, 3).await;
+        let tag = ids[0][..16].to_string();
+        fleet.respawn(2, &[("CELLD_TEST_TAGGED_IDS", "1")]).await;
+        let out = fleet
+            .get_json(2, &format!("/bump?id={}", ids[0]))
+            .await
+            .expect("the off node answers through the minting node");
+        assert_eq!(out["n"], 1);
+        let record = fleet
+            .object(&format!("cells/Cell:{}/own.json", ids[0]))
+            .await
+            .expect("a record");
+        assert_eq!(record["epoch"], 1, "{record}");
+        assert_eq!(record["by"], tag.as_str(), "{record}");
+        assert_eq!(record["node"], "lazy-0", "{record}");
+        // A build with these rules says so in its lease: a session grants without a
+        // read only while every live lease advertises this format.
+        let lease = fleet.object("nodes/lazy-0.json").await.expect("a lease");
+        assert_eq!(lease["session"]["format"], 2, "{lease}");
+    };
+    let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+    fleet.nodes.clear();
+    fleet.clean().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// What the minting node left behind when it died, for the two cases of B3 in which
+/// the takeover gate has no log to recover: how its node record is changed before a
+/// peer asks for an id that it minted and never decided.
+#[derive(Clone, Copy)]
+enum Left {
+    /// The node record is gone (retired), as is its log.
+    NoRecord,
+    /// The node record is there, expired, and never opened a log.
+    NoLog,
+}
+
+/// A dead session with no log to recover must still end the forward of its ids: the
+/// gate seals its header, the cell is judged again by the sealed chunk, and a peer
+/// takes the id at epoch 2. Before, the forward went on for ever, with no backoff.
+async fn dead_session_without_a_log_is_sealed(left: Left) {
+    let Some(mut fleet) = Fleet::start("do-ids", 3, READ).await else {
+        return;
+    };
+    let body = async {
+        wait_for_ensemble(&fleet).await;
+        let ids = mint(&fleet, 3).await;
+        let tag = ids[0][..16].to_string();
+        fleet.nodes[0].kill();
+        let key = "nodes/lazy-0.json";
+        match left {
+            Left::NoRecord => {
+                fleet.bucket.delete(key).await.unwrap();
+            }
+            Left::NoLog => {
+                let (bytes, token) = fleet.bucket.get(key).await.unwrap().expect("a node record");
+                let mut lease: Value = serde_json::from_slice(&bytes).unwrap();
+                let object = lease.as_object_mut().unwrap();
+                object.remove("log");
+                object.insert("expires_ms".into(), 1.into());
+                fleet
+                    .bucket
+                    .put_cas(key, serde_json::to_vec(&lease).unwrap(), Some(&token))
+                    .await
+                    .unwrap()
+                    .expect("the node record is replaced");
+            }
+        }
+        let n = wait_until(
+            "a peer to take the id of the dead session",
+            Duration::from_secs(120),
+            || async { peer_answers(&fleet, &ids[0]).await.first().copied() },
+        )
+        .await;
+        assert_eq!(n, 1);
+        let header = fleet
+            .object(&format!("fleet/sessions/{tag}.json"))
+            .await
+            .expect("the header");
+        assert_eq!(header["state"], "sealed", "{header}");
+        let record = fleet
+            .object(&format!("cells/Cell:{}/own.json", ids[0]))
+            .await
+            .expect("a record");
+        assert_eq!(record["epoch"], 2, "{record}");
+        assert_ne!(record["by"], tag.as_str(), "{record}");
+    };
+    let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+    fleet.nodes.clear();
+    fleet.clean().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn a_dead_session_whose_node_record_is_gone_is_sealed_and_its_ids_are_taken() {
+    dead_session_without_a_log_is_sealed(Left::NoRecord).await;
+}
+
+#[tokio::test]
+async fn a_dead_session_whose_node_never_opened_a_log_is_sealed_and_its_ids_are_taken() {
+    dead_session_without_a_log_is_sealed(Left::NoLog).await;
 }
 
 /// "Why P3 is needed". S minted an id and never granted it. The fleet claimed the
