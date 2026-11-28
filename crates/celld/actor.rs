@@ -252,6 +252,19 @@ async fn judged_refusal(
     }
 }
 
+/// Refuse to claim `cell` as new because its record is missing but `reason`
+/// says it existed: log it and hold the cell closed for the recheck interval.
+fn refuse_lost_record(bucket: &BucketOwnership, cell: &str, reason: &str) -> Failure {
+    eprintln!(
+        "celld ownership record lost: cells/{cell}/own.json is missing, but {reason}; \
+         refusing to claim {cell} as a new cell for {} s. See the ownership record repair \
+         in docs/guarantees.md.",
+        crate::ownership_store::LOST_RECORD_RECHECK_MS / 1_000
+    );
+    bucket.hold_lost_record(cell, crate::asyncrt::mono_ms());
+    Failure::Definite
+}
+
 impl Ownership {
     /// Read the record as it is stored. A missing record here means only that
     /// no record exists now, so this read must not decide a claim; the core
@@ -307,6 +320,47 @@ impl Ownership {
         if record.is_some() {
             return Ok(record);
         }
+        // `CELLD_BIRTH_REGISTRY=on`: the registry decides, and the listing below
+        // runs only as an audit of a `New` answer or when the registry cannot tell.
+        let mut audited = false;
+        if let Some(registry) = bucket.deciding_registry() {
+            use celld_logic::lost_record::{after_reread, decide, Decision, Packs};
+            let counters = &registry.counters;
+            let answer = registry
+                .lookup(&crate::registry_objects::key_of(cell))
+                .await
+                .answer;
+            match decide(false, Some(answer), Packs::Absent, 0) {
+                Decision::ClaimNew if !registry.audit_due() => {
+                    counters.guard_decided.fetch_add(1, Ordering::Relaxed);
+                    return Ok(None);
+                }
+                Decision::ClaimNew => {
+                    counters.guard_audits.fetch_add(1, Ordering::Relaxed);
+                    audited = true;
+                }
+                // The registry has seen the cell. A claim on another node can have
+                // written the record since the first read, so read it again.
+                Decision::Reread => {
+                    counters.guard_decided.fetch_add(1, Ordering::Relaxed);
+                    let reread = self.read_owner(cell, RecordReader::ClaimReread).await?;
+                    return match after_reread(reread.is_some()) {
+                        Decision::Claim => Ok(reread),
+                        _ => {
+                            counters.guard_refused.fetch_add(1, Ordering::Relaxed);
+                            Err(refuse_lost_record(
+                                bucket,
+                                cell,
+                                "the birth registry knows the cell",
+                            ))
+                        }
+                    };
+                }
+                _ => {
+                    counters.guard_fallbacks.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         // Asked beside the listing, so a new cell's first claim waits for
         // neither in turn. A registration is durable before its cell's first
         // LTX, but the directory sees another node's registration only once the
@@ -359,6 +413,16 @@ impl Ownership {
         if let Some(record) = reread {
             return Ok(Some(record));
         }
+        // The audit found what the registry called new: it lost a key.
+        if audited {
+            bucket.record_registry_mismatch();
+            tracing::error!(
+                event = "registry_mismatch",
+                cell,
+                lost = true,
+                "the birth registry called a cell new while its LTX exists"
+            );
+        }
         // The listing decides. A directory that calls a cell new whose record
         // is lost beside its LTX is the gap that must stay empty before the
         // directory may replace the listing. Compared only here, because a
@@ -389,14 +453,11 @@ impl Ownership {
         // claim has already written a record at epoch one. Each later wake
         // then advances one epoch, and a wake without a takeover can reuse a
         // stale local eviction snapshot, which skips the used-epoch check.
-        eprintln!(
-            "celld ownership record lost: cells/{cell}/own.json is missing, but the bucket \
-             holds LTX under cells/{cell}/ltx/; refusing to claim {cell} as a new cell for \
-             {} s. See the ownership record repair in docs/guarantees.md.",
-            crate::ownership_store::LOST_RECORD_RECHECK_MS / 1_000
-        );
-        bucket.hold_lost_record(cell, crate::asyncrt::mono_ms());
-        Err(Failure::Definite)
+        Err(refuse_lost_record(
+            bucket,
+            cell,
+            &format!("the bucket holds LTX under cells/{cell}/ltx/"),
+        ))
     }
 
     async fn read_node_lease(&self, owner: &str) -> Result<Option<NodeLeaseRecord>, Failure> {
