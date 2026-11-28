@@ -2072,7 +2072,12 @@ async fn a_node_with_the_flag_off_forwards_an_undecided_minted_id_to_its_minter(
         wait_for_ensemble(&fleet).await;
         let ids = mint(&fleet, 3).await;
         let tag = ids[0][..16].to_string();
-        fleet.respawn(2, &[("CELLD_TEST_TAGGED_IDS", "1")]).await;
+        fleet
+            .respawn(
+                2,
+                &[("CELLD_LAZY_BIRTH", "off"), ("CELLD_TEST_TAGGED_IDS", "1")],
+            )
+            .await;
         let out = fleet
             .get_json(2, &format!("/bump?id={}", ids[0]))
             .await
