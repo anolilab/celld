@@ -1310,7 +1310,7 @@ pub struct LtxRepl {
     /// Every cell with per-cell LTX, as far as this node has read. The store
     /// registers a cell here before its first artifact is written.
     cell_directory: Option<Arc<crate::cell_directory::CellDirectory>>,
-    /// The birth registry, in `CELLD_BIRTH_REGISTRY=shadow` with fleet durability.
+    /// The birth registry, in `CELLD_BIRTH_REGISTRY=shadow` or `on` with fleet durability.
     registry: Option<Arc<crate::registry::Registry>>,
 }
 
@@ -1400,13 +1400,14 @@ impl LtxRepl {
             | crate::bucket::StorageBackend::Local => TimestampMetadataKey::Litestream,
         };
         let (store, registry) = match birth_registry_mode()? {
-            Some(()) => {
+            Some(mode) => {
                 // Beside the cell directory a first write can wait for both; the
                 // registry's bound shrinks by the directory's wait.
                 let directory_wait = if directory.is_some() {
                     tracing::warn!(
-                        "CELLD_BIRTH_REGISTRY=shadow with CELLD_CELL_DIRECTORY_SHADOW=1: \
-                         a first write can wait for both"
+                        "CELLD_BIRTH_REGISTRY={} with CELLD_CELL_DIRECTORY_SHADOW=1: \
+                         a first write can wait for both",
+                        mode.name()
                     );
                     crate::cell_directory::first_write_wait(Duration::from_millis(
                         crate::env_vars::with_default::<u64>("CELLD_CELL_DIRECTORY_BATCH_MS", 0)?,
@@ -1414,8 +1415,11 @@ impl LtxRepl {
                 } else {
                     Duration::ZERO
                 };
-                let config =
-                    crate::registry::Config::from_env(durability_timeout_ms, directory_wait)?;
+                let config = crate::registry::Config::from_env(
+                    durability_timeout_ms,
+                    directory_wait,
+                    mode == crate::registry::Mode::On,
+                )?;
                 crate::registry_writer::check_bound(config.bound, durability_timeout_ms)?;
                 let registry = crate::registry::Registry::new(
                     store.clone(),
@@ -5677,23 +5681,27 @@ pub(crate) use retained::{live_path, remove_lineage};
 #[cfg(test)]
 mod tests;
 
-/// Whether `CELLD_BIRTH_REGISTRY=shadow` applies to this node: it acts only with
+/// The registry mode that applies to this node: `shadow` and `on` act only with
 /// fleet durability, and a node with bucket durability logs once that it
 /// ignores the flag.
-fn birth_registry_mode() -> anyhow::Result<Option<()>> {
-    match crate::env_vars::value("CELLD_BIRTH_REGISTRY")?.as_deref() {
-        None | Some("off") => Ok(None),
-        Some("shadow") => {
-            let durability = std::env::var("CELLD_DURABILITY").unwrap_or_else(|_| "fleet".into());
-            if durability == "fleet" {
-                Ok(Some(()))
-            } else {
-                tracing::warn!("CELLD_BIRTH_REGISTRY=shadow is ignored: this node does not use fleet durability");
-                Ok(None)
-            }
-        }
+fn birth_registry_mode() -> anyhow::Result<Option<crate::registry::Mode>> {
+    use crate::registry::Mode;
+    let mode = match crate::env_vars::value("CELLD_BIRTH_REGISTRY")?.as_deref() {
+        None | Some("off") => return Ok(None),
+        Some("shadow") => Mode::Shadow,
+        Some("on") => Mode::On,
         Some(other) => {
-            anyhow::bail!("CELLD_BIRTH_REGISTRY must be `off` or `shadow`, not {other:?}")
+            anyhow::bail!("CELLD_BIRTH_REGISTRY must be `off`, `shadow` or `on`, not {other:?}")
         }
+    };
+    let durability = std::env::var("CELLD_DURABILITY").unwrap_or_else(|_| "fleet".into());
+    if durability == "fleet" {
+        Ok(Some(mode))
+    } else {
+        tracing::warn!(
+            "CELLD_BIRTH_REGISTRY={} is ignored: this node does not use fleet durability",
+            mode.name()
+        );
+        Ok(None)
     }
 }

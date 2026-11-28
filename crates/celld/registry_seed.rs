@@ -415,7 +415,7 @@ pub async fn close_gate(store: &dyn ObjectStore, prefix: &str) -> anyhow::Result
         let closed = gate::close_gate(&read.value).map_err(|_| {
             anyhow::Error::new(GateRefused(
                 "this node is outside the birth registry's writer rule and shared packs exist: \
-                 refusing to start (set CELLD_BIRTH_REGISTRY and fleet durability)"
+                 refusing to start (set CELLD_BIRTH_REGISTRY to shadow or on, with fleet durability)"
                     .to_owned(),
             ))
         })?;

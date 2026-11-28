@@ -990,6 +990,10 @@ impl BucketOwnership {
         cell: &str,
     ) -> Option<tokio::sync::oneshot::Sender<ShadowVerdict>> {
         let registry = self.registry.clone()?;
+        // In `on` the registry decides: its lookup is the claim's own, not a shadow.
+        if registry.decides() {
+            return None;
+        }
         let slot = registry.shadow_slot()?;
         let (verdict, arrived) = tokio::sync::oneshot::channel::<ShadowVerdict>();
         let (this, cell) = (self.clone(), cell.to_owned());
@@ -1036,6 +1040,11 @@ impl BucketOwnership {
             }
         });
         Some(verdict)
+    }
+
+    /// The registry, when it decides claims (`CELLD_BIRTH_REGISTRY=on`).
+    pub(crate) fn deciding_registry(&self) -> Option<Arc<crate::registry::Registry>> {
+        self.registry.clone().filter(|registry| registry.decides())
     }
 
     /// Count one answer of the registry beside the listing of the same claim.

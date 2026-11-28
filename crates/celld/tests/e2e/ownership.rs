@@ -8,6 +8,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use futures_util::StreamExt as _;
 use serde_json::Value;
 
 use super::harness::{wait_until, Server};
@@ -18,6 +19,9 @@ use super::harness::{wait_until, Server};
 const DIRECTORY: &[(&str, &str)] = &[
     ("CELLD_CELL_DIRECTORY_SHADOW", "1"),
     ("CELLD_WAKER_TICK_MS", "1000"),
+    // The directory is compared with the listing, which the registry skips for a
+    // claim it decides.
+    ("CELLD_BIRTH_REGISTRY", "off"),
 ];
 
 /// The `celld dev` object store inside a project.
@@ -25,9 +29,29 @@ fn store(project: &Path) -> rusqlite::Connection {
     rusqlite::Connection::open(project.join(".celld/dev/objects.sqlite3")).expect("open the store")
 }
 
+/// The registry decides claims. Its coverage of a cell is a root and a delta or
+/// run the root names; a segment alone is not coverage and is deleted once folded.
+const REGISTRY: &[(&str, &str)] = &[("CELLD_BIRTH_REGISTRY", "on")];
+
+/// One counter of the registry's guard in the node's `/state`.
+async fn guard_counter(server: &Server, name: &str) -> u64 {
+    let state: Value = server
+        .internal_get("/state")
+        .await
+        .send()
+        .await
+        .expect("read the node state")
+        .json()
+        .await
+        .expect("decode the node state");
+    state["registry"]["counters"][name]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no registry counter {name} in the node state"))
+}
+
 #[tokio::test]
 async fn lost_record_beside_ltx_is_refused_not_reclaimed() {
-    let mut server = Server::start("bench-agents", &[("CELLD_CELL_DIRECTORY_SHADOW", "1")]).await;
+    let mut server = Server::start("bench-agents", REGISTRY).await;
     for _ in 0..3 {
         assert_eq!(server.get_text("/agent/kept").await, "ok");
     }
@@ -42,14 +66,25 @@ async fn lost_record_beside_ltx_is_refused_not_reclaimed() {
                 )
                 .expect("count LTX");
             assert!(ltx > 0, "the writes left no LTX in the store");
-            let registered: i64 = store
+            let root: i64 = store
                 .query_row(
-                    "SELECT count(*) FROM objects WHERE key LIKE '%fleet/dir/v2/born/%'",
+                    "SELECT count(*) FROM objects WHERE key LIKE '%fleet/reg/v1/root'",
                     [],
                     |row| row.get(0),
                 )
-                .expect("count directory segments");
-            assert!(registered > 0, "the LTX has no directory entry");
+                .expect("count registry roots");
+            let folded: i64 = store
+                .query_row(
+                    "SELECT count(*) FROM objects WHERE key LIKE '%fleet/reg/v1/delta/%' \
+                     OR key LIKE '%fleet/reg/v1/run/%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count registry deltas and runs");
+            assert!(
+                root == 1 && folded > 0,
+                "the LTX has no registry coverage: {root} roots, {folded} deltas and runs"
+            );
             let deleted = store
                 .execute("DELETE FROM objects WHERE key LIKE '%cells/%/own.json'", [])
                 .expect("delete the ownership record");
@@ -63,7 +98,10 @@ async fn lost_record_beside_ltx_is_refused_not_reclaimed() {
         .await;
 
     // The Worker's call to the cell is refused, which the Worker does not catch:
-    // the client gets the refusal as a 503, not an internal error.
+    // the client gets the refusal as a 503, not an internal error. The registry
+    // decides it: the cell reads `Exists` and no listing runs for the claim. The
+    // node refuses the cell once, when it resumes at start, and the request is
+    // held without asking again.
     assert_eq!(
         server.get_status("/agent/kept").await,
         reqwest::StatusCode::SERVICE_UNAVAILABLE,
@@ -72,6 +110,23 @@ async fn lost_record_beside_ltx_is_refused_not_reclaimed() {
     assert!(
         server.log_text().contains("celld ownership record lost"),
         "the refusal was not logged"
+    );
+    assert_eq!(
+        guard_counter(&server, "guard_refused").await,
+        1,
+        "the registry did not refuse the claim"
+    );
+    assert!(
+        guard_counter(&server, "exists").await >= 1,
+        "the registry did not answer `exists` for the cell"
+    );
+    assert_eq!(
+        (
+            guard_counter(&server, "guard_audits").await,
+            guard_counter(&server, "guard_fallbacks").await
+        ),
+        (0, 0),
+        "a listing ran for the claim: the registry did not decide it"
     );
     // The refusal is held, so a retry inside the hold is refused without
     // checking the bucket again. Here the record stays missing and the store
@@ -99,14 +154,77 @@ async fn lost_record_beside_ltx_is_refused_not_reclaimed() {
     assert_eq!(records, 0, "the refused claim wrote a record");
     // Other cells are unaffected.
     assert_eq!(server.get_text("/agent/new").await, "ok");
-    // The directory never called a cell new while its LTX existed. The
-    // compactor's first pass is a tick away, so no marker is published during
-    // this test and every lookup after the restart answers `unknown`; a restart
-    // inside the blind window may legitimately read `new`, so the tick is not
-    // shortened to make this assertion stronger.
+    // The registry never called a cell new while its LTX existed.
     assert!(
-        !server.log_text().contains("cell_directory_mismatch"),
-        "the directory disagreed with the listing"
+        !server.log_text().contains("registry_mismatch"),
+        "the registry disagreed with the listing"
+    );
+}
+
+/// With the gate open, the registry decides a new agent's claim, and the
+/// listing runs beside about one claim in 256 (the audit), not beside each.
+#[tokio::test]
+async fn new_agents_are_decided_by_the_registry_and_audited_one_in_256() {
+    const AGENTS: usize = 1_500;
+    let server = Server::start("bench-agents", REGISTRY).await;
+    // Until the seed has committed the gate is closed and every answer is
+    // `Unknown`, which runs the listing. The node's view of the root moves only
+    // when a lookup reads it, so each poll claims a new agent first.
+    let mut probe = 0;
+    wait_until(
+        "the registry's gate to open",
+        Duration::from_secs(90),
+        || {
+            probe += 1;
+            let path = format!("/agent/probe-{probe}");
+            let server = &server;
+            async move {
+                assert_eq!(server.get_text(&path).await, "ok");
+                let state: Value = server
+                    .internal_get("/state")
+                    .await
+                    .send()
+                    .await
+                    .expect("read the node state")
+                    .json()
+                    .await
+                    .expect("decode the node state");
+                let root = &state["registry"]["root"];
+                (!root["gate"].is_null() && root["gate"] == root["seed_gate"]).then_some(())
+            }
+        },
+    )
+    .await;
+    let before = guard_counter(&server, "guard_decided").await;
+    let audits_before = guard_counter(&server, "guard_audits").await;
+    let fallbacks_before = guard_counter(&server, "guard_fallbacks").await;
+    let server = &server;
+    futures_util::stream::iter(0..AGENTS)
+        .for_each_concurrent(16, |agent| async move {
+            assert_eq!(server.get_text(&format!("/agent/new-{agent}")).await, "ok");
+        })
+        .await;
+    let decided = guard_counter(server, "guard_decided").await - before;
+    let (audits, fallbacks) = (
+        guard_counter(server, "guard_audits").await - audits_before,
+        guard_counter(server, "guard_fallbacks").await,
+    );
+    eprintln!("agents={AGENTS} decided={decided} audits={audits} fallbacks={fallbacks}");
+    assert_eq!(
+        fallbacks, fallbacks_before,
+        "a lookup could not tell with the gate open"
+    );
+    assert_eq!(
+        decided + audits,
+        AGENTS as u64,
+        "a new agent's claim did not ask the registry"
+    );
+    // About 6 are expected; the bound is far above that and far below one in ten.
+    assert!(audits < 60, "{audits} of {AGENTS} claims ran the listing");
+    assert_eq!(
+        server.log_text().matches("registry_mismatch").count(),
+        0,
+        "the registry called a cell new while its LTX exists"
     );
 }
 

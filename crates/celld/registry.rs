@@ -67,6 +67,30 @@ pub(crate) const PUSH_IDS: usize = 8;
 /// Cached deltas that no root this node read names: what pushes may add.
 const PREFETCH_CAP: usize = 32;
 
+/// What `CELLD_BIRTH_REGISTRY` makes of a node that runs the registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Register, compact and look up beside the listing; the listing decides.
+    Shadow,
+    /// The registry decides a claim's lost-record question, the listing runs
+    /// for one claim in [`AUDIT_ONE_IN`] and when the registry cannot tell, and
+    /// a first write that the registry does not cover yet fails.
+    On,
+}
+
+impl Mode {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Shadow => "shadow",
+            Self::On => "on",
+        }
+    }
+}
+
+/// In `on`, the listing runs beside one `New` answer in this many, to catch a
+/// registry that lost keys.
+pub(crate) const AUDIT_ONE_IN: u32 = 256;
+
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub partitions: u32,
@@ -137,7 +161,13 @@ impl Config {
 
     /// `extra_wait` is the first-write wait of the cell directory when it runs
     /// beside the registry, which the registry's own bound shrinks by.
-    pub(crate) fn from_env(durability_ms: u64, extra_wait: Duration) -> anyhow::Result<Self> {
+    /// With `enforce` (`CELLD_BIRTH_REGISTRY=on`) the registry decides claims and a
+    /// first write that it does not cover by the bound fails.
+    pub(crate) fn from_env(
+        durability_ms: u64,
+        extra_wait: Duration,
+        enforce: bool,
+    ) -> anyhow::Result<Self> {
         use crate::env_vars::{flag, with_default};
         let partitions: u32 = with_default("CELLD_REGISTRY_PARTITIONS", 1024)?;
         let pass_ms: u64 = with_default("CELLD_REGISTRY_PASS_MS", 5_000)?;
@@ -145,6 +175,12 @@ impl Config {
         let spill_ms: u64 = with_default("CELLD_REGISTRY_SPILL_MS", 900_000)?;
         let base_days: u64 = with_default("CELLD_REGISTRY_BASE_DAYS", 3)?;
         let wait = flag("CELLD_REGISTRY_WAIT", true)?;
+        // `on` decides from the registry, and that rests on the wait of a first
+        // write: a count-only wait would let an uncovered cell through.
+        anyhow::ensure!(
+            wait || !enforce,
+            "CELLD_BIRTH_REGISTRY=on needs CELLD_REGISTRY_WAIT=1"
+        );
         let job_pacing = flag("CELLD_REGISTRY_JOB_PACING", true)?;
         let pass_read_ms: u64 = with_default("CELLD_REGISTRY_PASS_READ_MS", 1_000)?;
         let lease_ttl_ms = crate::machine::lease_ttl_ms_from_environment();
@@ -168,7 +204,7 @@ impl Config {
             base_ms,
             wait,
             bound,
-            enforce: false,
+            enforce,
             grace_ms: crate::registry_compactor::GRACE_MS,
             created_cap: crate::registry_writer::CREATED_CAP,
             waiting_cap: crate::registry_writer::WAITING_CAP,
@@ -271,6 +307,14 @@ pub(crate) struct Counters {
     pub sampler_misses: AtomicU64,
     /// Shadow lookups beside claims that were not started because too many ran.
     pub shadow_skipped: AtomicU64,
+    /// In `on`, claims whose cell had no record: those the registry decided
+    /// alone, those that also ran the listing as an audit, those that ran it
+    /// because the registry could not tell, and the claims refused because the
+    /// registry knew a cell whose record is lost.
+    pub guard_decided: AtomicU64,
+    pub guard_audits: AtomicU64,
+    pub guard_fallbacks: AtomicU64,
+    pub guard_refused: AtomicU64,
     /// Cells that were not queued because the queue was full.
     pub queue_dropped: AtomicU64,
     /// Rechecks that could not tell (a failed read, a closed gate).
@@ -438,6 +482,19 @@ impl Registry {
     /// Make this registry the one the routes serve.
     pub(crate) fn install(self: &Arc<Self>) {
         let _ = GLOBAL.set(self.clone());
+    }
+
+    /// The registry decides claims (`CELLD_BIRTH_REGISTRY=on`).
+    pub(crate) fn decides(&self) -> bool {
+        self.cfg.enforce
+    }
+
+    /// Whether the listing runs beside this claim's `New` answer: one claim in
+    /// [`AUDIT_ONE_IN`], drawn per claim and not from the cell's hash, so a
+    /// cell cannot stay out of the audit for good.
+    pub(crate) fn audit_due(&self) -> bool {
+        rand::RngCore::next_u32(&mut crate::asyncrt::rng("registry_audit"))
+            .is_multiple_of(AUDIT_ONE_IN)
     }
 
     /// A slot for one shadow lookup beside a claim, or `None` (counted) when the
@@ -991,6 +1048,10 @@ impl Registry {
             ("sampler_cells", &counters.sampler_cells),
             ("sampler_misses", &counters.sampler_misses),
             ("shadow_skipped", &counters.shadow_skipped),
+            ("guard_decided", &counters.guard_decided),
+            ("guard_audits", &counters.guard_audits),
+            ("guard_fallbacks", &counters.guard_fallbacks),
+            ("guard_refused", &counters.guard_refused),
             ("queue_dropped", &counters.queue_dropped),
             ("sampler_unknown", &counters.sampler_unknown),
             ("mismatches", &counters.mismatches),

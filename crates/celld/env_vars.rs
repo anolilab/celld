@@ -366,14 +366,14 @@ pub fn validate() -> anyhow::Result<()> {
     }
 
     if let Some(value) = value("CELLD_BIRTH_REGISTRY")? {
-        if !matches!(value.as_str(), "off" | "shadow") {
-            bail!("CELLD_BIRTH_REGISTRY must be off or shadow, not {value:?}");
+        if !matches!(value.as_str(), "off" | "shadow" | "on") {
+            bail!("CELLD_BIRTH_REGISTRY must be off, shadow or on, not {value:?}");
         }
         // The registry's own settings are read only when it runs: shadow, with
         // fleet durability (a node with bucket durability ignores the flag).
         let fleet =
             std::env::var("CELLD_DURABILITY").map_or(true, |durability| durability == "fleet");
-        if value == "shadow" && fleet {
+        if value != "off" && fleet {
             for name in ["CELLD_REGISTRY_JOB_PACING", "CELLD_REGISTRY_WAIT"] {
                 flag(name, false)?;
             }
