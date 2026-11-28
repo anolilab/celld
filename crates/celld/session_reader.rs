@@ -136,12 +136,13 @@ impl BucketOwnership {
         // record.
         let own = session::current();
         let own_tag = own.map(|own| own.tag());
-        // A plan belongs to one decision: a cell that is read again is judged
-        // again.
-        self.k5.take(cell);
+        // An id with no tag takes no lock and no read here.
         let Some(tag) = session::id_tag_of_scope(cell) else {
             return Ok(Verdict::Proceed);
         };
+        // A plan belongs to one decision: a cell that is read again is judged
+        // again.
+        self.k5.take(cell);
         if own_tag.as_deref() == Some(tag.as_str()) {
             return Ok(Verdict::Proceed);
         }
@@ -290,7 +291,11 @@ impl BucketOwnership {
         let verdict = match (&verdict, record) {
             (Take::FirstOverRecord { .. }, Some((_, form))) if form.birth => {
                 let exists = self.ltx_exists(cell).await?;
-                take::birth_guard(verdict, true, exists)
+                let guarded = take::birth_guard(verdict, true, exists);
+                if matches!(guarded, Take::Refuse(_)) {
+                    session::note_p3_refusal();
+                }
+                guarded
             }
             _ => verdict,
         };

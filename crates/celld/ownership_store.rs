@@ -533,6 +533,12 @@ pub(crate) const LOST_RECORD_RECHECK_MS: u64 = 10_000;
 /// How long the answer to "may a `Grant` be appended" holds.
 const MARKS_GATE_MS: u64 = 5_000;
 
+/// How old the answer about the leases may be when a session grants an id. Shorter
+/// than the judging cache: an older build whose lease appeared since must close
+/// the grant gate within a second, while one read still serves every id granted
+/// in that second.
+const GRANT_LEASES_MAX_AGE_MS: u64 = 1_000;
+
 /// How long a record waits for the fleet proof of its `Grant`
 /// (`CELLD_LAZY_BIRTH_PROOF_WAIT_MS`, 10 s by default).
 /// The longest a request in `shadow` waits for the proof of a grant.
@@ -1564,7 +1570,10 @@ impl BucketOwnership {
     /// and every live lease advertises the format, so the record about to be
     /// written is read by every live node.
     pub(crate) async fn may_grant(&self) -> bool {
-        self.marks_allowed().await && self.all_leases_at(BIRTH_FORMAT, false).await
+        self.marks_allowed().await
+            && self
+                .all_leases_at(BIRTH_FORMAT, GRANT_LEASES_MAX_AGE_MS)
+                .await
     }
 
     /// Whether a `Grant` may be appended now: the node log is open with an
@@ -1715,21 +1724,23 @@ impl BucketOwnership {
     /// record and would ignore the nonce. The positive answer is cached for
     /// [`MARKS_GATE_MS`] for judging; the write itself asks again with `fresh`.
     pub(crate) async fn all_leases_capable(&self, fresh: bool) -> bool {
-        self.all_leases_at(SESSION_FORMAT, fresh).await
+        self.all_leases_at(SESSION_FORMAT, if fresh { 0 } else { MARKS_GATE_MS })
+            .await
     }
 
     /// Whether every live lease advertises at least `format`. A lease that cannot
-    /// be read counts as format 0.
-    pub(crate) async fn all_leases_at(&self, format: u32, fresh: bool) -> bool {
+    /// be read counts as format 0. A kept answer older than `max_age_ms` is read
+    /// again (0 always reads).
+    pub(crate) async fn all_leases_at(&self, format: u32, max_age_ms: u64) -> bool {
         #[cfg(test)]
         {
             let delay = *self.lease_read_delay.lock().unwrap();
             crate::asyncrt::sleep(delay).await;
         }
         let now = crate::asyncrt::mono_ms();
-        if !fresh {
+        {
             let gate = self.records_gate.lock().unwrap();
-            if gate.0 != 0 && now.saturating_sub(gate.0) < MARKS_GATE_MS {
+            if gate.0 != 0 && now.saturating_sub(gate.0) < max_age_ms {
                 return gate.1 >= format;
             }
         }
@@ -2627,6 +2638,15 @@ mod grant_tests {
         bucket.delete("nodes/a4.json").await.unwrap();
         *ownership.records_gate.lock().unwrap() = (0, 0);
         assert!(ownership.may_grant().await);
+        // An older node that starts after the last read closes the gate within
+        // `GRANT_LEASES_MAX_AGE_MS`, not after the five seconds of the judging cache.
+        put_lease(&bucket, "a4", &lease(future, Some(SESSION_FORMAT))).await;
+        let aged = crate::asyncrt::mono_ms().saturating_sub(GRANT_LEASES_MAX_AGE_MS + 500);
+        *ownership.records_gate.lock().unwrap() = (aged.max(1), BIRTH_FORMAT);
+        assert!(
+            !ownership.may_grant().await,
+            "an answer older than a second"
+        );
     }
 
     /// An ensemble member whose lease has expired cannot prove a mark, however

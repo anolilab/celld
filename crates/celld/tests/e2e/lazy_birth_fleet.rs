@@ -30,7 +30,11 @@ use super::harness::{client, fixture_dir, run_id, signal_group, wait_until};
 #[allow(clippy::pedantic)]
 mod support;
 
-const CELLD: &str = env!("CARGO_BIN_EXE_celld");
+/// The binary under test. `LAZY_FLEET_CELLD` names another build, so a run can be
+/// compared with one of an older commit by the same harness.
+fn celld_bin() -> String {
+    std::env::var("LAZY_FLEET_CELLD").unwrap_or_else(|_| env!("CARGO_BIN_EXE_celld").to_string())
+}
 const TOKEN: &str = "lazy-birth-fleet-token";
 
 fn region() -> String {
@@ -62,7 +66,7 @@ impl Node {
             .append(true)
             .open(home.join("celld.log"))
             .expect("open the node log");
-        let child = Command::new(CELLD)
+        let child = Command::new(celld_bin())
             .args(["--bucket", bucket, "--endpoint", endpoint])
             .args(["--region", &region()])
             .args(["--listen", &format!("127.0.0.1:{public}")])
@@ -111,6 +115,19 @@ impl Node {
             async move { exited.then_some(()) }
         })
         .await;
+    }
+
+    /// The node's `/state`.
+    pub async fn state(&self, client: &reqwest::Client) -> Value {
+        client
+            .get(format!("{}/state", self.internal))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .expect("read the node")
+            .json()
+            .await
+            .expect("decode the node")
     }
 
     pub fn log(&self) -> String {
@@ -261,7 +278,7 @@ impl Fleet {
             .or(node_endpoint)
             .unwrap_or_else(|| store.clone());
         let home = tempfile::TempDir::new().expect("create a temp dir");
-        let deployed = Command::new(CELLD)
+        let deployed = Command::new(celld_bin())
             .arg("deploy")
             .arg(fixture_dir(fixture))
             .args(["--bucket", &spec, "--endpoint", &store])
@@ -1409,6 +1426,11 @@ async fn requests_per_minted_agent(mode: &'static str) -> (f64, f64, u64, u64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s4_a_minted_agent_in_read_costs_no_read_and_no_listing() {
     let (off_a, off_b, off_own, off_get) = requests_per_minted_agent("off").await;
+    // `LAZY_FLEET_S4_OFF_ONLY=1`: only the run with the flag off, to compare builds.
+    if std::env::var("LAZY_FLEET_S4_OFF_ONLY").is_ok() {
+        eprintln!("S4 off-only: A {off_a:.3} B {off_b:.3}, own.json {off_own} (GET {off_get})");
+        return;
+    }
     let (a, b, own_all, own_get) = requests_per_minted_agent("read").await;
     if a == 0.0 && b == 0.0 {
         return;
@@ -2316,6 +2338,15 @@ async fn a_birth_form_record_without_a_grant_is_refused_over_a_lost_claim() {
             peer_answers(&fleet, &claimed).await.is_empty(),
             "the cell with LTX must be refused"
         );
+        // The refusal is counted, for the operator.
+        let mut refused = 0;
+        for index in [1, 2] {
+            let state = fleet.nodes[index].state(&fleet.client).await;
+            refused += state["storage_counters"]["lazy_birth_session"]["p3_refusals"]
+                .as_u64()
+                .unwrap_or(0);
+        }
+        assert!(refused >= 1, "the P3 refusal is not counted in /state");
         // Without LTX nothing was ever claimed: the record is replaced at epoch 2.
         let n = wait_until(
             "a peer to take the unclaimed cell",

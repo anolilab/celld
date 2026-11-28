@@ -479,10 +479,23 @@ fn shadow_failures() -> BTreeMap<&'static str, u64> {
         .clone()
 }
 
-/// The counters of a session, for `/state`; none without a session.
+static P3_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// A cell was refused because a birth-form record that no grant covers lies over
+/// LTX (P3). It stays refused until the operator repairs the record.
+pub(crate) fn note_p3_refusal() {
+    P3_REFUSALS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The counters of a session, for `/state`; none without a session, unless a
+/// refusal of P3 was counted (a node with the flag off judges such a cell too).
 pub(crate) fn counters_json() -> Option<serde_json::Value> {
-    let session = current()?;
+    let p3_refusals = P3_REFUSALS.load(Ordering::Relaxed);
+    let Some(session) = current() else {
+        return (p3_refusals > 0).then(|| serde_json::json!({ "p3_refusals": p3_refusals }));
+    };
     Some(serde_json::json!({
+        "p3_refusals": p3_refusals,
         "tag": session.tag(),
         "verified_under_carried_tag": CARRIED_VERIFIED.load(Ordering::Relaxed),
         "shadow_failures": shadow_failures(),
@@ -572,7 +585,11 @@ fn scope_minted_by(session: Option<&Session>, scope: &str) -> bool {
     let Some(session) = session else {
         return false;
     };
-    !session.is_closed()
+    // Only a session whose peers forward its unrecorded ids back (B3) needs this:
+    // a `shadow` session arbitrates by its create-only write, and must not shed a
+    // resident cell for an id that a peer could claim.
+    session.mode() != Mode::Shadow
+        && !session.is_closed()
         && match kind_of_scope(scope) {
             Some(IdKind::Tagged { tag, block }) => {
                 tag == session.tag
@@ -1738,13 +1755,22 @@ mod tests {
         assert!(session.resumed_at("c", "old", 4));
     }
 
+    #[test]
+    fn a_p3_refusal_is_counted_for_the_state() {
+        let before = P3_REFUSALS.load(Ordering::Relaxed);
+        note_p3_refusal();
+        assert_eq!(P3_REFUSALS.load(Ordering::Relaxed), before + 1);
+        assert!(counters_json().is_some_and(|json| json["p3_refusals"].as_u64() > Some(0)));
+    }
+
     /// An id of the own open session that was issued is served on this node; an id
     /// of another session, an unissued counter, or any id after the session closed
     /// is not "minted here".
     #[test]
     fn only_an_issued_id_of_the_own_open_session_is_minted_here() {
         register_class(SCRIPT, CLASS);
-        let session = established([7; 8]);
+        let session = Session::with_tag(Mode::Read, [7; 8], &[]);
+        session.establish();
         let at = |counter| {
             let block = encrypt_counter(&session.counter_key, counter);
             let id = tagged_object_id(&key(), [7; 8], block);
@@ -1760,6 +1786,16 @@ mod tests {
             &format!("{CLASS}:{}", durable_object_id_hex(&other))
         ));
         assert!(!scope_minted_by(Some(&session), "Agent:plain"));
+        // A `shadow` session arbitrates by its create-only write: nothing is served
+        // here for it, and a full node sheds no cell for its ids.
+        let shadow = established([7; 8]);
+        shadow.mint(&key()).expect("counter 0");
+        let scope = {
+            let block = encrypt_counter(&shadow.counter_key, 0);
+            let id = tagged_object_id(&key(), [7; 8], block);
+            format!("{CLASS}:{}", durable_object_id_hex(&id))
+        };
+        assert!(!scope_minted_by(Some(&shadow), &scope));
         session.closed.store(true, Ordering::SeqCst);
         assert!(!scope_minted_by(Some(&session), &at(0)), "a closed session");
     }

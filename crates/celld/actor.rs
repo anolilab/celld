@@ -294,16 +294,37 @@ async fn settle_session_after_recovery(
         eprintln!("celld could not close the session {tag} of {owner} for {cell}: {error:#}");
         return Err(Failure::Ambiguous);
     }
+    // A read that fails here is an error that may pass, tried again behind the
+    // core's backoff; only the rules' own refusal is final.
+    let again = |error: anyhow::Error| {
+        eprintln!("celld could not judge {cell} again after the recovery of {owner}: {error:#}");
+        Failure::Ambiguous
+    };
     let (record, form) = bucket
         .resolve_owner_form(cell, RecordReader::Claim)
         .await
-        .map_err(ownership_read_failed)?
+        .map_err(again)?
         .map_or((None, None), |(record, form)| (Some(record), Some(form)));
-    match judged_refusal(bucket, cell, record.as_ref(), form.as_ref()).await? {
-        Judged::Proceed => Ok(()),
-        Judged::Refuse(refusal) => Err(refusal),
-        // The header is open again or still: nothing was settled.
-        Judged::Forward(_) => Err(Failure::Ambiguous),
+    let plain = crate::ownership_store::OwnerForm::default();
+    let judged = record
+        .as_ref()
+        .map(|record| (record, form.as_ref().unwrap_or(&plain)));
+    match bucket.judge_tagged(cell, judged).await.map_err(again)? {
+        crate::session_reader::Verdict::Proceed => Ok(()),
+        crate::session_reader::Verdict::Refuse(reason) => {
+            eprintln!(
+                "celld ownership record lost: {cell}: {reason}; refusing the cell for {} s. \
+                 See the ownership record repair in docs/guarantees.md.",
+                crate::ownership_store::LOST_RECORD_RECHECK_MS / 1_000
+            );
+            bucket.hold_lost_record(cell, crate::asyncrt::mono_ms());
+            Err(Failure::Definite)
+        }
+        // Nothing is known to be lost, and the header is open again or still, or a
+        // read was slow: nothing was settled.
+        crate::session_reader::Verdict::TimedOut | crate::session_reader::Verdict::Forward(_) => {
+            Err(Failure::Ambiguous)
+        }
     }
 }
 
@@ -3458,17 +3479,19 @@ impl Actor {
                                 Failure::Ambiguous
                             }),
                     };
+                    // The gate on the node ran: that is noted whatever the settling of
+                    // its session says next, which can be tried again.
+                    if result.is_ok() {
+                        if let Ownership::Bucket(bucket) = &ownership {
+                            bucket.note_node_recovered(&owner);
+                        }
+                    }
                     let result = match (&ownership, result) {
                         (Ownership::Bucket(bucket), Ok(())) => {
                             settle_session_after_recovery(bucket, &cell, &owner).await
                         }
                         (_, result) => result,
                     };
-                    if result.is_ok() {
-                        if let Ownership::Bucket(bucket) = &ownership {
-                            bucket.note_node_recovered(&owner);
-                        }
-                    }
                     CompletedEffect::timed(
                         Event::NodeLogRecovered { op, result },
                         timing_cell,
