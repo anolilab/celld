@@ -123,6 +123,62 @@ pub fn birth_guard(take: Take, birth: bool, ltx_exists: bool) -> Take {
     }
 }
 
+/// The epoch at which a decision claims the cell, if it claims.
+pub fn claim_epoch(take: &Take) -> Option<u64> {
+    match take {
+        Take::Standard { epoch }
+        | Take::FirstFromNothing { epoch }
+        | Take::FirstNew { epoch }
+        | Take::FirstOverRecord { epoch }
+        | Take::Plain { epoch }
+        | Take::ReplaceFirst { epoch }
+        | Take::ValidTakeover { epoch } => Some(*epoch),
+        Take::Refuse(_) | Take::Forward => None,
+    }
+}
+
+/// How the decision of the rules of mode `on` compares with the one of the mode in
+/// the header, for the same cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Agreement {
+    /// The same class of answer at the same epoch.
+    Same,
+    /// A difference that the design makes: a *granted* id without a record is a
+    /// lost record in `shadow` and `read`, whose sessions wrote it, and a lazy cell
+    /// in `on`, which `decide` takes by K5 from nothing.
+    ByDesign,
+    /// Any other difference: a rule that depends on the mode where it should not,
+    /// or a leave-form record under a header whose session writes none.
+    Mismatch,
+}
+
+/// Compare the decision for the mode in the header with the decision of mode `on`
+/// for the same view. Both are pure, so the comparison has no effect.
+pub fn compare_with_on(view: &View) -> Agreement {
+    let actual = decide(view);
+    let on_hdr = view.hdr.map(|hdr| Hdr {
+        mode: Mode::On,
+        lost: hdr.lost,
+    });
+    let on = decide(&View {
+        rec: view.rec,
+        hdr: on_hdr.as_ref(),
+        chunk: view.chunk,
+        author_live: view.author_live,
+        placed: view.placed,
+    });
+    if actual == on {
+        return Agreement::Same;
+    }
+    let granted_without_record =
+        view.rec.is_none() && view.chunk.is_some_and(|chunk| chunk.granted);
+    if granted_without_record && matches!(view.hdr, Some(hdr) if hdr.mode != Mode::On) {
+        Agreement::ByDesign
+    } else {
+        Agreement::Mismatch
+    }
+}
+
 fn decide_absent(view: &View, chunk: &ChunkCell, mode: Mode) -> Take {
     if chunk.taken.is_some() {
         return Take::Refuse("a later record was written and is lost");

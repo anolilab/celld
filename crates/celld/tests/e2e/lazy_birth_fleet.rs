@@ -130,6 +130,19 @@ impl Node {
             .expect("decode the node")
     }
 
+    /// The node's `/state`, or `None` when it does not answer (a killed node).
+    pub async fn try_state(&self, client: &reqwest::Client) -> Option<Value> {
+        client
+            .get(format!("{}/state", self.internal))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()
+    }
+
     pub fn log(&self) -> String {
         std::fs::read_to_string(self.home.join("celld.log")).unwrap_or_default()
     }
@@ -399,6 +412,45 @@ where
             fleet.clean().await;
         }
         Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// What the rules of mode `on`, computed beside the ones in force, said over the
+/// run: the sums over the nodes that answer. A `mismatch` or a claim at another
+/// epoch than the rules gave is a failure; `judged` is how many cells were
+/// compared.
+async fn taker_counts(fleet: &Fleet) -> (u64, u64, u64) {
+    let (mut judged, mut mismatch, mut epoch_mismatch) = (0, 0, 0);
+    for node in &fleet.nodes {
+        let Some(state) = node.try_state(&fleet.client).await else {
+            continue;
+        };
+        let taker = &state["storage_counters"]["lazy_birth_session"]["taker"];
+        let count = |key: &str| taker[key].as_u64().unwrap_or(0);
+        judged += count("same") + count("by_design") + count("mismatch");
+        mismatch += count("mismatch");
+        epoch_mismatch += count("claim_epoch_mismatch");
+    }
+    (judged, mismatch, epoch_mismatch)
+}
+
+/// 0 mismatches between the rules of `on` and the path in force, and every claim
+/// at the epoch the rules gave.
+async fn assert_taker_agrees(fleet: &Fleet, expect_judged: bool) {
+    let (judged, mismatch, epoch_mismatch) = taker_counts(fleet).await;
+    eprintln!(
+        "taker comparison: judged {judged}, mismatch {mismatch}, epoch mismatch {epoch_mismatch}"
+    );
+    assert_eq!(
+        mismatch, 0,
+        "the rules of `on` differ from the path in force"
+    );
+    assert_eq!(
+        epoch_mismatch, 0,
+        "a claim at another epoch than the rules gave"
+    );
+    if expect_judged {
+        assert!(judged > 0, "no cell was compared");
     }
 }
 
@@ -1563,6 +1615,7 @@ async fn s5_run(mode: &'static str) -> (Duration, usize) {
                 let _ = std::fs::write(format!("{dir}/s5-{mode}-node-{index}.log"), node.log());
             }
         }
+        assert_taker_agrees(&fleet, false).await;
         *result.lock().unwrap() = (started.elapsed(), wrong);
         fleet
     })
@@ -1818,6 +1871,20 @@ async fn s8_rolling_and_preserved_restarts_under_a_stream_of_new_agents() {
                     );
                 }
             }
+        }
+        // The check of the capture (B5) failed on no node in any preserved restart.
+        for (index, node) in fleet.nodes.iter().enumerate() {
+            let failed: Vec<String> = node
+                .log()
+                .lines()
+                .filter(|line| {
+                    (line.contains("shadow_failure") && line.contains("capture"))
+                        || line.contains("has no confirmed")
+                        || line.contains("will not carry")
+                })
+                .map(str::to_string)
+                .collect();
+            assert!(failed.is_empty(), "node {index}: {failed:?}");
         }
         if let Ok(dir) = std::env::var("LAZY_FLEET_KEEP_LOGS") {
             for (index, node) in fleet.nodes.iter().enumerate() {
@@ -2179,6 +2246,7 @@ async fn dead_session_without_a_log_is_sealed(left: Left) {
             .await
             .expect("the header");
         assert_eq!(header["state"], "sealed", "{header}");
+        assert_taker_agrees(&fleet, true).await;
         let record = fleet
             .object(&format!("cells/Cell:{}/own.json", ids[0]))
             .await
@@ -2266,6 +2334,7 @@ async fn a_record_read_under_an_open_header_is_judged_again_after_the_gate() {
                 .unwrap_or(0);
         }
         assert!(refused >= 1, "the P3 refusal is not counted in /state");
+        assert_taker_agrees(&fleet, true).await;
         let record = fleet
             .object(&format!("cells/Cell:{}/own.json", ids[0]))
             .await

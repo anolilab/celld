@@ -1289,7 +1289,7 @@ impl Lazy {
                     // Without an ensemble the announcement goes into the chunk.
                     if let Some(mut ch) = w.s.chunk[usize::from(k)].clone() {
                         if !ch.sealed {
-                            ch.granted[c] = true;
+                            ch.granted[c] |= self.d().left_sets_granted;
                             let left = ch.left[c].get_or_insert(Left {
                                 epoch: e,
                                 nonces: Vec::new(),
@@ -1452,7 +1452,7 @@ impl Lazy {
             }
             None => return,
         };
-        ch.granted[c] = true;
+        ch.granted[c] |= self.d().left_sets_granted;
         let left = ch.left[c].get_or_insert(Left {
             epoch: ep,
             nonces: vec![n],

@@ -223,3 +223,91 @@ fn a_birth_form_record_without_a_grant_is_refused_over_a_cell_with_ltx() {
         "granted: a plain takeover"
     );
 }
+
+mod compare_with_on_tests {
+    use crate::session::LeftEntry;
+    use crate::session_take::*;
+
+    fn rec(form: Form) -> Rec {
+        Rec {
+            by_minter: true,
+            epoch: 1,
+            form,
+            nonce: "n".into(),
+            over: Vec::new(),
+            leave: "l".into(),
+            released: false,
+        }
+    }
+
+    fn chunk(granted: bool, left: Option<LeftEntry>) -> ChunkCell {
+        ChunkCell {
+            unknown: false,
+            granted,
+            taken: None,
+            left,
+        }
+    }
+
+    fn agreement(mode: Mode, rec: Option<&Rec>, chunk: &ChunkCell) -> Agreement {
+        let hdr = Hdr { mode, lost: false };
+        compare_with_on(&View {
+            rec,
+            hdr: Some(&hdr),
+            chunk: Some(chunk),
+            author_live: false,
+            placed: false,
+        })
+    }
+
+    #[test]
+    fn a_plain_record_or_a_new_cell_reads_the_same_in_every_mode() {
+        for mode in [Mode::Shadow, Mode::Read, Mode::On] {
+            assert_eq!(
+                agreement(mode, Some(&rec(Form::Plain)), &chunk(true, None)),
+                Agreement::Same,
+                "{mode:?}"
+            );
+            assert_eq!(
+                agreement(mode, None, &chunk(false, None)),
+                Agreement::Same,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_granted_id_without_a_record_differs_by_design_below_on() {
+        for mode in [Mode::Shadow, Mode::Read] {
+            assert_eq!(
+                agreement(mode, None, &chunk(true, None)),
+                Agreement::ByDesign,
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            agreement(Mode::On, None, &chunk(true, None)),
+            Agreement::Same
+        );
+    }
+
+    #[test]
+    fn a_leave_form_record_under_a_header_that_writes_none_is_a_mismatch() {
+        let left = LeftEntry {
+            epoch: 1,
+            nonces: vec!["l".into()],
+            done: None,
+        };
+        for mode in [Mode::Shadow, Mode::Read] {
+            assert_eq!(
+                agreement(
+                    mode,
+                    Some(&rec(Form::Leave)),
+                    &chunk(true, Some(left.clone()))
+                ),
+                Agreement::Mismatch,
+                "{mode:?}"
+            );
+        }
+    }
+}

@@ -405,6 +405,8 @@ const MUTANTS: &[(&str, &str, &[&str])] = &[
     ("M41", "resume_std", RESUMED_BESIDE),
     ("M42", "stalled_std", TWO_WRITERS),
     ("M43", "placed", TWO_WRITERS),
+    // K4: a left entry implies the granted bit (revision 5).
+    ("M44", "handoff_read", &["a8_sealed_chunk_incomplete"]),
 ];
 
 /// What a missing trace before a release shows for a granted cell: two writers,

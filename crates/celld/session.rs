@@ -95,6 +95,12 @@ pub(crate) enum IdRefusal {
     Unissued,
 }
 
+/// A change to the left entry of one cell.
+enum LeftChange {
+    Announce { epoch: u64, nonce: String },
+    Confirm { nonce: String },
+}
+
 pub struct Session {
     tag: [u8; 8],
     mode: Mode,
@@ -481,6 +487,56 @@ fn shadow_failures() -> BTreeMap<&'static str, u64> {
 
 static P3_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
+static TAKER_SAME: AtomicU64 = AtomicU64::new(0);
+static TAKER_BY_DESIGN: AtomicU64 = AtomicU64::new(0);
+static TAKER_MISMATCH: AtomicU64 = AtomicU64::new(0);
+static CLAIM_EPOCH_SAME: AtomicU64 = AtomicU64::new(0);
+static CLAIM_EPOCH_MISMATCH: AtomicU64 = AtomicU64::new(0);
+
+/// How the rules of mode `on` compare with the ones in force for a cell that was
+/// judged (see `celld_logic::session_take::compare_with_on`).
+pub(crate) fn note_taker_agreement(agreement: celld_logic::session_take::Agreement) {
+    use celld_logic::session_take::Agreement;
+    let counter = match agreement {
+        Agreement::Same => &TAKER_SAME,
+        Agreement::ByDesign => &TAKER_BY_DESIGN,
+        Agreement::Mismatch => {
+            tracing::warn!(event = "taker_mismatch", "the rules of mode on differ here");
+            &TAKER_MISMATCH
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The epoch of a claim that followed a judgement, against the epoch the rules
+/// gave.
+pub(crate) fn note_claim_epoch(cell: &str, same: bool, expected: u64, written: u64) {
+    if same {
+        CLAIM_EPOCH_SAME.fetch_add(1, Ordering::Relaxed);
+    } else {
+        tracing::warn!(
+            event = "claim_epoch_mismatch",
+            cell,
+            expected,
+            written,
+            "a claim was written at another epoch than the rules gave"
+        );
+        CLAIM_EPOCH_MISMATCH.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The comparison counters, for `/state`: `mismatch` and `claim_epoch_mismatch`
+/// stay zero.
+fn taker_counters() -> serde_json::Value {
+    serde_json::json!({
+        "same": TAKER_SAME.load(Ordering::Relaxed),
+        "by_design": TAKER_BY_DESIGN.load(Ordering::Relaxed),
+        "mismatch": TAKER_MISMATCH.load(Ordering::Relaxed),
+        "claim_epoch_same": CLAIM_EPOCH_SAME.load(Ordering::Relaxed),
+        "claim_epoch_mismatch": CLAIM_EPOCH_MISMATCH.load(Ordering::Relaxed),
+    })
+}
+
 /// A cell was refused because a birth-form record that no grant covers lies over
 /// LTX (P3). It stays refused until the operator repairs the record.
 pub(crate) fn note_p3_refusal() {
@@ -492,10 +548,15 @@ pub(crate) fn note_p3_refusal() {
 pub(crate) fn counters_json() -> Option<serde_json::Value> {
     let p3_refusals = P3_REFUSALS.load(Ordering::Relaxed);
     let Some(session) = current() else {
-        return (p3_refusals > 0).then(|| serde_json::json!({ "p3_refusals": p3_refusals }));
+        let judged = TAKER_SAME.load(Ordering::Relaxed)
+            + TAKER_BY_DESIGN.load(Ordering::Relaxed)
+            + TAKER_MISMATCH.load(Ordering::Relaxed);
+        return (p3_refusals > 0 || judged > 0)
+            .then(|| serde_json::json!({ "p3_refusals": p3_refusals, "taker": taker_counters() }));
     };
     Some(serde_json::json!({
         "p3_refusals": p3_refusals,
+        "taker": taker_counters(),
         "tag": session.tag(),
         "verified_under_carried_tag": CARRIED_VERIFIED.load(Ordering::Relaxed),
         "shadow_failures": shadow_failures(),
@@ -982,6 +1043,11 @@ impl Session {
         })
     }
 
+    /// Whether the bucket holds a confirmed left entry for `counter`.
+    pub fn has_left(&self, counter: u64) -> bool {
+        self.left.lock().expect("left poisoned").contains(&counter)
+    }
+
     /// The trace that a cell had a record, in a chunk in the bucket: a left
     /// entry confirmed under a nonce of its own, by compare-and-swap. A left
     /// entry implies the granted bit. It is written before every release of
@@ -1050,6 +1116,162 @@ impl Session {
             }
         }
         anyhow::bail!("the leave of {scope} lost every race")
+    }
+
+    /// K3, step 1 without an ensemble: announce the leave of the cell `scope` at
+    /// `epoch` in the chunk, under a new nonce, by compare-and-swap, and return the
+    /// nonce. The entry sets the *granted* bit too (a left entry implies it). At
+    /// most [`celld_logic::session_leave::MAX_NONCES`] nonces are announced for one
+    /// cell, and a sealed chunk refuses the write.
+    pub async fn announce_leave(
+        &self,
+        bucket: &Bucket,
+        scope: &str,
+        epoch: u64,
+    ) -> anyhow::Result<String> {
+        let counter = self
+            .own_counter_of_scope(scope)
+            .with_context(|| format!("{scope} is not an id of this session"))?;
+        let mut nonce = [0_u8; 8];
+        getrandom::fill(&mut nonce).map_err(|error| anyhow::anyhow!("nonce: {error}"))?;
+        let nonce = hex(&nonce);
+        self.write_left(
+            bucket,
+            &[(
+                counter,
+                LeftChange::Announce {
+                    epoch,
+                    nonce: nonce.clone(),
+                },
+            )],
+        )
+        .await?;
+        Ok(nonce)
+    }
+
+    /// K3, step 3 (and step 4 before a release) without an ensemble: confirm the
+    /// leaves `(scope, nonce)` in the chunks, `done: nonce`, one compare-and-swap
+    /// for every cell of a chunk, so that a drain writes each chunk once.
+    pub async fn confirm_leaves(
+        &self,
+        bucket: &Bucket,
+        leaves: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        let mut changes = Vec::new();
+        for (scope, nonce) in leaves {
+            let counter = self
+                .own_counter_of_scope(scope)
+                .with_context(|| format!("{scope} is not an id of this session"))?;
+            changes.push((
+                counter,
+                LeftChange::Confirm {
+                    nonce: nonce.clone(),
+                },
+            ));
+        }
+        self.write_left(bucket, &changes).await
+    }
+
+    /// Apply `changes` to the chunks, one compare-and-swap loop for each chunk. A
+    /// write that loses reads the chunk again and applies the changes to what it
+    /// finds, and a chunk that is not open stops the session.
+    async fn write_left(
+        &self,
+        bucket: &Bucket,
+        changes: &[(u64, LeftChange)],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.is_closed() || self.sealing.load(Ordering::SeqCst),
+            "the session closed before the leave was in a chunk"
+        );
+        let mut by_chunk: BTreeMap<u64, Vec<&(u64, LeftChange)>> = BTreeMap::new();
+        for change in changes {
+            by_chunk.entry(change.0 / CHUNK).or_default().push(change);
+        }
+        let tag = self.tag();
+        for (chunk, changes) in by_chunk {
+            let writer = self.chunk_writer(chunk);
+            let _writing = writer.lock().await;
+            let mut done = false;
+            for _ in 0..6 {
+                let (current, token) = self
+                    .held
+                    .lock()
+                    .await
+                    .chunks
+                    .get(&chunk)
+                    .cloned()
+                    .context("the session holds no such chunk")?;
+                let mut next = current.clone();
+                for (counter, change) in &changes {
+                    let entry = next.left.entry(*counter).or_insert_with(|| store::Left {
+                        epoch: 1,
+                        nonces: Vec::new(),
+                        done: None,
+                    });
+                    match change {
+                        LeftChange::Announce { epoch, nonce } => {
+                            anyhow::ensure!(
+                                entry.done.is_none(),
+                                "the leave of counter {counter} is confirmed already"
+                            );
+                            anyhow::ensure!(
+                                entry.nonces.len() < celld_logic::session_leave::MAX_NONCES,
+                                "the leave of counter {counter} used its nonces"
+                            );
+                            if !entry.nonces.contains(nonce) {
+                                entry.nonces.push(nonce.clone());
+                            }
+                            entry.epoch = *epoch;
+                        }
+                        LeftChange::Confirm { nonce } => {
+                            anyhow::ensure!(
+                                entry.nonces.contains(nonce),
+                                "the nonce of counter {counter} was never announced"
+                            );
+                            anyhow::ensure!(
+                                entry.done.as_ref().is_none_or(|done| done == nonce),
+                                "the leave of counter {counter} is confirmed under another nonce"
+                            );
+                            entry.done = Some(nonce.clone());
+                        }
+                    }
+                    next.granted.insert(*counter);
+                }
+                next.rev += 1;
+                match store::swap_chunk(bucket, &tag, chunk, &next, &token).await? {
+                    Some(token) => {
+                        self.checkpointed
+                            .lock()
+                            .expect("checkpointed poisoned")
+                            .extend(next.granted.iter().copied());
+                        for (counter, change) in &changes {
+                            self.granted
+                                .lock()
+                                .expect("granted poisoned")
+                                .insert(*counter);
+                            if matches!(change, LeftChange::Confirm { .. }) {
+                                self.left.lock().expect("left poisoned").insert(*counter);
+                            }
+                        }
+                        self.held.lock().await.chunks.insert(chunk, (next, token));
+                        done = true;
+                        break;
+                    }
+                    None => match store::read_chunk(bucket, &tag, chunk).await? {
+                        store::Read::Found(found, token) if found.state == store::State::Open => {
+                            self.held.lock().await.chunks.insert(chunk, (found, token));
+                        }
+                        _ => {
+                            self.closed.store(true, Ordering::SeqCst);
+                            anyhow::bail!("chunk {chunk} is sealed or lost: the session stops");
+                        }
+                    },
+                }
+            }
+            anyhow::ensure!(done, "the leave in chunk {chunk} lost every race");
+        }
+        Ok(())
     }
 
     /// The decision of the first request for an id of this session in a mode that
@@ -1502,6 +1724,34 @@ pub async fn prepare_reload(
         in_use.len() == carried.len() && carried.len() <= CARRIED_BOUND,
         "the successor cannot carry the tags of the resident cells"
     );
+    // The check of the capture (B5, step 4), over what the leaving process knows: a
+    // cell of this process needs a trace in the bucket (its confirmed left entry, or
+    // the grant in a chunk), and the record of every cell a tag that the successor
+    // carries. The marker needs it to pass; in `shadow` a failure is counted and
+    // logged, and the reload goes on as before.
+    let captured: Vec<celld_logic::session_leave::Captured> = cells
+        .iter()
+        .map(|cell| {
+            let counter = session.own_counter_of_scope(&cell.id);
+            let tag = tags.get(&cell.id).map_or("", String::as_str);
+            celld_logic::session_leave::Captured {
+                own_tag: counter.is_some(),
+                granted: counter.is_some_and(|counter| session.is_granted(counter)),
+                confirmed_leave: counter.is_some_and(|counter| {
+                    session.has_left(counter)
+                        || (session.is_granted(counter) && session.is_checkpointed(counter))
+                        || session.is_waived(counter) && !session.is_claimed_scope(&cell.id)
+                }),
+                record_tag_carried: tag.is_empty() || carried.iter().any(|kept| kept == tag),
+            }
+        })
+        .collect();
+    tolerate(
+        session,
+        "capture",
+        celld_logic::session_leave::capture_check(&captured)
+            .map_err(|reason| anyhow::anyhow!(reason)),
+    )?;
     Ok(crate::clean_reload::ReloadSession {
         tags: carried,
         cells: tags,
@@ -2505,6 +2755,69 @@ mod tests {
         );
         drop(in_flight);
         session.leave_trace(&bucket, &scope).await.unwrap();
+    }
+
+    /// K3 without an ensemble: the announcement is an open left entry that sets the
+    /// *granted* bit, a nonce is announced at most four times, and the confirmation
+    /// of many cells writes each chunk once.
+    #[tokio::test]
+    async fn a_leave_is_announced_and_confirmed_in_the_chunks() {
+        crate::asyncrt::install_test_host_runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = crate::bucket::Bucket::open_dev(&dir.path().join("bucket.db")).unwrap();
+        let session = Session::with_tag(Mode::Shadow, [8; 8], &[]);
+        session.open(&bucket, "n", "g").await.unwrap();
+        session.issued.store(1_000, Ordering::SeqCst);
+        session.ensure_chunk_ahead(&bucket).await.unwrap();
+        let read = |chunk| {
+            let (bucket, tag) = (bucket.clone(), session.tag());
+            async move {
+                match store::read_chunk(&bucket, &tag, chunk).await.unwrap() {
+                    store::Read::Found(found, _) => found,
+                    _ => panic!("a chunk"),
+                }
+            }
+        };
+        let (first, second) = (scope_for(&session, 4), scope_for(&session, CHUNK + 9));
+        // The announcement is open, at its epoch, and implies the granted bit.
+        let nonce = session.announce_leave(&bucket, &first, 2).await.unwrap();
+        let chunk = read(0).await;
+        assert!(chunk.granted.contains(&4));
+        assert_eq!(chunk.left[&4].epoch, 2);
+        assert_eq!(chunk.left[&4].nonces, std::slice::from_ref(&nonce));
+        assert_eq!(chunk.left[&4].done, None, "announced, not confirmed");
+        assert!(!session.has_left(4));
+        // Nonces go up to four, and a new one is a new entry of the same cell.
+        for _ in 0..3 {
+            session.announce_leave(&bucket, &first, 2).await.unwrap();
+        }
+        assert!(session.announce_leave(&bucket, &first, 2).await.is_err());
+        // A nonce that was never announced confirms nothing.
+        assert!(session
+            .confirm_leaves(&bucket, &[(first.clone(), "other".into())])
+            .await
+            .is_err());
+        // Two cells in two chunks are confirmed together.
+        let second_nonce = session.announce_leave(&bucket, &second, 1).await.unwrap();
+        session
+            .confirm_leaves(
+                &bucket,
+                &[
+                    (first.clone(), nonce.clone()),
+                    (second.clone(), second_nonce.clone()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(read(0).await.left[&4].done, Some(nonce.clone()));
+        assert_eq!(read(1).await.left[&(CHUNK + 9)].done, Some(second_nonce));
+        assert!(session.has_left(4) && session.has_left(CHUNK + 9));
+        // Once confirmed, the cell announces nothing and confirms under that nonce only.
+        assert!(session.announce_leave(&bucket, &first, 3).await.is_err());
+        session
+            .confirm_leaves(&bucket, &[(first.clone(), nonce)])
+            .await
+            .unwrap();
     }
 
     /// A checkpoint writes each chunk with the counters of its own range only.

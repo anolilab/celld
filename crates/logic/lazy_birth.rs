@@ -224,6 +224,10 @@ pub(crate) struct Design {
     pub session_merges_chunk: bool,
     /// The bound of the carried set.
     pub carried_bound: usize,
+    /// K4: a left entry always implies the *granted* bit, for the session and for a
+    /// sealer. A chunk that holds the entry of a cell that left the lazy state and
+    /// no bit reads as a cell that was never granted, and a taker claims it as new.
+    pub left_sets_granted: bool,
     /// The flush moves the marks of the followers' tails into the bundle with
     /// the rows. Off, marks stay on the followers and reach the bucket only as
     /// a bit in the chunk: a bundle never holds a mark, so no object waits for a
@@ -287,6 +291,7 @@ impl Design {
             trace_before_release: true,
             trace_before_marker: true,
             carried_bound: 2,
+            left_sets_granted: true,
             marks_ride_bundles: true,
         }
     }
@@ -352,7 +357,7 @@ impl Design {
         }
     }
 
-    /// Revision 4 with one rule removed: mutant `n` of M1..M43, or a second
+    /// Revision 4 with one rule removed: mutant `n` of M1..M44, or a second
     /// form of it as `(n, form)`.
     pub(crate) fn mutant(n: u8, form: u8) -> Self {
         let mut d = Self::rev4();
@@ -414,6 +419,7 @@ impl Design {
             (41, _) => d.trace_before_marker = false,
             (42, _) => d.session_record_takeover_marks = false,
             (43, _) => d.sealer_keeps_taken = false,
+            (44, _) => d.left_sets_granted = false,
             _ => panic!("no mutant M{n}"),
         }
         d
