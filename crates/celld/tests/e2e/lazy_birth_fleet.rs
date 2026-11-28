@@ -2257,6 +2257,15 @@ async fn a_record_read_under_an_open_header_is_judged_again_after_the_gate() {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
         assert!(peer_answers(&fleet, &ids[0]).await.is_empty());
+        // The refusal is the guard of P3, and it is counted for the operator.
+        let mut refused = 0;
+        for index in [1, 2] {
+            let state = fleet.nodes[index].state(&fleet.client).await;
+            refused += state["storage_counters"]["lazy_birth_session"]["p3_refusals"]
+                .as_u64()
+                .unwrap_or(0);
+        }
+        assert!(refused >= 1, "the P3 refusal is not counted in /state");
         let record = fleet
             .object(&format!("cells/Cell:{}/own.json", ids[0]))
             .await
@@ -2338,15 +2347,6 @@ async fn a_birth_form_record_without_a_grant_is_refused_over_a_lost_claim() {
             peer_answers(&fleet, &claimed).await.is_empty(),
             "the cell with LTX must be refused"
         );
-        // The refusal is counted, for the operator.
-        let mut refused = 0;
-        for index in [1, 2] {
-            let state = fleet.nodes[index].state(&fleet.client).await;
-            refused += state["storage_counters"]["lazy_birth_session"]["p3_refusals"]
-                .as_u64()
-                .unwrap_or(0);
-        }
-        assert!(refused >= 1, "the P3 refusal is not counted in /state");
         // Without LTX nothing was ever claimed: the record is replaced at epoch 2.
         let n = wait_until(
             "a peer to take the unclaimed cell",
