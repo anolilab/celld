@@ -21,6 +21,13 @@ a supervisor that restarts the process.
   Tigris Global or Dual-region bucket provides it only in the region of the
   write, so do not enable epoch GC on one when fleet nodes are in more than one
   region.
+- No dependence on a token that differs when the same bytes are written twice.
+  A store whose token is a hash of the body (the same token for equal bytes) is
+  supported: celld never writes one body twice to the same key, and a write that
+  returns an error is settled by a read that compares what the record says, never
+  by sending the body again. `celld diagnose` reports whether the store repeats a
+  token for equal bytes (`cas token repeats for equal bytes: yes|no`); it is
+  information, not a failure.
 
 The qualified stores are Amazon S3, Cloudflare R2, Tigris, Google Cloud Storage,
 and Azure Blob Storage. The release tests run against R2; the S3 path uses the
@@ -148,6 +155,30 @@ the bucket. A released record skips the recovery of the node log of the
 previous owner. A record that is written before these logs are recovered can
 therefore lose acknowledged writes, and a node that still serves the cell
 becomes a second writer.
+
+#### A birth-form record that no grant covers
+
+With `CELLD_LAZY_BIRTH=read`, a session that minted an id writes its first record
+without reading first (a birth-form record, `"birth": true`, at epoch 1). If the
+session's sealed chunk holds no grant for the id and the cell has LTX under
+`cells/<cell>/ltx/`, the record may hide a claim that another node made and that
+was then lost, so a node refuses the cell. The line is `celld ownership record
+lost: <cell>: a birth-form record over a cell that has LTX`, the hold is the same
+10 seconds, and the node counts each refusal as `p3_refusals` under
+`storage_counters.lazy_birth_session` in `/state`. celld does not repair it by
+itself: the repair is the one above. Stop each node that served the cell, wait
+until its node log is recovered, and write a released record at the newest epoch
+under `cells/<cell>/ltx/`. A cell with no LTX is not refused: the record is
+replaced at epoch 2.
+
+Once `read` has run in a fleet, an older binary (one that advertises no session
+format, or format 1) must not join it. It ignores `birth` and runs none of these
+rules, so it could claim a cell whose record was lost. A node of this build
+treats a live older lease as a reason not to grant: while one is live, a session
+waives every new id and takes the standard path. A node that runs with the flag
+`off` advertises no format either, so it closes the grant gate for the whole fleet
+while it is live. Rolling back the flag to `shadow` is safe; rolling back the
+binary is not.
 
 ### The epoch prefix
 

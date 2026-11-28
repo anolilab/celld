@@ -74,12 +74,14 @@ impl Mode {
         }
     }
 
-    /// The mode this process runs in. Only `off` and `shadow` are available
-    /// yet: a process must not run in a mode whose rules it does not have.
+    /// The mode this process runs in. `on` is not available yet: a process must
+    /// not run in a mode whose rules it does not have.
     pub fn from_env() -> anyhow::Result<Self> {
         match Self::parse(std::env::var(ENV).ok().as_deref())? {
-            mode @ (Self::Off | Self::Shadow) => Ok(mode),
-            mode => anyhow::bail!("{ENV}={mode:?} is not supported by this build; use `shadow`"),
+            mode @ (Self::Off | Self::Shadow | Self::Read) => Ok(mode),
+            mode => anyhow::bail!(
+                "{ENV}={mode:?} is not supported by this build; use `off`, `shadow` or `read`"
+            ),
         }
     }
 }
@@ -136,6 +138,13 @@ pub struct Session {
     /// request to the bucket. A slow write of one chunk holds up the writers of
     /// that chunk only, not the session.
     chunk_writers: Mutex<HashMap<u64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// The ids whose first request was already decided: the session grants an id
+    /// at its first request or never (B1, K4), so a waived id is never granted
+    /// later and a rejected birth write is followed by a real read.
+    decided: Mutex<BTreeSet<u64>>,
+    /// The ids decided as granted without a read: their record is a birth-form
+    /// record (P1).
+    births: Mutex<BTreeSet<u64>>,
     header_writer: tokio::sync::Mutex<()>,
     /// The next counter to issue: every counter below it was issued.
     issued: AtomicU64,
@@ -195,6 +204,8 @@ impl Session {
             sealed_with_bits: AtomicBool::new(false),
             held: tokio::sync::Mutex::default(),
             chunk_writers: Mutex::default(),
+            decided: Mutex::default(),
+            births: Mutex::default(),
             header_writer: tokio::sync::Mutex::new(()),
             established: AtomicBool::new(false),
             resumed: Mutex::default(),
@@ -468,10 +479,23 @@ fn shadow_failures() -> BTreeMap<&'static str, u64> {
         .clone()
 }
 
-/// The counters of a session, for `/state`; none without a session.
+static P3_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// A cell was refused because a birth-form record that no grant covers lies over
+/// LTX (P3). It stays refused until the operator repairs the record.
+pub(crate) fn note_p3_refusal() {
+    P3_REFUSALS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The counters of a session, for `/state`; none without a session, unless a
+/// refusal of P3 was counted (a node with the flag off judges such a cell too).
 pub(crate) fn counters_json() -> Option<serde_json::Value> {
-    let session = current()?;
+    let p3_refusals = P3_REFUSALS.load(Ordering::Relaxed);
+    let Some(session) = current() else {
+        return (p3_refusals > 0).then(|| serde_json::json!({ "p3_refusals": p3_refusals }));
+    };
     Some(serde_json::json!({
+        "p3_refusals": p3_refusals,
         "tag": session.tag(),
         "verified_under_carried_tag": CARRIED_VERIFIED.load(Ordering::Relaxed),
         "shadow_failures": shadow_failures(),
@@ -548,6 +572,32 @@ pub(crate) fn id_tag_of_scope(scope: &str) -> Option<String> {
 /// needs that session's key to be judged, which the chunk rules do later.
 pub(crate) fn scope_unissued(scope: &str) -> bool {
     scope_unissued_by(current(), scope)
+}
+
+/// Whether `scope` is an id that this process's open session minted. Such a cell
+/// is served here and never placed on a peer (B3): while the session is open, a
+/// peer that finds no record forwards the request back to the minting node.
+pub(crate) fn scope_minted_here(scope: &str) -> bool {
+    scope_minted_by(current(), scope)
+}
+
+fn scope_minted_by(session: Option<&Session>, scope: &str) -> bool {
+    let Some(session) = session else {
+        return false;
+    };
+    // Only a session whose peers forward its unrecorded ids back (B3) needs this:
+    // a `shadow` session arbitrates by its create-only write, and must not shed a
+    // resident cell for an id that a peer could claim.
+    session.mode() != Mode::Shadow
+        && !session.is_closed()
+        && match kind_of_scope(scope) {
+            Some(IdKind::Tagged { tag, block }) => {
+                tag == session.tag
+                    && decrypt_counter(&session.counter_key, block)
+                        < session.issued.load(Ordering::SeqCst)
+            }
+            _ => false,
+        }
 }
 
 fn scope_unissued_by(session: Option<&Session>, scope: &str) -> bool {
@@ -664,7 +714,18 @@ pub(crate) fn enqueue_mark(scope: &str, counter: u64) -> tokio::sync::oneshot::R
         counter,
         done,
     });
+    if let Some(wake) = SHIP_WAKE.get() {
+        wake.notify_one();
+    }
     wait
+}
+
+static SHIP_WAKE: OnceLock<std::sync::Arc<tokio::sync::Notify>> = OnceLock::new();
+
+/// The wake of the ship loop, so that a mark that waits for its proof does not wait
+/// for the next tick of the loop's timer. Set once, by the first log tier.
+pub(crate) fn set_ship_wake(wake: std::sync::Arc<tokio::sync::Notify>) {
+    let _ = SHIP_WAKE.set(wake);
 }
 
 pub(crate) fn take_marks() -> Vec<PendingMark> {
@@ -991,6 +1052,56 @@ impl Session {
         anyhow::bail!("the leave of {scope} lost every race")
     }
 
+    /// The decision of the first request for an id of this session in a mode that
+    /// skips today's read and lookup: `Some(counter)` when the id is this
+    /// session's, not granted and not yet decided. The caller then calls
+    /// [`Self::decide_birth`] once.
+    pub(crate) fn undecided_own_counter(&self, scope: &str) -> Option<u64> {
+        let counter = self.own_counter_of_scope(scope)?;
+        // An id that was never issued is nobody's to decide (a forged one would
+        // otherwise grow the sets for ever); the core refuses to claim it.
+        if counter >= self.issued.load(Ordering::SeqCst) {
+            return None;
+        }
+        let decided = self.decided.lock().expect("decided poisoned");
+        (!decided.contains(&counter) && !self.is_granted(counter)).then_some(counter)
+    }
+
+    /// Fix the decision for `counter`: grant it without a read (its record is a
+    /// birth-form record), or waive it (the standard path, for ever).
+    pub(crate) fn decide_birth(&self, counter: u64, grant: bool) {
+        self.decided
+            .lock()
+            .expect("decided poisoned")
+            .insert(counter);
+        if grant {
+            self.births.lock().expect("births poisoned").insert(counter);
+        }
+    }
+
+    /// Whether the record about to be written for `scope` is a birth-form one.
+    pub(crate) fn is_birth_scope(&self, scope: &str) -> bool {
+        self.own_counter_of_scope(scope)
+            .is_some_and(|counter| self.is_birth(counter))
+    }
+
+    pub(crate) fn is_birth(&self, counter: u64) -> bool {
+        self.births
+            .lock()
+            .expect("births poisoned")
+            .contains(&counter)
+    }
+
+    /// The id was decided and not granted: it is waived and takes the standard
+    /// path for the life of the session.
+    pub(crate) fn is_waived(&self, counter: u64) -> bool {
+        self.decided
+            .lock()
+            .expect("decided poisoned")
+            .contains(&counter)
+            && !self.is_birth(counter)
+    }
+
     fn chunk_writer(&self, chunk: u64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         self.chunk_writers
             .lock()
@@ -1216,6 +1327,75 @@ pub async fn seal_predecessor(bucket: &Bucket, node: &str, generation: &str) -> 
         }
         _ => Ok(()),
     }
+}
+
+/// B3: close the header of the session `tag`, whose node `node` is not live,
+/// after the takeover gate ran on that node. It is the step that ends the
+/// forward of a cell that has no record while the header is still open: without
+/// it a dead session that had no log, or whose node record is gone, would be
+/// forwarded to for ever. A header that names another node is left alone.
+///
+/// The header is read first and its token kept; then the node record is read;
+/// only then is the header closed. Where nothing fences the session (its node
+/// record is absent, or names another generation) the close is the one
+/// compare-and-swap on the token that was read before the node record, and it is
+/// never sent again on a token read after it: a lost close returns an error, and
+/// the caller starts again from the header read. A session that is fenced (its
+/// node record names its generation, with a lease that ran out) is closed by
+/// the ordinary seal, which may retry.
+pub async fn seal_dead_session(bucket: &Bucket, tag: &str, node: &str) -> anyhow::Result<()> {
+    let (gather, marks) = (BTreeSet::<u64>::new(), BTreeSet::<String>::new());
+    let (header, token) = match store::read_header(bucket, tag).await? {
+        store::Read::Found(header, _) if header.state == store::State::Sealed => return Ok(()),
+        // A close that began is continued by any node: the fence of the first
+        // step already holds.
+        store::Read::Found(header, _) if header.state == store::State::Sealing => {
+            return store::seal_session(bucket, tag, &gather, &marks).await;
+        }
+        store::Read::Found(header, token) => (header, token),
+        // A missing or unreadable header is replaced by a sealed, lost one.
+        _ => return store::seal_session(bucket, tag, &gather, &marks).await,
+    };
+    // The header of another node's session is not this node's to close.
+    if header.node != node {
+        return Ok(());
+    }
+    let record = match bucket.get(&format!("nodes/{node}.json")).await? {
+        Some((bytes, _)) => Some(serde_json::from_slice::<
+            crate::ownership_store::NodeLeaseWire,
+        >(&bytes)?),
+        None => None,
+    };
+    let now = crate::ownership_store::now_ms();
+    let fenced = match &record {
+        Some(lease) if lease.generation == header.generation => {
+            anyhow::ensure!(
+                lease.expires_ms <= now,
+                "the node {node} of session {tag} is live"
+            );
+            true
+        }
+        // A live record of another generation is a successor that installed
+        // without sealing this header: the order was broken, and nothing here
+        // closes it.
+        Some(lease) if lease.expires_ms > now => {
+            anyhow::bail!("node {node} runs a later generation than the header of {tag}")
+        }
+        _ => false,
+    };
+    if fenced {
+        return store::seal_session(bucket, tag, &gather, &marks).await;
+    }
+    let mut sealing = header;
+    sealing.state = store::State::Sealing;
+    sealing.rev += 1;
+    anyhow::ensure!(
+        store::swap_header(bucket, tag, &sealing, &token)
+            .await?
+            .is_some(),
+        "closing the header of {tag} lost its race; reading it again"
+    );
+    store::seal_session(bucket, tag, &gather, &marks).await
 }
 
 /// Name the session in the records of a preserved restart's cells, before the
@@ -1573,6 +1753,51 @@ mod tests {
         assert!(!session.resumed_at("c", "gone", 4));
         session.note_resumed("c", "old", 4);
         assert!(session.resumed_at("c", "old", 4));
+    }
+
+    #[test]
+    fn a_p3_refusal_is_counted_for_the_state() {
+        let before = P3_REFUSALS.load(Ordering::Relaxed);
+        note_p3_refusal();
+        assert_eq!(P3_REFUSALS.load(Ordering::Relaxed), before + 1);
+        assert!(counters_json().is_some_and(|json| json["p3_refusals"].as_u64() > Some(0)));
+    }
+
+    /// An id of the own open session that was issued is served on this node; an id
+    /// of another session, an unissued counter, or any id after the session closed
+    /// is not "minted here".
+    #[test]
+    fn only_an_issued_id_of_the_own_open_session_is_minted_here() {
+        register_class(SCRIPT, CLASS);
+        let session = Session::with_tag(Mode::Read, [7; 8], &[]);
+        session.establish();
+        let at = |counter| {
+            let block = encrypt_counter(&session.counter_key, counter);
+            let id = tagged_object_id(&key(), [7; 8], block);
+            format!("{CLASS}:{}", durable_object_id_hex(&id))
+        };
+        session.mint(&key()).expect("counter 0");
+        assert!(scope_minted_by(Some(&session), &at(0)));
+        assert!(!scope_minted_by(Some(&session), &at(1)), "not issued");
+        assert!(!scope_minted_by(None, &at(0)), "no session");
+        let other = tagged_object_id(&key(), [8; 8], [3; 8]);
+        assert!(!scope_minted_by(
+            Some(&session),
+            &format!("{CLASS}:{}", durable_object_id_hex(&other))
+        ));
+        assert!(!scope_minted_by(Some(&session), "Agent:plain"));
+        // A `shadow` session arbitrates by its create-only write: nothing is served
+        // here for it, and a full node sheds no cell for its ids.
+        let shadow = established([7; 8]);
+        shadow.mint(&key()).expect("counter 0");
+        let scope = {
+            let block = encrypt_counter(&shadow.counter_key, 0);
+            let id = tagged_object_id(&key(), [7; 8], block);
+            format!("{CLASS}:{}", durable_object_id_hex(&id))
+        };
+        assert!(!scope_minted_by(Some(&shadow), &scope));
+        session.closed.store(true, Ordering::SeqCst);
+        assert!(!scope_minted_by(Some(&session), &at(0)), "a closed session");
     }
 
     #[test]
@@ -2389,6 +2614,32 @@ mod tests {
             .unwrap()
             .expect("written");
         assert!(store::create_chunk(&bucket, "tag", 2).await.is_err());
+    }
+
+    /// The decision of an id's first request is made once: a waived id is never
+    /// granted, a granted one is a birth, and neither is asked again.
+    #[test]
+    fn an_id_is_decided_once_as_a_birth_or_a_waive() {
+        let session = established([2; 8]);
+        session.issued.store(2, Ordering::SeqCst);
+        let first = scope_for(&session, 0);
+        let second = scope_for(&session, 1);
+        // A counter that was never issued is not decided, so a forged id grows
+        // nothing.
+        assert_eq!(
+            session.undecided_own_counter(&scope_for(&session, 2)),
+            None,
+            "unissued"
+        );
+        assert_eq!(session.undecided_own_counter(&first), Some(0));
+        session.decide_birth(0, true);
+        session.decide_birth(1, false);
+        assert_eq!(session.undecided_own_counter(&first), None);
+        assert_eq!(session.undecided_own_counter(&second), None);
+        assert!(session.is_birth_scope(&first) && !session.is_waived(0));
+        assert!(!session.is_birth_scope(&second) && session.is_waived(1));
+        // An id of another session is nobody's to decide here.
+        assert_eq!(session.undecided_own_counter("Agent:nothex"), None);
     }
 
     #[test]

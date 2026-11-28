@@ -74,6 +74,16 @@ pub(crate) enum Verdict {
     Proceed,
     /// The cell is refused, held and logged.
     Refuse(&'static str),
+    /// The header or the chunk was not read in time. Nothing is known to be lost,
+    /// so the cell is refused for now and judged again after the hold; it is not
+    /// reported as a lost record.
+    TimedOut,
+    /// B3: the cell has no record and its session header is not sealed, so only
+    /// the minting session may make its first claim. The claim path goes on as if
+    /// the record named the session's node: a live node is forwarded to, a dead
+    /// one is recovered first (which seals the header) and the cell is judged
+    /// again by the sealed chunk.
+    Forward(OwnerRecord),
 }
 
 fn unhex(text: &str) -> Option<Vec<u8>> {
@@ -101,16 +111,39 @@ impl BucketOwnership {
         cell: &str,
         record: Option<(&OwnerRecord, &OwnerForm)>,
     ) -> anyhow::Result<Verdict> {
-        let Some(own) = session::current() else {
+        // The reads of another session's header and chunk are bounded, and a read
+        // that does not finish refuses the cell (it is held and logged like any
+        // lost record): the first-form rules fail closed.
+        match crate::asyncrt::timeout(taker_step_wait(), self.judge_tagged_unbounded(cell, record))
+            .await
+        {
+            Ok(verdict) => verdict,
+            Err(_) => Ok(Verdict::TimedOut),
+        }
+    }
+
+    async fn judge_tagged_unbounded(
+        &self,
+        cell: &str,
+        record: Option<(&OwnerRecord, &OwnerForm)>,
+    ) -> anyhow::Result<Verdict> {
+        #[cfg(test)]
+        crate::asyncrt::sleep(self.read_delay()).await;
+        // The rules run in every mode of this build, and in a process with no
+        // session at all (`off`, or a `shadow` session that was given up): they
+        // follow what another session's header says, never the reader's own flag
+        // (B7). Such a process is no session's author, and it writes no first-form
+        // record.
+        let own = session::current();
+        let own_tag = own.map(|own| own.tag());
+        // An id with no tag takes no lock and no read here.
+        let Some(tag) = session::id_tag_of_scope(cell) else {
             return Ok(Verdict::Proceed);
         };
         // A plan belongs to one decision: a cell that is read again is judged
         // again.
         self.k5.take(cell);
-        let Some(tag) = session::id_tag_of_scope(cell) else {
-            return Ok(Verdict::Proceed);
-        };
-        if tag == own.tag() {
+        if own_tag.as_deref() == Some(tag.as_str()) {
             return Ok(Verdict::Proceed);
         }
         // A record of an older binary names no session and is not judged.
@@ -123,6 +156,26 @@ impl BucketOwnership {
             Some(header) => Some(header),
             None => match store::read_header(&bucket, &tag).await? {
                 Read::Found(header, _) if header.state != store::State::Sealed => {
+                    // A `shadow` session still writes the record of every id with
+                    // the create-only write of today, which arbitrates between it
+                    // and any taker, so only `read` and `on` need the forward.
+                    if record.is_none()
+                        && header.node != self.node_name()
+                        && header.mode != session::Mode::Shadow
+                    {
+                        tracing::debug!(
+                            cell,
+                            tag,
+                            node = %header.node,
+                            "no record and an unsealed header: the minting node decides"
+                        );
+                        return Ok(Verdict::Forward(OwnerRecord {
+                            node: Some(header.node),
+                            epoch: 1,
+                            etag: String::new(),
+                            by: Some(tag),
+                        }));
+                    }
                     tracing::debug!(cell, tag, "session header not sealed; standard path");
                     return Ok(Verdict::Proceed);
                 }
@@ -173,7 +226,10 @@ impl BucketOwnership {
         // finish it, so the cell acts only after the mark.
         if let (Some((record, form)), Some(entries)) = (record, cell_entries.as_mut()) {
             if let (Some(nonce), Some(by)) = (&form.nonce, &record.by) {
-                if *by == own.tag() && entries.taken.is_none() && !entries.unknown {
+                if own_tag.as_deref() == Some(by.as_str())
+                    && entries.taken.is_none()
+                    && !entries.unknown
+                {
                     entries.taken = Some(
                         match store::mark_taken(&bucket, &tag, counter, nonce).await? {
                             store::Marked::Ours => nonce.clone(),
@@ -230,6 +286,19 @@ impl BucketOwnership {
             author_live,
             placed: false,
         });
+        // A birth-form record that no grant covers is also held to the guard of the
+        // standard path: the strictest of the two rules decides (P3).
+        let verdict = match (&verdict, record) {
+            (Take::FirstOverRecord { .. }, Some((_, form))) if form.birth => {
+                let exists = self.ltx_exists(cell).await?;
+                let guarded = take::birth_guard(verdict, true, exists);
+                if matches!(guarded, Take::Refuse(_)) {
+                    session::note_p3_refusal();
+                }
+                guarded
+            }
+            _ => verdict,
+        };
         let judged = record.map(|(record, _)| record.etag.clone());
         let plan = |over: Vec<String>| K5Plan {
             nonce: new_nonce(),
@@ -244,7 +313,7 @@ impl BucketOwnership {
         let writes_marked_records = !matches!(
             verdict,
             Take::FirstNew { .. } | Take::FirstOverRecord { .. } | Take::ReplaceFirst { .. }
-        ) || self.all_leases_capable(false).await;
+        ) || (own.is_some() && self.all_leases_capable(false).await);
         if !writes_marked_records {
             tracing::info!(
                 event = "session_rule",
@@ -336,6 +405,26 @@ mod tests {
         assert_eq!(unhex("zz"), None);
     }
 }
+
+/// The longest a step of the path that claims another session's id waits for the
+/// bucket. A step that does not finish fails closed.
+const TAKER_STEP_WAIT_MS: u64 = 5_000;
+
+/// The bound of one step of that path; a test shortens it.
+pub(crate) fn taker_step_wait() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let ms = TAKER_WAIT_OVERRIDE_MS.load(std::sync::atomic::Ordering::SeqCst);
+        if ms != 0 {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    std::time::Duration::from_millis(TAKER_STEP_WAIT_MS)
+}
+
+#[cfg(test)]
+pub(crate) static TAKER_WAIT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// The sealed headers this process has read, by tag. A sealed header is final.
 static SEALED_HEADERS: std::sync::Mutex<

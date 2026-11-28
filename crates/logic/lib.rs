@@ -904,6 +904,12 @@ pub struct State {
     /// Whether the id of a cell is this process's own and names a counter it
     /// never issued: such a cell is never claimed.
     id_unissued: Option<fn(&str) -> bool>,
+    /// Whether the id of a cell is one that this process minted: only this node
+    /// can serve it while its session is open and no record exists, because a
+    /// peer that finds no record forwards the request back (B3). Such a cell is
+    /// never placed on a peer. A draining node refuses it like any inactive cell,
+    /// with a retryable error, until its seal lets a peer judge the cell.
+    minted_here: Option<fn(&str) -> bool>,
     /// The tag and epoch of the record of each cell this process resumed in a
     /// preserved restart. A predecessor's tag names this process only here.
     resumed: BTreeMap<CellId, (String, Epoch)>,
@@ -977,6 +983,7 @@ impl State {
             session_active: None,
             id_tag: None,
             id_unissued: None,
+            minted_here: None,
             resumed: BTreeMap::new(),
         }
     }
@@ -1014,6 +1021,16 @@ impl State {
     /// Refuse to claim a cell for which `unissued` answers true.
     pub fn set_id_unissued(&mut self, unissued: fn(&str) -> bool) {
         self.id_unissued = Some(unissued);
+    }
+
+    /// Serve the cells for which `minted` answers true on this node: they are not
+    /// placed on a peer.
+    pub fn set_minted_here(&mut self, minted: fn(&str) -> bool) {
+        self.minted_here = Some(minted);
+    }
+
+    fn is_minted_here(&self, id: &str) -> bool {
+        self.minted_here.is_some_and(|minted| minted(id))
     }
 
     /// Whether `record` names this process, or a predecessor whose cell this
@@ -4335,6 +4352,22 @@ impl State {
             return;
         }
 
+        // An id that this node minted and has not recorded is served here: a peer
+        // that took it would find no record and an open session, and forward the
+        // request back, so it would be refused for as long as this node is full.
+        // The cell waits for a slot and sheds one, as a claim does that no peer
+        // can serve.
+        if self.hosts_cells() && self.is_minted_here(id) {
+            self.activate_or_wait(
+                id,
+                cell,
+                Activation::Claim(claim),
+                WhenFull::ShedToAdmit,
+                effects,
+            );
+            return;
+        }
+
         self.place_on_peer(id, cell, claim, effects);
     }
 
@@ -4841,11 +4874,17 @@ impl State {
                 // A record whose author is no process that this node's lease
                 // carries was written by a predecessor of that node, which the
                 // node recovered before its own install.
-                let unrecovered = lease.as_ref().is_some_and(|lease| {
-                    lease.record.log_state != Some(crate::log_tier::LogState::Sealed)
-                        && (record.node.as_deref() != Some(lease.record.node.as_str())
-                            || session::author_live(record.by.as_deref(), &lease.record.tags))
-                });
+                // The record that the reader rules made up for a cell that has none
+                // (B3: its id's session is not sealed) has an empty etag. Nothing is
+                // written over it, so the gate runs on its node whatever the lease
+                // says, also with no lease at all: the recovery ends with the seal of
+                // the session's header, which is what lets the cell be judged again.
+                let unrecovered = record.etag.is_empty()
+                    || lease.as_ref().is_some_and(|lease| {
+                        lease.record.log_state != Some(crate::log_tier::LogState::Sealed)
+                            && (record.node.as_deref() != Some(lease.record.node.as_str())
+                                || session::author_live(record.by.as_deref(), &lease.record.tags))
+                    });
                 // An ingress-only node leaves the dead owner's log to the
                 // peer that takes the cell.
                 if unrecovered && self.hosts_cells() {
@@ -4921,6 +4960,13 @@ impl State {
             unreachable!()
         };
         match result {
+            // The reader rules refused the cell once the recovery was done: the
+            // answer is final, and the cell is held, not tried again.
+            Err(Failure::Definite) => {
+                cell.owner_log_recovery_attempts = 0;
+                set_phase(&mut self.occupied, &mut cell, Phase::Inactive);
+                self.finish_requests(&id, &mut cell, Err(RequestError::ResolveFailed), effects);
+            }
             Ok(()) => {
                 let Some(epoch) = self.next_writer_epoch(&id, &mut cell, owner.epoch, effects)
                 else {

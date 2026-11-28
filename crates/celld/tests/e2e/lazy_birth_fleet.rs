@@ -24,7 +24,17 @@ use serde_json::Value;
 
 use super::harness::{client, fixture_dir, run_id, signal_group, wait_until};
 
-const CELLD: &str = env!("CARGO_BIN_EXE_celld");
+// The counting proxy of the request bench: the nodes of a counted fleet talk to
+// the bucket through it, and its tally is the requests that each key got.
+#[path = "../../benches/support/mod.rs"]
+#[allow(clippy::pedantic)]
+mod support;
+
+/// The binary under test. `LAZY_FLEET_CELLD` names another build, so a run can be
+/// compared with one of an older commit by the same harness.
+fn celld_bin() -> String {
+    std::env::var("LAZY_FLEET_CELLD").unwrap_or_else(|_| env!("CARGO_BIN_EXE_celld").to_string())
+}
 const TOKEN: &str = "lazy-birth-fleet-token";
 
 fn region() -> String {
@@ -34,6 +44,7 @@ fn region() -> String {
 pub struct Node {
     child: Option<Child>,
     pub public: String,
+    internal: String,
     home: PathBuf,
 }
 
@@ -55,7 +66,7 @@ impl Node {
             .append(true)
             .open(home.join("celld.log"))
             .expect("open the node log");
-        let child = Command::new(CELLD)
+        let child = Command::new(celld_bin())
             .args(["--bucket", bucket, "--endpoint", endpoint])
             .args(["--region", &region()])
             .args(["--listen", &format!("127.0.0.1:{public}")])
@@ -76,8 +87,47 @@ impl Node {
         Node {
             child: Some(child),
             public: format!("http://127.0.0.1:{public}"),
+            internal: format!("http://127.0.0.1:{internal}"),
             home,
         }
+    }
+
+    /// Send a signal to the node's process group.
+    pub fn signal(&self, signal: &str) {
+        if let Some(child) = &self.child {
+            signal_group(child.id(), signal);
+        }
+    }
+
+    /// A preserved restart: ask the node to stop and keep its cells for the
+    /// next process of this directory, then wait for it to exit.
+    pub async fn preserve(&mut self, client: &reqwest::Client) {
+        let response = client
+            .post(format!("{}/shutdown?handoff=preserve", self.internal))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .expect("ask for a preserved stop");
+        assert!(response.status().is_success(), "{}", response.status());
+        let mut child = self.child.take().expect("a running node");
+        wait_until("the node to exit", Duration::from_secs(90), || {
+            let exited = matches!(child.try_wait(), Ok(Some(_)));
+            async move { exited.then_some(()) }
+        })
+        .await;
+    }
+
+    /// The node's `/state`.
+    pub async fn state(&self, client: &reqwest::Client) -> Value {
+        client
+            .get(format!("{}/state", self.internal))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .expect("read the node")
+            .json()
+            .await
+            .expect("decode the node")
     }
 
     pub fn log(&self) -> String {
@@ -161,6 +211,8 @@ pub struct Fleet {
     pub nodes: Vec<Node>,
     pub client: reqwest::Client,
     pub bucket: Bucket,
+    /// The proxy that counts the requests of the nodes, for a counted fleet.
+    pub proxy: Option<support::Proxy>,
 }
 
 impl Fleet {
@@ -181,16 +233,52 @@ impl Fleet {
         envs: &[&[(&str, &str)]],
         node_endpoint: Option<String>,
     ) -> Option<Fleet> {
+        Fleet::start_inner(fixture, envs, node_endpoint, false).await
+    }
+
+    /// A fleet whose nodes reach the bucket through a counting proxy.
+    pub async fn start_counted(fixture: &str, nodes: usize, env: &[(&str, &str)]) -> Option<Fleet> {
+        Fleet::start_inner(fixture, &vec![env; nodes], None, true).await
+    }
+
+    async fn start_inner(
+        fixture: &str,
+        envs: &[&[(&str, &str)]],
+        node_endpoint: Option<String>,
+        counted: bool,
+    ) -> Option<Fleet> {
         let Ok(bucket) = std::env::var("CELLD_STORE_CONTRACT_BUCKET") else {
             eprintln!("skipped: CELLD_STORE_CONTRACT_BUCKET is not set");
             return None;
         };
         let store = std::env::var("AWS_ENDPOINT_URL").expect("AWS_ENDPOINT_URL names the store");
-        let endpoint = node_endpoint.unwrap_or_else(|| store.clone());
         let run = run_id("lazy");
         let spec = format!("{}/{run}", bucket.trim_end_matches('/'));
+        let proxy = if counted {
+            let upstream = store
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+                .to_string();
+            let root = spec.trim_start_matches("s3://").to_string();
+            Some(
+                support::Proxy::start(
+                    "127.0.0.1:0",
+                    upstream,
+                    root,
+                    support::Classifier::default_layout(),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        let endpoint = proxy
+            .as_ref()
+            .map(|proxy| proxy.url.clone())
+            .or(node_endpoint)
+            .unwrap_or_else(|| store.clone());
         let home = tempfile::TempDir::new().expect("create a temp dir");
-        let deployed = Command::new(CELLD)
+        let deployed = Command::new(celld_bin())
             .arg("deploy")
             .arg(fixture_dir(fixture))
             .args(["--bucket", &spec, "--endpoint", &store])
@@ -222,6 +310,7 @@ impl Fleet {
             nodes,
             client,
             bucket,
+            proxy,
         })
     }
 
@@ -279,9 +368,18 @@ impl Fleet {
 
     /// Delete every object the run wrote.
     pub async fn clean(&self) {
-        let keys = self.keys("").await;
-        let deleted = self.bucket.delete_many(&keys).await;
-        assert_eq!(deleted.len(), keys.len(), "cleanup left objects");
+        // A store deletes a bounded number of keys in one request: go on until the
+        // run's prefix is empty.
+        let mut left = usize::MAX;
+        for _ in 0..8 {
+            let keys = self.keys("").await;
+            if keys.is_empty() {
+                return;
+            }
+            self.bucket.delete_many(&keys).await;
+            left = keys.len();
+        }
+        panic!("cleanup left objects: at least {left}");
     }
 }
 
@@ -1217,6 +1315,1053 @@ async fn s10_a_bucket_that_refuses_for_a_minute_loses_no_acknowledged_grant() {
         }
     }
     proxy.refuse(false);
+    fleet.nodes.clear();
+    fleet.clean().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn agents() -> usize {
+    std::env::var("LAZY_FLEET_AGENTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200)
+}
+
+/// The sum of the requests of each class in a tally.
+fn class_totals(tally: &support::Tally) -> (u64, u64) {
+    let mut totals = (0, 0);
+    for ((kind, _, _), n) in tally {
+        match support::class_of(kind) {
+            support::Class::A => totals.0 += n,
+            support::Class::B => totals.1 += n,
+            support::Class::Free => {}
+        }
+    }
+    totals
+}
+
+/// The requests of one kind (all kinds when empty) whose key shape contains
+/// `needle`.
+fn requests_on(tally: &support::Tally, kind: &str, needle: &str) -> u64 {
+    tally
+        .iter()
+        .filter(|((k, shape, _), _)| (kind.is_empty() || k == kind) && shape.contains(needle))
+        .map(|(_, n)| n)
+        .sum()
+}
+
+/// The requests a minted agent costs, measured at the bucket through the counting
+/// proxy: the window of the run minus an idle window of the same length, divided
+/// by the agents. Returns the class A and class B per agent, and the requests on
+/// `own.json` (all, and the GETs).
+async fn requests_per_minted_agent(mode: &'static str) -> (f64, f64, u64, u64) {
+    // The checkpoint interval is the default of 30 s, as in production.
+    let env: &[(&str, &str)] = &[("CELLD_LAZY_BIRTH", mode), ("CELLD_TEST_TAGGED_IDS", "1")];
+    let Some(fleet) = Fleet::start_counted("do-ids", 3, env).await else {
+        return (0.0, 0.0, 0, 0);
+    };
+    let result = std::sync::Arc::new(std::sync::Mutex::new((0.0, 0.0, 0, 0)));
+    let out = result.clone();
+    with_fleet(fleet, |fleet| async move {
+        if mode == "off" {
+            wait_until("an ensemble", Duration::from_secs(90), || async {
+                let lease = fleet.object("nodes/lazy-0.json").await?;
+                (lease["log"]["state"] == "open"
+                    && !lease["log"]["ensemble"].as_array()?.is_empty())
+                .then_some(())
+            })
+            .await;
+        } else {
+            wait_for_ensemble(&fleet).await;
+        }
+        // A warm-up agent settles the session's own writes.
+        assert_eq!(spawn_agents(&fleet, 1).await.len(), 1);
+        let proxy = fleet.proxy.as_ref().expect("a counted fleet");
+        let n = agents();
+        // The idle window: the same time without agents.
+        let idle_from = proxy.take();
+        let idle_started = Instant::now();
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        let idle = support::diff(&proxy.take(), &idle_from).expect("diff");
+        let idle_secs = idle_started.elapsed().as_secs_f64();
+        let before = proxy.take();
+        let started = Instant::now();
+        assert_eq!(spawn_agents(&fleet, n).await.len(), n);
+        // The run ends after a checkpoint of the session has fallen in the window.
+        tokio::time::sleep(Duration::from_secs(35)).await;
+        let after = proxy.take();
+        let secs = started.elapsed().as_secs_f64();
+        let load = support::diff(&after, &before).expect("diff");
+        let (a, b) = class_totals(&load);
+        let (idle_a, idle_b) = class_totals(&idle);
+        let scale = secs / idle_secs;
+        let net_a = a as f64 - idle_a as f64 * scale;
+        let net_b = b as f64 - idle_b as f64 * scale;
+        let own_get = requests_on(&load, "GET", "/own.json");
+        let own_all = requests_on(&load, "", "/own.json");
+        eprintln!(
+            "S4 mode={mode} agents={n} window={secs:.0}s: all-in A={a} B={b}; idle-scaled A={:.1} B={:.1}; \
+             net per agent A={:.3} B={:.3}; own.json requests={own_all} (GET {own_get})",
+            idle_a as f64 * scale,
+            idle_b as f64 * scale,
+            net_a / n as f64,
+            net_b / n as f64,
+        );
+        for ((kind, shape, part), count) in &load {
+            eprintln!("  {kind} {shape} {part:?} {count}");
+        }
+        *out.lock().unwrap() = (net_a / n as f64, net_b / n as f64, own_all, own_get);
+        fleet
+    })
+    .await;
+    let value = *result.lock().unwrap();
+    value
+}
+
+/// S4: requests per minted agent, `read` against the same run with the flag off
+/// (random ids). `read` skips the read and the listing of the cell: at most 2.05
+/// class A and 1.05 class B per agent, and no GET of `own.json`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s4_a_minted_agent_in_read_costs_no_read_and_no_listing() {
+    let (off_a, off_b, off_own, off_get) = requests_per_minted_agent("off").await;
+    // `LAZY_FLEET_S4_OFF_ONLY=1`: only the run with the flag off, to compare builds.
+    if std::env::var("LAZY_FLEET_S4_OFF_ONLY").is_ok() {
+        eprintln!("S4 off-only: A {off_a:.3} B {off_b:.3}, own.json {off_own} (GET {off_get})");
+        return;
+    }
+    let (a, b, own_all, own_get) = requests_per_minted_agent("read").await;
+    if a == 0.0 && b == 0.0 {
+        return;
+    }
+    let n = agents() as u64;
+    eprintln!("S4 off:  A {off_a:.3} B {off_b:.3}, own.json {off_own} (GET {off_get})");
+    eprintln!("S4 read: A {a:.3} B {b:.3}, own.json {own_all} (GET {own_get})");
+    assert_eq!(own_get, 0, "read skips the read of own.json");
+    assert_eq!(
+        own_all, n,
+        "one create-only write of own.json for each agent"
+    );
+    assert!(a <= 2.05 && b <= 1.05, "per agent A {a:.3} B {b:.3}");
+    assert!(a < off_a && b < off_b, "read costs less than off");
+}
+
+const READ: &[(&str, &str)] = &[
+    ("CELLD_LAZY_BIRTH", "read"),
+    ("CELLD_TEST_TAGGED_IDS", "1"),
+    ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "500"),
+];
+
+fn cells() -> usize {
+    std::env::var("LAZY_FLEET_CELLS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(12)
+}
+
+/// Ids from `/mint`, which makes three at a time and calls none of them.
+async fn mint(fleet: &Fleet, count: usize) -> Vec<String> {
+    let mut ids = Vec::new();
+    while ids.len() < count {
+        let minted = fleet.get_json(0, "/mint").await.expect("mint");
+        ids.extend(
+            minted["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_str().unwrap().to_string()),
+        );
+    }
+    ids.truncate(count);
+    ids
+}
+
+async fn delete_records(fleet: &Fleet, ids: &[String]) {
+    let keys: Vec<String> = ids
+        .iter()
+        .map(|id| format!("cells/Cell:{id}/own.json"))
+        .collect();
+    let deleted = fleet.bucket.delete_many(&keys).await;
+    assert_eq!(deleted.len(), keys.len());
+}
+
+/// Every call of every cell goes through a peer until it answers; the answer is
+/// the counter.
+async fn answer_through_peers(fleet: &Fleet, id: &str, wait: Duration) -> u64 {
+    wait_until("a peer to answer", wait, || async {
+        peer_answers(fleet, id).await.first().copied()
+    })
+    .await
+}
+
+/// S5. The minting node is killed under a set of cells that each acknowledged a
+/// write. Every cell answers again on a peer with its last acknowledged write.
+/// The time until all answer is reported for the flag on and, as the control, off.
+async fn s5_run(mode: &'static str) -> (Duration, usize) {
+    let env: &'static [(&str, &str)] = Box::leak(Box::new([
+        ("CELLD_LAZY_BIRTH", mode),
+        ("CELLD_TEST_TAGGED_IDS", "1"),
+        ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "500"),
+    ]));
+    let Some(fleet) = Fleet::start("do-ids", 3, env).await else {
+        return (Duration::ZERO, 0);
+    };
+    let out = std::sync::Arc::new(std::sync::Mutex::new((Duration::ZERO, 0)));
+    let result = out.clone();
+    with_fleet(fleet, |mut fleet| async move {
+        let lease_ready = mode == "off";
+        if lease_ready {
+            wait_until("an ensemble", Duration::from_secs(90), || async {
+                let lease = fleet.object("nodes/lazy-0.json").await?;
+                (lease["log"]["state"] == "open"
+                    && !lease["log"]["ensemble"].as_array()?.is_empty())
+                .then_some(())
+            })
+            .await;
+        } else {
+            wait_for_ensemble(&fleet).await;
+        }
+        let ids = spawn_agents(&fleet, agents_in_drills()).await;
+        // Let the writes reach a bundle, as they do in a moment of a real run.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        // The lease of the minting node renews every few seconds and a peer takes its
+        // cells only after it ran out: kill right after a renewal, so that both runs
+        // wait for the same lease and the times compare.
+        let first = fleet
+            .object("nodes/lazy-0.json")
+            .await
+            .map(|lease| lease["expires_ms"].clone());
+        wait_until(
+            "a renewal of the lease",
+            Duration::from_secs(30),
+            || async {
+                let now = fleet.object("nodes/lazy-0.json").await?["expires_ms"].clone();
+                (Some(&now) != first.as_ref()).then_some(())
+            },
+        )
+        .await;
+        fleet.nodes[0].kill();
+        let started = Instant::now();
+        // All the agents ask at once, as clients do.
+        let timed = futures_util::future::join_all(ids.iter().map(|id| async {
+            let n = answer_through_peers(&fleet, id, Duration::from_secs(240)).await;
+            (n, started.elapsed())
+        }))
+        .await;
+        let wrong = timed.iter().filter(|(n, _)| *n != 2).count();
+        let mut times: Vec<Duration> = timed.iter().map(|(_, t)| *t).collect();
+        times.sort();
+        eprintln!(
+            "S5 {mode}: first answer {:.2}s, median {:.2}s, last {:.2}s",
+            times[0].as_secs_f64(),
+            times[times.len() / 2].as_secs_f64(),
+            times[times.len() - 1].as_secs_f64()
+        );
+        if let Ok(dir) = std::env::var("LAZY_FLEET_KEEP_LOGS") {
+            for (index, node) in fleet.nodes.iter().enumerate() {
+                let _ = std::fs::write(format!("{dir}/s5-{mode}-node-{index}.log"), node.log());
+            }
+        }
+        *result.lock().unwrap() = (started.elapsed(), wrong);
+        fleet
+    })
+    .await;
+    let value = *out.lock().unwrap();
+    value
+}
+
+#[tokio::test]
+async fn s5_killing_the_minting_node_loses_no_write_and_answers_again() {
+    let (read, wrong_read) = s5_run("read").await;
+    let (off, wrong_off) = s5_run("off").await;
+    eprintln!(
+        "S5 agents {}: every agent answers {:.1}s after the kill in read (wrong answers {wrong_read}), {:.1}s with it off (wrong {wrong_off})",
+        agents_in_drills(),
+        read.as_secs_f64(),
+        off.as_secs_f64()
+    );
+    assert_eq!(wrong_read, 0, "a write was lost");
+    assert!(
+        read <= off + Duration::from_secs(1),
+        "the plan allows the control plus one second"
+    );
+}
+
+/// S6, the paused minting process. The process is stopped for three lease
+/// lifetimes and continued. Peers take its cells meanwhile; afterwards no cell has
+/// two writers: every answer goes on from the counter of the writer that took it.
+#[tokio::test]
+async fn s6_a_paused_minting_process_acknowledges_nothing_after_its_cells_were_taken() {
+    let Some(fleet) = Fleet::start("do-ids", 3, READ).await else {
+        return;
+    };
+    with_fleet(fleet, |fleet| async move {
+        wait_for_ensemble(&fleet).await;
+        let ids = spawn_agents(&fleet, agents_in_drills().min(20)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        fleet.nodes[0].signal("STOP");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let mut last = Vec::new();
+        for id in &ids {
+            let n = answer_through_peers(&fleet, id, Duration::from_secs(240)).await;
+            assert_eq!(n, 2, "the peer took the cell with its acknowledged write");
+            last.push(n);
+        }
+        fleet.nodes[0].signal("CONT");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        // The paused process must not answer from a state of its own: whatever
+        // it answers (or forwards) goes on from the peer's counter.
+        for (id, before) in ids.iter().zip(&last) {
+            if let Some(out) = fleet.get_json(0, &format!("/bump?id={id}")).await {
+                assert!(out["n"].as_u64().unwrap() > *before, "{out}");
+            }
+            let peer = answer_through_peers(&fleet, id, Duration::from_secs(60)).await;
+            assert!(peer > *before);
+        }
+        fleet
+    })
+    .await;
+}
+
+/// S9. Every node's disk is wiped and the fleet starts again from the bucket. The
+/// agents answer with the state that the same drill gives with the flag off.
+async fn s9_run(mode: &'static str) -> Vec<u64> {
+    let env: &'static [(&str, &str)] = Box::leak(Box::new([
+        ("CELLD_LAZY_BIRTH", mode),
+        ("CELLD_TEST_TAGGED_IDS", "1"),
+        ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "500"),
+    ]));
+    let Some(fleet) = Fleet::start("do-ids", 3, env).await else {
+        return Vec::new();
+    };
+    let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let result = out.clone();
+    with_fleet(fleet, |mut fleet| async move {
+        if mode == "off" {
+            wait_until("an ensemble", Duration::from_secs(90), || async {
+                let lease = fleet.object("nodes/lazy-0.json").await?;
+                (lease["log"]["state"] == "open"
+                    && !lease["log"]["ensemble"].as_array()?.is_empty())
+                .then_some(())
+            })
+            .await;
+        } else {
+            wait_for_ensemble(&fleet).await;
+        }
+        let ids = spawn_agents(&fleet, agents_in_drills()).await;
+        // Past the flush of the bundles and the checkpoint.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        for node in &mut fleet.nodes {
+            node.kill();
+        }
+        for index in 0..3 {
+            let _ = std::fs::remove_dir_all(fleet.home.path().join(format!("node-{index}")));
+        }
+        for index in 0..3 {
+            fleet.respawn(index, env).await;
+        }
+        let mut answers = Vec::new();
+        for id in &ids {
+            let n = wait_until("an agent to answer", Duration::from_secs(240), || async {
+                fleet.get_json(0, &format!("/bump?id={id}")).await
+            })
+            .await;
+            answers.push(n["n"].as_u64().unwrap());
+        }
+        *result.lock().unwrap() = answers;
+        fleet
+    })
+    .await;
+    let value = out.lock().unwrap().clone();
+    value
+}
+
+#[tokio::test]
+async fn s9_wiped_disks_restart_from_the_bucket_with_the_answers_of_the_flag_off_run() {
+    let read = s9_run("read").await;
+    let off = s9_run("off").await;
+    eprintln!(
+        "S9 agents {}: answers equal {}, read {:?}, off {:?}",
+        read.len(),
+        read == off,
+        read.iter().filter(|n| **n == 2).count(),
+        off.iter().filter(|n| **n == 2).count()
+    );
+    assert_eq!(read, off);
+}
+
+/// New agents are made at a steady pace by a few clients through all three
+/// nodes while the nodes are restarted one at a time: first by a drain, then twice
+/// by a preserved restart with resident cells. A call that fails is tried on the
+/// next node. Reports the success of new ids and the time of each restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s8_rolling_and_preserved_restarts_under_a_stream_of_new_agents() {
+    let mode: &'static str = Box::leak(
+        std::env::var("LAZY_FLEET_S8_MODE")
+            .unwrap_or_else(|_| "read".into())
+            .into_boxed_str(),
+    );
+    let env: &'static [(&str, &str)] = Box::leak(Box::new([
+        ("CELLD_LAZY_BIRTH", mode),
+        ("CELLD_TEST_TAGGED_IDS", "1"),
+        ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "500"),
+    ]));
+    let Some(mut fleet) = Fleet::start("do-ids", 3, env).await else {
+        return;
+    };
+    let body = async {
+        if mode != "off" {
+            wait_for_ensemble(&fleet).await;
+        } else {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+        }
+        let resident = spawn_agents(&fleet, 20).await;
+        let urls: Vec<String> = fleet.nodes.iter().map(|node| node.public.clone()).collect();
+        let _ = urls;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ok = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let bad = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // The nodes change address on a restart: the clients read the current
+        // addresses from a shared list.
+        let addresses = std::sync::Arc::new(std::sync::Mutex::new(urls));
+        let mut clients = Vec::new();
+        for worker in 0..6 {
+            let (stop, ok, bad, addresses, client) = (
+                stop.clone(),
+                ok.clone(),
+                bad.clone(),
+                addresses.clone(),
+                fleet.client.clone(),
+            );
+            clients.push(tokio::spawn(async move {
+                let mut turn = worker;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    let mut done = false;
+                    for attempt in 0..3 {
+                        let url = {
+                            let addresses = addresses.lock().unwrap();
+                            addresses[(turn + attempt) % addresses.len()].clone()
+                        };
+                        let response = client
+                            .get(format!("{url}/spawn?n=1"))
+                            .timeout(Duration::from_secs(20))
+                            .send()
+                            .await;
+                        match response {
+                            Ok(r) if r.status().is_success() => {
+                                done = true;
+                                break;
+                            }
+                            Ok(r) => {
+                                let status = r.status();
+                                let body = r.text().await.unwrap_or_default();
+                                eprintln!(
+                                    "S8 failed call: {status} {}",
+                                    &body[..body.len().min(160)]
+                                );
+                            }
+                            Err(error) => eprintln!("S8 failed call: {error}"),
+                        }
+                    }
+                    let counter = if done { &ok } else { &bad };
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    turn += 1;
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                }
+            }));
+        }
+        let started = Instant::now();
+        let mut times = Vec::new();
+        let publish = |fleet: &Fleet| {
+            *addresses.lock().unwrap() = fleet.nodes.iter().map(|n| n.public.clone()).collect();
+        };
+        // A rolling restart by a drain.
+        for index in 0..3 {
+            let t = Instant::now();
+            fleet.nodes[index].stop();
+            fleet.respawn(index, env).await;
+            publish(&fleet);
+            times.push(("drain", t.elapsed()));
+        }
+        // Two deploys in a row, each a preserved restart of every node.
+        for _ in 0..2 {
+            for index in 0..3 {
+                let t = Instant::now();
+                let client = fleet.client.clone();
+                fleet.nodes[index].preserve(&client).await;
+                let node = Node::spawn(fleet.home.path(), index, &fleet.spec, &fleet.endpoint, env);
+                node.wait_ready(&fleet.client).await;
+                fleet.nodes[index] = node;
+                publish(&fleet);
+                times.push(("preserved", t.elapsed()));
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        for client in clients {
+            let _ = client.await;
+        }
+        for (index, node) in fleet.nodes.iter().enumerate() {
+            let log = node.log();
+            for needle in [
+                "SELF-FENCE",
+                "clean_reload_abandoned",
+                "pending_grant",
+                "NodeFenced",
+            ] {
+                let lines: Vec<&str> = log.lines().filter(|line| line.contains(needle)).collect();
+                if let Some(first) = lines.first() {
+                    eprintln!(
+                        "S8 node {index} {needle}: {} lines, first: {}",
+                        lines.len(),
+                        &first[..first.len().min(300)]
+                    );
+                }
+            }
+        }
+        if let Ok(dir) = std::env::var("LAZY_FLEET_KEEP_LOGS") {
+            for (index, node) in fleet.nodes.iter().enumerate() {
+                let _ = std::fs::write(format!("{dir}/s8-node-{index}.log"), node.log());
+            }
+        }
+        let (ok, bad) = (
+            ok.load(std::sync::atomic::Ordering::SeqCst),
+            bad.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        let secs = started.elapsed().as_secs_f64();
+        let slowest = times.iter().map(|(_, t)| *t).max().unwrap();
+        eprintln!(
+            "S8 {:.0}s, {ok} new agents ok, {bad} failed after three attempts: {:.2}% success, {:.1} ids/s; slowest restart {:.1}s",
+            secs,
+            100.0 * ok as f64 / (ok + bad).max(1) as f64,
+            ok as f64 / secs,
+            slowest.as_secs_f64()
+        );
+        assert!(
+            ok as f64 / (ok + bad).max(1) as f64 >= 0.999,
+            "new agents succeed at least 99.9% of the time"
+        );
+        // The resident cells answer after the second deploy and keep counting.
+        for id in &resident {
+            let n = wait_until(
+                "a resident cell to answer",
+                Duration::from_secs(120),
+                || async { fleet.get_json(0, &format!("/bump?id={id}")).await },
+            )
+            .await;
+            assert_eq!(n["n"], 2, "the acknowledged write survived two deploys");
+        }
+    };
+    let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+    fleet.nodes.clear();
+    fleet.clean().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// S15, the `shadow` and `read` halves. Sessions in `shadow`, then in `read`,
+/// hand their cells to peers in a drain. Delete `own.json` of every handed-off cell:
+/// each is refused, and no granted id of a session of either mode is taken by a
+/// first-form claim over nothing.
+#[tokio::test]
+async fn s15_shadow_and_read_cells_are_refused_when_their_record_is_lost() {
+    let Some(mut fleet) = Fleet::start_each("do-ids", &[&MODE_SHADOW, READ, READ]).await else {
+        return;
+    };
+    let count = cells();
+    let body = async {
+        wait_for_ensemble(&fleet).await;
+        let mut handed: Vec<(&str, String, Vec<String>)> = Vec::new();
+        for mode in ["shadow", "read"] {
+            if mode == "read" {
+                fleet.respawn(0, READ).await;
+                wait_for_ensemble(&fleet).await;
+            }
+            let ids = spawn_agents(&fleet, count).await;
+            let tag = ids[0][..16].to_string();
+            fleet.nodes[0].stop();
+            // The drain handed every cell to a peer: each has a record that names a
+            // later session at a later epoch.
+            wait_until("the handoff", Duration::from_secs(120), || async {
+                for id in &ids {
+                    let record = fleet.object(&format!("cells/Cell:{id}/own.json")).await?;
+                    (record["by"] != tag.as_str() && record["epoch"].as_u64()? >= 2)
+                        .then_some(())?;
+                }
+                Some(())
+            })
+            .await;
+            handed.push((mode, tag, ids));
+        }
+        for (mode, _, ids) in &handed {
+            delete_records(&fleet, ids).await;
+            for id in ids {
+                assert!(
+                    peer_answers(&fleet, id).await.is_empty(),
+                    "a handed-off cell of a {mode} session must be refused"
+                );
+            }
+        }
+        for (mode, tag, ids) in &handed {
+            let header = fleet
+                .object(&format!("fleet/sessions/{tag}.json"))
+                .await
+                .unwrap();
+            let chunk = fleet
+                .object(&format!("fleet/sessions/{tag}/c/0"))
+                .await
+                .unwrap();
+            let taken = chunk["taken"].as_object().cloned().unwrap_or_default();
+            for id in ids {
+                let counter = counter_of(&header, id).to_string();
+                assert!(
+                    !taken.contains_key(&counter),
+                    "{mode}: a takeover of a granted id"
+                );
+            }
+        }
+    };
+    let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+    fleet.nodes.clear();
+    fleet.clean().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+const MODE_SHADOW: [(&str, &str); 3] = [
+    ("CELLD_LAZY_BIRTH", "shadow"),
+    ("CELLD_TEST_TAGGED_IDS", "1"),
+    ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "500"),
+];
+
+/// The time of the first request of a new minted agent, over `count` agents, in
+/// milliseconds sorted.
+async fn first_request_times(nodes: usize, mode: &'static str, count: usize) -> Vec<f64> {
+    let env: &'static [(&str, &str)] = Box::leak(Box::new([
+        ("CELLD_LAZY_BIRTH", mode),
+        ("CELLD_TEST_TAGGED_IDS", "1"),
+        ("CELLD_LAZY_BIRTH_CHECKPOINT_MS", "500"),
+    ]));
+    let Some(fleet) = Fleet::start("do-ids", nodes, env).await else {
+        return Vec::new();
+    };
+    let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let result = out.clone();
+    with_fleet(fleet, |fleet| async move {
+        if mode == "off" {
+            wait_until("an ensemble", Duration::from_secs(90), || async {
+                let lease = fleet.object("nodes/lazy-0.json").await?;
+                (lease["log"]["state"] == "open"
+                    && !lease["log"]["ensemble"].as_array()?.is_empty())
+                .then_some(())
+            })
+            .await;
+        } else {
+            wait_for_ensemble(&fleet).await;
+        }
+        assert_eq!(spawn_agents(&fleet, 3).await.len(), 3, "a warm-up");
+        let mut times = Vec::new();
+        for _ in 0..count {
+            let began = Instant::now();
+            let out = fleet.get_json(0, "/spawn?n=1").await;
+            assert!(out.is_some(), "an agent was created");
+            times.push(began.elapsed().as_secs_f64() * 1_000.0);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        *result.lock().unwrap() = times;
+        fleet
+    })
+    .await;
+    let value = out.lock().unwrap().clone();
+    value
+}
+
+/// S3, the cold path of a new minted agent: the time of its first response in
+/// `read` against the flag off, at 2 and at 4 nodes. The tail must not be worse;
+/// the median is reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_the_first_response_of_a_minted_agent_in_read_is_not_slower_than_off() {
+    // `LAZY_FLEET_S3_PAIRS=n` runs the interleaved pair mode instead (see
+    // `s3_pairs`): the gate for a quiet host.
+    if let Ok(pairs) = std::env::var("LAZY_FLEET_S3_PAIRS") {
+        s3_pairs(pairs.parse().expect("a number of pairs")).await;
+        return;
+    }
+    for nodes in [2, 4] {
+        let off = first_request_times(nodes, "off", 300).await;
+        let read = first_request_times(nodes, "read", 300).await;
+        if off.is_empty() || read.is_empty() {
+            return;
+        }
+        let p =
+            |times: &[f64], q: f64| times[((times.len() as f64 * q) as usize).min(times.len() - 1)];
+        eprintln!(
+            "S3 {nodes} nodes: off p50 {:.1} ms p99 {:.1} ms; read p50 {:.1} ms p99 {:.1} ms",
+            p(&off, 0.5),
+            p(&off, 0.99),
+            p(&read, 0.5),
+            p(&read, 0.99)
+        );
+        // The median is reported, not asserted: on a local store a read and a
+        // listing cost about a millisecond, so skipping them saves less than the
+        // wait for the fleet proof of the grant costs. The plan's gate ("not slower
+        // than off") needs a store with the latency of a real bucket.
+        eprintln!(
+            "S3 {nodes} nodes: the median of read is {:+.1} ms against off",
+            p(&read, 0.5) - p(&off, 0.5)
+        );
+        // The two runs are made one after the other on a host that other work
+        // shares, so run-to-run drift is of the size of the difference. The test
+        // asserts only that read is not slower by a margin that no drift explains,
+        // and reports the numbers; the gate "not slower than off" needs a quiet
+        // host and a store with the latency of a real bucket.
+        assert!(
+            p(&read, 0.5) <= p(&off, 0.5) + 100.0 && p(&read, 0.9) <= p(&off, 0.9) + 150.0,
+            "{nodes} nodes: read is far slower than off"
+        );
+    }
+}
+
+fn quantile(times: &[f64], q: f64) -> f64 {
+    times[((times.len() as f64 * q) as usize).min(times.len() - 1)]
+}
+
+fn median(mut values: Vec<f64>) -> f64 {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    values[values.len() / 2]
+}
+
+/// The gate of S3 for a quiet host: `pairs` runs of the flag off and of `read`,
+/// alternating, the order swapping from one pair to the next so that a drift of
+/// the host falls on both. Each pair gives the difference of the median and of the
+/// 99th percentile of the first response (read minus off). `read` is not slower if
+/// the median of those differences is not above the noise floor, at 2 and at 4
+/// nodes. Start it when nothing else runs on the host.
+async fn s3_pairs(pairs: usize) {
+    for nodes in [2, 4] {
+        let (mut d50, mut d99) = (Vec::new(), Vec::new());
+        for pair in 0..pairs {
+            let (off, read) = if pair % 2 == 0 {
+                let off = first_request_times(nodes, "off", 300).await;
+                (off, first_request_times(nodes, "read", 300).await)
+            } else {
+                let read = first_request_times(nodes, "read", 300).await;
+                (first_request_times(nodes, "off", 300).await, read)
+            };
+            // The pair mode is a gate asked for by name: without a fleet it has
+            // measured nothing, and must not pass.
+            assert!(
+                !off.is_empty() && !read.is_empty(),
+                "LAZY_FLEET_S3_PAIRS is set and no fleet started: set CELLD_STORE_CONTRACT_BUCKET \
+                 and AWS_ENDPOINT_URL"
+            );
+            d50.push(quantile(&read, 0.5) - quantile(&off, 0.5));
+            d99.push(quantile(&read, 0.99) - quantile(&off, 0.99));
+            eprintln!(
+                "S3 pair {pair} at {nodes} nodes: off p50 {:.1} p99 {:.1} ms, read p50 {:.1} p99 {:.1} ms",
+                quantile(&off, 0.5),
+                quantile(&off, 0.99),
+                quantile(&read, 0.5),
+                quantile(&read, 0.99)
+            );
+        }
+        let (m50, m99) = (median(d50.clone()), median(d99.clone()));
+        eprintln!("S3 {nodes} nodes over {pairs} pairs: read minus off, median of p50 {m50:+.1} ms, median of p99 {m99:+.1} ms (p50 {d50:?}, p99 {d99:?})");
+        assert!(
+            m50 <= 1.0,
+            "{nodes} nodes: the median of read is slower than off by {m50:.1} ms"
+        );
+        assert!(
+            m99 <= 5.0,
+            "{nodes} nodes: the 99th percentile of read is slower than off by {m99:.1} ms"
+        );
+    }
+}
+
+/// A node with the flag off has no session and still reads another session's id by
+/// that session's header (B7). An id minted by a live `read` node that has not
+/// decided it yet has no record: the off node forwards to the minting node and
+/// never claims the cell at epoch 2 beside it, which is what a node from before
+/// the reader rules did.
+#[tokio::test]
+async fn a_node_with_the_flag_off_forwards_an_undecided_minted_id_to_its_minter() {
+    let Some(mut fleet) = Fleet::start("do-ids", 3, READ).await else {
+        return;
+    };
+    let body = async {
+        wait_for_ensemble(&fleet).await;
+        let ids = mint(&fleet, 3).await;
+        let tag = ids[0][..16].to_string();
+        fleet
+            .respawn(
+                2,
+                &[("CELLD_LAZY_BIRTH", "off"), ("CELLD_TEST_TAGGED_IDS", "1")],
+            )
+            .await;
+        let out = fleet
+            .get_json(2, &format!("/bump?id={}", ids[0]))
+            .await
+            .expect("the off node answers through the minting node");
+        assert_eq!(out["n"], 1);
+        let record = fleet
+            .object(&format!("cells/Cell:{}/own.json", ids[0]))
+            .await
+            .expect("a record");
+        assert_eq!(record["epoch"], 1, "{record}");
+        assert_eq!(record["by"], tag.as_str(), "{record}");
+        assert_eq!(record["node"], "lazy-0", "{record}");
+        // A build with these rules says so in its lease: a session grants without a
+        // read only while every live lease advertises this format.
+        let lease = fleet.object("nodes/lazy-0.json").await.expect("a lease");
+        assert_eq!(lease["session"]["format"], 2, "{lease}");
+    };
+    let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+    fleet.nodes.clear();
+    fleet.clean().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// What the minting node left behind when it died, for the two cases of B3 in which
+/// the takeover gate has no log to recover: how its node record is changed before a
+/// peer asks for an id that it minted and never decided.
+#[derive(Clone, Copy)]
+enum Left {
+    /// The node record is gone (retired), as is its log.
+    NoRecord,
+    /// The node record is there, expired, and never opened a log.
+    NoLog,
+}
+
+/// A dead session with no log to recover must still end the forward of its ids: the
+/// gate seals its header, the cell is judged again by the sealed chunk, and a peer
+/// takes the id at epoch 2. Before, the forward went on for ever, with no backoff.
+async fn dead_session_without_a_log_is_sealed(left: Left) {
+    let Some(mut fleet) = Fleet::start("do-ids", 3, READ).await else {
+        return;
+    };
+    let body = async {
+        wait_for_ensemble(&fleet).await;
+        let ids = mint(&fleet, 3).await;
+        let tag = ids[0][..16].to_string();
+        fleet.nodes[0].kill();
+        let key = "nodes/lazy-0.json";
+        match left {
+            Left::NoRecord => {
+                fleet.bucket.delete(key).await.unwrap();
+            }
+            Left::NoLog => {
+                let (bytes, token) = fleet.bucket.get(key).await.unwrap().expect("a node record");
+                let mut lease: Value = serde_json::from_slice(&bytes).unwrap();
+                let object = lease.as_object_mut().unwrap();
+                object.remove("log");
+                object.insert("expires_ms".into(), 1.into());
+                fleet
+                    .bucket
+                    .put_cas(key, serde_json::to_vec(&lease).unwrap(), Some(&token))
+                    .await
+                    .unwrap()
+                    .expect("the node record is replaced");
+            }
+        }
+        let n = wait_until(
+            "a peer to take the id of the dead session",
+            Duration::from_secs(120),
+            || async { peer_answers(&fleet, &ids[0]).await.first().copied() },
+        )
+        .await;
+        assert_eq!(n, 1);
+        let header = fleet
+            .object(&format!("fleet/sessions/{tag}.json"))
+            .await
+            .expect("the header");
+        assert_eq!(header["state"], "sealed", "{header}");
+        let record = fleet
+            .object(&format!("cells/Cell:{}/own.json", ids[0]))
+            .await
+            .expect("a record");
+        assert_eq!(record["epoch"], 2, "{record}");
+        assert_ne!(record["by"], tag.as_str(), "{record}");
+    };
+    let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+    fleet.nodes.clear();
+    fleet.clean().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn a_dead_session_whose_node_record_is_gone_is_sealed_and_its_ids_are_taken() {
+    dead_session_without_a_log_is_sealed(Left::NoRecord).await;
+}
+
+#[tokio::test]
+async fn a_dead_session_whose_node_never_opened_a_log_is_sealed_and_its_ids_are_taken() {
+    dead_session_without_a_log_is_sealed(Left::NoLog).await;
+}
+
+/// A birth-form record with a dead author, read while the author's header is still
+/// open, is judged again once the gate on the author sealed it. Before, the cell
+/// went on to a plain takeover that skipped P3, and a node served a cell whose
+/// record no grant covers and whose LTX exists.
+#[tokio::test]
+async fn a_record_read_under_an_open_header_is_judged_again_after_the_gate() {
+    let Some(mut fleet) = Fleet::start("do-ids", 3, READ).await else {
+        return;
+    };
+    let body = async {
+        wait_for_ensemble(&fleet).await;
+        let ids = mint(&fleet, 3).await;
+        let tag = ids[0][..16].to_string();
+        fleet.nodes[0].kill();
+        // S's late write of a birth-form record for an id it never granted, and an
+        // object under the cell's LTX prefix that says someone acted on it. The
+        // header of S is still open: the gate runs on S's node when a peer asks.
+        let record = serde_json::json!({
+            "node": "lazy-0", "epoch": 1, "by": tag, "birth": true,
+        });
+        fleet
+            .bucket
+            .put_cas(
+                &format!("cells/Cell:{}/own.json", ids[0]),
+                serde_json::to_vec(&record).unwrap(),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("the record is written");
+        fleet
+            .bucket
+            .put(
+                &format!("cells/Cell:{}/ltx/e1/0000000000000001.ltx", ids[0]),
+                b"x".to_vec(),
+            )
+            .await
+            .unwrap();
+        let header_sealed = || async {
+            let header = fleet.object(&format!("fleet/sessions/{tag}.json")).await?;
+            (header["state"] == "sealed").then_some(())
+        };
+        // A peer asks until the gate has sealed the header; the cell is refused.
+        let began = Instant::now();
+        while header_sealed().await.is_none() {
+            assert!(began.elapsed() < Duration::from_secs(180), "never sealed");
+            assert!(
+                peer_answers(&fleet, &ids[0]).await.is_empty(),
+                "the cell was served before its record was judged"
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        assert!(peer_answers(&fleet, &ids[0]).await.is_empty());
+        // The refusal is the guard of P3, and it is counted for the operator.
+        let mut refused = 0;
+        for index in [1, 2] {
+            let state = fleet.nodes[index].state(&fleet.client).await;
+            refused += state["storage_counters"]["lazy_birth_session"]["p3_refusals"]
+                .as_u64()
+                .unwrap_or(0);
+        }
+        assert!(refused >= 1, "the P3 refusal is not counted in /state");
+        let record = fleet
+            .object(&format!("cells/Cell:{}/own.json", ids[0]))
+            .await
+            .expect("a record");
+        assert_eq!(record["epoch"], 1, "{record}");
+    };
+    let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+    fleet.nodes.clear();
+    fleet.clean().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// "Why P3 is needed". S minted an id and never granted it. The fleet claimed the
+/// id on its own (it ran the gate on S, sealed S's header, and claimed it at epoch
+/// 2), and that record was then lost. S's create-only write of a birth-form record
+/// now succeeds over the lost one. The record must not hide the loss: a reader
+/// finds that no grant covers it, finds LTX under the cell, and refuses it, as the
+/// standard path does. A cell that no node ever claimed (no LTX) is still taken.
+#[tokio::test]
+async fn a_birth_form_record_without_a_grant_is_refused_over_a_lost_claim() {
+    let Some(mut fleet) = Fleet::start("do-ids", 3, READ).await else {
+        return;
+    };
+    let body = async {
+        wait_for_ensemble(&fleet).await;
+        let ids = mint(&fleet, 3).await;
+        let tag = ids[0][..16].to_string();
+        let (claimed, fresh) = (ids[0].clone(), ids[1].clone());
+        // S is gone before it decides anything. The fleet runs the gate on it,
+        // which seals its header, and claims the id as a new cell at epoch 2.
+        fleet.nodes[0].kill();
+        let n = wait_until(
+            "a peer to claim the id",
+            Duration::from_secs(180),
+            || async { peer_answers(&fleet, &claimed).await.first().copied() },
+        )
+        .await;
+        assert_eq!(n, 1);
+        wait_until(
+            "the first object of the claim",
+            Duration::from_secs(90),
+            || async {
+                fleet
+                    .keys(&format!("cells/Cell:{claimed}/ltx/"))
+                    .await
+                    .iter()
+                    .any(|key| key.contains("/e2/"))
+                    .then_some(())
+            },
+        )
+        .await;
+        // The record of the claim is lost, and S's late write of its birth-form
+        // record applies over it.
+        delete_records(&fleet, std::slice::from_ref(&claimed)).await;
+        let late = serde_json::json!({
+            "node": "lazy-0", "epoch": 1, "by": tag, "birth": true,
+        });
+        for id in [&claimed, &fresh] {
+            fleet
+                .bucket
+                .put_cas(
+                    &format!("cells/Cell:{id}/own.json"),
+                    serde_json::to_vec(&late).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap()
+                .expect("the late write applies");
+        }
+        // The nodes that served the claim forget it (the cell is no longer resident),
+        // so that the record decides.
+        for index in [1, 2] {
+            fleet.respawn(index, READ).await;
+        }
+        // With LTX the record hides a lost claim: refused.
+        assert!(
+            peer_answers(&fleet, &claimed).await.is_empty(),
+            "the cell with LTX must be refused"
+        );
+        // Without LTX nothing was ever claimed: the record is replaced at epoch 2.
+        let n = wait_until(
+            "a peer to take the unclaimed cell",
+            Duration::from_secs(120),
+            || async { peer_answers(&fleet, &fresh).await.first().copied() },
+        )
+        .await;
+        assert_eq!(n, 1);
+        let record = fleet
+            .object(&format!("cells/Cell:{fresh}/own.json"))
+            .await
+            .unwrap();
+        assert_eq!(record["epoch"], 2, "{record}");
+    };
+    let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
     fleet.nodes.clear();
     fleet.clean().await;
     if let Err(panic) = outcome {

@@ -199,3 +199,27 @@ fn check(
     );
     1
 }
+
+/// P3: a birth-form record that no grant covers is replaced only over a cell
+/// without LTX; with LTX the record was created over a lost one and is refused.
+/// A birth-form record that a grant covers, or any other take, is not touched.
+#[test]
+fn a_birth_form_record_without_a_grant_is_refused_over_a_cell_with_ltx() {
+    let replace = prod::Take::FirstOverRecord { epoch: 2 };
+    assert_eq!(prod::birth_guard(replace.clone(), true, false), replace);
+    assert!(matches!(
+        prod::birth_guard(replace.clone(), true, true),
+        prod::Take::Refuse(_)
+    ));
+    assert_eq!(
+        prod::birth_guard(replace.clone(), false, true),
+        replace,
+        "not a birth record"
+    );
+    let plain = prod::Take::Plain { epoch: 2 };
+    assert_eq!(
+        prod::birth_guard(plain.clone(), true, true),
+        plain,
+        "granted: a plain takeover"
+    );
+}
