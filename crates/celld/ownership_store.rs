@@ -596,6 +596,8 @@ pub struct BucketOwnership {
     gate_hold: &'static crate::registry_seed::GateHold,
     /// The first-form record that the next conditional write of a cell carries.
     pub(crate) k5: crate::session_reader::K5Plans,
+    /// The epoch at which the reader rules said a cell is claimed.
+    pub(crate) expected: crate::session_reader::Expected,
     /// Whether the leases of an ensemble carry the capability, and when that was
     /// read, for which members: at most every [`MARKS_GATE_MS`]. Liveness is not
     /// cached; see `ensemble_live`.
@@ -872,6 +874,7 @@ impl BucketOwnership {
             registry_answers: RegistryAnswers::default(),
             gate_hold: crate::registry_seed::hold(),
             k5: crate::session_reader::K5Plans::default(),
+            expected: crate::session_reader::Expected::default(),
             marks_gate: std::sync::Mutex::new((0, false, Vec::new(), 0)),
             ensemble_live: std::sync::OnceLock::new(),
             member_caps: std::sync::Mutex::default(),
@@ -1974,6 +1977,7 @@ impl BucketOwnership {
         if matches!(&guard, CasGuard::Match(etag) if etag.is_empty()) {
             return Ok(CasOutcome::Rejected);
         }
+        let _ = self.expected.check(cell, &guard, epoch);
         let key = format!("cells/{cell}/own.json");
         let session = crate::session::current();
         let by = session.map(|session| session.tag());

@@ -54,6 +54,39 @@ impl K5Plan {
     }
 }
 
+/// The epoch at which the rules said that a cell is claimed, by the etag of the
+/// record they judged (`None` for no record).
+#[derive(Default)]
+pub(crate) struct Expected(Mutex<HashMap<String, (Option<String>, u64)>>);
+
+/// The most expectations kept; past it the map starts again.
+const EXPECTED_CAP: usize = 4_096;
+
+impl Expected {
+    pub(crate) fn set(&self, cell: &str, etag: Option<String>, epoch: u64) {
+        let mut map = self.0.lock().unwrap();
+        if map.len() >= EXPECTED_CAP {
+            map.clear();
+        }
+        map.insert(cell.to_string(), (etag, epoch));
+    }
+
+    /// Compare the claim that is about to be written with what the rules said. A
+    /// claim over another record than the one judged is not compared.
+    pub(crate) fn check(&self, cell: &str, guard: &CasGuard, epoch: u64) -> Option<bool> {
+        let (etag, expected) = self.0.lock().unwrap().remove(cell)?;
+        let same_record = match (guard, &etag) {
+            (CasGuard::Absent, None) => true,
+            (CasGuard::Match(held), Some(judged)) => held == judged,
+            _ => false,
+        };
+        same_record.then(|| {
+            session::note_claim_epoch(cell, epoch == expected, expected, epoch);
+            epoch == expected
+        })
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct K5Plans(Mutex<HashMap<String, K5Plan>>);
 
@@ -279,13 +312,18 @@ impl BucketOwnership {
             },
             lost: header.lost,
         });
-        let verdict = take::decide(&take::View {
+        let view = take::View {
             rec: rec.as_ref(),
             hdr: hdr.as_ref(),
             chunk: cell_entries.as_ref(),
             author_live,
             placed: false,
-        });
+        };
+        let verdict = take::decide(&view);
+        // The rules of mode `on`, computed beside the ones in force and compared,
+        // with no effect: no plan and no mark. A difference that the design makes is
+        // counted apart from any other.
+        session::note_taker_agreement(take::compare_with_on(&view));
         // A birth-form record that no grant covers is also held to the guard of the
         // standard path: the strictest of the two rules decides (P3).
         let verdict = match (&verdict, record) {
@@ -300,6 +338,11 @@ impl BucketOwnership {
             _ => verdict,
         };
         let judged = record.map(|(record, _)| record.etag.clone());
+        // The epoch at which the rules say the cell is claimed; the claim that
+        // follows is compared with it.
+        if let Some(epoch) = take::claim_epoch(&verdict) {
+            self.expected.set(cell, judged.clone(), epoch);
+        }
         let plan = |over: Vec<String>| K5Plan {
             nonce: new_nonce(),
             over,
@@ -396,6 +439,29 @@ mod tests {
             "its own nonce"
         );
         assert!(replace.conflicts_with(Some(&"other".to_string())));
+    }
+
+    /// A claim is compared with the epoch the rules gave only when it is over the
+    /// record they judged, and a difference is counted, not hidden.
+    #[test]
+    fn a_claim_is_compared_with_the_epoch_of_the_rules() {
+        let expected = Expected::default();
+        expected.set("a-cell", Some("e1".into()), 3);
+        assert_eq!(
+            expected.check("a-cell", &CasGuard::Match("e1".into()), 3),
+            Some(true)
+        );
+        // A claim over another record than the one judged is not compared.
+        expected.set("a-cell", Some("e1".into()), 3);
+        assert_eq!(
+            expected.check("a-cell", &CasGuard::Match("e2".into()), 9),
+            None
+        );
+        // The same record at another epoch is a mismatch.
+        expected.set("b-cell", None, 2);
+        assert_eq!(expected.check("b-cell", &CasGuard::Absent, 1), Some(false));
+        // An expectation is used once.
+        assert_eq!(expected.check("b-cell", &CasGuard::Absent, 1), None);
     }
 
     #[test]

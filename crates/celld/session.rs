@@ -481,6 +481,56 @@ fn shadow_failures() -> BTreeMap<&'static str, u64> {
 
 static P3_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
+static TAKER_SAME: AtomicU64 = AtomicU64::new(0);
+static TAKER_BY_DESIGN: AtomicU64 = AtomicU64::new(0);
+static TAKER_MISMATCH: AtomicU64 = AtomicU64::new(0);
+static CLAIM_EPOCH_SAME: AtomicU64 = AtomicU64::new(0);
+static CLAIM_EPOCH_MISMATCH: AtomicU64 = AtomicU64::new(0);
+
+/// How the rules of mode `on` compare with the ones in force for a cell that was
+/// judged (see `celld_logic::session_take::compare_with_on`).
+pub(crate) fn note_taker_agreement(agreement: celld_logic::session_take::Agreement) {
+    use celld_logic::session_take::Agreement;
+    let counter = match agreement {
+        Agreement::Same => &TAKER_SAME,
+        Agreement::ByDesign => &TAKER_BY_DESIGN,
+        Agreement::Mismatch => {
+            tracing::warn!(event = "taker_mismatch", "the rules of mode on differ here");
+            &TAKER_MISMATCH
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The epoch of a claim that followed a judgement, against the epoch the rules
+/// gave.
+pub(crate) fn note_claim_epoch(cell: &str, same: bool, expected: u64, written: u64) {
+    if same {
+        CLAIM_EPOCH_SAME.fetch_add(1, Ordering::Relaxed);
+    } else {
+        tracing::warn!(
+            event = "claim_epoch_mismatch",
+            cell,
+            expected,
+            written,
+            "a claim was written at another epoch than the rules gave"
+        );
+        CLAIM_EPOCH_MISMATCH.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The comparison counters, for `/state`: `mismatch` and `claim_epoch_mismatch`
+/// stay zero.
+fn taker_counters() -> serde_json::Value {
+    serde_json::json!({
+        "same": TAKER_SAME.load(Ordering::Relaxed),
+        "by_design": TAKER_BY_DESIGN.load(Ordering::Relaxed),
+        "mismatch": TAKER_MISMATCH.load(Ordering::Relaxed),
+        "claim_epoch_same": CLAIM_EPOCH_SAME.load(Ordering::Relaxed),
+        "claim_epoch_mismatch": CLAIM_EPOCH_MISMATCH.load(Ordering::Relaxed),
+    })
+}
+
 /// A cell was refused because a birth-form record that no grant covers lies over
 /// LTX (P3). It stays refused until the operator repairs the record.
 pub(crate) fn note_p3_refusal() {
@@ -492,10 +542,15 @@ pub(crate) fn note_p3_refusal() {
 pub(crate) fn counters_json() -> Option<serde_json::Value> {
     let p3_refusals = P3_REFUSALS.load(Ordering::Relaxed);
     let Some(session) = current() else {
-        return (p3_refusals > 0).then(|| serde_json::json!({ "p3_refusals": p3_refusals }));
+        let judged = TAKER_SAME.load(Ordering::Relaxed)
+            + TAKER_BY_DESIGN.load(Ordering::Relaxed)
+            + TAKER_MISMATCH.load(Ordering::Relaxed);
+        return (p3_refusals > 0 || judged > 0)
+            .then(|| serde_json::json!({ "p3_refusals": p3_refusals, "taker": taker_counters() }));
     };
     Some(serde_json::json!({
         "p3_refusals": p3_refusals,
+        "taker": taker_counters(),
         "tag": session.tag(),
         "verified_under_carried_tag": CARRIED_VERIFIED.load(Ordering::Relaxed),
         "shadow_failures": shadow_failures(),
