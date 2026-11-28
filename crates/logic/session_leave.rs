@@ -132,7 +132,10 @@ pub struct Captured {
     /// The process's own tag is the id's tag.
     pub own_tag: bool,
     pub granted: bool,
-    /// The left entry of the cell has a `done` nonce.
+    /// The bucket holds a trace that the cell had a record: for a lazy cell its
+    /// confirmed left entry (`done`); for a cell whose record exists, its grant in a
+    /// chunk or its confirmed left entry; for an id that was never claimed here,
+    /// nothing is needed.
     pub confirmed_leave: bool,
     /// The successor's lease will carry the tag of the cell's record.
     pub record_tag_carried: bool,

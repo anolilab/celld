@@ -1037,6 +1037,11 @@ impl Session {
         })
     }
 
+    /// Whether the bucket holds a confirmed left entry for `counter`.
+    pub fn has_left(&self, counter: u64) -> bool {
+        self.left.lock().expect("left poisoned").contains(&counter)
+    }
+
     /// The trace that a cell had a record, in a chunk in the bucket: a left
     /// entry confirmed under a nonce of its own, by compare-and-swap. A left
     /// entry implies the granted bit. It is written before every release of
@@ -1557,6 +1562,34 @@ pub async fn prepare_reload(
         in_use.len() == carried.len() && carried.len() <= CARRIED_BOUND,
         "the successor cannot carry the tags of the resident cells"
     );
+    // The check of the capture (B5, step 4), over what the leaving process knows: a
+    // cell of this process needs a trace in the bucket (its confirmed left entry, or
+    // the grant in a chunk), and the record of every cell a tag that the successor
+    // carries. The marker needs it to pass; in `shadow` a failure is counted and
+    // logged, and the reload goes on as before.
+    let captured: Vec<celld_logic::session_leave::Captured> = cells
+        .iter()
+        .map(|cell| {
+            let counter = session.own_counter_of_scope(&cell.id);
+            let tag = tags.get(&cell.id).map_or("", String::as_str);
+            celld_logic::session_leave::Captured {
+                own_tag: counter.is_some(),
+                granted: counter.is_some_and(|counter| session.is_granted(counter)),
+                confirmed_leave: counter.is_some_and(|counter| {
+                    session.has_left(counter)
+                        || (session.is_granted(counter) && session.is_checkpointed(counter))
+                        || session.is_waived(counter) && !session.is_claimed_scope(&cell.id)
+                }),
+                record_tag_carried: tag.is_empty() || carried.iter().any(|kept| kept == tag),
+            }
+        })
+        .collect();
+    tolerate(
+        session,
+        "capture",
+        celld_logic::session_leave::capture_check(&captured)
+            .map_err(|reason| anyhow::anyhow!(reason)),
+    )?;
     Ok(crate::clean_reload::ReloadSession {
         tags: carried,
         cells: tags,

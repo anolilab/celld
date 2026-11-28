@@ -1872,6 +1872,20 @@ async fn s8_rolling_and_preserved_restarts_under_a_stream_of_new_agents() {
                 }
             }
         }
+        // The check of the capture (B5) failed on no node in any preserved restart.
+        for (index, node) in fleet.nodes.iter().enumerate() {
+            let failed: Vec<String> = node
+                .log()
+                .lines()
+                .filter(|line| {
+                    (line.contains("shadow_failure") && line.contains("capture"))
+                        || line.contains("has no confirmed")
+                        || line.contains("will not carry")
+                })
+                .map(str::to_string)
+                .collect();
+            assert!(failed.is_empty(), "node {index}: {failed:?}");
+        }
         if let Ok(dir) = std::env::var("LAZY_FLEET_KEEP_LOGS") {
             for (index, node) in fleet.nodes.iter().enumerate() {
                 let _ = std::fs::write(format!("{dir}/s8-node-{index}.log"), node.log());
