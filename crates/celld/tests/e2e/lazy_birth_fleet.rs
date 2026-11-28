@@ -2177,6 +2177,73 @@ async fn a_dead_session_whose_node_never_opened_a_log_is_sealed_and_its_ids_are_
     dead_session_without_a_log_is_sealed(Left::NoLog).await;
 }
 
+/// A birth-form record with a dead author, read while the author's header is still
+/// open, is judged again once the gate on the author sealed it. Before, the cell
+/// went on to a plain takeover that skipped P3, and a node served a cell whose
+/// record no grant covers and whose LTX exists.
+#[tokio::test]
+async fn a_record_read_under_an_open_header_is_judged_again_after_the_gate() {
+    let Some(mut fleet) = Fleet::start("do-ids", 3, READ).await else {
+        return;
+    };
+    let body = async {
+        wait_for_ensemble(&fleet).await;
+        let ids = mint(&fleet, 3).await;
+        let tag = ids[0][..16].to_string();
+        fleet.nodes[0].kill();
+        // S's late write of a birth-form record for an id it never granted, and an
+        // object under the cell's LTX prefix that says someone acted on it. The
+        // header of S is still open: the gate runs on S's node when a peer asks.
+        let record = serde_json::json!({
+            "node": "lazy-0", "epoch": 1, "by": tag, "birth": true,
+        });
+        fleet
+            .bucket
+            .put_cas(
+                &format!("cells/Cell:{}/own.json", ids[0]),
+                serde_json::to_vec(&record).unwrap(),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("the record is written");
+        fleet
+            .bucket
+            .put(
+                &format!("cells/Cell:{}/ltx/e1/0000000000000001.ltx", ids[0]),
+                b"x".to_vec(),
+            )
+            .await
+            .unwrap();
+        let header_sealed = || async {
+            let header = fleet.object(&format!("fleet/sessions/{tag}.json")).await?;
+            (header["state"] == "sealed").then_some(())
+        };
+        // A peer asks until the gate has sealed the header; the cell is refused.
+        let began = Instant::now();
+        while header_sealed().await.is_none() {
+            assert!(began.elapsed() < Duration::from_secs(180), "never sealed");
+            assert!(
+                peer_answers(&fleet, &ids[0]).await.is_empty(),
+                "the cell was served before its record was judged"
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        assert!(peer_answers(&fleet, &ids[0]).await.is_empty());
+        let record = fleet
+            .object(&format!("cells/Cell:{}/own.json", ids[0]))
+            .await
+            .expect("a record");
+        assert_eq!(record["epoch"], 1, "{record}");
+    };
+    let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+    fleet.nodes.clear();
+    fleet.clean().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 /// "Why P3 is needed". S minted an id and never granted it. The fleet claimed the
 /// id on its own (it ran the gate on S, sealed S's header, and claimed it at epoch
 /// 2), and that record was then lost. S's create-only write of a birth-form record
