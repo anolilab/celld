@@ -2784,7 +2784,7 @@ mod tests {
         let chunk = read(0).await;
         assert!(chunk.granted.contains(&4));
         assert_eq!(chunk.left[&4].epoch, 2);
-        assert_eq!(chunk.left[&4].nonces, [nonce.clone()]);
+        assert_eq!(chunk.left[&4].nonces, std::slice::from_ref(&nonce));
         assert_eq!(chunk.left[&4].done, None, "announced, not confirmed");
         assert!(!session.has_left(4));
         // Nonces go up to four, and a new one is a new entry of the same cell.
